@@ -150,6 +150,68 @@ df = manager.get_training_history("fraud_detector")
 df = manager.get_model_registry(status="production")
 ```
 
+## Continuous Training Pipeline
+
+Automated retraining system that monitors model performance and retrains when data drifts or performance degrades.
+
+### Pipeline Stages
+1. **Data Ingestion** — Pulls labeled data from PostgreSQL, Kafka, or file exports
+2. **Drift Detection** — KS test + PSI (numerical), Chi-squared (categorical), AUC degradation (concept drift)
+3. **Retraining** — Trains challenger model with same architecture but on new data
+4. **Champion-Challenger** — Paired bootstrap test for statistical significance, business rule compliance
+5. **Promotion** — Staging → Canary (10-50% traffic) → Production, with automatic rollback
+6. **Monitoring** — Prometheus metrics, HTML dashboard, alerts
+
+### Quick Start
+
+```bash
+# Run full pipeline (drift check → retrain if needed → evaluate → promote)
+python -m ml.continuous_training.orchestrator --mode full
+
+# Drift check only
+python -m ml.continuous_training.orchestrator --mode drift
+
+# Force retrain specific model
+python -m ml.continuous_training.orchestrator --mode retrain --model fraud_detector --force
+
+# Start monitoring dashboard (http://localhost:8501/monitoring/dashboard)
+python -m ml.continuous_training.monitoring
+
+# Start scheduler daemon (cron-based retraining)
+python -m ml.continuous_training.scheduler
+```
+
+### Retraining Schedule
+
+| Model | Schedule | Min Samples | Requires Approval |
+|-------|----------|:-----------:|:-----------------:|
+| FraudDetector | Daily | 5,000 | Yes |
+| CreditScorer | Weekly | 2,000 | No |
+| AnomalyVAE | Weekly | 5,000 | No |
+| ChurnPredictor | Monthly | 1,000 | No |
+| GNNFraudRing | Weekly | 500 | Yes |
+| AMLRiskScorer | Daily | 3,000 | Yes |
+
+### Business Rules (Champion-Challenger)
+
+| Model | Recall Floor | FPR Ceiling | Min AUC Improvement |
+|-------|:-----------:|:-----------:|:-------------------:|
+| FraudDetector | 90% | 10% | 0.5% |
+| CreditScorer | 60% | 15% | 1.0% |
+| AMLRiskScorer | 95% | 15% | 0.5% |
+| ChurnPredictor | 70% | 20% | 1.0% |
+
+### Monitoring Endpoints
+
+```
+GET  /monitoring/dashboard             — HTML dashboard
+GET  /monitoring/status                — JSON status of all models
+GET  /monitoring/prometheus            — Prometheus metrics
+GET  /monitoring/models/{name}/drift   — Latest drift report
+GET  /monitoring/models/{name}/metrics — Current model metrics
+POST /monitoring/trigger/{name}        — Trigger manual retraining
+```
+
 ## Synthetic Data
 
 All data uses realistic Nigerian banking context:
