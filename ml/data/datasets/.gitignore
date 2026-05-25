@@ -1,0 +1,4 @@
+# Generated datasets — regenerate with: python ml/data/generate_all.py
+*.parquet
+*.npy
+delta/
