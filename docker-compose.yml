@@ -70,6 +70,91 @@ services:
       timeout: 10s
       retries: 5
 
+  # TigerBeetle — Financial ledger for double-entry accounting
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.16.11
+    command: ["start", "--addresses=0.0.0.0:3001", "--cluster-id=0"]
+    ports: ["3001:3001"]
+    volumes:
+      - tbdata:/var/lib/tigerbeetle
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 3001 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Keycloak — Identity & access management (OIDC/OAuth2)
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev
+    environment:
+      KC_HEALTH_ENABLED: "true"
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin_dev_password
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/banking54
+      KC_DB_USERNAME: banking
+      KC_DB_PASSWORD: banking_dev_password
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n' >&3 && cat <&3 | grep -q UP || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Permify — Zanzibar-style authorization engine
+  permify:
+    image: ghcr.io/permify/permify:v1.1.4
+    command: serve
+    environment:
+      PERMIFY_DATABASE_ENGINE: postgres
+      PERMIFY_DATABASE_URI: "postgres://banking:banking_dev_password@postgres:5432/banking54"
+    ports: ["3476:3476", "3478:3478"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 3476 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # APISIX — API Gateway with dynamic routing, rate limiting, TLS
+  apisix:
+    image: apache/apisix:3.9.1-debian
+    ports: ["9080:9080", "9443:9443", "9180:9180"]
+    volumes:
+      - ./config/apisix.yml:/usr/local/apisix/conf/apisix.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9080/apisix/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Dapr — Distributed application runtime (sidecar)
+  dapr-placement:
+    image: daprio/dapr:1.13.4
+    command: ["./placement", "-port", "50005"]
+    ports: ["50005:50005"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50005 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Fluvio — Streaming platform
+  fluvio:
+    image: infinyon/fluvio:0.11.9
+    command: ["fluvio", "cluster", "start", "--local"]
+    ports: ["9003:9003"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9003 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   # ── Express Gateway (BFF) ──
 
   gateway:
@@ -193,3 +278,4 @@ services:
 volumes:
   pgdata:
   osdata:
+  tbdata:
