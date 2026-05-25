@@ -202,6 +202,41 @@ def estimate_throughput(record_count, avg_record_size_bytes, parallelism=4):
     return {"records": record_count, "total_mb": round(mb_total, 2), "parallelism": parallelism, "estimated_seconds": round(est_seconds, 1), "throughput_mb_s": round(50 * parallelism, 1)}
 
 
+# --- Lakehouse Integration ---
+LAKEHOUSE_API_URL = os.environ.get("LAKEHOUSE_API_URL", "http://localhost:8020")
+
+def lakehouse_call(method, path, body=None, timeout=30):
+    """Call the lakehouse REST API."""
+    url = f"{LAKEHOUSE_API_URL}{path}"
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        logger.warning(f"Lakehouse call {method} {path} failed: {e}")
+        return {"error": str(e)}
+
+def run_etl_extract(tables=None, limit=2000):
+    """Extract data from PostgreSQL to lakehouse bronze layer."""
+    if tables:
+        return lakehouse_call("POST", "/v1/etl/extract", {"table": tables, "limit": limit})
+    return lakehouse_call("POST", "/v1/etl/extract", {"limit": limit})
+
+def run_etl_pipeline():
+    """Run the full bronze → silver → gold medallion pipeline."""
+    return lakehouse_call("POST", "/v1/etl/pipeline")
+
+def run_quality_checks():
+    """Run data quality checks across all lakehouse layers."""
+    return lakehouse_call("POST", "/v1/quality/run")
+
+def run_etl_job(job_name=None):
+    """Run a specific ETL scheduler job."""
+    return lakehouse_call("POST", "/v1/etl/run", {"job": job_name} if job_name else {})
+
+
 
 # --- HTTP Handler ---
 
@@ -404,9 +439,31 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/v1/lakehouse-etl/estimate-throughput":
             result = estimate_throughput(body.get("record_count",0), body.get("avg_record_size_bytes",512), body.get("parallelism",4))
             self.respond(200, result)
-
-
-
+        # --- Real ETL Lakehouse Endpoints ---
+        elif path == "/v1/etl/extract":
+            result = run_etl_extract(body.get("table"), body.get("limit", 2000))
+            self.respond(200, {"action": "extract", "result": result})
+        elif path == "/v1/etl/pipeline":
+            result = run_etl_pipeline()
+            self.respond(200, {"action": "pipeline", "result": result})
+        elif path == "/v1/etl/run":
+            result = run_etl_job(body.get("job"))
+            self.respond(200, {"action": "etl_job", "result": result})
+        elif path == "/v1/quality/run":
+            result = run_quality_checks()
+            self.respond(200, {"action": "quality_check", "result": result})
+        elif path == "/v1/ingest":
+            result = lakehouse_call("POST", "/v1/ingest", body)
+            self.respond(200, {"action": "ingest", "result": result})
+        elif path == "/v1/query":
+            result = lakehouse_call("POST", "/v1/query", body)
+            self.respond(200, {"action": "query", "result": result})
+        elif path == "/v1/time-travel":
+            result = lakehouse_call("POST", "/v1/time-travel", body)
+            self.respond(200, {"action": "time_travel", "result": result})
+        elif path == "/v1/cdc/event":
+            result = lakehouse_call("POST", "/v1/cdc/event", body)
+            self.respond(200, {"action": "cdc_event", "result": result})
         else:
             self.respond(404, {"error": "Not found"})
 

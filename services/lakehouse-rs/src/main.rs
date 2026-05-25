@@ -16,12 +16,25 @@ struct AppState {
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
-fn partition_path(table: &str, date: &str) -> String { format!("lakehouse/{}/year={}/month={}/day={}", table, &date[..4], &date[5..7], &date[8..10]) }
+fn partition_path(table: &str, date: &str) -> String {
+    if date.len() >= 10 {
+        format!("lakehouse/{}/year={}/month={}/day={}", table, &date[..4], &date[5..7], &date[8..10])
+    } else {
+        format!("lakehouse/{}/unpartitioned", table)
+    }
+}
+
+fn lakehouse_api_url() -> String {
+    std::env::var("LAKEHOUSE_API_URL").unwrap_or_else(|_| "http://localhost:8020".to_string())
+}
 
 async fn health() -> HttpResponse {
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({"status": "healthy", "service": "lakehouse-rs"}))
 }
 
+// query_lake: Proxies SQL queries to the DuckDB lakehouse query engine.
+// Input: {"sql": "SELECT ...", "limit": 1000} or {"table": "...", "date": "..."}
+// For backwards compatibility, still supports the old table+date format.
 async fn query_lake(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     let _sanitized = sanitize_input("");
     if !rl_allow() {
@@ -29,25 +42,104 @@ async fn query_lake(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     let input = body.into_inner();
-    let table_s = input.get("table").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let table = table_s.as_str();
-    let date_s = input.get("date").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let date = date_s.as_str();
-    let result = partition_path(table, date);
-    let _result_data = json!({"endpoint": "query_lake"});
-    db_persist(&state, "query_lake", &_result_data).await;
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("lakehouse-rs: upstream call ok"),
-        Err(e) => eprintln!("lakehouse-rs: upstream call failed: {}", e),
+
+    let lakehouse_url = lakehouse_api_url();
+
+    // If the request contains a "sql" field, forward it directly to DuckDB
+    if let Some(sql) = input.get("sql").and_then(|v| v.as_str()) {
+        let payload = json!({"sql": sql, "limit": input.get("limit").and_then(|v| v.as_i64()).unwrap_or(10000)});
+        match call_service_sync(&format!("{}/v1/query", lakehouse_url), &payload.to_string()) {
+            Ok(resp) => {
+                // Parse the HTTP response body (skip headers)
+                let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+                let body_str = &resp[body_start..];
+                if let Ok(result) = serde_json::from_str::<serde_json::Value>(body_str) {
+                    db_persist(&state, "query_lake", &json!({"sql": sql, "source": "duckdb"})).await;
+                    return HttpResponse::Ok().json(json!({
+                        "service": "lakehouse-rs",
+                        "endpoint": "query_lake",
+                        "engine": "duckdb",
+                        "result": result,
+                    }));
+                }
+            }
+            Err(e) => eprintln!("lakehouse-rs: DuckDB query failed: {}", e),
+        }
     }
+
+    // Backwards-compatible table+date query
+    let table_s = input.get("table").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let date_s = input.get("date").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let result = partition_path(&table_s, &date_s);
+
+    let _result_data = json!({"endpoint": "query_lake", "table": table_s, "date": date_s});
+    db_persist(&state, "query_lake", &_result_data).await;
 
     HttpResponse::Ok().json(json!({
         "service": "lakehouse-rs",
         "endpoint": "query_lake",
-        "result": json!({"value": result}),
+        "result": json!({"partition_path": result}),
     }))
+}
+
+// ingest_lake: Forwards records to the lakehouse bronze layer via Delta Lake.
+async fn ingest_lake(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if !rl_allow() {
+        return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
+    }
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let input = body.into_inner();
+
+    let lakehouse_url = lakehouse_api_url();
+    let payload = json!({
+        "layer": input.get("layer").and_then(|v| v.as_str()).unwrap_or("bronze"),
+        "table": input.get("table").and_then(|v| v.as_str()).unwrap_or(""),
+        "records": input.get("records").unwrap_or(&json!([])),
+    });
+
+    match call_service_sync(&format!("{}/v1/ingest", lakehouse_url), &payload.to_string()) {
+        Ok(resp) => {
+            let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+            let body_str = &resp[body_start..];
+            if let Ok(result) = serde_json::from_str::<serde_json::Value>(body_str) {
+                db_persist(&state, "ingest_lake", &json!({"table": payload["table"]})).await;
+                return HttpResponse::Ok().json(json!({
+                    "service": "lakehouse-rs",
+                    "endpoint": "ingest_lake",
+                    "result": result,
+                }));
+            }
+        }
+        Err(e) => eprintln!("lakehouse-rs: ingest failed: {}", e),
+    }
+
+    HttpResponse::InternalServerError().json(json!({"error": "lakehouse_unreachable"}))
+}
+
+// time_travel: Queries a Delta table at a specific historical version.
+async fn time_travel(req: actix_web::HttpRequest, _state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if !rl_allow() {
+        return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
+    }
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let input = body.into_inner();
+    let lakehouse_url = lakehouse_api_url();
+
+    match call_service_sync(&format!("{}/v1/time-travel", lakehouse_url), &input.to_string()) {
+        Ok(resp) => {
+            let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+            let body_str = &resp[body_start..];
+            if let Ok(result) = serde_json::from_str::<serde_json::Value>(body_str) {
+                return HttpResponse::Ok().json(json!({
+                    "service": "lakehouse-rs",
+                    "endpoint": "time_travel",
+                    "result": result,
+                }));
+            }
+        }
+        Err(e) => eprintln!("lakehouse-rs: time-travel failed: {}", e),
+    }
+    HttpResponse::InternalServerError().json(json!({"error": "time_travel_failed"}))
 }
 
 async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
@@ -271,6 +363,9 @@ async fn main() -> std::io::Result<()> {
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .route("/healthz", web::get().to(health))
             .route("/v1/query_lake", web::post().to(query_lake))
+            .route("/v1/query", web::post().to(query_lake))
+            .route("/v1/ingest", web::post().to(ingest_lake))
+            .route("/v1/time-travel", web::post().to(time_travel))
             .route("/v1/records", web::get().to(list_records))
             .route("/v1/stats", web::get().to(stats))
             .route("/readyz", web::get().to(readyz))

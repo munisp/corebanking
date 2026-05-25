@@ -137,3 +137,5 @@ services/*/card-management
 # Go binaries
 services/*-go/*-go
 services/*-go/*.exe
+lakehouse_data/
+.lakehouse.duckdb

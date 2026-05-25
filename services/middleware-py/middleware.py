@@ -95,23 +95,114 @@ class OpenSearchClient:
         return "connected" if self._connected else "configured"
 
 
-# ── Lakehouse ────────────────────────────────────────────────────────────────
+# ── Lakehouse (Delta Lake + DuckDB via REST API) ────────────────────────────
 
 class LakehouseClient:
+    """Client for the 54Bank Delta Lake lakehouse.
+    Writes data to bronze Delta tables via the lakehouse REST API.
+    Queries execute via DuckDB over the medallion (bronze/silver/gold) layers.
+    Falls back to logging when the lakehouse server is unreachable.
+    """
     def __init__(self):
-        self.endpoint = env_or("LAKEHOUSE_API_URL", "http://lakehouse-query:8000")
+        self.endpoint = env_or("LAKEHOUSE_API_URL", "http://localhost:8020")
         self.dataset = env_or("LAKEHOUSE_DATASET", "54bank_operational_analytics")
         self._connected = False
+        self._session = None
+
+    def _http(self):
+        if self._session is None:
+            import urllib.request
+            self._session = urllib.request
+        return self._session
 
     def publish(self, table: str, records: list[dict]) -> None:
-        print(f"[lakehouse] PUBLISH {self.dataset}.{table} records={len(records)}")
+        """Write records to a bronze Delta Lake table."""
+        import json as _json
+        payload = _json.dumps({
+            "layer": "bronze",
+            "table": table,
+            "records": records,
+        }).encode()
+        try:
+            req = self._http().Request(
+                f"{self.endpoint}/v1/ingest",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self._http().urlopen(req, timeout=10) as resp:
+                result = _json.loads(resp.read())
+                self._connected = True
+                print(f"[lakehouse] INGESTED {len(records)} records → bronze.{table} "
+                      f"(v{result.get('version', '?')}, {result.get('files', '?')} files)")
+        except Exception as e:
+            print(f"[lakehouse] Ingest fallback (server unreachable: {e}): "
+                  f"{self.dataset}.{table} records={len(records)}")
 
     def query(self, sql: str) -> list[dict]:
-        print(f"[lakehouse] QUERY {sql[:100]}")
-        return []
+        """Execute a SQL query via DuckDB on the lakehouse."""
+        import json as _json
+        payload = _json.dumps({"sql": sql, "limit": 10000}).encode()
+        try:
+            req = self._http().Request(
+                f"{self.endpoint}/v1/query",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self._http().urlopen(req, timeout=30) as resp:
+                result = _json.loads(resp.read())
+                self._connected = True
+                columns = result.get("columns", [])
+                rows = result.get("rows", [])
+                return [dict(zip(columns, row)) for row in rows]
+        except Exception as e:
+            print(f"[lakehouse] Query fallback (server unreachable: {e}): {sql[:100]}")
+            return []
+
+    def time_travel(self, layer: str, table: str, version: int) -> list[dict]:
+        """Query a Delta table at a specific historical version."""
+        import json as _json
+        payload = _json.dumps({
+            "layer": layer, "table": table, "version": version,
+        }).encode()
+        try:
+            req = self._http().Request(
+                f"{self.endpoint}/v1/time-travel",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self._http().urlopen(req, timeout=30) as resp:
+                result = _json.loads(resp.read())
+                return result.get("data", [])
+        except Exception:
+            return []
+
+    def publish_cdc(self, topic: str, payload: dict) -> None:
+        """Send a CDC event to the lakehouse streaming pipeline."""
+        import json as _json
+        data = _json.dumps({"topic": topic, "payload": payload}).encode()
+        try:
+            req = self._http().Request(
+                f"{self.endpoint}/v1/cdc/event",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            self._http().urlopen(req, timeout=5)
+        except Exception:
+            pass
 
     def health(self) -> str:
-        return "connected" if self._connected else "configured"
+        try:
+            with self._http().urlopen(f"{self.endpoint}/v1/health", timeout=3) as resp:
+                if resp.status == 200:
+                    self._connected = True
+                    return "connected"
+        except Exception:
+            pass
+        return "configured"
 
 
 # ── Postgres ─────────────────────────────────────────────────────────────────
