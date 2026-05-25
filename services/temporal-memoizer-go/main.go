@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateWorkflowExecution(workflowID, taskQueue string, timeoutSecs int) (bool, string) {
+	if workflowID == "" { return false, "Workflow ID required" }
+	if taskQueue == "" { return false, "Task queue required" }
+	if timeoutSecs > 86400 { return false, "Workflow timeout cannot exceed 24 hours" }
+	return true, "Workflow execution valid"
+}
+func computeRetryBackoff(attempt int, initialDelay float64) float64 {
+	delay := initialDelay
+	for i := 0; i < attempt; i++ { delay *= 2.0 }
+	if delay > 300 { return 300 } // Max 5 minutes
+	return delay
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9443" }

@@ -176,6 +176,29 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Cash Management Agent ─────────────────────────────────
+
+    def optimize_cash_position(self, branch_data):
+        """Optimize cash position across branch network."""
+        branches = branch_data.get("branches", [])
+        results = []
+        for branch in branches:
+            vault = branch.get("vault_balance", 0)
+            daily_avg = branch.get("daily_avg_withdrawal", 0)
+            days_of_cover = vault / daily_avg if daily_avg > 0 else 999
+
+            action = "OK"
+            if days_of_cover < 2: action = "URGENT_REPLENISH"
+            elif days_of_cover < 3: action = "SCHEDULE_REPLENISH"
+            elif days_of_cover > 7: action = "REDUCE_HOLDING"
+
+            results.append({
+                "branch_id": branch.get("id"), "vault_balance": vault,
+                "days_of_cover": round(days_of_cover, 1), "action": action,
+            })
+        return {"branches": results, "total_vault": sum(b.get("vault_balance", 0) for b in branches)}
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

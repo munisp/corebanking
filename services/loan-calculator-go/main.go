@@ -608,6 +608,91 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Loan Calculator ──────────────────────────────────────────
+
+func calculateSimpleInterest(principal, rate float64, years int) float64 {
+	return principal * rate / 100.0 * float64(years)
+}
+
+func calculateCompoundInterest(principal, rate float64, years, compoundsPerYear int) float64 {
+	r := rate / 100.0 / float64(compoundsPerYear)
+	n := float64(compoundsPerYear * years)
+	result := principal
+	for i := 0; i < int(n); i++ { result *= (1 + r) }
+	return result - principal
+}
+
+func calculateReducingBalanceEMI(principal, annualRate float64, months int) float64 {
+	if annualRate == 0 { return principal / float64(months) }
+	r := annualRate / 12.0 / 100.0
+	pow := 1.0
+	for i := 0; i < months; i++ { pow *= (1 + r) }
+	return principal * r * pow / (pow - 1)
+}
+
+func calculateFlatRateEMI(principal, annualRate float64, months int) float64 {
+	totalInterest := principal * annualRate / 100.0 * float64(months) / 12.0
+	return (principal + totalInterest) / float64(months)
+}
+
+func computeAPR(principal, totalPayments float64, months int) float64 {
+	if principal <= 0 || months <= 0 { return 0 }
+	totalInterest := totalPayments - principal
+	return (totalInterest / principal) * (12.0 / float64(months)) * 100.0
+}
+
+func generateAmortizationSchedule(principal, annualRate float64, months int) []map[string]interface{} {
+	emi := calculateReducingBalanceEMI(principal, annualRate, months)
+	monthlyRate := annualRate / 12.0 / 100.0
+	balance := principal
+	schedule := make([]map[string]interface{}, 0, months)
+	for m := 1; m <= months; m++ {
+		interest := balance * monthlyRate
+		principalPart := emi - interest
+		balance -= principalPart
+		if balance < 0.01 { balance = 0 }
+		schedule = append(schedule, map[string]interface{}{
+			"month": m, "emi": float64(int(emi*100)) / 100,
+			"principal": float64(int(principalPart*100)) / 100,
+			"interest": float64(int(interest*100)) / 100,
+			"balance": float64(int(balance*100)) / 100,
+		})
+	}
+	return schedule
+}
+
+func handleCalculate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		Principal   float64 `json:"principal"`
+		Rate        float64 `json:"rate"`
+		Months      int     `json:"months"`
+		Method      string  `json:"method"` // reducing_balance, flat_rate
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.Rate == 0 { body.Rate = 24.0 }
+	if body.Months == 0 { body.Months = 12 }
+
+	var emi float64
+	if body.Method == "flat_rate" {
+		emi = calculateFlatRateEMI(body.Principal, body.Rate, body.Months)
+	} else {
+		emi = calculateReducingBalanceEMI(body.Principal, body.Rate, body.Months)
+	}
+	totalPayment := emi * float64(body.Months)
+	apr := computeAPR(body.Principal, totalPayment, body.Months)
+	schedule := generateAmortizationSchedule(body.Principal, body.Rate, body.Months)
+
+	respondJSON(w, 200, map[string]interface{}{
+		"emi": float64(int(emi*100)) / 100, "total_payment": float64(int(totalPayment*100)) / 100,
+		"total_interest": float64(int((totalPayment-body.Principal)*100)) / 100,
+		"apr": float64(int(apr*100)) / 100, "method": body.Method,
+		"schedule": schedule,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9383" }
@@ -628,6 +713,7 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/loan-calculator/stats", handleStats)
 	mux.HandleFunc("/v1/loan-calculator/compute-emi", loan_calculatorEMIHandler)
 	mux.HandleFunc("/v1/loan-calculator/credit-check", loan_calculatorCreditCheckHandler)
+	mux.HandleFunc("/v1/loans/calculate", handleCalculate)
 	log.Printf("Loan Calculator v2.0 (Lending) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

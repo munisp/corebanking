@@ -601,6 +601,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validatePreparedStatement(query string, paramCount int) (bool, string) {
+	placeholders := 0
+	for _, c := range query { if c == '$' { placeholders++ } }
+	if placeholders != paramCount { return false, fmt.Sprintf("Expected %d params, got %d placeholders", paramCount, placeholders) }
+	return true, "Prepared statement valid"
+}
+func computeCacheSize(avgQuerySize int, maxStatements int) int {
+	return avgQuerySize * maxStatements // bytes
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9413" }

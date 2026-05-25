@@ -78,6 +78,39 @@ def call_service(method, url, data=None):
 
 PORT = int(os.environ.get("PORT", "8080"))
 
+
+# ─── Domain Logic: Financial Vector Search ───────────────────────────────────
+
+def compute_text_embedding(text, dim=128):
+    """Compute simple text embedding for financial documents."""
+    import hashlib
+    h = hashlib.sha256(text.encode()).digest()
+    embedding = [(b / 255.0) * 2 - 1 for b in h]
+    while len(embedding) < dim:
+        h = hashlib.sha256(h).digest()
+        embedding.extend([(b / 255.0) * 2 - 1 for b in h])
+    return embedding[:dim]
+
+def compute_cosine_similarity(vec_a, vec_b):
+    """Compute cosine similarity between two vectors."""
+    dot = sum(a * b for a, b in zip(vec_a, vec_b))
+    mag_a = sum(a * a for a in vec_a) ** 0.5
+    mag_b = sum(b * b for b in vec_b) ** 0.5
+    if mag_a == 0 or mag_b == 0: return 0
+    return dot / (mag_a * mag_b)
+
+def search_similar_documents(query, documents, top_k=5):
+    """Search for similar financial documents using cosine similarity."""
+    query_vec = compute_text_embedding(query)
+    results = []
+    for doc in documents:
+        doc_vec = compute_text_embedding(doc.get("text", ""))
+        score = compute_cosine_similarity(query_vec, doc_vec)
+        results.append({"document": doc, "score": round(score, 4)})
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):

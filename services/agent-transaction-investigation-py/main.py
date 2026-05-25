@@ -176,6 +176,25 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Transaction Investigation Agent ───────────────────────
+
+    def investigate_transaction(self, txn_data):
+        """Investigate suspicious transaction patterns."""
+        flags = []
+        amount = txn_data.get("amount", 0)
+        channel = txn_data.get("channel", "")
+        narration = txn_data.get("narration", "")
+
+        if amount > 10000000: flags.append("LARGE_VALUE: Amount exceeds ₦10M")
+        if amount > 1000000 and channel == "cash": flags.append("CASH_CTR: Cash transaction above ₦1M CTR threshold")
+        suspicious_words = ["loan shark", "bet", "gambl", "crypto"]
+        for word in suspicious_words:
+            if word in narration.lower(): flags.append(f"SUSPICIOUS_NARRATION: Contains '{word}'")
+
+        risk = "LOW" if len(flags) == 0 else "MEDIUM" if len(flags) <= 2 else "HIGH"
+        return {"flags": flags, "risk_level": risk, "requires_sar": risk == "HIGH", "recommendation": "FILE_STR" if risk == "HIGH" else "MONITOR" if risk == "MEDIUM" else "CLEAR"}
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

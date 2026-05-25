@@ -674,6 +674,29 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateKYCCompleteness(documents map[string]bool, tier string) (bool, []string) {
+	required := map[string][]string{
+		"tier1": {"bvn"},
+		"tier2": {"bvn", "nin", "utility_bill"},
+		"tier3": {"bvn", "nin", "utility_bill", "reference_letter"},
+	}
+	missing := []string{}
+	for _, doc := range required[tier] {
+		if !documents[doc] { missing = append(missing, doc) }
+	}
+	return len(missing) == 0, missing
+}
+func computeKYCRiskScore(pepStatus bool, countryRisk string, sourceOfFunds string) float64 {
+	score := 0.0
+	if pepStatus { score += 40 }
+	riskMap := map[string]float64{"high": 30, "medium": 15, "low": 5}
+	score += riskMap[countryRisk]
+	if sourceOfFunds == "unknown" { score += 25 }
+	return score
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {

@@ -651,6 +651,20 @@ func rpcCall(target string, method string, payload map[string]interface{}) (map[
 	return result, nil
 }
 
+
+func validateTradeFinance(lcAmount float64, expiryDays int, incoterm string) (bool, string) {
+	if lcAmount <= 0 { return false, "LC amount must be positive" }
+	if expiryDays < 1 { return false, "LC must have valid expiry" }
+	validTerms := map[string]bool{"FOB": true, "CIF": true, "CFR": true, "EXW": true, "DDP": true}
+	if !validTerms[incoterm] { return false, "Invalid incoterm: " + incoterm }
+	return true, "Trade finance application valid"
+}
+func computeLCFee(amount float64, durationDays int) float64 {
+	annualRate := 0.015 // 1.5% p.a.
+	return amount * annualRate * float64(durationDays) / 365.0
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 

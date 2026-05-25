@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateExpenseClaim(amount float64, category, receiptURL string) (bool, string) {
+	if amount <= 0 { return false, "Amount must be positive" }
+	if category == "" { return false, "Expense category required" }
+	if receiptURL == "" && amount > 5000 { return false, "Receipt required for expenses above ₦5,000" }
+	return true, "Expense claim valid"
+}
+func computeExpenseApprovalLevel(amount float64) string {
+	if amount > 1000000 { return "director" }
+	if amount > 100000 { return "manager" }
+	return "supervisor"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9357" }

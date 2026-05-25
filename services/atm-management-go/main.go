@@ -603,6 +603,24 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateATMTransaction(amount float64, cardType string, dailyWithdrawn float64) (bool, string) {
+	maxWithdrawal := 200000.0 // CBN max ATM daily withdrawal
+	if cardType == "corporate" { maxWithdrawal = 500000.0 }
+	if amount < 500 { return false, "Minimum ATM withdrawal is ₦500" }
+	if amount > 40000 { return false, "Maximum single ATM withdrawal is ₦40,000" }
+	if dailyWithdrawn+amount > maxWithdrawal {
+		return false, fmt.Sprintf("Daily limit exceeded: withdrawn ₦%.0f + ₦%.0f > ₦%.0f", dailyWithdrawn, amount, maxWithdrawal)
+	}
+	if int(amount)%500 != 0 { return false, "Amount must be in multiples of ₦500" }
+	return true, "Transaction approved"
+}
+func computeATMFee(isOnUs bool, amount float64) float64 {
+	if isOnUs { return 0 }
+	return 65
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9317" }

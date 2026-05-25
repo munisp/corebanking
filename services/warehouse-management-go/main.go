@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateWarehouseReceipt(commodityType string, quantity, gradeScore float64) (bool, string) {
+	if quantity <= 0 { return false, "Quantity must be positive" }
+	if gradeScore < 60 { return false, "Commodity grade below minimum threshold (60)" }
+	validCommodities := map[string]bool{"rice": true, "maize": true, "sorghum": true, "cocoa": true, "cashew": true, "sesame": true}
+	if !validCommodities[commodityType] { return false, "Commodity not accepted for warehouse receipt" }
+	return true, "Warehouse receipt valid"
+}
+func computeStorageFee(quantity float64, daysStored int, commodityType string) float64 {
+	ratePerTonPerDay := 150.0 // ₦150/ton/day base rate
+	if commodityType == "cocoa" || commodityType == "cashew" { ratePerTonPerDay = 200.0 }
+	return quantity * ratePerTonPerDay * float64(daysStored)
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9459" }

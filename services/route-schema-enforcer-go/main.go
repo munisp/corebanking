@@ -601,6 +601,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateRouteSchema(method, path string, hasAuth bool) (bool, string) {
+	validMethods := map[string]bool{"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true}
+	if !validMethods[method] { return false, "Invalid HTTP method: " + method }
+	if path == "" || path[0] != '/' { return false, "Path must start with /" }
+	if !hasAuth && method != "GET" { return false, "Write endpoints require authentication" }
+	return true, "Route schema valid"
+}
+func computeRouteWeight(latencyP99 int, errorRate float64) float64 {
+	return float64(latencyP99)*0.4 + errorRate*100*0.6
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9422" }

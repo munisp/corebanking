@@ -1042,6 +1042,20 @@ func rpcCall(target string, method string, payload map[string]interface{}) (map[
 	return result, nil
 }
 
+
+func validateJournalEntry(debitTotal, creditTotal float64) (bool, string) {
+	diff := debitTotal - creditTotal
+	if diff < 0 { diff = -diff }
+	if diff > 0.01 { return false, fmt.Sprintf("Journal entry unbalanced: debit ₦%.2f != credit ₦%.2f", debitTotal, creditTotal) }
+	return true, "Journal entry balanced"
+}
+func computeTrialBalance(entries []map[string]float64) map[string]float64 {
+	totalDebit := 0.0; totalCredit := 0.0
+	for _, e := range entries { totalDebit += e["debit"]; totalCredit += e["credit"] }
+	return map[string]float64{"total_debit": totalDebit, "total_credit": totalCredit, "difference": totalDebit - totalCredit}
+}
+
+
 func main() {
 	app := NewApp()
 

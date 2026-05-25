@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateMakerCheckerApproval(makerID, checkerID string, amount float64) (bool, string) {
+	if makerID == checkerID { return false, "Maker and checker must be different users" }
+	if amount > 50000000 { return false, "Amounts > ₦50M require dual checker approval" }
+	return true, "Approval valid"
+}
+func computeApprovalTier(amount float64) int {
+	if amount > 100000000 { return 3 } // Board level
+	if amount > 50000000 { return 2 }  // Senior management
+	if amount > 10000000 { return 1 }  // Branch manager
+	return 0 // Supervisor
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9386" }

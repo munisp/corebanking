@@ -524,6 +524,17 @@ func sanitizeInput(s string) string {
 	return s
 }
 
+
+func validateEsusuContribution(amount, expectedAmount float64, memberPosition int, totalMembers int) (bool, string) {
+	if amount != expectedAmount { return false, fmt.Sprintf("Contribution must be ₦%.0f", expectedAmount) }
+	if memberPosition < 1 || memberPosition > totalMembers { return false, "Invalid member position" }
+	return true, "Contribution valid"
+}
+func computeEsusuPayout(contributionAmount float64, totalMembers int) float64 {
+	return contributionAmount * float64(totalMembers)
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }

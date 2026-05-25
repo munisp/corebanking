@@ -602,6 +602,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validatePKCEChallenge(codeVerifier string, method string) (bool, string) {
+	if len(codeVerifier) < 43 { return false, "Code verifier must be at least 43 characters" }
+	if len(codeVerifier) > 128 { return false, "Code verifier must not exceed 128 characters" }
+	if method != "S256" && method != "plain" { return false, "Challenge method must be S256 or plain" }
+	if method == "plain" { return false, "Plain method not recommended — use S256" }
+	return true, "PKCE challenge valid"
+}
+func validateAuthorizationCode(code string, expirySeconds int) (bool, string) {
+	if len(code) < 20 { return false, "Authorization code too short" }
+	if expirySeconds > 600 { return false, "Authorization code validity cannot exceed 10 minutes" }
+	return true, "Authorization code valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9408" }

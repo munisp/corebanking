@@ -602,6 +602,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateMFASetup(method string, secretLength int) (bool, string) {
+	validMethods := map[string]bool{"totp": true, "sms": true, "email": true, "hardware_key": true, "biometric": true}
+	if !validMethods[method] { return false, "Unsupported MFA method: " + method }
+	if method == "totp" && secretLength < 16 { return false, "TOTP secret must be at least 16 bytes" }
+	return true, "MFA setup valid"
+}
+func computeMFAScore(methods []string) float64 {
+	scores := map[string]float64{"hardware_key": 40, "biometric": 35, "totp": 25, "sms": 15, "email": 10}
+	total := 0.0
+	for _, m := range methods { total += scores[m] }
+	if total > 100 { return 100 }
+	return total
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9389" }

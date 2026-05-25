@@ -602,6 +602,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateSMSGateway(phoneNumber, message string) (bool, string) {
+	if len(phoneNumber) < 10 { return false, "Invalid phone number" }
+	if len(message) > 160 { return false, "SMS exceeds 160 character limit" }
+	if len(message) == 0 { return false, "Message body required" }
+	return true, "SMS valid for delivery"
+}
+func computeSMSCost(messageCount int, isFlash bool) float64 {
+	rate := 4.0 // ₦4 per SMS
+	if isFlash { rate = 6.0 }
+	return float64(messageCount) * rate
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9431" }

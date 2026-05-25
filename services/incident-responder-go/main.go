@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func assessIncidentSeverity(affectedUsers int, isDataBreach bool, serviceDown bool) string {
+	if isDataBreach { return "SEV1" }
+	if serviceDown && affectedUsers > 1000 { return "SEV1" }
+	if serviceDown { return "SEV2" }
+	if affectedUsers > 100 { return "SEV3" }
+	return "SEV4"
+}
+func computeEscalationTime(severity string) int {
+	times := map[string]int{"SEV1": 5, "SEV2": 15, "SEV3": 60, "SEV4": 240}
+	return times[severity] // minutes
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9372" }

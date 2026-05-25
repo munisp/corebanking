@@ -709,6 +709,20 @@ func getTLSConfig() (bool, string, string) {
 
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
+
+func validateCypherQuery(query string) (bool, string) {
+	upper := strings.ToUpper(query)
+	dangerous := []string{"DROP", "DELETE ALL", "DETACH DELETE"}
+	for _, d := range dangerous { if strings.Contains(upper, d) { return false, "Destructive query not allowed: " + d } }
+	return true, "Cypher query valid"
+}
+func computeGraphMetrics(nodeCount, edgeCount int) map[string]float64 {
+	density := 0.0
+	if nodeCount > 1 { density = float64(edgeCount) / float64(nodeCount*(nodeCount-1)) }
+	return map[string]float64{"density": density, "avg_degree": float64(edgeCount*2) / float64(nodeCount)}
+}
+
+
 func main() {
 	initDB()
 	graph.SeedCOA()

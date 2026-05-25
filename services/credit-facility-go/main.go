@@ -608,6 +608,75 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Credit Facility ──────────────────────────────────────────
+
+type FacilityLimit struct {
+	Type          string  `json:"type"`
+	Limit         float64 `json:"limit"`
+	Utilized      float64 `json:"utilized"`
+	Available     float64 `json:"available"`
+	UtilizationPct float64 `json:"utilization_pct"`
+}
+
+func calculateFacilityUtilization(limit, utilized float64) FacilityLimit {
+	available := limit - utilized
+	if available < 0 { available = 0 }
+	pct := 0.0
+	if limit > 0 { pct = (utilized / limit) * 100.0 }
+	return FacilityLimit{Limit: limit, Utilized: utilized, Available: available, UtilizationPct: pct}
+}
+
+func validateDrawdown(facilityLimit, currentUtilized, drawdownAmount float64) (bool, string) {
+	if drawdownAmount <= 0 { return false, "Drawdown amount must be positive" }
+	if drawdownAmount > (facilityLimit - currentUtilized) {
+		return false, fmt.Sprintf("Drawdown ₦%.2f exceeds available limit ₦%.2f", drawdownAmount, facilityLimit-currentUtilized)
+	}
+	if drawdownAmount < 100000 { return false, "Minimum drawdown is ₦100,000" }
+	return true, "Approved"
+}
+
+func computeFacilityFee(facilityType string, limit float64) map[string]float64 {
+	fees := map[string]float64{}
+	switch facilityType {
+	case "revolving":
+		fees["commitment_fee"] = limit * 0.01
+		fees["management_fee"] = limit * 0.005
+		fees["facility_fee"] = limit * 0.015
+	case "term":
+		fees["arrangement_fee"] = limit * 0.02
+		fees["legal_fee"] = 500000
+		fees["facility_fee"] = limit * 0.01
+	case "overdraft":
+		fees["od_facility_fee"] = limit * 0.0125
+		fees["cot_monthly"] = 25000
+	default:
+		fees["processing_fee"] = limit * 0.01
+	}
+	total := 0.0
+	for _, v := range fees { total += v }
+	fees["total"] = total
+	return fees
+}
+
+func handleFacilityEvaluate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		Type     string  `json:"type"`
+		Limit    float64 `json:"limit"`
+		Utilized float64 `json:"utilized"`
+		Drawdown float64 `json:"drawdown_amount"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	util := calculateFacilityUtilization(body.Limit, body.Utilized)
+	ok, reason := validateDrawdown(body.Limit, body.Utilized, body.Drawdown)
+	fees := computeFacilityFee(body.Type, body.Limit)
+	respondJSON(w, 200, map[string]interface{}{
+		"utilization": util, "drawdown_approved": ok, "drawdown_reason": reason, "fees": fees,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9338" }
@@ -628,6 +697,7 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/credit-facility/stats", handleStats)
 	mux.HandleFunc("/v1/credit-facility/compute-emi", credit_facilityEMIHandler)
 	mux.HandleFunc("/v1/credit-facility/credit-check", credit_facilityCreditCheckHandler)
+	mux.HandleFunc("/v1/facilities/evaluate", handleFacilityEvaluate)
 	log.Printf("Credit Facility v2.0 (Lending) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

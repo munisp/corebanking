@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateContainerImage(imageName, tag string) (bool, string) {
+	if imageName == "" { return false, "Image name required" }
+	if tag == "latest" { return false, "Tag 'latest' not allowed in production" }
+	if tag == "" { return false, "Image tag required" }
+	return true, "Container image valid"
+}
+func computeImageScanPriority(age int, vulnCount int) string {
+	if vulnCount > 10 || age > 90 { return "critical" }
+	if vulnCount > 5 || age > 30 { return "high" }
+	return "normal"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9371" }

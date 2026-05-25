@@ -601,6 +601,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeCacheHitRate(hits, misses int) float64 {
+	total := hits + misses
+	if total == 0 { return 0 }
+	return float64(hits) / float64(total) * 100.0
+}
+func validateCachePolicy(maxAge int, staleWhileRevalidate int) (bool, string) {
+	if maxAge < 0 { return false, "max-age must be non-negative" }
+	if maxAge > 31536000 { return false, "max-age cannot exceed 1 year" }
+	return true, "Cache policy valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9332" }

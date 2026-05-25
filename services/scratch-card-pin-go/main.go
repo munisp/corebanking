@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateCardTransaction(amount float64, cardStatus, txnType string, posEntryMode string) (bool, string) {
+	if cardStatus != "active" { return false, "Card is not active: " + cardStatus }
+	if amount <= 0 { return false, "Amount must be positive" }
+	if txnType == "pos" && amount > 5000000 { return false, "POS limit is ₦5M per transaction" }
+	if txnType == "web" && amount > 2000000 { return false, "Web limit is ₦2M per transaction" }
+	return true, "Transaction approved"
+}
+func computeCardFee(txnType string, amount float64, isForeign bool) float64 {
+	fee := 0.0
+	if txnType == "pos" { fee = amount * 0.005 } // 0.5% POS fee
+	if isForeign { fee += amount * 0.035 } // 3.5% forex markup
+	return fee
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9427" }

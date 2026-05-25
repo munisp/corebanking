@@ -603,6 +603,17 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateCIF(cifNumber string) (bool, string) {
+	if len(cifNumber) != 10 { return false, "CIF number must be 10 digits" }
+	for _, c := range cifNumber { if c < '0' || c > '9' { return false, "CIF must contain only digits" } }
+	return true, "CIF valid"
+}
+func computeRelationshipValue(totalBalances, loanOutstanding, feeIncome float64) float64 {
+	return totalBalances*0.1 + feeIncome*12 - loanOutstanding*0.02
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9333" }

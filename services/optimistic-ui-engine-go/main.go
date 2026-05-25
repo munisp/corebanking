@@ -603,6 +603,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateOptimisticUpdate(clientVersion, serverVersion int) (bool, string) {
+	if clientVersion < serverVersion { return false, "Stale data: client version behind server" }
+	return true, "Optimistic update valid"
+}
+func computeRollbackStrategy(conflictCount int) string {
+	if conflictCount > 5 { return "full_refetch" }
+	if conflictCount > 2 { return "partial_merge" }
+	return "auto_resolve"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9402" }

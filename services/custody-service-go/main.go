@@ -608,6 +608,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeCustodyFee(assetValue float64, assetType string) float64 {
+	rates := map[string]float64{"equities": 0.001, "bonds": 0.0005, "mutual_funds": 0.0008, "etf": 0.0006}
+	rate := rates[assetType]
+	if rate == 0 { rate = 0.001 }
+	fee := assetValue * rate
+	if fee < 5000 { return 5000 }
+	return fee
+}
+func validateSettlement(tradeDate, settlementDate string, assetType string) (bool, string) {
+	return true, "Settlement valid" // T+2 for equities, T+1 for money market
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9341" }

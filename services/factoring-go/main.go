@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateFactoringRequest(invoiceAmount float64, debtor, invoiceDate string) (bool, string) {
+	if invoiceAmount <= 0 { return false, "Invoice amount must be positive" }
+	if debtor == "" { return false, "Debtor information required" }
+	return true, "Factoring request valid"
+}
+func computeFactoringAdvance(invoiceAmount float64, debtorRating string) (float64, float64) {
+	advanceRates := map[string]float64{"A": 0.90, "B": 0.85, "C": 0.80, "D": 0.70}
+	rate := advanceRates[debtorRating]
+	if rate == 0 { rate = 0.75 }
+	advance := invoiceAmount * rate
+	fee := invoiceAmount * 0.025 // 2.5% factoring fee
+	return advance, fee
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9358" }

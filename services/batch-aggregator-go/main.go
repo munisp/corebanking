@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateBatchSize(batchSize int, maxAllowed int) (bool, string) {
+	if batchSize < 1 { return false, "Batch size must be >= 1" }
+	if batchSize > maxAllowed { return false, fmt.Sprintf("Batch size %d exceeds max %d", batchSize, maxAllowed) }
+	return true, "Batch size valid"
+}
+func computeOptimalBatchSize(totalItems, workerCount int) int {
+	if workerCount == 0 { return totalItems }
+	size := totalItems / workerCount
+	if size < 1 { return 1 }
+	if size > 1000 { return 1000 }
+	return size
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9320" }

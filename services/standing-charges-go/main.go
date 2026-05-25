@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateStandingOrder(amount float64, frequency string, startDate string) (bool, string) {
+	if amount <= 0 { return false, "Amount must be positive" }
+	if amount < 100 { return false, "Minimum standing order amount is ₦100" }
+	validFreqs := map[string]bool{"daily": true, "weekly": true, "monthly": true, "quarterly": true}
+	if !validFreqs[frequency] { return false, "Invalid frequency: "+frequency }
+	return true, "Standing order valid"
+}
+func computeStandingOrderFee(frequency string) float64 {
+	fees := map[string]float64{"daily": 25, "weekly": 50, "monthly": 100, "quarterly": 100}
+	return fees[frequency]
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9434" }

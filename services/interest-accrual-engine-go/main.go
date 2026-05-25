@@ -539,6 +539,62 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Interest Accrual Engine ──────────────────────────────────
+
+func computeDailyAccrual(principal, annualRate float64, dayCountBasis string) float64 {
+	daysInYear := 365.0
+	if dayCountBasis == "act/360" || dayCountBasis == "30/360" { daysInYear = 360.0 }
+	return principal * (annualRate / 100.0) / daysInYear
+}
+
+func computeAccrualForPeriod(principal, annualRate float64, startDay, endDay int, basis string) float64 {
+	days := endDay - startDay
+	if days <= 0 { return 0 }
+	daysInYear := 365.0
+	if basis == "act/360" || basis == "30/360" { daysInYear = 360.0 }
+	return principal * (annualRate / 100.0) * float64(days) / daysInYear
+}
+
+func validateAccrualPosting(accrualAmount float64, glAccountCode string) (bool, string) {
+	if accrualAmount <= 0 { return false, "Accrual amount must be positive" }
+	if glAccountCode == "" { return false, "GL account code required" }
+	return true, "Valid for posting"
+}
+
+func handleAccrualCompute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		Accounts []struct {
+			AccountID string  `json:"account_id"`
+			Principal float64 `json:"principal"`
+			Rate      float64 `json:"rate"`
+			Basis     string  `json:"day_count_basis"`
+		} `json:"accounts"`
+		Days int `json:"days"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.Days == 0 { body.Days = 1 }
+
+	results := []map[string]interface{}{}
+	totalAccrual := 0.0
+	for _, acc := range body.Accounts {
+		if acc.Basis == "" { acc.Basis = "act/365" }
+		daily := computeDailyAccrual(acc.Principal, acc.Rate, acc.Basis)
+		period := daily * float64(body.Days)
+		totalAccrual += period
+		results = append(results, map[string]interface{}{
+			"account_id": acc.AccountID, "daily_accrual": float64(int(daily*100)) / 100,
+			"period_accrual": float64(int(period*100)) / 100, "days": body.Days,
+		})
+	}
+	respondJSON(w, 200, map[string]interface{}{
+		"accruals": results, "total_accrual": float64(int(totalAccrual*100)) / 100,
+		"period_days": body.Days,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8093" }
@@ -552,6 +608,7 @@ mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", healthz)
 	mux.HandleFunc("/v1/interest/accrue", runAccrualBatch)
+	mux.HandleFunc("/v1/accrual/compute", handleAccrualCompute)
 	log.Printf("Interest Accrual Engine (Go) listening on :%s — 14 middleware connected", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

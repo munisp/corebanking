@@ -591,6 +591,24 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func aggregateBureauScores(scores map[string]int) (int, string) {
+	total := 0; count := 0
+	for _, s := range scores { total += s; count++ }
+	if count == 0 { return 0, "No bureau data" }
+	avg := total / count
+	grade := "E"
+	switch { case avg >= 750: grade = "A"; case avg >= 650: grade = "B"; case avg >= 550: grade = "C"; case avg >= 450: grade = "D" }
+	return avg, grade
+}
+func validateBureauReport(bureauName string, reportAge int) (bool, string) {
+	if reportAge > 90 { return false, "Bureau report older than 90 days — request fresh report" }
+	validBureaus := map[string]bool{"CRC": true, "FirstCentral": true, "CreditRegistry": true}
+	if !validBureaus[bureauName] { return false, "Unknown credit bureau: " + bureauName }
+	return true, "Bureau report valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {

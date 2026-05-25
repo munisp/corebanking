@@ -176,6 +176,28 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Regulatory Returns Agent ──────────────────────────────
+
+    def validate_regulatory_return(self, return_data):
+        """Validate CBN regulatory return data completeness."""
+        report_type = return_data.get("report_type", "")
+        period = return_data.get("period", "")
+        data_fields = return_data.get("data_fields", {})
+
+        required_fields = {
+            "MBR": ["total_assets", "total_liabilities", "capital_adequacy_ratio", "liquidity_ratio", "npl_ratio"],
+            "QBR": ["total_assets", "total_deposits", "total_loans", "profit_before_tax", "car", "npl_ratio"],
+            "EFASS": ["balance_sheet", "income_statement", "cash_flow", "notes", "off_balance_sheet"],
+            "NFIU_CTR": ["transaction_count", "total_amount", "customer_count"],
+        }
+        required = required_fields.get(report_type, [])
+        missing = [f for f in required if f not in data_fields]
+        return {
+            "valid": len(missing) == 0, "report_type": report_type, "period": period,
+            "missing_fields": missing, "completeness": round((1 - len(missing) / max(len(required), 1)) * 100, 1),
+        }
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

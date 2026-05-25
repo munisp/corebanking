@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeFixedDepositMaturity(principal, annualRate float64, tenorDays int) float64 {
+	interest := principal * annualRate / 100 * float64(tenorDays) / 365
+	wht := interest * 0.1 // 10% WHT on interest
+	return principal + interest - wht
+}
+func validateSavingsProduct(productType string, minBalance float64) (bool, string) {
+	if minBalance < 0 { return false, "Minimum balance cannot be negative" }
+	validTypes := map[string]bool{"regular_savings": true, "fixed_deposit": true, "target_savings": true, "kids_savings": true}
+	if !validTypes[productType] { return false, "Invalid savings product type" }
+	return true, "Savings product valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9426" }

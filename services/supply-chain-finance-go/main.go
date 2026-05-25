@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateSupplyChainInvoice(invoiceAmount, orderAmount float64, deliveryComplete bool) (bool, string) {
+	if invoiceAmount > orderAmount*1.1 { return false, "Invoice exceeds order amount by more than 10%" }
+	if !deliveryComplete { return false, "Delivery must be confirmed before invoice payment" }
+	return true, "Supply chain invoice valid"
+}
+func computeEarlyPaymentDiscount(invoiceAmount float64, daysEarly int) float64 {
+	if daysEarly <= 0 { return 0 }
+	rate := float64(daysEarly) * 0.001 // 0.1% per day early
+	if rate > 0.03 { rate = 0.03 } // Cap at 3%
+	return invoiceAmount * rate
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9437" }

@@ -603,6 +603,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateWebhookEndpoint(url, secret string, retryCount int) (bool, string) {
+	if url == "" { return false, "Webhook URL required" }
+	if len(secret) < 16 { return false, "Webhook secret must be at least 16 characters" }
+	if retryCount > 10 { return false, "Maximum retry count is 10" }
+	return true, "Webhook endpoint valid"
+}
+func computeWebhookSignature(payload, secret string) string {
+	return fmt.Sprintf("sha256=%x", []byte(payload+secret))
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9460" }

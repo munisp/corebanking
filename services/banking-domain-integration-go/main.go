@@ -667,6 +667,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateBankingOperation(operationType, accountType string, amount float64) (bool, string) {
+	if amount < 0 { return false, "Amount cannot be negative" }
+	validOps := map[string]bool{"deposit": true, "withdrawal": true, "transfer": true, "reversal": true, "adjustment": true}
+	if !validOps[operationType] { return false, "Invalid operation type" }
+	return true, "Banking operation valid"
+}
+func computeTransactionReference() string {
+	return fmt.Sprintf("54BNK%d%08X", time.Now().UnixNano()/1000000, rand.Uint32())
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8096" }

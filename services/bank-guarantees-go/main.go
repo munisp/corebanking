@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateBankGuarantee(guaranteeType string, amount float64, expiryDays int) (bool, string) {
+	validTypes := map[string]bool{"bid_bond": true, "performance": true, "advance_payment": true, "customs": true, "shipping": true}
+	if !validTypes[guaranteeType] { return false, "Invalid guarantee type" }
+	if amount <= 0 { return false, "Guarantee amount must be positive" }
+	if expiryDays < 30 { return false, "Minimum guarantee period is 30 days" }
+	return true, "Bank guarantee valid"
+}
+func computeGuaranteeFee(amount float64, durationMonths int, riskRating string) float64 {
+	baseRate := 0.015 // 1.5% p.a.
+	if riskRating == "high" { baseRate = 0.025 }
+	return amount * baseRate * float64(durationMonths) / 12
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9319" }

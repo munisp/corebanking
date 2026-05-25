@@ -603,6 +603,60 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Interest Rate Engine ─────────────────────────────────────
+
+func computeEffectiveRate(nominalRate float64, compoundingFreq int) float64 {
+	r := nominalRate / 100.0 / float64(compoundingFreq)
+	effective := 1.0
+	for i := 0; i < compoundingFreq; i++ { effective *= (1 + r) }
+	return (effective - 1) * 100.0
+}
+
+func computeRiskPremium(baseRate float64, creditRating string) float64 {
+	premiums := map[string]float64{"AAA": 0.5, "AA": 1.0, "A": 1.5, "BBB": 2.5, "BB": 4.0, "B": 6.0, "CCC": 8.0, "D": 12.0}
+	premium, ok := premiums[creditRating]
+	if !ok { premium = 5.0 }
+	return baseRate + premium
+}
+
+func computeInterestAccrual(principal, annualRate float64, days int, basis string) float64 {
+	var daysInYear float64
+	switch basis {
+	case "act/365": daysInYear = 365
+	case "act/360": daysInYear = 360
+	case "30/360": daysInYear = 360
+	default: daysInYear = 365
+	}
+	return principal * (annualRate / 100.0) * float64(days) / daysInYear
+}
+
+func handleRateCompute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		NominalRate    float64 `json:"nominal_rate"`
+		Compounding    int     `json:"compounding_frequency"`
+		CreditRating   string  `json:"credit_rating"`
+		Principal      float64 `json:"principal"`
+		Days           int     `json:"days"`
+		DayCountBasis  string  `json:"day_count_basis"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.Compounding == 0 { body.Compounding = 12 }
+	if body.DayCountBasis == "" { body.DayCountBasis = "act/365" }
+
+	effectiveRate := computeEffectiveRate(body.NominalRate, body.Compounding)
+	riskAdjusted := computeRiskPremium(body.NominalRate, body.CreditRating)
+	accrual := computeInterestAccrual(body.Principal, body.NominalRate, body.Days, body.DayCountBasis)
+
+	respondJSON(w, 200, map[string]interface{}{
+		"nominal_rate": body.NominalRate, "effective_rate": float64(int(effectiveRate*1000)) / 1000,
+		"risk_adjusted_rate": riskAdjusted, "accrued_interest": float64(int(accrual*100)) / 100,
+		"day_count_basis": body.DayCountBasis, "mpn_rate": body.NominalRate + 3.0,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9373" }
@@ -623,6 +677,7 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/interest-rate-engine/stats", handleStats)
 	mux.HandleFunc("/v1/interest-rate-engine/score", interest_rate_engineScoreHandler)
 	mux.HandleFunc("/v1/interest-rate-engine/validate", interest_rate_engineValidateRequestHandler)
+	mux.HandleFunc("/v1/rates/compute", handleRateCompute)
 	log.Printf("Interest Rate Engine v2.0 (Lending) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

@@ -176,6 +176,31 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Reconciliation Agent ──────────────────────────────────
+
+    def reconcile_transactions(self, internal_txns, external_txns):
+        """Auto-reconcile transactions between internal ledger and external source."""
+        matched = []
+        unmatched_internal = list(internal_txns)
+        unmatched_external = list(external_txns)
+
+        for i_txn in internal_txns:
+            for e_txn in external_txns:
+                if (abs(i_txn.get("amount", 0) - e_txn.get("amount", 0)) < 0.01 and
+                    i_txn.get("reference") == e_txn.get("reference")):
+                    matched.append({"internal": i_txn, "external": e_txn, "status": "matched"})
+                    if i_txn in unmatched_internal: unmatched_internal.remove(i_txn)
+                    if e_txn in unmatched_external: unmatched_external.remove(e_txn)
+                    break
+
+        return {
+            "matched": len(matched), "unmatched_internal": len(unmatched_internal),
+            "unmatched_external": len(unmatched_external),
+            "reconciliation_rate": round(len(matched) / max(len(internal_txns), 1) * 100, 1),
+            "suspense_items": unmatched_internal[:10],
+        }
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

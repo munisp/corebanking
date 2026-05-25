@@ -603,6 +603,25 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateAPIRegistration(appName, redirectURI string, scopes []string) (bool, string) {
+	if appName == "" { return false, "Application name required" }
+	if redirectURI == "" { return false, "Redirect URI required" }
+	if len(scopes) == 0 { return false, "At least one scope required" }
+	return true, "API registration valid"
+}
+func computeRateLimitTier(plan string) map[string]int {
+	tiers := map[string]map[string]int{
+		"free":       {"rpm": 60, "rpd": 1000},
+		"basic":      {"rpm": 300, "rpd": 10000},
+		"pro":        {"rpm": 1000, "rpd": 100000},
+		"enterprise": {"rpm": 5000, "rpd": 1000000},
+	}
+	if t, ok := tiers[plan]; ok { return t }
+	return tiers["free"]
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9349" }

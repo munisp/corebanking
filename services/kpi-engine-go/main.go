@@ -1064,6 +1064,18 @@ func jwtMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func calculateKPIScore(actual, target float64) float64 {
+	if target == 0 { return 0 }
+	return (actual / target) * 100.0
+}
+func computePerformanceRating(scores []float64) string {
+	if len(scores) == 0 { return "N/A" }
+	avg := 0.0; for _, s := range scores { avg += s }; avg /= float64(len(scores))
+	switch { case avg >= 95: return "Exceptional"; case avg >= 80: return "Exceeds Expectations"; case avg >= 60: return "Meets Expectations"; case avg >= 40: return "Needs Improvement"; default: return "Unsatisfactory" }
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {

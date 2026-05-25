@@ -603,6 +603,82 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Salary Processing ────────────────────────────────────────
+
+type SalaryItem struct {
+	EmployeeID string  `json:"employee_id"`
+	BasicSalary float64 `json:"basic_salary"`
+	Allowances  float64 `json:"allowances"`
+	Deductions  float64 `json:"deductions"`
+	TaxRate     float64 `json:"tax_rate"`
+}
+
+func computePayeTax(annualGross float64) float64 {
+	// Nigeria PAYE tax bands (2024)
+	remaining := annualGross
+	tax := 0.0
+	bands := []struct{ limit, rate float64 }{
+		{300000, 0.07}, {300000, 0.11}, {500000, 0.15},
+		{500000, 0.19}, {1600000, 0.21}, {remaining, 0.24},
+	}
+	for _, band := range bands {
+		if remaining <= 0 { break }
+		taxable := remaining
+		if taxable > band.limit { taxable = band.limit }
+		tax += taxable * band.rate
+		remaining -= taxable
+	}
+	return tax
+}
+
+func computeNetSalary(basic, allowances, deductions float64) map[string]float64 {
+	grossMonthly := basic + allowances
+	annualGross := grossMonthly * 12
+	annualTax := computePayeTax(annualGross)
+	monthlyTax := annualTax / 12
+
+	pension := grossMonthly * 0.08 // Employee pension 8%
+	nhf := grossMonthly * 0.025    // NHF 2.5%
+	nhis := grossMonthly * 0.05    // NHIS 5%
+
+	totalDeductions := deductions + monthlyTax + pension + nhf + nhis
+	netPay := grossMonthly - totalDeductions
+
+	return map[string]float64{
+		"basic_salary": basic, "allowances": allowances, "gross_pay": grossMonthly,
+		"paye_tax": float64(int(monthlyTax*100)) / 100,
+		"pension": float64(int(pension*100)) / 100,
+		"nhf": float64(int(nhf*100)) / 100,
+		"nhis": float64(int(nhis*100)) / 100,
+		"other_deductions": deductions,
+		"total_deductions": float64(int(totalDeductions*100)) / 100,
+		"net_pay": float64(int(netPay*100)) / 100,
+	}
+}
+
+func handleSalaryCompute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		Employees []SalaryItem `json:"employees"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	results := []map[string]interface{}{}
+	totalNet := 0.0
+	for _, emp := range body.Employees {
+		breakdown := computeNetSalary(emp.BasicSalary, emp.Allowances, emp.Deductions)
+		totalNet += breakdown["net_pay"]
+		results = append(results, map[string]interface{}{
+			"employee_id": emp.EmployeeID, "breakdown": breakdown,
+		})
+	}
+	respondJSON(w, 200, map[string]interface{}{
+		"payroll": results, "total_net_payout": float64(int(totalNet*100)) / 100,
+		"employee_count": len(body.Employees),
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9424" }
@@ -623,6 +699,7 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/salary-processing/stats", handleStats)
 	mux.HandleFunc("/v1/salary-processing/score", salary_processingScoreHandler)
 	mux.HandleFunc("/v1/salary-processing/validate", salary_processingValidateRequestHandler)
+	mux.HandleFunc("/v1/salary/compute", handleSalaryCompute)
 	log.Printf("Salary Processing v2.0 (Payments) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

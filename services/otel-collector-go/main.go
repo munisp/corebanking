@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateTraceContext(traceID, spanID string) (bool, string) {
+	if len(traceID) != 32 { return false, "Trace ID must be 32 hex characters" }
+	if len(spanID) != 16 { return false, "Span ID must be 16 hex characters" }
+	return true, "Trace context valid"
+}
+func computeSamplingRate(errorRate float64, requestsPerSecond int) float64 {
+	if errorRate > 0.05 { return 1.0 } // Sample everything when error rate > 5%
+	if requestsPerSecond > 10000 { return 0.01 }
+	if requestsPerSecond > 1000 { return 0.1 }
+	return 1.0
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9403" }

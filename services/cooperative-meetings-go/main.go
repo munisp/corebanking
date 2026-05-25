@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateCooperativeMembership(memberAge int, sharesSubscribed float64, minShareValue float64) (bool, string) {
+	if memberAge < 18 { return false, "Must be 18+ to join cooperative" }
+	if sharesSubscribed < minShareValue { return false, fmt.Sprintf("Minimum share subscription is ₦%.0f", minShareValue) }
+	return true, "Membership approved"
+}
+func computeDividendDistribution(totalProfit, reservePct float64, members []float64) []float64 {
+	distributable := totalProfit * (1 - reservePct/100)
+	totalShares := 0.0
+	for _, s := range members { totalShares += s }
+	dividends := make([]float64, len(members))
+	for i, s := range members { dividends[i] = distributable * s / totalShares }
+	return dividends
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9335" }

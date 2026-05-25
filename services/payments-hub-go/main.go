@@ -631,6 +631,88 @@ func rpcCall(target string, method string, payload map[string]interface{}) (map[
 	return result, nil
 }
 
+
+// ─── Domain Logic: Payments Hub ─────────────────────────────────────────────
+
+type PaymentRequest struct {
+	SourceAccount string  `json:"source_account"`
+	DestAccount   string  `json:"dest_account"`
+	Amount        float64 `json:"amount"`
+	Currency      string  `json:"currency"`
+	Channel       string  `json:"channel"` // NIP, RTGS, internal, SWIFT
+	Narration     string  `json:"narration"`
+	BenefBank     string  `json:"beneficiary_bank"`
+}
+
+type PaymentValidation struct {
+	Valid      bool     `json:"valid"`
+	Fee       float64  `json:"fee"`
+	Route     string   `json:"route"`
+	EstTime   string   `json:"estimated_time"`
+	Errors    []string `json:"errors"`
+}
+
+func computeTransferFee(amount float64, channel string) float64 {
+	switch channel {
+	case "NIP":
+		if amount <= 5000 { return 10 }
+		if amount <= 50000 { return 25 }
+		return 50
+	case "RTGS":
+		return 500
+	case "SWIFT":
+		if amount <= 100000 { return 5000 }
+		return 10000
+	case "internal":
+		return 0
+	default:
+		return 50
+	}
+}
+
+func validatePaymentRoute(channel string, amount float64, currency string) (string, string) {
+	switch channel {
+	case "NIP":
+		if amount > 10000000 { return "RTGS", "Amount exceeds NIP limit ₦10M, routed to RTGS" }
+		return "NIP", "5 seconds"
+	case "RTGS":
+		if amount < 10000000 { return "NIP", "Below RTGS threshold, routed to NIP" }
+		return "RTGS", "30 minutes"
+	case "SWIFT":
+		return "SWIFT", "1-3 business days"
+	case "internal":
+		return "INTERNAL", "instant"
+	default:
+		if amount > 10000000 { return "RTGS", "30 minutes" }
+		return "NIP", "5 seconds"
+	}
+}
+
+func validatePaymentLimits(amount float64, channel string) []string {
+	var errors []string
+	if amount <= 0 { errors = append(errors, "Amount must be positive") }
+	if amount > 1000000000 { errors = append(errors, "Amount exceeds ₦1B single transaction limit") }
+	if channel == "NIP" && amount > 10000000 { errors = append(errors, "NIP limit is ₦10M per transaction") }
+	return errors
+}
+
+func handlePaymentValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var req PaymentRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	if req.Currency == "" { req.Currency = "NGN" }
+	if req.Channel == "" { req.Channel = "NIP" }
+
+	errors := validatePaymentLimits(req.Amount, req.Channel)
+	route, estTime := validatePaymentRoute(req.Channel, req.Amount, req.Currency)
+	fee := computeTransferFee(req.Amount, route)
+
+	respondJSON(w, 200, PaymentValidation{
+		Valid: len(errors) == 0, Fee: fee, Route: route, EstTime: estTime, Errors: errors,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 
@@ -652,6 +734,7 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/payments/route", routeHandler)
 	mux.HandleFunc("/v1/payments/validate", validatePaymentHandler)
 	mux.HandleFunc("/v1/payments/nip-transfer", nipTransferHandler)
+	mux.HandleFunc("/v1/payments/validate", handlePaymentValidate)
 
 	log.Printf("payments-hub-go listening on port %s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()

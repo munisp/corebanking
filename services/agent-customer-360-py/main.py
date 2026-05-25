@@ -176,6 +176,26 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Customer 360 Agent ────────────────────────────────────
+
+    def compute_customer_value(self, customer_data):
+        """Compute customer lifetime value and relationship score."""
+        balances = customer_data.get("total_balances", 0)
+        loan_outstanding = customer_data.get("loan_outstanding", 0)
+        monthly_fees = customer_data.get("monthly_fee_income", 0)
+        tenure_months = customer_data.get("tenure_months", 0)
+        products = customer_data.get("product_count", 1)
+
+        ltv = monthly_fees * 12 * 5  # 5-year projected income
+        relationship_score = min(100, (tenure_months / 12 * 10) + (products * 15) + (balances / 1000000 * 5))
+        segment = "PLATINUM" if relationship_score > 80 else "GOLD" if relationship_score > 60 else "SILVER" if relationship_score > 40 else "BRONZE"
+        return {
+            "ltv": round(ltv, 2), "relationship_score": round(relationship_score, 1),
+            "segment": segment, "product_count": products,
+            "cross_sell_opportunity": 6 - products if products < 6 else 0,
+        }
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

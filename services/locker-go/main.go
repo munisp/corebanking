@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateLockAcquisition(resourceID string, ttlSeconds int, ownerID string) (bool, string) {
+	if resourceID == "" { return false, "Resource ID required" }
+	if ownerID == "" { return false, "Owner ID required for lock tracking" }
+	if ttlSeconds > 300 { return false, "Lock TTL cannot exceed 5 minutes" }
+	if ttlSeconds < 1 { return false, "Lock TTL must be at least 1 second" }
+	return true, "Lock acquisition valid"
+}
+func computeLockContention(waitingThreads int, avgHoldTime float64) string {
+	if waitingThreads > 100 { return "critical" }
+	if waitingThreads > 50 || avgHoldTime > 5.0 { return "high" }
+	if waitingThreads > 10 { return "medium" }
+	return "low"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9385" }

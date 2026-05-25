@@ -492,6 +492,49 @@ func sanitizeInput(s string) string {
 	return s
 }
 
+
+// ─── Domain Logic: Account Closure ──────────────────────────────────────────
+
+func validateAccountClosure(balance float64, hasLiens, hasStandingOrders bool, accountAge int) (bool, []string) {
+	var errors []string
+	if balance > 0 { errors = append(errors, fmt.Sprintf("Account has outstanding balance ₦%.2f — must be zero", balance)) }
+	if balance < 0 { errors = append(errors, fmt.Sprintf("Account has debit balance ₦%.2f — must be cleared", balance)) }
+	if hasLiens { errors = append(errors, "Account has active liens — remove before closure") }
+	if hasStandingOrders { errors = append(errors, "Account has active standing orders — cancel first") }
+	if accountAge < 30 { errors = append(errors, "Account less than 30 days old — CBN minimum hold period") }
+	return len(errors) == 0, errors
+}
+
+func computeClosurePenalty(accountType string, balance, earnedInterest float64) float64 {
+	switch accountType {
+	case "fixed_deposit":
+		return earnedInterest * 0.5 // Forfeit 50% of accrued interest
+	case "savings":
+		return 500 // Flat closure fee
+	default:
+		return 1000
+	}
+}
+
+func handleClosureValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		Balance         float64 `json:"balance"`
+		HasLiens        bool    `json:"has_liens"`
+		HasStandingOrders bool  `json:"has_standing_orders"`
+		AccountAge      int     `json:"account_age_days"`
+		AccountType     string  `json:"account_type"`
+		EarnedInterest  float64 `json:"earned_interest"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	valid, errors := validateAccountClosure(body.Balance, body.HasLiens, body.HasStandingOrders, body.AccountAge)
+	penalty := computeClosurePenalty(body.AccountType, body.Balance, body.EarnedInterest)
+	respondJSON(w, 200, map[string]interface{}{
+		"can_close": valid, "errors": errors, "closure_penalty": penalty,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }
@@ -511,6 +554,7 @@ func main() {
 
 	mux.HandleFunc("/v1/closure/check", closureCheckHandler)
 	mux.HandleFunc("/v1/closure/process", processClosureHandler)
+	mux.HandleFunc("/v1/accounts/closure/validate", handleClosureValidate)
 
 	log.Printf("account-closure-go listening on port %s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()

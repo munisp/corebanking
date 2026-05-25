@@ -603,6 +603,20 @@ func rpcCall(target string, method string, payload map[string]interface{}) (map[
 	return result, nil
 }
 
+
+func validateNIPTransaction(amount float64, sessionID, destInstitution string) (bool, string) {
+	if amount <= 0 { return false, "Amount must be positive" }
+	if amount > 10000000 { return false, "NIP single transaction limit is ₦10M" }
+	if len(sessionID) < 12 { return false, "Invalid NIP session ID" }
+	return true, "NIP transaction valid"
+}
+func computeNIPCharge(amount float64) float64 {
+	if amount <= 5000 { return 10 }
+	if amount <= 50000 { return 25 }
+	return 50
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }

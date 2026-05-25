@@ -176,6 +176,28 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Dormancy Prevention Agent ─────────────────────────────
+
+    def assess_dormancy_risk(self, account_data):
+        """Assess account dormancy risk and suggest interventions."""
+        days_inactive = account_data.get("days_since_last_txn", 0)
+        balance = account_data.get("balance", 0)
+        product_count = account_data.get("product_count", 1)
+
+        risk_score = min(100, days_inactive / 3.65)
+        if product_count <= 1: risk_score += 10
+        if balance < 1000: risk_score += 15
+
+        status = "ACTIVE" if risk_score < 30 else "AT_RISK" if risk_score < 60 else "DORMANT_CANDIDATE" if risk_score < 80 else "DORMANT"
+        interventions = []
+        if risk_score > 30: interventions.append("Send re-engagement SMS")
+        if risk_score > 50: interventions.append("Offer promotional rate on savings")
+        if risk_score > 70: interventions.append("Assign to relationship manager")
+        if risk_score > 80: interventions.append("CBN dormancy notification (12 months)")
+
+        return {"dormancy_risk": round(risk_score, 1), "status": status, "interventions": interventions}
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateMigration(version int, direction string, hasRollback bool) (bool, string) {
+	if version < 1 { return false, "Migration version must be positive" }
+	if direction != "up" && direction != "down" { return false, "Direction must be 'up' or 'down'" }
+	if direction == "down" && !hasRollback { return false, "Rollback script required for down migration" }
+	return true, "Migration valid"
+}
+func computeVacuumPriority(deadTuplesPct float64, tableSizeMB int) string {
+	if deadTuplesPct > 30 { return "critical" }
+	if deadTuplesPct > 20 || tableSizeMB > 10000 { return "high" }
+	if deadTuplesPct > 10 { return "medium" }
+	return "low"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9344" }

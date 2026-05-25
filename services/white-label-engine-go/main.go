@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateWhiteLabelConfig(tenantID, brandName string, primaryColor string) (bool, string) {
+	if tenantID == "" { return false, "Tenant ID required" }
+	if brandName == "" { return false, "Brand name required" }
+	if len(primaryColor) != 7 || primaryColor[0] != '#' { return false, "Primary color must be hex format (#RRGGBB)" }
+	return true, "White label configuration valid"
+}
+func computeWhiteLabelFee(users int, features []string) float64 {
+	base := 500000.0 // ₦500K base
+	base += float64(users) * 2000
+	base += float64(len(features)) * 50000
+	return base
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9463" }

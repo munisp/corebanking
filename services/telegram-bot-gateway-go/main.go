@@ -602,6 +602,26 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateTelegramCommand(command, userID string) (bool, string) {
+	if command == "" { return false, "Command required" }
+	if userID == "" { return false, "User ID required" }
+	validCommands := map[string]bool{"/balance": true, "/transfer": true, "/statement": true, "/help": true, "/rates": true}
+	if !validCommands[command] { return false, "Unknown command: " + command }
+	return true, "Command valid"
+}
+func processCommand(command string) string {
+	responses := map[string]string{
+		"/balance": "Account Balance: Check your 54Bank account balance",
+		"/transfer": "Transfer Funds: Send money to any Nigerian bank",
+		"/statement": "Mini Statement: View your last 5 transactions",
+		"/help": "Available commands: /balance, /transfer, /statement, /rates",
+		"/rates": "Current FX Rates: USD/NGN, GBP/NGN, EUR/NGN",
+	}
+	return responses[command]
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9441" }

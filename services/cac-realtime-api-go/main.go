@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateAPIKey(key, scope string) (bool, string) {
+	if len(key) < 32 { return false, "API key must be at least 32 characters" }
+	validScopes := map[string]bool{"read": true, "write": true, "admin": true}
+	if !validScopes[scope] { return false, "Invalid scope: " + scope }
+	return true, "API key valid"
+}
+func computeAPIRateLimit(plan string) (int, int) {
+	limits := map[string][2]int{"free": {100, 1000}, "basic": {500, 10000}, "pro": {2000, 100000}, "enterprise": {10000, 1000000}}
+	l := limits[plan]
+	return l[0], l[1] // per-minute, per-day
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9328" }

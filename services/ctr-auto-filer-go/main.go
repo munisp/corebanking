@@ -603,6 +603,25 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Ctr Auto Filer ────────────────────────────────────────────
+
+func validateRequest(requestType string, payload map[string]interface{}) (bool, string) {
+	if requestType == "" { return false, "Request type required" }
+	if len(payload) == 0 { return false, "Payload required" }
+	return true, "Request valid"
+}
+
+func computeMetrics(items []map[string]interface{}) map[string]interface{} {
+	total := len(items)
+	active := 0
+	for _, item := range items {
+		if status, ok := item["status"].(string); ok && status == "active" { active++ }
+	}
+	return map[string]interface{}{"total": total, "active": active, "inactive": total - active, "utilization": float64(active) / float64(total+1) * 100}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9340" }

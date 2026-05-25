@@ -176,6 +176,38 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Account Opening Agent ─────────────────────────────────
+
+    def validate_account_opening(self, customer_data):
+        """Validate account opening eligibility with CBN tiered KYC rules."""
+        errors = []
+        kyc_tier = customer_data.get("kyc_tier", "tier1")
+        account_type = customer_data.get("account_type", "savings")
+        age = customer_data.get("age", 0)
+        customer_type = customer_data.get("customer_type", "individual")
+
+        tier_requirements = {
+            "tier1": ["bvn"],
+            "tier2": ["bvn", "nin", "utility_bill"],
+            "tier3": ["bvn", "nin", "utility_bill", "reference_letter"],
+        }
+        docs = customer_data.get("documents", {})
+        for doc in tier_requirements.get(kyc_tier, []):
+            if not docs.get(doc): errors.append(f"Missing document: {doc}")
+
+        if age < 18 and account_type != "savings":
+            errors.append("Minors can only open savings accounts")
+        if customer_type == "corporate" and kyc_tier != "tier3":
+            errors.append("Corporate accounts require Tier 3 KYC")
+
+        tier_limits = {
+            "tier1": {"daily_limit": 300000, "cumulative": 300000},
+            "tier2": {"daily_limit": 500000, "cumulative": 500000},
+            "tier3": {"daily_limit": 25000000, "cumulative": "unlimited"},
+        }
+        return {"eligible": len(errors) == 0, "errors": errors, "tier_limits": tier_limits.get(kyc_tier, {})}
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

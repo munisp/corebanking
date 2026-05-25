@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateMojaloopTransfer(amount float64, sourceFSP, destFSP, currency string) (bool, string) {
+	if amount <= 0 { return false, "Transfer amount must be positive" }
+	if sourceFSP == "" || destFSP == "" { return false, "Source and destination FSP required" }
+	if currency == "" { return false, "Currency required" }
+	return true, "Mojaloop transfer valid"
+}
+func computeMojaloopFee(amount float64, transferType string) float64 {
+	switch transferType {
+	case "p2p": return amount * 0.005
+	case "merchant": return amount * 0.01
+	default: return amount * 0.0075
+	}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9391" }

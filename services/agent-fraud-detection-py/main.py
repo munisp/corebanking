@@ -176,6 +176,33 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Fraud Detection Agent ─────────────────────────────────
+
+    def assess_fraud_risk(self, transaction):
+        """Assess fraud risk using rule-based scoring with ML-style features."""
+        score = 0.0
+        reasons = []
+        amount = transaction.get("amount", 0)
+        hour = transaction.get("hour", 12)
+        is_new_device = transaction.get("is_new_device", False)
+        is_new_beneficiary = transaction.get("is_new_beneficiary", False)
+        velocity = transaction.get("velocity_24h", 0)
+
+        if amount > 5000000: score += 25; reasons.append(f"High amount: ₦{amount:,.0f}")
+        if hour < 6 or hour > 23: score += 15; reasons.append(f"Unusual hour: {hour}:00")
+        if is_new_device: score += 20; reasons.append("New device detected")
+        if is_new_beneficiary: score += 15; reasons.append("First-time beneficiary")
+        if velocity > 10: score += 20; reasons.append(f"High velocity: {velocity} txns in 24h")
+
+        # Structuring detection: multiple txns just below CTR threshold
+        if 900000 < amount < 1000000:
+            score += 30; reasons.append("Possible structuring: amount near CTR threshold ₦1M")
+
+        risk_level = "LOW" if score < 30 else "MEDIUM" if score < 60 else "HIGH"
+        action = "APPROVE" if score < 30 else "REVIEW" if score < 60 else "HOLD"
+        return {"fraud_score": min(score, 100), "risk_level": risk_level, "action": action, "reasons": reasons}
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateTenantConfig(tenantID, tenantName string, maxUsers int) (bool, string) {
+	if tenantID == "" { return false, "Tenant ID required" }
+	if tenantName == "" { return false, "Tenant name required" }
+	if maxUsers < 1 { return false, "Max users must be at least 1" }
+	return true, "Tenant configuration valid"
+}
+func computeTenantBilling(activeUsers int, storageGB float64, apiCalls int) float64 {
+	userCharge := float64(activeUsers) * 5000 // ₦5000/user/month
+	storageCost := storageGB * 500 // ₦500/GB/month
+	apiCost := float64(apiCalls) * 0.01 // ₦0.01/call
+	return userCharge + storageCost + apiCost
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9449" }

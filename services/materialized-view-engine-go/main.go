@@ -603,6 +603,17 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateRefreshSchedule(intervalMinutes int) (bool, string) {
+	if intervalMinutes < 1 { return false, "Refresh interval must be at least 1 minute" }
+	if intervalMinutes > 1440 { return false, "Refresh interval cannot exceed 24 hours" }
+	return true, "Refresh schedule valid"
+}
+func computeRefreshCost(rowCount int, columnCount int) float64 {
+	return float64(rowCount*columnCount) * 0.0001 // Estimated compute cost
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9388" }

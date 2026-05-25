@@ -825,6 +825,80 @@ func jwtMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Account Opening ──────────────────────────────────────────
+
+func validateAccountOpening(customerType, accountType, kycLevel string, age int) (bool, []string) {
+	var errors []string
+	// CBN tiered KYC requirements
+	kycRequirements := map[string][]string{
+		"tier1": {"bvn"},
+		"tier2": {"bvn", "nin", "utility_bill"},
+		"tier3": {"bvn", "nin", "utility_bill", "reference_letter", "employer_letter"},
+	}
+	if _, ok := kycRequirements[kycLevel]; !ok {
+		errors = append(errors, "Invalid KYC tier: must be tier1, tier2, or tier3")
+	}
+	if age < 18 && accountType != "savings" {
+		errors = append(errors, "Minors can only open savings accounts")
+	}
+	if customerType == "corporate" && kycLevel != "tier3" {
+		errors = append(errors, "Corporate accounts require Tier 3 KYC")
+	}
+	// Account type validation
+	validTypes := map[string]bool{"savings": true, "current": true, "domiciliary": true, "fixed_deposit": true, "corporate": true}
+	if !validTypes[accountType] {
+		errors = append(errors, "Invalid account type")
+	}
+	// Transaction limits per tier
+	return len(errors) == 0, errors
+}
+
+func computeAccountTierLimits(kycTier string) map[string]interface{} {
+	switch kycTier {
+	case "tier1":
+		return map[string]interface{}{"single_debit_limit": 50000, "daily_limit": 300000, "cumulative_balance": 300000}
+	case "tier2":
+		return map[string]interface{}{"single_debit_limit": 200000, "daily_limit": 500000, "cumulative_balance": 500000}
+	case "tier3":
+		return map[string]interface{}{"single_debit_limit": 5000000, "daily_limit": 25000000, "cumulative_balance": "unlimited"}
+	default:
+		return map[string]interface{}{"single_debit_limit": 0, "daily_limit": 0, "cumulative_balance": 0}
+	}
+}
+
+func generateAccountNumber() string {
+	digits := "0123456789"
+	result := "54" // Bank code prefix
+	for i := 0; i < 8; i++ {
+		result += string(digits[rand.Intn(10)])
+	}
+	return result
+}
+
+func handleAccountValidate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		CustomerType string `json:"customer_type"`
+		AccountType  string `json:"account_type"`
+		KYCLevel     string `json:"kyc_level"`
+		Age          int    `json:"age"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.CustomerType == "" { body.CustomerType = "individual" }
+	if body.KYCLevel == "" { body.KYCLevel = "tier1" }
+
+	valid, errors := validateAccountOpening(body.CustomerType, body.AccountType, body.KYCLevel, body.Age)
+	limits := computeAccountTierLimits(body.KYCLevel)
+	accountNumber := ""
+	if valid { accountNumber = generateAccountNumber() }
+	respondJSON(w, 200, map[string]interface{}{
+		"eligible": valid, "errors": errors, "tier_limits": limits,
+		"proposed_account_number": accountNumber,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 
@@ -859,6 +933,7 @@ func main() {
 	mux.HandleFunc("/v1/accounts/applications/approve", approveHandler)
 	mux.HandleFunc("/v1/accounts/kyc/verify", kycVerifyHandler)
 	mux.HandleFunc("/v1/accounts/tier-limits", tierLimitsHandler)
+	mux.HandleFunc("/v1/accounts/validate", handleAccountValidate)
 
 	log.Printf("[account-opening-go] Starting on :%s (KYC enforcement enabled)", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()

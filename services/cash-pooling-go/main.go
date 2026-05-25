@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computePoolBalance(accounts []map[string]float64) map[string]float64 {
+	totalDebit := 0.0; totalCredit := 0.0
+	for _, acc := range accounts {
+		if acc["balance"] > 0 { totalCredit += acc["balance"] }
+		if acc["balance"] < 0 { totalDebit -= acc["balance"] }
+	}
+	return map[string]float64{"total_credit": totalCredit, "total_debit": totalDebit, "net_position": totalCredit - totalDebit}
+}
+func computeInterestSaving(netPosition float64, spreadBps int) float64 {
+	return netPosition * float64(spreadBps) / 10000 / 365
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9329" }

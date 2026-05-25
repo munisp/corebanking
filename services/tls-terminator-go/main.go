@@ -603,6 +603,17 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateCertificate(daysUntilExpiry int, keySize int) (bool, string) {
+	if daysUntilExpiry < 30 { return false, fmt.Sprintf("Certificate expires in %d days — renew immediately", daysUntilExpiry) }
+	if keySize < 2048 { return false, "Key size must be at least 2048 bits" }
+	return true, "Certificate valid"
+}
+func computeRenewalDate(expiryDays, renewBeforeDays int) int {
+	return expiryDays - renewBeforeDays
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9452" }

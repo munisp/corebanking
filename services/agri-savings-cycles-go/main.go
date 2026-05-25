@@ -604,6 +604,24 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeCropInsurancePremium(farmSize, sumInsured float64, cropType, state string) float64 {
+	baseRate := 0.05 // 5% of sum insured
+	cropMultipliers := map[string]float64{"rice": 1.0, "maize": 0.9, "cassava": 0.7, "yam": 0.8, "cocoa": 1.2}
+	m := cropMultipliers[cropType]
+	if m == 0 { m = 1.0 }
+	riskZones := map[string]float64{"Borno": 1.5, "Adamawa": 1.3, "Zamfara": 1.4, "Lagos": 0.8, "Ogun": 0.9}
+	z := riskZones[state]
+	if z == 0 { z = 1.0 }
+	return sumInsured * baseRate * m * z
+}
+func validateFarmerEligibility(bvnVerified bool, farmSize float64, state string) (bool, string) {
+	if !bvnVerified { return false, "BVN verification required for agri lending" }
+	if farmSize < 0.5 { return false, "Minimum farm size is 0.5 hectares" }
+	return true, "Farmer eligible for agri products"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9307" }

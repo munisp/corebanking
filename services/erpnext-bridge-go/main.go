@@ -862,6 +862,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateERPSyncPayload(doctype, name string, modified string) (bool, string) {
+	if doctype == "" { return false, "DocType required" }
+	if name == "" { return false, "Document name required" }
+	validDoctypes := map[string]bool{"Journal Entry": true, "Payment Entry": true, "Sales Invoice": true, "Purchase Invoice": true, "GL Entry": true}
+	if !validDoctypes[doctype] { return false, "Unsupported DocType: " + doctype }
+	return true, "Sync payload valid"
+}
+func computeSyncBatchSize(queueDepth int) int {
+	if queueDepth > 10000 { return 500 }
+	if queueDepth > 1000 { return 100 }
+	return 50
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8110" }

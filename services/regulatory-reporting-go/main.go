@@ -599,6 +599,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateRegulatorySubmission(reportType, filingPeriod string, isAmended bool) (bool, string) {
+	if reportType == "" { return false, "Report type required" }
+	if filingPeriod == "" { return false, "Filing period required" }
+	return true, "Regulatory submission valid"
+}
+func computeComplianceScore(totalChecks, passedChecks int) float64 {
+	if totalChecks == 0 { return 0 }
+	return float64(passedChecks) / float64(totalChecks) * 100
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9418" }

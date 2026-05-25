@@ -604,6 +604,21 @@ func rpcCall(target string, method string, payload map[string]interface{}) (map[
 	return result, nil
 }
 
+
+func validateChequeClearing(amount float64, chequeNumber, sortCode string) (bool, string) {
+	if amount <= 0 { return false, "Cheque amount must be positive" }
+	if len(chequeNumber) < 6 { return false, "Invalid cheque number" }
+	if len(sortCode) != 9 { return false, "Sort code must be 9 digits (CBN format)" }
+	if amount > 10000000 { return false, "Cheques above ₦10M require special clearing" }
+	return true, "Cheque accepted for clearing"
+}
+func computeChequeSettlementDays(amount float64, clearingType string) int {
+	if clearingType == "same_day" { return 0 }
+	if amount <= 10000000 { return 2 } // T+2 for standard
+	return 3 // T+3 for large value
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }

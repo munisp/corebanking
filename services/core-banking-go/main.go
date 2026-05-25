@@ -656,6 +656,19 @@ func rpcCall(target string, method string, payload map[string]interface{}) (map[
 	return result, nil
 }
 
+
+func validateTransaction(amount float64, accountStatus, txnType string) (bool, string) {
+	if amount <= 0 { return false, "Transaction amount must be positive" }
+	if accountStatus != "active" { return false, "Account is " + accountStatus }
+	validTypes := map[string]bool{"debit": true, "credit": true, "reversal": true, "adjustment": true}
+	if !validTypes[txnType] { return false, "Invalid transaction type" }
+	return true, "Transaction valid"
+}
+func computeAccountBalance(openingBalance float64, credits, debits float64) float64 {
+	return openingBalance + credits - debits
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 

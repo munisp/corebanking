@@ -291,6 +291,31 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+
+    # ─── Domain Logic: Chart of Accounts Graph ───────────────────────────────
+
+    def validate_coa_hierarchy(self, accounts):
+        """Validate chart of accounts hierarchy integrity."""
+        errors = []
+        account_ids = {a.get("code") for a in accounts}
+        for account in accounts:
+            parent = account.get("parent_code")
+            if parent and parent not in account_ids:
+                errors.append(f"Orphan account: {account.get('code')} references missing parent {parent}")
+            if not account.get("code"): errors.append("Account missing code")
+            if not account.get("name"): errors.append(f"Account {account.get('code')} missing name")
+        return {"valid": len(errors) == 0, "errors": errors, "total_accounts": len(accounts)}
+
+    def compute_trial_balance(self, entries):
+        """Compute trial balance from journal entries."""
+        total_debit = sum(e.get("debit", 0) for e in entries)
+        total_credit = sum(e.get("credit", 0) for e in entries)
+        return {
+            "total_debit": round(total_debit, 2), "total_credit": round(total_credit, 2),
+            "balanced": abs(total_debit - total_credit) < 0.01,
+            "difference": round(total_debit - total_credit, 2),
+        }
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

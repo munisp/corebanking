@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateDirectDebitMandate(amount float64, frequency, accountStatus string) (bool, string) {
+	if amount <= 0 { return false, "Mandate amount must be positive" }
+	validFreqs := map[string]bool{"daily": true, "weekly": true, "monthly": true, "quarterly": true, "annual": true}
+	if !validFreqs[frequency] { return false, "Invalid mandate frequency" }
+	if accountStatus != "active" { return false, "Account must be active for mandate setup" }
+	return true, "Mandate valid"
+}
+func computeMandateCharge(amount float64, frequency string) float64 {
+	baseCharge := 50.0
+	if frequency == "monthly" { baseCharge = 100 }
+	if frequency == "quarterly" { baseCharge = 200 }
+	return baseCharge
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9387" }

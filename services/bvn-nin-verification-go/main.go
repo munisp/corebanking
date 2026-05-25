@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateBVN(bvn string) (bool, string) {
+	if len(bvn) != 11 { return false, "BVN must be exactly 11 digits" }
+	for _, c := range bvn { if c < '0' || c > '9' { return false, "BVN must contain only digits" } }
+	if bvn[:2] != "22" { return false, "Nigerian BVN must start with 22" }
+	return true, "BVN format valid"
+}
+func validateNIN(nin string) (bool, string) {
+	if len(nin) != 11 { return false, "NIN must be exactly 11 digits" }
+	for _, c := range nin { if c < '0' || c > '9' { return false, "NIN must contain only digits" } }
+	return true, "NIN format valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9327" }

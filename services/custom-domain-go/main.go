@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateDomainName(domain string) (bool, string) {
+	if domain == "" { return false, "Domain name required" }
+	if !strings.Contains(domain, ".") { return false, "Invalid domain format" }
+	if strings.HasPrefix(domain, ".") || strings.HasSuffix(domain, ".") { return false, "Invalid domain format" }
+	return true, "Domain valid"
+}
+func computeDNSRecords(domain, targetIP string) []map[string]string {
+	return []map[string]string{
+		{"type": "A", "name": domain, "value": targetIP},
+		{"type": "CNAME", "name": "www." + domain, "value": domain},
+	}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9342" }

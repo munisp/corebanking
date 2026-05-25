@@ -601,6 +601,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateStreamConfig(partitions int, retentionHours int) (bool, string) {
+	if partitions < 1 { return false, "At least 1 partition required" }
+	if retentionHours < 1 { return false, "Retention must be at least 1 hour" }
+	if retentionHours > 8760 { return false, "Retention cannot exceed 1 year" }
+	return true, "Stream configuration valid"
+}
+func computeStreamThroughput(messagesPerSec int, avgMessageSize int) float64 {
+	return float64(messagesPerSec*avgMessageSize) / 1048576.0 // MB/s
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9436" }

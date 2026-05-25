@@ -603,6 +603,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateProjectFinancing(totalCost, equityContribution, debtAmount float64) (bool, string) {
+	if equityContribution/totalCost < 0.3 { return false, "Minimum equity contribution is 30% of project cost" }
+	if debtAmount > totalCost*0.7 { return false, "Debt cannot exceed 70% of project cost" }
+	return true, "Project financing structure valid"
+}
+func computeDSCR(netOperatingIncome, debtService float64) float64 {
+	if debtService == 0 { return 0 }
+	return netOperatingIncome / debtService
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9414" }

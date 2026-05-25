@@ -503,6 +503,21 @@ func sanitizeInput(s string) string {
 	return s
 }
 
+
+func validateTellerTransaction(amount float64, tellerLimit float64, operationType string) (bool, string) {
+	if amount > tellerLimit { return false, fmt.Sprintf("Amount exceeds teller limit ₦%.0f", tellerLimit) }
+	if amount < 0 { return false, "Amount must be positive" }
+	return true, "Approved"
+}
+func computeCashPosition(vaultBalance, tillBalance, todayCredits, todayDebits float64) map[string]float64 {
+	return map[string]float64{
+		"vault_balance": vaultBalance, "till_balance": tillBalance,
+		"today_credits": todayCredits, "today_debits": todayDebits,
+		"net_position": vaultBalance + tillBalance + todayCredits - todayDebits,
+	}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }

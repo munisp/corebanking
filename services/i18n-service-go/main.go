@@ -603,6 +603,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateLocale(locale string) (bool, string) {
+	supported := map[string]bool{"en-NG": true, "yo-NG": true, "ha-NG": true, "ig-NG": true, "pcm-NG": true, "fr-CM": true, "en-GH": true}
+	if !supported[locale] { return false, "Unsupported locale: " + locale }
+	return true, "Locale supported"
+}
+func computeTranslationCoverage(translated, total int) float64 {
+	if total == 0 { return 0 }
+	return float64(translated) / float64(total) * 100.0
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9368" }

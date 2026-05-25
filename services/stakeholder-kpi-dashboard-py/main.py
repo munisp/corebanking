@@ -342,6 +342,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.end_headers()
 
+
+    # ─── Domain Logic: KPI Dashboard ─────────────────────────────────────────
+
+    def compute_kpi_scores(self, metrics):
+        """Compute KPI scores across multiple dimensions."""
+        results = []
+        for kpi in metrics:
+            actual = kpi.get("actual", 0)
+            target = kpi.get("target", 1)
+            score = min(120, (actual / target * 100)) if target > 0 else 0
+            status = "ON_TRACK" if score >= 90 else "AT_RISK" if score >= 70 else "OFF_TRACK"
+            results.append({
+                "kpi_name": kpi.get("name"), "score": round(score, 1),
+                "actual": actual, "target": target, "status": status,
+            })
+        avg_score = sum(r["score"] for r in results) / max(len(results), 1)
+        return {"kpis": results, "overall_score": round(avg_score, 1), "total_kpis": len(results)}
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

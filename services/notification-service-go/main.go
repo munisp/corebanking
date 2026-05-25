@@ -603,6 +603,28 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateNotificationChannel(channel, recipient string) (bool, string) {
+	switch channel {
+	case "sms":
+		if len(recipient) < 10 { return false, "Invalid phone number" }
+	case "email":
+		if !strings.Contains(recipient, "@") { return false, "Invalid email address" }
+	case "push":
+		if recipient == "" { return false, "Device token required" }
+	case "whatsapp":
+		if len(recipient) < 10 { return false, "Invalid WhatsApp number" }
+	default:
+		return false, "Unknown channel: " + channel
+	}
+	return true, "Channel valid"
+}
+func computeNotificationCost(channel string, count int) float64 {
+	rates := map[string]float64{"sms": 4.0, "email": 0.5, "push": 0, "whatsapp": 2.0}
+	return rates[channel] * float64(count)
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9399" }

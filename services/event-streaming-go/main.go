@@ -601,6 +601,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateEventPayload(eventType, source string, payloadSize int) (bool, string) {
+	if eventType == "" { return false, "Event type required" }
+	if source == "" { return false, "Event source required" }
+	if payloadSize > 1048576 { return false, "Payload exceeds 1MB limit" }
+	return true, "Event payload valid"
+}
+func computeEventPartition(key string, partitions int) int {
+	if partitions <= 0 { return 0 }
+	hash := 0
+	for _, c := range key { hash = hash*31 + int(c) }
+	if hash < 0 { hash = -hash }
+	return hash % partitions
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9356" }

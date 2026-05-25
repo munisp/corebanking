@@ -78,6 +78,36 @@ def call_service(method, url, data=None):
 
 PORT = int(os.environ.get("PORT", "8080"))
 
+
+# ─── Domain Logic: FalkorDB Chart of Accounts ────────────────────────────────
+
+def validate_gl_code(code):
+    """Validate GL code format (CBN standard)."""
+    if not code: return False, "GL code required"
+    if len(code) < 4: return False, "GL code must be at least 4 digits"
+    prefix = code[0]
+    categories = {"1": "Assets", "2": "Liabilities", "3": "Equity", "4": "Revenue", "5": "Expenses"}
+    if prefix not in categories: return False, f"Invalid GL prefix: {prefix}"
+    return True, f"Valid {categories[prefix]} account"
+
+def compute_account_hierarchy_depth(accounts):
+    """Compute hierarchy depth for chart of accounts."""
+    depths = {}
+    for acc in accounts:
+        code = acc.get("code", "")
+        parent = acc.get("parent_code", "")
+        depth = 0
+        current = parent
+        visited = set()
+        while current and current not in visited:
+            visited.add(current)
+            depth += 1
+            parent_acc = next((a for a in accounts if a.get("code") == current), None)
+            current = parent_acc.get("parent_code", "") if parent_acc else ""
+        depths[code] = depth
+    return depths
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):

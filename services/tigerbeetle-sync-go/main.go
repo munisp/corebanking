@@ -601,6 +601,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateDoubleEntry(debitAmount, creditAmount float64) (bool, string) {
+	if debitAmount != creditAmount { return false, fmt.Sprintf("Debit ₦%.2f != Credit ₦%.2f — entries must balance", debitAmount, creditAmount) }
+	if debitAmount <= 0 { return false, "Amounts must be positive" }
+	return true, "Double entry balanced"
+}
+func computeLedgerBalance(entries []map[string]float64) float64 {
+	balance := 0.0
+	for _, e := range entries {
+		balance += e["credit"] - e["debit"]
+	}
+	return balance
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9451" }

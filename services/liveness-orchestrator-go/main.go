@@ -1127,6 +1127,20 @@ func jwtMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateLivenessCheck(responseTime int, statusCode int) (bool, string) {
+	if statusCode >= 500 { return false, "Service unhealthy: 5xx response" }
+	if responseTime > 5000 { return false, "Service unhealthy: response > 5s" }
+	return true, "Service healthy"
+}
+func computeHealthScore(successRate float64, avgLatency int, errorRate float64) float64 {
+	score := successRate * 40 / 100
+	if avgLatency < 100 { score += 30 } else if avgLatency < 500 { score += 20 } else if avgLatency < 1000 { score += 10 }
+	score += (1 - errorRate) * 30
+	return score
+}
+
+
 func main() {
 
 	dbURL := os.Getenv("DATABASE_URL")

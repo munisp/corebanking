@@ -361,6 +361,92 @@ def predict_aml(registry: ModelRegistry, data: dict) -> dict:
     }
 
 
+def predict_gnn(registry: ModelRegistry, data: dict) -> dict:
+    model = registry.get("gnn_fraud_ring")
+    if model is None:
+        return {"error": "gnn_fraud_ring model not loaded"}
+
+    start = time.time()
+    import math
+
+    # Build node features from input accounts
+    accounts = data.get("accounts", [])
+    if not accounts:
+        # Default: single-node prediction from flat input
+        accounts = [data]
+
+    node_features = []
+    for acc in accounts:
+        node_features.append([
+            acc.get("account_type_idx", 0),
+            math.log1p(acc.get("balance", 50000)),
+            acc.get("account_age_days", 365),
+            acc.get("kyc_level", 2),
+            acc.get("num_products", 2),
+            math.log1p(acc.get("avg_incoming_amount", 50000)),
+            math.log1p(acc.get("avg_outgoing_amount", 40000)),
+        ])
+
+    num_nodes = len(node_features)
+    x = torch.tensor(node_features, dtype=torch.float32)
+
+    # Build edges from input or default to fully connected
+    edges = data.get("edges", [])
+    if edges:
+        src_nodes = [e.get("source", 0) for e in edges]
+        dst_nodes = [e.get("target", 0) for e in edges]
+        edge_amounts = [[math.log1p(e.get("amount", 10000))] for e in edges]
+    else:
+        # Default: fully connected graph
+        src_nodes = []
+        dst_nodes = []
+        edge_amounts = []
+        for i in range(num_nodes):
+            for j in range(num_nodes):
+                if i != j:
+                    src_nodes.append(i)
+                    dst_nodes.append(j)
+                    edge_amounts.append([math.log1p(50000)])
+
+    if not src_nodes:
+        src_nodes = [0]
+        dst_nodes = [0]
+        edge_amounts = [[math.log1p(50000)]]
+
+    edge_index = torch.tensor([src_nodes, dst_nodes], dtype=torch.long)
+    edge_attr = torch.tensor(edge_amounts, dtype=torch.float32)
+
+    with torch.no_grad():
+        out = model(x, edge_index, edge_attr)
+
+    probabilities = out["probabilities"].squeeze(-1).tolist()
+    if isinstance(probabilities, float):
+        probabilities = [probabilities]
+
+    # Identify suspicious nodes (fraud ring members)
+    suspicious = [
+        {"node_idx": i, "fraud_probability": round(p, 6)}
+        for i, p in enumerate(probabilities) if p > 0.5
+    ]
+
+    avg_prob = sum(probabilities) / len(probabilities) if probabilities else 0
+    ring_detected = len(suspicious) >= 2  # Ring = 2+ connected suspicious nodes
+
+    latency = (time.time() - start) * 1000
+    inc_inference("gnn_fraud_ring", latency)
+    return {
+        "node_probabilities": [round(p, 6) for p in probabilities],
+        "suspicious_nodes": suspicious,
+        "ring_detected": ring_detected,
+        "avg_fraud_probability": round(avg_prob, 6),
+        "num_nodes": num_nodes,
+        "num_edges": len(src_nodes),
+        "model": "GNNFraudRing-v1",
+        "inference_device": "cpu",
+        "latency_ms": round(latency, 2),
+    }
+
+
 # ── HTTP Server ──────────────────────────────────────────────────────────────
 registry = None
 
@@ -437,6 +523,8 @@ class InferenceHandler(BaseHTTPRequestHandler):
                 result = predict_churn(registry, body)
             elif path == "/v1/aml/predict":
                 result = predict_aml(registry, body)
+            elif path == "/v1/gnn/predict":
+                result = predict_gnn(registry, body)
             else:
                 self.respond(404, {"error": "not_found"})
                 return

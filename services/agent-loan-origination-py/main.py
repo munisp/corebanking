@@ -176,6 +176,31 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Loan Origination Agent ────────────────────────────────
+
+    def evaluate_loan(self, application):
+        """Evaluate loan application with Nigerian banking rules."""
+        amount = application.get("amount", 0)
+        income = application.get("monthly_income", 0)
+        existing_debt = application.get("existing_debt", 0)
+        rate = application.get("interest_rate", 24.0)
+        tenor = application.get("tenor_months", 12)
+
+        # EMI calculation (reducing balance)
+        monthly_rate = rate / 12 / 100
+        if monthly_rate > 0:
+            emi = amount * monthly_rate * (1 + monthly_rate)**tenor / ((1 + monthly_rate)**tenor - 1)
+        else:
+            emi = amount / tenor
+
+        dti = ((existing_debt + emi) / income * 100) if income > 0 else 100
+        eligible = dti <= 40 and amount >= 50000
+        reasons = []
+        if dti > 40: reasons.append(f"DTI {dti:.1f}% exceeds 40% limit")
+        if amount < 50000: reasons.append("Minimum loan ₦50,000")
+        return {"eligible": eligible, "emi": round(emi, 2), "dti": round(dti, 1), "total_repayment": round(emi * tenor, 2), "reasons": reasons}
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateRemittance(amount float64, sourceCountry, destCountry, channel string) (bool, string) {
+	if amount <= 0 { return false, "Remittance amount must be positive" }
+	if amount > 5000 && sourceCountry != destCountry { return false, "Single inbound remittance limit is $5,000 equivalent" }
+	return true, "Remittance approved"
+}
+func computeRemittanceFee(amount float64, corridor string) float64 {
+	corridorRates := map[string]float64{"US-NG": 0.03, "UK-NG": 0.035, "EU-NG": 0.04, "GH-NG": 0.02}
+	rate := corridorRates[corridor]
+	if rate == 0 { rate = 0.05 }
+	fee := amount * rate
+	if fee < 500 { return 500 }
+	return fee
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9420" }

@@ -602,6 +602,23 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validatePermission(subject, resource, action string) (bool, string) {
+	if subject == "" { return false, "Subject required" }
+	if resource == "" { return false, "Resource required" }
+	if action == "" { return false, "Action required" }
+	validActions := map[string]bool{"read": true, "write": true, "delete": true, "admin": true, "approve": true}
+	if !validActions[action] { return false, "Invalid action: " + action }
+	return true, "Permission check valid"
+}
+func computeAccessLevel(roles []string) int {
+	maxLevel := 0
+	roleLevels := map[string]int{"viewer": 1, "editor": 2, "manager": 3, "admin": 4, "super_admin": 5}
+	for _, r := range roles { if l := roleLevels[r]; l > maxLevel { maxLevel = l } }
+	return maxLevel
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9406" }

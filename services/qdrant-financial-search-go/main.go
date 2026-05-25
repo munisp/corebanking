@@ -122,6 +122,25 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 201, map[string]interface{}{"created": true})
 }
 
+
+// ─── Domain Logic: Qdrant Financial Search ────────────────────────────────────────────
+
+func validateRequest(requestType string, payload map[string]interface{}) (bool, string) {
+	if requestType == "" { return false, "Request type required" }
+	if len(payload) == 0 { return false, "Payload required" }
+	return true, "Request valid"
+}
+
+func computeMetrics(items []map[string]interface{}) map[string]interface{} {
+	total := len(items)
+	active := 0
+	for _, item := range items {
+		if status, ok := item["status"].(string); ok && status == "active" { active++ }
+	}
+	return map[string]interface{}{"total": total, "active": active, "inactive": total - active, "utilization": float64(active) / float64(total+1) * 100}
+}
+
+
 func main() {
 	initDB()
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()

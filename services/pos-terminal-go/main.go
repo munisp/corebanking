@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validatePOSTransaction(amount float64, merchantID, terminalID string) (bool, string) {
+	if amount <= 0 { return false, "Amount must be positive" }
+	if amount > 5000000 { return false, "POS single transaction limit is ₦5M" }
+	if merchantID == "" { return false, "Merchant ID required" }
+	if terminalID == "" { return false, "Terminal ID required" }
+	return true, "POS transaction approved"
+}
+func computePOSCharge(amount float64, isInterbank bool) float64 {
+	mdr := amount * 0.005 // 0.5% MDR
+	if mdr > 1000 { mdr = 1000 } // ₦1000 cap
+	if isInterbank { mdr += 35 } // Interbank switching fee
+	return mdr
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9409" }

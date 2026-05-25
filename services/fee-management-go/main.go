@@ -603,6 +603,67 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Fee Management ───────────────────────────────────────────
+
+type FeeSchedule struct {
+	FeeType    string  `json:"fee_type"`
+	Amount     float64 `json:"amount"`
+	Method     string  `json:"method"` // flat, percentage, tiered
+	TierRanges []struct {
+		Min  float64 `json:"min"`
+		Max  float64 `json:"max"`
+		Rate float64 `json:"rate"`
+	} `json:"tier_ranges,omitempty"`
+}
+
+func calculateFee(feeType string, transactionAmount float64) float64 {
+	switch feeType {
+	case "transfer_nip":
+		if transactionAmount <= 5000 { return 10 }
+		if transactionAmount <= 50000 { return 25 }
+		return 50
+	case "transfer_rtgs": return 500
+	case "atm_withdrawal": return 65
+	case "sms_alert": return 4
+	case "account_maintenance": return 1000
+	case "card_issuance": return 1000
+	case "card_renewal": return 500
+	case "chequebook": return 2500
+	case "statement_request": return 500
+	case "cot":
+		return transactionAmount * 0.003 // Commission on turnover 0.3%
+	case "vat":
+		return transactionAmount * 0.075 // 7.5% VAT
+	default: return 0
+	}
+}
+
+func computeAllFees(transactionAmount float64, feeTypes []string) map[string]interface{} {
+	fees := map[string]float64{}
+	total := 0.0
+	for _, ft := range feeTypes {
+		fee := calculateFee(ft, transactionAmount)
+		fees[ft] = fee
+		total += fee
+	}
+	vat := total * 0.075
+	return map[string]interface{}{"fees": fees, "subtotal": total, "vat": vat, "total": total + vat}
+}
+
+func handleFeeCompute(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		Amount   float64  `json:"amount"`
+		FeeTypes []string `json:"fee_types"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if len(body.FeeTypes) == 0 { body.FeeTypes = []string{"transfer_nip", "sms_alert"} }
+	result := computeAllFees(body.Amount, body.FeeTypes)
+	respondJSON(w, 200, result)
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9359" }
@@ -623,6 +684,7 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/fee-management/stats", handleStats)
 	mux.HandleFunc("/v1/fee-management/score", fee_managementScoreHandler)
 	mux.HandleFunc("/v1/fee-management/validate", fee_managementValidateRequestHandler)
+	mux.HandleFunc("/v1/fees/compute", handleFeeCompute)
 	log.Printf("Fee Management v2.0 (Billing) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

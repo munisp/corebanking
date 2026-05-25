@@ -601,6 +601,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateKafkaTopic(topicName string, partitions, replicationFactor int) (bool, string) {
+	if topicName == "" { return false, "Topic name required" }
+	if partitions < 1 { return false, "At least 1 partition required" }
+	if replicationFactor < 1 { return false, "Replication factor must be >= 1" }
+	if replicationFactor > 3 { return false, "Maximum replication factor is 3" }
+	return true, "Kafka topic configuration valid"
+}
+func computePartitionKey(key string, numPartitions int) int {
+	hash := 0
+	for _, c := range key { hash = hash*31 + int(c) }
+	if hash < 0 { hash = -hash }
+	return hash % numPartitions
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9375" }

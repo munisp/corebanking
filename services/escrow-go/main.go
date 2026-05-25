@@ -603,6 +603,46 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Escrow ───────────────────────────────────────────────────
+
+func validateEscrowRelease(milestonesPassed, totalMilestones int, escrowAmount, releaseAmount float64) (bool, string) {
+	if releaseAmount <= 0 { return false, "Release amount must be positive" }
+	if releaseAmount > escrowAmount { return false, "Release exceeds escrow balance" }
+	if milestonesPassed < 1 { return false, "At least 1 milestone must be completed" }
+	completionPct := float64(milestonesPassed) / float64(totalMilestones) * 100
+	if releaseAmount > escrowAmount*completionPct/100 {
+		return false, fmt.Sprintf("Release ₦%.2f exceeds proportional milestone completion (%.0f%%)", releaseAmount, completionPct)
+	}
+	return true, "Release approved"
+}
+
+func computeEscrowFee(escrowAmount float64, durationDays int) float64 {
+	baseFee := escrowAmount * 0.01
+	if durationDays > 90 { baseFee += escrowAmount * 0.005 }
+	if durationDays > 180 { baseFee += escrowAmount * 0.005 }
+	return float64(int(baseFee*100)) / 100
+}
+
+func handleEscrowEvaluate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		EscrowAmount    float64 `json:"escrow_amount"`
+		ReleaseAmount   float64 `json:"release_amount"`
+		MilestonesPassed int    `json:"milestones_passed"`
+		TotalMilestones  int    `json:"total_milestones"`
+		DurationDays     int    `json:"duration_days"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	approved, reason := validateEscrowRelease(body.MilestonesPassed, body.TotalMilestones, body.EscrowAmount, body.ReleaseAmount)
+	fee := computeEscrowFee(body.EscrowAmount, body.DurationDays)
+	respondJSON(w, 200, map[string]interface{}{
+		"release_approved": approved, "reason": reason, "escrow_fee": fee,
+		"completion_pct": float64(body.MilestonesPassed) / float64(body.TotalMilestones) * 100,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9353" }
@@ -623,6 +663,7 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/escrow/stats", handleStats)
 	mux.HandleFunc("/v1/escrow/score", escrowScoreHandler)
 	mux.HandleFunc("/v1/escrow/validate", escrowValidateRequestHandler)
+	mux.HandleFunc("/v1/escrow/evaluate", handleEscrowEvaluate)
 	log.Printf("Escrow v2.0 (Payments) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

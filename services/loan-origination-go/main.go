@@ -717,6 +717,180 @@ func jwtMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// ─── Domain Logic: Loan Origination ─────────────────────────────────────────
+
+type LoanApplication struct {
+	CustomerID     string  `json:"customer_id"`
+	Amount         float64 `json:"amount"`
+	TenorMonths    int     `json:"tenor_months"`
+	InterestRate   float64 `json:"interest_rate"`
+	MonthlyIncome  float64 `json:"monthly_income"`
+	ExistingDebt   float64 `json:"existing_debt"`
+	EmploymentYrs  float64 `json:"employment_years"`
+	CollateralVal  float64 `json:"collateral_value"`
+	LoanType       string  `json:"loan_type"`
+	Purpose        string  `json:"purpose"`
+}
+
+type LoanDecision struct {
+	Eligible      bool    `json:"eligible"`
+	MaxAmount     float64 `json:"max_amount"`
+	EMI           float64 `json:"emi"`
+	DTI           float64 `json:"dti_ratio"`
+	LTV           float64 `json:"ltv_ratio"`
+	RiskGrade     string  `json:"risk_grade"`
+	InterestRate  float64 `json:"approved_rate"`
+	Reasons       []string `json:"reasons"`
+}
+
+func calculateEMI(principal, annualRate float64, tenorMonths int) float64 {
+	if annualRate == 0 { return principal / float64(tenorMonths) }
+	monthlyRate := annualRate / 12.0 / 100.0
+	n := float64(tenorMonths)
+	pow := 1.0
+	for i := 0; i < tenorMonths; i++ { pow *= (1 + monthlyRate) }
+	return principal * monthlyRate * pow / (pow - 1)
+}
+
+func computeDTI(monthlyIncome, existingDebt, proposedEMI float64) float64 {
+	if monthlyIncome <= 0 { return 100.0 }
+	return ((existingDebt + proposedEMI) / monthlyIncome) * 100.0
+}
+
+func computeLTV(loanAmount, collateralValue float64) float64 {
+	if collateralValue <= 0 { return 100.0 }
+	return (loanAmount / collateralValue) * 100.0
+}
+
+func assessLoanRiskGrade(dti, ltv, employmentYrs float64, loanType string) string {
+	score := 100.0
+	if dti > 50 { score -= 30 } else if dti > 40 { score -= 20 } else if dti > 30 { score -= 10 }
+	if ltv > 90 { score -= 25 } else if ltv > 80 { score -= 15 } else if ltv > 70 { score -= 5 }
+	if employmentYrs < 1 { score -= 20 } else if employmentYrs < 3 { score -= 10 }
+	if loanType == "unsecured" || loanType == "personal_loan" { score -= 10 }
+	switch {
+	case score >= 85: return "A"
+	case score >= 70: return "B"
+	case score >= 55: return "C"
+	case score >= 40: return "D"
+	default: return "E"
+	}
+}
+
+func validateLoanApplication(app LoanApplication) (LoanDecision, error) {
+	var reasons []string
+	emi := calculateEMI(app.Amount, app.InterestRate, app.TenorMonths)
+	dti := computeDTI(app.MonthlyIncome, app.ExistingDebt, emi)
+	ltv := computeLTV(app.Amount, app.CollateralVal)
+	riskGrade := assessLoanRiskGrade(dti, ltv, app.EmploymentYrs, app.LoanType)
+
+	// CBN guidelines: DTI max 33% for consumer, 40% for commercial
+	maxDTI := 40.0
+	if app.LoanType == "personal_loan" || app.LoanType == "consumer" { maxDTI = 33.0 }
+
+	eligible := true
+	if dti > maxDTI {
+		eligible = false
+		reasons = append(reasons, fmt.Sprintf("DTI ratio %.1f%% exceeds CBN maximum %.0f%%", dti, maxDTI))
+	}
+	if ltv > 80 && app.LoanType != "mortgage" {
+		eligible = false
+		reasons = append(reasons, fmt.Sprintf("LTV ratio %.1f%% exceeds 80%% for non-mortgage", ltv))
+	}
+	if app.Amount < 50000 {
+		eligible = false
+		reasons = append(reasons, "Minimum loan amount is ₦50,000")
+	}
+	if app.Amount > 500000000 {
+		reasons = append(reasons, "Amount exceeds ₦500M — requires board approval")
+	}
+	if app.EmploymentYrs < 0.5 {
+		eligible = false
+		reasons = append(reasons, "Minimum 6 months employment required")
+	}
+	if riskGrade == "E" {
+		eligible = false
+		reasons = append(reasons, "Risk grade E — below acceptable threshold")
+	}
+
+	// Compute max affordable amount based on 33% DTI
+	maxAffordableEMI := app.MonthlyIncome*0.33 - app.ExistingDebt
+	maxAmount := 0.0
+	if maxAffordableEMI > 0 && app.InterestRate > 0 {
+		monthlyRate := app.InterestRate / 12.0 / 100.0
+		n := float64(app.TenorMonths)
+		pow := 1.0
+		for i := 0; i < app.TenorMonths; i++ { pow *= (1 + monthlyRate) }
+		maxAmount = maxAffordableEMI * (pow - 1) / (monthlyRate * pow)
+	}
+
+	// Risk-adjusted interest rate
+	approvedRate := app.InterestRate
+	switch riskGrade {
+	case "C": approvedRate += 2.0
+	case "D": approvedRate += 4.0
+	case "E": approvedRate += 6.0
+	}
+
+	if len(reasons) == 0 { reasons = append(reasons, "All checks passed") }
+
+	return LoanDecision{
+		Eligible: eligible, MaxAmount: maxAmount, EMI: emi,
+		DTI: dti, LTV: ltv, RiskGrade: riskGrade,
+		InterestRate: approvedRate, Reasons: reasons,
+	}, nil
+}
+
+func handleLoanEvaluate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var app LoanApplication
+	if err := json.NewDecoder(r.Body).Decode(&app); err != nil {
+		respondJSON(w, 400, map[string]string{"error": "Invalid request body"})
+		return
+	}
+	if app.InterestRate == 0 { app.InterestRate = 24.0 } // CBN benchmark
+	if app.TenorMonths == 0 { app.TenorMonths = 12 }
+
+	decision, _ := validateLoanApplication(app)
+	respondJSON(w, 200, decision)
+}
+
+func handleEMICalculator(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		Principal float64 `json:"principal"`
+		Rate      float64 `json:"rate"`
+		Tenor     int     `json:"tenor_months"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	emi := calculateEMI(body.Principal, body.Rate, body.Tenor)
+	totalPayment := emi * float64(body.Tenor)
+	totalInterest := totalPayment - body.Principal
+
+	// Amortization schedule
+	schedule := []map[string]interface{}{}
+	balance := body.Principal
+	monthlyRate := body.Rate / 12.0 / 100.0
+	for m := 1; m <= body.Tenor; m++ {
+		interestPart := balance * monthlyRate
+		principalPart := emi - interestPart
+		balance -= principalPart
+		if balance < 0 { balance = 0 }
+		schedule = append(schedule, map[string]interface{}{
+			"month": m, "emi": round2(emi), "principal": round2(principalPart),
+			"interest": round2(interestPart), "balance": round2(balance),
+		})
+	}
+	respondJSON(w, 200, map[string]interface{}{
+		"emi": round2(emi), "total_payment": round2(totalPayment),
+		"total_interest": round2(totalInterest), "schedule": schedule,
+	})
+}
+
+func round2(v float64) float64 { return float64(int(v*100+0.5)) / 100 }
+
+
 func main() {
 
 	dbURL := os.Getenv("DATABASE_URL")
@@ -755,6 +929,8 @@ func main() {
 	mux.HandleFunc("/v1/applications", handleCreate)
 	mux.HandleFunc("/v1/applications/approve", handleProcess)
 	mux.HandleFunc("/v1/disbursements", handleProcess)
+	mux.HandleFunc("/v1/loans/evaluate", handleLoanEvaluate)
+	mux.HandleFunc("/v1/loans/emi-calculator", handleEMICalculator)
 	log.Printf("Loan Origination v3.0 (Lending, KYC enforced) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

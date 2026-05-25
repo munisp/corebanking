@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateInferenceRequest(model, prompt string, maxTokens int) (bool, string) {
+	if model == "" { return false, "Model name required" }
+	if prompt == "" { return false, "Prompt required" }
+	if maxTokens > 4096 { return false, "Max tokens cannot exceed 4096" }
+	return true, "Inference request valid"
+}
+func computeTokenCost(inputTokens, outputTokens int, model string) float64 {
+	rates := map[string]float64{"llama2": 0.001, "mistral": 0.0015, "codellama": 0.002}
+	rate := rates[model]
+	if rate == 0 { rate = 0.001 }
+	return float64(inputTokens+outputTokens) * rate
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9400" }

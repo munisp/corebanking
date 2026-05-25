@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateApprovalWorkflow(approverRole string, amount float64, workflowType string) (bool, string) {
+	thresholds := map[string]float64{"teller": 1000000, "supervisor": 10000000, "manager": 50000000, "director": 500000000}
+	limit := thresholds[approverRole]
+	if amount > limit { return false, fmt.Sprintf("Amount exceeds %s approval limit", approverRole) }
+	return true, "Approval within authority"
+}
+func computeEscalationPath(amount float64) []string {
+	if amount > 100000000 { return []string{"supervisor", "manager", "director", "board"} }
+	if amount > 50000000 { return []string{"supervisor", "manager", "director"} }
+	if amount > 10000000 { return []string{"supervisor", "manager"} }
+	return []string{"supervisor"}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9316" }

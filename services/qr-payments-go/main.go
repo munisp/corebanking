@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateQRPayment(amount float64, qrType, merchantID string) (bool, string) {
+	if amount <= 0 { return false, "Amount must be positive" }
+	if amount > 500000 { return false, "QR payment limit is ₦500,000" }
+	validTypes := map[string]bool{"static": true, "dynamic": true, "emv": true}
+	if !validTypes[qrType] { return false, "Invalid QR type" }
+	return true, "QR payment approved"
+}
+func computeQRCharge(amount float64) float64 {
+	fee := amount * 0.005
+	if fee > 500 { return 500 }
+	return fee
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9415" }

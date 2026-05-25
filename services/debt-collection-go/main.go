@@ -603,6 +603,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeDebtRecoveryPriority(daysPastDue int, amount float64, collateralCoverage float64) string {
+	if daysPastDue > 365 { return "write_off_candidate" }
+	if daysPastDue > 180 { return "legal_recovery" }
+	if daysPastDue > 90 { return "external_collection" }
+	if daysPastDue > 30 { return "internal_collection" }
+	return "watch_list"
+}
+func calculatePenaltyInterest(overdueAmount float64, daysPastDue int, penaltyRate float64) float64 {
+	return overdueAmount * penaltyRate / 100.0 * float64(daysPastDue) / 365.0
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9348" }

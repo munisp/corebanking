@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func detectDDoSPattern(requestsPerSecond int, uniqueIPs int, avgPayloadSize int) (bool, string) {
+	if requestsPerSecond > 10000 && uniqueIPs < 10 { return true, "Volumetric attack detected: high RPS from few IPs" }
+	if avgPayloadSize > 65000 { return true, "Amplification attack detected: oversized payloads" }
+	if requestsPerSecond > 50000 { return true, "DDoS threshold exceeded" }
+	return false, "Traffic pattern normal"
+}
+func computeMitigationAction(attackType string, severity float64) string {
+	if severity > 0.9 { return "blackhole_routing" }
+	if severity > 0.7 { return "rate_limit_aggressive" }
+	if severity > 0.5 { return "challenge_captcha" }
+	return "monitor"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9346" }

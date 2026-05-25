@@ -176,6 +176,33 @@ class Handler(BaseHTTPRequestHandler):
             "confidence": len(successful) / max(len(tool_results), 1),
         }
 
+
+    # ─── Domain Logic: Natural Language Reporting Agent ───────────────────────
+
+    def parse_report_query(self, query):
+        """Parse natural language query into structured report parameters."""
+        q = query.lower()
+        report_type = "custom"
+        period = "monthly"
+        metrics = []
+
+        if "daily" in q: period = "daily"
+        elif "weekly" in q: period = "weekly"
+        elif "quarterly" in q: period = "quarterly"
+        elif "annual" in q or "yearly" in q: period = "annual"
+
+        if "balance" in q or "position" in q: metrics.append("balance_summary")
+        if "loan" in q or "lending" in q: metrics.append("loan_portfolio")
+        if "profit" in q or "revenue" in q or "income" in q: metrics.append("income_statement")
+        if "risk" in q or "npl" in q: metrics.append("risk_metrics")
+        if "customer" in q or "account" in q: metrics.append("customer_metrics")
+
+        if "cbn" in q or "regulatory" in q: report_type = "regulatory"
+        elif "board" in q or "executive" in q: report_type = "executive"
+        elif "branch" in q: report_type = "branch_performance"
+
+        return {"report_type": report_type, "period": period, "metrics": metrics if metrics else ["summary"]}
+
     def do_GET(self):
         inc_requests()
         path = self.path.split("?")[0]

@@ -602,6 +602,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateGraphQLQuery(query string, maxDepth int) (bool, string) {
+	depth := 0; maxFound := 0
+	for _, c := range query { if c == '{' { depth++; if depth > maxFound { maxFound = depth } }; if c == '}' { depth-- } }
+	if maxFound > maxDepth { return false, fmt.Sprintf("Query depth %d exceeds max %d", maxFound, maxDepth) }
+	return true, "Query valid"
+}
+func computeQueryCost(fieldCount, depth int) int {
+	return fieldCount * depth
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9363" }

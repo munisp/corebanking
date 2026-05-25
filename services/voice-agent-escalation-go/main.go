@@ -603,6 +603,23 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateVoiceInput(transcription string, confidence float64) (bool, string) {
+	if confidence < 0.6 { return false, "Voice recognition confidence too low" }
+	if len(transcription) < 2 { return false, "Transcription too short" }
+	return true, "Voice input accepted"
+}
+func processVoiceCommand(intent string) (string, string) {
+	responses := map[string][2]string{
+		"check_balance": {"Your account balance is displayed on screen", "balance_response"},
+		"transfer": {"Please specify the amount and destination", "transfer_prompt"},
+		"help": {"You can check balance, transfer funds, or view statements", "help_response"},
+	}
+	r := responses[intent]
+	return r[0], r[1]
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9456" }

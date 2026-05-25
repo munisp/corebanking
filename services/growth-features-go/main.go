@@ -523,6 +523,17 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeCustomerLTV(avgMonthlyRevenue float64, churnRate float64) float64 {
+	if churnRate <= 0 { return avgMonthlyRevenue * 120 } // 10 year cap
+	return avgMonthlyRevenue / churnRate
+}
+func computeViralCoefficient(invitesSent, conversions int) float64 {
+	if invitesSent == 0 { return 0 }
+	return float64(conversions) / float64(invitesSent)
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8105" }

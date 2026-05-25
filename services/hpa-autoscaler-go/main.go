@@ -603,6 +603,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeTargetReplicas(currentRPS float64, targetRPSPerPod float64, minReplicas, maxReplicas int) int {
+	desired := int(currentRPS/targetRPSPerPod) + 1
+	if desired < minReplicas { return minReplicas }
+	if desired > maxReplicas { return maxReplicas }
+	return desired
+}
+func validateScalingPolicy(minReplicas, maxReplicas int, scaleUpPct, scaleDownPct int) (bool, string) {
+	if minReplicas < 1 { return false, "Min replicas must be >= 1" }
+	if maxReplicas < minReplicas { return false, "Max replicas must be >= min replicas" }
+	if scaleUpPct > 100 { return false, "Scale up percent cannot exceed 100" }
+	return true, "Scaling policy valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9367" }

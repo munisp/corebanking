@@ -603,6 +603,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateCoalescingWindow(windowMs int) (bool, string) {
+	if windowMs < 1 { return false, "Window must be at least 1ms" }
+	if windowMs > 5000 { return false, "Window cannot exceed 5 seconds" }
+	return true, "Coalescing window valid"
+}
+func computeCoalescingRatio(totalRequests, coalescedRequests int) float64 {
+	if totalRequests == 0 { return 0 }
+	return float64(coalescedRequests) / float64(totalRequests) * 100.0
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9421" }

@@ -603,6 +603,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateDaprBinding(bindingName, operation string) (bool, string) {
+	if bindingName == "" { return false, "Binding name required" }
+	validOps := map[string]bool{"create": true, "get": true, "delete": true, "list": true}
+	if !validOps[operation] { return false, "Invalid binding operation: " + operation }
+	return true, "Dapr binding valid"
+}
+func computeStateStoreTTL(stateType string) int {
+	ttls := map[string]int{"session": 1800, "cache": 300, "persistent": 0, "temp": 60}
+	return ttls[stateType]
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9343" }

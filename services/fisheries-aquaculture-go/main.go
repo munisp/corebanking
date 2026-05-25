@@ -603,6 +603,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateFisheriesLicense(vesselType string, tonnage float64, zone string) (bool, string) {
+	if tonnage <= 0 { return false, "Vessel tonnage must be positive" }
+	validZones := map[string]bool{"inshore": true, "offshore": true, "artisanal": true, "deep_sea": true}
+	if !validZones[zone] { return false, "Invalid fishing zone: " + zone }
+	return true, "Fisheries license valid"
+}
+func computeFisheriesLoanLimit(vesselValue, catchHistory float64) float64 {
+	return vesselValue*0.6 + catchHistory*2
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9360" }

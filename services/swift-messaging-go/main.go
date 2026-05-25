@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateSWIFTMessage(messageType, senderBIC, receiverBIC string) (bool, string) {
+	if len(senderBIC) != 8 && len(senderBIC) != 11 { return false, "Sender BIC must be 8 or 11 characters" }
+	if len(receiverBIC) != 8 && len(receiverBIC) != 11 { return false, "Receiver BIC must be 8 or 11 characters" }
+	validTypes := map[string]bool{"MT103": true, "MT202": true, "MT940": true, "MT950": true, "MT760": true}
+	if !validTypes[messageType] { return false, "Unsupported SWIFT message type: " + messageType }
+	return true, "SWIFT message valid"
+}
+func computeSWIFTCharge(messageType string, amount float64) float64 {
+	charges := map[string]float64{"MT103": 5000, "MT202": 3000, "MT940": 500, "MT950": 500, "MT760": 10000}
+	return charges[messageType]
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9439" }

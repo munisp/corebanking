@@ -926,6 +926,24 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateEntitlement(tenantPlan string, featureName string) (bool, string) {
+	plans := map[string][]string{
+		"starter": {"core_banking", "savings", "transfers"},
+		"professional": {"core_banking", "savings", "transfers", "loans", "cards", "forex"},
+		"enterprise": {"core_banking", "savings", "transfers", "loans", "cards", "forex", "trade_finance", "treasury", "open_banking"},
+	}
+	features := plans[tenantPlan]
+	for _, f := range features { if f == featureName { return true, "Feature available" } }
+	return false, fmt.Sprintf("Feature '%s' not available on %s plan", featureName, tenantPlan)
+}
+func computePlanUpgradeValue(currentPlan, targetPlan string, remainingDays int) float64 {
+	prices := map[string]float64{"starter": 50000, "professional": 200000, "enterprise": 500000}
+	dailyDiff := (prices[targetPlan] - prices[currentPlan]) / 30.0
+	return dailyDiff * float64(remainingDays)
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {

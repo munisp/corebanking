@@ -599,6 +599,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateCBNReturn(reportType, period string) (bool, string) {
+	validReports := map[string]bool{"MBR": true, "QBR": true, "EFASS": true, "NDIC": true, "NFIU_CTR": true, "NFIU_STR": true}
+	if !validReports[reportType] { return false, "Unknown CBN report type: " + reportType }
+	if period == "" { return false, "Reporting period required" }
+	return true, "CBN return valid"
+}
+func computeRegulatoryDeadline(reportType string, periodEnd int) int {
+	deadlines := map[string]int{"MBR": 15, "QBR": 30, "EFASS": 45, "NDIC": 30}
+	return deadlines[reportType] + periodEnd
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9330" }

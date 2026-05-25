@@ -507,6 +507,24 @@ func jwtMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateSecurityPolicy(passwordLength int, hasMFA bool, sessionTimeout int) (bool, []string) {
+	var issues []string
+	if passwordLength < 12 { issues = append(issues, "Password must be at least 12 characters") }
+	if !hasMFA { issues = append(issues, "MFA is required for all accounts") }
+	if sessionTimeout > 3600 { issues = append(issues, "Session timeout cannot exceed 1 hour") }
+	return len(issues) == 0, issues
+}
+func computeSecurityScore(hasMFA bool, passwordStrength, patchLevel int) float64 {
+	score := 0.0
+	if hasMFA { score += 30 }
+	score += float64(passwordStrength) * 3
+	score += float64(patchLevel) * 2
+	if score > 100 { return 100 }
+	return score
+}
+
+
 func main() {
 
 	dbURL := os.Getenv("DATABASE_URL")

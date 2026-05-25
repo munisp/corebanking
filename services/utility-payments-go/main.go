@@ -603,6 +603,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateUtilityPayment(billerCode, customerRef string, amount float64) (bool, string) {
+	if billerCode == "" { return false, "Biller code required" }
+	if customerRef == "" { return false, "Customer reference required" }
+	if amount <= 0 { return false, "Amount must be positive" }
+	return true, "Utility payment valid"
+}
+func computeUtilityCharge(amount float64) float64 {
+	return 100 // Flat ₦100 charge
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9455" }

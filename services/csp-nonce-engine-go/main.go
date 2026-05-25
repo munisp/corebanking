@@ -603,6 +603,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateCSPDirective(directive string) (bool, string) {
+	valid := map[string]bool{"default-src": true, "script-src": true, "style-src": true, "img-src": true, "connect-src": true, "font-src": true, "frame-src": true}
+	if !valid[directive] { return false, "Unknown CSP directive: " + directive }
+	return true, "CSP directive valid"
+}
+func computeCSPHeader(directives map[string]string) string {
+	result := ""
+	for k, v := range directives { result += k + " " + v + "; " }
+	return result
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9339" }

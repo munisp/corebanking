@@ -263,6 +263,31 @@ class TenantHandler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+
+    # ─── Domain Logic: Tenant Management ─────────────────────────────────────
+
+    def validate_tenant_configuration(self, config):
+        """Validate multi-tenant configuration."""
+        errors = []
+        if not config.get("tenant_id"): errors.append("Tenant ID required")
+        if not config.get("tenant_name"): errors.append("Tenant name required")
+        max_users = config.get("max_users", 0)
+        if max_users < 1: errors.append("Max users must be >= 1")
+        plan = config.get("plan", "")
+        valid_plans = {"starter", "professional", "enterprise"}
+        if plan not in valid_plans: errors.append(f"Invalid plan: {plan}")
+        return {"valid": len(errors) == 0, "errors": errors}
+
+    def compute_tenant_billing(self, usage):
+        """Compute tenant billing based on usage metrics."""
+        plan_rates = {"starter": 50000, "professional": 200000, "enterprise": 500000}
+        base = plan_rates.get(usage.get("plan", "starter"), 100000)
+        users = usage.get("active_users", 0)
+        storage_gb = usage.get("storage_gb", 0)
+        api_calls = usage.get("api_calls", 0)
+        extra = max(0, users - 10) * 5000 + storage_gb * 500 + max(0, api_calls - 100000) * 0.01
+        return {"base_charge": base, "overage": round(extra, 2), "total": round(base + extra, 2)}
+
     def do_GET(self):
         path = self.path.split("?")[0]
 

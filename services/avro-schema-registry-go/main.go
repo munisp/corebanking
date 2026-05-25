@@ -601,6 +601,15 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateSchemaCompatibility(existingFields, newFields int, hasBreakingChange bool) (bool, string) {
+	if hasBreakingChange { return false, "Breaking schema change detected — use new version" }
+	if newFields < existingFields { return false, "Cannot remove fields — backward incompatible" }
+	return true, "Schema compatible"
+}
+func computeSchemaVersion(currentVersion int) int { return currentVersion + 1 }
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9318" }

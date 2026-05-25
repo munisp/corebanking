@@ -78,6 +78,41 @@ def call_service(method, url, data=None):
 
 PORT = int(os.environ.get("PORT", "8080"))
 
+
+# ─── Domain Logic: Knowledge Graph QA ────────────────────────────────────────
+
+def extract_entities(query):
+    """Extract financial entities from natural language query."""
+    import re
+    entities = []
+    # Account numbers
+    for m in re.finditer(r"\b\d{10}\b", query):
+        entities.append({"type": "account_number", "value": m.group()})
+    # BVN
+    for m in re.finditer(r"\b22\d{9}\b", query):
+        entities.append({"type": "bvn", "value": m.group()})
+    # Amounts
+    for m in re.finditer(r"[₦N]?\s*([\d,]+\.?\d*)", query):
+        entities.append({"type": "amount", "value": m.group(1).replace(",", "")})
+    # Dates
+    for m in re.finditer(r"\d{4}-\d{2}-\d{2}", query):
+        entities.append({"type": "date", "value": m.group()})
+    return entities
+
+def generate_cypher_query(intent, entities):
+    """Generate Cypher query from intent and entities."""
+    templates = {
+        "find_account": "MATCH (a:Account {{number: '{account_number}'}}) RETURN a",
+        "find_customer": "MATCH (c:Customer)-[:OWNS]->(a:Account) WHERE c.bvn = '{bvn}' RETURN c, a",
+        "find_transactions": "MATCH (a:Account {{number: '{account_number}'}})-[:HAS_TXN]->(t:Transaction) RETURN t ORDER BY t.date DESC LIMIT 10",
+    }
+    params = {}
+    for e in entities: params[e["type"]] = e["value"]
+    template = templates.get(intent, "MATCH (n) RETURN n LIMIT 10")
+    try: return template.format(**params)
+    except KeyError: return template
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):

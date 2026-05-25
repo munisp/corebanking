@@ -603,6 +603,23 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func assessPaymentFailure(errorCode string, amount float64, channel string) (string, string) {
+	switch errorCode {
+	case "51": return "Insufficient funds", "Retry after funding"
+	case "06": return "System error", "Auto-retry in 5 minutes"
+	case "12": return "Invalid transaction", "Check beneficiary details"
+	case "91": return "Issuer unavailable", "Retry in 30 minutes"
+	case "96": return "System malfunction", "Escalate to NIBSS"
+	default: return "Unknown error: " + errorCode, "Manual investigation required"
+	}
+}
+func computeRefundAmount(originalAmount, fee float64, hoursElapsed int) float64 {
+	if hoursElapsed > 24 { return originalAmount } // Full refund after 24h
+	return originalAmount + fee // Refund including fee
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9404" }

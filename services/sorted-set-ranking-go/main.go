@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeLeaderboard(scores map[string]float64, limit int) []map[string]interface{} {
+	type entry struct { key string; score float64 }
+	entries := make([]entry, 0, len(scores))
+	for k, v := range scores { entries = append(entries, entry{k, v}) }
+	for i := 0; i < len(entries); i++ { for j := i+1; j < len(entries); j++ { if entries[j].score > entries[i].score { entries[i], entries[j] = entries[j], entries[i] } } }
+	result := []map[string]interface{}{}
+	for i, e := range entries { if i >= limit { break }; result = append(result, map[string]interface{}{"rank": i+1, "key": e.key, "score": e.score}) }
+	return result
+}
+func validateRangeQuery(min, max float64) (bool, string) {
+	if min > max { return false, "Min must be <= max" }
+	return true, "Range valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9433" }

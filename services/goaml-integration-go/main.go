@@ -610,6 +610,27 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func assessAMLRisk(amount float64, isStructured, isPEP bool, country string) (string, float64) {
+	score := 0.0
+	if amount > 5000000 { score += 20 }
+	if amount > 50000000 { score += 30 }
+	if isStructured { score += 35 }
+	if isPEP { score += 25 }
+	highRisk := map[string]bool{"IR": true, "KP": true, "SY": true, "AF": true, "MM": true}
+	if highRisk[country] { score += 30 }
+	if score > 70 { return "HIGH", score }
+	if score > 40 { return "MEDIUM", score }
+	return "LOW", score
+}
+func validateSTRFiling(caseID, narration string, amount float64) (bool, string) {
+	if caseID == "" { return false, "Case ID required for STR filing" }
+	if narration == "" { return false, "Narration required for STR" }
+	if amount < 1000000 { return false, "CTR threshold is ₦1M (NFIU)" }
+	return true, "Valid for filing"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9362" }

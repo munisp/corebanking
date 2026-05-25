@@ -602,6 +602,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateUSSDSession(sessionID string, inputLength int) (bool, string) {
+	if sessionID == "" { return false, "Session ID required" }
+	if inputLength > 160 { return false, "USSD input exceeds 160 chars" }
+	return true, "Session valid"
+}
+func computeUSSDCharge(transactionAmount float64) float64 {
+	if transactionAmount <= 5000 { return 6.98 }
+	return 6.98 // Flat USSD charge per session
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9453" }

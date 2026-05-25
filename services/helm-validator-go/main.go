@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateHelmValues(replicas int, cpuLimit, memLimit string) (bool, []string) {
+	var issues []string
+	if replicas < 1 { issues = append(issues, "Replicas must be >= 1") }
+	if replicas > 100 { issues = append(issues, "Replicas exceeds max of 100") }
+	if cpuLimit == "" { issues = append(issues, "CPU limit required") }
+	if memLimit == "" { issues = append(issues, "Memory limit required") }
+	return len(issues) == 0, issues
+}
+func computeResourceQuota(services int) map[string]string {
+	cpuCores := services * 2
+	memGB := services * 4
+	return map[string]string{"cpu": fmt.Sprintf("%d", cpuCores), "memory": fmt.Sprintf("%dGi", memGB)}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9366" }

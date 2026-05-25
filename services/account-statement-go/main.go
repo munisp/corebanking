@@ -520,6 +520,61 @@ func sanitizeInput(s string) string {
 	return s
 }
 
+
+// ─── Domain Logic: Account Statement ────────────────────────────────────────
+
+func computeStatementSummary(transactions []map[string]interface{}) map[string]interface{} {
+	totalCredits := 0.0
+	totalDebits := 0.0
+	creditCount := 0
+	debitCount := 0
+	for _, txn := range transactions {
+		if amt, ok := txn["amount"].(float64); ok {
+			if txnType, _ := txn["type"].(string); txnType == "credit" {
+				totalCredits += amt
+				creditCount++
+			} else {
+				totalDebits += amt
+				debitCount++
+			}
+		}
+	}
+	return map[string]interface{}{
+		"total_credits": totalCredits, "total_debits": totalDebits,
+		"credit_count": creditCount, "debit_count": debitCount,
+		"net_movement": totalCredits - totalDebits,
+		"transaction_count": creditCount + debitCount,
+	}
+}
+
+func validateStatementRequest(startDate, endDate, format string) (bool, string) {
+	if startDate == "" || endDate == "" { return false, "Start and end dates required" }
+	if format != "" && format != "pdf" && format != "csv" && format != "mt940" {
+		return false, "Supported formats: pdf, csv, mt940"
+	}
+	return true, "Valid request"
+}
+
+func handleStatementSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body struct {
+		AccountID    string                   `json:"account_id"`
+		StartDate    string                   `json:"start_date"`
+		EndDate      string                   `json:"end_date"`
+		Format       string                   `json:"format"`
+		Transactions []map[string]interface{} `json:"transactions"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	valid, reason := validateStatementRequest(body.StartDate, body.EndDate, body.Format)
+	if !valid { respondJSON(w, 400, map[string]string{"error": reason}); return }
+	summary := computeStatementSummary(body.Transactions)
+	respondJSON(w, 200, map[string]interface{}{
+		"account_id": body.AccountID, "period": map[string]string{"start": body.StartDate, "end": body.EndDate},
+		"summary": summary, "format": body.Format,
+	})
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }
@@ -542,6 +597,7 @@ func main() {
 
 	mux.HandleFunc("/v1/account-statement/score", account_statementScoreHandler)
 	mux.HandleFunc("/v1/account-statement/validate", account_statementValidateRequestHandler)
+	mux.HandleFunc("/v1/statements/summary", handleStatementSummary)
 	log.Printf("account-statement-go listening on port %s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert

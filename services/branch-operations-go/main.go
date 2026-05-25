@@ -603,6 +603,24 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateBranchOperation(operationType string, amount float64, authLevel int) (bool, string) {
+	thresholds := map[int]float64{1: 1000000, 2: 10000000, 3: 100000000}
+	maxAmount := thresholds[authLevel]
+	if amount > maxAmount { return false, fmt.Sprintf("Amount ₦%.2f exceeds auth level %d limit", amount, authLevel) }
+	return true, "Operation approved"
+}
+func computeTellerBalance(openingBalance float64, credits, debits []float64) map[string]float64 {
+	totalCredits := 0.0; totalDebits := 0.0
+	for _, c := range credits { totalCredits += c }
+	for _, d := range debits { totalDebits += d }
+	return map[string]float64{
+		"opening_balance": openingBalance, "total_credits": totalCredits,
+		"total_debits": totalDebits, "closing_balance": openingBalance + totalCredits - totalDebits,
+	}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9325" }

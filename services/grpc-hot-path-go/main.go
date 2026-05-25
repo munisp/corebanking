@@ -603,6 +603,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateGRPCRequest(serviceName, methodName string, payloadSize int) (bool, string) {
+	if serviceName == "" { return false, "Service name required" }
+	if methodName == "" { return false, "Method name required" }
+	if payloadSize > 4194304 { return false, "Payload exceeds 4MB gRPC limit" }
+	return true, "gRPC request valid"
+}
+func computeDeadline(methodType string) int {
+	deadlines := map[string]int{"unary": 30, "server_stream": 120, "client_stream": 120, "bidi_stream": 300}
+	return deadlines[methodType]
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9365" }

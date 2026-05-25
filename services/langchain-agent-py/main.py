@@ -78,6 +78,32 @@ def call_service(method, url, data=None):
 
 PORT = int(os.environ.get("PORT", "8080"))
 
+
+# ─── Domain Logic: LangChain Agent ───────────────────────────────────────────
+
+def parse_banking_intent(query):
+    """Parse banking intent from natural language query."""
+    q = query.lower()
+    if any(w in q for w in ["balance", "how much", "account"]): return "check_balance"
+    if any(w in q for w in ["transfer", "send", "pay"]): return "transfer_funds"
+    if any(w in q for w in ["loan", "borrow", "credit"]): return "loan_inquiry"
+    if any(w in q for w in ["rate", "exchange", "fx"]): return "fx_rates"
+    if any(w in q for w in ["block", "freeze", "card"]): return "card_services"
+    return "general_inquiry"
+
+def generate_response(intent, context=None):
+    """Generate response based on parsed intent."""
+    responses = {
+        "check_balance": "I can help you check your account balance. Please provide your account number.",
+        "transfer_funds": "To transfer funds, I need: destination account, amount, and bank name.",
+        "loan_inquiry": "We offer personal loans from ₦50,000 to ₦50M. What amount do you need?",
+        "fx_rates": "Current indicative rates: USD/NGN 1,590, GBP/NGN 2,010, EUR/NGN 1,735.",
+        "card_services": "I can help with card blocking, PIN reset, and card requests.",
+        "general_inquiry": "How can I help you today? I can assist with balances, transfers, loans, FX rates, and more.",
+    }
+    return {"intent": intent, "response": responses.get(intent, responses["general_inquiry"])}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):

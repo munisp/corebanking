@@ -481,6 +481,20 @@ func sanitizeInput(s string) string {
 	return s
 }
 
+
+func validateVirtualAccount(parentAccount, currency string, dailyLimit float64) (bool, string) {
+	if parentAccount == "" { return false, "Parent account required" }
+	validCurrencies := map[string]bool{"NGN": true, "USD": true, "GBP": true, "EUR": true}
+	if !validCurrencies[currency] { return false, "Unsupported currency: " + currency }
+	if dailyLimit <= 0 { return false, "Daily limit must be positive" }
+	return true, "Virtual account valid"
+}
+func computeVirtualAccountFee(transactionCount int) float64 {
+	if transactionCount <= 100 { return 5000 }
+	return 5000 + float64(transactionCount-100)*25
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }

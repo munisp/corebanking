@@ -603,6 +603,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateConsentRequest(scope string, expiryDays int) (bool, string) {
+	validScopes := map[string]bool{"accounts": true, "payments": true, "balance": true, "transactions": true}
+	if !validScopes[scope] { return false, "Invalid consent scope: " + scope }
+	if expiryDays > 90 { return false, "Consent validity cannot exceed 90 days" }
+	return true, "Consent request valid"
+}
+func computeTPPCharge(apiCalls int) float64 {
+	if apiCalls <= 1000 { return 0 }
+	return float64(apiCalls-1000) * 0.05
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9401" }

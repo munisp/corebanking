@@ -608,6 +608,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateGuaranteeApplication(loanAmount, guaranteePct float64, sector string) (bool, string) {
+	validSectors := map[string]bool{"agriculture": true, "manufacturing": true, "sme": true, "agro_processing": true}
+	if !validSectors[sector] { return false, "Sector not eligible for NIRSAL guarantee" }
+	if guaranteePct > 75 { return false, "Maximum NIRSAL guarantee is 75% of loan" }
+	return true, "NIRSAL guarantee application valid"
+}
+func computeGuaranteeFee(loanAmount, guaranteePct float64) float64 {
+	guaranteeAmount := loanAmount * guaranteePct / 100
+	return guaranteeAmount * 0.01 // 1% guarantee fee
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9397" }

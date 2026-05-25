@@ -603,6 +603,19 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateIdempotencyKey(key string) (bool, string) {
+	if len(key) < 16 { return false, "Idempotency key must be at least 16 characters" }
+	if len(key) > 128 { return false, "Idempotency key must not exceed 128 characters" }
+	return true, "Valid idempotency key"
+}
+func computeKeyExpiry(operationType string) int {
+	expiryMap := map[string]int{"payment": 86400, "transfer": 86400, "query": 300, "default": 3600}
+	if v, ok := expiryMap[operationType]; ok { return v }
+	return expiryMap["default"]
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9369" }

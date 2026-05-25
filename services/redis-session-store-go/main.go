@@ -602,6 +602,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeCacheEvictionPolicy(memoryUsedPct float64, keyCount int) string {
+	if memoryUsedPct > 90 { return "allkeys-lru" }
+	if memoryUsedPct > 70 { return "volatile-lru" }
+	if keyCount > 1000000 { return "allkeys-lfu" }
+	return "noeviction"
+}
+func validateCacheEntry(key string, ttlSeconds int) (bool, string) {
+	if key == "" { return false, "Cache key required" }
+	if ttlSeconds > 86400 { return false, "Max TTL is 24 hours (86400 seconds)" }
+	return true, "Cache entry valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9417" }

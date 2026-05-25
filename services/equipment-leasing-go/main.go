@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeLeasePayment(assetValue, residualValue float64, termMonths int, annualRate float64) float64 {
+	if annualRate == 0 { return (assetValue - residualValue) / float64(termMonths) }
+	r := annualRate / 12 / 100
+	pv := assetValue - residualValue
+	pow := 1.0; for i := 0; i < termMonths; i++ { pow *= (1 + r) }
+	return pv * r * pow / (pow - 1)
+}
+func validateLeaseApplication(assetValue, clientRevenue float64) (bool, string) {
+	if assetValue > clientRevenue*0.3 { return false, "Lease value exceeds 30% of annual revenue" }
+	return true, "Lease application valid"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9352" }

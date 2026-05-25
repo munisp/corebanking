@@ -603,6 +603,32 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateIdentityDocument(documentType, documentNumber string) (bool, string) {
+	switch documentType {
+	case "bvn":
+		if len(documentNumber) != 11 { return false, "BVN must be 11 digits" }
+	case "nin":
+		if len(documentNumber) != 11 { return false, "NIN must be 11 digits" }
+	case "passport":
+		if len(documentNumber) < 8 { return false, "Invalid passport number" }
+	case "drivers_license":
+		if len(documentNumber) < 10 { return false, "Invalid driver's license number" }
+	default:
+		return false, "Unknown document type: " + documentType
+	}
+	return true, "Document valid"
+}
+func computeVerificationScore(bvnVerified, ninVerified, addressVerified, livenessVerified bool) float64 {
+	score := 0.0
+	if bvnVerified { score += 30 }
+	if ninVerified { score += 25 }
+	if addressVerified { score += 20 }
+	if livenessVerified { score += 25 }
+	return score
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9370" }

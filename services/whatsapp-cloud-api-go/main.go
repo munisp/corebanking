@@ -508,6 +508,18 @@ func sanitizeInput(s string) string {
 	return s
 }
 
+
+func validateWhatsAppMessage(phoneNumber, templateName string) (bool, string) {
+	if len(phoneNumber) < 10 { return false, "Invalid WhatsApp number" }
+	if templateName == "" { return false, "Template name required for business messaging" }
+	return true, "WhatsApp message valid"
+}
+func computeWhatsAppCost(messageType string, count int) float64 {
+	rates := map[string]float64{"utility": 0.005, "authentication": 0.005, "marketing": 0.025, "service": 0}
+	return rates[messageType] * float64(count) * 750 // Rate in NGN
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }

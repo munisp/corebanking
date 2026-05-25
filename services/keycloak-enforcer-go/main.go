@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateKeyRotation(keyAge int, keyType string) (bool, string) {
+	maxAge := map[string]int{"aes256": 90, "rsa2048": 365, "hmac": 180, "api_key": 90}
+	max := maxAge[keyType]
+	if max == 0 { max = 90 }
+	if keyAge > max { return false, fmt.Sprintf("Key expired: age %d days exceeds max %d for %s", keyAge, max, keyType) }
+	return true, "Key within rotation policy"
+}
+func computeNextRotation(lastRotated int, keyType string) int {
+	periods := map[string]int{"aes256": 90, "rsa2048": 365, "hmac": 180}
+	p := periods[keyType]
+	if p == 0 { p = 90 }
+	return p - lastRotated
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9381" }

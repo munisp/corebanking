@@ -608,6 +608,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func computeDepreciation(cost, salvageValue float64, usefulLifeYears int, method string) float64 {
+	if method == "straight_line" {
+		return (cost - salvageValue) / float64(usefulLifeYears)
+	}
+	// Double declining balance
+	rate := 2.0 / float64(usefulLifeYears)
+	return cost * rate
+}
+func validateAssetDisposal(bookValue, salePrice float64) (float64, string) {
+	pnl := salePrice - bookValue
+	if pnl > 0 { return pnl, "Gain on disposal" }
+	return pnl, "Loss on disposal"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9361" }

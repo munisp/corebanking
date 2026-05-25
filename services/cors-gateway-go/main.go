@@ -602,6 +602,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateCORSOrigin(origin string, allowedOrigins []string) bool {
+	for _, o := range allowedOrigins { if o == origin || o == "*" { return true } }
+	return false
+}
+func computeCORSHeaders(origin, method string) map[string]string {
+	return map[string]string{
+		"Access-Control-Allow-Origin": origin, "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
+		"Access-Control-Allow-Headers": "Content-Type,Authorization,X-Tenant-ID",
+		"Access-Control-Max-Age": "86400",
+	}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9337" }

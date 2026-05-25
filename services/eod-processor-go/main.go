@@ -603,6 +603,25 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateEODPrerequisites(openTransactions, pendingApprovals int, glBalanced bool) (bool, []string) {
+	var issues []string
+	if openTransactions > 0 { issues = append(issues, fmt.Sprintf("%d open transactions must be resolved", openTransactions)) }
+	if pendingApprovals > 0 { issues = append(issues, fmt.Sprintf("%d pending approvals must be actioned", pendingApprovals)) }
+	if !glBalanced { issues = append(issues, "GL trial balance is not balanced") }
+	return len(issues) == 0, issues
+}
+func computeEODAccruals(loanPortfolio, depositPortfolio float64, avgLendingRate, avgDepositRate float64) map[string]float64 {
+	loanAccrual := loanPortfolio * avgLendingRate / 100.0 / 365.0
+	depositAccrual := depositPortfolio * avgDepositRate / 100.0 / 365.0
+	return map[string]float64{
+		"loan_interest_accrual": float64(int(loanAccrual*100)) / 100,
+		"deposit_interest_accrual": float64(int(depositAccrual*100)) / 100,
+		"net_interest_margin_daily": float64(int((loanAccrual-depositAccrual)*100)) / 100,
+	}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9351" }

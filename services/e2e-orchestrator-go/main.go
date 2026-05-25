@@ -603,6 +603,20 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func validateE2ETestSuite(testCount int, coveragePct float64) (bool, string) {
+	if testCount < 1 { return false, "At least 1 test required" }
+	if coveragePct < 80 { return false, fmt.Sprintf("Coverage %.1f%% below 80%% threshold", coveragePct) }
+	return true, "E2E test suite valid"
+}
+func computeTestPriority(lastRunDays int, failureRate float64) string {
+	if failureRate > 0.2 { return "critical" }
+	if lastRunDays > 7 { return "high" }
+	if lastRunDays > 3 { return "medium" }
+	return "low"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9350" }

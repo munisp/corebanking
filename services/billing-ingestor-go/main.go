@@ -603,6 +603,22 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+func calculateBillingAmount(plan string, users int, apiCalls int) float64 {
+	planRates := map[string]float64{"starter": 50000, "professional": 200000, "enterprise": 500000}
+	base := planRates[plan]
+	if base == 0 { base = 100000 }
+	extra := 0.0
+	if users > 10 { extra += float64(users-10) * 5000 }
+	if apiCalls > 100000 { extra += float64(apiCalls-100000) * 0.01 }
+	return base + extra
+}
+func validateBillingPeriod(startDate, endDate string) (bool, string) {
+	if startDate == "" || endDate == "" { return false, "Billing period dates required" }
+	return true, "Valid billing period"
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9322" }
