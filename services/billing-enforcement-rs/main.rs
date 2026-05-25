@@ -94,6 +94,50 @@ fn default_overage_policies() -> Vec<OveragePolicy> {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// DOMAIN LOGIC
+// ═══════════════════════════════════════════════════════════════════════════════
+
+fn compute_overage_charge(usage: u64, included_limit: u64, rate_ngn: i64, hard_cap: Option<u64>) -> i64 {
+    if usage <= included_limit { return 0; }
+    let excess = usage - included_limit;
+    let capped = match hard_cap {
+        Some(cap) => excess.min(cap - included_limit),
+        None => excess,
+    };
+    capped as i64 * rate_ngn
+}
+
+fn validate_invoice(invoice: &BillingInvoice) -> Vec<String> {
+    let mut errors = Vec::new();
+    if invoice.tenant_id.is_empty() { errors.push("Tenant ID required".into()); }
+    if invoice.period.is_empty() { errors.push("Period required".into()); }
+    let computed_total = invoice.base_fee_ngn + invoice.addon_fees_ngn + invoice.overage_fees_ngn;
+    if computed_total != invoice.total_ngn {
+        errors.push(format!("Total mismatch: computed {} != stated {}", computed_total, invoice.total_ngn));
+    }
+    if invoice.base_fee_ngn < 0 { errors.push("Base fee cannot be negative".into()); }
+    errors
+}
+
+fn check_suspension_eligibility(overdue_days: u32, suspend_after: u32, total_owed: i64, threshold: i64) -> (bool, String) {
+    if overdue_days > suspend_after && total_owed > threshold {
+        (true, format!("Suspend: {}d overdue, ₦{} owed", overdue_days, total_owed))
+    } else {
+        (false, "Within grace period".into())
+    }
+}
+
+fn compute_tier_pricing(tier: &str, active_users: u32, api_calls: u64) -> i64 {
+    match tier {
+        "starter" => 500_000,
+        "professional" => 5_000_000 + (active_users.saturating_sub(100) as i64 * 5_000),
+        "enterprise" => 25_000_000 + (api_calls.saturating_sub(1_000_000) as i64),
+        "gold_partner" => 20_000_000,
+        _ => 1_000_000,
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // SIMULATED DATA
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -196,7 +240,21 @@ struct ApiResponse<T: serde::Serialize> {
     middleware: serde_json::Value,
 }
 
+fn validate_overage_policy(policy: &OveragePolicy) -> Vec<String> {
+    let mut errors = Vec::new();
+    if policy.feature.is_empty() { errors.push("Feature name required".into()); }
+    if policy.included_limit == 0 { errors.push("Included limit must be > 0".into()); }
+    if policy.overage_rate_ngn <= 0 { errors.push("Overage rate must be positive".into()); }
+    if policy.suspend_after_days == 0 { errors.push("Suspension threshold must be > 0 days".into()); }
+    if let Some(cap) = policy.hard_cap {
+        if cap <= policy.included_limit { errors.push("Hard cap must exceed included limit".into()); }
+    }
+    errors
+}
+
 fn main() {
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
+    if !db_url.is_empty() { println!("[billing-enforcement-rs] DB configured: {}", &db_url[..db_url.len().min(30)]); }
     let port = std::env::var("PORT").unwrap_or_else(|_| "8108".to_string());
     let meters = Arc::new(RwLock::new(sample_meters()));
     let invoices = Arc::new(RwLock::new(sample_invoices()));

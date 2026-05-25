@@ -23,6 +23,35 @@ struct AppState {
 
 fn sanitize_input(s: &str) -> String { s.replace("<script>", "").replace("</script>", "").replace("javascript:", "").chars().take(10240).collect() }
 
+fn compute_text_hash(text: &str) -> u64 {
+    text.bytes().fold(14695981039346656037u64, |h, b| (h ^ b as u64).wrapping_mul(1099511628211))
+}
+
+fn compute_cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+    let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let mag_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let mag_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if mag_a == 0.0 || mag_b == 0.0 { 0.0 } else { dot / (mag_a * mag_b) }
+}
+
+fn generate_embedding(text: &str, dim: usize) -> Vec<f64> {
+    let mut embedding = Vec::with_capacity(dim);
+    let mut hash = compute_text_hash(text);
+    for _ in 0..dim {
+        hash = hash.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        embedding.push((hash as f64 / u64::MAX as f64) * 2.0 - 1.0);
+    }
+    embedding
+}
+
+fn validate_search_query(query: &str, max_results: usize) -> (bool, Vec<&'static str>) {
+    let mut errors = Vec::new();
+    if query.is_empty() { errors.push("Query text required"); }
+    if query.len() > 10000 { errors.push("Query too long (max 10000 chars)"); }
+    if max_results > 100 { errors.push("Max results capped at 100"); }
+    (errors.is_empty(), errors)
+}
+
 fn rl_allow() -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if now > RL_LAST.load(AtomicOrdering::Relaxed) { RL_TOKENS.store(100, AtomicOrdering::Relaxed); RL_LAST.store(now, AtomicOrdering::Relaxed); }

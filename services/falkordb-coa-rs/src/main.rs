@@ -23,6 +23,43 @@ struct AppState {
 
 fn sanitize_input(s: &str) -> String { s.replace("<script>", "").replace("</script>", "").replace("javascript:", "").chars().take(10240).collect() }
 
+fn validate_gl_code(code: &str) -> (bool, &'static str) {
+    if code.is_empty() { return (false, "GL code required"); }
+    if code.len() < 4 { return (false, "GL code must be at least 4 digits"); }
+    match code.chars().next() {
+        Some('1') => (true, "Assets"),
+        Some('2') => (true, "Liabilities"),
+        Some('3') => (true, "Equity"),
+        Some('4') => (true, "Revenue"),
+        Some('5') => (true, "Expenses"),
+        _ => (false, "Invalid GL prefix"),
+    }
+}
+
+fn compute_hierarchy_depth(parent_chain: &[&str]) -> usize {
+    parent_chain.len()
+}
+
+fn validate_double_entry(debit_total: f64, credit_total: f64) -> (bool, f64) {
+    let diff = (debit_total - credit_total).abs();
+    (diff < 0.01, diff)
+}
+
+fn classify_account_category(gl_code: &str) -> &'static str {
+    match gl_code.chars().next() {
+        Some('1') if gl_code.starts_with("11") => "current_assets",
+        Some('1') if gl_code.starts_with("12") => "fixed_assets",
+        Some('1') => "other_assets",
+        Some('2') if gl_code.starts_with("21") => "current_liabilities",
+        Some('2') => "long_term_liabilities",
+        Some('3') => "shareholders_equity",
+        Some('4') => "operating_revenue",
+        Some('5') if gl_code.starts_with("51") => "operating_expenses",
+        Some('5') => "non_operating_expenses",
+        _ => "unclassified",
+    }
+}
+
 fn rl_allow() -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if now > RL_LAST.load(AtomicOrdering::Relaxed) { RL_TOKENS.store(100, AtomicOrdering::Relaxed); RL_LAST.store(now, AtomicOrdering::Relaxed); }

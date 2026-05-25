@@ -73,6 +73,28 @@ struct AppState {
     configs: Mutex<Vec<CBConfig>>,
 }
 
+fn compute_failure_rate(failures: u32, total: u64) -> f64 {
+    if total == 0 { return 0.0; }
+    failures as f64 / total as f64 * 100.0
+}
+
+fn evaluate_health_score(failure_rate: f64, p99_latency: f64, timeouts: u64, total: u64) -> f64 {
+    let timeout_rate = if total > 0 { timeouts as f64 / total as f64 } else { 0.0 };
+    let latency_penalty = if p99_latency > 1000.0 { 20.0 } else if p99_latency > 500.0 { 10.0 } else { 0.0 };
+    let base = 100.0 - failure_rate - timeout_rate * 100.0 - latency_penalty;
+    if base < 0.0 { 0.0 } else { base }
+}
+
+fn check_should_trip(failure_count: u32, threshold: u32, window_failures: &[u64], min_requests: u64) -> bool {
+    let total: u64 = window_failures.iter().sum();
+    failure_count >= threshold && total >= min_requests
+}
+
+fn compute_backoff_delay(attempt: u32, base_ms: u64, max_ms: u64, multiplier: f64) -> u64 {
+    let delay = base_ms as f64 * multiplier.powi(attempt as i32);
+    (delay as u64).min(max_ms)
+}
+
 fn seed_breakers() -> Vec<CircuitBreaker> {
     let services = vec![
         ("core-banking-go", 8090, "closed", 0, 45200, "seed_data_fallback"),

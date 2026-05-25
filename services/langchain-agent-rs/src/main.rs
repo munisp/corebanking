@@ -23,6 +23,33 @@ struct AppState {
 
 fn sanitize_input(s: &str) -> String { s.replace("<script>", "").replace("</script>", "").replace("javascript:", "").chars().take(10240).collect() }
 
+fn parse_banking_intent(query: &str) -> &'static str {
+    let q = query.to_lowercase();
+    if q.contains("balance") || q.contains("how much") || q.contains("account") { "check_balance" }
+    else if q.contains("transfer") || q.contains("send") || q.contains("pay") { "transfer_funds" }
+    else if q.contains("loan") || q.contains("borrow") || q.contains("credit") { "loan_inquiry" }
+    else if q.contains("rate") || q.contains("exchange") || q.contains("fx") { "fx_rates" }
+    else if q.contains("block") || q.contains("freeze") || q.contains("card") { "card_services" }
+    else if q.contains("complaint") || q.contains("issue") || q.contains("problem") { "complaint" }
+    else { "general_inquiry" }
+}
+
+fn generate_response(intent: &str) -> &'static str {
+    match intent {
+        "check_balance" => "I can help you check your account balance. Please provide your account number.",
+        "transfer_funds" => "To transfer funds, I need: destination account, amount, and bank name.",
+        "loan_inquiry" => "We offer personal loans from ₦50,000 to ₦50M. What amount and tenor do you need?",
+        "fx_rates" => "Current indicative rates: USD/NGN 1,590, GBP/NGN 2,010, EUR/NGN 1,735.",
+        "card_services" => "I can help with card blocking, PIN reset, and new card requests.",
+        "complaint" => "I'm sorry about the issue. Let me connect you to our complaints desk.",
+        _ => "How can I help you today? I can assist with balances, transfers, loans, FX rates, and more.",
+    }
+}
+
+fn validate_query_length(query: &str, max_len: usize) -> (bool, usize) {
+    (query.len() <= max_len, query.len())
+}
+
 fn rl_allow() -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if now > RL_LAST.load(AtomicOrdering::Relaxed) { RL_TOKENS.store(100, AtomicOrdering::Relaxed); RL_LAST.store(now, AtomicOrdering::Relaxed); }

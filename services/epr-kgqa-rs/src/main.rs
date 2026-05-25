@@ -23,6 +23,40 @@ struct AppState {
 
 fn sanitize_input(s: &str) -> String { s.replace("<script>", "").replace("</script>", "").replace("javascript:", "").chars().take(10240).collect() }
 
+fn extract_entities(query: &str) -> Vec<(&str, String)> {
+    let mut entities = Vec::new();
+    let q = query.to_lowercase();
+    // Account numbers (10 digits)
+    for word in q.split_whitespace() {
+        if word.len() == 10 && word.chars().all(|c| c.is_ascii_digit()) {
+            entities.push(("account_number", word.to_string()));
+        }
+        // BVN (starts with 22, 11 digits)
+        if word.len() == 11 && word.starts_with("22") && word.chars().all(|c| c.is_ascii_digit()) {
+            entities.push(("bvn", word.to_string()));
+        }
+    }
+    entities
+}
+
+fn generate_cypher(intent: &str, entity_type: &str, entity_value: &str) -> String {
+    match (intent, entity_type) {
+        ("find_account", "account_number") => format!("MATCH (a:Account {{number: '{}'}}) RETURN a", entity_value),
+        ("find_customer", "bvn") => format!("MATCH (c:Customer)-[:OWNS]->(a:Account) WHERE c.bvn = '{}' RETURN c, a", entity_value),
+        ("find_transactions", "account_number") => format!("MATCH (a:Account {{number: '{}'}})-[:HAS_TXN]->(t:Transaction) RETURN t ORDER BY t.date DESC LIMIT 10", entity_value),
+        _ => format!("MATCH (n) WHERE n.id = '{}' RETURN n LIMIT 10", entity_value),
+    }
+}
+
+fn classify_intent(query: &str) -> &'static str {
+    let q = query.to_lowercase();
+    if q.contains("account") || q.contains("balance") { "find_account" }
+    else if q.contains("customer") || q.contains("bvn") { "find_customer" }
+    else if q.contains("transaction") || q.contains("transfer") { "find_transactions" }
+    else if q.contains("fraud") || q.contains("suspicious") { "fraud_investigation" }
+    else { "general_query" }
+}
+
 fn rl_allow() -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if now > RL_LAST.load(AtomicOrdering::Relaxed) { RL_TOKENS.store(100, AtomicOrdering::Relaxed); RL_LAST.store(now, AtomicOrdering::Relaxed); }
