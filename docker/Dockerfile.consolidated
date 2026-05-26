@@ -1,0 +1,49 @@
+# 54Bank — Consolidated Multi-Service Dockerfile
+# Builds and runs multiple microservices in a single container
+
+ARG PRIMARY_LANG=go
+
+# ── Go Build Stage ──
+FROM golang:1.22-alpine AS go-builder
+RUN apk add --no-cache git
+WORKDIR /build
+COPY go.mod go.sum* ./
+RUN go mod download 2>/dev/null || true
+COPY services/ /build/services/
+COPY middleware-go/ /build/middleware-go/ 2>/dev/null || true
+
+# Build all Go services (skip failures for non-Go dirs)
+RUN for svc in /build/services/*-go; do \
+      if [ -f "$svc/main.go" ]; then \
+        name=$(basename "$svc"); \
+        echo "Building $name..."; \
+        cd "$svc" && go build -o "/out/$name/$name" main.go 2>/dev/null || echo "WARN: $name build skipped"; \
+        cd /build; \
+      fi \
+    done
+
+# ── Python Stage ──
+FROM python:3.12-slim AS python-base
+RUN pip install --no-cache-dir psycopg2-binary redis opensearch-py 2>/dev/null || true
+
+# ── Runtime ──
+FROM python:3.12-slim
+
+# Install Go runtime (for compiled binaries)
+COPY --from=go-builder /out/ /app/services/
+
+# Copy Python services
+COPY services/ /app/services/
+
+# Copy Rust binaries (pre-built or skip)
+# Note: Rust services require separate compilation
+
+# Copy entrypoint scripts
+COPY docker/entrypoints/ /app/entrypoints/
+
+# Common env
+ENV DATABASE_URL=postgresql://banking:banking_dev_password@postgres:5432/banking54
+ENV REDIS_URL=redis://redis:6379
+
+ENTRYPOINT ["/bin/bash"]
+CMD ["/app/entrypoints/default.sh"]

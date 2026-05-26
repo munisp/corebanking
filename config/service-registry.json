@@ -1,0 +1,2482 @@
+{
+  "ab-testing-py": {
+    "container": "platform-devops",
+    "host": "platform-devops",
+    "port": 9442
+  },
+  "accessibility-auditor-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9576
+  },
+  "account-closure-go": {
+    "container": "core-accounts",
+    "host": "core-accounts",
+    "port": 9251
+  },
+  "account-opening-go": {
+    "container": "core-accounts",
+    "host": "core-accounts",
+    "port": 9252
+  },
+  "account-statement-go": {
+    "container": "core-accounts",
+    "host": "core-accounts",
+    "port": 9253
+  },
+  "accounting-rules-rs": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9403
+  },
+  "acgsf-guarantee-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9490
+  },
+  "adaptive-rate-limiter-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9376
+  },
+  "address-verification-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9189
+  },
+  "adverse-media-scanner-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9190
+  },
+  "adverse-media-screening-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9191
+  },
+  "agent-account-opening-py": {
+    "container": "core-accounts",
+    "host": "core-accounts",
+    "port": 9254
+  },
+  "agent-banking-go": {
+    "container": "channels-agents",
+    "host": "channels-agents",
+    "port": 9134
+  },
+  "agent-cash-management-py": {
+    "container": "channels-agents",
+    "host": "channels-agents",
+    "port": 9135
+  },
+  "agent-customer-360-py": {
+    "container": "channels-agents",
+    "host": "channels-agents",
+    "port": 9136
+  },
+  "agent-dormancy-prevention-py": {
+    "container": "channels-agents",
+    "host": "channels-agents",
+    "port": 9137
+  },
+  "agent-farmer-onboarding-go": {
+    "container": "channels-agents",
+    "host": "channels-agents",
+    "port": 9138
+  },
+  "agent-fraud-detection-py": {
+    "container": "compliance-fraud",
+    "host": "compliance-fraud",
+    "port": 9180
+  },
+  "agent-kyc-capture-go": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9192
+  },
+  "agent-loan-origination-py": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9275
+  },
+  "agent-nl-reporting-py": {
+    "container": "channels-agents",
+    "host": "channels-agents",
+    "port": 9139
+  },
+  "agent-reconciliation-py": {
+    "container": "channels-agents",
+    "host": "channels-agents",
+    "port": 9140
+  },
+  "agent-regulatory-returns-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9223
+  },
+  "agent-transaction-investigation-py": {
+    "container": "channels-agents",
+    "host": "channels-agents",
+    "port": 9141
+  },
+  "aggregation-center-go": {
+    "container": "customer-pricing",
+    "host": "customer-pricing",
+    "port": 9309
+  },
+  "agri-esg-impact-py": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9491
+  },
+  "agri-evoucher-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9492
+  },
+  "agri-input-marketplace-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9493
+  },
+  "agri-iot-sensor-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9494
+  },
+  "agri-logistics-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9495
+  },
+  "agri-reinsurance-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9496
+  },
+  "agri-savings-cycles-go": {
+    "container": "core-deposits",
+    "host": "core-deposits",
+    "port": 9267
+  },
+  "agriculture-banking-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9497
+  },
+  "ai-fraud-scoring-rs": {
+    "container": "compliance-fraud",
+    "host": "compliance-fraud",
+    "port": 9181
+  },
+  "aml-case-manager-go": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9193
+  },
+  "aml-compliance-dashboard-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9194
+  },
+  "aml-engine-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9195
+  },
+  "aml-risk-scoring-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9196
+  },
+  "aml-training-tracker-go": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9197
+  },
+  "analytics-engine-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9625
+  },
+  "animal-id-traceability-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9577
+  },
+  "anomaly-detector-py": {
+    "container": "compliance-fraud",
+    "host": "compliance-fraud",
+    "port": 9182
+  },
+  "api-analytics-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9626
+  },
+  "api-key-enforcer-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9428
+  },
+  "api-key-vault-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9429
+  },
+  "api-marketplace-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9430
+  },
+  "api-versioning-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9431
+  },
+  "apisix-gateway-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9432
+  },
+  "apisix-plugin-optimizer-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9433
+  },
+  "apm-sentry-py": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9392
+  },
+  "approval-workflow-go": {
+    "container": "security-access",
+    "host": "security-access",
+    "port": 9464
+  },
+  "area-yield-index-insurance-py": {
+    "container": "specialized-islamic",
+    "host": "specialized-islamic",
+    "port": 9523
+  },
+  "art-adversarial-robustness-py": {
+    "container": "ai-ml-inference",
+    "host": "ai-ml-inference",
+    "port": 9129
+  },
+  "atm-management-go": {
+    "container": "core-cards",
+    "host": "core-cards",
+    "port": 9259
+  },
+  "auth-enforcer-rs": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9316
+  },
+  "avro-schema-registry-go": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9347
+  },
+  "backup-manager-py": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9348
+  },
+  "bank-guarantees-go": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9540
+  },
+  "banking-clearing-ops-rs": {
+    "container": "ledger-reconciliation",
+    "host": "ledger-reconciliation",
+    "port": 9414
+  },
+  "banking-domain-integration-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9578
+  },
+  "banking-operations-pipeline-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9579
+  },
+  "basel-engine-rs": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9224
+  },
+  "batch-aggregator-go": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9566
+  },
+  "batch-processing-py": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9567
+  },
+  "beneficial-ownership-go": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9198
+  },
+  "beneficiary-management-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9290
+  },
+  "billing-analytics-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9627
+  },
+  "billing-enforcement-rs": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9451
+  },
+  "billing-event-processor-py": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9361
+  },
+  "billing-ingestor-go": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9452
+  },
+  "billing-orchestrator-go": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9453
+  },
+  "billing-rating-rs": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9454
+  },
+  "billing-rbac-rs": {
+    "container": "security-access",
+    "host": "security-access",
+    "port": 9465
+  },
+  "biometric-auth-rs": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9317
+  },
+  "bloom-filter-cache-rs": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9335
+  },
+  "body-limit-enforcer-go": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9470
+  },
+  "branch-operations-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9580
+  },
+  "branded-comms-py": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9143
+  },
+  "browser-fingerprint-go": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9318
+  },
+  "bulk-payments-rs": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9291
+  },
+  "bundle-splitter-py": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9434
+  },
+  "bvn-nin-verification-go": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9199
+  },
+  "cac-realtime-api-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9581
+  },
+  "cache-invalidation-rs": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9336
+  },
+  "card-management-go": {
+    "container": "core-cards",
+    "host": "core-cards",
+    "port": 9260
+  },
+  "cash-pooling-go": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9550
+  },
+  "cbn-agri-returns-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9225
+  },
+  "cbn-agsmeis-go": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9226
+  },
+  "cbn-anchor-borrowers-go": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9227
+  },
+  "cbn-compliance-checker-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9228
+  },
+  "cbn-returns-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9229
+  },
+  "cbn-tiered-kyc-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9200
+  },
+  "cdn-edge-cache-go": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9337
+  },
+  "certificate-manager-py": {
+    "container": "platform-devops",
+    "host": "platform-devops",
+    "port": 9443
+  },
+  "changelog-generator-py": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9393
+  },
+  "chatbot-py": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9165
+  },
+  "cheque-clearing-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9292
+  },
+  "cif-management-go": {
+    "container": "core-accounts",
+    "host": "core-accounts",
+    "port": 9255
+  },
+  "circuit-breaker-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9377
+  },
+  "clickjack-defender-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9471
+  },
+  "cloud-kms-bridge-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9472
+  },
+  "cocoindex-pipeline-py": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9105
+  },
+  "collateral-valuation-rs": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9276
+  },
+  "commodity-exchange-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9551
+  },
+  "commodity-price-intelligence-py": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9552
+  },
+  "component-memoizer-py": {
+    "container": "specialized-engagement",
+    "host": "specialized-engagement",
+    "port": 9516
+  },
+  "connection-pooler-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9378
+  },
+  "contingent-liabilities-rs": {
+    "container": "compliance-risk",
+    "host": "compliance-risk",
+    "port": 9245
+  },
+  "continuous-liveness-rs": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9319
+  },
+  "contract-test-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9582
+  },
+  "cooperative-credit-scoring-py": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9277
+  },
+  "cooperative-financials-py": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9498
+  },
+  "cooperative-management-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9499
+  },
+  "cooperative-meetings-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9500
+  },
+  "core-banking-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9583
+  },
+  "corporate-doc-verification-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9201
+  },
+  "corporate-monitoring-go": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9394
+  },
+  "cors-gateway-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9435
+  },
+  "credit-bureau-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9584
+  },
+  "credit-facility-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9585
+  },
+  "credit-scoring-py": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9278
+  },
+  "crop-yield-prediction-py": {
+    "container": "ai-ml-inference",
+    "host": "ai-ml-inference",
+    "port": 9130
+  },
+  "crossborder-agri-trade-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9501
+  },
+  "csp-nonce-engine-go": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9473
+  },
+  "ctr-auto-filer-go": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9230
+  },
+  "custody-service-go": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9553
+  },
+  "custom-domain-go": {
+    "container": "channels-mobile-web",
+    "host": "channels-mobile-web",
+    "port": 9160
+  },
+  "customer-360-dashboard-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9628
+  },
+  "customer-360-py": {
+    "container": "customer-management",
+    "host": "customer-management",
+    "port": 9303
+  },
+  "customer-engagement-py": {
+    "container": "customer-management",
+    "host": "customer-management",
+    "port": 9304
+  },
+  "customer-feedback-py": {
+    "container": "customer-management",
+    "host": "customer-management",
+    "port": 9305
+  },
+  "customer-insights-py": {
+    "container": "ai-ml-inference",
+    "host": "ai-ml-inference",
+    "port": 9131
+  },
+  "dapr-sidecar-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9436
+  },
+  "data-export-rs": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9349
+  },
+  "db-migration-manager-go": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9350
+  },
+  "db-migrations": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9351
+  },
+  "ddos-protection-go": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9474
+  },
+  "ddos-shield-go": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9475
+  },
+  "debt-collection-go": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9279
+  },
+  "developer-portal-go": {
+    "container": "channels-mobile-web",
+    "host": "channels-mobile-web",
+    "port": 9161
+  },
+  "diaspora-banking-py": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9530
+  },
+  "dispute-management-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9586
+  },
+  "distroless-builder-py": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9476
+  },
+  "docker-hardener-py": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9477
+  },
+  "document-intelligence-py": {
+    "container": "ai-data-pipeline",
+    "host": "ai-data-pipeline",
+    "port": 9100
+  },
+  "document-management-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9629
+  },
+  "dormancy-management-rs": {
+    "container": "core-accounts",
+    "host": "core-accounts",
+    "port": 9256
+  },
+  "e2e-orchestrator-go": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9568
+  },
+  "education-loans-py": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9280
+  },
+  "efass-generator-rs": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9231
+  },
+  "efass-kyc-returns-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9202
+  },
+  "egress-controller-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9379
+  },
+  "enaira-cbdc-py": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9531
+  },
+  "eod-processor-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9587
+  },
+  "epr-kgqa-engine-py": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9106
+  },
+  "epr-kgqa-go": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9107
+  },
+  "epr-kgqa-py": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9108
+  },
+  "epr-kgqa-rs": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9109
+  },
+  "equipment-leasing-go": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9541
+  },
+  "erpnext-bridge-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9588
+  },
+  "erpnext-sync-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9589
+  },
+  "error-telemetry-py": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9395
+  },
+  "escrow-go": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9542
+  },
+  "esusu-groups-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9502
+  },
+  "etd-trading-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9554
+  },
+  "event-bus-go": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9362
+  },
+  "event-correlator-py": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9363
+  },
+  "event-dedup-engine-rs": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9364
+  },
+  "event-sourcing-go": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9365
+  },
+  "event-streaming-go": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9366
+  },
+  "exam-management-py": {
+    "container": "specialized-islamic",
+    "host": "specialized-islamic",
+    "port": 9524
+  },
+  "expense-mgmt-go": {
+    "container": "customer-management",
+    "host": "customer-management",
+    "port": 9306
+  },
+  "express-rate-limiter-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9380
+  },
+  "face-match-rs": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9320
+  },
+  "factoring-go": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9543
+  },
+  "falkordb-coa-go": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9110
+  },
+  "falkordb-coa-py": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9111
+  },
+  "falkordb-coa-rs": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9112
+  },
+  "falkordb-graph-engine-rs": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9113
+  },
+  "falkordb-graph-rs": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9114
+  },
+  "farm-boundary-mapping-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9503
+  },
+  "fast-json-serializer-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9590
+  },
+  "fatca-crs-rs": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9232
+  },
+  "feature-entitlement-go": {
+    "container": "platform-devops",
+    "host": "platform-devops",
+    "port": 9444
+  },
+  "feature-flag-engine-rs": {
+    "container": "platform-devops",
+    "host": "platform-devops",
+    "port": 9445
+  },
+  "fee-management-go": {
+    "container": "customer-pricing",
+    "host": "customer-pricing",
+    "port": 9310
+  },
+  "field-level-encryption-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9478
+  },
+  "fisheries-aquaculture-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9504
+  },
+  "fixed-assets-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9591
+  },
+  "flag-audit-rs": {
+    "container": "platform-devops",
+    "host": "platform-devops",
+    "port": 9446
+  },
+  "fluvio-streams-rs": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9367
+  },
+  "fluvio-wasm-transform-rs": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9368
+  },
+  "fraud-detection-rs": {
+    "container": "compliance-fraud",
+    "host": "compliance-fraud",
+    "port": 9183
+  },
+  "fraudfusion-ensemble-rs": {
+    "container": "compliance-fraud",
+    "host": "compliance-fraud",
+    "port": 9184
+  },
+  "fx-rates-engine-rs": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9532
+  },
+  "gl-engine-go": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9404
+  },
+  "gl-engine-rs": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9405
+  },
+  "gl-regulatory-pipeline-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9233
+  },
+  "gnn-fraud-detection-py": {
+    "container": "compliance-fraud",
+    "host": "compliance-fraud",
+    "port": 9185
+  },
+  "goaml-integration-go": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9203
+  },
+  "graduated-rollout-rs": {
+    "container": "platform-devops",
+    "host": "platform-devops",
+    "port": 9447
+  },
+  "graphql-gateway-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9437
+  },
+  "grid-token-card-go": {
+    "container": "core-cards",
+    "host": "core-cards",
+    "port": 9261
+  },
+  "group-lending-go": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9281
+  },
+  "growth-features-go": {
+    "container": "specialized-engagement",
+    "host": "specialized-engagement",
+    "port": 9517
+  },
+  "grpc-gateway-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9381
+  },
+  "grpc-hot-path-go": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9382
+  },
+  "helm-validator-go": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9479
+  },
+  "hot-data-cache-rs": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9338
+  },
+  "hpa-autoscaler-go": {
+    "container": "platform-devops",
+    "host": "platform-devops",
+    "port": 9448
+  },
+  "hsm-key-manager-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9480
+  },
+  "http2-multiplexer-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9383
+  },
+  "i18n-service-go": {
+    "container": "customer-management",
+    "host": "customer-management",
+    "port": 9307
+  },
+  "idempotency-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9592
+  },
+  "identity-channels-go": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9321
+  },
+  "identity-verification-go": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9322
+  },
+  "ifrs9-ecl-engine-rs": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9234
+  },
+  "ifrs9-engine-rs": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9235
+  },
+  "image-scanner-go": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9481
+  },
+  "immutable-audit-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9593
+  },
+  "incident-responder-go": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9396
+  },
+  "insurance-portfolio-analytics-py": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9555
+  },
+  "insurance-py": {
+    "container": "specialized-islamic",
+    "host": "specialized-islamic",
+    "port": 9525
+  },
+  "interactive-ussd-agri-py": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9166
+  },
+  "interbank-lending-rs": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9282
+  },
+  "interest-accrual-engine-go": {
+    "container": "core-deposits",
+    "host": "core-deposits",
+    "port": 9268
+  },
+  "interest-computation-rs": {
+    "container": "core-deposits",
+    "host": "core-deposits",
+    "port": 9269
+  },
+  "interest-rate-engine-go": {
+    "container": "core-deposits",
+    "host": "core-deposits",
+    "port": 9270
+  },
+  "inventory-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9594
+  },
+  "ip-allowlist-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9482
+  },
+  "islamic-banking-py": {
+    "container": "specialized-islamic",
+    "host": "specialized-islamic",
+    "port": 9526
+  },
+  "iso20022-hub-rs": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9533
+  },
+  "jwt-validator-rs": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9323
+  },
+  "kafka-batch-producer-rs": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9369
+  },
+  "kafka-broker-go": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9370
+  },
+  "kafka-consumer-optimizer-go": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9371
+  },
+  "kafka-schema-registry-go": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9372
+  },
+  "kafka-streaming-go": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9373
+  },
+  "keda-scaler-go": {
+    "container": "platform-devops",
+    "host": "platform-devops",
+    "port": 9449
+  },
+  "keepalive-tuner-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9384
+  },
+  "key-rotation-engine-go": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9483
+  },
+  "keycloak-admin-go": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9324
+  },
+  "keycloak-enforcer-go": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9325
+  },
+  "keycloak-identity-py": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9326
+  },
+  "kgqa-reasoning-engine-py": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9115
+  },
+  "kpi-analytics-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9630
+  },
+  "kpi-engine-go": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9631
+  },
+  "kpi-threshold-monitor-rs": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9397
+  },
+  "kyb-engine-go": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9204
+  },
+  "kyb-engine-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9205
+  },
+  "kyc-aml-screening-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9206
+  },
+  "kyc-analytics-dashboard-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9207
+  },
+  "kyc-data-quality-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9208
+  },
+  "kyc-engine-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9209
+  },
+  "kyc-event-consumer-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9210
+  },
+  "kyc-self-service-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9211
+  },
+  "kyc-workflow-orchestration-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9212
+  },
+  "lakehouse-etl-py": {
+    "container": "ai-data-pipeline",
+    "host": "ai-data-pipeline",
+    "port": 9101
+  },
+  "lakehouse-rs": {
+    "container": "ai-data-pipeline",
+    "host": "ai-data-pipeline",
+    "port": 9102
+  },
+  "langchain-agent-go": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9116
+  },
+  "langchain-agent-py": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9117
+  },
+  "langchain-agent-rs": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9118
+  },
+  "lcr-nsfr-rs": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9236
+  },
+  "leasing-go": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9544
+  },
+  "ledger-reconciliation-rs": {
+    "container": "ledger-reconciliation",
+    "host": "ledger-reconciliation",
+    "port": 9415
+  },
+  "liveness-detection-rs": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9327
+  },
+  "liveness-inference-py": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9328
+  },
+  "liveness-orchestrator-go": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9329
+  },
+  "livestock-finance-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9505
+  },
+  "livestock-insurance-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9506
+  },
+  "livestock-management-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9507
+  },
+  "load-test-runner-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9595
+  },
+  "loan-calculator-go": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9283
+  },
+  "loan-origination-go": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9284
+  },
+  "locker-go": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9545
+  },
+  "maker-checker-go": {
+    "container": "security-access",
+    "host": "security-access",
+    "port": 9466
+  },
+  "mandate-management-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9293
+  },
+  "materialized-view-engine-go": {
+    "container": "ai-data-pipeline",
+    "host": "ai-data-pipeline",
+    "port": 9103
+  },
+  "mcmc-bayesian-risk-py": {
+    "container": "compliance-fraud",
+    "host": "compliance-fraud",
+    "port": 9186
+  },
+  "mfa-orchestrator-go": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9330
+  },
+  "microfinance-engine-go": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9285
+  },
+  "microfinance-py": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9286
+  },
+  "middleware-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9596
+  },
+  "middleware-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9597
+  },
+  "middleware-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9598
+  },
+  "mojaloop-admin-go": {
+    "container": "mojaloop-connector",
+    "host": "mojaloop-connector",
+    "port": 9420
+  },
+  "mojaloop-connector-go": {
+    "container": "mojaloop-connector",
+    "host": "mojaloop-connector",
+    "port": 9421
+  },
+  "mojaloop-crossborder-py": {
+    "container": "mojaloop-connector",
+    "host": "mojaloop-connector",
+    "port": 9422
+  },
+  "mojaloop-fspiop-callbacks-rs": {
+    "container": "mojaloop-connector",
+    "host": "mojaloop-connector",
+    "port": 9423
+  },
+  "mojaloop-pisp-go": {
+    "container": "mojaloop-connector",
+    "host": "mojaloop-connector",
+    "port": 9424
+  },
+  "mojaloop-protocol-py": {
+    "container": "mojaloop-connector",
+    "host": "mojaloop-connector",
+    "port": 9425
+  },
+  "mojaloop-settlement-mgr-go": {
+    "container": "ledger-reconciliation",
+    "host": "ledger-reconciliation",
+    "port": 9416
+  },
+  "mojaloop-tb-bridge-rs": {
+    "container": "mojaloop-connector",
+    "host": "mojaloop-connector",
+    "port": 9426
+  },
+  "money-market-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9556
+  },
+  "mortgage-servicing-rs": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9287
+  },
+  "mtls-mesh-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9385
+  },
+  "multi-bureau-verification-go": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9213
+  },
+  "multi-entity-go": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9455
+  },
+  "multi-peril-crop-insurance-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9508
+  },
+  "multicurrency-revaluation-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9557
+  },
+  "ndpr-compliance-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9599
+  },
+  "neo4j-coa-graph-go": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9119
+  },
+  "neo4j-coa-graph-py": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9120
+  },
+  "neo4j-coa-graph-rs": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9121
+  },
+  "neo4j-knowledge-graph-go": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9122
+  },
+  "network-policy-manager-py": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9386
+  },
+  "nfiu-ctr-str-filing-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9237
+  },
+  "nibss-direct-debit-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9294
+  },
+  "nibss-nip-engine-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9295
+  },
+  "nirsal-agro-geocoop-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9509
+  },
+  "nirsal-credit-guarantee-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9510
+  },
+  "notification-router-go": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9144
+  },
+  "notification-service-go": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9145
+  },
+  "offline-resilience-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9600
+  },
+  "ollama-inference-go": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9123
+  },
+  "open-banking-baas-go": {
+    "container": "channels-mobile-web",
+    "host": "channels-mobile-web",
+    "port": 9162
+  },
+  "open-banking-go": {
+    "container": "channels-mobile-web",
+    "host": "channels-mobile-web",
+    "port": 9163
+  },
+  "openappsec-waf-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9484
+  },
+  "opensearch-analytics-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9632
+  },
+  "opensearch-indexer-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9601
+  },
+  "opensearch-optimizer-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9602
+  },
+  "operations-control-gl-rs": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9406
+  },
+  "optimistic-ui-engine-go": {
+    "container": "specialized-engagement",
+    "host": "specialized-engagement",
+    "port": 9518
+  },
+  "otc-derivatives-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9558
+  },
+  "otel-collector-go": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9398
+  },
+  "otp-hardening-rs": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9331
+  },
+  "output-encoder-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9485
+  },
+  "parametric-insurance-iot-rs": {
+    "container": "specialized-islamic",
+    "host": "specialized-islamic",
+    "port": 9527
+  },
+  "path-validator-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9387
+  },
+  "payment-investigation-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9296
+  },
+  "payments-hub-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9297
+  },
+  "pbac-engine-rs": {
+    "container": "security-access",
+    "host": "security-access",
+    "port": 9467
+  },
+  "pci-scanner-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9486
+  },
+  "pension-py": {
+    "container": "specialized-islamic",
+    "host": "specialized-islamic",
+    "port": 9528
+  },
+  "pentest-orchestrator-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9603
+  },
+  "pep-enhanced-dd-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9214
+  },
+  "permify-authz-go": {
+    "container": "security-access",
+    "host": "security-access",
+    "port": 9468
+  },
+  "pgbouncer-manager-go": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9352
+  },
+  "pin-block-engine-rs": {
+    "container": "core-cards",
+    "host": "core-cards",
+    "port": 9262
+  },
+  "pin-hasher-rs": {
+    "container": "core-cards",
+    "host": "core-cards",
+    "port": 9263
+  },
+  "pkce-auth-flow-go": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9332
+  },
+  "platform-hardening-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9604
+  },
+  "platform-operations-engine-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9605
+  },
+  "platform-security-infra-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9606
+  },
+  "plugin-marketplace-py": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9438
+  },
+  "portfolio-mgmt-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9559
+  },
+  "pos-terminal-go": {
+    "container": "core-cards",
+    "host": "core-cards",
+    "port": 9264
+  },
+  "post-harvest-loss-tracker-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9511
+  },
+  "postgres-adapter-go": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9353
+  },
+  "postgres-persistence-rs": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9354
+  },
+  "postgres-query-cache-rs": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9339
+  },
+  "postgres-query-optimizer-go": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9355
+  },
+  "postgres-vacuum-py": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9356
+  },
+  "prepared-stmt-cache-go": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9340
+  },
+  "product-factory-rs": {
+    "container": "customer-pricing",
+    "host": "customer-pricing",
+    "port": 9311
+  },
+  "project-finance-go": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9546
+  },
+  "prometheus-dashboard-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9633
+  },
+  "qdrant-financial-search-go": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9124
+  },
+  "qdrant-financial-search-py": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9125
+  },
+  "qdrant-financial-search-rs": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9126
+  },
+  "qdrant-vector-store-rs": {
+    "container": "ai-graph-search",
+    "host": "ai-graph-search",
+    "port": 9127
+  },
+  "qr-payments-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9298
+  },
+  "quality-certification-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9512
+  },
+  "query-cache-engine-rs": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9341
+  },
+  "rate-cascade-rs": {
+    "container": "customer-pricing",
+    "host": "customer-pricing",
+    "port": 9312
+  },
+  "read-replica-router-rs": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9357
+  },
+  "realtime-pricing-rs": {
+    "container": "customer-pricing",
+    "host": "customer-pricing",
+    "port": 9313
+  },
+  "recon-engine-rs": {
+    "container": "ledger-reconciliation",
+    "host": "ledger-reconciliation",
+    "port": 9417
+  },
+  "reconciliation-engine-rs": {
+    "container": "ledger-reconciliation",
+    "host": "ledger-reconciliation",
+    "port": 9418
+  },
+  "redis-cache-middleware-rs": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9342
+  },
+  "redis-cache-rs": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9343
+  },
+  "redis-session-store-go": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9344
+  },
+  "regulatory-automation-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9238
+  },
+  "regulatory-reporting-go": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9239
+  },
+  "regulatory-reporting-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9240
+  },
+  "regulatory-sandbox-go": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9241
+  },
+  "relationship-pricing-rs": {
+    "container": "customer-pricing",
+    "host": "customer-pricing",
+    "port": 9314
+  },
+  "remittance-go": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9534
+  },
+  "request-coalescer-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9607
+  },
+  "request-validator-py": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9388
+  },
+  "resilience-service-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9608
+  },
+  "response-compressor-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9609
+  },
+  "risk-based-approach-py": {
+    "container": "compliance-risk",
+    "host": "compliance-risk",
+    "port": 9246
+  },
+  "risk-scoring-rs": {
+    "container": "compliance-risk",
+    "host": "compliance-risk",
+    "port": 9247
+  },
+  "route-schema-enforcer-go": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9358
+  },
+  "route-trie-optimizer-rs": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9389
+  },
+  "safe-deposit-go": {
+    "container": "core-deposits",
+    "host": "core-deposits",
+    "port": 9271
+  },
+  "saga-coordinator-py": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9569
+  },
+  "salary-processing-go": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9407
+  },
+  "sanctions-batch-rescreener-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9215
+  },
+  "sanctions-engine-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9216
+  },
+  "sanctions-screening-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9217
+  },
+  "sar-filing-engine-go": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9242
+  },
+  "satellite-crop-monitor-rs": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9513
+  },
+  "savings-products-go": {
+    "container": "core-deposits",
+    "host": "core-deposits",
+    "port": 9272
+  },
+  "savings-products-py": {
+    "container": "core-deposits",
+    "host": "core-deposits",
+    "port": 9273
+  },
+  "scratch-card-pin-go": {
+    "container": "core-cards",
+    "host": "core-cards",
+    "port": 9265
+  },
+  "secrets-rotation-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9610
+  },
+  "secrets-vault-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9611
+  },
+  "securities-trading-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9560
+  },
+  "security-audit-logger-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9612
+  },
+  "security-gateway-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9439
+  },
+  "security-hardening-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9613
+  },
+  "session-security-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9614
+  },
+  "siem-exporter-py": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9399
+  },
+  "signature-verification-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9218
+  },
+  "skeleton-loading-rs": {
+    "container": "specialized-engagement",
+    "host": "specialized-engagement",
+    "port": 9519
+  },
+  "sms-alert-notification-py": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9146
+  },
+  "sms-banking-gateway-go": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9147
+  },
+  "sms-email-gateway-go": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9148
+  },
+  "sms-otp-service-rs": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9149
+  },
+  "soc2-evidence-collector-py": {
+    "container": "compliance-regulatory",
+    "host": "compliance-regulatory",
+    "port": 9243
+  },
+  "soil-analysis-py": {
+    "container": "ai-ml-inference",
+    "host": "ai-ml-inference",
+    "port": 9132
+  },
+  "sorted-set-ranking-go": {
+    "container": "specialized-engagement",
+    "host": "specialized-engagement",
+    "port": 9520
+  },
+  "sql-parameterizer-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9615
+  },
+  "sri-validator-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9487
+  },
+  "stakeholder-kpi-dashboard-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9634
+  },
+  "standing-charges-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9616
+  },
+  "standing-orders-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9299
+  },
+  "statement-generator-py": {
+    "container": "workflow-reporting",
+    "host": "workflow-reporting",
+    "port": 9635
+  },
+  "stream-response-go": {
+    "container": "infra-messaging",
+    "host": "infra-messaging",
+    "port": 9374
+  },
+  "stress-testing-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9617
+  },
+  "supply-chain-finance-go": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9547
+  },
+  "sw-api-cache-go": {
+    "container": "infra-caching",
+    "host": "infra-caching",
+    "port": 9345
+  },
+  "swift-iso20022-rs": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9535
+  },
+  "swift-messaging-go": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9536
+  },
+  "syndicated-loans-go": {
+    "container": "core-lending",
+    "host": "core-lending",
+    "port": 9288
+  },
+  "table-partitioner-rs": {
+    "container": "infra-database",
+    "host": "infra-database",
+    "port": 9359
+  },
+  "tax-reporting-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9618
+  },
+  "telegram-banking-commands-rs": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9150
+  },
+  "telegram-bot-gateway-go": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9151
+  },
+  "telegram-kyc-bot-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9219
+  },
+  "telegram-mini-app-go": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9152
+  },
+  "telegram-notification-py": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9153
+  },
+  "teller-operations-go": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9619
+  },
+  "temporal-memoizer-go": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9570
+  },
+  "temporal-orchestrator-py": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9571
+  },
+  "temporal-sagas-go": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9572
+  },
+  "temporal-worker-go": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9573
+  },
+  "tenant-billing-go": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9456
+  },
+  "tenant-export-go": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9457
+  },
+  "tenant-isolation-go": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9458
+  },
+  "tenant-management-py": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9459
+  },
+  "tenant-metering-go": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9460
+  },
+  "tenant-provisioning-go": {
+    "container": "compliance-risk",
+    "host": "compliance-risk",
+    "port": 9248
+  },
+  "tenant-provisioning-py": {
+    "container": "compliance-risk",
+    "host": "compliance-risk",
+    "port": 9249
+  },
+  "tenant-ratelimit-rs": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9461
+  },
+  "tigerbeetle-adapter-rs": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9408
+  },
+  "tigerbeetle-batch-engine-rs": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9409
+  },
+  "tigerbeetle-ledger-rs": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9410
+  },
+  "tigerbeetle-multicurrency-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9561
+  },
+  "tigerbeetle-protocol-rs": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9411
+  },
+  "tigerbeetle-sync-go": {
+    "container": "ledger-gl",
+    "host": "ledger-gl",
+    "port": 9412
+  },
+  "tls-terminator-go": {
+    "container": "infra-network",
+    "host": "infra-network",
+    "port": 9390
+  },
+  "token-rotation-rs": {
+    "container": "identity-auth",
+    "host": "identity-auth",
+    "port": 9333
+  },
+  "trade-finance-gl-go": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9537
+  },
+  "trade-finance-go": {
+    "container": "trade-fx",
+    "host": "trade-fx",
+    "port": 9538
+  },
+  "treasury-liquidity-py": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9562
+  },
+  "treasury-liquidity-rs": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9563
+  },
+  "trust-estate-rs": {
+    "container": "trade-supply-chain",
+    "host": "trade-supply-chain",
+    "port": 9548
+  },
+  "txn-monitoring-rules-rs": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9400
+  },
+  "txn-pattern-analyzer-py": {
+    "container": "compliance-fraud",
+    "host": "compliance-fraud",
+    "port": 9187
+  },
+  "typology-detector-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9620
+  },
+  "ubo-ownership-graph-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9621
+  },
+  "unit-test-runner-py": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9622
+  },
+  "ussd-banking-gateway-go": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9167
+  },
+  "ussd-multilingual-py": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9168
+  },
+  "ussd-sim-toolkit-go": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9169
+  },
+  "ussd-transaction-engine-rs": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9170
+  },
+  "utility-payments-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9300
+  },
+  "vault-integration-rs": {
+    "container": "workflow-operations",
+    "host": "workflow-operations",
+    "port": 9623
+  },
+  "video-kyc-py": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9220
+  },
+  "virtual-accounts-go": {
+    "container": "core-accounts",
+    "host": "core-accounts",
+    "port": 9257
+  },
+  "virtual-scroll-engine-rs": {
+    "container": "specialized-engagement",
+    "host": "specialized-engagement",
+    "port": 9521
+  },
+  "voice-agent-escalation-go": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9171
+  },
+  "voice-asr-nigerian-py": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9172
+  },
+  "voice-banking-gateway-go": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9173
+  },
+  "voice-biometric-auth-rs": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9174
+  },
+  "voice-call-analytics-py": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9175
+  },
+  "voice-ivr-menu-go": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9176
+  },
+  "voice-nlu-banking-py": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9177
+  },
+  "voice-tts-nigerian-rs": {
+    "container": "channels-voice",
+    "host": "channels-voice",
+    "port": 9178
+  },
+  "waf-rules-engine-rs": {
+    "container": "security-waf",
+    "host": "security-waf",
+    "port": 9488
+  },
+  "warehouse-management-go": {
+    "container": "specialized-agri",
+    "host": "specialized-agri",
+    "port": 9514
+  },
+  "watchlist-manager-rs": {
+    "container": "compliance-kyc-aml",
+    "host": "compliance-kyc-aml",
+    "port": 9221
+  },
+  "wealth-mgmt-py": {
+    "container": "treasury-investments",
+    "host": "treasury-investments",
+    "port": 9564
+  },
+  "webhook-engine-go": {
+    "container": "platform-api",
+    "host": "platform-api",
+    "port": 9440
+  },
+  "whatsapp-banking-flows-rs": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9154
+  },
+  "whatsapp-business-gateway-go": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9155
+  },
+  "whatsapp-cloud-api-go": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9156
+  },
+  "whatsapp-document-service-rs": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9157
+  },
+  "whatsapp-notification-py": {
+    "container": "channels-messaging",
+    "host": "channels-messaging",
+    "port": 9158
+  },
+  "whatsapp-payment-integration-go": {
+    "container": "core-payments",
+    "host": "core-payments",
+    "port": 9301
+  },
+  "white-label-engine-go": {
+    "container": "platform-tenant",
+    "host": "platform-tenant",
+    "port": 9462
+  },
+  "wire-transfer-monitor-rs": {
+    "container": "infra-observability",
+    "host": "infra-observability",
+    "port": 9401
+  },
+  "workflow-engine-py": {
+    "container": "workflow-batch",
+    "host": "workflow-batch",
+    "port": 9574
+  }
+}
