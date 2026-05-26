@@ -20,6 +20,12 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone
 
 SERVICE_NAME = "tenant-management-py"
+
+# --- mTLS Configuration ---
+MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
+TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54bank/certs/service.crt")
+TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
+TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
 PORT = int(os.environ.get("PORT", "8080"))
 
 # --- Logging ---

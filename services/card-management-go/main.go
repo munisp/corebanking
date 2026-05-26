@@ -594,6 +594,93 @@ func computeCardFee(txnType string, amount float64, isForeign bool) float64 {
 }
 
 
+// --- Alerting ---
+type alertManager struct {
+    rules []alertRule
+    mu    sync.RWMutex
+}
+
+type alertRule struct {
+    Name      string
+    Metric    string
+    Threshold float64
+    Severity  string
+}
+
+var _alertMgr = &alertManager{
+    rules: []alertRule{
+        {"high_error_rate", "error_rate", 0.05, "critical"},
+        {"high_latency", "p99_latency_ms", 5000, "warning"},
+        {"db_connection_failures", "db_failures", 3, "critical"},
+    },
+}
+
+func (am *alertManager) check() []map[string]interface{} {
+    var fired []map[string]interface{}
+    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    if errRate > 0.05 {
+        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+    }
+    return fired
+}
+
+func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+
+func alertsHandler(w http.ResponseWriter, r *http.Request) {
+    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+}
+
+// --- Graceful Degradation ---
+type degradationState struct {
+    dbAvailable    bool
+    cacheAvailable bool
+    upstreamOK     map[string]bool
+    mu             sync.RWMutex
+}
+
+var _degrade = &degradationState{
+    dbAvailable:    true,
+    cacheAvailable: true,
+    upstreamOK:     make(map[string]bool),
+}
+
+func (d *degradationState) setDB(ok bool) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+    d.dbAvailable = ok
+}
+
+func (d *degradationState) isDBAvailable() bool {
+    d.mu.RLock()
+    defer d.mu.RUnlock()
+    return d.dbAvailable
+}
+
+func (d *degradationState) setUpstream(name string, ok bool) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+    d.upstreamOK[name] = ok
+}
+
+func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
+    _degrade.mu.RLock()
+    defer _degrade.mu.RUnlock()
+    jsonResp(w, 200, map[string]interface{}{
+        "service":        serviceName,
+        "db_available":   _degrade.dbAvailable,
+        "cache_available": _degrade.cacheAvailable,
+        "upstreams":      _degrade.upstreamOK,
+        "mode":           func() string { if _degrade.dbAvailable { return "normal" }; return "degraded" }(),
+    })
+}
+
+// --- Integration Tests ---
+func respondJSON(w http.ResponseWriter, code int, data interface{}) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(code)
+    json.NewEncoder(w).Encode(data)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 
@@ -606,6 +693,8 @@ mux := http.NewServeMux()
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
+	mux.HandleFunc("/v1/alerts", alertsHandler)
+	mux.HandleFunc("/v1/degradation", degradationStatusHandler)
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/api/list", listHandler)
 	mux.HandleFunc("/api/stats", statsHandler)

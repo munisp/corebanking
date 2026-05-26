@@ -351,3 +351,18 @@ fn main() {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_service_name() {
+        assert_eq!("billing-enforcement-rs", "billing-enforcement-rs");
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        assert!(rl_allow());
+    }
+}

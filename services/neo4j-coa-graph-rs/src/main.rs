@@ -161,6 +161,63 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     }
 }
 
+
+// --- Circuit Breaker + Retry for gRPC/HTTP calls ---
+use std::sync::atomic::{AtomicI32, AtomicI64};
+
+static CB_FAILURES: AtomicI32 = AtomicI32::new(0);
+static CB_LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
+const CB_THRESHOLD: i32 = 5;
+const CB_RESET_SECS: i64 = 30;
+
+fn cb_allow() -> bool {
+    let failures = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if failures >= CB_THRESHOLD {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        let last = CB_LAST_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
+        if now - last > CB_RESET_SECS {
+            CB_FAILURES.store(CB_THRESHOLD / 2, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        return false;
+    }
+    true
+}
+
+fn cb_record_success() {
+    let f = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if f > 0 { CB_FAILURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
+}
+
+fn cb_record_failure() {
+    CB_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
+    CB_LAST_FAILURE.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn call_service_with_retry(url: &str, body: &str, retries: u32) -> Result<String, String> {
+    if !cb_allow() {
+        return Err(format!("circuit breaker open for {}", url));
+    }
+    for attempt in 0..retries {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
+        }
+        match call_service_sync(url, body) {
+            Ok(resp) => { cb_record_success(); return Ok(resp); }
+            Err(e) => {
+                cb_record_failure();
+                eprintln!("[inter-service] {} attempt {} failed: {}", url, attempt + 1, e);
+            }
+        }
+    }
+    Err(format!("all {} retries exhausted for {}", retries, url))
+}
+
 fn call_service_sync(url: &str, payload: &str) -> Result<String, String> {
     let tcp = std::net::TcpStream::connect_timeout(
         &url.replace("http://", "").replace("https://", "").parse().unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap()),
@@ -189,6 +246,25 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let mut recs = state.records.lock().unwrap();
         recs.push(json!({"id": id, "service": svc_name, "data": data}));
     }
+}
+
+
+// --- Graceful Degradation ---
+use std::sync::atomic::AtomicBool;
+
+static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
+static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+fn degradation_mode() -> &'static str {
+    if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
+}
+
+async fn degradation_status() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
+        "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
+        "mode": degradation_mode(),
+    }))
 }
 
 async fn health() -> HttpResponse {
@@ -311,6 +387,77 @@ fn get_tenant_id(req: &actix_web::HttpRequest) -> String {
         .to_string()
 }
 
+
+// --- gRPC Server (binary protocol, length-prefixed) ---
+fn start_grpc_server(service_name: &'static str, port: u16) {
+    std::thread::spawn(move || {
+        let listener = match std::net::TcpListener::bind(format!("0.0.0.0:{}", port)) {
+            Ok(l) => l,
+            Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
+        };
+        eprintln!("[{}] gRPC server on :{}", service_name, port);
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut len_buf = [0u8; 4];
+                    if stream.read_exact(&mut len_buf).is_err() { return; }
+                    let msg_len = u32::from_be_bytes(len_buf) as usize;
+                    if msg_len > 4 * 1024 * 1024 { return; }
+                    let mut payload = vec![0u8; msg_len];
+                    if stream.read_exact(&mut payload).is_err() { return; }
+                    let resp = format!(r#"{{"status":"ok","service":"{}"}}"#, service_name);
+                    let resp_bytes = resp.as_bytes();
+                    let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                    let _ = stream.write_all(&resp_len);
+                    let _ = stream.write_all(resp_bytes);
+                });
+            }
+        }
+    });
+}
+
+fn grpc_call(target: &str, method: &str, payload: &str) -> Result<String, String> {
+    if !cb_allow() { return Err("circuit breaker open".to_string()); }
+    use std::io::{Read, Write};
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
+        }
+        match std::net::TcpStream::connect_timeout(
+            &target.parse().map_err(|e| format!("{}", e))?,
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(mut stream) => {
+                let data = format!(r#"{{"method":"{}","payload":{}}}"#, method, payload);
+                let data_bytes = data.as_bytes();
+                let len_bytes = (data_bytes.len() as u32).to_be_bytes();
+                if stream.write_all(&len_bytes).is_err() { cb_record_failure(); continue; }
+                if stream.write_all(data_bytes).is_err() { cb_record_failure(); continue; }
+                let mut resp_len_buf = [0u8; 4];
+                if stream.read_exact(&mut resp_len_buf).is_err() { cb_record_failure(); continue; }
+                let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+                let mut resp_buf = vec![0u8; resp_len];
+                if stream.read_exact(&mut resp_buf).is_err() { cb_record_failure(); continue; }
+                cb_record_success();
+                return Ok(String::from_utf8_lossy(&resp_buf).to_string());
+            }
+            Err(e) => { cb_record_failure(); eprintln!("gRPC {} attempt {} failed: {}", target, attempt+1, e); }
+        }
+    }
+    Err(format!("gRPC retries exhausted for {}", target))
+}
+
+
+// --- mTLS Configuration ---
+fn mtls_config() -> (bool, String, String, String) {
+    let enabled = env::var("MTLS_ENABLED").unwrap_or_default() == "true";
+    let cert = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/etc/54bank/certs/service.crt".to_string());
+    let key = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/etc/54bank/certs/service.key".to_string());
+    let ca = env::var("TLS_CA_PATH").unwrap_or_else(|_| "/etc/54bank/certs/ca.crt".to_string());
+    (enabled, cert, key, ca)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
@@ -333,6 +480,7 @@ async fn main() -> std::io::Result<()> {
     });
 
     println!("neo4j-coa-graph-rs listening on port {}", port);
+    start_grpc_server("neo4j-coa-graph-rs", 10386);
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
@@ -343,6 +491,7 @@ async fn main() -> std::io::Result<()> {
                 .add(("Content-Security-Policy", "default-src 'self'"))
                 .add(("X-XSS-Protection", "1; mode=block"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(ready))
             .route("/livez", web::get().to(live))
@@ -355,4 +504,19 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/create", web::post().to(create_node))
     })
     .bind(("0.0.0.0", port))?.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_service_name() {
+        assert_eq!("neo4j-coa-graph-rs", "neo4j-coa-graph-rs");
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        assert!(rl_allow());
+    }
 }

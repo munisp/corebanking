@@ -79,8 +79,14 @@ def cache_set(key, value, ttl=300):
 
 # --- Configuration ---
 DB_URL = os.environ.get("DATABASE_URL", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production")
+JWT_SECRET = os.environ.get("JWT_SECRET", "${JWT_SECRET}")
 KYC_ENGINE_URL = os.environ.get("KYC_ENGINE_URL", "http://localhost:8122")
+
+# --- mTLS Configuration ---
+MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
+TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54bank/certs/service.crt")
+TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
+TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
 PORT = int(os.environ.get("PORT", "9460"))
 START_TIME = time.time()
 
@@ -411,6 +417,50 @@ def call_service_grpc(target, method, payload=None):
             break
     return call_service_grpc(target, payload)
 
+
+# --- Alerting ---
+_ALERT_RULES = [
+    {"name": "high_error_rate", "metric": "error_rate", "threshold": 0.05, "severity": "critical"},
+    {"name": "high_latency", "metric": "p99_latency_ms", "threshold": 5000, "severity": "warning"},
+    {"name": "db_failures", "metric": "db_failures", "threshold": 3, "severity": "critical"},
+]
+
+def check_alerts():
+    fired = []
+    err_rate = error_count / max(request_count, 1)
+    if err_rate > 0.05:
+        fired.append({"rule": "high_error_rate", "value": err_rate, "severity": "critical"})
+    return fired
+
+
+# --- Graceful Degradation ---
+class _DegradationState:
+    def __init__(self):
+        self.db_available = True
+        self.cache_available = True
+        self.upstreams = {}
+        self._lock = threading.Lock()
+
+    def set_db(self, ok):
+        with self._lock: self.db_available = ok
+
+    def is_db_ok(self):
+        with self._lock: return self.db_available
+
+    def set_upstream(self, name, ok):
+        with self._lock: self.upstreams[name] = ok
+
+    def status(self):
+        with self._lock:
+            return {
+                "db_available": self.db_available,
+                "cache_available": self.cache_available,
+                "upstreams": dict(self.upstreams),
+                "mode": "normal" if self.db_available else "degraded",
+            }
+
+_degrade = _DegradationState()
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
@@ -461,7 +511,11 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(200, {"ready": True})
         elif path == "/livez":
             self.respond(200, {"alive": True})
-        elif path == "/metrics":
+        elif path == "/v1/degradation":
+                self._json(200, {"service": "kyc-event-consumer-py", **_degrade.status()})
+            elif path == "/v1/alerts":
+                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+            elif path == "/metrics":
             body = (
                 f'# HELP requests_total Total requests\n'
                 f'# TYPE requests_total counter\n'

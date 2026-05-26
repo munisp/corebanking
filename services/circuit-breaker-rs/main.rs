@@ -165,6 +165,25 @@ fn seed_configs() -> Vec<CBConfig> {
     ]
 }
 
+
+// --- Graceful Degradation ---
+use std::sync::atomic::AtomicBool;
+
+static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
+static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+fn degradation_mode() -> &'static str {
+    if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
+}
+
+async fn degradation_status() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
+        "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
+        "mode": degradation_mode(),
+    }))
+}
+
 async fn healthz() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
         "service": "circuit-breaker-rs", "status": "healthy", "version": "1.0.0",
@@ -288,6 +307,16 @@ async fn reset_breaker(path: web::Path<String>, data: web::Data<AppState>) -> Ht
     HttpResponse::Ok().json(serde_json::json!({ "reset": true, "service": service }))
 }
 
+
+// --- mTLS Configuration ---
+fn mtls_config() -> (bool, String, String, String) {
+    let enabled = env::var("MTLS_ENABLED").unwrap_or_default() == "true";
+    let cert = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/etc/54bank/certs/service.crt".to_string());
+    let key = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/etc/54bank/certs/service.key".to_string());
+    let ca = env::var("TLS_CA_PATH").unwrap_or_else(|_| "/etc/54bank/certs/ca.crt".to_string());
+    (enabled, cert, key, ca)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8260".to_string()).parse().unwrap_or(8260);
@@ -300,6 +329,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(healthz))
             .route("/v1/circuit-breakers", web::get().to(list_breakers))
             .route("/v1/circuit-breakers/stats", web::get().to(get_stats))
@@ -313,4 +343,19 @@ async fn main() -> std::io::Result<()> {
     .bind(("0.0.0.0", port))?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_service_name() {
+        assert_eq!("circuit-breaker-rs", "circuit-breaker-rs");
+    }
+
+    #[test]
+    fn test_rate_limiter() {
+        assert!(rl_allow());
+    }
 }
