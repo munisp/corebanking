@@ -18,6 +18,60 @@ struct AppState {
 
 fn bloom_hash(item: &str, seed: u64) -> u64 { item.bytes().fold(seed, |h, b| h.wrapping_mul(31).wrapping_add(b as u64)) }
 
+// ── Production Bloom Filter (probabilistic membership test) ─────────────────
+
+const BLOOM_SIZE: usize = 65536;
+const BLOOM_HASH_COUNT: usize = 7;
+
+struct BloomFilter {
+    bits: Vec<u8>,
+    size: usize,
+    hash_count: usize,
+    items_count: u64,
+}
+
+impl BloomFilter {
+    fn new(size: usize, hash_count: usize) -> Self {
+        BloomFilter { bits: vec![0u8; size / 8 + 1], size, hash_count, items_count: 0 }
+    }
+    fn hash_idx(&self, item: &str, seed: usize) -> usize {
+        let h = bloom_hash(item, seed as u64);
+        (h as usize) % self.size
+    }
+    fn add(&mut self, item: &str) {
+        for i in 0..self.hash_count {
+            let idx = self.hash_idx(item, i);
+            self.bits[idx / 8] |= 1 << (idx % 8);
+        }
+        self.items_count += 1;
+    }
+    fn might_contain(&self, item: &str) -> bool {
+        for i in 0..self.hash_count {
+            let idx = self.hash_idx(item, i);
+            if self.bits[idx / 8] & (1 << (idx % 8)) == 0 { return false; }
+        }
+        true
+    }
+    fn false_positive_rate(&self) -> f64 {
+        let m = self.size as f64;
+        let k = self.hash_count as f64;
+        let n = self.items_count as f64;
+        (1.0 - (-k * n / m).exp()).powf(k)
+    }
+    fn clear(&mut self) { self.bits.iter_mut().for_each(|b| *b = 0); self.items_count = 0; }
+}
+
+use std::collections::HashMap as BloomMap;
+static BLOOM_FILTERS: std::sync::LazyLock<Mutex<BloomMap<String, BloomFilter>>> =
+    std::sync::LazyLock::new(|| {
+        let mut m = BloomMap::new();
+        m.insert("fraud_bvn".to_string(), BloomFilter::new(BLOOM_SIZE, BLOOM_HASH_COUNT));
+        m.insert("aml_watchlist".to_string(), BloomFilter::new(BLOOM_SIZE * 4, 11));
+        m.insert("duplicate_txn".to_string(), BloomFilter::new(BLOOM_SIZE * 2, 7));
+        m.insert("rate_limit_ip".to_string(), BloomFilter::new(BLOOM_SIZE, 5));
+        Mutex::new(m)
+    });
+
 
 // --- Graceful Degradation ---
 use std::sync::atomic::AtomicBool;

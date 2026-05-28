@@ -376,6 +376,220 @@ class RedisClient:
         return "configured"
 
 
+# ── Production Cache Manager (Multi-Level, Stampede Protection, Metrics) ─────
+
+class CacheManager:
+    """Production-grade caching layer with L1 in-process + L2 Redis.
+    Features: connection pooling (via RedisClient), stampede protection (SETNX),
+    distributed invalidation (PUBLISH), structured key namespacing, configurable TTL,
+    cache warming, and observability metrics.
+    """
+
+    def __init__(self, service_name: str, redis_client: 'RedisClient'):
+        self.service_name = service_name
+        self.redis = redis_client
+        self._l1: dict[str, tuple[Any, float]] = {}
+        self._l1_lock = threading.Lock()
+        self._l1_max = int(os.environ.get("CACHE_L1_MAX_SIZE", "1000"))
+        self._hits = 0
+        self._misses = 0
+        self._stampedes = 0
+        self._invalidations = 0
+        self._metrics_lock = threading.Lock()
+        # TTL config
+        self.ttl_default = 300
+        self.ttl_session = 1800
+        self.ttl_rate_limit = 60
+        self.ttl_user_data = 120
+        self.ttl_list_query = 30
+        self.ttl_hot_data = 10
+        self.ttl_reference = 3600
+        # Start invalidation listener
+        self._sub_thread = threading.Thread(target=self._subscribe_invalidations, daemon=True)
+        self._sub_thread.start()
+
+    def key(self, entity: str, id: str) -> str:
+        return f"{self.service_name}:{entity}:{id}"
+
+    def key_with_tenant(self, tenant: str, entity: str, id: str) -> str:
+        return f"{self.service_name}:{tenant}:{entity}:{id}"
+
+    def list_key(self, entity: str, page: int = 1, limit: int = 20) -> str:
+        return f"{self.service_name}:{entity}:list:{page}:{limit}"
+
+    def get(self, key: str) -> Optional[str]:
+        """Multi-level get: L1 → L2 → miss."""
+        # L1
+        with self._l1_lock:
+            entry = self._l1.get(key)
+            if entry:
+                val, exp = entry
+                if time.time() < exp:
+                    with self._metrics_lock:
+                        self._hits += 1
+                    return val
+                del self._l1[key]
+
+        # L2: Redis
+        val = self.redis.get(key)
+        if val is not None:
+            with self._metrics_lock:
+                self._hits += 1
+            # Promote to L1
+            self._l1_set(key, val, self.ttl_hot_data)
+            return val
+
+        with self._metrics_lock:
+            self._misses += 1
+        return None
+
+    def set(self, key: str, value: Any, ttl: int = 0) -> None:
+        """Multi-level set: L1 + L2."""
+        if ttl <= 0:
+            ttl = self.ttl_default
+        val_str = json.dumps(value, default=str) if not isinstance(value, (str, int, float)) else str(value)
+        # L1 (capped TTL)
+        l1_ttl = min(ttl, 30)
+        self._l1_set(key, val_str, l1_ttl)
+        # L2: Redis
+        self.redis.set(key, val_str, ttl)
+
+    def get_or_load(self, key: str, loader, ttl: int = 0) -> Optional[str]:
+        """Get from cache or load with stampede protection (SETNX lock)."""
+        val = self.get(key)
+        if val is not None:
+            return val
+
+        # Stampede protection
+        lock_key = f"{key}:lock"
+        if self.redis._ensure_connected():
+            try:
+                self.redis._send_command("SET", lock_key, "1", "NX", "EX", "5")
+                resp = self.redis._read_response()
+                if resp is None:
+                    with self._metrics_lock:
+                        self._stampedes += 1
+                    time.sleep(0.05)
+                    val = self.get(key)
+                    if val is not None:
+                        return val
+            except Exception:
+                pass
+
+        # Load
+        result = loader()
+        if result is not None:
+            self.set(key, result, ttl or self.ttl_default)
+            # Release lock
+            self.redis.delete(lock_key)
+        return result
+
+    def invalidate(self, key: str) -> None:
+        """Invalidate from both L1 and L2, publish to other instances."""
+        with self._metrics_lock:
+            self._invalidations += 1
+        with self._l1_lock:
+            self._l1.pop(key, None)
+        self.redis.delete(key)
+        self.redis.publish_event("54bank:cache:invalidate", key)
+
+    def invalidate_prefix(self, prefix: str) -> int:
+        """Invalidate all keys matching prefix from L1."""
+        count = 0
+        with self._l1_lock:
+            keys_to_del = [k for k in self._l1 if k.startswith(prefix)]
+            for k in keys_to_del:
+                del self._l1[k]
+                count += 1
+        with self._metrics_lock:
+            self._invalidations += count
+        self.redis.publish_event("54bank:cache:invalidate", f"{prefix}*")
+        return count
+
+    def warm(self, entries: list[tuple[str, str, int]]) -> int:
+        """Pre-populate cache with known hot entries. Each entry: (key, value, ttl)."""
+        count = 0
+        for key, value, ttl in entries:
+            self.set(key, value, ttl)
+            count += 1
+        logger.info(f"[cache] Warmed {count} entries for {self.service_name}")
+        return count
+
+    def metrics(self) -> dict:
+        """Return cache observability metrics."""
+        with self._metrics_lock:
+            total = self._hits + self._misses
+            hit_rate = (self._hits / total * 100) if total > 0 else 0
+            return {
+                "service": self.service_name,
+                "l1_hits": self._hits,
+                "l2_misses": self._misses,
+                "hit_rate_pct": round(hit_rate, 2),
+                "stampedes_prevented": self._stampedes,
+                "invalidations": self._invalidations,
+                "l1_size": len(self._l1),
+                "l1_max_size": self._l1_max,
+                "redis_connected": self.redis.health() == "connected",
+            }
+
+    def prometheus_metrics(self) -> str:
+        """Return Prometheus-format metrics."""
+        m = self.metrics()
+        svc = self.service_name
+        return (
+            f'cache_l1_hits_total{{service="{svc}"}} {m["l1_hits"]}\n'
+            f'cache_misses_total{{service="{svc}"}} {m["l2_misses"]}\n'
+            f'cache_hit_rate{{service="{svc}"}} {m["hit_rate_pct"]}\n'
+            f'cache_stampedes_total{{service="{svc}"}} {m["stampedes_prevented"]}\n'
+            f'cache_invalidations_total{{service="{svc}"}} {m["invalidations"]}\n'
+            f'cache_l1_size{{service="{svc}"}} {m["l1_size"]}\n'
+        )
+
+    def _l1_set(self, key: str, value: str, ttl: int) -> None:
+        with self._l1_lock:
+            if len(self._l1) >= self._l1_max:
+                # Evict oldest
+                oldest = min(self._l1, key=lambda k: self._l1[k][1])
+                del self._l1[oldest]
+            self._l1[key] = (value, time.time() + ttl)
+
+    def _subscribe_invalidations(self) -> None:
+        """Listen for distributed cache invalidation messages."""
+        while True:
+            try:
+                parsed = urlparse(self.redis.url)
+                host = parsed.hostname or "localhost"
+                port = parsed.port or 6379
+                sock = socket.create_connection((host, port), timeout=5)
+                sock.settimeout(60)
+                if parsed.password:
+                    cmd = f"*2\r\n$4\r\nAUTH\r\n${len(parsed.password)}\r\n{parsed.password}\r\n"
+                    sock.sendall(cmd.encode())
+                    sock.recv(256)
+                channel = "54bank:cache:invalidate"
+                cmd = f"*2\r\n$9\r\nSUBSCRIBE\r\n${len(channel)}\r\n{channel}\r\n"
+                sock.sendall(cmd.encode())
+                while True:
+                    data = sock.recv(4096).decode(errors="replace")
+                    if "message" in data:
+                        parts = data.split("\r\n")
+                        for i, p in enumerate(parts):
+                            if p == "message" and i + 4 < len(parts):
+                                key = parts[i + 4]
+                                if key:
+                                    if key.endswith("*"):
+                                        prefix = key[:-1]
+                                        with self._l1_lock:
+                                            to_del = [k for k in self._l1 if k.startswith(prefix)]
+                                            for k in to_del:
+                                                del self._l1[k]
+                                    else:
+                                        with self._l1_lock:
+                                            self._l1.pop(key, None)
+            except Exception:
+                time.sleep(5)
+
+
 # ── OpenSearch ───────────────────────────────────────────────────────────────
 
 class OpenSearchClient:
@@ -1668,9 +1882,10 @@ class APISIXClient:
 # ── Middleware Bundle ────────────────────────────────────────────────────────
 
 class Bundle:
-    def __init__(self):
+    def __init__(self, service_name: str = "54bank"):
         self.kafka = KafkaClient()
         self.redis = RedisClient()
+        self.cache = CacheManager(service_name, self.redis)
         self.opensearch = OpenSearchClient()
         self.lakehouse = LakehouseClient()
         self.postgres = PostgresClient()

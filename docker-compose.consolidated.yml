@@ -52,9 +52,43 @@ services:
   redis:
     image: redis:7-alpine
     ports: ["6379:6379"]
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly yes
+      --appendfsync everysec
+      --tcp-backlog 511
+      --timeout 300
+      --tcp-keepalive 60
+      --maxclients 10000
+      --hz 10
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --latency-tracking yes
+      --activedefrag yes
+      --active-defrag-ignore-bytes 100mb
+      --active-defrag-threshold-lower 10
+      --notify-keyspace-events Ex
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis-sentinel:
+    image: redis:7-alpine
+    ports: ["26379:26379"]
+    depends_on:
+      redis: { condition: service_healthy }
+    command: >
+      sh -c "echo 'sentinel monitor mymaster redis 6379 1' > /tmp/sentinel.conf &&
+      echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf &&
+      echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf &&
+      echo 'sentinel parallel-syncs mymaster 1' >> /tmp/sentinel.conf &&
+      redis-sentinel /tmp/sentinel.conf"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5

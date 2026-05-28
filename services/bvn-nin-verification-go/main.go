@@ -140,7 +140,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
-	cacheSet("bvn_nin_verification_list", "", 1) // invalidate list cache on write
+	cacheInvalidate("bvn_nin_verification_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
@@ -487,39 +487,166 @@ func traceMiddleware(next http.Handler) http.Handler {
 }
 
 // --- Redis Caching Layer ---
-var redisAddr string
+// --- Production Cache (connection-pooled, multi-level, with metrics) ---
+var _cachePool *cachePool
+var _l1Cache sync.Map // L1 in-process cache
+var _cacheHits atomic.Uint64
+var _cacheMisses atomic.Uint64
+var _cacheStampedes atomic.Uint64
 
-func init() {
-	redisAddr = os.Getenv("REDIS_URL")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
+type cachePool struct {
+	pool     chan net.Conn
+	host     string
+	port     string
+	password string
+	db       string
+}
+
+type l1CacheEntry struct {
+	Value  string
+	Expiry time.Time
+}
+
+func initCachePool() {
+	url := os.Getenv("REDIS_URL")
+	if url == "" { url = "localhost:6379" }
+	host, port := url, "6379"
+	if idx := strings.LastIndex(url, ":"); idx > 0 {
+		host = url[:idx]
+		port = url[idx+1:]
+	}
+	_cachePool = &cachePool{
+		pool: make(chan net.Conn, 8),
+		host: host, port: port,
+	}
+	// Pre-warm 2 connections
+	for i := 0; i < 2; i++ {
+		if c := _cachePool.dial(); c != nil {
+			_cachePool.pool <- c
+		}
+	}
+}
+
+func (p *cachePool) dial() net.Conn {
+	addr := net.JoinHostPort(p.host, p.port)
+	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
+	if err != nil { return nil }
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	fmt.Fprintf(conn, "*1\r\n$4\r\nPING\r\n")
+	buf := make([]byte, 64)
+	n, _ := conn.Read(buf)
+	if n > 0 && buf[0] == '+' { return conn }
+	conn.Close()
+	return nil
+}
+
+func (p *cachePool) get() net.Conn {
+	select {
+	case c := <-p.pool:
+		c.SetDeadline(time.Now().Add(2 * time.Second))
+		fmt.Fprintf(c, "*1\r\n$4\r\nPING\r\n")
+		buf := make([]byte, 64)
+		n, err := c.Read(buf)
+		if err == nil && n > 0 && buf[0] == '+' { return c }
+		c.Close()
+		return p.dial()
+	default:
+		return p.dial()
+	}
+}
+
+func (p *cachePool) put(c net.Conn) {
+	if c == nil { return }
+	select {
+	case p.pool <- c:
+	default:
+		c.Close()
 	}
 }
 
 func cacheGet(key string) (string, bool) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
-	defer conn.Close()
+	// L1: in-process check
+	if entry, ok := _l1Cache.Load(key); ok {
+		e := entry.(l1CacheEntry)
+		if time.Now().Before(e.Expiry) {
+			_cacheHits.Add(1)
+			return e.Value, true
+		}
+		_l1Cache.Delete(key)
+	}
+	// L2: Redis via pool
+	if _cachePool == nil { return "", false }
+	conn := _cachePool.get()
+	if conn == nil { _cacheMisses.Add(1); return "", false }
+	defer _cachePool.put(conn)
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 4096)
+	buf := make([]byte, 8192)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
+	if err != nil || n < 3 { _cacheMisses.Add(1); return "", false }
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
-		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+		if len(parts) >= 3 {
+			_cacheHits.Add(1)
+			// Promote to L1 (10s TTL)
+			_l1Cache.Store(key, l1CacheEntry{Value: parts[1], Expiry: time.Now().Add(10 * time.Second)})
+			return parts[1], true
+		}
 	}
+	_cacheMisses.Add(1)
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
-	defer conn.Close()
-	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
-		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
+	// L1 store
+	_l1Cache.Store(key, l1CacheEntry{Value: value, Expiry: time.Now().Add(time.Duration(ttlSeconds) * time.Second)})
+	// L2: Redis via pool
+	if _cachePool == nil { return }
+	conn := _cachePool.get()
+	if conn == nil { return }
+	defer _cachePool.put(conn)
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	ttlStr := fmt.Sprintf("%d", ttlSeconds)
+	fmt.Fprintf(conn, "*6\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%s\r\n$2\r\nNX\r\n",
+		len(key), key, len(value), value, len(ttlStr), ttlStr)
+	buf := make([]byte, 256)
+	conn.Read(buf)
 }
+
+func cacheInvalidate(key string) {
+	_l1Cache.Delete(key)
+	if _cachePool == nil { return }
+	conn := _cachePool.get()
+	if conn == nil { return }
+	defer _cachePool.put(conn)
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	fmt.Fprintf(conn, "*2\r\n$3\r\nDEL\r\n$%d\r\n%s\r\n", len(key), key)
+	buf := make([]byte, 64)
+	conn.Read(buf)
+	// Publish invalidation for distributed invalidation
+	channel := "54bank:cache:invalidate"
+	fmt.Fprintf(conn, "*3\r\n$7\r\nPUBLISH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+		len(channel), channel, len(key), key)
+	conn.Read(buf)
+}
+
+func cacheMetricsHandler(w http.ResponseWriter, r *http.Request) {
+	hits := _cacheHits.Load()
+	misses := _cacheMisses.Load()
+	total := hits + misses
+	hitRate := 0.0
+	if total > 0 { hitRate = float64(hits) / float64(total) * 100 }
+	l1Size := 0
+	_l1Cache.Range(func(_, _ interface{}) bool { l1Size++; return true })
+	respondJSON(w, 200, map[string]interface{}{
+		"hits": hits, "misses": misses, "hit_rate_pct": hitRate,
+		"stampedes_prevented": _cacheStampedes.Load(),
+		"l1_size": l1Size,
+		"pool_connected": _cachePool != nil,
+	})
+}
+
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {

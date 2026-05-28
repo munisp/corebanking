@@ -118,12 +118,28 @@ impl PgStore {
     }
 }
 
-// ── Redis Client (RESP protocol over TCP) ───────────────────────────────────
+// ── Redis Client (Connection-Pooled, Multi-Level Cache) ─────────────────────
+
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+static CACHE_STAMPEDES: AtomicU64 = AtomicU64::new(0);
+
+struct L1Entry {
+    value: String,
+    expires_at: u64, // unix millis
+}
 
 pub struct RedisClient {
     host: String,
     port: u16,
     connected: Mutex<bool>,
+    pool: Mutex<Vec<TcpStream>>,
+    pool_max: usize,
+    l1_cache: Mutex<HashMap<String, L1Entry>>,
+    l1_max_size: usize,
     fallback: Mutex<HashMap<String, String>>,
 }
 
@@ -131,67 +147,162 @@ impl RedisClient {
     pub fn new() -> Self {
         let url = env_or("REDIS_URL", "redis://redis-master:6379/0");
         let (host, port) = parse_redis_url(&url);
+        let pool_size: usize = env::var("REDIS_POOL_SIZE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+        let l1_max: usize = env::var("CACHE_L1_MAX_SIZE")
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+
         let client = RedisClient {
             host: host.clone(),
             port,
             connected: Mutex::new(false),
+            pool: Mutex::new(Vec::with_capacity(pool_size)),
+            pool_max: pool_size,
+            l1_cache: Mutex::new(HashMap::with_capacity(l1_max)),
+            l1_max_size: l1_max,
             fallback: Mutex::new(HashMap::new()),
         };
-        if let Ok(mut stream) = TcpStream::connect_timeout(
-            &format!("{}:{}", host, port).parse().unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap()),
-            Duration::from_secs(3),
-        ) {
-            let _ = stream.write_all(b"*1\r\n$4\r\nPING\r\n");
-            let mut buf = [0u8; 64];
-            if let Ok(n) = stream.read(&mut buf) {
-                if n > 0 && buf[0] == b'+' {
-                    *client.connected.lock().unwrap() = true;
-                    log::info!("[redis] Connected to {}:{}", host, port);
-                }
+
+        // Pre-warm pool with 2 connections
+        let mut initial_conns = Vec::new();
+        for _ in 0..2 {
+            if let Some(stream) = client.dial() {
+                initial_conns.push(stream);
             }
         }
-        if !*client.connected.lock().unwrap() {
+        if !initial_conns.is_empty() {
+            *client.connected.lock().unwrap() = true;
+            let mut pool = client.pool.lock().unwrap();
+            for c in initial_conns {
+                pool.push(c);
+            }
+            log::info!("[redis] Pool connected to {}:{} (size={})", host, port, pool.len());
+        } else {
             log::warn!("[redis] Connection failed, using fallback mode");
         }
         client
     }
 
-    fn exec_cmd(&self, args: &[&str]) -> Option<String> {
+    fn dial(&self) -> Option<TcpStream> {
         let addr = format!("{}:{}", self.host, self.port);
-        if let Ok(mut stream) = TcpStream::connect_timeout(
+        let stream = TcpStream::connect_timeout(
             &addr.parse().ok()?,
             Duration::from_secs(3),
-        ) {
-            stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-            let mut cmd = format!("*{}\r\n", args.len());
-            for arg in args {
-                cmd.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
-            }
-            stream.write_all(cmd.as_bytes()).ok()?;
-            let mut buf = vec![0u8; 4096];
-            let n = stream.read(&mut buf).ok()?;
-            let response = String::from_utf8_lossy(&buf[..n]).to_string();
-            let lines: Vec<&str> = response.split("\r\n").collect();
-            if lines.is_empty() {
-                return None;
-            }
-            let first = lines[0];
-            match first.as_bytes().first()? {
-                b'+' => Some(first[1..].to_string()),
-                b':' => Some(first[1..].to_string()),
-                b'$' => {
-                    let len: i32 = first[1..].parse().ok()?;
-                    if len < 0 { return None; }
-                    if lines.len() > 1 { Some(lines[1].to_string()) } else { None }
-                }
-                _ => None,
-            }
+        ).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
+        // PING
+        let mut s = stream;
+        s.write_all(b"*1\r\n$4\r\nPING\r\n").ok()?;
+        let mut buf = [0u8; 64];
+        let n = s.read(&mut buf).ok()?;
+        if n > 0 && buf[0] == b'+' {
+            Some(s)
         } else {
             None
         }
     }
 
+    fn pool_get(&self) -> Option<TcpStream> {
+        // Try to get from pool
+        {
+            let mut pool = self.pool.lock().unwrap();
+            while let Some(mut conn) = pool.pop() {
+                // Health check
+                if conn.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
+                    let mut buf = [0u8; 64];
+                    if let Ok(n) = conn.read(&mut buf) {
+                        if n > 0 && buf[0] == b'+' {
+                            return Some(conn);
+                        }
+                    }
+                }
+                // Stale connection, drop it
+            }
+        }
+        // Pool empty, dial new
+        self.dial()
+    }
+
+    fn pool_put(&self, conn: TcpStream) {
+        let mut pool = self.pool.lock().unwrap();
+        if pool.len() < self.pool_max {
+            pool.push(conn);
+        }
+        // else: drop conn (closes on Drop)
+    }
+
+    fn exec_cmd(&self, args: &[&str]) -> Option<String> {
+        let mut stream = self.pool_get()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        let mut cmd = format!("*{}\r\n", args.len());
+        for arg in args {
+            cmd.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
+        }
+        stream.write_all(cmd.as_bytes()).ok()?;
+        let mut buf = vec![0u8; 8192];
+        let n = stream.read(&mut buf).ok()?;
+        let response = String::from_utf8_lossy(&buf[..n]).to_string();
+        self.pool_put(stream);
+
+        let lines: Vec<&str> = response.split("\r\n").collect();
+        if lines.is_empty() {
+            return None;
+        }
+        let first = lines[0];
+        match first.as_bytes().first()? {
+            b'+' => Some(first[1..].to_string()),
+            b':' => Some(first[1..].to_string()),
+            b'$' => {
+                let len: i32 = first[1..].parse().ok()?;
+                if len < 0 { return None; }
+                if lines.len() > 1 { Some(lines[1].to_string()) } else { None }
+            }
+            _ => None,
+        }
+    }
+
+    fn now_millis() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    }
+
+    fn l1_get(&self, key: &str) -> Option<String> {
+        let cache = self.l1_cache.lock().unwrap();
+        if let Some(entry) = cache.get(key) {
+            if Self::now_millis() < entry.expires_at {
+                return Some(entry.value.clone());
+            }
+        }
+        None
+    }
+
+    fn l1_set(&self, key: &str, value: &str, ttl_ms: u64) {
+        let mut cache = self.l1_cache.lock().unwrap();
+        if cache.len() >= self.l1_max_size {
+            // Evict oldest entry
+            let oldest = cache.iter()
+                .min_by_key(|(_, v)| v.expires_at)
+                .map(|(k, _)| k.clone());
+            if let Some(k) = oldest {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(key.to_string(), L1Entry {
+            value: value.to_string(),
+            expires_at: Self::now_millis() + ttl_ms,
+        });
+    }
+
+    fn l1_del(&self, key: &str) {
+        self.l1_cache.lock().unwrap().remove(key);
+    }
+
     pub fn set(&self, key: &str, value: &str, ttl_secs: u64) -> bool {
+        // L1 store (min 10s TTL for L1)
+        let l1_ttl = if ttl_secs > 0 { std::cmp::min(ttl_secs * 1000, 30_000) } else { 30_000 };
+        self.l1_set(key, value, l1_ttl);
+
+        // L2: Redis
         if *self.connected.lock().unwrap() {
             let result = if ttl_secs > 0 {
                 self.exec_cmd(&["SET", key, value, "EX", &ttl_secs.to_string()])
@@ -207,19 +318,57 @@ impl RedisClient {
     }
 
     pub fn get(&self, key: &str) -> Option<String> {
+        // L1: in-process
+        if let Some(val) = self.l1_get(key) {
+            CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return Some(val);
+        }
+
+        // L2: Redis
         if *self.connected.lock().unwrap() {
             if let Some(val) = self.exec_cmd(&["GET", key]) {
+                CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                // Promote to L1
+                self.l1_set(key, &val, 10_000);
                 return Some(val);
             }
         }
+        CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
         self.fallback.lock().unwrap().get(key).cloned()
     }
 
     pub fn del(&self, key: &str) -> bool {
+        self.l1_del(key);
         if *self.connected.lock().unwrap() {
             self.exec_cmd(&["DEL", key]);
+            // Distributed invalidation
+            self.exec_cmd(&["PUBLISH", "54bank:cache:invalidate", key]);
         }
         self.fallback.lock().unwrap().remove(key).is_some()
+    }
+
+    pub fn get_or_load<F>(&self, key: &str, ttl_secs: u64, loader: F) -> Option<String>
+    where F: FnOnce() -> Option<String>
+    {
+        // Try cache
+        if let Some(val) = self.get(key) {
+            return Some(val);
+        }
+        // Stampede protection: SETNX lock
+        let lock_key = format!("{}:lock", key);
+        let lock_result = self.exec_cmd(&["SET", &lock_key, "1", "NX", "EX", "5"]);
+        if lock_result.is_none() {
+            CACHE_STAMPEDES.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+            if let Some(val) = self.get(key) {
+                return Some(val);
+            }
+        }
+        // Load
+        let val = loader()?;
+        self.set(key, &val, ttl_secs);
+        self.exec_cmd(&["DEL", &lock_key]);
+        Some(val)
     }
 
     pub fn incr(&self, key: &str) -> Option<i64> {
@@ -236,6 +385,72 @@ impl RedisClient {
         } else {
             false
         }
+    }
+
+    pub fn pipeline(&self, commands: &[Vec<&str>]) -> Vec<Option<String>> {
+        let mut stream = match self.pool_get() {
+            Some(s) => s,
+            None => return vec![None; commands.len()],
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(5 * commands.len() as u64 + 5))).ok();
+        // Send all commands
+        let mut all_cmds = String::new();
+        for cmd in commands {
+            all_cmds.push_str(&format!("*{}\r\n", cmd.len()));
+            for arg in cmd {
+                all_cmds.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
+            }
+        }
+        if stream.write_all(all_cmds.as_bytes()).is_err() {
+            return vec![None; commands.len()];
+        }
+        // Read all responses
+        let mut results = Vec::with_capacity(commands.len());
+        let mut buf = vec![0u8; 16384];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let response = String::from_utf8_lossy(&buf[..n]).to_string();
+        self.pool_put(stream);
+
+        for line in response.split("\r\n") {
+            if line.is_empty() { continue; }
+            match line.as_bytes().first() {
+                Some(b'+') => results.push(Some(line[1..].to_string())),
+                Some(b':') => results.push(Some(line[1..].to_string())),
+                Some(b'$') => {
+                    if line == "$-1" { results.push(None); }
+                    // bulk string value will be on next line - simplified
+                }
+                Some(b'-') => results.push(None),
+                _ => {
+                    // Likely a bulk string value
+                    if results.len() < commands.len() {
+                        if let Some(last) = results.last_mut() {
+                            if last.is_none() {
+                                *last = Some(line.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        while results.len() < commands.len() { results.push(None); }
+        results
+    }
+
+    pub fn cache_metrics(&self) -> HashMap<String, u64> {
+        let hits = CACHE_HITS.load(Ordering::Relaxed);
+        let misses = CACHE_MISSES.load(Ordering::Relaxed);
+        let total = hits + misses;
+        let l1_size = self.l1_cache.lock().unwrap().len() as u64;
+        let pool_size = self.pool.lock().unwrap().len() as u64;
+        let mut m = HashMap::new();
+        m.insert("hits".to_string(), hits);
+        m.insert("misses".to_string(), misses);
+        m.insert("hit_rate_pct".to_string(), if total > 0 { hits * 100 / total } else { 0 });
+        m.insert("stampedes_prevented".to_string(), CACHE_STAMPEDES.load(Ordering::Relaxed));
+        m.insert("l1_size".to_string(), l1_size);
+        m.insert("pool_size".to_string(), pool_size);
+        m
     }
 
     pub fn health(&self) -> &str {

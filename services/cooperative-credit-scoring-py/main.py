@@ -51,32 +51,205 @@ def _rl_allow():
         _rl_tokens -= 1
         return True
 
-_REDIS_URL = os.environ.get("REDIS_URL", "localhost:6379")
+# --- Production Cache (connection-pooled, multi-level L1+L2, stampede protection, metrics) ---
+import socket as _cache_socket
+import threading as _cache_threading
 
-def cache_get(key):
-    try:
-        host, port = _REDIS_URL.rsplit(":", 1)
-        s = _socket.create_connection((host, int(port)), timeout=2)
-        s.sendall(f"*2\r\n$3\r\nGET\r\n${len(key)}\r\n{key}\r\n".encode())
-        data = s.recv(4096).decode()
-        s.close()
-        if data.startswith("$-1"): return None
-        parts = data.split("\r\n", 2)
-        return parts[1] if len(parts) >= 3 else None
-    except Exception:
+_REDIS_URL = os.environ.get("REDIS_URL", "localhost:6379")
+_CACHE_POOL_SIZE = int(os.environ.get("REDIS_POOL_SIZE", "8"))
+
+class _CachePool:
+    """Thread-safe Redis connection pool with health checks."""
+    def __init__(self, url, size=8):
+        parts = url.rsplit(":", 1)
+        self.host = parts[0] if parts else "localhost"
+        self.port = int(parts[1]) if len(parts) > 1 else 6379
+        self.pool = []
+        self.lock = _cache_threading.Lock()
+        self.max_size = size
+        # Pre-warm 2 connections
+        for _ in range(2):
+            c = self._dial()
+            if c: self.pool.append(c)
+
+    def _dial(self):
+        try:
+            s = _cache_socket.create_connection((self.host, self.port), timeout=2)
+            s.settimeout(3)
+            s.sendall(b"*1\r\n$4\r\nPING\r\n")
+            resp = s.recv(64)
+            if resp and resp[0:1] == b'+':
+                return s
+            s.close()
+        except Exception:
+            pass
         return None
 
-def cache_set(key, value, ttl=300):
-    try:
-        host, port = _REDIS_URL.rsplit(":", 1)
-        s = _socket.create_connection((host, int(port)), timeout=2)
-        cmd = f"*4\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(str(value))}\r\n{value}\r\n$2\r\nEX\r\n${len(str(ttl))}\r\n{ttl}\r\n"
-        s.sendall(cmd.encode())
-        s.recv(256)
-        s.close()
-    except Exception:
-        pass
+    def get(self):
+        with self.lock:
+            while self.pool:
+                conn = self.pool.pop()
+                try:
+                    conn.settimeout(1)
+                    conn.sendall(b"*1\r\n$4\r\nPING\r\n")
+                    r = conn.recv(64)
+                    if r and r[0:1] == b'+':
+                        conn.settimeout(3)
+                        return conn
+                except Exception:
+                    pass
+                try: conn.close()
+                except: pass
+        return self._dial()
 
+    def put(self, conn):
+        if conn is None: return
+        with self.lock:
+            if len(self.pool) < self.max_size:
+                self.pool.append(conn)
+            else:
+                try: conn.close()
+                except: pass
+
+    def health(self):
+        c = self.get()
+        if c:
+            self.put(c)
+            return True
+        return False
+
+_cache_pool = _CachePool(_REDIS_URL, _CACHE_POOL_SIZE)
+_l1_cache = {}  # key -> (value, expiry_time)
+_l1_lock = _cache_threading.Lock()
+_l1_max_size = int(os.environ.get("CACHE_L1_MAX_SIZE", "500"))
+_cache_hits = 0
+_cache_misses = 0
+_cache_stampedes = 0
+_cache_metrics_lock = _cache_threading.Lock()
+
+def _l1_get(key):
+    with _l1_lock:
+        entry = _l1_cache.get(key)
+        if entry:
+            val, exp = entry
+            if time.time() < exp:
+                return val
+            del _l1_cache[key]
+    return None
+
+def _l1_set(key, value, ttl=10):
+    with _l1_lock:
+        if len(_l1_cache) >= _l1_max_size:
+            # Evict oldest
+            oldest_k = min(_l1_cache, key=lambda k: _l1_cache[k][1])
+            del _l1_cache[oldest_k]
+        _l1_cache[key] = (value, time.time() + ttl)
+
+def _l1_delete(key):
+    with _l1_lock:
+        _l1_cache.pop(key, None)
+
+def cache_get(key):
+    global _cache_hits, _cache_misses
+    # L1: in-process
+    val = _l1_get(key)
+    if val is not None:
+        with _cache_metrics_lock: _cache_hits += 1
+        return val
+    # L2: Redis via pool
+    conn = _cache_pool.get()
+    if conn is None:
+        with _cache_metrics_lock: _cache_misses += 1
+        return None
+    try:
+        conn.sendall(f"*2\r\n$3\r\nGET\r\n${len(key)}\r\n{key}\r\n".encode())
+        data = conn.recv(8192).decode()
+        _cache_pool.put(conn)
+        if data.startswith("$-1"):
+            with _cache_metrics_lock: _cache_misses += 1
+            return None
+        parts = data.split("\r\n", 2)
+        if len(parts) >= 3 and parts[1]:
+            with _cache_metrics_lock: _cache_hits += 1
+            _l1_set(key, parts[1])  # Promote to L1
+            return parts[1]
+    except Exception:
+        try: conn.close()
+        except: pass
+    with _cache_metrics_lock: _cache_misses += 1
+    return None
+
+def cache_set(key, value, ttl=300):
+    # L1 store
+    _l1_set(key, str(value), min(ttl, 30))
+    # L2: Redis via pool
+    conn = _cache_pool.get()
+    if conn is None: return
+    try:
+        v = str(value)
+        t = str(ttl)
+        cmd = f"*6\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(v)}\r\n{v}\r\n$2\r\nEX\r\n${len(t)}\r\n{t}\r\n$2\r\nNX\r\n"
+        conn.sendall(cmd.encode())
+        conn.recv(256)
+        _cache_pool.put(conn)
+    except Exception:
+        try: conn.close()
+        except: pass
+
+def cache_invalidate(key):
+    _l1_delete(key)
+    conn = _cache_pool.get()
+    if conn is None: return
+    try:
+        conn.sendall(f"*2\r\n$3\r\nDEL\r\n${len(key)}\r\n{key}\r\n".encode())
+        conn.recv(64)
+        # Distributed invalidation via PUBLISH
+        channel = "54bank:cache:invalidate"
+        conn.sendall(f"*3\r\n$7\r\nPUBLISH\r\n${len(channel)}\r\n{channel}\r\n${len(key)}\r\n{key}\r\n".encode())
+        conn.recv(64)
+        _cache_pool.put(conn)
+    except Exception:
+        try: conn.close()
+        except: pass
+
+def cache_get_or_load(key, loader, ttl=300):
+    """Get from cache or load with stampede protection."""
+    global _cache_stampedes
+    val = cache_get(key)
+    if val is not None: return val
+    # Stampede lock via SETNX
+    lock_key = key + ":lock"
+    conn = _cache_pool.get()
+    if conn:
+        try:
+            conn.sendall(f"*6\r\n$3\r\nSET\r\n${len(lock_key)}\r\n{lock_key}\r\n$1\r\n1\r\n$2\r\nNX\r\n$2\r\nEX\r\n$1\r\n5\r\n".encode())
+            resp = conn.recv(64).decode()
+            _cache_pool.put(conn)
+            if "$-1" in resp or resp.startswith("-"):
+                with _cache_metrics_lock: _cache_stampedes += 1
+                time.sleep(0.05)
+                val = cache_get(key)
+                if val is not None: return val
+        except Exception:
+            try: conn.close()
+            except: pass
+    # Load from source
+    result = loader()
+    if result is not None:
+        cache_set(key, result if isinstance(result, str) else json.dumps(result, default=str), ttl)
+    return result
+
+def cache_metrics():
+    with _cache_metrics_lock:
+        total = _cache_hits + _cache_misses
+        rate = (_cache_hits / total * 100) if total > 0 else 0
+    return {
+        "hits": _cache_hits, "misses": _cache_misses,
+        "hit_rate_pct": round(rate, 2),
+        "stampedes_prevented": _cache_stampedes,
+        "l1_size": len(_l1_cache),
+        "pool_connected": _cache_pool.health(),
+    }
 
 # --- gRPC Server (binary protocol, length-prefixed, with circuit breaker + retry) ---
 import socket as _grpc_socket
@@ -492,7 +665,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
 
-        if path == "/healthz":
+        if         if path == "/v1/cache-metrics":
+            self._respond(200, cache_metrics())
+            return
+        path == "/healthz":
             db = get_db()
             self.respond(200, {
                 "status": "healthy",
