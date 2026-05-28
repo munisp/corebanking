@@ -21,16 +21,118 @@ import {
 } from "@/components/ui/sidebar";
 import { getLoginUrl } from "@/const";
 import { useIsMobile } from "@/hooks/useMobile";
-import { LayoutDashboard, LogOut, PanelLeft, Users } from "lucide-react";
-import { CSSProperties, useEffect, useRef, useState } from "react";
+import {
+  LayoutDashboard, LogOut, PanelLeft, Users, CreditCard, ArrowRightLeft,
+  Shield, TrendingUp, Calculator, Building2, Bell, Search, ChevronDown,
+  ChevronRight, Star, Clock, Wallet, Heart,
+} from "lucide-react";
+import { CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "wouter";
 import { DashboardLayoutSkeleton } from './DashboardLayoutSkeleton';
 import { Button } from "./ui/button";
+import { Input } from "./ui/input";
 
-const menuItems = [
-  { icon: LayoutDashboard, label: "Page 1", path: "/" },
-  { icon: Users, label: "Page 2", path: "/some-path" },
+type NavItem = { icon: React.ElementType; label: string; path: string };
+type NavCategory = { name: string; icon: React.ElementType; items: NavItem[] };
+
+const navCategories: NavCategory[] = [
+  {
+    name: "Overview",
+    icon: LayoutDashboard,
+    items: [
+      { icon: LayoutDashboard, label: "Dashboard", path: "/" },
+      { icon: Bell, label: "Alerts", path: "/alerts" },
+      { icon: TrendingUp, label: "Analytics", path: "/analytics" },
+    ],
+  },
+  {
+    name: "Customers",
+    icon: Users,
+    items: [
+      { icon: Users, label: "Customer 360", path: "/customer-360" },
+      { icon: Users, label: "Segments", path: "/customer-segments" },
+      { icon: Heart, label: "Engagement", path: "/customer-engagement" },
+      { icon: Users, label: "Onboarding", path: "/customer-onboarding" },
+      { icon: Star, label: "Feedback", path: "/customer-feedback" },
+    ],
+  },
+  {
+    name: "Accounts",
+    icon: Building2,
+    items: [
+      { icon: Building2, label: "Account Opening", path: "/account-opening" },
+      { icon: Building2, label: "Statements", path: "/account-statements" },
+      { icon: Wallet, label: "Savings", path: "/savings-products" },
+      { icon: Clock, label: "Fixed Deposits", path: "/fixed-deposits" },
+      { icon: Building2, label: "Dormancy", path: "/dormancy" },
+    ],
+  },
+  {
+    name: "Payments",
+    icon: ArrowRightLeft,
+    items: [
+      { icon: ArrowRightLeft, label: "Payments Hub", path: "/payments-hub" },
+      { icon: ArrowRightLeft, label: "Transfers", path: "/payment-transactions" },
+      { icon: ArrowRightLeft, label: "Bulk Payments", path: "/bulk-payments" },
+      { icon: ArrowRightLeft, label: "Remittance", path: "/remittance" },
+      { icon: ArrowRightLeft, label: "QR Payments", path: "/qr-payments" },
+    ],
+  },
+  {
+    name: "Cards",
+    icon: CreditCard,
+    items: [
+      { icon: CreditCard, label: "Card Management", path: "/card-management" },
+      { icon: CreditCard, label: "Card Tokens", path: "/card-tokens" },
+      { icon: CreditCard, label: "Virtual Cards", path: "/virtual-accounts" },
+    ],
+  },
+  {
+    name: "Lending",
+    icon: Wallet,
+    items: [
+      { icon: Wallet, label: "Loan Origination", path: "/loan-origination" },
+      { icon: Wallet, label: "Credit Facilities", path: "/credit-facilities" },
+      { icon: Wallet, label: "Collections", path: "/collections" },
+      { icon: Wallet, label: "Disbursement", path: "/disbursement" },
+    ],
+  },
+  {
+    name: "Treasury",
+    icon: TrendingUp,
+    items: [
+      { icon: TrendingUp, label: "Treasury", path: "/treasury-liquidity" },
+      { icon: TrendingUp, label: "FX Rates", path: "/fx-rates" },
+      { icon: TrendingUp, label: "Money Market", path: "/money-market" },
+    ],
+  },
+  {
+    name: "Risk & Compliance",
+    icon: Shield,
+    items: [
+      { icon: Shield, label: "KYC", path: "/kyc-verification" },
+      { icon: Shield, label: "AML", path: "/aml-screening" },
+      { icon: Shield, label: "Fraud Detection", path: "/ai-fraud-detection" },
+      { icon: Shield, label: "Compliance", path: "/compliance-checks" },
+      { icon: Shield, label: "Audit Trail", path: "/audit-trail" },
+    ],
+  },
+  {
+    name: "Accounting",
+    icon: Calculator,
+    items: [
+      { icon: Calculator, label: "Chart of Accounts", path: "/chart-of-accounts" },
+      { icon: Calculator, label: "GL Entries", path: "/gl-entries" },
+      { icon: Calculator, label: "Reconciliation", path: "/reconciliation" },
+      { icon: Calculator, label: "EOD Processing", path: "/batch-eod" },
+    ],
+  },
 ];
+
+const allMenuItems: NavItem[] = navCategories.flatMap((c) => c.items);
+
+// Flat list for backward compat
+const menuItems = allMenuItems;
 
 const SIDEBAR_WIDTH_KEY = "sidebar-width";
 const DEFAULT_WIDTH = 280;
@@ -111,9 +213,30 @@ function DashboardLayoutContent({
   const { state, toggleSidebar } = useSidebar();
   const isCollapsed = state === "collapsed";
   const [isResizing, setIsResizing] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [openCategories, setOpenCategories] = useState<Set<string>>(() => {
+    const initial = new Set<string>();
+    initial.add("Overview");
+    const activeCat = navCategories.find((c) => c.items.some((i) => i.path === location));
+    if (activeCat) initial.add(activeCat.name);
+    return initial;
+  });
   const sidebarRef = useRef<HTMLDivElement>(null);
-  const activeMenuItem = menuItems.find(item => item.path === location);
+  const activeMenuItem = allMenuItems.find(item => item.path === location);
   const isMobile = useIsMobile();
+
+  // Cmd+K keyboard shortcut for search
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        const input = document.querySelector<HTMLInputElement>('[placeholder*="Search pages"]');
+        input?.focus();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, []);
 
   useEffect(() => {
     if (isCollapsed) {
@@ -179,25 +302,88 @@ function DashboardLayoutContent({
           </SidebarHeader>
 
           <SidebarContent className="gap-0">
+            {!isCollapsed && (
+              <div className="px-3 pt-2 pb-1">
+                <div className="relative">
+                  <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
+                  <Input
+                    placeholder="Search pages... (⌘K)"
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                    className="h-8 pl-8 text-xs"
+                  />
+                </div>
+              </div>
+            )}
             <SidebarMenu className="px-2 py-1">
-              {menuItems.map(item => {
-                const isActive = location === item.path;
-                return (
-                  <SidebarMenuItem key={item.path}>
-                    <SidebarMenuButton
-                      isActive={isActive}
-                      onClick={() => setLocation(item.path)}
-                      tooltip={item.label}
-                      className={`h-10 transition-all font-normal`}
-                    >
-                      <item.icon
-                        className={`h-4 w-4 ${isActive ? "text-primary" : ""}`}
-                      />
-                      <span>{item.label}</span>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                );
-              })}
+              {searchQuery ? (
+                allMenuItems
+                  .filter((item) => item.label.toLowerCase().includes(searchQuery.toLowerCase()))
+                  .slice(0, 20)
+                  .map((item) => {
+                    const isActive = location === item.path;
+                    return (
+                      <SidebarMenuItem key={item.path}>
+                        <SidebarMenuButton
+                          isActive={isActive}
+                          onClick={() => { setLocation(item.path); setSearchQuery(""); }}
+                          tooltip={item.label}
+                          className="h-9 transition-all font-normal"
+                        >
+                          <item.icon className={`h-4 w-4 ${isActive ? "text-primary" : ""}`} />
+                          <span>{item.label}</span>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    );
+                  })
+              ) : (
+                navCategories.map((cat) => {
+                  const isCatOpen = openCategories.has(cat.name);
+                  const hasActive = cat.items.some((item) => item.path === location);
+                  return (
+                    <div key={cat.name} className="mb-0.5">
+                      <SidebarMenuItem>
+                        <SidebarMenuButton
+                          onClick={() => {
+                            setOpenCategories((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(cat.name)) next.delete(cat.name);
+                              else next.add(cat.name);
+                              return next;
+                            });
+                          }}
+                          tooltip={cat.name}
+                          className={`h-9 font-medium text-xs uppercase tracking-wide ${hasActive ? "text-primary" : "text-muted-foreground"}`}
+                        >
+                          <cat.icon className="h-4 w-4" />
+                          <span className="flex-1">{cat.name}</span>
+                          {!isCollapsed && (
+                            <span className="text-muted-foreground">
+                              {isCatOpen ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+                            </span>
+                          )}
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                      {isCatOpen && !isCollapsed && cat.items.map((item) => {
+                        const isActive = location === item.path;
+                        return (
+                          <SidebarMenuItem key={item.path}>
+                            <SidebarMenuButton
+                              isActive={isActive}
+                              onClick={() => setLocation(item.path)}
+                              tooltip={item.label}
+                              className="h-8 pl-7 transition-all font-normal text-sm"
+                            >
+                              <item.icon className={`h-3.5 w-3.5 ${isActive ? "text-primary" : ""}`} />
+                              <span>{item.label}</span>
+                            </SidebarMenuButton>
+                          </SidebarMenuItem>
+                        );
+                      })}
+                    </div>
+                  );
+                })
+              )}
             </SidebarMenu>
           </SidebarContent>
 

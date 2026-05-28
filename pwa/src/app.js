@@ -42,6 +42,9 @@ class App {
     this.tenantBranding = null;
     this.tenantFeatures = null;
     this.tenantTier = 'starter';
+    this.sidebarOpen = false;
+    this.recentPages = JSON.parse(localStorage.getItem('54bank_recent_pages') || '[]');
+    window.app = this;
     this.init();
   }
 
@@ -144,22 +147,139 @@ class App {
     return `
       <nav class="bottom-nav">
         <a href="#home" class="nav-item ${this.currentPage === 'home' ? 'active' : ''}">
-          <span class="nav-icon">&#x1F3E0;</span><span class="nav-label">Home</span>
+          <svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg><span class="nav-label">Home</span>
         </a>
         <a href="#agents" class="nav-item ${this.currentPage === 'agents' ? 'active' : ''}">
-          <span class="nav-icon">&#x1F916;</span><span class="nav-label">Agents</span>
+          <svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 2v4m0 12v4m-7-7H1m22 0h-4m-1.5-6.5L15 5m-6 14l-2.5-2.5M19.5 5L17 7.5M5 19.5L7.5 17"/></svg><span class="nav-label">Agents</span>
         </a>
         <a href="#kpi" class="nav-item ${this.currentPage === 'kpi' ? 'active' : ''}">
-          <span class="nav-icon">&#x1F4CA;</span><span class="nav-label">KPIs</span>
+          <svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 20V10m-6 10V4M6 20v-6"/></svg><span class="nav-label">KPIs</span>
         </a>
         <a href="#graph" class="nav-item ${this.currentPage === 'graph' ? 'active' : ''}">
-          <span class="nav-icon">&#x1F578;</span><span class="nav-label">Graph</span>
+          <svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="18" r="3"/><circle cx="18" cy="6" r="3"/><path d="M8.6 7.4L15.4 16.6M8.6 4.6L15.4 4.6"/></svg><span class="nav-label">Graph</span>
         </a>
-        <a href="#settings" class="nav-item ${this.currentPage === 'settings' ? 'active' : ''}">
-          <span class="nav-icon">&#x2699;</span><span class="nav-label">Settings</span>
-        </a>
+        <button class="nav-item" onclick="window.app.toggleSidebar()">
+          <svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg><span class="nav-label">More</span>
+        </button>
       </nav>
+      ${this.renderSideDrawer()}
     `;
+  }
+
+  toggleSidebar() {
+    this.sidebarOpen = !this.sidebarOpen;
+    this.render();
+  }
+
+  renderSideDrawer() {
+    const isDesktop = window.innerWidth >= 768;
+    if (!this.sidebarOpen && !isDesktop) return '';
+    const categories = [
+      { name: 'Core Banking', icon: 'bank', items: [
+        { label: 'Account Opening', hash: 'account-opening' },
+        { label: 'Customer 360', hash: 'customer-360' },
+        { label: 'Deposits', hash: 'deposits' },
+        { label: 'Standing Orders', hash: 'standing-orders' },
+        { label: 'Branch Ops', hash: 'branch-ops' },
+      ]},
+      { name: 'Payments', icon: 'arrow-swap', items: [
+        { label: 'Payments Hub', hash: 'payments-hub' },
+        { label: 'Bulk Payments', hash: 'bulk-payments' },
+        { label: 'QR Payments', hash: 'qr-payments' },
+        { label: 'Remittance', hash: 'remittance' },
+        { label: 'SWIFT', hash: 'swift' },
+      ]},
+      { name: 'Cards', icon: 'credit-card', items: [
+        { label: 'Card Management', hash: 'card-management' },
+        { label: 'Virtual Cards', hash: 'virtual-cards' },
+        { label: 'Card Tokens', hash: 'card-tokens' },
+      ]},
+      { name: 'Lending', icon: 'dollar', items: [
+        { label: 'Loan Origination', hash: 'loan-origination' },
+        { label: 'Credit Scoring', hash: 'credit-scoring' },
+        { label: 'Collections', hash: 'collections' },
+        { label: 'Disbursement', hash: 'disbursement' },
+      ]},
+      { name: 'Treasury & FX', icon: 'trending-up', items: [
+        { label: 'Treasury', hash: 'treasury' },
+        { label: 'FX Rates', hash: 'fx-rates' },
+        { label: 'Money Market', hash: 'money-market' },
+        { label: 'Investments', hash: 'investments' },
+      ]},
+      { name: 'Risk & Compliance', icon: 'shield', items: [
+        { label: 'KYC/KYB', hash: 'kyc' },
+        { label: 'AML Screening', hash: 'aml' },
+        { label: 'Fraud Detection', hash: 'fraud' },
+        { label: 'Audit Trail', hash: 'audit' },
+        { label: 'Regulatory Returns', hash: 'regulatory' },
+      ]},
+      { name: 'Insurance', icon: 'shield-check', items: [
+        { label: 'Agricultural Insurance', hash: 'agri-insurance' },
+        { label: 'Claims', hash: 'claims' },
+        { label: 'Policy Mgmt', hash: 'policies' },
+      ]},
+      { name: 'Agent Banking', icon: 'users', items: [
+        { label: 'Agent Network', hash: 'agents' },
+        { label: 'Float Mgmt', hash: 'float' },
+        { label: 'Commission', hash: 'commission' },
+      ]},
+      { name: 'Administration', icon: 'settings', items: [
+        { label: 'User Management', hash: 'users' },
+        { label: 'Roles & Permissions', hash: 'roles' },
+        { label: 'Tenant Config', hash: 'tenant-config' },
+        { label: 'Feature Flags', hash: 'feature-flags' },
+        { label: 'System Health', hash: 'system-health' },
+      ]},
+    ];
+    return `
+      <div class="sidebar-overlay" onclick="window.app.toggleSidebar()"></div>
+      <aside class="sidebar-drawer open">
+        <div class="sidebar-header">
+          <h2 class="sidebar-title">Navigation</h2>
+          <button class="sidebar-close" onclick="window.app.toggleSidebar()">&times;</button>
+        </div>
+        <div class="sidebar-search">
+          <input type="text" placeholder="Search pages..." class="sidebar-search-input" id="pwa-nav-search" oninput="window.app.filterSidebarNav(this.value)" />
+        </div>
+        <nav class="sidebar-nav" id="pwa-sidebar-nav">
+          ${categories.map(cat => `
+            <div class="sidebar-category">
+              <div class="sidebar-cat-header" onclick="this.parentElement.classList.toggle('open')">
+                <span class="sidebar-cat-name">${cat.name}</span>
+                <span class="sidebar-cat-count">${cat.items.length}</span>
+                <span class="sidebar-chevron">&#9656;</span>
+              </div>
+              <div class="sidebar-cat-items">
+                ${cat.items.map(item => `
+                  <a href="#${item.hash}" class="sidebar-item" onclick="window.app.toggleSidebar()">${item.label}</a>
+                `).join('')}
+              </div>
+            </div>
+          `).join('')}
+        </nav>
+        <div class="sidebar-footer">
+          <div class="sidebar-footer-info">${categories.reduce((sum, c) => sum + c.items.length, 0)} pages across ${categories.length} categories</div>
+        </div>
+      </aside>
+    `;
+  }
+
+  filterSidebarNav(query) {
+    const nav = document.getElementById('pwa-sidebar-nav');
+    if (!nav) return;
+    const items = nav.querySelectorAll('.sidebar-item');
+    const categories = nav.querySelectorAll('.sidebar-category');
+    query = query.toLowerCase();
+    categories.forEach(cat => {
+      let visible = 0;
+      cat.querySelectorAll('.sidebar-item').forEach(item => {
+        const match = item.textContent.toLowerCase().includes(query);
+        item.style.display = match ? '' : 'none';
+        if (match) visible++;
+      });
+      cat.style.display = visible > 0 || !query ? '' : 'none';
+      if (query) cat.classList.add('open');
+    });
   }
 
   renderPage() {
@@ -820,6 +940,39 @@ class App {
       .locked::after { content: ''; position: absolute; inset: 0; background: rgba(255,255,255,.3); border-radius: var(--radius); }
       .lock-badge { display: inline-block; background: var(--accent); color: #fff; font-size: .7rem; padding: 4px 10px; border-radius: 10px; font-weight: 600; margin-top: 8px; }
       code { background: var(--bg); padding: 2px 6px; border-radius: 4px; font-size: .85rem; }
+      .nav-svg { width: 22px; height: 22px; margin-bottom: 2px; }
+      .nav-item button { background: none; border: none; cursor: pointer; }
+      .sidebar-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 200; animation: fadeIn .2s; }
+      .sidebar-drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 300px; max-width: 85vw; background: #fff; z-index: 201; transform: translateX(100%); transition: transform .3s ease; display: flex; flex-direction: column; box-shadow: -4px 0 24px rgba(0,0,0,.15); }
+      .sidebar-drawer.open { transform: translateX(0); }
+      .sidebar-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+      .sidebar-title { font-size: 1.1rem; font-weight: 700; color: var(--primary); }
+      .sidebar-close { background: none; border: none; font-size: 1.5rem; cursor: pointer; color: var(--text-secondary); }
+      .sidebar-search { padding: 12px 16px; }
+      .sidebar-search-input { width: 100%; padding: 10px 14px; border: 1px solid var(--border); border-radius: 10px; font-size: .9rem; outline: none; }
+      .sidebar-search-input:focus { border-color: var(--primary); }
+      .sidebar-nav { flex: 1; overflow-y: auto; padding: 0 12px; }
+      .sidebar-category { margin-bottom: 4px; border-radius: 8px; overflow: hidden; }
+      .sidebar-cat-header { display: flex; align-items: center; gap: 8px; padding: 10px 12px; cursor: pointer; font-weight: 600; font-size: .85rem; color: var(--text); border-radius: 8px; transition: background .2s; }
+      .sidebar-cat-header:hover { background: var(--bg); }
+      .sidebar-cat-name { flex: 1; }
+      .sidebar-cat-count { font-size: .7rem; background: var(--bg); padding: 2px 8px; border-radius: 10px; color: var(--text-secondary); font-weight: 500; }
+      .sidebar-chevron { font-size: .7rem; transition: transform .2s; color: var(--text-secondary); }
+      .sidebar-category.open .sidebar-chevron { transform: rotate(90deg); }
+      .sidebar-cat-items { display: none; padding: 0 0 8px 20px; }
+      .sidebar-category.open .sidebar-cat-items { display: block; }
+      .sidebar-item { display: block; padding: 8px 12px; font-size: .85rem; color: var(--text-secondary); text-decoration: none; border-radius: 6px; transition: background .2s, color .2s; }
+      .sidebar-item:hover { background: var(--bg); color: var(--primary); }
+      .sidebar-footer { padding: 12px 16px; border-top: 1px solid var(--border); }
+      .sidebar-footer-info { font-size: .75rem; color: var(--text-secondary); text-align: center; }
+      @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+      @media (min-width: 768px) {
+        .bottom-nav { display: none; }
+        .main-content { margin-bottom: 0; margin-left: 260px; }
+        .sidebar-drawer { left: 0; right: auto; top: 56px; transform: none; box-shadow: none; border-right: 1px solid var(--border); width: 260px; }
+        .sidebar-overlay { display: none; }
+        .sidebar-drawer .sidebar-close { display: none; }
+      }
       @media (max-width: 600px) { .action-grid, .agent-grid, .graph-tools, .kpi-summary-grid, .kpi-grid { grid-template-columns: 1fr; } .widget-grid { grid-template-columns: repeat(2, 1fr); } }
     `;
   }

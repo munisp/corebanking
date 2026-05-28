@@ -1,7 +1,7 @@
 // Design philosophy: extracted 54Bank admin portal as canonical base.
 // Sidebar organized into collapsible categories to manage 230+ pages.
 
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useRef } from "react";
 import { Link, useLocation } from "wouter";
 import { useFeatureFlags, SERVICE_CATALOG } from "@/hooks/useFeatureFlags";
 import {
@@ -1078,7 +1078,54 @@ function CategorySection({
 export default function ArchiveAdminSidebar() {
   const [location] = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [recentPages, setRecentPages] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("54bank_recent_pages") || "[]"); } catch { return []; }
+  });
   const { isEnabled } = useFeatureFlags();
+  const searchInputRef = useRef<HTMLInputElement>(null);
+
+  // Track recent pages
+  useEffect(() => {
+    if (location && location !== "/") {
+      setRecentPages((prev) => {
+        const updated = [location, ...prev.filter((p) => p !== location)].slice(0, 8);
+        localStorage.setItem("54bank_recent_pages", JSON.stringify(updated));
+        return updated;
+      });
+    }
+  }, [location]);
+
+  // Cmd+K keyboard shortcut
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, []);
+
+  // Compute breadcrumb
+  const breadcrumb = useMemo(() => {
+    for (const cat of categorizedMenu) {
+      const item = cat.items.find((i) => i.path === location);
+      if (item) return { category: cat.category, item: item.label };
+    }
+    return null;
+  }, [location]);
+
+  // Search results
+  const searchResults = useMemo(() => {
+    if (!searchQuery) return [];
+    const q = searchQuery.toLowerCase();
+    return categorizedMenu
+      .flatMap((cat) => cat.items.map((item) => ({ ...item, category: cat.category })))
+      .filter((item) => item.label.toLowerCase().includes(q) || item.path.includes(q))
+      .slice(0, 15);
+  }, [searchQuery]);
 
   // Auto-expand the category that contains the active route
   const activeCategory = categorizedMenu.findIndex((cat) =>
@@ -1106,17 +1153,90 @@ export default function ArchiveAdminSidebar() {
 
   const navigationItems = (
     <div className="space-y-0.5">
-      {categorizedMenu.map((cat, idx) => (
-        <CategorySection
-          key={cat.category}
-          cat={cat}
-          isOpen={openCategories.has(idx)}
-          onToggle={() => toggleCategory(idx)}
-          location={location}
-          onItemClick={() => setMobileOpen(false)}
-          isEnabled={isEnabled}
-        />
-      ))}
+      {/* Search bar */}
+      <div className="px-3 pb-2">
+        <div className="relative">
+          <Search size={14} className="absolute left-2.5 top-2.5 text-slate-400" />
+          <input
+            ref={searchInputRef}
+            type="text"
+            placeholder="Search pages... (⌘K)"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="w-full rounded-lg border border-slate-200 bg-slate-50 py-2 pl-8 pr-3 text-xs outline-none transition-colors focus:border-blue-400 focus:bg-white"
+          />
+        </div>
+      </div>
+
+      {/* Breadcrumb */}
+      {breadcrumb && !searchQuery && (
+        <div className="mx-3 mb-2 flex items-center gap-1 rounded-lg bg-blue-50 px-3 py-1.5 text-xs text-blue-700">
+          <span className="font-medium">{breadcrumb.category}</span>
+          <ChevronRight size={12} />
+          <span className="truncate">{breadcrumb.item}</span>
+        </div>
+      )}
+
+      {/* Search results */}
+      {searchQuery ? (
+        <div className="space-y-0.5 px-2">
+          {searchResults.length === 0 && (
+            <p className="px-3 py-4 text-center text-xs text-slate-400">No pages match &ldquo;{searchQuery}&rdquo;</p>
+          )}
+          {searchResults.map((item) => {
+            const Icon = item.icon;
+            return (
+              <Link
+                key={item.path}
+                href={item.path}
+                onClick={() => { setMobileOpen(false); setSearchQuery(""); }}
+                className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-slate-600 transition-colors hover:bg-slate-50"
+              >
+                <Icon size={14} />
+                <span className="flex-1 truncate">{item.label}</span>
+                <span className="text-[10px] text-slate-400">{item.category}</span>
+              </Link>
+            );
+          })}
+        </div>
+      ) : (
+        <>
+          {/* Recently visited */}
+          {recentPages.length > 0 && (
+            <div className="mb-2 px-2">
+              <p className="mb-1 px-3 text-[10px] font-semibold uppercase tracking-wider text-slate-400">Recent</p>
+              {recentPages.slice(0, 4).map((path) => {
+                const item = categorizedMenu.flatMap((c) => c.items).find((i) => i.path === path);
+                if (!item) return null;
+                const Icon = item.icon;
+                return (
+                  <Link
+                    key={path}
+                    href={path}
+                    onClick={() => setMobileOpen(false)}
+                    className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-slate-500 transition-colors hover:bg-slate-50 hover:text-slate-700"
+                  >
+                    <Clock size={12} className="text-slate-400" />
+                    <Icon size={12} />
+                    <span className="truncate">{item.label}</span>
+                  </Link>
+                );
+              })}
+            </div>
+          )}
+          {categorizedMenu.map((cat, idx) => (
+            <CategorySection
+              key={cat.category}
+              cat={cat}
+              isOpen={openCategories.has(idx)}
+              onToggle={() => toggleCategory(idx)}
+              location={location}
+              onItemClick={() => setMobileOpen(false)}
+              isEnabled={isEnabled}
+            />
+          ))}
+        </>
+      )}
     </div>
   );
 
