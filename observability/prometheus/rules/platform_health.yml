@@ -1,0 +1,302 @@
+# 54Bank Platform Health Alerting Rules
+# Prometheus alerting rules for bugs, orphan features, and performance bottlenecks
+
+groups:
+  # ── Service Health ──────────────────────────────────────────
+  - name: service_health
+    interval: 30s
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Service {{ $labels.job }}/{{ $labels.instance }} is down"
+          description: "{{ $labels.instance }} has been unreachable for >2 minutes"
+          runbook: "https://wiki.54bank.com/runbooks/service-down"
+
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_errors_total[5m])) by (service)
+            /
+            sum(rate(http_requests_total[5m])) by (service)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} error rate {{ $value | humanizePercentage }}"
+          description: "Error rate has exceeded 5% for 5 minutes"
+
+      - alert: HighErrorRateWarning
+        expr: |
+          (
+            sum(rate(http_errors_total[5m])) by (service)
+            /
+            sum(rate(http_requests_total[5m])) by (service)
+          ) > 0.01
+        for: 15m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} error rate elevated at {{ $value | humanizePercentage }}"
+
+  # ── Latency ─────────────────────────────────────────────────
+  - name: latency
+    interval: 30s
+    rules:
+      - alert: HighP95Latency
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} P95 latency {{ $value | humanizeDuration }}"
+
+      - alert: CriticalP99Latency
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service)) > 2.0
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} P99 latency {{ $value | humanizeDuration }}"
+
+      - alert: SlowDatabaseQueries
+        expr: pg_stat_statements_mean_exec_time_ms > 500
+        for: 10m
+        labels:
+          severity: warning
+          team: database
+        annotations:
+          summary: "Slow PostgreSQL query: mean {{ $value }}ms"
+
+  # ── Orphan/Dead Service Detection ───────────────────────────
+  - name: orphan_detection
+    interval: 1h
+    rules:
+      - alert: OrphanService
+        expr: sum(rate(http_requests_total[7d])) by (service) == 0
+        for: 7d
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} received 0 requests in 7 days — possible orphan"
+          description: "This service may be unused. Consider removing or investigating."
+
+      - alert: DeadEndpoint
+        expr: sum(rate(http_requests_total[7d])) by (service, handler) == 0
+        for: 7d
+        labels:
+          severity: info
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }}/{{ $labels.handler }} has 0 traffic in 7 days"
+
+  # ── Cache Performance ───────────────────────────────────────
+  - name: cache_health
+    interval: 1m
+    rules:
+      - alert: LowCacheHitRate
+        expr: cache_hit_rate < 0.3
+        for: 30m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} cache hit rate {{ $value | humanizePercentage }}"
+
+      - alert: CacheStampede
+        expr: rate(cache_stampedes_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Cache stampede detected in {{ $labels.service }}"
+
+      - alert: RedisHighMemory
+        expr: redis_memory_used_bytes / redis_memory_max_bytes > 0.9
+        for: 5m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Redis memory usage {{ $value | humanizePercentage }}"
+
+      - alert: RedisHighEvictions
+        expr: rate(redis_evicted_keys_total[5m]) > 100
+        for: 10m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Redis evicting {{ $value }} keys/sec"
+
+  # ── Database Health ─────────────────────────────────────────
+  - name: database_health
+    interval: 30s
+    rules:
+      - alert: PostgresConnectionPoolExhaustion
+        expr: pg_stat_activity_count / pg_settings_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: critical
+          team: database
+        annotations:
+          summary: "PostgreSQL connection pool at {{ $value | humanizePercentage }}"
+
+      - alert: PostgresHighSequentialScans
+        expr: rate(pg_stat_user_tables_seq_scan[1h]) > 1000
+        for: 1h
+        labels:
+          severity: warning
+          team: database
+        annotations:
+          summary: "High sequential scans on {{ $labels.relname }}: {{ $value }}/hr"
+
+      - alert: PostgresDeadTuples
+        expr: pg_stat_user_tables_n_dead_tup > 100000
+        for: 30m
+        labels:
+          severity: warning
+          team: database
+        annotations:
+          summary: "{{ $labels.relname }} has {{ $value }} dead tuples — needs VACUUM"
+
+      - alert: PostgresReplicationLag
+        expr: pg_replication_lag_seconds > 30
+        for: 5m
+        labels:
+          severity: critical
+          team: database
+        annotations:
+          summary: "PostgreSQL replication lag {{ $value }}s"
+
+  # ── Kafka Health ────────────────────────────────────────────
+  - name: kafka_health
+    interval: 30s
+    rules:
+      - alert: KafkaConsumerLag
+        expr: kafka_consumer_group_lag > 10000
+        for: 10m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Kafka consumer lag {{ $value }} for {{ $labels.group }}"
+
+      - alert: KafkaUnderReplicatedPartitions
+        expr: kafka_server_replica_manager_under_replicated_partitions > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Kafka has {{ $value }} under-replicated partitions"
+
+  # ── Circuit Breaker ─────────────────────────────────────────
+  - name: circuit_breaker
+    interval: 15s
+    rules:
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state == 1
+        for: 1m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "Circuit breaker OPEN for {{ $labels.service }} → {{ $labels.target }}"
+          description: "Upstream {{ $labels.target }} is failing. Traffic is being shed."
+
+      - alert: CircuitBreakerHalfOpen
+        expr: circuit_breaker_state == 2
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "Circuit breaker half-open for {{ $labels.service }} → {{ $labels.target }}"
+
+  # ── Resource Usage ──────────────────────────────────────────
+  - name: resources
+    interval: 30s
+    rules:
+      - alert: HighCPU
+        expr: rate(container_cpu_usage_seconds_total[5m]) > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "{{ $labels.name }} CPU usage {{ $value | humanizePercentage }}"
+
+      - alert: HighMemory
+        expr: container_memory_usage_bytes / container_spec_memory_limit_bytes > 0.9
+        for: 5m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "{{ $labels.name }} memory usage {{ $value | humanizePercentage }}"
+
+      - alert: ContainerRestarting
+        expr: rate(container_restart_count[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "{{ $labels.name }} has restarted {{ $value }} times in 15m"
+
+  # ── ML Pipeline ─────────────────────────────────────────────
+  - name: ml_pipeline
+    interval: 1m
+    rules:
+      - alert: ModelDriftDetected
+        expr: ml_model_drift_score > 0.1
+        for: 30m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "Model {{ $labels.model }} drift score {{ $value }}"
+
+      - alert: MLInferenceLatency
+        expr: histogram_quantile(0.95, rate(ml_inference_duration_seconds_bucket[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          team: ml
+        annotations:
+          summary: "ML inference P95 {{ $value | humanizeDuration }}"
+
+  # ── Graceful Degradation ────────────────────────────────────
+  - name: degradation
+    interval: 30s
+    rules:
+      - alert: ServiceDegraded
+        expr: service_degradation_mode == 1
+        for: 5m
+        labels:
+          severity: warning
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} is in degraded mode"
+          description: "Service is operating with reduced functionality"
+
+      - alert: MultipleServicesDegraded
+        expr: count(service_degradation_mode == 1) > 5
+        for: 5m
+        labels:
+          severity: critical
+          team: platform
+        annotations:
+          summary: "{{ $value }} services are in degraded mode"

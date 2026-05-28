@@ -1,0 +1,167 @@
+# 54Bank Prometheus Configuration
+# Scrapes metrics from all 496 services + infrastructure components
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: '54bank-production'
+    environment: 'production'
+
+rule_files:
+  - '/etc/prometheus/rules/*.yml'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+      timeout: 10s
+
+scrape_configs:
+  # ── Self-monitoring ─────────────────────────────────────────
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # ── Infrastructure ──────────────────────────────────────────
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres-exporter:9187']
+    metrics_path: /metrics
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka-exporter:9308']
+
+  - job_name: 'opensearch'
+    static_configs:
+      - targets: ['opensearch-exporter:9114']
+
+  - job_name: 'apisix'
+    static_configs:
+      - targets: ['apisix:9091']
+    metrics_path: /apisix/prometheus/metrics
+
+  - job_name: 'keycloak'
+    static_configs:
+      - targets: ['keycloak:8080']
+    metrics_path: /metrics
+
+  # ── Application Services (consolidated containers) ──────────
+  - job_name: 'core-banking'
+    static_configs:
+      - targets:
+          - 'core-accounts:9100'
+          - 'core-lending:9114'
+          - 'core-payments:9128'
+          - 'core-cards:9140'
+          - 'core-deposits:9147'
+    metrics_path: /v1/metrics
+    scrape_interval: 30s
+
+  - job_name: 'compliance'
+    static_configs:
+      - targets:
+          - 'compliance-kyc-aml:9154'
+          - 'compliance-regulatory:9187'
+          - 'compliance-fraud:9208'
+          - 'compliance-risk:9216'
+    metrics_path: /v1/metrics
+    scrape_interval: 30s
+
+  - job_name: 'treasury-trade'
+    static_configs:
+      - targets:
+          - 'treasury-investments:9221'
+          - 'treasury-fx:9236'
+          - 'treasury-supply-chain:9245'
+    metrics_path: /v1/metrics
+
+  - job_name: 'ai-ml'
+    static_configs:
+      - targets:
+          - 'ml-inference-server:8010'
+          - 'ai-inference:9254'
+          - 'ai-graph-search:9258'
+          - 'ai-data-pipeline:9281'
+    metrics_path: /v1/metrics
+
+  - job_name: 'channels'
+    static_configs:
+      - targets:
+          - 'channels-messaging:9285'
+          - 'channels-voice:9301'
+          - 'channels-mobile-web:9315'
+          - 'channels-ai-agents:9319'
+    metrics_path: /v1/metrics
+
+  - job_name: 'infrastructure-services'
+    static_configs:
+      - targets:
+          - 'infra-messaging:9327'
+          - 'infra-caching:9341'
+          - 'infra-database:9352'
+          - 'infra-network:9365'
+          - 'infra-observability:9380'
+    metrics_path: /v1/metrics
+
+  - job_name: 'workflow-ops'
+    static_configs:
+      - targets:
+          - 'workflow-batch:9390'
+          - 'workflow-operations:9399'
+          - 'workflow-reporting:9447'
+    metrics_path: /v1/metrics
+
+  - job_name: 'platform'
+    static_configs:
+      - targets:
+          - 'platform-tenant:9458'
+          - 'platform-api:9470'
+          - 'platform-devops:9483'
+    metrics_path: /v1/metrics
+
+  - job_name: 'specialized'
+    static_configs:
+      - targets:
+          - 'specialized-agriculture:9491'
+          - 'specialized-islamic:9516'
+          - 'specialized-engagement:9522'
+    metrics_path: /v1/metrics
+
+  - job_name: 'ledger'
+    static_configs:
+      - targets:
+          - 'ledger-gl:9528'
+          - 'ledger-reconciliation:9538'
+    metrics_path: /v1/metrics
+
+  - job_name: 'identity-security'
+    static_configs:
+      - targets:
+          - 'identity-auth:9543'
+          - 'identity-waf:9561'
+          - 'identity-access:9580'
+    metrics_path: /v1/metrics
+
+  # ── Lakehouse ───────────────────────────────────────────────
+  - job_name: 'lakehouse'
+    static_configs:
+      - targets: ['lakehouse-server:8020']
+    metrics_path: /v1/metrics
+
+  # ── Node Exporter (host metrics) ────────────────────────────
+  - job_name: 'node'
+    static_configs:
+      - targets: ['node-exporter:9100']
+
+  # ── cAdvisor (container metrics) ────────────────────────────
+  - job_name: 'cadvisor'
+    static_configs:
+      - targets: ['cadvisor:8080']
+    metrics_path: /metrics

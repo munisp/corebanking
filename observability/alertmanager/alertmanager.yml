@@ -1,0 +1,175 @@
+# 54Bank Alertmanager Configuration
+# Routes alerts to appropriate channels based on severity and team
+
+global:
+  resolve_timeout: 5m
+  smtp_smarthost: 'smtp.54bank.com:587'
+  smtp_from: 'alerts@54bank.com'
+  smtp_auth_username: '${SMTP_USERNAME}'
+  smtp_auth_password: '${SMTP_PASSWORD}'
+
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'
+
+route:
+  group_by: ['alertname', 'service', 'severity']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'default-slack'
+
+  routes:
+    # Critical alerts → PagerDuty + Slack
+    - match:
+        severity: critical
+      receiver: 'pagerduty-critical'
+      group_wait: 10s
+      repeat_interval: 1h
+      routes:
+        - match:
+            team: database
+          receiver: 'pagerduty-database'
+        - match:
+            team: infrastructure
+          receiver: 'pagerduty-infrastructure'
+        - match:
+            team: ml
+          receiver: 'pagerduty-ml'
+
+    # Warning alerts → Slack only
+    - match:
+        severity: warning
+      receiver: 'slack-warnings'
+      repeat_interval: 8h
+
+    # Info alerts (self-healing triggers) → dedicated channel
+    - match:
+        severity: info
+      receiver: 'slack-self-healing'
+      repeat_interval: 24h
+
+    # Orphan detection → weekly digest
+    - match:
+        alertname: OrphanService
+      receiver: 'slack-orphans'
+      group_wait: 1h
+      repeat_interval: 168h  # Weekly
+
+    # Dead endpoints → weekly digest
+    - match:
+        alertname: DeadEndpoint
+      receiver: 'slack-orphans'
+      group_wait: 1h
+      repeat_interval: 168h
+
+inhibit_rules:
+  # Don't alert on high latency if service is down
+  - source_match:
+      alertname: ServiceDown
+    target_match_re:
+      alertname: 'High.*Latency|HighErrorRate'
+    equal: ['service']
+
+  # Don't alert on cache issues if Redis is down
+  - source_match:
+      alertname: ServiceDown
+      job: redis
+    target_match_re:
+      alertname: 'LowCacheHitRate|CacheStampede|RedisHigh.*'
+
+  # Don't alert on Kafka lag if Kafka is down
+  - source_match:
+      alertname: ServiceDown
+      job: kafka
+    target_match_re:
+      alertname: 'KafkaConsumer.*'
+
+receivers:
+  - name: 'default-slack'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#54bank-alerts'
+        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+        text: >-
+          *Service:* {{ .CommonLabels.service }}
+          *Severity:* {{ .CommonLabels.severity }}
+          *Summary:* {{ .CommonAnnotations.summary }}
+          *Description:* {{ .CommonAnnotations.description }}
+        send_resolved: true
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+
+  - name: 'pagerduty-critical'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_SERVICE_KEY}'
+        severity: 'critical'
+        description: '{{ .CommonAnnotations.summary }}'
+        details:
+          service: '{{ .CommonLabels.service }}'
+          alertname: '{{ .CommonLabels.alertname }}'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#54bank-critical'
+        title: 'CRITICAL: {{ .CommonLabels.alertname }}'
+        text: '{{ .CommonAnnotations.summary }}'
+        color: 'danger'
+
+  - name: 'pagerduty-database'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_DB_KEY}'
+        severity: 'critical'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#54bank-database'
+        title: 'DB CRITICAL: {{ .CommonLabels.alertname }}'
+        text: '{{ .CommonAnnotations.summary }}'
+        color: 'danger'
+
+  - name: 'pagerduty-infrastructure'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_INFRA_KEY}'
+        severity: 'critical'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#54bank-infrastructure'
+        title: 'INFRA CRITICAL: {{ .CommonLabels.alertname }}'
+        text: '{{ .CommonAnnotations.summary }}'
+        color: 'danger'
+
+  - name: 'pagerduty-ml'
+    pagerduty_configs:
+      - service_key: '${PAGERDUTY_ML_KEY}'
+        severity: 'critical'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#54bank-ml'
+        title: 'ML CRITICAL: {{ .CommonLabels.alertname }}'
+        text: '{{ .CommonAnnotations.summary }}'
+        color: 'danger'
+
+  - name: 'slack-warnings'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#54bank-warnings'
+        title: 'WARNING: {{ .CommonLabels.alertname }}'
+        text: '{{ .CommonAnnotations.summary }}'
+        color: 'warning'
+        send_resolved: true
+
+  - name: 'slack-self-healing'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#54bank-self-healing'
+        title: 'AUTO-HEAL: {{ .CommonLabels.alertname }}'
+        text: >-
+          *Action:* {{ .CommonLabels.action }}
+          *Service:* {{ .CommonLabels.service }}
+          *Summary:* {{ .CommonAnnotations.summary }}
+        color: '#2196F3'
+
+  - name: 'slack-orphans'
+    slack_configs:
+      - api_url: '${SLACK_WEBHOOK_URL}'
+        channel: '#54bank-tech-debt'
+        title: 'ORPHAN: {{ .CommonLabels.alertname }}'
+        text: '{{ .CommonAnnotations.summary }}'
+        color: '#FF9800'

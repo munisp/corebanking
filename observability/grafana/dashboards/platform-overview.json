@@ -1,0 +1,121 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "54bank-platform-overview",
+    "title": "54Bank Platform Overview",
+    "description": "Top-level health dashboard for all 496 services",
+    "tags": ["54bank", "overview", "platform"],
+    "timezone": "utc",
+    "refresh": "30s",
+    "time": { "from": "now-6h", "to": "now" },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Services Up",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+        "targets": [{ "expr": "count(up == 1)", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "red", "value": 0 }, { "color": "yellow", "value": 40 }, { "color": "green", "value": 50 }] } } }
+      },
+      {
+        "id": 2,
+        "title": "Services Down",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+        "targets": [{ "expr": "count(up == 0)", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 3 }] } } }
+      },
+      {
+        "id": 3,
+        "title": "Total Request Rate",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+        "targets": [{ "expr": "sum(rate(http_requests_total[5m]))", "legendFormat": "req/s" }],
+        "fieldConfig": { "defaults": { "unit": "reqps" } }
+      },
+      {
+        "id": 4,
+        "title": "Platform Error Rate",
+        "type": "gauge",
+        "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+        "targets": [{ "expr": "sum(rate(http_errors_total[5m])) / sum(rate(http_requests_total[5m]))", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "max": 0.1, "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 0.01 }, { "color": "red", "value": 0.05 }] } } }
+      },
+      {
+        "id": 5,
+        "title": "Active Alerts",
+        "type": "stat",
+        "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+        "targets": [{ "expr": "count(ALERTS{alertstate='firing'})", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } }
+      },
+      {
+        "id": 6,
+        "title": "Cache Hit Rate",
+        "type": "gauge",
+        "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+        "targets": [{ "expr": "avg(cache_hit_rate)", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "thresholds": { "steps": [{ "color": "red", "value": 0 }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] } } }
+      },
+      {
+        "id": 10,
+        "title": "Request Rate by Service",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+        "targets": [{ "expr": "topk(10, sum(rate(http_requests_total[5m])) by (service))", "legendFormat": "{{ service }}" }],
+        "fieldConfig": { "defaults": { "unit": "reqps" } }
+      },
+      {
+        "id": 11,
+        "title": "P95 Latency by Service",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+        "targets": [{ "expr": "topk(10, service:http_latency_p95:5m)", "legendFormat": "{{ service }}" }],
+        "fieldConfig": { "defaults": { "unit": "s" } }
+      },
+      {
+        "id": 12,
+        "title": "Error Rate by Service",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+        "targets": [{ "expr": "topk(10, service:http_error_rate:5m > 0)", "legendFormat": "{{ service }}" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit" } }
+      },
+      {
+        "id": 13,
+        "title": "Circuit Breaker States",
+        "type": "table",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+        "targets": [{ "expr": "circuit_breaker_state != 0", "format": "table", "legendFormat": "" }],
+        "transformations": [{ "id": "organize", "options": { "renameByName": { "service": "Service", "target": "Target", "Value": "State" } } }]
+      },
+      {
+        "id": 14,
+        "title": "Degraded Services",
+        "type": "table",
+        "gridPos": { "h": 6, "w": 12, "x": 0, "y": 20 },
+        "targets": [{ "expr": "service_degradation_mode == 1", "format": "table" }]
+      },
+      {
+        "id": 15,
+        "title": "Container Memory Usage",
+        "type": "timeseries",
+        "gridPos": { "h": 6, "w": 12, "x": 12, "y": 20 },
+        "targets": [{ "expr": "topk(10, container_memory_usage_bytes / 1024 / 1024)", "legendFormat": "{{ name }}" }],
+        "fieldConfig": { "defaults": { "unit": "decmbytes" } }
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "service",
+          "type": "query",
+          "query": "label_values(up, service)",
+          "multi": true,
+          "includeAll": true,
+          "current": { "text": "All", "value": "$__all" }
+        }
+      ]
+    }
+  }
+}

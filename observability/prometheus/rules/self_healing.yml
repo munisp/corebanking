@@ -1,0 +1,111 @@
+# 54Bank Self-Healing & Auto-Remediation Rules
+# Recording rules for computed metrics + remediation triggers
+
+groups:
+  # ── Recording Rules (pre-computed metrics) ──────────────────
+  - name: recording_rules
+    interval: 30s
+    rules:
+      # Per-service error rate
+      - record: service:http_error_rate:5m
+        expr: |
+          sum(rate(http_errors_total[5m])) by (service)
+          /
+          clamp_min(sum(rate(http_requests_total[5m])) by (service), 1)
+
+      # Per-service P95 latency
+      - record: service:http_latency_p95:5m
+        expr: histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+
+      # Per-service P99 latency
+      - record: service:http_latency_p99:5m
+        expr: histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, service))
+
+      # Per-service request rate
+      - record: service:http_request_rate:5m
+        expr: sum(rate(http_requests_total[5m])) by (service)
+
+      # Cache effectiveness
+      - record: service:cache_effectiveness:5m
+        expr: |
+          cache_l1_hits_total + cache_l2_hits_total
+          /
+          clamp_min(cache_l1_hits_total + cache_l2_hits_total + cache_misses_total, 1)
+
+      # Database connection utilization
+      - record: postgres:connection_utilization
+        expr: pg_stat_activity_count / pg_settings_max_connections
+
+      # Kafka consumer lag rate of change
+      - record: kafka:consumer_lag_velocity:5m
+        expr: deriv(kafka_consumer_group_lag[5m])
+
+  # ── Self-Healing Triggers ───────────────────────────────────
+  - name: self_healing
+    interval: 15s
+    rules:
+      # Auto-scale trigger: sustained high request rate
+      - alert: AutoScaleTrigger
+        expr: service:http_request_rate:5m > 1000
+        for: 5m
+        labels:
+          severity: info
+          action: scale_up
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} request rate {{ $value }}/s — consider scaling"
+
+      # Auto-vacuum trigger
+      - alert: AutoVacuumTrigger
+        expr: pg_stat_user_tables_n_dead_tup > 50000
+        for: 10m
+        labels:
+          severity: info
+          action: vacuum
+          team: database
+        annotations:
+          summary: "{{ $labels.relname }} needs VACUUM ({{ $value }} dead tuples)"
+
+      # Cache warmup trigger: sustained cold cache
+      - alert: CacheWarmupTrigger
+        expr: cache_hit_rate < 0.1 and up == 1
+        for: 5m
+        labels:
+          severity: info
+          action: cache_warmup
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} cache cold — trigger warmup"
+
+      # Circuit breaker recovery: auto-reset after upstream recovers
+      - alert: CircuitBreakerRecoveryCheck
+        expr: circuit_breaker_state == 1 and up{job=~".*"} == 1
+        for: 2m
+        labels:
+          severity: info
+          action: circuit_reset
+          team: platform
+        annotations:
+          summary: "{{ $labels.service }} circuit breaker may be ready to reset"
+
+      # Kafka consumer lag recovery
+      - alert: KafkaLagRecovery
+        expr: kafka:consumer_lag_velocity:5m > 100
+        for: 10m
+        labels:
+          severity: info
+          action: add_consumer
+          team: infrastructure
+        annotations:
+          summary: "Kafka lag growing for {{ $labels.group }} — add consumers"
+
+      # Connection pool recovery
+      - alert: ConnectionPoolRecovery
+        expr: postgres:connection_utilization > 0.7
+        for: 5m
+        labels:
+          severity: info
+          action: pool_resize
+          team: database
+        annotations:
+          summary: "PostgreSQL connections at {{ $value | humanizePercentage }} — resize pool"
