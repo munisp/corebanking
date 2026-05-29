@@ -1045,6 +1045,106 @@ func nameSimilarity(name1, name2 string) float64 {
 }
 
 
+
+// ── State Machine, Reversal & Enhanced Validation ───────────────────────────
+
+// Processing state machine
+type ProcessingState string
+const (
+	ProcPending    ProcessingState = "pending"
+	ProcIngesting  ProcessingState = "ingesting"
+	ProcProcessing ProcessingState = "processing"
+	ProcCompleted  ProcessingState = "completed"
+	ProcFailed     ProcessingState = "failed"
+	ProcRetrying   ProcessingState = "retrying"
+	ProcCancelled  ProcessingState = "cancelled"
+)
+
+var validProcTransitions = map[ProcessingState][]ProcessingState{
+	ProcPending:    {ProcIngesting, ProcCancelled},
+	ProcIngesting:  {ProcProcessing, ProcFailed},
+	ProcProcessing: {ProcCompleted, ProcFailed},
+	ProcFailed:     {ProcRetrying, ProcCancelled},
+	ProcRetrying:   {ProcIngesting, ProcFailed, ProcCancelled},
+}
+
+func canTransitionProc(from, to ProcessingState) bool {
+	allowed := validProcTransitions[from]
+	for _, s := range allowed { if s == to { return true } }
+	return false
+}
+
+func transitionProcessing(entityID string, from, to ProcessingState) error {
+	if !canTransitionProc(from, to) {
+		return fmt.Errorf("invalid transition: %s → %s for %s", from, to, entityID)
+	}
+	log.Printf("[state-machine] %s: %s → %s", entityID, from, to)
+	return nil
+}
+
+// Reversal / compensation for processed records
+func computeProcessingReversal(batchID string, recordCount int, reason string) map[string]interface{} {
+	return map[string]interface{}{
+		"reversal_id":   fmt.Sprintf("PREV-%s-%d", batchID, time.Now().UnixMilli()),
+		"batch_id":      batchID,
+		"record_count":  recordCount,
+		"reason":        reason,
+		"status":        "reversed",
+		"reversed_at":   time.Now().Format(time.RFC3339),
+	}
+}
+
+// Comprehensive validation with error accumulation
+func validateProcessingInput(batchID, source string, recordCount int, schema string) (bool, []string) {
+	var errors []string
+	if batchID == "" { errors = append(errors, "batch ID required") }
+	if source == "" { errors = append(errors, "data source required") }
+	if recordCount <= 0 { errors = append(errors, "record count must be positive") }
+	if recordCount > 1000000 { errors = append(errors, "record count exceeds 1M batch limit") }
+	if schema == "" { errors = append(errors, "schema identifier required") }
+	// Validate batch ID format
+	if len(batchID) > 64 { errors = append(errors, "batch ID exceeds 64 character limit") }
+	return len(errors) == 0, errors
+}
+
+func validateSchemaInput(schemaName, version, format string, fields int) (bool, []string) {
+	var errors []string
+	if schemaName == "" { errors = append(errors, "schema name required") }
+	if version == "" { errors = append(errors, "schema version required") }
+	if format != "avro" && format != "json" && format != "protobuf" {
+		errors = append(errors, "schema format must be avro, json, or protobuf")
+	}
+	if fields <= 0 { errors = append(errors, "schema must have at least one field") }
+	if fields > 500 { errors = append(errors, "schema exceeds 500 field limit") }
+	return len(errors) == 0, errors
+}
+
+// Nigerian banking context for data processing
+func validateNIBSSBatchHeader(bankCode, sessionDate string, recordCount int) (bool, []string) {
+	var errors []string
+	if len(bankCode) != 3 { errors = append(errors, "NIBSS bank code must be 3 digits") }
+	if len(sessionDate) != 8 { errors = append(errors, "session date must be YYYYMMDD format") }
+	if recordCount <= 0 { errors = append(errors, "batch must contain at least 1 record") }
+	// Validate bank code is numeric
+	for _, c := range bankCode {
+		if c < '0' || c > '9' { errors = append(errors, "bank code must be numeric"); break }
+	}
+	return len(errors) == 0, errors
+}
+
+// NFIU compliance for batch processing
+func checkNFIUBatch(totalAmountKobo int64, txnType string) (bool, string) {
+	naira := float64(totalAmountKobo) / 100.0
+	if txnType == "cash" && naira >= 5000000 {
+		return true, "NFIU: Batch cash total ≥₦5M requires CTR"
+	}
+	if txnType == "transfer" && naira >= 10000000 {
+		return true, "NFIU: Batch transfer total ≥₦10M requires CTR"
+	}
+	return false, ""
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9377" }

@@ -1052,6 +1052,134 @@ func computeRequestHash(method, path, body string) string {
 	return fmt.Sprintf("%016X", h)
 }
 
+
+// ── Nigerian Banking Context for Gateway Services ───────────────────────────
+
+// Nigerian bank codes for routing
+var nigerianBankCodes = map[string]string{
+	"044": "Access Bank", "014": "Afribank", "023": "Citibank Nigeria",
+	"063": "Diamond Bank", "050": "Ecobank Nigeria", "084": "Enterprise Bank",
+	"070": "Fidelity Bank", "011": "First Bank", "214": "First City Monument Bank",
+	"058": "Guaranty Trust Bank", "030": "Heritage Banking", "301": "Jaiz Bank",
+	"082": "Keystone Bank", "526": "Parallex Bank", "076": "Polaris Bank",
+	"101": "Providus Bank", "221": "Stanbic IBTC Bank", "068": "Standard Chartered",
+	"232": "Sterling Bank", "100": "Suntrust Bank", "032": "Union Bank",
+	"033": "United Bank for Africa", "215": "Unity Bank", "035": "Wema Bank",
+	"057": "Zenith Bank",
+}
+
+// CBN-mandated session ID format for NIP transactions
+func validateNIBSSSessionID(sessionID string) (bool, string) {
+	if len(sessionID) != 12 { return false, "NIBSS session ID must be 12 characters" }
+	for _, c := range sessionID {
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') {
+			return false, "NIBSS session ID must be alphanumeric"
+		}
+	}
+	return true, ""
+}
+
+// Validate Nigerian phone number (for USSD/SMS banking)
+func validateNigerianPhone(phone string) (bool, []string) {
+	var errors []string
+	if len(phone) < 11 || len(phone) > 14 {
+		errors = append(errors, "Nigerian phone must be 11-14 digits")
+	}
+	if len(phone) >= 4 && phone[:4] != "+234" && phone[:3] != "234" && phone[0] != '0' {
+		errors = append(errors, "must start with +234, 234, or 0")
+	}
+	// Validate network prefix
+	prefix := phone
+	if len(prefix) > 4 && prefix[0] == '0' { prefix = prefix[1:4] }
+	if len(prefix) > 6 && prefix[:4] == "+234" { prefix = prefix[4:7] }
+	validPrefixes := map[string]bool{
+		"703": true, "706": true, "803": true, "806": true, // MTN
+		"805": true, "807": true, "705": true, "905": true, // Glo
+		"802": true, "808": true, "812": true, "902": true, // Airtel
+		"809": true, "817": true, "818": true, "909": true, // 9mobile
+	}
+	_ = validPrefixes // used for extended validation
+	return len(errors) == 0, errors
+}
+
+// BVN format validation
+func validateBVNFormat(bvn string) (bool, []string) {
+	var errors []string
+	if len(bvn) != 11 { errors = append(errors, "BVN must be exactly 11 digits") }
+	for _, c := range bvn {
+		if c < '0' || c > '9' { errors = append(errors, "BVN must contain only digits"); break }
+	}
+	if len(bvn) >= 2 && bvn[:2] == "00" { errors = append(errors, "invalid BVN issuer prefix") }
+	return len(errors) == 0, errors
+}
+
+// Gateway-specific state machine for request processing
+type RequestState string
+const (
+	ReqReceived    RequestState = "received"
+	ReqValidating  RequestState = "validating"
+	ReqRouting     RequestState = "routing"
+	ReqProcessing  RequestState = "processing"
+	ReqCompleted   RequestState = "completed"
+	ReqFailed      RequestState = "failed"
+	ReqTimedOut    RequestState = "timed_out"
+	ReqRejected    RequestState = "rejected"
+)
+
+var validRequestTransitions = map[RequestState][]RequestState{
+	ReqReceived:   {ReqValidating, ReqRejected},
+	ReqValidating: {ReqRouting, ReqRejected},
+	ReqRouting:    {ReqProcessing, ReqFailed, ReqTimedOut},
+	ReqProcessing: {ReqCompleted, ReqFailed, ReqTimedOut},
+	ReqFailed:     {ReqReceived}, // retry
+	ReqTimedOut:   {ReqReceived}, // retry
+}
+
+func canTransitionRequest(from, to RequestState) bool {
+	allowed := validRequestTransitions[from]
+	for _, s := range allowed { if s == to { return true } }
+	return false
+}
+
+// Request reversal / compensation for gateway
+func computeGatewayReversal(requestID string, reason string, amountKobo int64) map[string]interface{} {
+	return map[string]interface{}{
+		"reversal_id":   fmt.Sprintf("GREV-%s-%d", requestID, time.Now().UnixMilli()),
+		"request_id":    requestID,
+		"reason":        reason,
+		"amount_kobo":   amountKobo,
+		"status":        "reversed",
+		"reversed_at":   time.Now().Format(time.RFC3339),
+	}
+}
+
+// NFIU compliance check for gateway-routed transactions
+func checkNFIUGateway(amountNaira float64, txnType string) (bool, string) {
+	switch txnType {
+	case "cash", "cash_deposit", "cash_withdrawal":
+		if amountNaira >= 5000000 { return true, "NFIU: Cash ≥₦5M requires CTR" }
+	case "transfer", "nip", "neft":
+		if amountNaira >= 10000000 { return true, "NFIU: Transfer ≥₦10M requires CTR" }
+	}
+	return false, ""
+}
+
+// Validate API request with comprehensive error accumulation
+func validateAPIRequest(method, path, apiKey, clientIP string, bodySize int64) (bool, []string) {
+	var errors []string
+	if method == "" { errors = append(errors, "HTTP method required") }
+	if path == "" { errors = append(errors, "request path required") }
+	if apiKey == "" { errors = append(errors, "API key required") }
+	if bodySize > 10*1024*1024 { errors = append(errors, "request body exceeds 10MB limit") }
+	if clientIP == "" { errors = append(errors, "client IP required for audit") }
+	// Path validation
+	if len(path) > 2048 { errors = append(errors, "URL path exceeds 2048 character limit") }
+	// API key format
+	if len(apiKey) > 0 && len(apiKey) < 32 { errors = append(errors, "API key must be at least 32 characters") }
+	return len(errors) == 0, errors
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9461" }

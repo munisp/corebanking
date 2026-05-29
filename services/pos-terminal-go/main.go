@@ -979,6 +979,102 @@ func computeCardFraudScore(
 }
 
 
+
+// ── State Machine & Reversal Logic ──────────────────────────────────────────
+
+// Transaction state machine
+type TxnState string
+const (
+	TxnInitiated  TxnState = "initiated"
+	TxnValidating TxnState = "validating"
+	TxnProcessing TxnState = "processing"
+	TxnCompleted  TxnState = "completed"
+	TxnFailed     TxnState = "failed"
+	TxnReversed   TxnState = "reversed"
+	TxnCancelled  TxnState = "cancelled"
+)
+
+var validTxnTransitions = map[TxnState][]TxnState{
+	TxnInitiated:  {TxnValidating, TxnCancelled},
+	TxnValidating: {TxnProcessing, TxnFailed},
+	TxnProcessing: {TxnCompleted, TxnFailed},
+	TxnCompleted:  {TxnReversed},
+	TxnFailed:     {TxnInitiated}, // retry
+}
+
+func canTransitionTxn(from, to TxnState) bool {
+	allowed := validTxnTransitions[from]
+	for _, s := range allowed { if s == to { return true } }
+	return false
+}
+
+func transitionTxn(entityID string, from, to TxnState) (bool, string) {
+	if !canTransitionTxn(from, to) {
+		return false, fmt.Sprintf("invalid transition: %s → %s for %s", from, to, entityID)
+	}
+	log.Printf("[state-machine] %s: %s → %s", entityID, from, to)
+	return true, ""
+}
+
+// Transaction reversal with GL entries
+func computeReversal(txnID string, amountKobo int64, debitAccount, creditAccount, reason string) map[string]interface{} {
+	return map[string]interface{}{
+		"reversal_id":     fmt.Sprintf("REV-%s-%d", txnID, time.Now().UnixMilli()),
+		"original_txn_id": txnID,
+		"amount_kobo":     amountKobo,
+		"reason":          reason,
+		"status":          "reversed",
+		"reversed_at":     time.Now().Format(time.RFC3339),
+		"gl_entries": []map[string]interface{}{
+			{"debit": debitAccount, "credit": creditAccount, "amount_kobo": amountKobo, "narration": "Reversal: " + reason},
+		},
+	}
+}
+
+// Idempotency key generation
+func computeIdempotencyKey(senderID, receiverID string, amountKobo int64, reference string) string {
+	data := fmt.Sprintf("%s:%s:%d:%s", senderID, receiverID, amountKobo, reference)
+	h := uint64(0)
+	for _, c := range data { h = h*31 + uint64(c) }
+	return fmt.Sprintf("IDEM-%016X", h)
+}
+
+// Comprehensive input validation with error accumulation
+func validateTransactionInput(senderID, receiverID, currency string, amountKobo int64, narration string) (bool, []string) {
+	var errors []string
+	if senderID == "" { errors = append(errors, "sender ID required") }
+	if receiverID == "" { errors = append(errors, "receiver ID required") }
+	if senderID == receiverID { errors = append(errors, "sender and receiver cannot be the same") }
+	if amountKobo <= 0 { errors = append(errors, "amount must be positive") }
+	if amountKobo > 10000000000 { errors = append(errors, "amount exceeds ₦100M single transaction limit") }
+	if currency == "" { errors = append(errors, "currency required") }
+	if currency != "NGN" && currency != "USD" && currency != "GBP" && currency != "EUR" {
+		errors = append(errors, "unsupported currency: "+currency)
+	}
+	if len(narration) > 100 { errors = append(errors, "narration exceeds 100 character limit") }
+	// Check for special characters that could be injection
+	for _, c := range narration {
+		if c == '<' || c == '>' || c == ';' {
+			errors = append(errors, "narration contains invalid characters")
+			break
+		}
+	}
+	return len(errors) == 0, errors
+}
+
+// NFIU compliance check
+func checkNFIUCompliance(amountKobo int64, txnType string) (bool, string) {
+	naira := float64(amountKobo) / 100.0
+	if txnType == "cash_deposit" || txnType == "cash_withdrawal" {
+		if naira >= 5000000 { return true, "NFIU: Cash transaction ≥₦5M requires CTR filing" }
+	}
+	if txnType == "transfer" || txnType == "nip" {
+		if naira >= 10000000 { return true, "NFIU: Transfer ≥₦10M requires CTR filing" }
+	}
+	return false, ""
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9409" }
