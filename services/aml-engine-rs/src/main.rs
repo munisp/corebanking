@@ -309,6 +309,275 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 // --- Circuit Breaker + Retry for gRPC/HTTP calls ---
 use std::sync::atomic::{AtomicI32, AtomicI64};
 
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Deep Domain Logic — Production-Ready Business Rules
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// AmountKobo — monetary amounts in kobo (smallest unit) to avoid float precision errors
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct AmountKobo(i64);
+
+impl AmountKobo {
+    fn from_naira(naira: f64) -> Self { AmountKobo((naira * 100.0).round() as i64) }
+    fn naira(&self) -> f64 { self.0 as f64 / 100.0 }
+    fn zero() -> Self { AmountKobo(0) }
+}
+
+impl std::ops::Add for AmountKobo { type Output = Self; fn add(self, rhs: Self) -> Self { AmountKobo(self.0 + rhs.0) } }
+impl std::ops::Sub for AmountKobo { type Output = Self; fn sub(self, rhs: Self) -> Self { AmountKobo(self.0 - rhs.0) } }
+impl std::fmt::Display for AmountKobo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "₦{}.{:02}", self.0 / 100, (self.0 % 100).abs())
+    }
+}
+
+/// Formal state machine with transition guards
+#[derive(Debug, Clone, PartialEq)]
+enum EntityState {
+    Draft, Submitted, UnderReview, Approved, Processing, Completed, Failed, Reversed, Cancelled,
+}
+
+impl EntityState {
+    fn can_transition_to(&self, target: &EntityState) -> bool {
+        match self {
+            EntityState::Draft => matches!(target, EntityState::Submitted | EntityState::Cancelled),
+            EntityState::Submitted => matches!(target, EntityState::UnderReview | EntityState::Cancelled),
+            EntityState::UnderReview => matches!(target, EntityState::Approved | EntityState::Failed),
+            EntityState::Approved => matches!(target, EntityState::Processing | EntityState::Cancelled),
+            EntityState::Processing => matches!(target, EntityState::Completed | EntityState::Failed),
+            EntityState::Completed => matches!(target, EntityState::Reversed),
+            EntityState::Failed => matches!(target, EntityState::Submitted), // retry
+            _ => false,
+        }
+    }
+}
+
+/// CBN Tier Limits
+struct CbnTierLimit {
+    max_single_debit: AmountKobo,
+    max_daily: AmountKobo,
+    max_balance: AmountKobo,
+}
+
+fn cbn_tier_limits(tier: &str) -> Option<CbnTierLimit> {
+    match tier {
+        "tier1" => Some(CbnTierLimit {
+            max_single_debit: AmountKobo::from_naira(50_000.0),
+            max_daily: AmountKobo::from_naira(300_000.0),
+            max_balance: AmountKobo::from_naira(300_000.0),
+        }),
+        "tier2" => Some(CbnTierLimit {
+            max_single_debit: AmountKobo::from_naira(200_000.0),
+            max_daily: AmountKobo::from_naira(500_000.0),
+            max_balance: AmountKobo::from_naira(500_000.0),
+        }),
+        "tier3" => Some(CbnTierLimit {
+            max_single_debit: AmountKobo::from_naira(5_000_000.0),
+            max_daily: AmountKobo::from_naira(10_000_000.0),
+            max_balance: AmountKobo(0), // unlimited
+        }),
+        _ => None,
+    }
+}
+
+fn validate_tier_transaction(tier: &str, amount: AmountKobo, daily_total: AmountKobo) -> Result<(), String> {
+    let limits = cbn_tier_limits(tier).ok_or("Unknown KYC tier")?;
+    if amount > limits.max_single_debit {
+        return Err(format!("Exceeds {} single debit limit {}", tier, limits.max_single_debit));
+    }
+    let new_daily = AmountKobo(daily_total.0 + amount.0);
+    if new_daily > limits.max_daily {
+        return Err(format!("Exceeds {} daily limit {}", tier, limits.max_daily));
+    }
+    Ok(())
+}
+
+/// BVN Validation (11-digit Bank Verification Number)
+fn validate_bvn(bvn: &str) -> Result<(), String> {
+    if bvn.len() != 11 { return Err("BVN must be 11 digits".to_string()); }
+    if !bvn.chars().all(|c| c.is_ascii_digit()) { return Err("BVN must contain only digits".to_string()); }
+    if &bvn[..2] == "00" { return Err("Invalid BVN issuer code".to_string()); }
+    Ok(())
+}
+
+/// NIN Validation (11-digit National ID)
+fn validate_nin(nin: &str) -> Result<(), String> {
+    if nin.len() != 11 { return Err("NIN must be 11 digits".to_string()); }
+    if !nin.chars().all(|c| c.is_ascii_digit()) { return Err("NIN must contain only digits".to_string()); }
+    Ok(())
+}
+
+/// NUBAN validation with check digit algorithm
+fn validate_nuban(bank_code: &str, account_number: &str) -> Result<(), String> {
+    if account_number.len() != 10 { return Err("NUBAN must be 10 digits".to_string()); }
+    if bank_code.len() != 3 { return Err("Bank code must be 3 digits".to_string()); }
+    let serial = format!("{}{}", bank_code, &account_number[..9]);
+    let weights = [3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3];
+    let sum: u32 = serial.chars().zip(weights.iter())
+        .map(|(c, w)| c.to_digit(10).unwrap_or(0) * (*w as u32))
+        .sum();
+    let check_digit = (10 - (sum % 10)) % 10;
+    let actual = account_number.chars().last().and_then(|c| c.to_digit(10)).unwrap_or(99);
+    if check_digit != actual {
+        return Err(format!("NUBAN check digit mismatch: expected {}, got {}", check_digit, actual));
+    }
+    Ok(())
+}
+
+/// NFIU threshold check
+fn check_nfiu_threshold(amount: AmountKobo, txn_type: &str) -> Option<String> {
+    match txn_type {
+        "cash_deposit" | "cash_withdrawal" => {
+            if amount >= AmountKobo::from_naira(5_000_000.0) {
+                Some("NFIU: Cash transaction ≥₦5M requires CTR filing".to_string())
+            } else { None }
+        }
+        "transfer" | "wire" => {
+            if amount >= AmountKobo::from_naira(10_000_000.0) {
+                Some("NFIU: Transfer ≥₦10M requires CTR filing".to_string())
+            } else { None }
+        }
+        _ => None,
+    }
+}
+
+/// EMI (Equated Monthly Installment) computation
+fn compute_emi(principal: AmountKobo, annual_rate_pct: f64, tenor_months: u32) -> AmountKobo {
+    if tenor_months == 0 { return AmountKobo::zero(); }
+    if annual_rate_pct == 0.0 { return AmountKobo(principal.0 / tenor_months as i64); }
+    let monthly_rate = annual_rate_pct / 12.0 / 100.0;
+    let n = tenor_months as f64;
+    let power = (1.0 + monthly_rate).powf(n);
+    let emi = principal.0 as f64 * monthly_rate * power / (power - 1.0);
+    AmountKobo(emi.round() as i64)
+}
+
+/// DTI (Debt-to-Income) ratio
+fn compute_dti(monthly_income: AmountKobo, existing_debt: AmountKobo, proposed_emi: AmountKobo) -> f64 {
+    if monthly_income.0 <= 0 { return 100.0; }
+    (existing_debt.0 + proposed_emi.0) as f64 / monthly_income.0 as f64 * 100.0
+}
+
+/// Interest computation with day-count conventions
+fn compute_simple_interest(principal: AmountKobo, annual_rate_pct: f64, days: u32, day_basis: u32) -> AmountKobo {
+    let interest = principal.0 as f64 * (annual_rate_pct / 100.0) * (days as f64 / day_basis as f64);
+    AmountKobo(interest.round() as i64)
+}
+
+fn compute_compound_interest(principal: AmountKobo, annual_rate_pct: f64, days: u32, day_basis: u32, freq: u32) -> AmountKobo {
+    let periods = days as f64 / (day_basis as f64 / freq as f64);
+    let rate_per_period = annual_rate_pct / 100.0 / freq as f64;
+    let amount = principal.0 as f64 * (1.0 + rate_per_period).powf(periods);
+    AmountKobo((amount - principal.0 as f64).round() as i64)
+}
+
+fn get_day_basis(convention: &str) -> u32 {
+    match convention { "ACT/360" => 360, "ACT/365" => 365, "30/360" => 360, _ => 365 }
+}
+
+/// AML Risk Scoring
+fn compute_aml_risk_score(
+    txn_amount: AmountKobo, is_pep: bool, is_high_risk_country: bool,
+    cash_intensive: bool, is_structuring: bool, has_adverse_media: bool,
+    account_age_months: u32,
+) -> (f64, Vec<&'static str>) {
+    let mut score = 0.0f64;
+    let mut indicators = Vec::new();
+    if is_pep { score += 30.0; indicators.push("PEP_STATUS"); }
+    if is_high_risk_country { score += 25.0; indicators.push("HIGH_RISK_JURISDICTION"); }
+    if cash_intensive { score += 15.0; indicators.push("CASH_INTENSIVE"); }
+    if is_structuring { score += 35.0; indicators.push("STRUCTURING_DETECTED"); }
+    if has_adverse_media { score += 20.0; indicators.push("ADVERSE_MEDIA"); }
+    if txn_amount > AmountKobo::from_naira(10_000_000.0) { score += 10.0; indicators.push("HIGH_VALUE_TXN"); }
+    if account_age_months < 3 { score += 10.0; indicators.push("NEW_ACCOUNT"); }
+    (score.min(100.0), indicators)
+}
+
+/// CBN Provisioning rates (Prudential Guidelines)
+fn compute_provisioning_rate(days_past_due: u32) -> f64 {
+    match days_past_due {
+        0..=90 => 1.0,       // Performing
+        91..=180 => 10.0,    // Watchlist
+        181..=360 => 50.0,   // Substandard
+        361..=720 => 75.0,   // Doubtful
+        _ => 100.0,          // Lost
+    }
+}
+
+/// Withholding Tax on interest — 10%
+fn compute_wht(interest: AmountKobo) -> AmountKobo {
+    AmountKobo((interest.0 as f64 * 0.10).round() as i64)
+}
+
+/// NIP charge computation (NIBSS Instant Payment)
+fn compute_nip_charge(amount: AmountKobo) -> AmountKobo {
+    match amount.naira() as u64 {
+        0..=5000 => AmountKobo::from_naira(10.0),
+        5001..=50000 => AmountKobo::from_naira(25.0),
+        _ => AmountKobo::from_naira(50.0),
+    }
+}
+
+/// Comprehensive validation with error accumulation
+fn validate_transaction_deep(
+    sender: &str, receiver: &str, amount: AmountKobo,
+    currency: &str, channel: &str,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if sender.is_empty() { errors.push("Sender account required".to_string()); }
+    if receiver.is_empty() { errors.push("Receiver account required".to_string()); }
+    if sender == receiver { errors.push("Sender and receiver cannot be same".to_string()); }
+    if amount.0 <= 0 { errors.push("Amount must be positive".to_string()); }
+    if amount > AmountKobo::from_naira(100_000_000.0) { errors.push("Single transfer limit ₦100M exceeded".to_string()); }
+    if !["NGN", "USD", "GBP", "EUR"].contains(&currency) { errors.push(format!("Unsupported currency: {}", currency)); }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// Luhn algorithm for card PAN validation
+fn validate_luhn(card_number: &str) -> bool {
+    let mut sum = 0u32;
+    let n = card_number.len();
+    let parity = n % 2;
+    for (i, c) in card_number.chars().enumerate() {
+        let mut digit = match c.to_digit(10) { Some(d) => d, None => return false };
+        if i % 2 == parity { digit *= 2; if digit > 9 { digit -= 9; } }
+        sum += digit;
+    }
+    sum % 10 == 0
+}
+
+/// Velocity check for fraud detection
+fn check_velocity(recent_count: u32, recent_amount: AmountKobo, window_hours: u32) -> Result<(), String> {
+    if window_hours <= 1 && recent_count >= 10 {
+        return Err("Velocity: 10+ transactions in 1 hour".to_string());
+    }
+    if window_hours <= 24 && recent_count >= 20 {
+        return Err("Velocity: 20+ transactions in 24 hours".to_string());
+    }
+    if window_hours <= 24 && recent_amount > AmountKobo::from_naira(50_000_000.0) {
+        return Err("Velocity: cumulative amount exceeds ₦50M in 24h".to_string());
+    }
+    Ok(())
+}
+
+/// Payment reversal
+fn generate_reversal(txn_id: &str, amount: AmountKobo, sender: &str, receiver: &str, reason: &str) -> serde_json::Value {
+    json!({
+        "reversal_id": format!("REV-{}-{}", txn_id, chrono::Utc::now().timestamp_millis()),
+        "original_txn_id": txn_id,
+        "amount_kobo": amount.0,
+        "reason": reason,
+        "status": "reversed",
+        "gl_entries": [{
+            "debit": receiver, "credit": sender,
+            "amount_kobo": amount.0, "narration": format!("Reversal: {}", reason)
+        }]
+    })
+}
+
+
+
 static CB_FAILURES: AtomicI32 = AtomicI32::new(0);
 static CB_LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
 const CB_THRESHOLD: i32 = 5;

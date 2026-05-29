@@ -903,6 +903,143 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+
+// ── Deep Domain Logic: Accounts ─────────────────────────────────────────────
+
+type AmountKobo int64
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
+func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
+
+// AccountState lifecycle
+type AccountState string
+const (
+	AccountDraft     AccountState = "draft"
+	AccountPendingKYC AccountState = "pending_kyc"
+	AccountActive    AccountState = "active"
+	AccountDormant   AccountState = "dormant"
+	AccountFrozen    AccountState = "frozen"
+	AccountClosed    AccountState = "closed"
+	AccountPND       AccountState = "post_no_debit"
+)
+
+var validAccountTransitions = map[AccountState][]AccountState{
+	AccountDraft:      {AccountPendingKYC, AccountActive},
+	AccountPendingKYC: {AccountActive, AccountClosed},
+	AccountActive:     {AccountDormant, AccountFrozen, AccountClosed, AccountPND},
+	AccountDormant:    {AccountActive, AccountClosed},
+	AccountFrozen:     {AccountActive, AccountClosed},
+	AccountPND:        {AccountActive, AccountFrozen, AccountClosed},
+}
+
+func canTransitionAccount(from, to AccountState) bool {
+	allowed := validAccountTransitions[from]
+	for _, s := range allowed { if s == to { return true } }
+	return false
+}
+
+// CBN Tier Limits
+type TierLimit struct {
+	MaxSingleDebit    AmountKobo
+	MaxDailyDebit     AmountKobo
+	MaxBalance        AmountKobo
+	MaxDailyCumulative AmountKobo
+	RequiredDocs      []string
+}
+
+var cbnTierLimits = map[string]TierLimit{
+	"tier1": {
+		MaxSingleDebit:    nairaToKobo(50000),
+		MaxDailyDebit:     nairaToKobo(300000),
+		MaxBalance:        nairaToKobo(300000),
+		MaxDailyCumulative: nairaToKobo(300000),
+		RequiredDocs:      []string{"phone_number"},
+	},
+	"tier2": {
+		MaxSingleDebit:    nairaToKobo(200000),
+		MaxDailyDebit:     nairaToKobo(500000),
+		MaxBalance:        nairaToKobo(500000),
+		MaxDailyCumulative: nairaToKobo(500000),
+		RequiredDocs:      []string{"bvn", "phone_number", "date_of_birth"},
+	},
+	"tier3": {
+		MaxSingleDebit:    nairaToKobo(5000000),
+		MaxDailyDebit:     nairaToKobo(10000000),
+		MaxBalance:        nairaToKobo(0), // unlimited
+		MaxDailyCumulative: nairaToKobo(10000000),
+		RequiredDocs:      []string{"bvn", "nin", "proof_of_address", "passport_photo", "utility_bill"},
+	},
+}
+
+func validateTierTransaction(tier string, amountKobo AmountKobo, dailyTotalKobo AmountKobo) (bool, string) {
+	limit, ok := cbnTierLimits[tier]
+	if !ok { return false, "unknown tier" }
+	if amountKobo > limit.MaxSingleDebit { return false, fmt.Sprintf("exceeds %s single debit limit ₦%.0f", tier, limit.MaxSingleDebit.Naira()) }
+	if dailyTotalKobo+amountKobo > limit.MaxDailyCumulative { return false, fmt.Sprintf("exceeds %s daily cumulative limit ₦%.0f", tier, limit.MaxDailyCumulative.Naira()) }
+	return true, ""
+}
+
+// BVN Validation (11-digit with check algorithm)
+func validateBVN(bvn string) (bool, string) {
+	if len(bvn) != 11 { return false, "BVN must be 11 digits" }
+	for _, c := range bvn {
+		if c < '0' || c > '9' { return false, "BVN must contain only digits" }
+	}
+	// First 2 digits = issuer code (must be valid)
+	issuer := bvn[:2]
+	if issuer == "00" { return false, "invalid BVN issuer code" }
+	return true, ""
+}
+
+// NIN Validation (11-digit National Identity Number)
+func validateNIN(nin string) (bool, string) {
+	if len(nin) != 11 { return false, "NIN must be 11 digits" }
+	for _, c := range nin {
+		if c < '0' || c > '9' { return false, "NIN must contain only digits" }
+	}
+	return true, ""
+}
+
+// Dormancy detection — CBN: no customer-initiated transaction in 12 months
+func checkDormancy(lastTxnDate time.Time) (bool, int) {
+	days := int(time.Since(lastTxnDate).Hours() / 24)
+	isDormant := days >= 365
+	return isDormant, days
+}
+
+// COT (Commission on Turnover) — deprecated but some accounts still have it
+func computeCOT(turnoverKobo AmountKobo, rate float64) AmountKobo {
+	if rate <= 0 { return 0 }
+	return AmountKobo(float64(turnoverKobo) * rate / 100.0)
+}
+
+// SMS alert charge
+func computeSMSAlertCharge(alertCount int, pricePerAlert AmountKobo) AmountKobo {
+	return AmountKobo(alertCount) * pricePerAlert
+}
+
+// Account closure validation
+func validateAccountClosure(balanceKobo AmountKobo, hasActiveLoan, hasPendingTxn, hasLien bool) (bool, []string) {
+	var errors []string
+	if balanceKobo != 0 { errors = append(errors, fmt.Sprintf("account balance must be zero (current: ₦%.2f)", balanceKobo.Naira())) }
+	if hasActiveLoan { errors = append(errors, "active loan linked to account") }
+	if hasPendingTxn { errors = append(errors, "pending transactions exist") }
+	if hasLien { errors = append(errors, "lien placed on account") }
+	return len(errors) == 0, errors
+}
+
+// Interest accrual for savings (daily accrual, monthly capitalization)
+func computeDailyInterestAccrual(balanceKobo AmountKobo, annualRatePct float64) AmountKobo {
+	dailyRate := annualRatePct / 365.0 / 100.0
+	return AmountKobo(float64(balanceKobo) * dailyRate)
+}
+
+// WHT (Withholding Tax) on interest — 10% for individuals, 10% for corporates
+func computeWHT(interestKobo AmountKobo, accountType string) AmountKobo {
+	rate := 0.10 // 10% for both individual and corporate per Nigerian tax law
+	return AmountKobo(float64(interestKobo) * rate)
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9426" }

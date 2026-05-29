@@ -905,6 +905,198 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+
+// ── Deep Domain Logic: Payments ─────────────────────────────────────────────
+
+type AmountKobo int64
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
+func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
+
+// PaymentState formal lifecycle
+type PaymentState string
+const (
+	PaymentInitiated  PaymentState = "initiated"
+	PaymentValidating PaymentState = "validating"
+	PaymentProcessing PaymentState = "processing"
+	PaymentCompleted  PaymentState = "completed"
+	PaymentFailed     PaymentState = "failed"
+	PaymentReversed   PaymentState = "reversed"
+	PaymentRefunded   PaymentState = "refunded"
+)
+
+var validPaymentTransitions = map[PaymentState][]PaymentState{
+	PaymentInitiated:  {PaymentValidating, PaymentFailed},
+	PaymentValidating: {PaymentProcessing, PaymentFailed},
+	PaymentProcessing: {PaymentCompleted, PaymentFailed},
+	PaymentCompleted:  {PaymentReversed, PaymentRefunded},
+	PaymentFailed:     {PaymentInitiated}, // retry
+}
+
+func canTransitionPayment(from, to PaymentState) bool {
+	allowed := validPaymentTransitions[from]
+	for _, s := range allowed { if s == to { return true } }
+	return false
+}
+
+// NUBAN validation (CBN standard)
+func validateNUBAN(bankCode string, accountNumber string) (bool, string) {
+	if len(accountNumber) != 10 { return false, "NUBAN must be 10 digits" }
+	if len(bankCode) != 3 { return false, "bank code must be 3 digits" }
+	// NUBAN check digit algorithm
+	serial := bankCode + accountNumber[:9]
+	weights := []int{3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3}
+	sum := 0
+	for i, c := range serial {
+		if i >= len(weights) { break }
+		digit := int(c - '0')
+		sum += digit * weights[i]
+	}
+	checkDigit := (10 - (sum % 10)) % 10
+	actualCheck := int(accountNumber[9] - '0')
+	if checkDigit != actualCheck {
+		return false, fmt.Sprintf("NUBAN check digit mismatch: expected %d, got %d", checkDigit, actualCheck)
+	}
+	return true, ""
+}
+
+// NIP (NIBSS Instant Payment) charge computation — CBN-regulated tiers
+func computeNIPCharge(amountKobo AmountKobo) AmountKobo {
+	naira := amountKobo.Naira()
+	switch {
+	case naira <= 5000:    return nairaToKobo(10)
+	case naira <= 50000:   return nairaToKobo(25)
+	default:               return nairaToKobo(50)
+	}
+}
+
+// NEFT (NIBSS Electronic Funds Transfer) charge
+func computeNEFTCharge(amountKobo AmountKobo) AmountKobo {
+	naira := amountKobo.Naira()
+	switch {
+	case naira <= 5000:     return nairaToKobo(2)
+	case naira <= 50000:    return nairaToKobo(4)
+	case naira <= 250000:   return nairaToKobo(6)
+	case naira <= 1000000:  return nairaToKobo(8)
+	case naira <= 5000000:  return nairaToKobo(10)
+	default:                return nairaToKobo(12)
+	}
+}
+
+// NFIU (Nigerian Financial Intelligence Unit) threshold check
+func checkNFIUThreshold(amountKobo AmountKobo, txnType string) (bool, string) {
+	naira := amountKobo.Naira()
+	switch txnType {
+	case "cash_deposit", "cash_withdrawal":
+		if naira >= 5000000 { return true, "NFIU: Cash transaction ≥₦5M requires CTR filing" }
+	case "transfer", "wire":
+		if naira >= 10000000 { return true, "NFIU: Transfer ≥₦10M requires CTR filing" }
+	}
+	return false, ""
+}
+
+// VelocityCheck — prevent structuring (smurfing)
+type VelocityRule struct {
+	MaxAmount   AmountKobo
+	MaxCount    int
+	WindowHours int
+}
+
+var velocityRules = []VelocityRule{
+	{MaxAmount: nairaToKobo(4900000), MaxCount: 3, WindowHours: 24},  // 3x just-under-threshold in 24h
+	{MaxAmount: nairaToKobo(1000000), MaxCount: 10, WindowHours: 1},  // 10 transfers in 1 hour
+	{MaxAmount: nairaToKobo(500000), MaxCount: 20, WindowHours: 24},  // 20 transfers in 24h
+}
+
+func checkVelocity(recentTxns []map[string]interface{}, newAmountKobo AmountKobo) (bool, string) {
+	for _, rule := range velocityRules {
+		count := 0
+		for _, txn := range recentTxns {
+			if amt, ok := txn["amount_kobo"].(int64); ok && AmountKobo(amt) >= rule.MaxAmount {
+				count++
+			}
+		}
+		if count >= rule.MaxCount {
+			return false, fmt.Sprintf("velocity breach: %d transactions ≥₦%.0f in %dh window", count, rule.MaxAmount.Naira(), rule.WindowHours)
+		}
+	}
+	return true, ""
+}
+
+// Payment idempotency
+func generateIdempotencyKey(senderID, receiverID string, amountKobo AmountKobo, reference string) string {
+	data := fmt.Sprintf("%s:%s:%d:%s", senderID, receiverID, amountKobo, reference)
+	h := uint64(0)
+	for _, c := range data { h = h*31 + uint64(c) }
+	return fmt.Sprintf("IDEM-%016X", h)
+}
+
+// PaymentReversal — full compensation
+func reversePayment(txnID, reason string, amountKobo AmountKobo, senderAccount, receiverAccount string) map[string]interface{} {
+	return map[string]interface{}{
+		"reversal_id":      fmt.Sprintf("REV-%s-%d", txnID, time.Now().UnixMilli()),
+		"original_txn_id":  txnID,
+		"amount_kobo":      amountKobo,
+		"reason":           reason,
+		"status":           "reversed",
+		"reversed_at":      time.Now().Format(time.RFC3339),
+		"gl_entries": []map[string]interface{}{
+			{"debit": receiverAccount, "credit": senderAccount, "amount_kobo": amountKobo, "narration": "Payment reversal: " + reason},
+		},
+	}
+}
+
+// Reconciliation — match internal records vs NIBSS
+type ReconciliationResult struct {
+	Matched    int `json:"matched"`
+	Unmatched  int `json:"unmatched"`
+	Exceptions int `json:"exceptions"`
+	TotalInternal int `json:"total_internal"`
+	TotalExternal int `json:"total_external"`
+}
+
+func reconcileTransactions(internal, external []map[string]interface{}) ReconciliationResult {
+	extMap := make(map[string]bool)
+	for _, e := range external {
+		if ref, ok := e["session_id"].(string); ok { extMap[ref] = true }
+	}
+	matched, unmatched := 0, 0
+	for _, i := range internal {
+		if ref, ok := i["session_id"].(string); ok {
+			if extMap[ref] { matched++ } else { unmatched++ }
+		}
+	}
+	return ReconciliationResult{
+		Matched: matched, Unmatched: unmatched,
+		Exceptions: len(external) - matched,
+		TotalInternal: len(internal), TotalExternal: len(external),
+	}
+}
+
+// ValidatePayment with full error accumulation
+func validatePaymentDeep(
+	senderAccount, receiverAccount, bankCode string,
+	amountKobo AmountKobo, currency, channel, narration string,
+) (bool, []string) {
+	var errors []string
+
+	if senderAccount == "" { errors = append(errors, "sender account required") }
+	if receiverAccount == "" { errors = append(errors, "receiver account required") }
+	if senderAccount == receiverAccount { errors = append(errors, "sender and receiver cannot be same account") }
+	if amountKobo <= 0 { errors = append(errors, "amount must be positive") }
+	if amountKobo > nairaToKobo(100000000) { errors = append(errors, "single transfer limit ₦100M exceeded") }
+	if currency != "NGN" && currency != "USD" && currency != "GBP" && currency != "EUR" {
+		errors = append(errors, "unsupported currency: "+currency)
+	}
+	if len(narration) > 100 { errors = append(errors, "narration max 100 characters") }
+	if channel == "NIP" {
+		valid, reason := validateNUBAN(bankCode, receiverAccount)
+		if !valid { errors = append(errors, reason) }
+	}
+
+	return len(errors) == 0, errors
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9394" }

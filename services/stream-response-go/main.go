@@ -897,6 +897,150 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+
+// ── Deep Domain Logic: Compliance ───────────────────────────────────────────
+
+type AmountKobo int64
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
+func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
+
+// CTR (Currency Transaction Report) — NFIU requirement
+type CTRReport struct {
+	ReportID       string     `json:"report_id"`
+	CustomerID     string     `json:"customer_id"`
+	TransactionID  string     `json:"transaction_id"`
+	AmountKobo     AmountKobo `json:"amount_kobo"`
+	Type           string     `json:"type"` // cash_deposit, cash_withdrawal, transfer
+	Threshold      string     `json:"threshold"`
+	FiledAt        string     `json:"filed_at"`
+	Status         string     `json:"status"` // pending, filed, acknowledged
+}
+
+func generateCTR(customerID, txnID string, amountKobo AmountKobo, txnType string) *CTRReport {
+	threshold := ""
+	if txnType == "cash_deposit" || txnType == "cash_withdrawal" {
+		if amountKobo >= nairaToKobo(5000000) { threshold = "NFIU_CASH_5M" }
+	} else {
+		if amountKobo >= nairaToKobo(10000000) { threshold = "NFIU_TRANSFER_10M" }
+	}
+	if threshold == "" { return nil }
+	return &CTRReport{
+		ReportID: fmt.Sprintf("CTR-%d", time.Now().UnixMilli()),
+		CustomerID: customerID, TransactionID: txnID,
+		AmountKobo: amountKobo, Type: txnType,
+		Threshold: threshold, FiledAt: time.Now().Format(time.RFC3339),
+		Status: "pending",
+	}
+}
+
+// STR (Suspicious Transaction Report) generation
+type STRReport struct {
+	ReportID    string `json:"report_id"`
+	CustomerID  string `json:"customer_id"`
+	Reason      string `json:"reason"`
+	RiskScore   float64 `json:"risk_score"`
+	Indicators  []string `json:"indicators"`
+	Narrative   string `json:"narrative"`
+	FiledAt     string `json:"filed_at"`
+}
+
+func generateSTR(customerID string, riskScore float64, indicators []string) *STRReport {
+	if riskScore < 70 { return nil } // Only file if high risk
+	return &STRReport{
+		ReportID:   fmt.Sprintf("STR-%d", time.Now().UnixMilli()),
+		CustomerID: customerID,
+		Reason:     "automated_detection",
+		RiskScore:  riskScore,
+		Indicators: indicators,
+		Narrative:  fmt.Sprintf("Automated STR: %d risk indicators detected, score %.1f", len(indicators), riskScore),
+		FiledAt:    time.Now().Format(time.RFC3339),
+	}
+}
+
+// AML Risk Scoring — multi-factor
+func computeAMLRiskScoreDeep(
+	txnAmountKobo AmountKobo, isPEP bool, isHighRiskCountry bool,
+	cashIntensive bool, isStructuring bool, hasAdverseMedia bool,
+	customerAge int, accountAgeMonths int,
+) (float64, []string) {
+	score := 0.0
+	var indicators []string
+
+	if isPEP { score += 30; indicators = append(indicators, "PEP_STATUS") }
+	if isHighRiskCountry { score += 25; indicators = append(indicators, "HIGH_RISK_JURISDICTION") }
+	if cashIntensive { score += 15; indicators = append(indicators, "CASH_INTENSIVE") }
+	if isStructuring { score += 35; indicators = append(indicators, "STRUCTURING_DETECTED") }
+	if hasAdverseMedia { score += 20; indicators = append(indicators, "ADVERSE_MEDIA") }
+	if txnAmountKobo > nairaToKobo(10000000) { score += 10; indicators = append(indicators, "HIGH_VALUE_TXN") }
+	if accountAgeMonths < 3 { score += 10; indicators = append(indicators, "NEW_ACCOUNT") }
+	if customerAge < 25 && txnAmountKobo > nairaToKobo(5000000) { score += 15; indicators = append(indicators, "YOUNG_HIGH_VALUE") }
+
+	if score > 100 { score = 100 }
+	return score, indicators
+}
+
+// Sanctions screening
+var sanctionedCountries = map[string]bool{
+	"KP": true, "IR": true, "SY": true, "CU": true, "VE": true,
+	"MM": true, "BY": true, "ZW": true, "SD": true,
+}
+
+func checkSanctions(countryCode string) (bool, string) {
+	if sanctionedCountries[countryCode] {
+		return true, fmt.Sprintf("country %s is on sanctions list — transaction blocked", countryCode)
+	}
+	return false, ""
+}
+
+// PEP (Politically Exposed Person) enhanced due diligence
+func computePEPRiskLevel(pepCategory string, relationshipType string) string {
+	switch pepCategory {
+	case "head_of_state", "minister", "governor":
+		return "very_high"
+	case "senator", "representative", "judge":
+		return "high"
+	case "director_general", "commissioner":
+		return "medium"
+	case "family_member", "close_associate":
+		if relationshipType == "immediate_family" { return "high" }
+		return "medium"
+	default:
+		return "standard"
+	}
+}
+
+// Transaction monitoring — pattern detection
+func detectStructuring(transactions []map[string]interface{}, windowHours int) bool {
+	// Check for multiple transactions just below ₦5M threshold
+	count := 0
+	for _, txn := range transactions {
+		if amt, ok := txn["amount_kobo"].(int64); ok {
+			if AmountKobo(amt) >= nairaToKobo(4000000) && AmountKobo(amt) < nairaToKobo(5000000) {
+				count++
+			}
+		}
+	}
+	return count >= 3 // 3+ just-below-threshold = structuring
+}
+
+// OFAC/UN Sanctions name matching (fuzzy)
+func nameSimilarity(name1, name2 string) float64 {
+	n1 := strings.ToLower(strings.TrimSpace(name1))
+	n2 := strings.ToLower(strings.TrimSpace(name2))
+	if n1 == n2 { return 100.0 }
+	// Simple Jaccard similarity on character bigrams
+	bigrams1 := make(map[string]bool)
+	bigrams2 := make(map[string]bool)
+	for i := 0; i < len(n1)-1; i++ { bigrams1[n1[i:i+2]] = true }
+	for i := 0; i < len(n2)-1; i++ { bigrams2[n2[i:i+2]] = true }
+	intersection := 0
+	for bg := range bigrams1 { if bigrams2[bg] { intersection++ } }
+	union := len(bigrams1) + len(bigrams2) - intersection
+	if union == 0 { return 0 }
+	return float64(intersection) / float64(union) * 100.0
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9436" }

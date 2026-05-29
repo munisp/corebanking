@@ -909,6 +909,81 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+
+// ── Deep Domain Logic: Agriculture ──────────────────────────────────────────
+
+type AmountKobo int64
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
+func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
+
+// Crop cycle loan scheduling — aligned to planting/harvest seasons
+type CropCycle struct {
+	Crop          string `json:"crop"`
+	PlantingSeason string `json:"planting_season"` // e.g., "March-April"
+	HarvestSeason  string `json:"harvest_season"`  // e.g., "September-October"
+	CycleDays      int    `json:"cycle_days"`
+	YieldPerHa     float64 `json:"yield_per_hectare_kg"`
+}
+
+var cropCycles = map[string]CropCycle{
+	"maize":    {Crop: "maize", PlantingSeason: "March-April", HarvestSeason: "July-August", CycleDays: 120, YieldPerHa: 2500},
+	"rice":     {Crop: "rice", PlantingSeason: "June-July", HarvestSeason: "October-November", CycleDays: 150, YieldPerHa: 3000},
+	"cassava":  {Crop: "cassava", PlantingSeason: "April-May", HarvestSeason: "December-February", CycleDays: 270, YieldPerHa: 15000},
+	"sorghum":  {Crop: "sorghum", PlantingSeason: "June-July", HarvestSeason: "October-November", CycleDays: 120, YieldPerHa: 1500},
+	"groundnut":{Crop: "groundnut", PlantingSeason: "May-June", HarvestSeason: "September-October", CycleDays: 120, YieldPerHa: 1200},
+	"yam":      {Crop: "yam", PlantingSeason: "February-March", HarvestSeason: "August-October", CycleDays: 210, YieldPerHa: 12000},
+	"cocoa":    {Crop: "cocoa", PlantingSeason: "Perennial", HarvestSeason: "September-March", CycleDays: 365, YieldPerHa: 500},
+}
+
+// ACGSF (Agricultural Credit Guarantee Scheme Fund) eligibility
+func checkACGSFEligibility(loanAmountKobo AmountKobo, cropType string, farmSizeHa float64, farmerAge int) (bool, []string) {
+	var errors []string
+	if loanAmountKobo > nairaToKobo(100000000) { errors = append(errors, "ACGSF max guarantee ₦100M") }
+	if farmSizeHa < 0.5 { errors = append(errors, "minimum farm size 0.5 hectares") }
+	if farmerAge < 18 || farmerAge > 70 { errors = append(errors, "farmer must be 18-70 years") }
+	if _, ok := cropCycles[cropType]; !ok { errors = append(errors, "crop not in approved ACGSF list") }
+	return len(errors) == 0, errors
+}
+
+// Compute expected yield revenue for loan assessment
+func computeExpectedRevenue(crop string, hectares float64, pricePerKgKobo AmountKobo) AmountKobo {
+	cycle, ok := cropCycles[crop]
+	if !ok { return 0 }
+	yieldKg := cycle.YieldPerHa * hectares
+	return AmountKobo(yieldKg * float64(pricePerKgKobo))
+}
+
+// Insurance premium for crop (NAIC rates)
+func computeCropInsurancePremium(cropType string, sumInsuredKobo AmountKobo) AmountKobo {
+	rates := map[string]float64{
+		"maize": 4.5, "rice": 5.0, "cassava": 3.5, "sorghum": 4.0,
+		"groundnut": 4.0, "yam": 3.0, "cocoa": 6.0,
+	}
+	rate := rates[cropType]
+	if rate == 0 { rate = 5.0 } // default
+	return AmountKobo(float64(sumInsuredKobo) * rate / 100.0)
+}
+
+// Weather risk scoring for agricultural lending
+func computeWeatherRiskScore(annualRainfallMm float64, floodRisk, droughtRisk bool) float64 {
+	score := 50.0 // baseline
+	if annualRainfallMm < 500 { score += 20 } // drought zone
+	if annualRainfallMm > 2500 { score += 15 } // flood zone
+	if floodRisk { score += 25 }
+	if droughtRisk { score += 20 }
+	if score > 100 { score = 100 }
+	return score
+}
+
+// Agent commission for farmer onboarding
+func computeAgentFarmerCommission(farmersOnboarded int, loansOriginated int, disbursedKobo AmountKobo) AmountKobo {
+	base := AmountKobo(farmersOnboarded) * nairaToKobo(500) // ₦500 per farmer
+	loanBonus := AmountKobo(float64(disbursedKobo) * 0.005)  // 0.5% of disbursed
+	if loanBonus > nairaToKobo(50000) { loanBonus = nairaToKobo(50000) } // cap
+	return base + loanBonus
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9301" }

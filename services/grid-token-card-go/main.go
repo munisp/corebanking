@@ -904,6 +904,80 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+
+// ── Deep Domain Logic: Cards ────────────────────────────────────────────────
+
+type AmountKobo int64
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
+func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
+
+// Luhn algorithm for PAN validation
+func validateLuhn(cardNumber string) bool {
+	var sum int
+	nDigits := len(cardNumber)
+	parity := nDigits % 2
+	for i, c := range cardNumber {
+		digit := int(c - '0')
+		if digit < 0 || digit > 9 { return false }
+		if i%2 == parity { digit *= 2; if digit > 9 { digit -= 9 } }
+		sum += digit
+	}
+	return sum%10 == 0
+}
+
+// Card transaction limit by type
+func getCardTransactionLimit(cardType, txnType string) AmountKobo {
+	limits := map[string]map[string]AmountKobo{
+		"debit":   {"pos": nairaToKobo(500000), "atm": nairaToKobo(200000), "web": nairaToKobo(1000000), "contactless": nairaToKobo(15000)},
+		"credit":  {"pos": nairaToKobo(2000000), "atm": nairaToKobo(500000), "web": nairaToKobo(5000000), "contactless": nairaToKobo(15000)},
+		"prepaid": {"pos": nairaToKobo(100000), "atm": nairaToKobo(50000), "web": nairaToKobo(200000), "contactless": nairaToKobo(10000)},
+	}
+	if cardLimits, ok := limits[cardType]; ok {
+		if limit, ok := cardLimits[txnType]; ok { return limit }
+	}
+	return nairaToKobo(50000) // default conservative limit
+}
+
+// Interchange fee computation (Verve/Mastercard/Visa)
+func computeInterchangeFee(scheme string, amountKobo AmountKobo, txnType string) AmountKobo {
+	var rate float64
+	switch scheme {
+	case "verve":
+		if txnType == "pos" { rate = 0.75 } else { rate = 1.0 }
+	case "mastercard":
+		if txnType == "pos" { rate = 0.80 } else { rate = 1.25 }
+	case "visa":
+		if txnType == "pos" { rate = 0.85 } else { rate = 1.30 }
+	default:
+		rate = 1.0
+	}
+	fee := AmountKobo(float64(amountKobo) * rate / 100.0)
+	// CBN cap: max ₦1,200 for POS, ₦2,000 for web
+	var cap AmountKobo
+	if txnType == "pos" { cap = nairaToKobo(1200) } else { cap = nairaToKobo(2000) }
+	if fee > cap { fee = cap }
+	return fee
+}
+
+// Card fraud scoring
+func computeCardFraudScore(
+	amountKobo AmountKobo, isInternational bool, isCardPresent bool,
+	hoursFromLastTxn float64, distanceKmFromLast float64, failedPINAttempts int,
+) (float64, string) {
+	score := 0.0
+	if isInternational { score += 20 }
+	if !isCardPresent { score += 15 }
+	if hoursFromLastTxn < 0.1 && distanceKmFromLast > 100 { score += 40 } // impossible travel
+	if failedPINAttempts >= 3 { score += 30 }
+	if amountKobo > nairaToKobo(500000) { score += 10 }
+	if score > 100 { score = 100 }
+
+	risk := "low"
+	if score >= 70 { risk = "high" } else if score >= 40 { risk = "medium" }
+	return score, risk
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9364" }

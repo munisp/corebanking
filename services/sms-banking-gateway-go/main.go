@@ -902,6 +902,158 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+
+// ── Deep Domain Logic: Infrastructure ───────────────────────────────────────
+
+// Exponential backoff with jitter for retries
+func computeBackoffMs(attempt int, baseMs int, maxMs int) int {
+	delay := baseMs * (1 << attempt) // exponential
+	// Add jitter (±25%)
+	jitter := delay / 4
+	delay += rand.Intn(jitter*2) - jitter
+	if delay > maxMs { delay = maxMs }
+	return delay
+}
+
+// Token bucket rate limiter with burst capacity
+type TokenBucketAdvanced struct {
+	tokens     float64
+	maxTokens  float64
+	refillRate float64 // tokens per second
+	lastRefill time.Time
+	mu         sync.Mutex
+}
+
+func (tb *TokenBucketAdvanced) Allow(cost float64) bool {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	now := time.Now()
+	elapsed := now.Sub(tb.lastRefill).Seconds()
+	tb.tokens += elapsed * tb.refillRate
+	if tb.tokens > tb.maxTokens { tb.tokens = tb.maxTokens }
+	tb.lastRefill = now
+	if tb.tokens >= cost { tb.tokens -= cost; return true }
+	return false
+}
+
+// Sliding window counter for rate limiting
+type SlidingWindowCounter struct {
+	windowSize time.Duration
+	buckets    map[int64]int
+	mu         sync.Mutex
+}
+
+func (sw *SlidingWindowCounter) Increment() {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	now := time.Now().Unix()
+	sw.buckets[now]++
+	// Cleanup old buckets
+	cutoff := now - int64(sw.windowSize.Seconds())
+	for k := range sw.buckets { if k < cutoff { delete(sw.buckets, k) } }
+}
+
+func (sw *SlidingWindowCounter) Count() int {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	cutoff := time.Now().Unix() - int64(sw.windowSize.Seconds())
+	total := 0
+	for k, v := range sw.buckets { if k >= cutoff { total += v } }
+	return total
+}
+
+// Health check scoring for upstream dependencies
+func computeHealthScore(successCount, failureCount int, avgLatencyMs float64) float64 {
+	total := successCount + failureCount
+	if total == 0 { return 100.0 }
+	successRate := float64(successCount) / float64(total) * 100.0
+	latencyPenalty := 0.0
+	if avgLatencyMs > 500 { latencyPenalty = (avgLatencyMs - 500) / 100.0 }
+	score := successRate - latencyPenalty
+	if score < 0 { score = 0 }
+	return score
+}
+
+// Connection pool sizing recommendation
+func recommendPoolSize(avgRPS float64, avgLatencyMs float64, targetUtilization float64) int {
+	// Little's Law: L = λ * W
+	concurrentConns := avgRPS * (avgLatencyMs / 1000.0)
+	recommended := int(concurrentConns / targetUtilization)
+	if recommended < 2 { recommended = 2 }
+	if recommended > 100 { recommended = 100 }
+	return recommended
+}
+
+
+// ── Gateway/Infrastructure Domain Logic ─────────────────────────────────────
+
+// RequestValidation with error accumulation for gateway services
+func validateGatewayRequest(method, path, contentType string, bodySize int64, headers map[string]string) (bool, []string) {
+	var errors []string
+	if method == "" { errors = append(errors, "HTTP method required") }
+	if path == "" { errors = append(errors, "request path required") }
+	if bodySize > 10*1024*1024 { errors = append(errors, "request body exceeds 10MB limit") }
+	if method == "POST" || method == "PUT" {
+		if contentType == "" { errors = append(errors, "Content-Type header required for POST/PUT") }
+	}
+	// Check required headers
+	if _, ok := headers["X-Request-ID"]; !ok { errors = append(errors, "X-Request-ID header required") }
+	return len(errors) == 0, errors
+}
+
+// Circuit breaker state machine
+type CBState string
+const (
+	CBClosed   CBState = "closed"
+	CBOpen     CBState = "open"
+	CBHalfOpen CBState = "half_open"
+)
+
+func computeCircuitState(failures int, threshold int, lastFailureAge int64, cooldownSec int64) CBState {
+	if failures < threshold { return CBClosed }
+	if lastFailureAge > cooldownSec { return CBHalfOpen }
+	return CBOpen
+}
+
+// Request routing score for load balancing
+func computeRoutingScore(latencyMs float64, errorRate float64, activeConns int, weight float64) float64 {
+	score := weight * 100.0
+	if latencyMs > 200 { score -= (latencyMs - 200) / 10.0 }
+	score -= errorRate * 50.0
+	if activeConns > 50 { score -= float64(activeConns - 50) * 0.5 }
+	if score < 0 { score = 0 }
+	return score
+}
+
+// Rate limit computation with configurable policies
+type RateLimitPolicy struct {
+	RequestsPerSecond int
+	BurstSize         int
+	KeyExtractor      string // "ip", "api_key", "user_id"
+}
+
+func computeRateLimit(policy RateLimitPolicy, currentCount int, windowStart int64) (bool, int) {
+	remaining := policy.RequestsPerSecond - currentCount
+	if remaining <= 0 { return false, 0 }
+	return true, remaining
+}
+
+// CORS validation
+func validateCORSOrigin(origin string, allowedOrigins []string) bool {
+	for _, allowed := range allowedOrigins {
+		if allowed == "*" { return true }
+		if allowed == origin { return true }
+	}
+	return false
+}
+
+// Request deduplication (idempotency)
+func computeRequestHash(method, path, body string) string {
+	h := uint64(0)
+	for _, c := range method + path + body { h = h*31 + uint64(c) }
+	return fmt.Sprintf("%016X", h)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9431" }

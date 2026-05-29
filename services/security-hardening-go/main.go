@@ -910,6 +910,214 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
+
+// ── Deep Domain Logic: Lending ──────────────────────────────────────────────
+
+// AmountKobo represents money in smallest unit (kobo) to avoid floating-point errors
+type AmountKobo int64
+
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
+func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
+func (a AmountKobo) String() string        { return fmt.Sprintf("₦%s", formatKobo(a)) }
+
+func formatKobo(k AmountKobo) string {
+	whole := k / 100
+	frac := k % 100
+	if frac < 0 { frac = -frac }
+	return fmt.Sprintf("%d.%02d", whole, frac)
+}
+
+// LoanState represents formal loan lifecycle states
+type LoanState string
+
+const (
+	LoanDraft       LoanState = "draft"
+	LoanSubmitted   LoanState = "submitted"
+	LoanUnderReview LoanState = "under_review"
+	LoanApproved    LoanState = "approved"
+	LoanDisbursed   LoanState = "disbursed"
+	LoanRepaying    LoanState = "repaying"
+	LoanSettled     LoanState = "settled"
+	LoanDefaulted   LoanState = "defaulted"
+	LoanWrittenOff  LoanState = "written_off"
+	LoanRejected    LoanState = "rejected"
+	LoanCancelled   LoanState = "cancelled"
+)
+
+// ValidTransitions defines allowed state machine transitions
+var validLoanTransitions = map[LoanState][]LoanState{
+	LoanDraft:       {LoanSubmitted, LoanCancelled},
+	LoanSubmitted:   {LoanUnderReview, LoanRejected, LoanCancelled},
+	LoanUnderReview: {LoanApproved, LoanRejected},
+	LoanApproved:    {LoanDisbursed, LoanCancelled},
+	LoanDisbursed:   {LoanRepaying},
+	LoanRepaying:    {LoanSettled, LoanDefaulted},
+	LoanDefaulted:   {LoanWrittenOff, LoanRepaying},
+}
+
+func canTransition(from, to LoanState) bool {
+	allowed, ok := validLoanTransitions[from]
+	if !ok { return false }
+	for _, s := range allowed { if s == to { return true } }
+	return false
+}
+
+func transitionLoan(currentState LoanState, newState LoanState, loanID string) error {
+	if !canTransition(currentState, newState) {
+		return fmt.Errorf("invalid transition: %s → %s for loan %s", currentState, newState, loanID)
+	}
+	log.Printf("[state-machine] Loan %s: %s → %s", loanID, currentState, newState)
+	return nil
+}
+
+// GenerateAmortizationSchedule produces full repayment schedule
+type AmortizationEntry struct {
+	Period        int        `json:"period"`
+	EMI           AmountKobo `json:"emi_kobo"`
+	Principal     AmountKobo `json:"principal_kobo"`
+	Interest      AmountKobo `json:"interest_kobo"`
+	Balance       AmountKobo `json:"balance_kobo"`
+	CumulativeInt AmountKobo `json:"cumulative_interest_kobo"`
+}
+
+func generateAmortizationSchedule(principalKobo AmountKobo, annualRatePct float64, tenorMonths int) []AmortizationEntry {
+	if tenorMonths <= 0 { return nil }
+	monthlyRate := annualRatePct / 12.0 / 100.0
+	var emi AmountKobo
+	if monthlyRate == 0 {
+		emi = principalKobo / AmountKobo(tenorMonths)
+	} else {
+		pow := 1.0
+		for i := 0; i < tenorMonths; i++ { pow *= (1 + monthlyRate) }
+		emiFloat := float64(principalKobo) * monthlyRate * pow / (pow - 1)
+		emi = AmountKobo(emiFloat)
+	}
+
+	schedule := make([]AmortizationEntry, 0, tenorMonths)
+	balance := principalKobo
+	var cumulativeInterest AmountKobo
+
+	for i := 1; i <= tenorMonths; i++ {
+		interestPart := AmountKobo(float64(balance) * monthlyRate)
+		principalPart := emi - interestPart
+		if i == tenorMonths { principalPart = balance } // settle rounding on last payment
+		balance -= principalPart
+		cumulativeInterest += interestPart
+		schedule = append(schedule, AmortizationEntry{
+			Period: i, EMI: emi, Principal: principalPart,
+			Interest: interestPart, Balance: balance, CumulativeInt: cumulativeInterest,
+		})
+	}
+	return schedule
+}
+
+// ComputeEarlySettlementPenalty — CBN allows max 1% penalty on outstanding
+func computeEarlySettlementPenalty(outstandingKobo AmountKobo, monthsRemaining int, penaltyPct float64) AmountKobo {
+	if penaltyPct > 1.0 { penaltyPct = 1.0 } // CBN cap
+	return AmountKobo(float64(outstandingKobo) * penaltyPct / 100.0)
+}
+
+// ComputeLateFee — tiered by days past due
+func computeLateFee(emiKobo AmountKobo, daysPastDue int) AmountKobo {
+	if daysPastDue <= 0 { return 0 }
+	var rate float64
+	switch {
+	case daysPastDue <= 7:  rate = 0.01  // 1%
+	case daysPastDue <= 30: rate = 0.025 // 2.5%
+	case daysPastDue <= 90: rate = 0.05  // 5%
+	default:               rate = 0.10  // 10% (max)
+	}
+	return AmountKobo(float64(emiKobo) * rate)
+}
+
+// PAR (Portfolio at Risk) computation — CBN regulatory metric
+func computePAR(totalLoansKobo, loansOverdueKobo AmountKobo, daysBucket int) float64 {
+	if totalLoansKobo == 0 { return 0 }
+	return float64(loansOverdueKobo) / float64(totalLoansKobo) * 100.0
+}
+
+// Provisioning rates per CBN Prudential Guidelines
+func computeProvisioningRate(classificationDays int) float64 {
+	switch {
+	case classificationDays <= 90:  return 1.0   // Performing — 1%
+	case classificationDays <= 180: return 10.0  // Watchlist — 10%
+	case classificationDays <= 360: return 50.0  // Substandard — 50%
+	case classificationDays <= 720: return 75.0  // Doubtful — 75%
+	default:                        return 100.0 // Lost — 100%
+	}
+}
+
+// ValidateLoanApplication with comprehensive error accumulation
+func validateLoanApplicationDeep(
+	customerID string, amount AmountKobo, tenorMonths int, annualRate float64,
+	monthlyIncomeKobo AmountKobo, existingDebtKobo AmountKobo,
+	kycLevel string, employmentYears float64, age int,
+) (bool, []string) {
+	var errors []string
+
+	// Amount bounds (CBN microfinance: min ₦10K, max depends on tier)
+	if amount < nairaToKobo(10000) { errors = append(errors, "amount below CBN minimum ₦10,000") }
+	if amount > nairaToKobo(50000000) { errors = append(errors, "amount exceeds ₦50M max single obligor limit") }
+
+	// Tenor bounds
+	if tenorMonths < 1 { errors = append(errors, "tenor must be at least 1 month") }
+	if tenorMonths > 360 { errors = append(errors, "tenor exceeds 30-year maximum") }
+
+	// Rate bounds (CBN usury cap)
+	if annualRate <= 0 { errors = append(errors, "interest rate must be positive") }
+	if annualRate > 30 { errors = append(errors, "rate exceeds CBN maximum lending rate") }
+
+	// DTI check
+	emi := AmountKobo(0)
+	if tenorMonths > 0 && annualRate > 0 {
+		monthlyRate := annualRate / 12.0 / 100.0
+		pow := 1.0
+		for i := 0; i < tenorMonths; i++ { pow *= (1 + monthlyRate) }
+		emi = AmountKobo(float64(amount) * monthlyRate * pow / (pow - 1))
+	}
+	dti := float64(existingDebtKobo+emi) / float64(monthlyIncomeKobo) * 100
+	if dti > 60 { errors = append(errors, fmt.Sprintf("DTI ratio %.1f%% exceeds 60%% maximum", dti)) }
+
+	// KYC tier check
+	switch kycLevel {
+	case "tier1":
+		if amount > nairaToKobo(300000) { errors = append(errors, "Tier 1 KYC max loan ₦300,000") }
+	case "tier2":
+		if amount > nairaToKobo(5000000) { errors = append(errors, "Tier 2 KYC max loan ₦5,000,000") }
+	case "tier3":
+		// No limit for Tier 3
+	default:
+		errors = append(errors, "valid KYC level required (tier1/tier2/tier3)")
+	}
+
+	// Age check (18-65 at loan maturity)
+	if age < 18 { errors = append(errors, "applicant must be 18+") }
+	maturityAge := age + tenorMonths/12
+	if maturityAge > 65 { errors = append(errors, fmt.Sprintf("applicant will be %d at maturity (max 65)", maturityAge)) }
+
+	// Employment stability
+	if employmentYears < 0.5 { errors = append(errors, "minimum 6 months employment required") }
+
+	return len(errors) == 0, errors
+}
+
+// ReverseLoanDisbursement — compensation logic
+func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, reason string) map[string]interface{} {
+	return map[string]interface{}{
+		"reversal_id":  fmt.Sprintf("REV-%s-%d", loanID, time.Now().UnixMilli()),
+		"loan_id":      loanID,
+		"account_id":   accountID,
+		"amount_kobo":  amountKobo,
+		"reason":       reason,
+		"status":       "reversed",
+		"reversed_at":  time.Now().Format(time.RFC3339),
+		"gl_entries": []map[string]interface{}{
+			{"debit": "loan_receivable", "credit": accountID, "amount_kobo": amountKobo},
+		},
+	}
+}
+
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9430" }
