@@ -197,7 +197,7 @@ async fn generate_efass(
     };
 
     // Store report
-    let mut reports = data.reports.lock().unwrap();
+    let mut reports = data.reports.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     reports.push(report.clone());
     db_persist(&data, "generate_efass", &json!({"report_id": report.report_id, "period": report.period})).await;
 

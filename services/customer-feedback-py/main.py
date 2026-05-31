@@ -179,8 +179,8 @@ def init_tracing():
         provider = TracerProvider()
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
         trace.set_tracer_provider(provider)
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug(f"Suppressed error: {_exc}")
 
 
 def analyze_sentiment(text):
@@ -189,8 +189,9 @@ def analyze_sentiment(text):
     words = text.lower().split()
     pos = sum(1 for w in words if w in positive)
     neg = sum(1 for w in words if w in negative)
-    if pos > neg: return {"sentiment": "positive", "score": 0.8}
-    if neg > pos: return {"sentiment": "negative", "score": 0.2}
+    total = max(pos + neg + 1, 1)
+    if pos > neg: return {"sentiment": "positive", "score": round(pos / total, 4)}
+    if neg > pos: return {"sentiment": "negative", "score": round(1.0 - neg / total, 4)}
     return {"sentiment": "neutral", "score": 0.5}
 
 
@@ -575,8 +576,8 @@ def start_grpc_server(service_name, port):
             result = servicer.Process(data)
             response = json.dumps(result).encode()
             conn.sendall(_grpc_struct.pack(">I", len(response)) + response)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug(f"Suppressed error: {_exc}")
         finally:
             conn.close()
 
@@ -655,7 +656,8 @@ def grpc_call(target, method, payload, retries=3):
             logger.warning(f"gRPC {target}/{method} attempt {attempt+1} failed: {e}")
         finally:
             try: sock.close()
-            except: pass
+            except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
     return None
 
 def call_service(method, url, body=None, retries=3, timeout=15):

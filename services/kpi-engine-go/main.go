@@ -624,11 +624,26 @@ func jsonResp(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	dbStatus := "disconnected"
+	dbStatus := "not_configured"
+	overallStatus := "healthy"
 	if db != nil {
-		if err := db.Ping(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			dbStatus = fmt.Sprintf("unhealthy: %v", err)
+			overallStatus = "degraded"
+		} else {
 			dbStatus = "connected"
 		}
+	}
+	jsonResp(w, 200, map[string]interface{}{
+		"status": overallStatus,
+		"service": serviceName,
+		"checks": map[string]interface{}{
+			"database": dbStatus,
+		},
+	})
+}
 	}
 	jsonResp(w, 200, map[string]interface{}{
 		"service":   "kpi-engine-go",

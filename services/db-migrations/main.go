@@ -212,7 +212,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			// Simulate domain processing
 			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
 			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
+			// Score computed from record data hash — deterministic, not random
+			recordHash := uint64(0); for _, b := range []byte(fmt.Sprintf("%v", records[i].Data)) { recordHash = recordHash*31 + uint64(b) }; records[i].Data["score"] = float64(recordHash % 100) / 100.0
 			records[i].Status = "completed"
 			domainStats.ProcessedToday++
 			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})

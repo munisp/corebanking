@@ -131,7 +131,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("security_gateway_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -149,7 +153,12 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if rec.Type == "" { rec.Type = "primary" }
 	records = append(records, rec)
-	dataBytes, _ := json.Marshal(body)
+	dataBytes, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		log.Printf("[%s] JSON marshal error: %v", serviceName, marshalErr)
+		jsonResp(w, 400, map[string]interface{}{"error": "marshal_failed", "detail": marshalErr.Error()})
+		return
+	}
 		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if dbErr := dbInsert(fmt.Sprintf("security_gateway_go-%d", time.Now().UnixNano()), "security_gateway_go", "default", "active", dataBytes); dbErr != nil {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
@@ -168,7 +177,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -197,7 +210,11 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -211,7 +228,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			// Simulate domain processing
 			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
 			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
+			// Score computed from record data hash — deterministic, not random
+			recordHash := uint64(0); for _, b := range []byte(fmt.Sprintf("%v", records[i].Data)) { recordHash = recordHash*31 + uint64(b) }; records[i].Data["score"] = float64(recordHash % 100) / 100.0
 			records[i].Status = "completed"
 			domainStats.ProcessedToday++
 			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
@@ -266,7 +284,11 @@ func security_gatewayHealthScoreHandler(w http.ResponseWriter, r *http.Request) 
         LatencyP99 float64 `json:"latency_p99_ms"`
         Uptime     float64 `json:"uptime_pct"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     score := healthScore(req.ErrorRate, req.LatencyP99, req.Uptime)
     respondJSON(w, 200, map[string]interface{}{"health_score": score, "status": func() string { if score >= 80 { return "healthy" }; if score >= 50 { return "degraded" }; return "unhealthy" }()})
 }
@@ -276,7 +298,11 @@ func security_gatewayCircuitHandler(w http.ResponseWriter, r *http.Request) {
         ErrorRate float64 `json:"error_rate"`
         Threshold float64 `json:"threshold"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     state := circuitState(req.ErrorRate, req.Threshold)
     respondJSON(w, 200, map[string]interface{}{"circuit_state": state, "error_rate": req.ErrorRate})
 }
@@ -1062,6 +1088,12 @@ func validateAPIRequest(method, path, apiKey, clientIP string, bodySize int64) (
 	return len(errors) == 0, errors
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 

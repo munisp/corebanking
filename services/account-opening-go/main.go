@@ -354,7 +354,12 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 		"timestamp": app.CreatedAt,
 	})
 
-	dataBytes, _ := json.Marshal(body)
+	dataBytes, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		log.Printf("[%s] JSON marshal error: %v", serviceName, marshalErr)
+		jsonResp(w, 400, map[string]interface{}{"error": "marshal_failed", "detail": marshalErr.Error()})
+		return
+	}
 		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if dbErr := dbInsert(fmt.Sprintf("account_opening_go-%d", time.Now().UnixNano()), "account_opening_go", "default", "active", dataBytes); dbErr != nil {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
@@ -373,7 +378,11 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 func approveHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { jsonResp(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	appID := getString(body, "applicationId")
 
 	mu.Lock()
@@ -405,7 +414,11 @@ func approveHandler(w http.ResponseWriter, r *http.Request) {
 func kycVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { jsonResp(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	customerID := getString(body, "customerId")
 	level := getString(body, "level")
 	if level == "" { level = "standard" }
@@ -1028,7 +1041,11 @@ func handleAccountValidate(w http.ResponseWriter, r *http.Request) {
 		KYCLevel     string `json:"kyc_level"`
 		Age          int    `json:"age"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	if body.CustomerType == "" { body.CustomerType = "individual" }
 	if body.KYCLevel == "" { body.KYCLevel = "tier1" }
 

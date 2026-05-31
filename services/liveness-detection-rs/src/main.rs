@@ -446,11 +446,11 @@ async fn score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<
     };
 
     {
-        let mut checks = state.checks.lock().unwrap();
+        let mut checks = state.checks.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
         checks.push(check.clone());
     }
     {
-        let mut st = state.stats.lock().unwrap();
+        let mut st = state.stats.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
         st.total_checks += 1;
         if is_live { st.passed += 1; } else { st.failed += 1; }
         if anti_spoof.is_spoof {
@@ -509,14 +509,14 @@ async fn score_face_match(body: web::Json<FaceMatchScoreRequest>, state: web::Da
     };
 
     {
-        let mut matches = state.matches.lock().unwrap();
+        let mut matches = state.matches.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
         matches.push(match_result.clone());
     }
     {
-        let mut st = state.stats.lock().unwrap();
+        let mut st = state.stats.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
         st.total_face_matches += 1;
         let n = st.total_face_matches as f64;
-        let matched_count = state.matches.lock().unwrap().iter().filter(|m| m.matched).count() as f64;
+        let matched_count = state.matches.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).iter().filter(|m| m.matched).count() as f64;
         st.face_match_rate = matched_count / n;
     }
 
@@ -538,7 +538,7 @@ async fn get_checks(state: web::Data<AppState>, req: HttpRequest) -> HttpRespons
             }
         }
     }
-    let checks = state.checks.lock().unwrap();
+    let checks = state.checks.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let start = (page - 1) * limit;
     let items: Vec<_> = checks.iter().skip(start).take(limit).cloned().collect();
     db_persist(&state, "get_checks", &json!({"action": "get_checks"})).await;
@@ -547,7 +547,7 @@ async fn get_checks(state: web::Data<AppState>, req: HttpRequest) -> HttpRespons
 
 async fn get_check_by_id(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
     let id = path.into_inner();
-    let checks = state.checks.lock().unwrap();
+    let checks = state.checks.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     match checks.iter().find(|c| c.id == id) {
         Some(c) => HttpResponse::Ok().json(c),
         None => HttpResponse::NotFound().json(json!({"error": format!("Check {} not found", id)})),
@@ -556,14 +556,14 @@ async fn get_check_by_id(path: web::Path<String>, state: web::Data<AppState>) ->
 
 async fn get_matches(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let matches = state.matches.lock().unwrap();
+    let matches = state.matches.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "get_matches", &json!({"action": "get_matches"})).await;
     HttpResponse::Ok().json(json!({"matches": *matches, "total": matches.len()}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let st = state.stats.lock().unwrap();
+    let st = state.stats.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "get_stats", &json!({"action": "get_stats"})).await;
     HttpResponse::Ok().json(json!({
         "total_checks": st.total_checks,
@@ -809,10 +809,14 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("liveness-detection-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
+    } else {
+        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
     }
 }
 

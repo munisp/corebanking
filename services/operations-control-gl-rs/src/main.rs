@@ -25,10 +25,12 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("operations-control-gl-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
     }
 }
 
@@ -321,8 +323,25 @@ async fn degradation_status() -> HttpResponse {
     }))
 }
 
-async fn healthz(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "operations-control-gl-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+}
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "status": "healthy",

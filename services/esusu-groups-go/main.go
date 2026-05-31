@@ -38,9 +38,41 @@ func jsonResp(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	
-	
-	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "esusu-groups-go", })
+	dbStatus := "not_configured"
+	redisStatus := "not_configured"
+	overallStatus := "healthy"
+
+	// Check Postgres connectivity
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			dbStatus = fmt.Sprintf("unhealthy: %v", err)
+			overallStatus = "degraded"
+		} else {
+			dbStatus = "connected"
+		}
+	}
+
+	// Check Redis via cache pool health
+	if _cachePool != nil {
+		cacheSet("__health_ping__", "1", 10)
+		if _, ok := cacheGet("__health_ping__"); ok {
+			redisStatus = "connected"
+		} else {
+			redisStatus = "unreachable"
+			overallStatus = "degraded"
+		}
+	}
+
+	jsonResp(w, 200, map[string]interface{}{
+		"status": overallStatus,
+		"service": "esusu-groups-go",
+		"checks": map[string]interface{}{
+			"database": dbStatus,
+			"cache": redisStatus,
+		},
+	})
 }
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
@@ -102,9 +134,18 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	_ = defaultPenalty(1000.0, 0.05)
 	_ = payoutOrder(10, 1)
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	id := fmt.Sprintf("%s-%d", "esusu_groups_go", time.Now().UnixNano())
-	dataBytes, _ := json.Marshal(body)
+	dataBytes, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		log.Printf("[%s] JSON marshal error: %v", serviceName, marshalErr)
+		jsonResp(w, 400, map[string]interface{}{"error": "marshal_failed", "detail": marshalErr.Error()})
+		return
+	}
 		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if db != nil {
 		_, err := db.Exec(
@@ -128,11 +169,10 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "database"})
 		return
 	}
-	// No DB — respond with in-memory acknowledgement
-	if dbErr := dbInsert(fmt.Sprintf("esusu_groups_go-%d", time.Now().UnixNano()), "esusu_groups_go", "default", "active", dataBytes); dbErr != nil {
-		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-	}
-	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "in-memory"})
+	// No DB connection — reject request to prevent data loss
+	log.Printf("[%s] FATAL: No database connection — refusing write to prevent data loss", serviceName)
+	jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable", "detail": "Service requires database connection. Set DATABASE_URL environment variable.", "service": serviceName})
+	return
 }
 
 
@@ -156,14 +196,22 @@ func payoutOrder(members int, currentRound int) int {
 
 func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Members int `json:"members"`; Amount float64 `json:"amount"`; Frequency string `json:"frequency"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	schedule := contributionSchedule(req.Members, req.Amount, req.Frequency)
 	jsonResp(w, 200, map[string]interface{}{"group_id": fmt.Sprintf("ESU-%d", time.Now().UnixNano()), "schedule": schedule, "total_pool": req.Amount * float64(req.Members)})
 }
 
 func recordContributionHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { GroupID string `json:"group_id"`; MemberID string `json:"member_id"`; Amount float64 `json:"amount"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	jsonResp(w, 200, map[string]interface{}{"status": "recorded", "group": req.GroupID, "member": req.MemberID, "amount": req.Amount})
 }
 
@@ -192,14 +240,22 @@ func esusu_groupsScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     score := esusu_groupsComputeScore(req.Value, req.Weight, req.Threshold)
     jsonResp(w, 200, map[string]interface{}{"score": score})
 }
 
 func esusu_groupsValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    json.NewDecoder(r.Body).Decode(&body)
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     result := esusu_groupsValidateRequest(body)
     jsonResp(w, 200, result)
 }
@@ -262,13 +318,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -276,7 +332,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -1033,6 +1089,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")

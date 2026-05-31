@@ -184,12 +184,25 @@ async fn degradation_status() -> HttpResponse {
     }))
 }
 
-async fn healthz() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "circuit-breaker-rs", "status": "healthy", "version": "1.0.0",
-        "description": "Platform-wide circuit breaker with per-service state machines, bulkhead isolation, retry policies, and health-aware routing",
-        "middleware": {
-            "kafka": { "status": "connected", "topics": ["cb.state-changes", "cb.failures", "cb.recoveries"] },
+async fn healthz(state: web::Data<AppState>) -> HttpResponse {
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "circuit-breaker-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+},
             "dapr": { "status": "connected", "appId": "circuit-breaker-rs" },
             "fluvio": { "status": "connected", "topic": "cb-events-stream" },
             "temporal": { "status": "connected", "workflows": ["health-probe", "auto-recovery", "escalation"] },
@@ -208,12 +221,12 @@ async fn healthz() -> HttpResponse {
 }
 
 async fn list_breakers(data: web::Data<AppState>) -> HttpResponse {
-    let b = data.breakers.lock().unwrap();
+    let b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     HttpResponse::Ok().json(serde_json::json!({ "items": *b, "total": b.len() }))
 }
 
 async fn get_stats(data: web::Data<AppState>) -> HttpResponse {
-    let b = data.breakers.lock().unwrap();
+    let b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let closed = b.iter().filter(|x| x.state == CBState::Closed).count();
     let open = b.iter().filter(|x| x.state == CBState::Open).count();
     let half_open = b.iter().filter(|x| x.state == CBState::HalfOpen).count();
@@ -237,18 +250,18 @@ async fn get_stats(data: web::Data<AppState>) -> HttpResponse {
 }
 
 async fn list_events(data: web::Data<AppState>) -> HttpResponse {
-    let e = data.events.lock().unwrap();
+    let e = data.events.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     HttpResponse::Ok().json(serde_json::json!({ "items": *e, "total": e.len() }))
 }
 
 async fn list_configs(data: web::Data<AppState>) -> HttpResponse {
-    let c = data.configs.lock().unwrap();
+    let c = data.configs.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     HttpResponse::Ok().json(serde_json::json!({ "items": *c, "total": c.len() }))
 }
 
 async fn check_service(path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
     let service = path.into_inner();
-    let b = data.breakers.lock().unwrap();
+    let b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     match b.iter().find(|x| x.service == service) {
         Some(cb) => {
             let allowed = cb.state != CBState::Open;
@@ -269,7 +282,7 @@ async fn check_service(path: web::Path<String>, data: web::Data<AppState>) -> Ht
 
 async fn record_failure(path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
     let service = path.into_inner();
-    let mut b = data.breakers.lock().unwrap();
+    let mut b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     if let Some(cb) = b.iter_mut().find(|x| x.service == service) {
         cb.failure_count += 1;
         cb.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
@@ -283,7 +296,7 @@ async fn record_failure(path: web::Path<String>, data: web::Data<AppState>) -> H
 
 async fn record_success(path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
     let service = path.into_inner();
-    let mut b = data.breakers.lock().unwrap();
+    let mut b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     if let Some(cb) = b.iter_mut().find(|x| x.service == service) {
         cb.success_count += 1;
         cb.last_success_at = Some(chrono::Utc::now().to_rfc3339());
@@ -297,7 +310,7 @@ async fn record_success(path: web::Path<String>, data: web::Data<AppState>) -> H
 
 async fn reset_breaker(path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
     let service = path.into_inner();
-    let mut b = data.breakers.lock().unwrap();
+    let mut b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     if let Some(cb) = b.iter_mut().find(|x| x.service == service) {
         cb.state = CBState::Closed;
         cb.failure_count = 0;

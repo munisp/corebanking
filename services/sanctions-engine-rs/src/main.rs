@@ -80,12 +80,12 @@ struct AppState {
 }
 
 fn rand_id(prefix: &str) -> String {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("{}-{:08X}", prefix, (t.subsec_nanos() ^ (t.as_secs() as u32)) & 0xFFFFFFFF)
 }
 
 fn now_str() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("2026-05-09T{:02}:{:02}:{:02}Z", (d.as_secs() / 3600) % 24, (d.as_secs() / 60) % 60, d.as_secs() % 60)
 }
 
@@ -124,14 +124,28 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
-        return HttpResponse::TooManyRequests()
-            .insert_header(("Retry-After", "1"))
-            .json(serde_json::json!({"error": "rate_limit_exceeded"}));
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "sanctions-engine-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap();
-    let watchlist = state.watchlist.lock().unwrap();
+    let screenings = state.screenings.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let watchlist = state.watchlist.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
     match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
@@ -183,7 +197,7 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
     let entity_type = body.entity_type.as_deref().unwrap_or("individual");
     let screening_type = body.screening_type.as_deref().unwrap_or("customer_onboarding");
 
-    let watchlist = state.watchlist.lock().unwrap();
+    let watchlist = state.watchlist.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let mut best_score = 0.0_f64;
     let mut best_match: Option<&WatchlistEntry> = None;
 
@@ -221,7 +235,7 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
         notes: None,
     };
 
-    let mut screenings = state.screenings.lock().unwrap();
+    let mut screenings = state.screenings.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     screenings.push(screening.clone());
 
     db_persist(&state, "screen_entity", &json!({"action": "screen_entity"})).await;
@@ -238,7 +252,7 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
 }
 
 async fn record_decision(body: web::Json<DecisionRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let mut screenings = state.screenings.lock().unwrap();
+    let mut screenings = state.screenings.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     for s in screenings.iter_mut() {
         if s.id == body.screening_id {
             s.decision = body.decision.clone();
@@ -272,7 +286,7 @@ async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<Ap
 
 async fn list_screenings(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap();
+    let screenings = state.screenings.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let pending = screenings.iter().filter(|s| s.decision_by.is_none()).count();
     db_persist(&state, "list_screenings", &json!({"action": "list_screenings"})).await;
     HttpResponse::Ok().json(json!({
@@ -284,7 +298,7 @@ async fn list_screenings(req: actix_web::HttpRequest, state: web::Data<AppState>
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap();
+    let screenings = state.screenings.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let total = screenings.len();
     let matches = screenings.iter().filter(|s| s.match_score >= 0.7).count();
     let false_positives = screenings.iter().filter(|s| s.status == "false_positive").count();
@@ -308,7 +322,7 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 
 async fn get_false_positives(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap();
+    let screenings = state.screenings.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let fps: Vec<&Screening> = screenings.iter().filter(|s| s.status == "false_positive").collect();
     db_persist(&state, "get_false_positives", &json!({"action": "get_false_positives"})).await;
     HttpResponse::Ok().json(json!({
@@ -450,10 +464,14 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("sanctions-engine-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
+    } else {
+        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
     }
 }
 

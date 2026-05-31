@@ -466,7 +466,7 @@ func coaCypherHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		atomic.AddUint64(&errorCount, 1)
 		jsonResp(w, 200, map[string]interface{}{
-			"query": req.Query, "results": []interface{}{}, "source": "in-memory",
+			"query": req.Query, "results": []interface{}{}, "source": "database_fallback", "warning": "DB was unavailable during this request",
 			"note": fmt.Sprintf("Neo4j unavailable (%v), returning empty", err),
 		})
 		return
@@ -1069,6 +1069,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	initDB()

@@ -574,9 +574,25 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    let entities = state.entities.lock().unwrap();
-    let edges = state.edges.lock().unwrap();
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "falkordb-graph-engine-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+}", e); e.into_inner() });
+    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let _cbn = cbn_reporting_threshold_ngn();
     HttpResponse::Ok().json(json!({
         "status": "healthy",
@@ -645,7 +661,7 @@ async fn create_entity(req: actix_web::HttpRequest, state: web::Data<AppState>, 
         entity.entity_type, entity.entity_id, entity.name, entity.risk_score.unwrap_or(0.0)
     );
     let _ = state.falkordb.execute_query(&cypher, &json!({}));
-    let mut entities = state.entities.lock().unwrap();
+    let mut entities = state.entities.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     entities.push(entity.clone());
     db_persist(&state, "create_entity", &json!({"entityId": entity.entity_id})).await;
     HttpResponse::Created().json(json!({"created": true, "entityId": entity.entity_id}))
@@ -662,7 +678,7 @@ async fn create_edge(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
         edge.from_id, edge.to_id, edge.edge_type
     );
     let _ = state.falkordb.execute_query(&cypher, &json!({}));
-    let mut edges = state.edges.lock().unwrap();
+    let mut edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     edges.push(edge.clone());
     db_persist(&state, "create_edge", &json!({"from": edge.from_id, "to": edge.to_id, "type": edge.edge_type})).await;
     HttpResponse::Created().json(json!({"linked": true, "edgeType": edge.edge_type}))
@@ -671,7 +687,7 @@ async fn create_edge(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
 async fn detect_circular(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let edges = state.edges.lock().unwrap();
+    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let cycles = detect_circular_transactions(&edges);
 
     // Inter-service: notify AML engine
@@ -686,7 +702,7 @@ async fn entity_centrality(req: actix_web::HttpRequest, state: web::Data<AppStat
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
     let entity_id = query.get("entityId").cloned().unwrap_or_default();
-    let edges = state.edges.lock().unwrap();
+    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let entity_edges: Vec<GraphEdge> = edges.iter().filter(|e| e.from_id == entity_id).cloned().collect();
     let centrality = compute_entity_centrality(&entity_edges);
     HttpResponse::Ok().json(json!({"entityId": entity_id, "degreeCentrality": centrality, "connections": entity_edges.len()}))
@@ -747,7 +763,7 @@ async fn transaction_velocity(req: actix_web::HttpRequest, state: web::Data<AppS
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
     let window = query.get("window").and_then(|w| w.parse::<u64>().ok()).unwrap_or(3600);
-    let edges = state.edges.lock().unwrap();
+    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let velocity = compute_transaction_velocity(&edges, window);
     HttpResponse::Ok().json(json!({"velocity": velocity, "windowSeconds": window, "totalEdges": edges.len()}))
 }

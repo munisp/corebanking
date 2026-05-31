@@ -86,10 +86,23 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
+    let mut overall = "healthy";
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected".to_string(),
+            Err(e) => { overall = "degraded"; format!("unhealthy: {}", e) }
+        }
+    } else {
+        "not_configured".to_string()
+    };
+
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "status": "healthy",
+        "status": overall,
         "service": "interest-computation-rs",
         "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
     }))
 }
 
@@ -254,10 +267,14 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("interest-computation-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
+    } else {
+        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
     }
 }
 

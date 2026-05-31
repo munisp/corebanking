@@ -243,7 +243,7 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
             &[&id, &svc_name, &data.to_string()],
         ).await;
     } else {
-        let mut recs = state.records.lock().unwrap();
+        let mut recs = state.records.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
         recs.push(json!({"id": id, "service": svc_name, "data": data}));
     }
 }
@@ -536,11 +536,25 @@ async fn degradation_status() -> HttpResponse {
     }))
 }
 
-async fn health() -> HttpResponse {
-    HttpResponse::Ok().json(json!({
-        "status": "healthy", "service": "neo4j-coa-graph-rs",
-        "capabilities": ["coa_graph", "neo4j_cypher", "pagerank", "basel_iii", "path_traversal"],
+async fn health(state: web::Data<AppState>) -> HttpResponse {
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "neo4j-coa-graph-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
     }))
+}))
 }
 
 async fn ready() -> HttpResponse { HttpResponse::Ok().json(json!({"ready": true, "service": "neo4j-coa-graph-rs"})) }
@@ -556,8 +570,8 @@ async fn coa_graph(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let nodes = state.nodes.lock().unwrap().clone();
-    let edges = state.edges.lock().unwrap().clone();
+    let nodes = state.nodes.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).clone();
+    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).clone();
     db_persist(&state, "coa_graph", &json!({"action": "get_graph"})).await;
     HttpResponse::Ok().json(json!({"nodes": nodes, "edges": edges, "total_nodes": nodes.len(), "total_edges": edges.len()}))
 }
@@ -566,8 +580,8 @@ async fn coa_pagerank(req: actix_web::HttpRequest, state: web::Data<AppState>) -
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let nodes = state.nodes.lock().unwrap().clone();
-    let edges = state.edges.lock().unwrap().clone();
+    let nodes = state.nodes.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).clone();
+    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).clone();
     let rankings = compute_pagerank(&nodes, &edges, 20, 0.85);
     let named: Vec<serde_json::Value> = rankings.iter().map(|(code, rank)| {
         let name = nodes.iter().find(|n| n.code == *code).map(|n| n.name.clone()).unwrap_or_default();
@@ -580,7 +594,7 @@ async fn coa_basel(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let nodes = state.nodes.lock().unwrap().clone();
+    let nodes = state.nodes.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).clone();
     let result = compute_basel_iii(&nodes);
     HttpResponse::Ok().json(result)
 }
@@ -592,7 +606,7 @@ async fn coa_traverse(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     if let Err(resp) = check_jwt(&req) { return resp; }
     let from = body.get("from").and_then(|v| v.as_str()).unwrap_or("");
     let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("");
-    let edges = state.edges.lock().unwrap().clone();
+    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).clone();
     // BFS traversal
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
@@ -622,7 +636,7 @@ async fn transaction_flow(req: actix_web::HttpRequest, state: web::Data<AppState
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
     if let Err(resp) = check_jwt(&req) { return resp; }
     let txn = body.into_inner();
-    let mut edges = state.edges.lock().unwrap();
+    let mut edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     edges.push(COAEdge {
         from_code: txn.debit_account.clone(), to_code: txn.credit_account.clone(),
         relation_type: "TRANSACTION".into(), weight: txn.amount,
@@ -642,7 +656,7 @@ async fn create_node(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
     if let Err(resp) = check_jwt(&req) { return resp; }
     let node = body.into_inner();
     let code = node.code.clone();
-    state.nodes.lock().unwrap().push(node);
+    state.nodes.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).push(node);
     db_persist(&state, "create_node", &json!({"code": &code})).await;
     HttpResponse::Created().json(json!({"created": true, "code": code}))
 }

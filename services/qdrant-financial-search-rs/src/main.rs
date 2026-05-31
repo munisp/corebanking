@@ -136,7 +136,7 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
     if let Some(client) = &state.db_client {
         let _ = client.execute("INSERT INTO records (id,service,tenant,status,data,created_at) VALUES ($1,$2,'default','active',$3,NOW()) ON CONFLICT (id) DO UPDATE SET data=$3", &[&id, &svc, &data.to_string()]).await;
     } else {
-        state.records.lock().unwrap().push(json!({"id": id, "service": svc, "data": data}));
+        state.records.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() }).push(json!({"id": id, "service": svc, "data": data}));
     }
 }
 
@@ -428,7 +428,25 @@ async fn degradation_status() -> HttpResponse {
     }))
 }
 
-async fn health() -> HttpResponse { HttpResponse::Ok().json(json!({"status": "healthy", "service": "qdrant-financial-search-rs"})) }
+async fn health(state: web::Data<AppState>) -> HttpResponse {
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "qdrant-financial-search-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+})) }
 async fn ready() -> HttpResponse { HttpResponse::Ok().json(json!({"ready": true, "service": "qdrant-financial-search-rs"})) }
 async fn live() -> HttpResponse { HttpResponse::Ok().json(json!({"live": true})) }
 async fn metrics() -> HttpResponse {

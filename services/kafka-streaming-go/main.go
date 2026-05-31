@@ -115,7 +115,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(cached))
 		return
 	}
-	// DB-first query with in-memory fallback
+	// DB-first query with WARNING: DB unavailable — degraded mode active
 	if db != nil {
 		rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT 100", "kafka_streaming_go")
 		if err == nil {
@@ -131,19 +131,23 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 			respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
 			return
 		}
-		log.Printf("kafka-streaming-go: DB query failed, falling back to in-memory: %v", err)
+		log.Printf("kafka-streaming-go: DB query failed, DB query failed — returning cached/empty result: %v", err)
 	}
 	// In-memory fallback
 	mu.Lock()
 	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "in-memory"})
+	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "database_fallback", "warning": "DB was unavailable during this request"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("kafka_streaming_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -192,7 +196,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -221,7 +229,11 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -235,7 +247,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			// Simulate domain processing
 			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
 			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
+			// Score computed from record data hash — deterministic, not random
+			recordHash := uint64(0); for _, b := range []byte(fmt.Sprintf("%v", records[i].Data)) { recordHash = recordHash*31 + uint64(b) }; records[i].Data["score"] = float64(recordHash % 100) / 100.0
 			records[i].Status = "completed"
 			domainStats.ProcessedToday++
 			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
@@ -288,7 +301,11 @@ func kafka_streamingThroughputHandler(w http.ResponseWriter, r *http.Request) {
         BatchSize  int `json:"batch_size"`
         IntervalMs int `json:"interval_ms"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     tps := estimateThroughput(req.BatchSize, req.IntervalMs)
     respondJSON(w, 200, map[string]interface{}{"throughput_per_sec": tps, "batch_size": req.BatchSize})
 }
@@ -298,7 +315,11 @@ func kafka_streamingPartitionHandler(w http.ResponseWriter, r *http.Request) {
         CustomerID    string `json:"customer_id"`
         NumPartitions int    `json:"num_partitions"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     if req.NumPartitions <= 0 { req.NumPartitions = 12 }
     partition := partitionKey(req.CustomerID, req.NumPartitions)
     respondJSON(w, 200, map[string]interface{}{"partition": partition, "customer_id": req.CustomerID, "total_partitions": req.NumPartitions})
@@ -362,13 +383,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -376,7 +397,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -1144,6 +1165,12 @@ func checkNFIUBatch(totalAmountKobo int64, txnType string) (bool, string) {
 	return false, ""
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")

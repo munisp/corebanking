@@ -50,8 +50,24 @@ async fn degradation_status() -> HttpResponse {
     }))
 }
 
-async fn health() -> HttpResponse {
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({"status": "healthy", "service": "adaptive-rate-limiter-rs", "version": "1.0.0"}))
+async fn health(state: web::Data<AppState>) -> HttpResponse {
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "adaptive-rate-limiter-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
 }
 
 async fn check_rate(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
@@ -63,8 +79,8 @@ async fn check_rate(req: actix_web::HttpRequest, body: web::Json<serde_json::Val
     let error_rate = body.get("error_rate").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let latency_p99 = body.get("latency_p99").and_then(|v| v.as_f64()).unwrap_or(100.0);
     let limit = adaptive_limit(base_rate, error_rate, latency_p99);
-    let mut buckets = state.buckets.lock().unwrap();
-    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let mut buckets = state.buckets.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
     let (tokens, _) = buckets.entry(client_id.to_string()).or_insert((limit, now_ms));
     let allowed = *tokens > 0;
     if allowed { *tokens -= 1; }
@@ -77,7 +93,7 @@ async fn check_rate(req: actix_web::HttpRequest, body: web::Json<serde_json::Val
 async fn stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    let buckets = state.buckets.lock().unwrap();
+    let buckets = state.buckets.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "stats", &json!({"action": "stats"})).await;
     HttpResponse::Ok().json(json!({"active_clients": buckets.len(), "service": "adaptive-rate-limiter-rs"}))
 }
@@ -201,10 +217,12 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("adaptive-rate-limiter-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
     }
 }
 

@@ -75,12 +75,12 @@ struct AppState {
 }
 
 fn rand_id(prefix: &str) -> String {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("{}-{:08X}", prefix, (t.subsec_nanos() ^ (t.as_secs() as u32)) & 0xFFFFFFFF)
 }
 
 fn now_str() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("2026-05-09T{:02}:{:02}:{:02}Z", (d.as_secs() / 3600) % 24, (d.as_secs() / 60) % 60, d.as_secs() % 60)
 }
 
@@ -106,10 +106,24 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
-        return HttpResponse::TooManyRequests()
-            .insert_header(("Retry-After", "1"))
-            .json(serde_json::json!({"error": "rate_limit_exceeded"}));
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "reconciliation-engine-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     // Inter-service call
@@ -175,7 +189,7 @@ async fn run_settlement_recon(body: web::Json<RunSettlementReconRequest>, state:
         reconciled_at: now_str(),
     };
 
-    let mut recons = state.recons.lock().unwrap();
+    let mut recons = state.recons.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     recons.push(recon.clone());
 
     db_persist(&state, "run_settlement_recon", &json!({"action": "run_settlement_recon"})).await;
@@ -194,7 +208,7 @@ async fn run_settlement_recon(body: web::Json<RunSettlementReconRequest>, state:
 
 async fn get_suspense(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let items = state.suspense_items.lock().unwrap();
+    let items = state.suspense_items.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let total_amount: f64 = items.iter().map(|i| i.amount).sum();
     let aging_0_7: usize = items.iter().filter(|i| i.aging_days <= 7).count();
     let aging_8_30: usize = items.iter().filter(|i| i.aging_days > 7 && i.aging_days <= 30).count();
@@ -211,15 +225,15 @@ async fn get_suspense(req: actix_web::HttpRequest, state: web::Data<AppState>) -
 
 async fn list_recons(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let recons = state.recons.lock().unwrap();
+    let recons = state.recons.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "list_recons", &json!({"action": "list_recons"})).await;
     HttpResponse::Ok().json(json!({"recons": *recons, "total": recons.len()}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let recons = state.recons.lock().unwrap();
-    let items = state.suspense_items.lock().unwrap();
+    let recons = state.recons.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let items = state.suspense_items.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "get_stats", &json!({"action": "get_stats"})).await;
     HttpResponse::Ok().json(json!({
         "total_recons_run": recons.len(),
@@ -235,7 +249,7 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 
 async fn eod_report(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let recons = state.recons.lock().unwrap();
+    let recons = state.recons.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "eod_report", &json!({"action": "eod_report"})).await;
     HttpResponse::Ok().json(json!({
         "report_type": "end_of_day_reconciliation",
@@ -376,10 +390,14 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("reconciliation-engine-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
+    } else {
+        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
     }
 }
 

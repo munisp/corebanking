@@ -587,9 +587,25 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    let collections = state.collections.lock().unwrap();
-    let points = state.points.lock().unwrap();
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "qdrant-vector-store-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+}", e); e.into_inner() });
+    let points = state.points.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let total_points: usize = points.values().map(|v| v.len()).sum();
     let _cbn = cbn_reporting_threshold_ngn();
     HttpResponse::Ok().json(json!({
@@ -640,12 +656,12 @@ async fn init_collections(state: web::Data<AppState>) -> HttpResponse {
     for cfg in &configs {
         let _ = state.qdrant.create_collection(&cfg.name, cfg.vector_size);
     }
-    let mut collections = state.collections.lock().unwrap();
+    let mut collections = state.collections.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     *collections = configs.clone();
 
     // Seed regulatory embeddings
     let reg_points = seed_regulatory_embeddings();
-    let mut points = state.points.lock().unwrap();
+    let mut points = state.points.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     points.insert("bank54_regulations".to_string(), reg_points.clone());
 
     let _ = state.qdrant.upsert_points("bank54_regulations", &reg_points);
@@ -661,7 +677,7 @@ async fn upsert_vectors(req: actix_web::HttpRequest, state: web::Data<AppState>,
     let req_data = body.into_inner();
     let count = req_data.points.len();
     let _ = state.qdrant.upsert_points(&req_data.collection, &req_data.points);
-    let mut points = state.points.lock().unwrap();
+    let mut points = state.points.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     points.entry(req_data.collection.clone()).or_default().extend(req_data.points);
     db_persist(&state, "upsert_vectors", &json!({"collection": req_data.collection, "count": count})).await;
     HttpResponse::Created().json(json!({"upserted": count, "collection": req_data.collection}))
@@ -675,7 +691,7 @@ async fn semantic_search(req: actix_web::HttpRequest, state: web::Data<AppState>
     let limit = search.limit.unwrap_or(10) as usize;
 
     // In-memory similarity search fallback
-    let points = state.points.lock().unwrap();
+    let points = state.points.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let mut results: Vec<SearchResult> = Vec::new();
     if let Some(collection_points) = points.get(&search.collection) {
         let mut scored: Vec<(f32, &VectorPoint)> = collection_points.iter()
@@ -708,7 +724,7 @@ async fn search_regulations(req: actix_web::HttpRequest, state: web::Data<AppSta
     let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
     let query_vec = generate_text_embedding(query_text, 768);
 
-    let points = state.points.lock().unwrap();
+    let points = state.points.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let mut results: Vec<SearchResult> = Vec::new();
     if let Some(reg_points) = points.get("bank54_regulations") {
         let mut scored: Vec<(f32, &VectorPoint)> = reg_points.iter()

@@ -285,7 +285,11 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		DeviceModel    string `json:"deviceModel"`
 		ChallengeCount int    `json:"challengeCount"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	if body.Mode == "" {
 		body.Mode = "hybrid"
@@ -344,7 +348,11 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 		FrameBase64  string `json:"frameBase64"`
 		FrameIndex   int    `json:"frameIndex"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	session, exists := sessions[body.SessionID]
@@ -501,7 +509,11 @@ func handlePassiveLiveness(w http.ResponseWriter, r *http.Request) {
 		ImageBase64    string `json:"imageBase64"`
 		DevicePlatform string `json:"devicePlatform"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	sessionID := generateID("PLV")
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -573,7 +585,11 @@ func handleFaceMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body FaceMatchRequest
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	// In production: calls liveness-inference-py POST /v1/face-match
 	matchID := generateID("FM")
@@ -619,7 +635,11 @@ func handleSubmitChallenge(w http.ResponseWriter, r *http.Request) {
 		DevicePlatform string   `json:"devicePlatform"`
 		DeviceModel    string   `json:"deviceModel"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	session, exists := sessions[body.SessionID]
@@ -1641,6 +1661,12 @@ func checkNFIUBatch(totalAmountKobo int64, txnType string) (bool, string) {
 	return false, ""
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 

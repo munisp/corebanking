@@ -306,14 +306,22 @@ func trade_finance_glScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     score := trade_finance_glComputeScore(req.Value, req.Weight, req.Threshold)
     respondJSON(w, map[string]interface{}{"score": score})
 }
 
 func trade_finance_glValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    json.NewDecoder(r.Body).Decode(&body)
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     result := trade_finance_glValidateRequest(body)
     respondJSON(w, result)
 }
@@ -376,13 +384,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -390,7 +398,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -1129,6 +1137,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")

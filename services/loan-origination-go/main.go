@@ -182,7 +182,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("loan_origination_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	customerID := getString(body, "customerId")
 	loanType := getString(body, "type")
@@ -211,7 +215,12 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 			records = append(records, rec)
 			domainStats.PendingKYC++
 			mu.Unlock()
-	dataBytes, _ := json.Marshal(body)
+	dataBytes, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		log.Printf("[%s] JSON marshal error: %v", serviceName, marshalErr)
+		jsonResp(w, 400, map[string]interface{}{"error": "marshal_failed", "detail": marshalErr.Error()})
+		return
+	}
 		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if dbErr := dbInsert(fmt.Sprintf("loan_origination_go-%d", time.Now().UnixNano()), "loan_origination_go", "default", "active", dataBytes); dbErr != nil {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
@@ -270,7 +279,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -299,7 +312,11 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -322,7 +339,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 				records[i].Version++
 				records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
 				records[i].Data["processingResult"] = "success"
-				records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
+				// Score computed from record data hash — deterministic, not random
+			recordHash := uint64(0); for _, b := range []byte(fmt.Sprintf("%v", records[i].Data)) { recordHash = recordHash*31 + uint64(b) }; records[i].Data["score"] = float64(recordHash % 100) / 100.0
 				records[i].Status = "completed"
 				domainStats.ProcessedToday++
 				respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
@@ -336,7 +354,11 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 func handleKYCCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	customerID := getString(body, "customerId")
 	level := getString(body, "level")
@@ -1007,7 +1029,11 @@ func handleEMICalculator(w http.ResponseWriter, r *http.Request) {
 		Rate      float64 `json:"rate"`
 		Tenor     int     `json:"tenor_months"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	emi := calculateEMI(body.Principal, body.Rate, body.Tenor)
 	totalPayment := emi * float64(body.Tenor)
 	totalInterest := totalPayment - body.Principal
@@ -1278,6 +1304,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 

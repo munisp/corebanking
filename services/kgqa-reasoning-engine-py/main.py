@@ -733,8 +733,8 @@ def start_grpc_server(service_name, port):
             result = servicer.Process(data)
             response = json.dumps(result).encode()
             conn.sendall(_grpc_struct.pack(">I", len(response)) + response)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug(f"Suppressed error: {_exc}")
         finally:
             conn.close()
 
@@ -813,7 +813,8 @@ def grpc_call(target, method, payload, retries=3):
             logger.warning(f"gRPC {target}/{method} attempt {attempt+1} failed: {e}")
         finally:
             try: sock.close()
-            except: pass
+            except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
     return None
 
 def call_service(method, url, body=None, retries=3, timeout=15):
@@ -955,8 +956,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", (SERVICE_NAME,))
                     total = cur.fetchone()[0]
                     pool.putconn(conn)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug(f"Suppressed error: {_exc}")
             self.respond(200, {"service": SERVICE_NAME, "items": items, "total": total, "source": "database" if pool else "in-memory"})
 
     def do_POST(self):

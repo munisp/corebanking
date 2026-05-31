@@ -207,12 +207,12 @@ fn check_limit(tier: &str, amount: u64, daily_total: u64, balance: u64) -> Limit
 }
 
 fn rand_u32() -> u32 {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     (t.as_nanos() % u32::MAX as u128) as u32
 }
 
 fn chrono_now() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("2026-05-09T{:02}:{:02}:{:02}Z", (d.as_secs() / 3600) % 24, (d.as_secs() / 60) % 60, d.as_secs() % 60)
 }
 
@@ -238,10 +238,24 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
-        return HttpResponse::TooManyRequests()
-            .insert_header(("Retry-After", "1"))
-            .json(serde_json::json!({"error": "rate_limit_exceeded"}));
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "cbn-tiered-kyc-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     // Inter-service call
@@ -296,7 +310,7 @@ async fn assess_tier(body: web::Json<serde_json::Value>, state: web::Data<AppSta
     let address = body.get("addressVerified").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let assessment = assess_tier_eligibility(customer_id, &docs, liveness, bvn, nin, address);
-    let mut assessments = state.assessments.lock().unwrap();
+    let mut assessments = state.assessments.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     assessments.push(assessment.clone());
 
     db_persist(&state, "assess_tier", &json!({"action": "assess_tier"})).await;
@@ -313,7 +327,7 @@ async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web:
     check.customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
     check.transaction_type = body.get("transactionType").and_then(|v| v.as_str()).unwrap_or("transfer").to_string();
 
-    let mut checks = state.limit_checks.lock().unwrap();
+    let mut checks = state.limit_checks.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     checks.push(check.clone());
 
     db_persist(&state, "check_transaction_limit", &json!({"action": "check_transaction_limit"})).await;
@@ -322,15 +336,15 @@ async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web:
 
 async fn get_assessments(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let assessments = state.assessments.lock().unwrap();
+    let assessments = state.assessments.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "get_assessments", &json!({"action": "get_assessments"})).await;
     HttpResponse::Ok().json(json!({"assessments": *assessments, "total": assessments.len()}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let assessments = state.assessments.lock().unwrap();
-    let checks = state.limit_checks.lock().unwrap();
+    let assessments = state.assessments.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let checks = state.limit_checks.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let mut tier_counts = std::collections::HashMap::new();
     for a in assessments.iter() {
         *tier_counts.entry(a.eligible_tier.clone()).or_insert(0) += 1;
@@ -467,10 +481,14 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("cbn-tiered-kyc-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
+    } else {
+        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
     }
 }
 

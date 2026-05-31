@@ -61,8 +61,8 @@ class _CachePool:
             if resp and resp[0:1] == b'+':
                 return s
             s.close()
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug(f"Suppressed error: {_exc}")
         return None
 
     def get(self):
@@ -76,10 +76,11 @@ class _CachePool:
                     if r and r[0:1] == b'+':
                         conn.settimeout(3)
                         return conn
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug(f"Suppressed error: {_exc}")
                 try: conn.close()
-                except: pass
+                except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
         return self._dial()
 
     def put(self, conn):
@@ -89,7 +90,8 @@ class _CachePool:
                 self.pool.append(conn)
             else:
                 try: conn.close()
-                except: pass
+                except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
 
     def health(self):
         c = self.get()
@@ -155,7 +157,8 @@ def cache_get(key):
             return parts[1]
     except Exception:
         try: conn.close()
-        except: pass
+        except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
     with _cache_metrics_lock: _cache_misses += 1
     return None
 
@@ -174,7 +177,8 @@ def cache_set(key, value, ttl=300):
         _cache_pool.put(conn)
     except Exception:
         try: conn.close()
-        except: pass
+        except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
 
 def cache_invalidate(key):
     _l1_delete(key)
@@ -190,7 +194,8 @@ def cache_invalidate(key):
         _cache_pool.put(conn)
     except Exception:
         try: conn.close()
-        except: pass
+        except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
 
 def cache_get_or_load(key, loader, ttl=300):
     """Get from cache or load with stampede protection."""
@@ -212,7 +217,8 @@ def cache_get_or_load(key, loader, ttl=300):
                 if val is not None: return val
         except Exception:
             try: conn.close()
-            except: pass
+            except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
     # Load from source
     result = loader()
     if result is not None:
@@ -286,15 +292,14 @@ def release_db(conn):
     if _db_pool and conn:
         try:
             _db_pool.putconn(conn)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug(f"Suppressed error: {_exc}")
 
 def db_insert(table, record):
     conn = get_db()
     if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+        logger.error(f"[{SERVICE_NAME}] CRITICAL: No database connection — refusing write to prevent data loss")
+        raise ConnectionError(f"Database unavailable for {SERVICE_NAME}. Set DATABASE_URL environment variable.")
     try:
         cur = conn.cursor()
         data = json.dumps(record)
@@ -305,9 +310,8 @@ def db_insert(table, record):
         record["created_at"] = str(row[1])
         return record
     except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
+        logger.error(f"[{SERVICE_NAME}] DB insert failed: {e}")
+        raise
 
 def db_query(table, page=1, limit=50):
     conn = get_db()
@@ -993,11 +997,37 @@ class Handler(BaseHTTPRequestHandler):
             return
         path == "/healthz":
             db = get_db()
+            db_status = "not_configured"
+            redis_status = "not_configured"
+            overall = "healthy"
+            if db:
+                try:
+                    cur = db.cursor()
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+                    db_status = "connected"
+                except Exception as _hce:
+                    db_status = f"unhealthy: {_hce}"
+                    overall = "degraded"
+            if _cache_pool:
+                try:
+                    cache_set("__healthcheck__", "1", 10)
+                    if cache_get("__healthcheck__"):
+                        redis_status = "connected"
+                    else:
+                        redis_status = "unreachable"
+                        overall = "degraded"
+                except Exception:
+                    redis_status = "unreachable"
+                    overall = "degraded"
             self.respond(200, {
-                "status": "healthy",
+                "status": overall,
                 "service": "credit-scoring-py",
                 "version": "2.0.0",
-                "db": "connected" if db else "not_configured",
+                "checks": {
+                    "database": db_status,
+                    "cache": redis_status,
+                },
                 "uptime_secs": round(time.time() - START_TIME),
             })
         elif path == "/readyz":
@@ -1062,12 +1092,20 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/create":
-            result = db_insert("credit_scoring_py", body)
+            try:
+                result = db_insert("credit_scoring_py", body)
             _compute_credit_score_result = compute_credit_score(body.get("data", {}))
             _call_credit_bureau_result = call_credit_bureau(body.get("data", {}))
             _affordability_check_result = affordability_check(body.get("data", {}))
             cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-            self.respond(201, {"created": True, "data": result})
+                self.respond(201, {"created": True, "data": result})
+            except ConnectionError as ce:
+                self.respond(503, {"error": "database_unavailable", "detail": str(ce)})
+                return
+            except Exception as de:
+                logger.error(f"[{SERVICE_NAME}] Write failed: {de}")
+                self.respond(500, {"error": "write_failed", "detail": str(de)})
+                return
         else:
             self.respond(404, {"error": "not_found", "path": path})
 

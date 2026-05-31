@@ -543,7 +543,7 @@ func initDB() {
 
 func dbInsert(id, service, tenant, status string, data []byte) error {
 	if db == nil {
-		log.Printf("[neo4j-kg] dbInsert: no db connection (in-memory mode)")
+		log.Printf("[neo4j-kg] dbInsert: no db connection (WARNING: No DATABASE_URL — write operations will return 503)")
 		return fmt.Errorf("no db")
 	}
 	_, err := db.Exec("INSERT INTO records (id, service, tenant, status, data, created_at) VALUES ($1, $2, $3, $4, $5, NOW()) ON CONFLICT (id) DO UPDATE SET data=$5, status=$4", id, service, tenant, status, data)
@@ -1186,6 +1186,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")

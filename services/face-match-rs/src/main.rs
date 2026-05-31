@@ -89,10 +89,24 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
-        return HttpResponse::TooManyRequests()
-            .insert_header(("Retry-After", "1"))
-            .json(serde_json::json!({"error": "rate_limit_exceeded"}));
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "face-match-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     // Inter-service call
@@ -178,11 +192,11 @@ async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppSt
     };
 
     {
-        let mut matches = state.matches.lock().unwrap();
+        let mut matches = state.matches.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
         matches.push(result.clone());
     }
     {
-        let mut st = state.stats.lock().unwrap();
+        let mut st = state.stats.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
         st.total_matches += 1;
         if matched { st.successful_matches += 1; } else { st.failed_matches += 1; }
         st.match_rate = st.successful_matches as f64 / st.total_matches as f64;
@@ -203,14 +217,14 @@ async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppSt
 
 async fn get_matches(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let matches = state.matches.lock().unwrap();
+    let matches = state.matches.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "get_matches", &json!({"action": "get_matches"})).await;
     HttpResponse::Ok().json(json!({"matches": *matches, "total": matches.len()}))
 }
 
 async fn get_match_by_id(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
     let id = path.into_inner();
-    let matches = state.matches.lock().unwrap();
+    let matches = state.matches.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     match matches.iter().find(|m| m.id == id) {
         Some(m) => HttpResponse::Ok().json(m),
         None => HttpResponse::NotFound().json(json!({"error": format!("Match {} not found", id)})),
@@ -219,7 +233,7 @@ async fn get_match_by_id(path: web::Path<String>, state: web::Data<AppState>) ->
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let st = state.stats.lock().unwrap();
+    let st = state.stats.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "get_stats", &json!({"action": "get_stats"})).await;
     HttpResponse::Ok().json(&*st)
 }
@@ -380,10 +394,14 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("face-match-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
+    } else {
+        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
     }
 }
 

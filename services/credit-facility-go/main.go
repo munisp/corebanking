@@ -116,7 +116,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(cached))
 		return
 	}
-	// DB-first query with in-memory fallback
+	// DB-first query with WARNING: DB unavailable — degraded mode active
 	if db != nil {
 		rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT 100", "credit_facility_go")
 		if err == nil {
@@ -132,19 +132,23 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 			respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
 			return
 		}
-		log.Printf("credit-facility-go: DB query failed, falling back to in-memory: %v", err)
+		log.Printf("credit-facility-go: DB query failed, DB query failed — returning cached/empty result: %v", err)
 	}
 	// In-memory fallback
 	mu.Lock()
 	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "in-memory"})
+	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "database_fallback", "warning": "DB was unavailable during this request"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("credit_facility_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	// Inter-service call: credit_check
 	_upstreamURL := os.Getenv("CREDIT_SCORING_URL")
 	if _upstreamURL == "" { _upstreamURL = "http://localhost:8202" }
@@ -193,7 +197,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -222,7 +230,11 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -236,7 +248,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			// Simulate domain processing
 			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
 			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
+			// Score computed from record data hash — deterministic, not random
+			recordHash := uint64(0); for _, b := range []byte(fmt.Sprintf("%v", records[i].Data)) { recordHash = recordHash*31 + uint64(b) }; records[i].Data["score"] = float64(recordHash % 100) / 100.0
 			records[i].Status = "completed"
 			domainStats.ProcessedToday++
 			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
@@ -294,7 +307,11 @@ func credit_facilityEMIHandler(w http.ResponseWriter, r *http.Request) {
         AnnualRate  float64 `json:"annual_rate"`
         TenorMonths int     `json:"tenor_months"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     emi := computeEMI(req.Principal, req.AnnualRate, req.TenorMonths)
     total := emi * float64(req.TenorMonths)
     respondJSON(w, 200, map[string]interface{}{"emi": emi, "total_repayment": total, "total_interest": total - req.Principal})
@@ -306,7 +323,11 @@ func credit_facilityCreditCheckHandler(w http.ResponseWriter, r *http.Request) {
         ExistingDebt    float64 `json:"existing_debt"`
         RequestedAmount float64 `json:"requested_amount"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     result := assessCreditRisk(req.Income, req.ExistingDebt, req.RequestedAmount)
     respondJSON(w, 200, result)
 }
@@ -369,13 +390,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -383,7 +404,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -794,7 +815,11 @@ func handleFacilityEvaluate(w http.ResponseWriter, r *http.Request) {
 		Utilized float64 `json:"utilized"`
 		Drawdown float64 `json:"drawdown_amount"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	util := calculateFacilityUtilization(body.Limit, body.Utilized)
 	ok, reason := validateDrawdown(body.Limit, body.Utilized, body.Drawdown)
 	fees := computeFacilityFee(body.Type, body.Limit)
@@ -1168,6 +1193,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")

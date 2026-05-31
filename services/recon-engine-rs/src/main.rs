@@ -76,12 +76,12 @@ struct AppState {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn rand_id(prefix: &str) -> String {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("{}-{:08X}", prefix, (t.subsec_nanos() ^ (t.as_secs() as u32)) & 0xFFFFFFFF)
 }
 
 fn now_str() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     format!("2026-05-09T{:02}:{:02}:{:02}Z", (d.as_secs() / 3600) % 24, (d.as_secs() / 60) % 60, d.as_secs() % 60)
 }
 
@@ -107,10 +107,24 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if !rl_allow() {
-        return HttpResponse::TooManyRequests()
-            .insert_header(("Retry-After", "1"))
-            .json(serde_json::json!({"error": "rate_limit_exceeded"}));
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected",
+            Err(_) => "unhealthy",
+        }
+    } else {
+        "not_configured"
+    };
+    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
+        "status": overall,
+        "service": "recon-engine-rs",
+        "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
+    }))
+}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     // Inter-service call
@@ -209,9 +223,9 @@ async fn run_recon(body: web::Json<RunReconRequest>, state: web::Data<AppState>)
         });
     }
 
-    let mut jobs = state.jobs.lock().unwrap();
+    let mut jobs = state.jobs.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     jobs.push(job.clone());
-    let mut excs = state.exceptions.lock().unwrap();
+    let mut excs = state.exceptions.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     excs.extend(new_exceptions);
 
     db_persist(&state, "run_recon", &json!({"action": "run_recon"})).await;
@@ -229,14 +243,14 @@ async fn run_recon(body: web::Json<RunReconRequest>, state: web::Data<AppState>)
 
 async fn list_jobs(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let jobs = state.jobs.lock().unwrap();
+    let jobs = state.jobs.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "list_jobs", &json!({"action": "list_jobs"})).await;
     HttpResponse::Ok().json(json!({"jobs": *jobs, "total": jobs.len()}))
 }
 
 async fn list_exceptions(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let excs = state.exceptions.lock().unwrap();
+    let excs = state.exceptions.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let open = excs.iter().filter(|e| e.status == "open").count();
     let resolved = excs.iter().filter(|e| e.status == "resolved").count();
     db_persist(&state, "list_exceptions", &json!({"action": "list_exceptions"})).await;
@@ -247,7 +261,7 @@ async fn list_exceptions(req: actix_web::HttpRequest, state: web::Data<AppState>
 }
 
 async fn resolve_exception(body: web::Json<ResolveRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let mut excs = state.exceptions.lock().unwrap();
+    let mut excs = state.exceptions.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     for exc in excs.iter_mut() {
         if exc.id == body.exception_id {
             exc.status = "resolved".into();
@@ -262,8 +276,8 @@ async fn resolve_exception(body: web::Json<ResolveRequest>, state: web::Data<App
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let jobs = state.jobs.lock().unwrap();
-    let excs = state.exceptions.lock().unwrap();
+    let jobs = state.jobs.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let excs = state.exceptions.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let total_matched: u64 = jobs.iter().map(|j| j.matched).sum();
     let total_source: u64 = jobs.iter().map(|j| j.source_count).sum();
     let avg_match_rate = if total_source > 0 { total_matched as f64 / total_source as f64 * 100.0 } else { 0.0 };
@@ -283,8 +297,8 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 
 async fn recon_dashboard(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let jobs = state.jobs.lock().unwrap();
-    let excs = state.exceptions.lock().unwrap();
+    let jobs = state.jobs.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let excs = state.exceptions.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     db_persist(&state, "recon_dashboard", &json!({"action": "recon_dashboard"})).await;
     HttpResponse::Ok().json(json!({
         "today": {
@@ -429,10 +443,14 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("recon-engine-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
+    } else {
+        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
     }
 }
 

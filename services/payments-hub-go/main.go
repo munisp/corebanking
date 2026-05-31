@@ -53,9 +53,41 @@ func jsonResp(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	
-	
-	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "payments-hub-go", })
+	dbStatus := "not_configured"
+	redisStatus := "not_configured"
+	overallStatus := "healthy"
+
+	// Check Postgres connectivity
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			dbStatus = fmt.Sprintf("unhealthy: %v", err)
+			overallStatus = "degraded"
+		} else {
+			dbStatus = "connected"
+		}
+	}
+
+	// Check Redis via cache pool health
+	if _cachePool != nil {
+		cacheSet("__health_ping__", "1", 10)
+		if _, ok := cacheGet("__health_ping__"); ok {
+			redisStatus = "connected"
+		} else {
+			redisStatus = "unreachable"
+			overallStatus = "degraded"
+		}
+	}
+
+	jsonResp(w, 200, map[string]interface{}{
+		"status": overallStatus,
+		"service": "payments-hub-go",
+		"checks": map[string]interface{}{
+			"database": dbStatus,
+			"cache": redisStatus,
+		},
+	})
 }
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
@@ -93,13 +125,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -107,7 +139,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -133,9 +165,18 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" { tenantID = "platform" }
 	_ = settlementBatch([]float64{})
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	id := fmt.Sprintf("%s-%d", "payments_hub_go", time.Now().UnixNano())
-	dataBytes, _ := json.Marshal(body)
+	dataBytes, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		log.Printf("[%s] JSON marshal error: %v", serviceName, marshalErr)
+		jsonResp(w, 400, map[string]interface{}{"error": "marshal_failed", "detail": marshalErr.Error()})
+		return
+	}
 		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if err := dbInsert(id, "payments_hub_go", "default", "active", dataBytes); err != nil {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, err)
@@ -186,7 +227,11 @@ func settlementBatch(amounts []float64) float64 {
 
 func routeHandler(w http.ResponseWriter, r *http.Request) {
 	var req PaymentRequest
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	route := routePayment(req.Amount, req.Channel)
 	fee := computeFee(req.Amount)
 	jsonResp(w, 200, map[string]interface{}{"route": route, "fee": fee, "total": req.Amount + fee})
@@ -194,7 +239,11 @@ func routeHandler(w http.ResponseWriter, r *http.Request) {
 
 func validatePaymentHandler(w http.ResponseWriter, r *http.Request) {
 	var req PaymentRequest
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	var errors []string
 	if !validateNuban(req.FromAccount) { errors = append(errors, "invalid source account NUBAN") }
 	if !validateNuban(req.ToAccount) { errors = append(errors, "invalid destination account NUBAN") }
@@ -204,7 +253,11 @@ func validatePaymentHandler(w http.ResponseWriter, r *http.Request) {
 
 func nipTransferHandler(w http.ResponseWriter, r *http.Request) {
 	var req PaymentRequest
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	ref := fmt.Sprintf("NIP-%d", time.Now().UnixNano())
 	jsonResp(w, 200, map[string]interface{}{"status": "processed", "reference": ref, "channel": "NIP", "amount": req.Amount, "fee": computeFee(req.Amount)})
 }
@@ -843,7 +896,11 @@ func validatePaymentLimits(amount float64, channel string) []string {
 func handlePaymentValidate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var req PaymentRequest
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	if req.Currency == "" { req.Currency = "NGN" }
 	if req.Channel == "" { req.Channel = "NIP" }
 
@@ -1091,6 +1148,12 @@ func validatePaymentDeep(
 	return len(errors) == 0, errors
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")

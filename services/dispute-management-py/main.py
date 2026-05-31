@@ -179,8 +179,8 @@ def init_tracing():
         provider = TracerProvider()
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
         trace.set_tracer_provider(provider)
-    except Exception:
-        pass
+    except Exception as _exc:
+        logger.debug(f"Suppressed error: {_exc}")
 
 
 def process_dispute_management(data):
@@ -576,8 +576,8 @@ def start_grpc_server(service_name, port):
             result = servicer.Process(data)
             response = json.dumps(result).encode()
             conn.sendall(_grpc_struct.pack(">I", len(response)) + response)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug(f"Suppressed error: {_exc}")
         finally:
             conn.close()
 
@@ -656,7 +656,8 @@ def grpc_call(target, method, payload, retries=3):
             logger.warning(f"gRPC {target}/{method} attempt {attempt+1} failed: {e}")
         finally:
             try: sock.close()
-            except: pass
+            except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
     return None
 
 def call_service(method, url, body=None, retries=3, timeout=15):

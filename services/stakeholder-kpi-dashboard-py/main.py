@@ -74,8 +74,8 @@ class _CachePool:
             if resp and resp[0:1] == b'+':
                 return s
             s.close()
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug(f"Suppressed error: {_exc}")
         return None
 
     def get(self):
@@ -89,10 +89,11 @@ class _CachePool:
                     if r and r[0:1] == b'+':
                         conn.settimeout(3)
                         return conn
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug(f"Suppressed error: {_exc}")
                 try: conn.close()
-                except: pass
+                except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
         return self._dial()
 
     def put(self, conn):
@@ -102,7 +103,8 @@ class _CachePool:
                 self.pool.append(conn)
             else:
                 try: conn.close()
-                except: pass
+                except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
 
     def health(self):
         c = self.get()
@@ -168,7 +170,8 @@ def cache_get(key):
             return parts[1]
     except Exception:
         try: conn.close()
-        except: pass
+        except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
     with _cache_metrics_lock: _cache_misses += 1
     return None
 
@@ -187,7 +190,8 @@ def cache_set(key, value, ttl=300):
         _cache_pool.put(conn)
     except Exception:
         try: conn.close()
-        except: pass
+        except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
 
 def cache_invalidate(key):
     _l1_delete(key)
@@ -203,7 +207,8 @@ def cache_invalidate(key):
         _cache_pool.put(conn)
     except Exception:
         try: conn.close()
-        except: pass
+        except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
 
 def cache_get_or_load(key, loader, ttl=300):
     """Get from cache or load with stampede protection."""
@@ -225,7 +230,8 @@ def cache_get_or_load(key, loader, ttl=300):
                 if val is not None: return val
         except Exception:
             try: conn.close()
-            except: pass
+            except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
     # Load from source
     result = loader()
     if result is not None:
@@ -867,8 +873,8 @@ def start_grpc_server(service_name, port):
             result = servicer.Process(data)
             response = json.dumps(result).encode()
             conn.sendall(_grpc_struct.pack(">I", len(response)) + response)
-        except Exception:
-            pass
+        except Exception as _exc:
+            logger.debug(f"Suppressed error: {_exc}")
         finally:
             conn.close()
 
@@ -947,7 +953,8 @@ def grpc_call(target, method, payload, retries=3):
             logger.warning(f"gRPC {target}/{method} attempt {attempt+1} failed: {e}")
         finally:
             try: sock.close()
-            except: pass
+            except Exception as _exc:
+                    logger.debug(f"Suppressed: {_exc}")
     return None
 
 def call_service(method, url, body=None, retries=3, timeout=15):
@@ -1127,8 +1134,8 @@ class Handler(BaseHTTPRequestHandler):
             if cached:
                 try:
                     self.respond(200, json.loads(cached)); return
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    logger.debug(f"Suppressed error: {_exc}")
             kpi_results = []
             for kpi_def in role_config["kpis"]:
                 value = _get_kpi_value(kpi_def["id"])

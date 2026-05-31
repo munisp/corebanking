@@ -82,7 +82,27 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
     })
 }; next.ServeHTTP(w, r) }) }
 func metricsHandler(w http.ResponseWriter, _ *http.Request) { r2 := atomic.LoadUint64(&requestCount); e2 := atomic.LoadUint64(&errorCount); w.Header().Set("Content-Type", "text/plain"); fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"%s\"} %d\n# TYPE errors_total counter\nerrors_total{service=\"%s\"} %d\n", serviceName, r2, serviceName, e2) }
-func healthHandler(w http.ResponseWriter, _ *http.Request) { jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": serviceName}) }
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	dbStatus := "not_configured"
+	overallStatus := "healthy"
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			dbStatus = fmt.Sprintf("unhealthy: %v", err)
+			overallStatus = "degraded"
+		} else {
+			dbStatus = "connected"
+		}
+	}
+	jsonResp(w, 200, map[string]interface{}{
+		"status": overallStatus,
+		"service": serviceName,
+		"checks": map[string]interface{}{
+			"database": dbStatus,
+		},
+	})
+}
 func readyHandler(w http.ResponseWriter, _ *http.Request) { jsonResp(w, 200, map[string]interface{}{"ready": true, "service": serviceName}) }
 func liveHandler(w http.ResponseWriter, _ *http.Request) { jsonResp(w, 200, map[string]interface{}{"live": true}) }
 
@@ -503,6 +523,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	initDB()

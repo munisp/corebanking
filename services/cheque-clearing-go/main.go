@@ -37,9 +37,41 @@ func jsonResp(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	
-	
-	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "cheque-clearing-go", })
+	dbStatus := "not_configured"
+	redisStatus := "not_configured"
+	overallStatus := "healthy"
+
+	// Check Postgres connectivity
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			dbStatus = fmt.Sprintf("unhealthy: %v", err)
+			overallStatus = "degraded"
+		} else {
+			dbStatus = "connected"
+		}
+	}
+
+	// Check Redis via cache pool health
+	if _cachePool != nil {
+		cacheSet("__health_ping__", "1", 10)
+		if _, ok := cacheGet("__health_ping__"); ok {
+			redisStatus = "connected"
+		} else {
+			redisStatus = "unreachable"
+			overallStatus = "degraded"
+		}
+	}
+
+	jsonResp(w, 200, map[string]interface{}{
+		"status": overallStatus,
+		"service": "cheque-clearing-go",
+		"checks": map[string]interface{}{
+			"database": dbStatus,
+			"cache": redisStatus,
+		},
+	})
 }
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
@@ -99,9 +131,18 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-Id")
 	if tenantID == "" { tenantID = "platform" }
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	id := fmt.Sprintf("%s-%d", "cheque_clearing_go", time.Now().UnixNano())
-	dataBytes, _ := json.Marshal(body)
+	dataBytes, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		log.Printf("[%s] JSON marshal error: %v", serviceName, marshalErr)
+		jsonResp(w, 400, map[string]interface{}{"error": "marshal_failed", "detail": marshalErr.Error()})
+		return
+	}
 		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if db != nil {
 		_, err := db.Exec(
@@ -125,11 +166,10 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "database"})
 		return
 	}
-	// No DB — respond with in-memory acknowledgement
-	if dbErr := dbInsert(fmt.Sprintf("cheque_clearing_go-%d", time.Now().UnixNano()), "cheque_clearing_go", "default", "active", dataBytes); dbErr != nil {
-		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-	}
-	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "in-memory"})
+	// No DB connection — reject request to prevent data loss
+	log.Printf("[%s] FATAL: No database connection — refusing write to prevent data loss", serviceName)
+	jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable", "detail": "Service requires database connection. Set DATABASE_URL environment variable.", "service": serviceName})
+	return
 }
 
 
@@ -163,7 +203,11 @@ func staleCheque(issueDateDays int) bool {
 
 func presentChequeHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { MICR string `json:"micr"`; Amount float64 `json:"amount"`; IssueDateDays int `json:"issue_date_days"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	if staleCheque(req.IssueDateDays) {
 		jsonResp(w, 400, map[string]interface{}{"error": "stale cheque", "return_code": returnReasonCode("stale_cheque")})
 		return
@@ -175,7 +219,11 @@ func presentChequeHandler(w http.ResponseWriter, r *http.Request) {
 
 func returnChequeHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { ChequeRef string `json:"cheque_ref"`; Reason string `json:"reason"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	code := returnReasonCode(req.Reason)
 	jsonResp(w, 200, map[string]interface{}{"cheque_ref": req.ChequeRef, "return_code": code, "reason": req.Reason, "status": "returned"})
 }
@@ -239,13 +287,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -253,7 +301,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -1103,6 +1151,12 @@ func validatePaymentDeep(
 	return len(errors) == 0, errors
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")

@@ -113,10 +113,23 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
+    let mut overall = "healthy";
+    let db_status = if let Some(ref client) = state.db_client {
+        match client.execute("SELECT 1", &[]).await {
+            Ok(_) => "connected".to_string(),
+            Err(e) => { overall = "degraded"; format!("unhealthy: {}", e) }
+        }
+    } else {
+        "not_configured".to_string()
+    };
+
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "status": "healthy",
+        "status": overall,
         "service": "gl-engine-rs",
         "version": "1.0.0",
+        "checks": {
+            "database": db_status,
+        },
     }))
 }
 
@@ -128,7 +141,7 @@ async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppSt
         return HttpResponse::BadRequest().json(json!({"error": e}));
     }
     let entry_id = format!("JRN-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
-    let mut accounts = state.accounts.lock().unwrap();
+    let mut accounts = state.accounts.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     for entry in &entries {
         if let Some(acc) = accounts.iter_mut().find(|a| a.account_code.as_deref() == Some(&entry.debit_account)) {
             *acc.balance.get_or_insert(0.0) += entry.amount;
@@ -142,7 +155,7 @@ async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppSt
 }
 
 async fn trial_balance(body: web::Json<TrialBalanceRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let accounts = state.accounts.lock().unwrap();
+    let accounts = state.accounts.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let tb = compute_trial_balance(&accounts);
     db_persist(&state, "trial_balance", &json!({"action": "trial_balance"})).await;
     HttpResponse::Ok().json(tb)
@@ -155,7 +168,7 @@ async fn chart_of_accounts(req: actix_web::HttpRequest, state: web::Data<AppStat
             .json(serde_json::json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let accounts = state.accounts.lock().unwrap();
+    let accounts = state.accounts.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let grouped: std::collections::HashMap<&str, Vec<&GLAccount>> = accounts.iter().fold(
         std::collections::HashMap::new(),
         |mut map, acc| { map.entry(classify_account(acc.account_code.as_deref().unwrap_or(""))).or_default().push(acc); map }
@@ -172,7 +185,7 @@ async fn chart_of_accounts(req: actix_web::HttpRequest, state: web::Data<AppStat
 
 async fn account_balance(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
     let code = path.into_inner();
-    let accounts = state.accounts.lock().unwrap();
+    let accounts = state.accounts.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     match accounts.iter().find(|a| a.account_code.as_deref() == Some(&code)) {
         Some(acc) => HttpResponse::Ok().json(json!({"account": acc, "classification": classify_account(&code)})),
         None => HttpResponse::NotFound().json(json!({"error": "Account not found"})),
@@ -305,10 +318,14 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
         let svc_name = String::from("gl-engine-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
+        if let Err(e) = client.execute(
             "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
             &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
+        ).await {
+            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
+        }
+    } else {
+        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
     }
 }
 

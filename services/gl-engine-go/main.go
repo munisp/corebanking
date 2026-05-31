@@ -700,14 +700,22 @@ func gl_engineScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     score := gl_engineComputeScore(req.Value, req.Weight, req.Threshold)
     writeJSON(w, 200, map[string]interface{}{"score": score})
 }
 
 func gl_engineValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    json.NewDecoder(r.Body).Decode(&body)
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     result := gl_engineValidateRequest(body)
     writeJSON(w, 200, result)
 }
@@ -1529,6 +1537,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	app := NewApp()

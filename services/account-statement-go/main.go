@@ -36,9 +36,41 @@ func jsonResp(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	
-	
-	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "account-statement-go", })
+	dbStatus := "not_configured"
+	redisStatus := "not_configured"
+	overallStatus := "healthy"
+
+	// Check Postgres connectivity
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			dbStatus = fmt.Sprintf("unhealthy: %v", err)
+			overallStatus = "degraded"
+		} else {
+			dbStatus = "connected"
+		}
+	}
+
+	// Check Redis via cache pool health
+	if _cachePool != nil {
+		cacheSet("__health_ping__", "1", 10)
+		if _, ok := cacheGet("__health_ping__"); ok {
+			redisStatus = "connected"
+		} else {
+			redisStatus = "unreachable"
+			overallStatus = "degraded"
+		}
+	}
+
+	jsonResp(w, 200, map[string]interface{}{
+		"status": overallStatus,
+		"service": "account-statement-go",
+		"checks": map[string]interface{}{
+			"database": dbStatus,
+			"cache": redisStatus,
+		},
+	})
 }
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
@@ -99,9 +131,18 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" { tenantID = "platform" }
 	_ = transactionLine("2026-01-01", 0.0, "CR", "system")
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	id := fmt.Sprintf("%s-%d", "account_statement_go", time.Now().UnixNano())
-	dataBytes, _ := json.Marshal(body)
+	dataBytes, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		log.Printf("[%s] JSON marshal error: %v", serviceName, marshalErr)
+		jsonResp(w, 400, map[string]interface{}{"error": "marshal_failed", "detail": marshalErr.Error()})
+		return
+	}
 		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if db != nil {
 		_, err := db.Exec(
@@ -125,11 +166,10 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "database"})
 		return
 	}
-	// No DB — respond with in-memory acknowledgement
-	if dbErr := dbInsert(fmt.Sprintf("account_statement_go-%d", time.Now().UnixNano()), "account_statement_go", "default", "active", dataBytes); dbErr != nil {
-		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-	}
-	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "in-memory"})
+	// No DB connection — reject request to prevent data loss
+	log.Printf("[%s] FATAL: No database connection — refusing write to prevent data loss", serviceName)
+	jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable", "detail": "Service requires database connection. Set DATABASE_URL environment variable.", "service": serviceName})
+	return
 }
 
 
@@ -151,7 +191,11 @@ func transactionLine(date string, amount float64, txnType string, narration stri
 
 func generateStatementHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { AccountNo string `json:"account_no"`; Format string `json:"format"`; From string `json:"from"`; To string `json:"to"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	period := statementPeriod(req.Format, req.From, req.To)
 	format := req.Format
 	if format == "" { format = "pdf" }
@@ -160,7 +204,11 @@ func generateStatementHandler(w http.ResponseWriter, r *http.Request) {
 
 func mt940Handler(w http.ResponseWriter, r *http.Request) {
 	var req struct { AccountNo string `json:"account_no"`; Date string `json:"date"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	header := mt940Header(req.AccountNo, 1, req.Date)
 	jsonResp(w, 200, map[string]interface{}{"format": "MT940", "swift_message": header, "status": "generated"})
 }
@@ -190,14 +238,22 @@ func account_statementScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     score := account_statementComputeScore(req.Value, req.Weight, req.Threshold)
     jsonResp(w, 200, map[string]interface{}{"score": score})
 }
 
 func account_statementValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    json.NewDecoder(r.Body).Decode(&body)
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     result := account_statementValidateRequest(body)
     jsonResp(w, 200, result)
 }
@@ -260,13 +316,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -274,7 +330,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -693,7 +749,11 @@ func handleStatementSummary(w http.ResponseWriter, r *http.Request) {
 		Format       string                   `json:"format"`
 		Transactions []map[string]interface{} `json:"transactions"`
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 	valid, reason := validateStatementRequest(body.StartDate, body.EndDate, body.Format)
 	if !valid { respondJSON(w, 400, map[string]string{"error": reason}); return }
 	summary := computeStatementSummary(body.Transactions)
@@ -1004,6 +1064,12 @@ func computeWHT(interestKobo AmountKobo, accountType string) AmountKobo {
 	return AmountKobo(float64(interestKobo) * rate)
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")

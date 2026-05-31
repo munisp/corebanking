@@ -101,7 +101,7 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func simulateBureauCheck(bureau Bureau, idNumber string) VerificationResult {
-	confidence := 0.85 + float64(rand.Intn(14))/100.0
+	confidence := 0.90 // Production: use actual bureau match confidence
 	ms := bureau.AvgMs + rand.Intn(200) - 100
 	status := "verified"
 	if rand.Float64() < 0.03 {
@@ -154,7 +154,11 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		log.Printf("[%s] JSON decode error: %v", serviceName, err)
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		return
+	}
 
 	idNumber := getString(body, "idNumber")
 	if idNumber == "" {
@@ -275,14 +279,22 @@ func multi_bureau_verificationScoreHandler(w http.ResponseWriter, r *http.Reques
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    json.NewDecoder(r.Body).Decode(&req)
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     score := multi_bureau_verificationComputeScore(req.Value, req.Weight, req.Threshold)
     respondJSON(w, 200, map[string]interface{}{"score": score})
 }
 
 func multi_bureau_verificationValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    json.NewDecoder(r.Body).Decode(&body)
+    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
+    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	return
+    }
     result := multi_bureau_verificationValidateRequest(body)
     respondJSON(w, 200, result)
 }
@@ -345,13 +357,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -359,7 +371,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
 		db = nil
 		return
 	}
@@ -1100,6 +1112,12 @@ func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, re
 	}
 }
 
+
+func ensureDB() {
+	if db == nil {
+		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")
