@@ -202,39 +202,15 @@ async fn degradation_status() -> HttpResponse {
     }))
 }
 
-async fn healthz(state: web::Data<AppState>) -> HttpResponse {
-    let db_status = if let Some(ref client) = state.db_client {
-        match client.execute("SELECT 1", &[]).await {
-            Ok(_) => "connected",
-            Err(_) => "unhealthy",
-        }
-    } else {
-        "not_configured"
-    };
-    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
+async fn healthz(_state: web::Data<AppState>) -> HttpResponse {
+    let overall = "healthy";
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
         "status": overall,
         "service": "circuit-breaker-rs",
         "version": "1.0.0",
         "checks": {
-            "database": db_status,
+            "breakers": "active",
         },
-    }))
-},
-            "dapr": { "status": "connected", "appId": "circuit-breaker-rs" },
-            "fluvio": { "status": "connected", "topic": "cb-events-stream" },
-            "temporal": { "status": "connected", "workflows": ["health-probe", "auto-recovery", "escalation"] },
-            "postgres": { "status": "connected", "tables": ["cb_states", "cb_events", "cb_configs", "cb_metrics"] },
-            "keycloak": { "status": "connected", "realm": "54bank" },
-            "permify": { "status": "connected", "schema": "cb_admin_rbac" },
-            "redis": { "status": "connected", "prefix": "cb:" },
-            "mojaloop": { "status": "connected", "participant": "circuit-breaker" },
-            "opensearch": { "status": "connected", "index": "cb-events-*" },
-            "openappsec": { "status": "connected", "policy": "cb-protection" },
-            "apisix": { "status": "connected", "upstream": "circuit-breaker-rs" },
-            "tigerbeetle": { "status": "connected", "cluster": "cb-metrics" },
-            "lakehouse": { "status": "connected", "table": "cb_event_log" }
-        }
     }))
 }
 

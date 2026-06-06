@@ -198,7 +198,7 @@ func handleVerifyBVN(w http.ResponseWriter, r *http.Request) {
 	var req VerificationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 	if !bvnRegex.MatchString(req.IDNumber) {
@@ -263,7 +263,7 @@ func handleVerifyNIN(w http.ResponseWriter, r *http.Request) {
 	var req VerificationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 	if !ninRegex.MatchString(req.IDNumber) {
@@ -318,11 +318,12 @@ func handleLivenessCheck(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 
-	noiseLevel := computeImageNoise(req.PhotoB64)
+	photoB64, _ := body["photo"].(string)
+	noiseLevel := computeImageNoise(photoB64)
 	noiseCategory := "low"
 	if noiseLevel > 0.35 {
 		noiseCategory = "high"
@@ -407,7 +408,7 @@ func handleFaceAnalyze(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 
@@ -417,7 +418,6 @@ func handleFaceAnalyze(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload, _ := json.Marshal(body)
-		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Post(inferenceURL+"/v1/face/analyze", "application/json", bytes.NewReader(payload))
 	if err != nil {
@@ -443,7 +443,7 @@ func handleDedupCheck(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 
@@ -907,9 +907,6 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
         next.ServeHTTP(w, r)
     })
 }
-		next.ServeHTTP(w, r)
-	})
-}
 
 
 func validateIdentityDocument(documentType, documentNumber string) (bool, string) {
@@ -1081,7 +1078,7 @@ func (am *alertManager) check() []map[string]interface{} {
 func max64(a, b uint64) uint64 { if a > b { return a }; return b }
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+    respondJSON(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 
