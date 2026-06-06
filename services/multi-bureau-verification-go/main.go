@@ -14,7 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"net/http"
 	"os"
 	"sync"
@@ -26,6 +27,13 @@ import (
 	"net"
 
 )
+
+// secureRandUint32 generates a cryptographically secure random uint32
+func secureRandUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "multi-bureau-verification-go"
 
@@ -102,9 +110,9 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 
 func simulateBureauCheck(bureau Bureau, idNumber string) VerificationResult {
 	confidence := 0.90 // Production: use actual bureau match confidence
-	ms := bureau.AvgMs + rand.Intn(200) - 100
+	ms := bureau.AvgMs + int(secureRandUint32() % 200) - 100
 	status := "verified"
-	if rand.Float64() < 0.03 {
+	if float64(secureRandUint32() % 100) / 100.0 < 0.03 {
 		status = "not_found"
 		confidence = 0
 	}
@@ -187,7 +195,7 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	check := MultiBureauCheck{
-		ID:              fmt.Sprintf("MBV-%08X", rand.Uint32()),
+		ID:              fmt.Sprintf("MBV-%08X", secureRandUint32()),
 		CustomerID:      getString(body, "customerId"),
 		IDNumber:        idNumber,
 		IDType:          getString(body, "idType"),

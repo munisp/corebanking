@@ -46,7 +46,7 @@ export default function LivenessDetectionWorkspace() {
         <ActiveLivenessChallenge
           customerId={testCustomerId}
           onComplete={(session) => {
-            console.log("Liveness session complete:", session);
+            // Liveness session complete
             setMode("list");
           }}
           onCancel={() => setMode("list")}

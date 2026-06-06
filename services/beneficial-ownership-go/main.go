@@ -14,7 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"net/http"
 	"os"
 	"sync"
@@ -26,6 +27,13 @@ import (
 	"net"
 
 )
+
+// secureRandUint32 generates a cryptographically secure random uint32
+func secureRandUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "beneficial-ownership-go"
 
@@ -151,7 +159,7 @@ func traverseChain(shareholders []map[string]interface{}, threshold float64) ([]
 			isPEP := getBool(s, "isPEP")
 			isSanctioned := getBool(s, "isSanctioned")
 			ubo := UBO{
-				ID:             fmt.Sprintf("UBO-%08X", rand.Uint32()),
+				ID:             fmt.Sprintf("UBO-%08X", secureRandUint32()),
 				EntityType:     eType,
 				FullName:       getString(s, "entityName"),
 				Nationality:    getString(s, "country"),
@@ -337,7 +345,7 @@ func handleAddToRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	entry := RegisterEntry{
-		ID:           fmt.Sprintf("REG-%08X", rand.Uint32()),
+		ID:           fmt.Sprintf("REG-%08X", secureRandUint32()),
 		CompanyID:    getString(body, "companyId"),
 		CompanyName:  getString(body, "companyName"),
 		UBOs:         []UBO{},

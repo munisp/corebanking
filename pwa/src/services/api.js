@@ -152,6 +152,70 @@ class BankAPI {
   // Core banking
   async getAccounts() { return this.request('GET', '/core-banking/list'); }
   async getGLAccounts() { return this.request('GET', '/gl-engine/chart-of-accounts'); }
+  async getAccountStatement(accountId) { return this.request('GET', `/accounts/v1/statements/${accountId}`); }
+  async getFixedDeposits() { return this.request('GET', '/deposits/v1/fixed'); }
+  async getSavingsProducts() { return this.request('GET', '/products/v1/savings'); }
+
+  // Payments
+  async getPayments() { return this.request('GET', '/payments/v1/transactions'); }
+  async createPayment(data) { return this.request('POST', '/payments/v1/transactions', data); }
+  async getTransfers() { return this.request('GET', '/transfers/v1/list'); }
+  async initiateTransfer(data) { return this.request('POST', '/transfers/v1/initiate', data); }
+  async getBulkPayments() { return this.request('GET', '/payments/v1/bulk'); }
+
+  // Loans
+  async getLoans() { return this.request('GET', '/loans/v1/applications'); }
+  async createLoanApplication(data) { return this.request('POST', '/loans/v1/applications', data); }
+  async getLoanSchedule(loanId) { return this.request('GET', `/loans/v1/schedule/${loanId}`); }
+  async getLoanRepayments(loanId) { return this.request('GET', `/loans/v1/repayments/${loanId}`); }
+
+  // Cards
+  async getCards() { return this.request('GET', '/cards/v1/list'); }
+  async requestCard(data) { return this.request('POST', '/cards/v1/request', data); }
+  async freezeCard(cardId) { return this.request('POST', `/cards/v1/${cardId}/freeze`); }
+  async getCardTransactions(cardId) { return this.request('GET', `/cards/v1/${cardId}/transactions`); }
+
+  // KYC
+  async getKYCStatus() { return this.request('GET', '/kyc/v1/status'); }
+  async submitKYCDocuments(data) { return this.request('POST', '/kyc/v1/documents', data); }
+  async getLivenessSession() { return this.request('POST', '/kyc/v1/liveness/session'); }
+  async uploadLivenessFrame(sessionId, frame) { return this.request('POST', `/kyc/v1/liveness/${sessionId}/frame`, { frame }); }
+
+  // Notifications
+  async getNotifications() { return this.request('GET', '/notifications/v1/list'); }
+  async markRead(notificationId) { return this.request('POST', `/notifications/v1/${notificationId}/read`); }
+
+  // Profile
+  async getProfile() { return this.request('GET', '/profile/v1/me'); }
+  async updateProfile(data) { return this.request('PUT', '/profile/v1/me', data); }
+  async changePassword(data) { return this.request('POST', '/profile/v1/change-password', data); }
+
+  // Beneficiaries
+  async getBeneficiaries() { return this.request('GET', '/beneficiaries/v1/list'); }
+  async addBeneficiary(data) { return this.request('POST', '/beneficiaries/v1/add', data); }
+  async deleteBeneficiary(id) { return this.request('DELETE', `/beneficiaries/v1/${id}`); }
+
+  // FX
+  async getFXRates() { return this.request('GET', '/fx/v1/rates'); }
+  async executeFXTrade(data) { return this.request('POST', '/fx/v1/trade', data); }
+
+  // Bills
+  async getBillers() { return this.request('GET', '/bills/v1/billers'); }
+  async payBill(data) { return this.request('POST', '/bills/v1/pay', data); }
+  async getAirtimeProviders() { return this.request('GET', '/bills/v1/airtime/providers'); }
+  async buyAirtime(data) { return this.request('POST', '/bills/v1/airtime/purchase', data); }
+
+  // Insurance
+  async getInsuranceProducts() { return this.request('GET', '/insurance/v1/products'); }
+  async getInsurancePolicies() { return this.request('GET', '/insurance/v1/policies'); }
+
+  // Investments
+  async getInvestments() { return this.request('GET', '/investments/v1/portfolio'); }
+  async getInvestmentProducts() { return this.request('GET', '/investments/v1/products'); }
+
+  // Statements & Reports
+  async downloadStatement(accountId, format) { return this.request('POST', `/statements/v1/generate`, { accountId, format }); }
+  async getTransactionHistory(params) { return this.request('GET', `/transactions/v1/history?${new URLSearchParams(params)}`); }
 }
 
 export const api = new BankAPI();

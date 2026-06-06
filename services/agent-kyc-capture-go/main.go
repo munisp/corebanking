@@ -14,7 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"net/http"
 	"os"
 	"sync"
@@ -26,6 +27,13 @@ import (
 	"net"
 
 )
+
+// secureRandUint32 generates a cryptographically secure random uint32
+func secureRandUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "agent-kyc-capture-go"
 
@@ -175,7 +183,7 @@ func handleCreateCapture(w http.ResponseWriter, r *http.Request) {
 	}
 
 	form := CaptureForm{
-		ID:            fmt.Sprintf("CAP-%08X", rand.Uint32()),
+		ID:            fmt.Sprintf("CAP-%08X", secureRandUint32()),
 		AgentID:       getString(body, "agentId"),
 		CustomerName:  getString(body, "customerName"),
 		CustomerPhone: getString(body, "customerPhone"),
@@ -297,7 +305,7 @@ func handleUSSDCapture(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	form := CaptureForm{
-		ID:            fmt.Sprintf("USSD-%08X", rand.Uint32()),
+		ID:            fmt.Sprintf("USSD-%08X", secureRandUint32()),
 		AgentID:       getString(body, "agentId"),
 		CustomerName:  getString(body, "customerName"),
 		CustomerPhone: getString(body, "customerPhone"),

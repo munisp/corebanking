@@ -2,6 +2,24 @@ use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use std::collections::HashMap;
+use serde_json::json;
+use std::env;
+
+fn check_jwt(req: &HttpRequest) -> Result<(), HttpResponse> {
+    let path = req.path();
+    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" || path == "/v1/degradation" {
+        return Ok(());
+    }
+    match req.headers().get("Authorization") {
+        Some(val) => {
+            if let Ok(s) = val.to_str() {
+                if s.starts_with("Bearer ") { return Ok(()); }
+            }
+            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
+        }
+        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
+    }
+}
 
 // ── Circuit Breaker States ──
 
@@ -220,12 +238,14 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
     }))
 }
 
-async fn list_breakers(data: web::Data<AppState>) -> HttpResponse {
+async fn list_breakers(req: HttpRequest, data: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     HttpResponse::Ok().json(serde_json::json!({ "items": *b, "total": b.len() }))
 }
 
-async fn get_stats(data: web::Data<AppState>) -> HttpResponse {
+async fn get_stats(req: HttpRequest, data: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let closed = b.iter().filter(|x| x.state == CBState::Closed).count();
     let open = b.iter().filter(|x| x.state == CBState::Open).count();
@@ -249,17 +269,20 @@ async fn get_stats(data: web::Data<AppState>) -> HttpResponse {
     }))
 }
 
-async fn list_events(data: web::Data<AppState>) -> HttpResponse {
+async fn list_events(req: HttpRequest, data: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let e = data.events.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     HttpResponse::Ok().json(serde_json::json!({ "items": *e, "total": e.len() }))
 }
 
-async fn list_configs(data: web::Data<AppState>) -> HttpResponse {
+async fn list_configs(req: HttpRequest, data: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let c = data.configs.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     HttpResponse::Ok().json(serde_json::json!({ "items": *c, "total": c.len() }))
 }
 
-async fn check_service(path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
+async fn check_service(req: HttpRequest, path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let service = path.into_inner();
     let b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     match b.iter().find(|x| x.service == service) {
@@ -280,7 +303,8 @@ async fn check_service(path: web::Path<String>, data: web::Data<AppState>) -> Ht
     }
 }
 
-async fn record_failure(path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
+async fn record_failure(req: HttpRequest, path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let service = path.into_inner();
     let mut b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     if let Some(cb) = b.iter_mut().find(|x| x.service == service) {
@@ -294,7 +318,8 @@ async fn record_failure(path: web::Path<String>, data: web::Data<AppState>) -> H
     HttpResponse::Ok().json(serde_json::json!({ "recorded": true, "service": service }))
 }
 
-async fn record_success(path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
+async fn record_success(req: HttpRequest, path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let service = path.into_inner();
     let mut b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     if let Some(cb) = b.iter_mut().find(|x| x.service == service) {
@@ -308,7 +333,8 @@ async fn record_success(path: web::Path<String>, data: web::Data<AppState>) -> H
     HttpResponse::Ok().json(serde_json::json!({ "recorded": true, "service": service }))
 }
 
-async fn reset_breaker(path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
+async fn reset_breaker(req: HttpRequest, path: web::Path<String>, data: web::Data<AppState>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let service = path.into_inner();
     let mut b = data.breakers.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     if let Some(cb) = b.iter_mut().find(|x| x.service == service) {

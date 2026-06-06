@@ -15,7 +15,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"net/http"
 	"os"
 	"strconv"
@@ -25,6 +26,13 @@ import (
 	"net"
 
 )
+
+// secureRandUint32 generates a cryptographically secure random uint32
+func secureRandUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "account-opening-go"
 
@@ -309,7 +317,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 		if !kycResult.Allowed {
 			mu.Lock()
 			app := AccountApplication{
-				ID: fmt.Sprintf("APP-%08X", rand.Uint32()), CustomerID: customerID,
+				ID: fmt.Sprintf("APP-%08X", secureRandUint32()), CustomerID: customerID,
 				CustomerName: customerName, AccountType: accountType, Currency: getString(body, "currency"),
 				Tier: tier, Status: "pending_kyc", KYCStatus: kycResult.Status,
 				KYCLevel: kycResult.Level, KYCVerified: false,
@@ -337,7 +345,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	app := AccountApplication{
-		ID: fmt.Sprintf("APP-%08X", rand.Uint32()), CustomerID: customerID,
+		ID: fmt.Sprintf("APP-%08X", secureRandUint32()), CustomerID: customerID,
 		CustomerName: customerName, AccountType: accountType,
 		Currency: getString(body, "currency"), Tier: tier,
 		Status: "approved", KYCStatus: "verified", KYCLevel: requiredKYCLevel,
@@ -1028,7 +1036,7 @@ func generateAccountNumber() string {
 	digits := "0123456789"
 	result := "54" // Bank code prefix
 	for i := 0; i < 8; i++ {
-		result += string(digits[rand.Intn(10)])
+		result += string(digits[secureRandUint32() % 10])
 	}
 	return result
 }

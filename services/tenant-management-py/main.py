@@ -555,13 +555,68 @@ def _init_platform_tenant():
 
 _init_platform_tenant()
 
-# --- DB Persistence (stub — production uses Postgres) ---
+# --- DB Persistence (Postgres) ---
+_DB_URL = os.environ.get("DATABASE_URL", "")
+_db_pool = None
+
+def _get_db():
+    global _db_pool
+    if not _DB_URL:
+        return None
+    try:
+        if _db_pool is None:
+            import psycopg2.pool
+            _db_pool = psycopg2.pool.SimpleConnectionPool(minconn=2, maxconn=10, dsn=_DB_URL)
+            logger.info("Database connection pool initialized")
+        conn = _db_pool.getconn()
+        conn.autocommit = True
+        return conn
+    except Exception as e:
+        logger.warning(f"DB connection failed: {e}")
+        return None
+
+def _release_db(conn):
+    if _db_pool and conn:
+        try:
+            _db_pool.putconn(conn)
+        except Exception:
+            pass
+
 def db_insert(table, data):
-    logger.info(f"db_insert table={table} keys={list(data.keys())}")
+    conn = _get_db()
+    if not conn:
+        logger.error("CRITICAL: No database connection — refusing write")
+        raise ConnectionError("Database unavailable for tenant-management-py")
+    try:
+        cur = conn.cursor()
+        import json as _json
+        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id",
+                    (_json.dumps(data), "tenant-management-py"))
+        row = cur.fetchone()
+        data["id"] = str(row[0])
+        return data
+    except Exception as e:
+        logger.error(f"DB insert failed: {e}")
+        raise
+    finally:
+        _release_db(conn)
 
 def db_query(table, filters):
-    logger.info(f"db_query table={table} filters={filters}")
-    return []
+    conn = _get_db()
+    if not conn:
+        return []
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, data FROM records WHERE service = %s ORDER BY id DESC LIMIT 100",
+                    ("tenant-management-py",))
+        rows = cur.fetchall()
+        import json as _json
+        return [_json.loads(row[1]) if isinstance(row[1], str) else row[1] for row in rows]
+    except Exception as e:
+        logger.error(f"DB query failed: {e}")
+        return []
+    finally:
+        _release_db(conn)
 
 # --- Cache ---
 _cache = {}

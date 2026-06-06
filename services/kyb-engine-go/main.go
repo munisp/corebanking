@@ -14,7 +14,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"net/http"
 	"os"
 	"sync"
@@ -26,6 +27,13 @@ import (
 	"net"
 
 )
+
+// secureRandUint32 generates a cryptographically secure random uint32
+func secureRandUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "kyb-engine-go"
 
@@ -275,7 +283,7 @@ func handleAnalyze(w http.ResponseWriter, r *http.Request) {
 	}
 
 	structure := CorporateStructure{
-		ID:                fmt.Sprintf("STR-%08X", rand.Uint32()),
+		ID:                fmt.Sprintf("STR-%08X", secureRandUint32()),
 		CompanyID:         getString(body, "companyId"),
 		CompanyName:       getString(body, "companyName"),
 		RCNumber:          getString(body, "rcNumber"),

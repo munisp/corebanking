@@ -16,7 +16,8 @@ import (
 "encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"net/http"
 	"os"
 	"sync"
@@ -25,6 +26,13 @@ import (
 	"strings"
 
 )
+
+// secureRandUint32 generates a cryptographically secure random uint32
+func secureRandUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var db *sql.DB
 
@@ -141,7 +149,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("SEC-%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("SEC-%08X", secureRandUint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -166,7 +174,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	domainStats.TotalRecords = len(records)
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -196,7 +204,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", secureRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -817,7 +825,7 @@ func computeBackoffMs(attempt int, baseMs int, maxMs int) int {
 	delay := baseMs * (1 << attempt) // exponential
 	// Add jitter (±25%)
 	jitter := delay / 4
-	delay += rand.Intn(jitter*2) - jitter
+	delay += int(time.Now().UnixNano()%int64(jitter*2)) - jitter
 	if delay > maxMs { delay = maxMs }
 	return delay
 }
