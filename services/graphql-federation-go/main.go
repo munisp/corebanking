@@ -14,25 +14,90 @@ import (
 	"time"
 )
 
-// --- GraphQL federation gateway — unified API for mobile/PWA ---
+// GraphQL Federation Gateway — schema stitching, query planning, resolver orchestration
+// Handles composite queries across 54Bank's microservice mesh
 
-var PORT = "8107"
-func init() { if p := os.Getenv("PORT"); p != "" { PORT = p } }
+var PORT = "8100"
 
-// --- State ---
-type Record struct {
-	ID        string                 `json:"id"`
-	Data      map[string]interface{} `json:"data"`
-	CreatedAt string                 `json:"created_at"`
-	UpdatedAt string                 `json:"updated_at"`
-	TenantID  string                 `json:"tenant_id"`
-	Status    string                 `json:"status"`
+func init() {
+	if p := os.Getenv("PORT"); p != "" {
+		PORT = p
+	}
 }
 
+// ─── Domain Types ───
+
+type Subgraph struct {
+	Name            string   `json:"name"`
+	URL             string   `json:"url"`
+	SchemaVersion   string   `json:"schema_version"`
+	Types           []string `json:"types"`
+	Status          string   `json:"status"` // registered→healthy→degraded→unreachable
+	LastHealthCheck string   `json:"last_health_check"`
+	AvgLatencyMs    float64  `json:"avg_latency_ms"`
+	ErrorRate       float64  `json:"error_rate"`
+	QueryCount      int64    `json:"query_count"`
+	CreatedAt       string   `json:"created_at"`
+}
+
+type QueryPlan struct {
+	ID               string   `json:"id"`
+	OriginalQuery    string   `json:"original_query"`
+	InvolvedSubgraphs []string `json:"involved_subgraphs"`
+	Steps            []QueryStep `json:"steps"`
+	EstimatedLatency int      `json:"estimated_latency_ms"`
+	Complexity       int      `json:"complexity"`
+	CacheKey         string   `json:"cache_key"`
+	CacheHit         bool     `json:"cache_hit"`
+	CreatedAt        string   `json:"created_at"`
+}
+
+type QueryStep struct {
+	Subgraph string `json:"subgraph"`
+	Fetch    string `json:"fetch"`
+	Requires string `json:"requires,omitempty"`
+	Parallel bool   `json:"parallel"`
+}
+
+type SchemaComposition struct {
+	ID          string   `json:"id"`
+	Subgraphs   []string `json:"subgraphs"`
+	TotalTypes  int      `json:"total_types"`
+	TotalFields int      `json:"total_fields"`
+	Conflicts   []string `json:"conflicts,omitempty"`
+	Status      string   `json:"status"` // composed, conflict, partial
+	ComposedAt  string   `json:"composed_at"`
+}
+
+type PersistedQuery struct {
+	Hash      string `json:"hash"`
+	Query     string `json:"query"`
+	Subgraphs []string `json:"subgraphs"`
+	TTL       int    `json:"ttl_seconds"`
+	HitCount  int64  `json:"hit_count"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ─── State ───
+
 var (
-	records   []Record
-	recordsMu sync.RWMutex
+	subgraphs       []Subgraph
+	subgraphsMu     sync.RWMutex
+	queryPlans      []QueryPlan
+	queryPlansMu    sync.RWMutex
+	compositions    []SchemaComposition
+	compositionsMu  sync.RWMutex
+	persistedQueries []PersistedQuery
+	pqMu            sync.RWMutex
+	requestCount    int64
+	errorCount      int64
+	counterMu       sync.Mutex
 )
+
+func incRequests() { counterMu.Lock(); requestCount++; counterMu.Unlock() }
+func incErrors()   { counterMu.Lock(); errorCount++; counterMu.Unlock() }
+
+// ─── Utilities ───
 
 func secureRandID() string {
 	b := make([]byte, 8)
@@ -40,84 +105,451 @@ func secureRandID() string {
 	return fmt.Sprintf("%X", b)
 }
 
-// --- PII Masking (NDPR) ---
-func maskPII(value, fieldType string) string {
-	if len(value) == 0 { return "***" }
-	switch fieldType {
-	case "bvn", "nin":
-		if len(value) >= 4 { return "***" + value[len(value)-4:] }
-		return "***"
-	case "phone":
-		if len(value) >= 4 { return "+234***" + value[len(value)-4:] }
-		return "+234***"
-	case "email":
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return string(parts[0][0]) + "***@" + parts[1] }
-		return "***@***"
-	case "account":
-		if len(value) >= 4 { return "****" + value[len(value)-4:] }
-		return "****"
-	default:
-		return "***"
-	}
-}
-
 func sanitizeLogEntry(msg string) string {
 	re1 := regexp.MustCompile(`\b[0-9]{11}\b`)
-	msg = re1.ReplaceAllStringFunc(msg, func(s string) string { return "***" + s[len(s)-4:] })
-	return msg
+	return re1.ReplaceAllStringFunc(msg, func(s string) string { return "***" + s[len(s)-4:] })
 }
 
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Content-Security-Policy", "default-src 'self'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(data)
 }
 
+// ─── Banking Domain Subgraph Definitions ───
+
+var bankingSubgraphs = map[string][]string{
+	"accounts":     {"Account", "Balance", "Statement", "AccountHolder", "AccountProduct"},
+	"transactions": {"Transaction", "Transfer", "Payment", "Reversal", "Settlement"},
+	"kyc":          {"KYCRecord", "BVNVerification", "NINVerification", "LivenessCheck", "TierUpgrade"},
+	"loans":        {"Loan", "LoanApplication", "Repayment", "AmortizationSchedule", "Collateral"},
+	"cards":        {"Card", "CardTransaction", "CardLimit", "PINChange", "CardBlock"},
+	"compliance":   {"AMLAlert", "STR", "CTR", "NFIUReport", "PEPScreening", "SanctionsCheck"},
+	"deposits":     {"FixedDeposit", "SavingsProduct", "InterestAccrual", "Maturity"},
+	"fx":           {"FXRate", "FXOrder", "RemittanceCorridor", "FXSettlement"},
+}
+
+// Sensitive fields that must not appear in query results without authorization
+var sensitiveFields = map[string]bool{
+	"bvn": true, "nin": true, "phone": true, "email": true,
+	"account_number": true, "balance": true, "pin": true,
+	"password": true, "secret": true, "ssn": true,
+}
+
+// ─── Query Complexity Scoring ───
+
+func computeQueryComplexity(query string, depth int) int {
+	baseComplexity := len(query) / 10
+	depthPenalty := depth * depth * 2
+
+	// Expensive operations
+	if strings.Contains(query, "transactions") { baseComplexity += 50 }
+	if strings.Contains(query, "statements") { baseComplexity += 100 }
+	if strings.Contains(query, "aml") || strings.Contains(query, "AML") { baseComplexity += 75 }
+	if strings.Contains(query, "loan") || strings.Contains(query, "Loan") { baseComplexity += 30 }
+
+	// Pagination amplifier
+	if strings.Contains(query, "first:") || strings.Contains(query, "last:") {
+		baseComplexity += 20
+	}
+
+	return baseComplexity + depthPenalty
+}
+
+var maxQueryComplexity = 1000
+
+// ─── Query Planning ───
+
+func planQuery(query string) ([]string, []QueryStep, int) {
+	involvedSubgraphs := []string{}
+	steps := []QueryStep{}
+
+	for sg, types := range bankingSubgraphs {
+		for _, t := range types {
+			if strings.Contains(query, t) || strings.Contains(strings.ToLower(query), strings.ToLower(t)) {
+				involvedSubgraphs = append(involvedSubgraphs, sg)
+				steps = append(steps, QueryStep{
+					Subgraph: sg,
+					Fetch:    fmt.Sprintf("SELECT %s FROM %s", t, sg),
+					Parallel: true,
+				})
+				break
+			}
+		}
+	}
+
+	// Add dependencies: KYC data requires accounts subgraph
+	hasKYC := false
+	hasAccounts := false
+	for _, sg := range involvedSubgraphs {
+		if sg == "kyc" { hasKYC = true }
+		if sg == "accounts" { hasAccounts = true }
+	}
+	if hasKYC && !hasAccounts {
+		involvedSubgraphs = append(involvedSubgraphs, "accounts")
+		steps = append(steps, QueryStep{
+			Subgraph: "accounts",
+			Fetch:    "SELECT AccountHolder FROM accounts",
+			Requires: "kyc.customer_id",
+			Parallel: false,
+		})
+	}
+
+	estimatedLatency := len(involvedSubgraphs) * 50 + 10
+	return involvedSubgraphs, steps, estimatedLatency
+}
+
+// ─── Field-Level Authorization ───
+
+func checkFieldAuthorization(fields []string, role string) ([]string, []string) {
+	allowed := []string{}
+	denied := []string{}
+	for _, f := range fields {
+		if sensitiveFields[f] && role != "admin" && role != "compliance" {
+			denied = append(denied, f)
+		} else {
+			allowed = append(allowed, f)
+		}
+	}
+	return allowed, denied
+}
+
+// ─── Handlers ───
+
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
-	recordsMu.RLock()
-	count := len(records)
-	recordsMu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"status": "healthy", "service": "graphql-federation-go", "version": "1.0.0", "records": count})
+	subgraphsMu.RLock()
+	healthy := 0
+	for _, sg := range subgraphs {
+		if sg.Status == "healthy" { healthy++ }
+	}
+	total := len(subgraphs)
+	subgraphsMu.RUnlock()
+	respondJSON(w, 200, map[string]interface{}{
+		"status": "healthy", "service": "graphql-federation-go", "version": "2.0.0",
+		"subgraphs_healthy": healthy, "subgraphs_total": total,
+		"supergraph_types": len(bankingSubgraphs),
+	})
 }
 
-func handleList(w http.ResponseWriter, r *http.Request) {
-	recordsMu.RLock()
-	defer recordsMu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"records": records, "count": len(records)})
-}
-
-func handleCreate(w http.ResponseWriter, r *http.Request) {
-	var body map[string]interface{}
+func handleSubgraphRegister(w http.ResponseWriter, r *http.Request) {
+	incRequests()
+	var body struct {
+		Name    string   `json:"name"`
+		URL     string   `json:"url"`
+		Version string   `json:"schema_version"`
+		Types   []string `json:"types"`
+	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		respondJSON(w, 400, map[string]interface{}{"error": "Invalid JSON", "details": err.Error()})
+		incErrors()
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
 	}
-	now := time.Now().UTC().Format(time.RFC3339)
-	rec := Record{
-		ID: fmt.Sprintf("GRA-%s", secureRandID()),
-		Data: body, CreatedAt: now, UpdatedAt: now,
-		TenantID: fmt.Sprintf("%v", body["tenant_id"]),
-		Status: "active",
+	errs := []string{}
+	if body.Name == "" { errs = append(errs, "name_required") }
+	if body.URL == "" { errs = append(errs, "url_required") }
+	if len(body.Types) == 0 { errs = append(errs, "types_required") }
+	if len(errs) > 0 {
+		incErrors()
+		respondJSON(w, 400, map[string]interface{}{"error": "validation_failed", "errors": errs})
+		return
 	}
-	recordsMu.Lock()
-	records = append(records, rec)
-	recordsMu.Unlock()
-	respondJSON(w, 201, map[string]interface{}{"status": "created", "record": rec})
+
+	// Check for type conflicts
+	subgraphsMu.RLock()
+	conflicts := []string{}
+	for _, sg := range subgraphs {
+		for _, existingType := range sg.Types {
+			for _, newType := range body.Types {
+				if existingType == newType {
+					conflicts = append(conflicts, fmt.Sprintf("type_%s_already_owned_by_%s", newType, sg.Name))
+				}
+			}
+		}
+	}
+	subgraphsMu.RUnlock()
+
+	if len(conflicts) > 0 {
+		respondJSON(w, 409, map[string]interface{}{
+			"error": "type_conflicts", "conflicts": conflicts,
+			"suggestion": "Use @key directive to share types or rename conflicting types",
+		})
+		return
+	}
+
+	sg := Subgraph{
+		Name:          body.Name,
+		URL:           body.URL,
+		SchemaVersion: body.Version,
+		Types:         body.Types,
+		Status:        "healthy",
+		LastHealthCheck: time.Now().UTC().Format(time.RFC3339),
+		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+	subgraphsMu.Lock()
+	subgraphs = append(subgraphs, sg)
+	subgraphsMu.Unlock()
+
+	respondJSON(w, 201, map[string]interface{}{"subgraph": sg})
+}
+
+func handleSubgraphList(w http.ResponseWriter, r *http.Request) {
+	incRequests()
+	subgraphsMu.RLock()
+	defer subgraphsMu.RUnlock()
+	respondJSON(w, 200, map[string]interface{}{"subgraphs": subgraphs, "count": len(subgraphs)})
+}
+
+func handleQueryPlan(w http.ResponseWriter, r *http.Request) {
+	incRequests()
+	var body struct {
+		Query  string   `json:"query"`
+		Fields []string `json:"fields"`
+		Role   string   `json:"role"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		incErrors()
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
+		return
+	}
+	if body.Query == "" {
+		respondJSON(w, 400, map[string]interface{}{"error": "query_required"})
+		return
+	}
+
+	// Complexity check
+	involvedSGs, steps, estLatency := planQuery(body.Query)
+	complexity := computeQueryComplexity(body.Query, len(involvedSGs))
+	if complexity > maxQueryComplexity {
+		incErrors()
+		respondJSON(w, 400, map[string]interface{}{
+			"error": "query_too_complex",
+			"complexity": complexity,
+			"max_complexity": maxQueryComplexity,
+			"suggestion": "Reduce query depth or limit fields",
+		})
+		return
+	}
+
+	// Field authorization
+	allowed, denied := checkFieldAuthorization(body.Fields, body.Role)
+
+	plan := QueryPlan{
+		ID:               fmt.Sprintf("QP-%s", secureRandID()),
+		OriginalQuery:    body.Query,
+		InvolvedSubgraphs: involvedSGs,
+		Steps:            steps,
+		EstimatedLatency: estLatency,
+		Complexity:       complexity,
+		CacheKey:         fmt.Sprintf("%x", body.Query),
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339),
+	}
+	queryPlansMu.Lock()
+	queryPlans = append(queryPlans, plan)
+	queryPlansMu.Unlock()
+
+	resp := map[string]interface{}{
+		"plan":            plan,
+		"allowed_fields":  allowed,
+		"parallel_execution": len(involvedSGs) > 1,
+	}
+	if len(denied) > 0 {
+		resp["denied_fields"] = denied
+		resp["authorization_warning"] = "Some fields require elevated permissions"
+	}
+	respondJSON(w, 200, resp)
+}
+
+func handleSchemaCompose(w http.ResponseWriter, r *http.Request) {
+	incRequests()
+	subgraphsMu.RLock()
+	sgNames := []string{}
+	totalTypes := 0
+	totalFields := 0
+	for _, sg := range subgraphs {
+		sgNames = append(sgNames, sg.Name)
+		totalTypes += len(sg.Types)
+		totalFields += len(sg.Types) * 5 // estimated fields per type
+	}
+	subgraphsMu.RUnlock()
+
+	// Add built-in banking types
+	for _, types := range bankingSubgraphs {
+		totalTypes += len(types)
+		totalFields += len(types) * 8
+	}
+
+	composition := SchemaComposition{
+		ID:         fmt.Sprintf("SC-%s", secureRandID()),
+		Subgraphs:  sgNames,
+		TotalTypes: totalTypes,
+		TotalFields: totalFields,
+		Status:     "composed",
+		ComposedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	compositionsMu.Lock()
+	compositions = append(compositions, composition)
+	compositionsMu.Unlock()
+
+	respondJSON(w, 200, map[string]interface{}{
+		"composition": composition,
+		"banking_domain_types": bankingSubgraphs,
+	})
+}
+
+func handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	incRequests()
+	types := map[string]interface{}{}
+	for sg, sgTypes := range bankingSubgraphs {
+		for _, t := range sgTypes {
+			types[t] = map[string]interface{}{
+				"subgraph": sg,
+				"fields":   []string{"id", "created_at", "updated_at", "status"},
+			}
+		}
+	}
+	respondJSON(w, 200, map[string]interface{}{
+		"__schema": map[string]interface{}{
+			"types":     types,
+			"queryType": "Query",
+			"mutationType": "Mutation",
+			"directives": []string{"@key", "@requires", "@provides", "@external"},
+		},
+	})
+}
+
+func handlePersistedQueryStore(w http.ResponseWriter, r *http.Request) {
+	incRequests()
+	var body struct {
+		Query     string   `json:"query"`
+		TTL       int      `json:"ttl_seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		incErrors()
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
+		return
+	}
+	if body.Query == "" {
+		respondJSON(w, 400, map[string]interface{}{"error": "query_required"})
+		return
+	}
+	if body.TTL <= 0 { body.TTL = 3600 }
+
+	involvedSGs, _, _ := planQuery(body.Query)
+	complexity := computeQueryComplexity(body.Query, len(involvedSGs))
+	if complexity > maxQueryComplexity {
+		incErrors()
+		respondJSON(w, 400, map[string]interface{}{
+			"error": "persisted_query_too_complex",
+			"complexity": complexity,
+			"max_complexity": maxQueryComplexity,
+		})
+		return
+	}
+
+	hash := fmt.Sprintf("%x", body.Query)
+	pq := PersistedQuery{
+		Hash:      hash,
+		Query:     body.Query,
+		Subgraphs: involvedSGs,
+		TTL:       body.TTL,
+		HitCount:  0,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	pqMu.Lock()
+	persistedQueries = append(persistedQueries, pq)
+	pqMu.Unlock()
+
+	respondJSON(w, 201, map[string]interface{}{
+		"persisted_query": pq,
+		"usage": "Pass {extensions: {persistedQuery: {sha256Hash: \"" + hash + "\"}}} instead of full query",
+	})
+}
+
+func handlePersistedQueryExecute(w http.ResponseWriter, r *http.Request) {
+	incRequests()
+	var body struct {
+		Hash string `json:"hash"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		incErrors()
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
+		return
+	}
+	pqMu.Lock()
+	defer pqMu.Unlock()
+	for i := range persistedQueries {
+		if persistedQueries[i].Hash == body.Hash {
+			persistedQueries[i].HitCount++
+			involvedSGs, steps, estLatency := planQuery(persistedQueries[i].Query)
+			complexity := computeQueryComplexity(persistedQueries[i].Query, len(involvedSGs))
+			respondJSON(w, 200, map[string]interface{}{
+				"persisted_query": persistedQueries[i],
+				"execution_plan": map[string]interface{}{
+					"subgraphs":        involvedSGs,
+					"steps":            steps,
+					"estimated_latency": estLatency,
+					"complexity":       complexity,
+				},
+			})
+			return
+		}
+	}
+	respondJSON(w, 404, map[string]interface{}{
+		"error": "persisted_query_not_found",
+		"hash":  body.Hash,
+	})
+}
+
+func handleSubgraphHealth(w http.ResponseWriter, r *http.Request) {
+	incRequests()
+	subgraphsMu.RLock()
+	defer subgraphsMu.RUnlock()
+	health := []map[string]interface{}{}
+	for _, sg := range subgraphs {
+		health = append(health, map[string]interface{}{
+			"name":            sg.Name,
+			"status":          sg.Status,
+			"avg_latency_ms":  sg.AvgLatencyMs,
+			"error_rate":      sg.ErrorRate,
+			"query_count":     sg.QueryCount,
+			"last_health_check": sg.LastHealthCheck,
+			"types_count":     len(sg.Types),
+		})
+	}
+	respondJSON(w, 200, map[string]interface{}{
+		"subgraph_health": health,
+		"total_subgraphs": len(health),
+	})
+}
+
+func handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	counterMu.Lock()
+	rc, ec := requestCount, errorCount
+	counterMu.Unlock()
+	fmt.Fprintf(w, "requests_total{service=\"graphql-federation-go\"} %d\n", rc)
+	fmt.Fprintf(w, "errors_total{service=\"graphql-federation-go\"} %d\n", ec)
 }
 
 func main() {
-	_ = maskPII
-	_ = sanitizeLogEntry
 	_ = big.NewInt
+	_ = sanitizeLogEntry
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/readyz", handleHealthz)
 	mux.HandleFunc("/livez", handleHealthz)
-	mux.HandleFunc("/api/v1/graphql_federation", handleList)
-	mux.HandleFunc("/api/v1/graphql_federation/create", handleCreate)
-	log.Printf("GraphQL federation gateway — unified API for mobile/PWA listening on :%s", PORT)
+	mux.HandleFunc("/metrics", handleMetrics)
+	mux.HandleFunc("/v1/subgraph/register", handleSubgraphRegister)
+	mux.HandleFunc("/v1/subgraph/list", handleSubgraphList)
+	mux.HandleFunc("/v1/query/plan", handleQueryPlan)
+	mux.HandleFunc("/v1/schema/compose", handleSchemaCompose)
+	mux.HandleFunc("/v1/introspect", handleIntrospect)
+	mux.HandleFunc("/v1/persisted-query/store", handlePersistedQueryStore)
+	mux.HandleFunc("/v1/persisted-query/execute", handlePersistedQueryExecute)
+	mux.HandleFunc("/v1/subgraph/health", handleSubgraphHealth)
+	log.Printf("GraphQL Federation Gateway listening on :%s", PORT)
 	log.Fatal(http.ListenAndServe(":"+PORT, mux))
 }
