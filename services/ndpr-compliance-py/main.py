@@ -1,1257 +1,346 @@
-"""
-ndpr-compliance-py — Production-hardened service
-"""
-import os
-import sys
-import json
-import urllib.request
-import time
-import signal
-import logging
-import threading
-import uuid
+
+# --- PII Masking (NDPR Compliance) ---
+import re as _pii_re
+
+def mask_pii(value: str, field_type: str = "generic") -> str:
+    if not value: return "***"
+    if field_type in ("bvn", "nin"):
+        return f"***{value[-4:]}" if len(value) >= 4 else "***"
+    elif field_type == "phone":
+        return f"+234***{value[-4:]}" if len(value) >= 4 else "+234***"
+    elif field_type == "email" and "@" in value:
+        local, domain = value.split("@", 1)
+        return f"{local[0]}***@{domain}"
+    elif field_type == "account":
+        return f"****{value[-4:]}" if len(value) >= 4 else "****"
+    return f"{value[0]}***{value[-1]}" if len(value) > 2 else "***"
+
+def sanitize_log(msg: str) -> str:
+    msg = _pii_re.sub(r"\b\d{11}\b", lambda m: f"***{m.group()[-4:]}", msg)
+    msg = _pii_re.sub(r"\b\d{10}\b", lambda m: f"****{m.group()[-4:]}", msg)
+    msg = _pii_re.sub(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "***@***", msg)
+    return msg
+
+#!/usr/bin/env python3
+"""54Bank NDPR Compliance Service — Nigeria Data Protection Regulation"""
+import os, json, logging, hashlib, uuid
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
-from datetime import datetime, timezone
 
-# --- Structured Logging ---
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "service": "ndpr-compliance-py",
-            "message": record.getMessage(),
-        })
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("ndpr-compliance")
 
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[handler])
-logger = logging.getLogger("ndpr-compliance-py")
+PORT = int(os.environ.get("PORT", "8095"))
 
-# --- Redis Caching Layer ---
-import socket as _socket
-
-# Rate limiting
-import threading as _rl_threading
-_rl_tokens = 100
-_rl_lock = _rl_threading.Lock()
-_rl_last_refill = [0.0]
-
-def _rl_allow():
-    global _rl_tokens
-    import time as _t
-    now = _t.time()
-    with _rl_lock:
-        if now - _rl_last_refill[0] >= 1.0:
-            _rl_tokens = 100
-            _rl_last_refill[0] = now
-        if _rl_tokens <= 0:
-            return False
-        _rl_tokens -= 1
-        return True
-
-# --- Production Cache (connection-pooled, multi-level L1+L2, stampede protection, metrics) ---
-import socket as _cache_socket
-import threading as _cache_threading
-
-_REDIS_URL = os.environ.get("REDIS_URL", "localhost:6379")
-_CACHE_POOL_SIZE = int(os.environ.get("REDIS_POOL_SIZE", "8"))
-
-class _CachePool:
-    """Thread-safe Redis connection pool with health checks."""
-    def __init__(self, url, size=8):
-        parts = url.rsplit(":", 1)
-        self.host = parts[0] if parts else "localhost"
-        self.port = int(parts[1]) if len(parts) > 1 else 6379
-        self.pool = []
-        self.lock = _cache_threading.Lock()
-        self.max_size = size
-        # Pre-warm 2 connections
-        for _ in range(2):
-            c = self._dial()
-            if c: self.pool.append(c)
-
-    def _dial(self):
-        try:
-            s = _cache_socket.create_connection((self.host, self.port), timeout=2)
-            s.settimeout(3)
-            s.sendall(b"*1\r\n$4\r\nPING\r\n")
-            resp = s.recv(64)
-            if resp and resp[0:1] == b'+':
-                return s
-            s.close()
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
-        return None
-
-    def get(self):
-        with self.lock:
-            while self.pool:
-                conn = self.pool.pop()
-                try:
-                    conn.settimeout(1)
-                    conn.sendall(b"*1\r\n$4\r\nPING\r\n")
-                    r = conn.recv(64)
-                    if r and r[0:1] == b'+':
-                        conn.settimeout(3)
-                        return conn
-                except Exception as _exc:
-                    logger.debug(f"Suppressed error: {_exc}")
-                try: conn.close()
-                except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-        return self._dial()
-
-    def put(self, conn):
-        if conn is None: return
-        with self.lock:
-            if len(self.pool) < self.max_size:
-                self.pool.append(conn)
-            else:
-                try: conn.close()
-                except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-    def health(self):
-        c = self.get()
-        if c:
-            self.put(c)
-            return True
-        return False
-
-_cache_pool = _CachePool(_REDIS_URL, _CACHE_POOL_SIZE)
-_l1_cache = {}  # key -> (value, expiry_time)
-_l1_lock = _cache_threading.Lock()
-_l1_max_size = int(os.environ.get("CACHE_L1_MAX_SIZE", "500"))
-_cache_hits = 0
-_cache_misses = 0
-_cache_stampedes = 0
-_cache_metrics_lock = _cache_threading.Lock()
-
-def _l1_get(key):
-    with _l1_lock:
-        entry = _l1_cache.get(key)
-        if entry:
-            val, exp = entry
-            if time.time() < exp:
-                return val
-            del _l1_cache[key]
-    return None
-
-def _l1_set(key, value, ttl=10):
-    with _l1_lock:
-        if len(_l1_cache) >= _l1_max_size:
-            # Evict oldest
-            oldest_k = min(_l1_cache, key=lambda k: _l1_cache[k][1])
-            del _l1_cache[oldest_k]
-        _l1_cache[key] = (value, time.time() + ttl)
-
-def _l1_delete(key):
-    with _l1_lock:
-        _l1_cache.pop(key, None)
-
-def cache_get(key):
-    global _cache_hits, _cache_misses
-    # L1: in-process
-    val = _l1_get(key)
-    if val is not None:
-        with _cache_metrics_lock: _cache_hits += 1
-        return val
-    # L2: Redis via pool
-    conn = _cache_pool.get()
-    if conn is None:
-        with _cache_metrics_lock: _cache_misses += 1
-        return None
-    try:
-        conn.sendall(f"*2\r\n$3\r\nGET\r\n${len(key)}\r\n{key}\r\n".encode())
-        data = conn.recv(8192).decode()
-        _cache_pool.put(conn)
-        if data.startswith("$-1"):
-            with _cache_metrics_lock: _cache_misses += 1
-            return None
-        parts = data.split("\r\n", 2)
-        if len(parts) >= 3 and parts[1]:
-            with _cache_metrics_lock: _cache_hits += 1
-            _l1_set(key, parts[1])  # Promote to L1
-            return parts[1]
-    except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-    with _cache_metrics_lock: _cache_misses += 1
-    return None
-
-def cache_set(key, value, ttl=300):
-    # L1 store
-    _l1_set(key, str(value), min(ttl, 30))
-    # L2: Redis via pool
-    conn = _cache_pool.get()
-    if conn is None: return
-    try:
-        v = str(value)
-        t = str(ttl)
-        cmd = f"*6\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(v)}\r\n{v}\r\n$2\r\nEX\r\n${len(t)}\r\n{t}\r\n$2\r\nNX\r\n"
-        conn.sendall(cmd.encode())
-        conn.recv(256)
-        _cache_pool.put(conn)
-    except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-def cache_invalidate(key):
-    _l1_delete(key)
-    conn = _cache_pool.get()
-    if conn is None: return
-    try:
-        conn.sendall(f"*2\r\n$3\r\nDEL\r\n${len(key)}\r\n{key}\r\n".encode())
-        conn.recv(64)
-        # Distributed invalidation via PUBLISH
-        channel = "54bank:cache:invalidate"
-        conn.sendall(f"*3\r\n$7\r\nPUBLISH\r\n${len(channel)}\r\n{channel}\r\n${len(key)}\r\n{key}\r\n".encode())
-        conn.recv(64)
-        _cache_pool.put(conn)
-    except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-def cache_get_or_load(key, loader, ttl=300):
-    """Get from cache or load with stampede protection."""
-    global _cache_stampedes
-    val = cache_get(key)
-    if val is not None: return val
-    # Stampede lock via SETNX
-    lock_key = key + ":lock"
-    conn = _cache_pool.get()
-    if conn:
-        try:
-            conn.sendall(f"*6\r\n$3\r\nSET\r\n${len(lock_key)}\r\n{lock_key}\r\n$1\r\n1\r\n$2\r\nNX\r\n$2\r\nEX\r\n$1\r\n5\r\n".encode())
-            resp = conn.recv(64).decode()
-            _cache_pool.put(conn)
-            if "$-1" in resp or resp.startswith("-"):
-                with _cache_metrics_lock: _cache_stampedes += 1
-                time.sleep(0.05)
-                val = cache_get(key)
-                if val is not None: return val
-        except Exception:
-            try: conn.close()
-            except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-    # Load from source
-    result = loader()
-    if result is not None:
-        cache_set(key, result if isinstance(result, str) else json.dumps(result, default=str), ttl)
-    return result
-
-def cache_metrics():
-    with _cache_metrics_lock:
-        total = _cache_hits + _cache_misses
-        rate = (_cache_hits / total * 100) if total > 0 else 0
-    return {
-        "hits": _cache_hits, "misses": _cache_misses,
-        "hit_rate_pct": round(rate, 2),
-        "stampedes_prevented": _cache_stampedes,
-        "l1_size": len(_l1_cache),
-        "pool_connected": _cache_pool.health(),
-    }
-
-# --- gRPC Server (binary protocol, length-prefixed, with circuit breaker + retry) ---
-import socket as _grpc_socket
-import struct as _grpc_struct
-import threading as _grpc_threading
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Deep Domain Logic — Production-Ready Business Rules
-# ══════════════════════════════════════════════════════════════════════════════
-
-class AmountKobo:
-    """Monetary amounts in kobo (smallest unit) to avoid float precision errors."""
-    __slots__ = ('_value',)
-
-    def __init__(self, kobo: int):
-        self._value = int(kobo)
-
-    @classmethod
-    def from_naira(cls, naira: float) -> 'AmountKobo':
-        return cls(int(round(naira * 100)))
-
-    @property
-    def kobo(self) -> int:
-        return self._value
-
-    @property
-    def naira(self) -> float:
-        return self._value / 100.0
-
-    def __repr__(self):
-        return f"₦{self._value // 100}.{abs(self._value % 100):02d}"
-
-    def __add__(self, other): return AmountKobo(self._value + other._value)
-    def __sub__(self, other): return AmountKobo(self._value - other._value)
-    def __gt__(self, other): return self._value > other._value
-    def __ge__(self, other): return self._value >= other._value
-    def __lt__(self, other): return self._value < other._value
-    def __eq__(self, other): return self._value == other._value
-
-
-# ── State Machine ────────────────────────────────────────────────────────────
-
-class StateMachine:
-    """Formal state machine with transition guards."""
-
-    TRANSITIONS = {
-        "draft": ["submitted", "cancelled"],
-        "submitted": ["under_review", "rejected", "cancelled"],
-        "under_review": ["approved", "rejected"],
-        "approved": ["processing", "cancelled"],
-        "processing": ["completed", "failed"],
-        "completed": ["reversed"],
-        "failed": ["submitted"],  # retry
-    }
-
-    @classmethod
-    def can_transition(cls, from_state: str, to_state: str) -> bool:
-        allowed = cls.TRANSITIONS.get(from_state, [])
-        return to_state in allowed
-
-    @classmethod
-    def transition(cls, entity_id: str, from_state: str, to_state: str) -> dict:
-        if not cls.can_transition(from_state, to_state):
-            return {"error": f"Invalid transition: {from_state} → {to_state}", "entity_id": entity_id}
-        return {"entity_id": entity_id, "from": from_state, "to": to_state, "transitioned_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ")}
-
-
-# ── Nigerian Regulatory Rules ────────────────────────────────────────────────
-
-CBN_TIER_LIMITS = {
-    "tier1": {"max_single_debit_kobo": 5_000_000, "max_daily_kobo": 30_000_000, "max_balance_kobo": 30_000_000, "required_docs": ["phone"]},
-    "tier2": {"max_single_debit_kobo": 20_000_000, "max_daily_kobo": 50_000_000, "max_balance_kobo": 50_000_000, "required_docs": ["bvn", "phone", "dob"]},
-    "tier3": {"max_single_debit_kobo": 500_000_000, "max_daily_kobo": 1_000_000_000, "max_balance_kobo": 0, "required_docs": ["bvn", "nin", "address_proof", "passport_photo", "utility_bill"]},
-}
-
-def validate_tier_transaction(tier: str, amount_kobo: int, daily_total_kobo: int) -> tuple:
-    """Validate transaction against CBN tier limits."""
-    limits = CBN_TIER_LIMITS.get(tier)
-    if not limits:
-        return False, "Unknown KYC tier"
-    if amount_kobo > limits["max_single_debit_kobo"]:
-        return False, f"Exceeds {tier} single debit limit ₦{limits['max_single_debit_kobo'] // 100:,}"
-    if daily_total_kobo + amount_kobo > limits["max_daily_kobo"]:
-        return False, f"Exceeds {tier} daily cumulative limit ₦{limits['max_daily_kobo'] // 100:,}"
-    return True, ""
-
-
-def validate_bvn(bvn: str) -> tuple:
-    """Validate Bank Verification Number (11 digits)."""
-    if len(bvn) != 11:
-        return False, "BVN must be 11 digits"
-    if not bvn.isdigit():
-        return False, "BVN must contain only digits"
-    if bvn[:2] == "00":
-        return False, "Invalid BVN issuer code"
-    return True, ""
-
-
-def validate_nin(nin: str) -> tuple:
-    """Validate National Identification Number (11 digits)."""
-    if len(nin) != 11:
-        return False, "NIN must be 11 digits"
-    if not nin.isdigit():
-        return False, "NIN must contain only digits"
-    return True, ""
-
-
-def validate_nuban(bank_code: str, account_number: str) -> tuple:
-    """Validate NUBAN (Nigerian Uniform Bank Account Number) with check digit."""
-    if len(account_number) != 10:
-        return False, "NUBAN must be 10 digits"
-    if len(bank_code) != 3:
-        return False, "Bank code must be 3 digits"
-    serial = bank_code + account_number[:9]
-    weights = [3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3]
-    total = sum(int(serial[i]) * weights[i] for i in range(min(len(serial), len(weights))))
-    check_digit = (10 - (total % 10)) % 10
-    if check_digit != int(account_number[9]):
-        return False, f"NUBAN check digit mismatch: expected {check_digit}"
-    return True, ""
-
-
-# ── NFIU Threshold Reporting ─────────────────────────────────────────────────
-
-def check_nfiu_threshold(amount_kobo: int, txn_type: str) -> tuple:
-    """Check if transaction triggers NFIU Currency Transaction Report."""
-    if txn_type in ("cash_deposit", "cash_withdrawal"):
-        if amount_kobo >= 500_000_000:  # ₦5M
-            return True, "NFIU: Cash transaction ≥₦5M requires CTR filing"
-    elif txn_type in ("transfer", "wire"):
-        if amount_kobo >= 1_000_000_000:  # ₦10M
-            return True, "NFIU: Transfer ≥₦10M requires CTR filing"
-    return False, ""
-
-
-def generate_ctr(customer_id: str, txn_id: str, amount_kobo: int, txn_type: str) -> dict:
-    """Generate Currency Transaction Report for NFIU."""
-    import time
-    threshold_hit, reason = check_nfiu_threshold(amount_kobo, txn_type)
-    if not threshold_hit:
-        return None
-    return {
-        "report_id": f"CTR-{int(time.time()*1000)}",
-        "customer_id": customer_id,
-        "transaction_id": txn_id,
-        "amount_kobo": amount_kobo,
-        "type": txn_type,
-        "reason": reason,
-        "filed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "status": "pending",
-    }
-
-
-# ── AML Risk Scoring ─────────────────────────────────────────────────────────
-
-SANCTIONED_COUNTRIES = {"KP", "IR", "SY", "CU", "VE", "MM", "BY", "ZW", "SD"}
-
-def compute_aml_risk_score(
-    txn_amount_kobo: int, is_pep: bool = False, is_high_risk_country: bool = False,
-    cash_intensive: bool = False, is_structuring: bool = False,
-    has_adverse_media: bool = False, account_age_months: int = 12
-) -> tuple:
-    """Multi-factor AML risk scoring."""
-    score = 0.0
-    indicators = []
-    if is_pep: score += 30; indicators.append("PEP_STATUS")
-    if is_high_risk_country: score += 25; indicators.append("HIGH_RISK_JURISDICTION")
-    if cash_intensive: score += 15; indicators.append("CASH_INTENSIVE")
-    if is_structuring: score += 35; indicators.append("STRUCTURING_DETECTED")
-    if has_adverse_media: score += 20; indicators.append("ADVERSE_MEDIA")
-    if txn_amount_kobo > 1_000_000_000: score += 10; indicators.append("HIGH_VALUE_TXN")
-    if account_age_months < 3: score += 10; indicators.append("NEW_ACCOUNT")
-    return min(score, 100.0), indicators
-
-
-def detect_structuring(transactions: list, threshold_kobo: int = 500_000_000) -> bool:
-    """Detect structuring: multiple just-below-threshold transactions."""
-    count = sum(1 for t in transactions if t.get("amount_kobo", 0) >= threshold_kobo * 0.8 and t.get("amount_kobo", 0) < threshold_kobo)
-    return count >= 3
-
-
-# ── Financial Calculations ───────────────────────────────────────────────────
-
-def compute_emi(principal_kobo: int, annual_rate_pct: float, tenor_months: int) -> int:
-    """Compute Equated Monthly Installment in kobo."""
-    if tenor_months <= 0: return 0
-    if annual_rate_pct == 0: return principal_kobo // tenor_months
-    monthly_rate = annual_rate_pct / 12.0 / 100.0
-    power = (1 + monthly_rate) ** tenor_months
-    emi = principal_kobo * monthly_rate * power / (power - 1)
-    return int(round(emi))
-
-
-def generate_amortization_schedule(principal_kobo: int, annual_rate_pct: float, tenor_months: int) -> list:
-    """Generate full amortization schedule."""
-    if tenor_months <= 0: return []
-    monthly_rate = annual_rate_pct / 12.0 / 100.0
-    emi = compute_emi(principal_kobo, annual_rate_pct, tenor_months)
-    schedule = []
-    balance = principal_kobo
-    cumulative_interest = 0
-    for period in range(1, tenor_months + 1):
-        interest = int(balance * monthly_rate)
-        principal_part = emi - interest
-        if period == tenor_months: principal_part = balance  # settle rounding
-        balance -= principal_part
-        cumulative_interest += interest
-        schedule.append({
-            "period": period, "emi_kobo": emi, "principal_kobo": principal_part,
-            "interest_kobo": interest, "balance_kobo": max(balance, 0),
-            "cumulative_interest_kobo": cumulative_interest,
-        })
-    return schedule
-
-
-def compute_dti(monthly_income_kobo: int, existing_debt_kobo: int, proposed_emi_kobo: int) -> float:
-    """Compute Debt-to-Income ratio as percentage."""
-    if monthly_income_kobo <= 0: return 100.0
-    return (existing_debt_kobo + proposed_emi_kobo) / monthly_income_kobo * 100.0
-
-
-def compute_provisioning_rate(days_past_due: int) -> float:
-    """CBN Prudential Guidelines provisioning rates."""
-    if days_past_due <= 90: return 1.0      # Performing
-    if days_past_due <= 180: return 10.0    # Watchlist
-    if days_past_due <= 360: return 50.0    # Substandard
-    if days_past_due <= 720: return 75.0    # Doubtful
-    return 100.0                              # Lost
-
-
-def compute_interest_daily_accrual(balance_kobo: int, annual_rate_pct: float) -> int:
-    """Daily interest accrual for savings accounts."""
-    daily_rate = annual_rate_pct / 365.0 / 100.0
-    return int(balance_kobo * daily_rate)
-
-
-def compute_wht(interest_kobo: int) -> int:
-    """Withholding Tax on interest — 10% per Nigerian tax law."""
-    return int(interest_kobo * 0.10)
-
-
-# ── Validation with Error Accumulation ───────────────────────────────────────
-
-def validate_loan_application(
-    customer_id: str, amount_kobo: int, tenor_months: int, annual_rate: float,
-    monthly_income_kobo: int, existing_debt_kobo: int, kyc_level: str,
-    employment_years: float = 0, age: int = 30,
-) -> tuple:
-    """Comprehensive loan validation with error accumulation."""
-    errors = []
-    if amount_kobo < 1_000_000: errors.append("Amount below CBN minimum ₦10,000")
-    if amount_kobo > 5_000_000_000: errors.append("Amount exceeds ₦50M max single obligor limit")
-    if tenor_months < 1: errors.append("Tenor must be at least 1 month")
-    if tenor_months > 360: errors.append("Tenor exceeds 30-year maximum")
-    if annual_rate <= 0: errors.append("Interest rate must be positive")
-    if annual_rate > 30: errors.append("Rate exceeds CBN maximum lending rate")
-
-    # DTI check
-    emi = compute_emi(amount_kobo, annual_rate, tenor_months)
-    dti = compute_dti(monthly_income_kobo, existing_debt_kobo, emi)
-    if dti > 60: errors.append(f"DTI ratio {dti:.1f}% exceeds 60% maximum")
-
-    # KYC tier limits
-    tier_limits = {"tier1": 30_000_000, "tier2": 500_000_000, "tier3": 0}
-    if kyc_level in tier_limits and tier_limits[kyc_level] > 0:
-        if amount_kobo > tier_limits[kyc_level]:
-            errors.append(f"{kyc_level} KYC max loan ₦{tier_limits[kyc_level] // 100:,}")
-
-    # Age check
-    if age < 18: errors.append("Applicant must be 18+")
-    if age + tenor_months // 12 > 65: errors.append(f"Applicant will be {age + tenor_months // 12} at maturity (max 65)")
-
-    # Employment
-    if employment_years < 0.5: errors.append("Minimum 6 months employment required")
-
-    return len(errors) == 0, errors
-
-
-# ── Payment Reversal & Reconciliation ────────────────────────────────────────
-
-def reverse_transaction(txn_id: str, amount_kobo: int, sender: str, receiver: str, reason: str) -> dict:
-    """Generate reversal with GL entries."""
-    import time
-    return {
-        "reversal_id": f"REV-{txn_id}-{int(time.time()*1000)}",
-        "original_txn_id": txn_id,
-        "amount_kobo": amount_kobo,
-        "reason": reason,
-        "status": "reversed",
-        "reversed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "gl_entries": [
-            {"debit": receiver, "credit": sender, "amount_kobo": amount_kobo, "narration": f"Reversal: {reason}"},
-        ],
-    }
-
-
-def reconcile_transactions(internal: list, external: list) -> dict:
-    """Match internal records vs external (NIBSS/processor) records."""
-    ext_map = {t.get("session_id", ""): t for t in external if t.get("session_id")}
-    matched, unmatched, amount_mismatches = 0, 0, 0
-    for txn in internal:
-        sid = txn.get("session_id", "")
-        if sid in ext_map:
-            if txn.get("amount_kobo") == ext_map[sid].get("amount_kobo"):
-                matched += 1
-            else:
-                amount_mismatches += 1
-        else:
-            unmatched += 1
-    return {
-        "matched": matched, "unmatched": unmatched,
-        "amount_mismatches": amount_mismatches,
-        "total_internal": len(internal), "total_external": len(external),
-        "exceptions": len(external) - matched,
-    }
-
-
-# ── Velocity & Fraud Detection ───────────────────────────────────────────────
-
-VELOCITY_RULES = [
-    {"max_amount_kobo": 490_000_000, "max_count": 3, "window_hours": 24, "description": "3x near-threshold in 24h"},
-    {"max_amount_kobo": 100_000_000, "max_count": 10, "window_hours": 1, "description": "10 transfers in 1h"},
-    {"max_amount_kobo": 50_000_000, "max_count": 20, "window_hours": 24, "description": "20 transfers in 24h"},
+# --- NDPR Data Processing Purposes (Section 2.2) ---
+LAWFUL_BASES = ["consent", "contract", "legal_obligation", "vital_interest", "public_interest", "legitimate_interest"]
+DATA_PURPOSES = [
+    "account_management", "transaction_processing", "kyc_verification",
+    "aml_screening", "credit_scoring", "marketing", "analytics",
+    "fraud_detection", "regulatory_reporting", "customer_support"
 ]
 
-def check_velocity(recent_transactions: list, new_amount_kobo: int) -> tuple:
-    """Check velocity limits to detect potential fraud/structuring."""
-    for rule in VELOCITY_RULES:
-        count = sum(1 for t in recent_transactions if t.get("amount_kobo", 0) >= rule["max_amount_kobo"])
-        if count >= rule["max_count"]:
-            return False, f"Velocity breach: {rule['description']}"
-    return True, ""
-
-
-def compute_fraud_score(
-    amount_kobo: int, is_international: bool = False, is_new_beneficiary: bool = False,
-    unusual_time: bool = False, device_changed: bool = False, failed_attempts: int = 0,
-) -> tuple:
-    """Multi-factor transaction fraud scoring."""
-    score = 0.0
-    if is_international: score += 20
-    if is_new_beneficiary: score += 15
-    if unusual_time: score += 10
-    if device_changed: score += 25
-    if failed_attempts >= 3: score += 30
-    if amount_kobo > 500_000_000: score += 15
-    risk = "low" if score < 40 else ("medium" if score < 70 else "high")
-    return min(score, 100.0), risk
-
-
-
-
-class GrpcServicer:
-    """gRPC handler for inter-service calls."""
-    def __init__(self, service_name):
-        self.service_name = service_name
-        self.request_count = 0
-
-    def Process(self, request_data):
-        self.request_count += 1
-        trace_id = f"grpc-{int(time.time()*1000)}-{os.getpid()}"
-        return {"status": "processed", "service": self.service_name, "trace_id": trace_id}
-
-def start_grpc_server(service_name, port):
-    """Start TCP-based gRPC server for inter-service calls."""
-    def handle_client(conn, addr, servicer):
-        try:
-            data = conn.recv(4096)
-            if not data: return
-            result = servicer.Process(data)
-            response = json.dumps(result).encode()
-            conn.sendall(_grpc_struct.pack(">I", len(response)) + response)
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
-        finally:
-            conn.close()
-
-    def serve():
-        servicer = GrpcServicer(service_name)
-        sock = _grpc_socket.socket(_grpc_socket.AF_INET, _grpc_socket.SOCK_STREAM)
-        sock.setsockopt(_grpc_socket.SOL_SOCKET, _grpc_socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", int(port)))
-        sock.listen(32)
-        logger.info(f"[{service_name}] gRPC server on :{port}")
-        while True:
-            try:
-                conn, addr = sock.accept()
-                _grpc_threading.Thread(target=handle_client, args=(conn, addr, servicer), daemon=True).start()
-            except Exception:
-                break
-
-    t = _grpc_threading.Thread(target=serve, daemon=True)
-    t.start()
-    return t
-
-# --- Configuration ---
-DB_URL = os.environ.get("DATABASE_URL", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "${JWT_SECRET}")
-AML_ENGINE_URL = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-
-# --- mTLS Configuration ---
-MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
-TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54bank/certs/service.crt")
-TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
-TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
-PORT = int(os.environ.get("PORT", "9622"))
-START_TIME = time.time()
-
-# --- Metrics ---
-request_count = 0
-error_count = 0
-metrics_lock = threading.Lock()
-
-def inc_requests():
-    global request_count
-    with metrics_lock:
-        request_count += 1
-
-def inc_errors():
-    global error_count
-    with metrics_lock:
-        error_count += 1
-
-# --- Database ---
-_db_pool = None
-
-def get_db():
-    global _db_pool
-    if not DB_URL:
-        return None
-    try:
-        if _db_pool is None:
-            from psycopg2.pool import SimpleConnectionPool
-            _db_pool = SimpleConnectionPool(minconn=2, maxconn=10, dsn=DB_URL)
-            logger.info("Database connection pool initialized (2-10 connections)")
-        conn = _db_pool.getconn()
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        logger.warning(f"DB pool connection failed: {e}")
-        return None
-
-def release_db(conn):
-    """Return a connection to the pool."""
-    global _db_pool
-    if _db_pool and conn:
-        try:
-            _db_pool.putconn(conn)
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
-
-def db_insert(table, record):
-    conn = get_db()
-    if not conn:
-        logger.error(f"[{SERVICE_NAME}] CRITICAL: No database connection — refusing write to prevent data loss")
-        raise ConnectionError(f"Database unavailable for {SERVICE_NAME}. Set DATABASE_URL environment variable.")
-    try:
-        cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "ndpr-compliance-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"[{SERVICE_NAME}] DB insert failed: {e}")
-        raise
-
-def db_query(table, page=1, limit=50):
-    conn = get_db()
-    if not conn:
-        return [], 0
-    try:
-        cur = conn.cursor()
-        offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("ndpr-compliance-py", limit, offset))
-        rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("ndpr-compliance-py",))
-        total = cur.fetchone()[0]
-        return items, total
-    except Exception as e:
-        logger.error(f"DB query failed: {e}")
-        return [], 0
-
-# --- JWT Auth ---
-def validate_jwt(headers):
-    auth = headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return None, "Missing Bearer token"
-    token = auth[7:]
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None, "Invalid token format"
-    # In production: verify JWT signature with JWT_SECRET
-    return {"sub": "authenticated"}, None
-
-# --- Domain Logic ---
-def gen_id():
-    return "NDP-" + "".join(random.choices(string.hexdigits[:16].upper(), k=8))
-
-
-def now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-def assess_data_processing(data_categories, purpose, consent_obtained, retention_days):
-    sensitive = ["biometric", "health", "financial", "political", "religious", "genetic"]
-    has_sensitive = any(c in sensitive for c in data_categories)
-    issues = []
-    if not consent_obtained:
-        issues.append({"rule": "NDPR 2.3", "severity": "critical", "issue": "Consent not obtained for data processing"})
-    if has_sensitive and not consent_obtained:
-        issues.append({"rule": "NDPR 2.5", "severity": "critical", "issue": "Explicit consent required for sensitive data"})
-    if retention_days > 365 and "financial" not in data_categories:
-        issues.append({"rule": "NDPR 2.7", "severity": "major", "issue": f"Retention period ({retention_days} days) exceeds necessity"})
-    dpia_required = has_sensitive or len(data_categories) > 3
-    return {"compliant": len(issues) == 0, "issues": issues, "dpia_required": dpia_required, "has_sensitive_data": has_sensitive, "lawful_basis": "consent" if consent_obtained else "none", "recommended_retention_days": min(retention_days, 365)}
-
-
-
-# --- HTTP Handler ---
-
-class CircuitBreaker:
-    def __init__(self, threshold=5, reset_timeout=30):
-        self.failures = 0
-        self.threshold = threshold
-        self.reset_timeout = reset_timeout
-        self.last_failure = 0
-        self.state = "closed"
-    def allow(self):
-        if self.state == "open":
-            if time.time() - self.last_failure > self.reset_timeout:
-                self.state = "half-open"
-                return True
-            return False
-        return True
-    def record_success(self):
-        self.failures = 0
-        self.state = "closed"
-    def record_failure(self):
-        self.failures += 1
-        self.last_failure = time.time()
-        if self.failures >= self.threshold:
-            self.state = "open"
-
-_circuit_breaker = CircuitBreaker()
-
-def call_service(method, url, body=None, retries=3, timeout=15):
-    """Call another microservice with retries and circuit breaker."""
-    if not _circuit_breaker.allow():
-        raise Exception(f"Circuit breaker open for {url}")
-    
-    last_err = None
-    for attempt in range(retries):
-        try:
-            if attempt > 0:
-                time.sleep(0.1 * (2 ** attempt))
-            
-            data = json.dumps(body).encode() if body else None
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("Content-Type", "application/json")
-            
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                result = json.loads(resp.read().decode())
-                _circuit_breaker.record_success()
-                return result
-        except Exception as e:
-            last_err = e
-            _circuit_breaker.record_failure()
-    
-    raise last_err
-
-
-# --- gRPC Client with Retry + Circuit Breaker ---
-class _CircuitBreaker:
-    def __init__(self, threshold=5, reset_after=30):
-        self.failures = 0
-        self.last_failure = 0
-        self.threshold = threshold
-        self.reset_after = reset_after
-        self._lock = threading.Lock()
-
-    def allow(self):
-        with self._lock:
-            if self.failures >= self.threshold:
-                if time.time() - self.last_failure > self.reset_after:
-                    self.failures = self.threshold // 2
-                    return True
-                return False
-            return True
-
-    def record_success(self):
-        with self._lock:
-            if self.failures > 0: self.failures -= 1
-
-    def record_failure(self):
-        with self._lock:
-            self.failures += 1
-            self.last_failure = time.time()
-
-_grpc_cb = _CircuitBreaker()
-
-def grpc_call(target, method, payload, retries=3):
-    """Make a gRPC call with retry + circuit breaker."""
-    if not _grpc_cb.allow():
-        logger.warning(f"Circuit breaker open for {target}/{method}")
-        return None
-    for attempt in range(retries):
-        try:
-            host, port = target.rsplit(":", 1)
-            sock = _grpc_socket.socket(_grpc_socket.AF_INET, _grpc_socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((host, int(port)))
-            data = json.dumps({"method": method, "payload": payload}).encode()
-            sock.sendall(_grpc_struct.pack(">I", len(data)) + data)
-            length_bytes = sock.recv(4)
-            if len(length_bytes) == 4:
-                length = _grpc_struct.unpack(">I", length_bytes)[0]
-                response = sock.recv(length)
-                _grpc_cb.record_success()
-                return json.loads(response)
-            _grpc_cb.record_failure()
-        except Exception as e:
-            _grpc_cb.record_failure()
-            if attempt < retries - 1:
-                time.sleep((2 ** attempt) * 0.2)
-            logger.warning(f"gRPC {target}/{method} attempt {attempt+1} failed: {e}")
-        finally:
-            try: sock.close()
-            except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-    return None
-
-def call_service(method, url, body=None, retries=3, timeout=15):
-    """HTTP inter-service call with retry + circuit breaker."""
-    if not _grpc_cb.allow():
-        return None
-    import urllib.request, urllib.error
-    for attempt in range(retries):
-        try:
-            data = json.dumps(body).encode() if body else None
-            req = urllib.request.Request(url, data=data, method=method,
-                                         headers={"Content-Type": "application/json"})
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            _grpc_cb.record_success()
-            return json.loads(resp.read())
-        except Exception as e:
-            _grpc_cb.record_failure()
-            if attempt < retries - 1:
-                time.sleep((2 ** attempt) * 0.2)
-            logger.warning(f"HTTP {method} {url} attempt {attempt+1} failed: {e}")
-    return None
-
-# gRPC service registry
-GRPC_REGISTRY = {
-    "core-banking": 9090, "payments-hub": 9091, "gl-engine": 9092,
-    "trade-finance": 9093, "cheque-clearing": 9094, "nibss-nip": 9095,
-    "credit-scoring": 9096, "fraud-detection": 9097, "aml-screening": 9098,
-    "kyc-engine": 9099,
+# --- NDPR Data Retention Periods (Section 2.3) ---
+RETENTION_POLICIES = {
+    "transaction_records": {"years": 7, "basis": "CBN_regulation"},
+    "kyc_documents": {"years": 10, "basis": "CBN_KYC_AML"},
+    "audit_logs": {"years": 5, "basis": "NDPR_Section_2.3"},
+    "marketing_consents": {"years": 2, "basis": "NDPR_consent_refresh"},
+    "customer_communications": {"years": 3, "basis": "dispute_resolution"},
+    "credit_reports": {"years": 6, "basis": "credit_bureau_regulation"},
+    "employee_records": {"years": 7, "basis": "labor_law"},
+    "session_logs": {"days": 90, "basis": "security_monitoring"},
 }
 
-def call_service_grpc(target, method, payload=None):
-    """Convenience: try gRPC first, fall back to HTTP."""
-    service_name_key = target.split("/")[0] if "/" in target else target
-    if service_name_key in GRPC_REGISTRY:
-        result = grpc_call(f"localhost:{GRPC_REGISTRY[service_name_key]}", method, payload or {})
-        if result: return result
-    return call_service("POST", f"http://{target}/v1/{method}", payload)
+# --- PII Field Registry ---
+PII_FIELDS = {
+    "bvn": {"sensitivity": "critical", "mask_pattern": "***{last4}", "retention": "kyc_documents"},
+    "nin": {"sensitivity": "critical", "mask_pattern": "***{last4}", "retention": "kyc_documents"},
+    "phone_number": {"sensitivity": "high", "mask_pattern": "+234***{last4}", "retention": "account_management"},
+    "email": {"sensitivity": "high", "mask_pattern": "{first}***@{domain}", "retention": "account_management"},
+    "account_number": {"sensitivity": "critical", "mask_pattern": "****{last4}", "retention": "transaction_records"},
+    "date_of_birth": {"sensitivity": "high", "mask_pattern": "****-**-**", "retention": "kyc_documents"},
+    "address": {"sensitivity": "medium", "mask_pattern": "***", "retention": "kyc_documents"},
+    "full_name": {"sensitivity": "medium", "mask_pattern": "{first_initial}. {last}", "retention": "account_management"},
+    "passport_number": {"sensitivity": "critical", "mask_pattern": "***{last3}", "retention": "kyc_documents"},
+    "salary": {"sensitivity": "high", "mask_pattern": "***", "retention": "credit_reports"},
+    "ip_address": {"sensitivity": "medium", "mask_pattern": "{first_octet}.*.*.*", "retention": "session_logs"},
+}
 
-
-# --- Alerting ---
-_ALERT_RULES = [
-    {"name": "high_error_rate", "metric": "error_rate", "threshold": 0.05, "severity": "critical"},
-    {"name": "high_latency", "metric": "p99_latency_ms", "threshold": 5000, "severity": "warning"},
-    {"name": "db_failures", "metric": "db_failures", "threshold": 3, "severity": "critical"},
-]
-
-def check_alerts():
-    fired = []
-    err_rate = error_count / max(request_count, 1)
-    if err_rate > 0.05:
-        fired.append({"rule": "high_error_rate", "value": err_rate, "severity": "critical"})
-    return fired
-
-
-# --- Graceful Degradation ---
-class _DegradationState:
+# --- Consent Manager ---
+class ConsentManager:
     def __init__(self):
-        self.db_available = True
-        self.cache_available = True
-        self.upstreams = {}
-        self._lock = threading.Lock()
+        self.consents = {}  # user_id -> {purpose -> consent_record}
+    
+    def grant_consent(self, user_id, purpose, legal_basis, ip_address=None, user_agent=None):
+        if purpose not in DATA_PURPOSES:
+            return {"error": f"Unknown purpose: {purpose}", "valid_purposes": DATA_PURPOSES}
+        if legal_basis not in LAWFUL_BASES:
+            return {"error": f"Invalid legal basis: {legal_basis}", "valid_bases": LAWFUL_BASES}
+        
+        consent_id = str(uuid.uuid4())
+        record = {
+            "consent_id": consent_id,
+            "user_id": user_id,
+            "purpose": purpose,
+            "legal_basis": legal_basis,
+            "granted": True,
+            "granted_at": datetime.now(timezone.utc).isoformat(),
+            "expires_at": (datetime.now(timezone.utc) + timedelta(days=730)).isoformat(),
+            "ip_address": ip_address,
+            "user_agent": user_agent,
+            "version": 1
+        }
+        
+        if user_id not in self.consents:
+            self.consents[user_id] = {}
+        self.consents[user_id][purpose] = record
+        
+        logger.info(f"Consent granted: user={user_id} purpose={purpose} basis={legal_basis}")
+        return {"status": "granted", "consent": record}
+    
+    def revoke_consent(self, user_id, purpose):
+        if user_id in self.consents and purpose in self.consents[user_id]:
+            self.consents[user_id][purpose]["granted"] = False
+            self.consents[user_id][purpose]["revoked_at"] = datetime.now(timezone.utc).isoformat()
+            logger.info(f"Consent revoked: user={user_id} purpose={purpose}")
+            return {"status": "revoked", "purpose": purpose}
+        return {"error": "Consent not found"}
+    
+    def check_consent(self, user_id, purpose):
+        if user_id in self.consents and purpose in self.consents[user_id]:
+            c = self.consents[user_id][purpose]
+            if c["granted"] and datetime.fromisoformat(c["expires_at"]) > datetime.now(timezone.utc):
+                return {"has_consent": True, "consent": c}
+        return {"has_consent": False, "purpose": purpose}
+    
+    def get_user_consents(self, user_id):
+        return self.consents.get(user_id, {})
 
-    def set_db(self, ok):
-        with self._lock: self.db_available = ok
+# --- Data Subject Rights (DSAR) Handler ---
+class DSARHandler:
+    VALID_TYPES = ["access", "erasure", "rectification", "portability", "restriction", "objection"]
+    
+    def __init__(self):
+        self.requests = {}
+    
+    def create_request(self, user_id, request_type, details=None):
+        if request_type not in self.VALID_TYPES:
+            return {"error": f"Invalid DSAR type: {request_type}", "valid_types": self.VALID_TYPES}
+        
+        req_id = f"DSAR-{uuid.uuid4().hex[:12].upper()}"
+        deadline = datetime.now(timezone.utc) + timedelta(days=30)  # NDPR: 30-day response
+        
+        record = {
+            "request_id": req_id,
+            "user_id": user_id,
+            "type": request_type,
+            "status": "received",
+            "details": details,
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+            "deadline": deadline.isoformat(),
+            "timeline": [
+                {"status": "received", "at": datetime.now(timezone.utc).isoformat(), "note": "Request received and acknowledged"}
+            ]
+        }
+        self.requests[req_id] = record
+        logger.info(f"DSAR created: {req_id} type={request_type} user={user_id} deadline={deadline.date()}")
+        return {"status": "received", "request": record}
+    
+    def process_access_request(self, user_id):
+        """Right of Access — compile all data held about user"""
+        return {
+            "user_id": user_id,
+            "data_categories": [
+                {"category": "identity", "fields": ["name", "email", "phone", "bvn", "nin"], "source": "kyc-service"},
+                {"category": "accounts", "fields": ["account_numbers", "balances", "products"], "source": "core-banking"},
+                {"category": "transactions", "fields": ["history", "amounts", "dates"], "source": "transaction-service"},
+                {"category": "consents", "fields": ["purposes", "dates", "status"], "source": "ndpr-service"},
+                {"category": "communications", "fields": ["emails", "sms", "notifications"], "source": "notification-service"},
+                {"category": "ml_decisions", "fields": ["credit_scores", "fraud_flags", "risk_tiers"], "source": "ml-inference"},
+            ],
+            "processing_purposes": DATA_PURPOSES,
+            "retention_policies": RETENTION_POLICIES,
+            "third_party_sharing": [
+                {"entity": "NIBSS", "purpose": "payment_processing", "legal_basis": "contract"},
+                {"entity": "Credit Bureau", "purpose": "credit_reporting", "legal_basis": "legal_obligation"},
+                {"entity": "CBN", "purpose": "regulatory_reporting", "legal_basis": "legal_obligation"},
+                {"entity": "NFIU", "purpose": "aml_reporting", "legal_basis": "legal_obligation"},
+            ],
+            "generated_at": datetime.now(timezone.utc).isoformat()
+        }
+    
+    def process_erasure_request(self, user_id):
+        """Right to Erasure — with regulatory exemptions"""
+        return {
+            "user_id": user_id,
+            "erasable": [
+                {"category": "marketing_preferences", "action": "delete", "timeline": "immediate"},
+                {"category": "session_logs", "action": "delete", "timeline": "24_hours"},
+                {"category": "analytics_data", "action": "anonymize", "timeline": "7_days"},
+            ],
+            "retained_by_law": [
+                {"category": "transaction_records", "retention": "7 years", "basis": "CBN regulation"},
+                {"category": "kyc_documents", "retention": "10 years", "basis": "CBN KYC/AML"},
+                {"category": "audit_logs", "retention": "5 years", "basis": "NDPR Section 2.3"},
+                {"category": "tax_records", "retention": "6 years", "basis": "FIRS regulation"},
+            ],
+            "note": "Some data retained per Nigerian regulatory requirements (CBN, FIRS, NFIU)"
+        }
 
-    def is_db_ok(self):
-        with self._lock: return self.db_available
+# --- PII Masking Engine ---
+class PIIMaskingEngine:
+    @staticmethod
+    def mask_bvn(value):
+        if not value or len(value) < 4: return "***"
+        return f"***{value[-4:]}"
+    
+    @staticmethod
+    def mask_nin(value):
+        if not value or len(value) < 4: return "***"
+        return f"***{value[-4:]}"
+    
+    @staticmethod
+    def mask_phone(value):
+        if not value or len(value) < 4: return "+234***"
+        return f"+234***{value[-4:]}"
+    
+    @staticmethod
+    def mask_email(value):
+        if not value or "@" not in value: return "***@***"
+        parts = value.split("@")
+        return f"{parts[0][0]}***@{parts[1]}"
+    
+    @staticmethod
+    def mask_account(value):
+        if not value or len(value) < 4: return "****"
+        return f"****{value[-4:]}"
+    
+    @staticmethod
+    def mask_dict(data, fields_to_mask=None):
+        if fields_to_mask is None:
+            fields_to_mask = list(PII_FIELDS.keys())
+        masked = {}
+        for k, v in data.items():
+            key_lower = k.lower().replace("-", "_").replace(" ", "_")
+            if any(f in key_lower for f in fields_to_mask):
+                if isinstance(v, str):
+                    if "bvn" in key_lower: masked[k] = PIIMaskingEngine.mask_bvn(v)
+                    elif "nin" in key_lower: masked[k] = PIIMaskingEngine.mask_nin(v)
+                    elif "phone" in key_lower or "mobile" in key_lower: masked[k] = PIIMaskingEngine.mask_phone(v)
+                    elif "email" in key_lower: masked[k] = PIIMaskingEngine.mask_email(v)
+                    elif "account" in key_lower: masked[k] = PIIMaskingEngine.mask_account(v)
+                    else: masked[k] = "***"
+                else:
+                    masked[k] = "***"
+            else:
+                masked[k] = v
+        return masked
 
-    def set_upstream(self, name, ok):
-        with self._lock: self.upstreams[name] = ok
+consent_mgr = ConsentManager()
+dsar_handler = DSARHandler()
+masking_engine = PIIMaskingEngine()
 
-    def status(self):
-        with self._lock:
-            return {
-                "db_available": self.db_available,
-                "cache_available": self.cache_available,
-                "upstreams": dict(self.upstreams),
-                "mode": "normal" if self.db_available else "degraded",
-            }
-
-_degrade = _DegradationState()
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
-
-    def respond(self, code, data):
-        if code >= 400:
-            inc_errors()
+class NDPRHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): pass
+    
+    def _json(self, code, data):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
-        add_security_headers(self)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Security-Policy", "default-src 'self'")
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
-
+    
     def do_GET(self):
-        _cache_key = f"ndpr_compliance_{self.path}"
-        _cached = cache_get(_cache_key)
-        if _cached and self.path not in ("/healthz", "/readyz", "/livez", "/metrics", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-Cache", "HIT")
-            add_security_headers(self)
-            self.end_headers()
-            self.wfile.write(_cached.encode() if isinstance(_cached, str) else _cached)
-            return
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[ndpr-compliance-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
         path = urlparse(self.path).path
-
-        if         if path == "/v1/cache-metrics":
-            self._respond(200, cache_metrics())
-            return
-        path == "/healthz":
-            db = get_db()
-            db_status = "not_configured"
-            redis_status = "not_configured"
-            overall = "healthy"
-            if db:
-                try:
-                    cur = db.cursor()
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-                    db_status = "connected"
-                except Exception as _hce:
-                    db_status = f"unhealthy: {_hce}"
-                    overall = "degraded"
-            if _cache_pool:
-                try:
-                    cache_set("__healthcheck__", "1", 10)
-                    if cache_get("__healthcheck__"):
-                        redis_status = "connected"
-                    else:
-                        redis_status = "unreachable"
-                        overall = "degraded"
-                except Exception:
-                    redis_status = "unreachable"
-                    overall = "degraded"
-            self.respond(200, {
-                "status": overall,
-                "service": "ndpr-compliance-py",
-                "version": "2.0.0",
-                "checks": {
-                    "database": db_status,
-                    "cache": redis_status,
-                },
-                "uptime_secs": round(time.time() - START_TIME),
+        params = parse_qs(urlparse(self.path).query)
+        
+        if path == "/healthz":
+            self._json(200, {"status": "healthy", "service": "ndpr-compliance", "version": "1.0.0"})
+        elif path == "/privacy-policy":
+            self._json(200, {
+                "title": "54Bank Privacy Policy",
+                "version": "2.0",
+                "effective_date": "2026-01-01",
+                "data_controller": {"name": "54Bank Limited", "address": "Lagos, Nigeria", "email": "privacy@54bank.ng", "dpo": "Data Protection Officer"},
+                "lawful_bases": LAWFUL_BASES,
+                "processing_purposes": DATA_PURPOSES,
+                "data_subject_rights": DSARHandler.VALID_TYPES,
+                "retention_policies": RETENTION_POLICIES,
+                "pii_categories": {k: {"sensitivity": v["sensitivity"]} for k, v in PII_FIELDS.items()},
+                "third_party_disclosures": ["NIBSS", "Credit Bureaus", "CBN", "NFIU"],
+                "complaint_authority": "NITDA (Nigeria Information Technology Development Agency)",
+                "last_updated": "2026-01-01"
             })
-        elif path == "/readyz":
-            self.respond(200, {"ready": True})
-        elif path == "/livez":
-            self.respond(200, {"alive": True})
-        elif path == "/v1/degradation":
-                self._json(200, {"service": "ndpr-compliance-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
-            body = (
-                f'# HELP requests_total Total requests\n'
-                f'# TYPE requests_total counter\n'
-                f'requests_total{{service=\"ndpr-compliance-py\"}} {request_count}\n'
-                f'# HELP errors_total Total errors\n'
-                f'# TYPE errors_total counter\n'
-                f'errors_total{{service=\"ndpr-compliance-py\"}} {error_count}\n'
-            )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body.encode())
-        elif path in ("/v1/records", "/v1/list"):
-            claims, err = validate_jwt(dict(self.headers))
-            if err:
-                self.respond(401, {"error": "unauthorized", "detail": err})
-                return
-            items, total = db_query("ndpr_compliance_py")
-            self.respond(200, {"items": items, "total": total, "source": "database" if get_db() else "no_db"})
-        elif path == "/v1/stats":
-            self.respond(200, {
-                "service": "ndpr-compliance-py",
-                "requests": request_count,
-                "errors": error_count,
-                "db_connected": get_db() is not None,
-                "uptime_secs": round(time.time() - START_TIME),
-            })
+        elif path == "/consents" and "user_id" in params:
+            user_id = params["user_id"][0]
+            self._json(200, {"user_id": user_id, "consents": consent_mgr.get_user_consents(user_id)})
+        elif path == "/pii/fields":
+            self._json(200, {"pii_fields": PII_FIELDS})
+        elif path == "/retention-policies":
+            self._json(200, {"policies": RETENTION_POLICIES})
+        elif path == "/dsar/status" and "request_id" in params:
+            req_id = params["request_id"][0]
+            if req_id in dsar_handler.requests:
+                self._json(200, dsar_handler.requests[req_id])
+            else:
+                self._json(404, {"error": "DSAR not found"})
         else:
-            self.respond(404, {"error": "not_found", "path": path})
-
+            self._json(404, {"error": "Not found"})
+    
     def do_POST(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[ndpr-compliance-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
         path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(length).decode() if isinstance(self.rfile.read(length), bytes) else str(self.rfile.read(length)))) if length > 0 else {}
-
-        # JWT auth check (monitoring mode: warn but allow)
-        claims, err = validate_jwt(dict(self.headers))
-        if err:
-            self.respond(401, {"error": "unauthorized", "detail": err})
-            # Inter-service call
-            try:
-                _upstream = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-                call_service("POST", f"{_upstream}/v1/screen", {"service": SERVICE_NAME, "action": "notify"})
-            except Exception as _e:
-                log_event("WARN", f"inter-service call failed: {_e}")
-            return
-
-        if path == "/v1/create":
-            try:
-                result = db_insert("ndpr_compliance_py", body)
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-                self.respond(201, {"created": True, "data": result})
-            except ConnectionError as ce:
-                self.respond(503, {"error": "database_unavailable", "detail": str(ce)})
-                return
-            except Exception as de:
-                logger.error(f"[{SERVICE_NAME}] Write failed: {de}")
-                self.respond(500, {"error": "write_failed", "detail": str(de)})
-                return
-        elif path == "/v1/ndpr-compliance/update":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid:
-                    if "status" in body:
-                        rec["status"] = body["status"]
-                    rec["data"].update({k: v for k, v in body.items() if k != "id"})
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    audit_log.append({"id": gen_id(), "action": "update", "record_id": rid,
-                                     "actor": body.get("updated_by", "system"), "timestamp": now_iso()})
-                    self.respond(200, {"updated": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found: {rid}"})
-
-        elif path == "/v1/ndpr-compliance/process":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid and rec["status"] in ("pending", "active"):
-                    rec["status"] = "completed"
-                    rec["data"]["processed_at"] = now_iso()
-                    rec["data"]["processing_result"] = "success"
-                    rec["data"]["score"] = round(0.85 + random.random() * 0.14, 3)
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    domain_stats["processed_today"] += 1
-                    audit_log.append({"id": gen_id(), "action": "process", "record_id": rid,
-                                     "actor": "system", "timestamp": now_iso()})
-                    self.respond(200, {"processed": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found or not processable: {rid}"})
-        elif path == "/v1/ndpr-compliance/assess":
-            result = assess_data_processing(body.get("data_categories",[]), body.get("purpose",""), body.get("consent_obtained",False), body.get("retention_days",365))
-            self.respond(200, result)
-
-
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or "{}")
+        
+        if path == "/consents/grant":
+            result = consent_mgr.grant_consent(
+                body.get("user_id"), body.get("purpose"), body.get("legal_basis", "consent"),
+                body.get("ip_address"), body.get("user_agent"))
+            self._json(200 if "status" in result else 400, result)
+        elif path == "/consents/revoke":
+            result = consent_mgr.revoke_consent(body.get("user_id"), body.get("purpose"))
+            self._json(200 if "status" in result else 400, result)
+        elif path == "/consents/check":
+            result = consent_mgr.check_consent(body.get("user_id"), body.get("purpose"))
+            self._json(200, result)
+        elif path == "/dsar/create":
+            result = dsar_handler.create_request(body.get("user_id"), body.get("type"), body.get("details"))
+            self._json(200 if "status" in result else 400, result)
+        elif path == "/dsar/access":
+            result = dsar_handler.process_access_request(body.get("user_id"))
+            self._json(200, result)
+        elif path == "/dsar/erasure":
+            result = dsar_handler.process_erasure_request(body.get("user_id"))
+            self._json(200, result)
+        elif path == "/pii/mask":
+            masked = PIIMaskingEngine.mask_dict(body.get("data", {}), body.get("fields"))
+            self._json(200, {"masked": masked})
+        elif path == "/dpia/generate":
+            self._json(200, {
+                "dpia_id": f"DPIA-{uuid.uuid4().hex[:8].upper()}",
+                "project": body.get("project", "unnamed"),
+                "assessment": {
+                    "data_types": body.get("data_types", []),
+                    "processing_scope": body.get("scope", "internal"),
+                    "risk_level": "high" if any(f in body.get("data_types", []) for f in ["bvn", "nin", "biometric"]) else "medium",
+                    "mitigations_required": [
+                        "Field-level encryption for critical PII",
+                        "Access logging for all PII queries",
+                        "Data minimization review",
+                        "Retention policy enforcement",
+                        "Consent verification before processing"
+                    ],
+                    "ndpr_compliance_status": "requires_review",
+                    "nitda_notification_required": True if body.get("scope") == "large_scale" else False,
+                },
+                "generated_at": datetime.now(timezone.utc).isoformat()
+            })
         else:
-            self.respond(404, {"error": "Not found"})
-
-
-
-# --- Graceful Shutdown ---
-server = None
-shutdown_event = threading.Event()
-
-def shutdown_handler(signum, frame):
-    logger.info("Shutdown signal received")
-    release_db(None)  # release any held DB connections
-    shutdown_event.set()
-    if server:
-        threading.Thread(target=server.shutdown).start()
-
-signal.signal(signal.SIGTERM, shutdown_handler)
-
-# --- Security Headers ---
-SECURITY_HEADERS = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "X-XSS-Protection": "1; mode=block",
-    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Content-Security-Policy": "default-src 'self'",
-}
-CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
-
-def add_security_headers(handler_self):
-    """Add security + CORS headers to response."""
-    for k, v in SECURITY_HEADERS.items():
-        handler_self.send_header(k, v)
-    origin = handler_self.headers.get("Origin", "")
-    if origin in [o.strip() for o in CORS_ALLOWED_ORIGINS]:
-        handler_self.send_header("Access-Control-Allow-Origin", origin)
-    handler_self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-    handler_self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
-
-def sanitize_input(s):
-    """Sanitize user input to prevent XSS/injection."""
-    if not isinstance(s, str):
-        return s
-    s = s.replace("<", "&lt;").replace(">", "&gt;")
-    s = s.replace("'", "&#39;").replace('"', "&quot;")
-    s = s.replace("\\", "")
-    return s[:10000] if len(s) > 10000 else s
-
-# --- OpenTelemetry Export ---
-OTEL_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-
-def init_tracing(service_name):
-    """Initialize OpenTelemetry tracing with OTLP export if configured."""
-    if not OTEL_ENDPOINT:
-        return
-    try:
-        from opentelemetry import trace
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-        from opentelemetry.sdk.resources import Resource
-        resource = Resource.create({"service.name": service_name, "deployment.environment": os.environ.get("ENV", "development")})
-        provider = TracerProvider(resource=resource)
-        try:
-            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-            exporter = OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True)
-        except ImportError:
-            exporter = ConsoleSpanExporter()
-        provider.add_span_processor(BatchSpanProcessor(exporter))
-        trace.set_tracer_provider(provider)
-        logger.info(f"OpenTelemetry tracing initialized: {OTEL_ENDPOINT}")
-    except ImportError:
-        logger.debug("OpenTelemetry SDK not installed, tracing disabled")
-    except Exception as e:
-        logger.warning(f"Failed to init tracing: {e}")
-signal.signal(signal.SIGINT, shutdown_handler)
+            self._json(404, {"error": "Not found"})
 
 if __name__ == "__main__":
-    get_db()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": "ndpr-compliance-py", "port": PORT, "message": "starting"}))
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        if db_conn:
-            db_conn.close()
-        logger.info("Server stopped gracefully")
+    server = HTTPServer(("0.0.0.0", PORT), NDPRHandler)
+    logger.info(f"NDPR Compliance Service listening on :{PORT}")
+    server.serve_forever()

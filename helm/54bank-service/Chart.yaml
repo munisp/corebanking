@@ -1,0 +1,5 @@
+apiVersion: v2
+name: 54bank-service
+description: Generic Helm chart for 54Bank microservices
+version: 1.0.0
+appVersion: "1.0.0"

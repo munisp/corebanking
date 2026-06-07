@@ -672,7 +672,38 @@ fn mtls_config() -> (bool, String, String, String) {
 }
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
+async 
+// --- PII Masking (NDPR Compliance) ---
+fn mask_pii(value: &str, field_type: &str) -> String {
+    if value.is_empty() { return "***".to_string(); }
+    match field_type {
+        "bvn" | "nin" => {
+            if value.len() >= 4 { format!("***{}", &value[value.len()-4..]) }
+            else { "***".to_string() }
+        },
+        "phone" => {
+            if value.len() >= 4 { format!("+234***{}", &value[value.len()-4..]) }
+            else { "+234***".to_string() }
+        },
+        "email" => {
+            if let Some(at) = value.find('@') {
+                let local = &value[..at]; let domain = &value[at+1..];
+                format!("{}***@{}", &local[..1], domain)
+            } else { "***@***".to_string() }
+        },
+        "account" => {
+            if value.len() >= 4 { format!("****{}", &value[value.len()-4..]) }
+            else { "****".to_string() }
+        },
+        _ => {
+            if value.len() > 2 { format!("{}***{}", &value[..1], &value[value.len()-1..]) }
+            else { "***".to_string() }
+        }
+    }
+}
+
+
+fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8269);
     let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
         match init_db(&url).await {

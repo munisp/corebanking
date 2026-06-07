@@ -1154,6 +1154,43 @@ func ensureDB() {
 	}
 }
 
+
+// --- PII Masking (NDPR Compliance) ---
+func maskPII(value, fieldType string) string {
+	if len(value) == 0 { return "***" }
+	switch fieldType {
+	case "bvn", "nin":
+		if len(value) >= 4 { return "***" + value[len(value)-4:] }
+		return "***"
+	case "phone":
+		if len(value) >= 4 { return "+234***" + value[len(value)-4:] }
+		return "+234***"
+	case "email":
+		parts := strings.SplitN(value, "@", 2)
+		if len(parts) == 2 { return string(parts[0][0]) + "***@" + parts[1] }
+		return "***@***"
+	case "account":
+		if len(value) >= 4 { return "****" + value[len(value)-4:] }
+		return "****"
+	default:
+		if len(value) > 4 { return value[:1] + "***" + value[len(value)-1:] }
+		return "***"
+	}
+}
+
+func sanitizeLogEntry(msg string) string {
+	// Mask BVN patterns (11 digits)
+	re1 := regexp.MustCompile(`\b[0-9]{11}\b`)
+	msg = re1.ReplaceAllStringFunc(msg, func(s string) string { return "***" + s[len(s)-4:] })
+	// Mask account numbers (10 digits)
+	re2 := regexp.MustCompile(`\b[0-9]{10}\b`)
+	msg = re2.ReplaceAllStringFunc(msg, func(s string) string { return "****" + s[len(s)-4:] })
+	// Mask email
+	re3 := regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
+	msg = re3.ReplaceAllString(msg, "***@***")
+	return msg
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }

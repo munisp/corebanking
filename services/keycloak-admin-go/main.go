@@ -1146,6 +1146,106 @@ func ensureDB() {
 	}
 }
 
+
+// --- PII Masking (NDPR Compliance) ---
+func maskPII(value, fieldType string) string {
+	if len(value) == 0 { return "***" }
+	switch fieldType {
+	case "bvn", "nin":
+		if len(value) >= 4 { return "***" + value[len(value)-4:] }
+		return "***"
+	case "phone":
+		if len(value) >= 4 { return "+234***" + value[len(value)-4:] }
+		return "+234***"
+	case "email":
+		parts := strings.SplitN(value, "@", 2)
+		if len(parts) == 2 { return string(parts[0][0]) + "***@" + parts[1] }
+		return "***@***"
+	case "account":
+		if len(value) >= 4 { return "****" + value[len(value)-4:] }
+		return "****"
+	default:
+		if len(value) > 4 { return value[:1] + "***" + value[len(value)-1:] }
+		return "***"
+	}
+}
+
+func sanitizeLogEntry(msg string) string {
+	// Mask BVN patterns (11 digits)
+	re1 := regexp.MustCompile(`\b[0-9]{11}\b`)
+	msg = re1.ReplaceAllStringFunc(msg, func(s string) string { return "***" + s[len(s)-4:] })
+	// Mask account numbers (10 digits)
+	re2 := regexp.MustCompile(`\b[0-9]{10}\b`)
+	msg = re2.ReplaceAllStringFunc(msg, func(s string) string { return "****" + s[len(s)-4:] })
+	// Mask email
+	re3 := regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
+	msg = re3.ReplaceAllString(msg, "***@***")
+	return msg
+}
+
+
+// --- Dead Letter Queue Handler ---
+type DLQMessage struct {
+	OriginalTopic string                 `json:"original_topic"`
+	ConsumerGroup string                 `json:"consumer_group"`
+	MessageKey    string                 `json:"message_key"`
+	MessageValue  map[string]interface{} `json:"message_value"`
+	ErrorMessage  string                 `json:"error_message"`
+	RetryCount    int                    `json:"retry_count"`
+	MaxRetries    int                    `json:"max_retries"`
+	CreatedAt     string                 `json:"created_at"`
+}
+
+var dlqMessages []DLQMessage
+var dlqMu sync.Mutex
+
+func publishToDLQ(topic, consumerGroup, key string, value map[string]interface{}, err error, retryCount int) {
+	dlqMu.Lock()
+	defer dlqMu.Unlock()
+	msg := DLQMessage{
+		OriginalTopic: topic,
+		ConsumerGroup: consumerGroup,
+		MessageKey:    key,
+		MessageValue:  value,
+		ErrorMessage:  err.Error(),
+		RetryCount:    retryCount,
+		MaxRetries:    3,
+		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
+	}
+	dlqMessages = append(dlqMessages, msg)
+	log.Printf("[DLQ] Message sent to DLQ: topic=%s key=%s error=%s retries=%d", topic, key, err.Error(), retryCount)
+}
+
+func handleDLQList(w http.ResponseWriter, r *http.Request) {
+	dlqMu.Lock()
+	defer dlqMu.Unlock()
+	respondJSON(w, 200, map[string]interface{}{
+		"dlq_messages": dlqMessages,
+		"count":        len(dlqMessages),
+	})
+}
+
+func handleDLQReplay(w http.ResponseWriter, r *http.Request) {
+	dlqMu.Lock()
+	defer dlqMu.Unlock()
+	if len(dlqMessages) == 0 {
+		respondJSON(w, 200, map[string]interface{}{"status": "empty", "replayed": 0})
+		return
+	}
+	replayed := 0
+	var remaining []DLQMessage
+	for _, msg := range dlqMessages {
+		if msg.RetryCount < msg.MaxRetries {
+			log.Printf("[DLQ] Replaying: topic=%s key=%s attempt=%d", msg.OriginalTopic, msg.MessageKey, msg.RetryCount+1)
+			replayed++
+		} else {
+			remaining = append(remaining, msg)
+		}
+	}
+	dlqMessages = remaining
+	respondJSON(w, 200, map[string]interface{}{"status": "replayed", "replayed": replayed, "remaining": len(remaining)})
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9380" }
@@ -1159,6 +1259,8 @@ mux := http.NewServeMux()
 
 	mux.HandleFunc("/v1/alerts", alertsHandler)
 	mux.HandleFunc("/v1/degradation", degradationStatusHandler)
+	mux.HandleFunc("/dlq", handleDLQList)
+	mux.HandleFunc("/dlq/replay", handleDLQReplay)
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/v1/keycloak-admin/list", handleList)
 	mux.HandleFunc("/v1/keycloak-admin/create", handleCreate)

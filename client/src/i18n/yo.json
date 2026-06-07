@@ -1,0 +1,18 @@
+{
+  "app_name": "54Bank",
+  "dashboard": "Dasibodu",
+  "accounts": "Àwọn àkọọlẹ̀",
+  "transfers": "Gbígbé owó",
+  "payments": "Ìsanwó",
+  "cards": "Káàdì",
+  "loans": "Àwín",
+  "settings": "Ètò",
+  "logout": "Jade",
+  "welcome": "Ẹ káàbọ̀",
+  "balance": "Ìwọ̀ntúnwọ̀nsì Àkọọlẹ̀",
+  "recent_transactions": "Àwọn ìdúnàádúrà tó ṣẹ̀ṣẹ̀",
+  "quick_transfer": "Gbígbé owó kíákíá",
+  "pay_bills": "San owó ìdíyelé",
+  "currency": "NGN",
+  "language": "Yorùbá"
+}

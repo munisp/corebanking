@@ -1,0 +1,53 @@
+# 54Bank Security Scanning Pipeline
+# SAST + Dependency Scanning + Container Scanning + Secret Detection
+
+scans:
+  sast:
+    tool: semgrep
+    config:
+      - p/golang
+      - p/python
+      - p/rust
+      - p/typescript
+      - p/owasp-top-ten
+      - p/security-audit
+    exclude:
+      - "tests/**"
+      - "*.test.*"
+      - "node_modules/**"
+    severity_threshold: WARNING
+
+  dependency_scanning:
+    tool: trivy
+    targets:
+      - go.mod
+      - requirements.txt
+      - Cargo.toml
+      - package.json
+    severity: [CRITICAL, HIGH]
+    ignore_unfixed: false
+
+  container_scanning:
+    tool: trivy
+    images:
+      - "54bank/*:latest"
+    severity: [CRITICAL, HIGH]
+
+  secret_detection:
+    tool: trufflehog
+    scan_entire_history: true
+    only_verified: false
+    exclude_paths:
+      - ".git"
+      - "node_modules"
+
+  dast:
+    tool: owasp-zap
+    target: "http://localhost:3000"
+    scan_type: baseline
+    rules:
+      - 10038  # CSP
+      - 10098  # Cross-Domain Misconfiguration
+      - 40012  # Cross Site Scripting (Reflected)
+      - 40014  # Cross Site Scripting (Persistent)
+      - 90001  # Insecure JSF ViewState

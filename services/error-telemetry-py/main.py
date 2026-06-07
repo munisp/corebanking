@@ -1,3 +1,26 @@
+
+# --- PII Masking (NDPR Compliance) ---
+import re as _pii_re
+
+def mask_pii(value: str, field_type: str = "generic") -> str:
+    if not value: return "***"
+    if field_type in ("bvn", "nin"):
+        return f"***{value[-4:]}" if len(value) >= 4 else "***"
+    elif field_type == "phone":
+        return f"+234***{value[-4:]}" if len(value) >= 4 else "+234***"
+    elif field_type == "email" and "@" in value:
+        local, domain = value.split("@", 1)
+        return f"{local[0]}***@{domain}"
+    elif field_type == "account":
+        return f"****{value[-4:]}" if len(value) >= 4 else "****"
+    return f"{value[0]}***{value[-1]}" if len(value) > 2 else "***"
+
+def sanitize_log(msg: str) -> str:
+    msg = _pii_re.sub(r"\b\d{11}\b", lambda m: f"***{m.group()[-4:]}", msg)
+    msg = _pii_re.sub(r"\b\d{10}\b", lambda m: f"****{m.group()[-4:]}", msg)
+    msg = _pii_re.sub(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "***@***", msg)
+    return msg
+
 """
 error-telemetry-py — Production-hardened service
 """

@@ -1,0 +1,88 @@
+# 54Bank Zero Trust Service-to-Service Authorization Policies
+# Defines which services can communicate with which others
+
+apiVersion: security.54bank.ng/v1
+kind: ServiceAuthorizationPolicy
+
+policies:
+  # --- Core Banking Domain ---
+  - name: payment-to-ledger
+    source: payments-hub-go
+    destination: tigerbeetle-ledger-rs
+    methods: [POST, GET]
+    paths: ["/api/v1/transfers", "/api/v1/accounts/*/balance"]
+    
+  - name: payment-to-aml
+    source: payments-hub-go
+    destination: kyc-aml-screening-py
+    methods: [POST]
+    paths: ["/api/v1/screen", "/api/v1/threshold-check"]
+    
+  - name: payment-to-nfiu
+    source: payments-hub-go
+    destination: nfiu-reporting-go
+    methods: [POST]
+    paths: ["/api/v1/str", "/api/v1/ctr"]
+    condition: amount >= 5000000  # ₦50,000+ threshold
+
+  # --- KYC Domain ---
+  - name: kyc-to-identity
+    source: kyc-aml-screening-py
+    destination: identity-verification-go
+    methods: [POST]
+    paths: ["/api/v1/verify/bvn", "/api/v1/verify/nin", "/api/v1/liveness"]
+    
+  - name: kyc-to-ndpr
+    source: kyc-aml-screening-py
+    destination: ndpr-compliance-py
+    methods: [POST, GET]
+    paths: ["/consents/check", "/pii/mask"]
+
+  # --- Lending Domain ---
+  - name: loan-to-credit
+    source: loan-origination-go
+    destination: credit-scoring-rs
+    methods: [POST]
+    paths: ["/api/v1/score", "/api/v1/affordability"]
+    
+  - name: loan-to-collateral
+    source: loan-origination-go
+    destination: collateral-management-go
+    methods: [POST, GET]
+    paths: ["/api/v1/collateral/*"]
+
+  # --- Compliance Domain ---
+  - name: compliance-to-pep
+    source: kyc-aml-screening-py
+    destination: adverse-media-screening-py
+    methods: [POST]
+    paths: ["/api/v1/screen/pep", "/api/v1/screen/sanctions"]
+
+  # --- Infrastructure (deny external access) ---
+  - name: deny-external-to-internal
+    source: "*"
+    destination: [db-migrations, db-migration-manager-go, event-store-rs]
+    methods: ["*"]
+    action: DENY
+    reason: "Internal infrastructure services — no external access"
+
+networkSegmentation:
+  zones:
+    - name: payments
+      services: [payments-hub-go, nip-gateway-go, rtgs-engine-rs, card-processing-go]
+      egressAllowed: [ledger, compliance]
+    - name: compliance
+      services: [kyc-aml-screening-py, nfiu-reporting-go, ndpr-compliance-py, adverse-media-screening-py]
+      egressAllowed: [identity, ledger]
+    - name: lending
+      services: [loan-origination-go, credit-scoring-rs, collateral-management-go]
+      egressAllowed: [compliance, ledger]
+    - name: identity
+      services: [identity-verification-go, biometric-auth-go, cbn-tiered-kyc-rs]
+      egressAllowed: [compliance]
+    - name: ledger
+      services: [tigerbeetle-ledger-rs, general-ledger-go, accounting-rules-rs]
+      egressAllowed: []
+    - name: analytics
+      services: [realtime-analytics-py, data-lineage-catalog-py, business-intelligence-go]
+      egressAllowed: []
