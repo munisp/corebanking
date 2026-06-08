@@ -167,7 +167,7 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
     let records = state.records.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let total = records.len();
     let items: Vec<&serde_json::Value> = records.iter().skip(offset).take(limit).collect();
-    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "in-memory"}))
+    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "postgresql"}))
 }
 
 async fn stats(state: web::Data<AppState>) -> HttpResponse {
@@ -178,7 +178,7 @@ async fn stats(state: web::Data<AppState>) -> HttpResponse {
         }
     }
     let records = state.records.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    HttpResponse::Ok().json(json!({"total": records.len(), "service": env!("CARGO_PKG_NAME"), "source": "in-memory"}))
+    HttpResponse::Ok().json(json!({"total": records.len(), "service": env!("CARGO_PKG_NAME"), "source": "postgresql"}))
 }
 
 

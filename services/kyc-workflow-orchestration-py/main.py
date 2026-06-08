@@ -1059,10 +1059,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
 
-        if         if path == "/v1/cache-metrics":
+        if path == "/v1/cache-metrics":
             self._respond(200, cache_metrics())
             return
-        path == "/healthz":
+        elif path == "/healthz":
             db = get_db()
             db_status = "not_configured"
             redis_status = "not_configured"
@@ -1102,10 +1102,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/livez":
             self.respond(200, {"alive": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "kyc-workflow-orchestration-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "kyc-workflow-orchestration-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             body = (
                 f'# HELP requests_total Total requests\n'
                 f'# TYPE requests_total counter\n'
@@ -1161,14 +1161,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/create":
             try:
                 result = db_insert("kyc_workflow_orchestration_py", body)
-            _call_sanctions_check_result = call_sanctions_check(body.get("data", {}))
-            _call_liveness_check_result = call_liveness_check(body.get("data", {}))
-            _call_document_verify_result = call_document_verify(body.get("data", {}))
-            _auto_decision_result = auto_decision(body.get("data", {}))
-            _compute_verification_score_result = compute_verification_score(body.get("data", {}))
-            _compute_risk_assessment_result = compute_risk_assessment(body.get("data", {}))
-            _check_sla_breach_result = check_sla_breach(body.get("data", {}))
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
+                _call_sanctions_check_result = call_sanctions_check(body.get("data", {}))
+                _call_liveness_check_result = call_liveness_check(body.get("data", {}))
+                _call_document_verify_result = call_document_verify(body.get("data", {}))
+                _auto_decision_result = auto_decision(body.get("data", {}))
+                _compute_verification_score_result = compute_verification_score(body.get("data", {}))
+                _compute_risk_assessment_result = compute_risk_assessment(body.get("data", {}))
+                _check_sla_breach_result = check_sla_breach(body.get("data", {}))
+                cache_set(f"{self.get_tenant_id()}:last_post", str(body))
                 self.respond(201, {"created": True, "data": result})
             except ConnectionError as ce:
                 self.respond(503, {"error": "database_unavailable", "detail": str(ce)})

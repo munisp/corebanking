@@ -1120,20 +1120,20 @@ class Handler(BaseHTTPRequestHandler):
         trace_id = self.headers.get("X-Trace-Id", str(uuid.uuid4()))
         logger.info(f"GET {path} trace={trace_id}")
 
-        if         if path == "/v1/cache-metrics":
+        if path == "/v1/cache-metrics":
             self._respond(200, cache_metrics())
             return
-        path == "/healthz":
+        elif path == "/healthz":
             self.respond(200, {"status": "healthy", "service": SERVICE_NAME})
         elif path == "/readyz":
             self.respond(200, {"ready": True})
         elif path == "/livez":
             self.respond(200, {"live": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "stakeholder-kpi-dashboard-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "stakeholder-kpi-dashboard-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write(f'requests_total{{service="{SERVICE_NAME}"}} {request_count}\nerrors_total{{service="{SERVICE_NAME}"}} {error_count}\n'.encode())
 

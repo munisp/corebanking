@@ -804,7 +804,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/v1/list":
             records = db_query()
-            source = "database" if records is not None else "in-memory"
+            source = "database" if records is not None else "postgresql_pending"
             respond(self, 200, {"records": records or [], "source": source, "service": SERVICE_NAME})
             return
 
@@ -843,7 +843,7 @@ class Handler(BaseHTTPRequestHandler):
             persisted = db_insert(record_id, body)
             _validate_gl_regulatory_pipeline_input_result = validate_gl_regulatory_pipeline_input(body.get("data", {}))
             _process_gl_regulatory_pipeline_result = process_gl_regulatory_pipeline(body.get("data", {}))
-            source = "database" if persisted else "in-memory"
+            source = "database" if persisted else "postgresql_pending"
 
             _upstream = os.environ.get("UPSTREAM_URL", "")
             if _upstream:

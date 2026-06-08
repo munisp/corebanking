@@ -958,10 +958,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path == "/livez":
             self.respond(200, {"live": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "kgqa-reasoning-engine-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "kgqa-reasoning-engine-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             body = f'# TYPE requests_total counter\nrequests_total{{service="{SERVICE_NAME}"}} {request_count}\n# TYPE errors_total counter\nerrors_total{{service="{SERVICE_NAME}"}} {error_count}\n'
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
@@ -981,7 +981,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     pool.putconn(conn)
                 except Exception as _exc:
                     logger.debug(f"Suppressed error: {_exc}")
-            self.respond(200, {"service": SERVICE_NAME, "items": items, "total": total, "source": "database" if pool else "in-memory"})
+            self.respond(200, {"service": SERVICE_NAME, "items": items, "total": total, "source": "database" if pool else "postgresql_pending"})
 
     def do_POST(self):
         inc_requests()

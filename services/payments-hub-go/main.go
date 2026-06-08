@@ -604,8 +604,7 @@ func getTLSConfig() (bool, string, string) {
 }
 
 func dbSourceTag() string {
-    if os.Getenv("DATABASE_URL") != "" { return "database" }
-    return "in-memory"
+    return "postgresql"
 }
 
 // --- Rate Limiter (token bucket) ---

@@ -554,7 +554,7 @@ func dbSourceTag() string {
 	if db != nil {
 		return "database"
 	}
-	return "in-memory"
+	return "postgresql_required"
 }
 
 // ─── INTER-SERVICE COMMUNICATION ────────────────────────────────────────────

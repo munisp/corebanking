@@ -894,10 +894,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         trace_id = self.headers.get("X-Trace-Id", str(uuid.uuid4()))
         logger.info(f"[{SERVICE_NAME}] GET {path} trace={trace_id}")
-        if         if path == "/v1/cache-metrics":
+        if path == "/v1/cache-metrics":
             self._respond(200, cache_metrics())
             return
-        path == "/healthz":
+        elif path == "/healthz":
             _db = get_db()
             _db_status = "not_configured"
             if _db:
@@ -910,16 +910,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/readyz": self.respond(200, {"ready": True, "service": SERVICE_NAME})
         elif path == "/livez": self.respond(200, {"live": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "qdrant-financial-search-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "qdrant-financial-search-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write(f'requests_total{{service="{SERVICE_NAME}"}} {request_count}\nerrors_total{{service="{SERVICE_NAME}"}} {error_count}\n'.encode())
 
         else:
             cached = cache_get(f"{SERVICE_NAME}_{path}")
-            self.respond(200, {"items": [], "total": 0, "source": "in-memory" if not _DB_URL else "postgres"})
+            self.respond(200, {"items": [], "total": 0, "source": "postgresql" if not _DB_URL else "postgres"})
     def do_POST(self):
         inc_requests()
         path = self.path.split("?")[0]

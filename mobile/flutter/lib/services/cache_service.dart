@@ -2,8 +2,11 @@ import 'dart:convert';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 
-/// SQLite-based offline cache for API responses.
-/// Stores JSON responses keyed by endpoint path with TTL-based expiration.
+/// Device-local offline cache for API responses (mobile-only).
+/// Uses sqflite for device-local temporary storage only — all persistent
+/// data is stored in PostgreSQL server-side. This cache enables offline
+/// mode and queues mutations for sync when connectivity resumes.
+/// NOT a replacement for server-side PostgreSQL storage.
 class CacheService {
   static CacheService? _instance;
   Database? _db;

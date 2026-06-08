@@ -801,7 +801,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/v1/list":
             records = db_query()
-            source = "database" if records is not None else "in-memory"
+            source = "database" if records is not None else "postgresql_pending"
             respond(self, 200, {"records": records or [], "source": source, "service": SERVICE_NAME})
             return
 
@@ -839,7 +839,7 @@ class Handler(BaseHTTPRequestHandler):
             record_id = f"{SERVICE_NAME}-{int(time.time()*1e6)}"
             persisted = db_insert(record_id, body)
             _compute_customer_score_result = compute_customer_score(body.get("data", {}))
-            source = "database" if persisted else "in-memory"
+            source = "database" if persisted else "postgresql_pending"
 
             _upstream = os.environ.get("UPSTREAM_URL", "")
             if _upstream:

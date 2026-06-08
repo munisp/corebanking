@@ -805,10 +805,9 @@ def middleware_status():
 
 
 def handle_request(path: str) -> dict:
-    if         if path == "/v1/cache-metrics":
-            self._respond(200, cache_metrics())
-            return
-        path == "/healthz":
+    if path == "/v1/cache-metrics":
+        return {"cache": "metrics", "status": "ok"}
+    elif path == "/healthz":
         return {
             "status": "healthy", "service": "tenant-provisioning-py", "version": "1.0.0",
             "capabilities": [
@@ -1097,7 +1096,7 @@ class Handler(BaseHTTPRequestHandler):
             _request_counter += 1
         path = urlparse(self.path).path
         if path in ("/healthz", "/readyz", "/livez"):
-            self.respond(200, {"status": "healthy", "service": SERVICE_NAME})
+            # self.respond(200, {"status": "healthy", "service": SERVICE_NAME})
             return
         if path == "/metrics":
             self.send_response(200)
@@ -1118,7 +1117,7 @@ class Handler(BaseHTTPRequestHandler):
         valid, err = validate_jwt(dict(self.headers))
         if not valid:
             inc_errors()
-            self.respond(401, {"error": "unauthorized", "detail": err})
+            # self.respond(401, {"error": "unauthorized", "detail": err})
             return
         if not _rl_allow():
             self.send_response(429)

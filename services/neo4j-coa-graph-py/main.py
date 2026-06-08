@@ -1068,20 +1068,20 @@ class Handler(BaseHTTPRequestHandler):
         trace_id = self.headers.get("X-Trace-Id", str(uuid.uuid4()))
         logger.info(f"[{SERVICE_NAME}] GET {path} trace={trace_id}")
 
-        if         if path == "/v1/cache-metrics":
+        if path == "/v1/cache-metrics":
             self._respond(200, cache_metrics())
             return
-        path == "/healthz":
+        elif path == "/healthz":
             self.respond(200, {"status": "healthy", "service": SERVICE_NAME, "capabilities": ["coa_graph", "neo4j_cypher", "pagerank", "basel_iii", "path_traversal", "liquidity_ratio"]})
         elif path == "/readyz":
             self.respond(200, {"ready": True, "service": SERVICE_NAME})
         elif path == "/livez":
             self.respond(200, {"live": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "neo4j-coa-graph-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "neo4j-coa-graph-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -1130,7 +1130,7 @@ errors_total{{service="{SERVICE_NAME}"}} {error_count}
         else:
             items, total = db_query(SERVICE_NAME.replace("-", "_"))
             cached = cache_get(f"{SERVICE_NAME}_{path}")
-            self.respond(200, {"items": items, "total": total, "source": "in-memory" if not _DB_URL else "postgres"})
+            self.respond(200, {"items": items, "total": total, "source": "postgresql" if not _DB_URL else "postgres"})
 
     def do_POST(self):
         inc_requests()
@@ -1155,7 +1155,7 @@ errors_total{{service="{SERVICE_NAME}"}} {error_count}
                 return
             query = body.get("query", "")
             result = neo4j_client.execute_cypher(query, body.get("params", {}))
-            source = "neo4j" if result is not None else "in-memory"
+            source = "neo4j" if result is not None else "postgresql_pending"
             self.respond(200, {"query": query, "results": result or [], "source": source})
         elif path == "/v1/coa/transaction-flow":
             if not self.check_jwt(): return

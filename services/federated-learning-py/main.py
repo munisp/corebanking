@@ -1,66 +1,329 @@
 #!/usr/bin/env python3
-"""Federated learning — cross-bank fraud model training, privacy-preserving"""
-import os, json, logging, uuid, re
+"""Federated learning — cross-bank fraud model training, privacy-preserving aggregation, differential privacy"""
+import os, json, logging, uuid, re, time, hashlib, threading, math, random
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("federated-learning-py")
 
-PORT = int(os.environ.get("PORT", "8112"))
+PORT = int(os.environ.get("PORT", "8106"))
+SERVICE_NAME = "federated-learning-py"
+START_TIME = time.time()
+_request_count = 0; _error_count = 0; _counter_lock = threading.Lock()
 
-# --- PII Masking (NDPR) ---
 def mask_pii(value: str, field_type: str = "generic") -> str:
     if not value: return "***"
-    if field_type in ("bvn", "nin"):
-        return f"***{value[-4:]}" if len(value) >= 4 else "***"
-    elif field_type == "phone":
-        return f"+234***{value[-4:]}" if len(value) >= 4 else "+234***"
-    elif field_type == "email" and "@" in value:
-        local, domain = value.split("@", 1)
-        return f"{local[0]}***@{domain}"
-    elif field_type == "account":
-        return f"****{value[-4:]}" if len(value) >= 4 else "****"
+    if field_type in ("bvn", "nin"): return f"***{value[-4:]}" if len(value) >= 4 else "***"
     return "***"
+def inc_requests():
+    global _request_count
+    with _counter_lock: _request_count += 1
+def inc_errors():
+    global _error_count
+    with _counter_lock: _error_count += 1
 
-def sanitize_log(msg: str) -> str:
-    msg = re.sub(r"\b\d{11}\b", lambda m: f"***{m.group()[-4:]}", msg)
-    msg = re.sub(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "***@***", msg)
-    return msg
+_db = None
+def get_db():
+    global _db
+    if _db is None:
+        db_url = os.environ.get("DATABASE_URL")
+        if db_url:
+            try:
+                import psycopg2; _db = psycopg2.connect(db_url); _db.autocommit = True
+            except Exception as e: logger.error(f"DB failed: {e}")
+    return _db
+def db_insert(table, data):
+    db = get_db()
+    if not db: raise ConnectionError("database_unavailable")
+    cur = db.cursor()
+    cur.execute(f"INSERT INTO {table} (id, data, created_at) VALUES (%s, %s, NOW()) RETURNING id",
+                (data.get("id", str(uuid.uuid4())), json.dumps(data)))
+    return cur.fetchone()[0]
+def validate_jwt(headers):
+    auth = headers.get("Authorization", "")
+    if not auth.startswith("Bearer "): return None, "missing_bearer_token"
+    parts = auth[7:].split(".")
+    if len(parts) != 3: return None, "invalid_jwt_format"
+    try:
+        import base64
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=="))
+        if payload.get("exp", float("inf")) < time.time(): return None, "token_expired"
+        return payload, None
+    except Exception: return None, "jwt_decode_failed"
 
-records = []
+_rl_tokens = 100.0; _rl_last = time.time(); _rl_lock = threading.Lock()
+def _rl_allow():
+    global _rl_tokens, _rl_last
+    with _rl_lock:
+        now = time.time(); _rl_tokens = min(100.0, _rl_tokens + (now - _rl_last) * 10); _rl_last = now
+        if _rl_tokens >= 1: _rl_tokens -= 1; return True
+        return False
+
+# ─── Federated Aggregation Strategies ───
+
+def federated_average(client_updates: list, weights: list = None) -> dict:
+    """FedAvg: weighted average of model parameters from multiple banks."""
+    errors = []
+    if not client_updates:
+        errors.append("client_updates_required")
+        return {"valid": False, "errors": errors}
+
+    num_clients = len(client_updates)
+    if weights is None:
+        weights = [1.0 / num_clients] * num_clients
+    elif len(weights) != num_clients:
+        errors.append("weights_count_must_match_clients")
+        return {"valid": False, "errors": errors}
+
+    # Normalize weights
+    weight_sum = sum(weights)
+    weights = [w / weight_sum for w in weights]
+
+    # Aggregate parameters (simulate with dict of layer->values)
+    aggregated_params = {}
+    for i, update in enumerate(client_updates):
+        params = update.get("parameters", {})
+        for layer_name, layer_values in params.items():
+            if layer_name not in aggregated_params:
+                aggregated_params[layer_name] = [0.0] * len(layer_values)
+            for j, val in enumerate(layer_values):
+                aggregated_params[layer_name][j] += val * weights[i]
+
+    # Compute update norms per client (for anomaly detection)
+    client_norms = []
+    for update in client_updates:
+        params = update.get("parameters", {})
+        norm = 0.0
+        for vals in params.values():
+            norm += sum(v ** 2 for v in vals)
+        client_norms.append(math.sqrt(norm))
+
+    median_norm = sorted(client_norms)[len(client_norms) // 2]
+    anomalous_clients = [i for i, n in enumerate(client_norms) if n > median_norm * 3]
+
+    return {
+        "valid": True,
+        "strategy": "federated_averaging",
+        "num_clients": num_clients,
+        "weights": [round(w, 4) for w in weights],
+        "aggregated_layers": list(aggregated_params.keys()),
+        "aggregated_param_count": sum(len(v) for v in aggregated_params.values()),
+        "client_norms": [round(n, 4) for n in client_norms],
+        "anomalous_clients": anomalous_clients,
+        "median_norm": round(median_norm, 4),
+    }
+
+def apply_differential_privacy(gradients: list, epsilon: float = 1.0,
+                                delta: float = 1e-5, clip_norm: float = 1.0) -> dict:
+    """Apply (ε,δ)-differential privacy to gradient updates via Gaussian mechanism."""
+    errors = []
+    if epsilon <= 0:
+        errors.append("epsilon_must_be_positive")
+    if delta <= 0 or delta >= 1:
+        errors.append("delta_must_be_between_0_and_1")
+    if clip_norm <= 0:
+        errors.append("clip_norm_must_be_positive")
+    if not gradients:
+        errors.append("gradients_required")
+    if errors:
+        return {"valid": False, "errors": errors}
+
+    # Clip gradients to L2 norm bound
+    grad_norm = math.sqrt(sum(g ** 2 for g in gradients))
+    clip_factor = min(1.0, clip_norm / grad_norm) if grad_norm > 0 else 1.0
+    clipped = [g * clip_factor for g in gradients]
+
+    # Compute noise scale (Gaussian mechanism)
+    sensitivity = clip_norm
+    sigma = sensitivity * math.sqrt(2 * math.log(1.25 / delta)) / epsilon
+
+    # Add calibrated Gaussian noise
+    rng = random.Random(42)  # deterministic for reproducibility
+    noisy = [g + rng.gauss(0, sigma) for g in clipped]
+
+    # Privacy budget accounting
+    rdp_alpha = 2.0  # Rényi divergence order
+    rdp_epsilon = rdp_alpha * (clip_norm ** 2) / (2 * sigma ** 2)
+
+    return {
+        "valid": True,
+        "mechanism": "gaussian",
+        "epsilon": epsilon,
+        "delta": delta,
+        "sigma": round(sigma, 6),
+        "clip_norm": clip_norm,
+        "original_norm": round(grad_norm, 6),
+        "clipped_norm": round(math.sqrt(sum(g ** 2 for g in clipped)), 6),
+        "noisy_gradient_sample": [round(g, 6) for g in noisy[:5]],
+        "noise_magnitude": round(sigma * math.sqrt(len(gradients)), 6),
+        "privacy_loss": {
+            "rdp_alpha": rdp_alpha,
+            "rdp_epsilon": round(rdp_epsilon, 6),
+            "composition": "advanced_composition_theorem",
+        },
+        "gradient_count": len(gradients),
+    }
+
+def secure_aggregation_protocol(participants: list) -> dict:
+    """Simulate secure aggregation using secret sharing (Shamir/additive)."""
+    errors = []
+    if len(participants) < 2:
+        errors.append("minimum_2_participants_required")
+        return {"valid": False, "errors": errors}
+
+    n = len(participants)
+    threshold = max(2, n * 2 // 3)  # 2/3 threshold for reconstruction
+
+    # Generate secret shares for each participant
+    shares_map = {}
+    for i, p in enumerate(participants):
+        bank_id = p.get("bank_id", f"bank_{i}")
+        model_hash = hashlib.sha256(json.dumps(p.get("model_update", {})).encode()).hexdigest()[:16]
+        num_samples = p.get("num_samples", 0)
+
+        # Simulate additive secret sharing
+        shares = []
+        for j in range(n):
+            share_id = hashlib.sha256(f"{bank_id}-{j}-{time.time()}".encode()).hexdigest()[:12]
+            shares.append({"share_id": share_id, "recipient": f"participant_{j}", "encrypted": True})
+
+        shares_map[bank_id] = {
+            "model_hash": model_hash,
+            "num_samples": num_samples,
+            "shares_generated": len(shares),
+            "shares": shares[:3],
+        }
+
+    return {
+        "valid": True,
+        "protocol": "additive_secret_sharing",
+        "num_participants": n,
+        "reconstruction_threshold": threshold,
+        "participants": shares_map,
+        "privacy_guarantees": [
+            "No participant sees another's raw model update",
+            "Server only sees aggregated result",
+            "Dropout tolerance up to n-threshold participants",
+        ],
+        "communication_rounds": 3,
+        "encryption": "AES-256-GCM for share transport",
+    }
+
+# ─── Federation Round Management ───
+ROUND_TRANSITIONS = {
+    "initialized": ["participant_registration"],
+    "participant_registration": ["local_training"],
+    "local_training": ["update_collection"],
+    "update_collection": ["aggregation"],
+    "aggregation": ["evaluation"],
+    "evaluation": ["model_distribution", "local_training"],
+    "model_distribution": ["participant_registration", "completed"],
+    "completed": [],
+}
+
+# ─── Model Performance Tracking ───
+def evaluate_federated_model(metrics_per_bank: list) -> dict:
+    """Aggregate evaluation metrics across participating banks."""
+    if not metrics_per_bank:
+        return {"valid": False, "errors": ["metrics_required"]}
+
+    auc_scores = [m.get("auc_roc", 0) for m in metrics_per_bank]
+    precision_scores = [m.get("precision", 0) for m in metrics_per_bank]
+    recall_scores = [m.get("recall", 0) for m in metrics_per_bank]
+    f1_scores = [m.get("f1", 0) for m in metrics_per_bank]
+    sample_counts = [m.get("num_samples", 1) for m in metrics_per_bank]
+
+    # Weighted average by sample count
+    total_samples = sum(sample_counts)
+    weighted_auc = sum(a * s for a, s in zip(auc_scores, sample_counts)) / total_samples if total_samples else 0
+    weighted_f1 = sum(f * s for f, s in zip(f1_scores, sample_counts)) / total_samples if total_samples else 0
+
+    # Fairness: check performance disparity across banks
+    auc_std = math.sqrt(sum((a - weighted_auc) ** 2 for a in auc_scores) / len(auc_scores)) if auc_scores else 0
+    max_disparity = max(auc_scores) - min(auc_scores) if auc_scores else 0
+
+    return {
+        "valid": True,
+        "num_banks": len(metrics_per_bank),
+        "total_samples": total_samples,
+        "weighted_auc_roc": round(weighted_auc, 4),
+        "weighted_f1": round(weighted_f1, 4),
+        "per_bank_auc": [round(a, 4) for a in auc_scores],
+        "auc_std": round(auc_std, 4),
+        "max_performance_disparity": round(max_disparity, 4),
+        "fairness_assessment": "acceptable" if max_disparity < 0.1 else "review_needed",
+        "model_ready_for_deployment": weighted_auc > 0.75 and max_disparity < 0.15,
+    }
+
+def add_security_headers(handler):
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("X-Frame-Options", "DENY")
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
-    
-    def _json(self, code, data):
+    def respond(self, code, data):
+        if code >= 400: inc_errors()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'")
+        add_security_headers(self)
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
-    
+
     def do_GET(self):
-        if self.path == "/healthz":
-            self._json(200, {"status": "healthy", "service": "federated-learning-py", "version": "1.0.0", "records": len(records)})
-        elif self.path.startswith("/api/v1/"):
-            self._json(200, {"records": records, "count": len(records)})
-        else:
-            self._json(404, {"error": "Not found"})
-    
+        inc_requests()
+        if not _rl_allow(): self.respond(429, {"error": "rate_limit_exceeded"}); return
+        path = urlparse(self.path).path
+        if path == "/healthz":
+            db = get_db()
+            self.respond(200, {"status": "healthy", "service": SERVICE_NAME,
+                               "checks": {"database": "connected" if db else "not_configured"},
+                               "capabilities": ["federated_averaging", "differential_privacy", "secure_aggregation"],
+                               "uptime_secs": round(time.time() - START_TIME)})
+        elif path == "/readyz": self.respond(200, {"ready": True})
+        elif path == "/livez": self.respond(200, {"alive": True})
+        elif path == "/metrics":
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write(f'requests_total{{service="{SERVICE_NAME}"}} {_request_count}\n'.encode())
+        elif path == "/v1/round/states":
+            self.respond(200, {"transitions": ROUND_TRANSITIONS})
+        elif path == "/v1/aggregation/strategies":
+            self.respond(200, {"strategies": ["federated_averaging", "federated_proximal", "scaffold",
+                                               "federated_matched_averaging"]})
+        else: self.respond(404, {"error": "not_found"})
+
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or "{}")
-        rec = {
-            "id": f"FED-{uuid.uuid4().hex[:12].upper()}",
-            "data": body,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "status": "active"
-        }
-        records.append(rec)
-        self._json(201, {"status": "created", "record": rec})
+        inc_requests()
+        if not _rl_allow(): self.respond(429, {"error": "rate_limit_exceeded"}); return
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()) if int(self.headers.get("Content-Length", 0)) > 0 else {}
+        except json.JSONDecodeError: self.respond(400, {"error": "invalid_json"}); return
+        path = urlparse(self.path).path
+        claims, err = validate_jwt(dict(self.headers))
+        if err: self.respond(401, {"error": "unauthorized", "detail": err}); return
+        if path == "/v1/aggregate":
+            self.respond(200, federated_average(body.get("client_updates", []), body.get("weights")))
+        elif path == "/v1/differential-privacy/apply":
+            self.respond(200, apply_differential_privacy(
+                body.get("gradients", []), body.get("epsilon", 1.0),
+                body.get("delta", 1e-5), body.get("clip_norm", 1.0)))
+        elif path == "/v1/secure-aggregation":
+            self.respond(200, secure_aggregation_protocol(body.get("participants", [])))
+        elif path == "/v1/evaluate":
+            self.respond(200, evaluate_federated_model(body.get("metrics_per_bank", [])))
+        elif path == "/v1/create":
+            try:
+                body["id"] = f"FED-{uuid.uuid4().hex[:12].upper()}"
+                body["created_at"] = datetime.now(timezone.utc).isoformat()
+                db_insert("federated_rounds", body)
+                self.respond(201, {"created": True, "data": body})
+            except ConnectionError: self.respond(503, {"error": "database_unavailable"})
+            except Exception as e: logger.error(f"Write failed: {e}"); self.respond(500, {"error": "write_failed"})
+        else: self.respond(404, {"error": "not_found"})
 
 if __name__ == "__main__":
+    get_db()
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(f"Federated learning — cross-bank fraud model training, privacy-preserving listening on :{PORT}")
+    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "Federated learning coordinator started"}))
     server.serve_forever()

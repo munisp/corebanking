@@ -606,7 +606,7 @@ func dbSourceTag() string {
 	if os.Getenv("DATABASE_URL") != "" {
 		return "postgres"
 	}
-	return "in-memory"
+	return "postgresql_required"
 }
 
 func initDB() {

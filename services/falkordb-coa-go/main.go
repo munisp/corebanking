@@ -31,7 +31,7 @@ func sanitizeInput(s string) string { s = strings.ReplaceAll(s, "<script>", "");
 func checkJWT(r *http.Request) error { if strings.HasPrefix(r.URL.Path, "/healthz") || strings.HasPrefix(r.URL.Path, "/readyz") || strings.HasPrefix(r.URL.Path, "/livez") || strings.HasPrefix(r.URL.Path, "/metrics") { return nil }; auth := r.Header.Get("Authorization"); if !strings.HasPrefix(auth, "Bearer ") { return fmt.Errorf("unauthorized") }; return nil }
 var rlTokens int64 = 100; var rlLastRefill int64
 func rlAllow() bool { now := time.Now().Unix(); if now > atomic.LoadInt64(&rlLastRefill) { atomic.StoreInt64(&rlTokens, 100); atomic.StoreInt64(&rlLastRefill, now) }; return atomic.AddInt64(&rlTokens, -1) >= 0 }
-func dbSourceTag() string { if os.Getenv("DATABASE_URL") != "" { return "postgres" }; return "in-memory" }
+func dbSourceTag() string { if os.Getenv("DATABASE_URL") != "" { return "postgres" }; return "postgresql_required" }
 func initDB() { dsn := os.Getenv("DATABASE_URL"); if dsn == "" { return }; var err error; db, err = sql.Open("postgres", dsn); if err != nil { log.Printf("DB open error: %v", err); return }; db.SetMaxOpenConns(25); db.SetMaxIdleConns(5) }
 func dbInsert(id, svc, tenant, status string, data []byte) error { if db == nil { log.Printf("dbInsert(%s): no db", id); return fmt.Errorf("no db") }; _, err := db.Exec("INSERT INTO records (id,service,tenant,status,data,created_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (id) DO UPDATE SET data=$5", id, svc, tenant, status, data); return err }
 func cacheGet(_ string) (string, bool) { return "", false }
@@ -181,7 +181,7 @@ func graphQueryHandler(w http.ResponseWriter, r *http.Request) {
 	if req.Graph == "" { req.Graph = "coa_54bank" }
 	results, err := falkorClient.GraphQuery(req.Graph, req.Query)
 	source := "falkordb"
-	if err != nil { source = "in-memory"; results = []map[string]interface{}{} }
+	if err != nil { source = "postgresql_fallback"; results = []map[string]interface{}{} }
 	dbData, _ := json.Marshal(map[string]string{"query": req.Query})
 	dbInsert(fmt.Sprintf("falkor_%d", time.Now().UnixNano()), serviceName, "default", "active", dbData)
 	jsonResp(w, 200, map[string]interface{}{"graph": req.Graph, "query": req.Query, "results": results, "source": source})

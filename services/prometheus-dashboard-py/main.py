@@ -1032,10 +1032,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
 
-        if         if path == "/v1/cache-metrics":
+        if path == "/v1/cache-metrics":
             self._respond(200, cache_metrics())
             return
-        path == "/healthz":
+        elif path == "/healthz":
             db = get_db()
             db_status = "not_configured"
             redis_status = "not_configured"
@@ -1075,10 +1075,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/livez":
             self.respond(200, {"alive": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "prometheus-dashboard-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "prometheus-dashboard-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             body = (
                 f'# HELP requests_total Total requests\n'
                 f'# TYPE requests_total counter\n'
@@ -1139,7 +1139,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/create":
             try:
                 result = db_insert("prometheus_dashboard_py", body)
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
+                cache_set(f"{self.get_tenant_id()}:last_post", str(body))
                 self.respond(201, {"created": True, "data": result})
             except ConnectionError as ce:
                 self.respond(503, {"error": "database_unavailable", "detail": str(ce)})

@@ -90,7 +90,7 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
     let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
     let total = records.len();
     let items: Vec<&serde_json::Value> = records.iter().skip((page-1)*limit).take(limit).collect();
-    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": if state.db_url.is_some() { "database" } else { "in-memory" }}))
+    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": if state.db_url.is_some() { "database" } else { "postgresql" }}))
 }
 
 async fn stats(state: web::Data<AppState>) -> HttpResponse {

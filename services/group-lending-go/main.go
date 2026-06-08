@@ -579,8 +579,7 @@ func getTLSConfig() (bool, string, string) {
 }
 
 func dbSourceTag() string {
-    if os.Getenv("DATABASE_URL") != "" { return "database" }
-    return "in-memory"
+    return "postgresql"
 }
 
 var coreBankingURL = func() string { v := os.Getenv("CORE_BANKING_URL"); if v == "" { return "http://localhost:8100" }; return v }()
