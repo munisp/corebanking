@@ -1,4 +1,98 @@
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ML CHURN PREDICTION INTEGRATION
+# Calls ML inference server for customer churn risk prediction
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ML_INFERENCE_URL = os.environ.get("ML_INFERENCE_URL", "http://ml-inference-server:8500")
+
+
+def ml_predict_churn(monthly_activity: list):
+    """Call ML churn prediction model with 12-month activity history.
+    
+    monthly_activity: list of 12 lists, each [txn_count, volume, logins, products, digital, complaints, balance, active]
+    Returns: {"churn_probability": float, "churn_risk": str, "attention_weights": list, "critical_months": list}
+    or None if ML unavailable.
+    """
+    try:
+        payload = json.dumps({"monthly_activity": monthly_activity}).encode()
+        req = urllib.request.Request(
+            f"{ML_INFERENCE_URL}/v1/churn/predict",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode())
+            logger.info(f"ML_CHURN: prob={result.get('churn_probability', 0):.4f} "
+                       f"risk={result.get('churn_risk', 'unknown')} "
+                       f"critical_months={[m.get('month') for m in result.get('critical_months', [])]}")
+            return result
+    except Exception as e:
+        logger.debug(f"ML churn prediction unavailable: {e}")
+        return None
+
+
+def assess_customer_churn_risk(customer_id: str, monthly_activity: list):
+    """Assess customer churn risk using ML model and generate retention actions.
+    
+    Returns: {
+        "customer_id": str,
+        "churn_probability": float,
+        "risk_level": str,
+        "retention_actions": list,
+        "critical_months": list,
+        "ml_available": bool
+    }
+    """
+    ml_result = ml_predict_churn(monthly_activity)
+    
+    if ml_result is None:
+        # Fallback: simple rule-based assessment
+        recent = monthly_activity[-3:] if len(monthly_activity) >= 3 else monthly_activity
+        avg_txns = sum(m[0] for m in recent) / max(len(recent), 1)
+        risk = "high" if avg_txns < 2 else "medium" if avg_txns < 5 else "low"
+        return {
+            "customer_id": customer_id,
+            "churn_probability": 0.7 if risk == "high" else 0.4 if risk == "medium" else 0.1,
+            "risk_level": risk,
+            "retention_actions": ["personal_call_from_rm"] if risk == "high" else [],
+            "critical_months": [],
+            "ml_available": False,
+        }
+    
+    prob = ml_result.get("churn_probability", 0)
+    risk = ml_result.get("churn_risk", "low")
+    critical = ml_result.get("critical_months", [])
+    attention = ml_result.get("attention_weights", [])
+    
+    # Generate retention actions based on ML insights
+    actions = []
+    if prob >= 0.7:
+        actions.extend(["urgent_personal_call_from_rm", "retention_offer_fee_waiver", "exclusive_rate_upgrade"])
+    elif prob >= 0.4:
+        actions.extend(["push_notification_engagement", "cashback_incentive", "product_recommendation"])
+    elif prob >= 0.2:
+        actions.extend(["email_newsletter", "savings_goal_nudge"])
+    
+    # Use attention weights to identify intervention timing
+    if critical and len(critical) >= 1:
+        most_critical = critical[0].get("month", 0)
+        if most_critical >= 9:
+            actions.append("immediate_intervention_recent_decline")
+        elif most_critical <= 2:
+            actions.append("investigate_initial_engagement_failure")
+    
+    return {
+        "customer_id": customer_id,
+        "churn_probability": round(prob, 4),
+        "risk_level": risk,
+        "retention_actions": actions,
+        "critical_months": critical,
+        "attention_weights": attention,
+        "ml_available": True,
+    }
+
 # --- PII Masking (NDPR Compliance) ---
 import re as _pii_re
 

@@ -1192,6 +1192,108 @@ func sanitizeLogEntry(msg string) string {
 	return msg
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ML FRAUD SCORING INTEGRATION
+// Calls ML inference server for real-time fraud detection on every payment
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var mlInferenceURL_payments = os.Getenv("ML_INFERENCE_URL")
+
+func init() {
+	if mlInferenceURL_payments == "" {
+		mlInferenceURL_payments = "http://ml-inference-server:8500"
+	}
+}
+
+// mlScoreFraud calls the ML fraud detection model before processing a payment
+// Returns: fraud_probability (0.0-1.0), risk_action (ALLOW/FLAG/STEP_UP/HOLD/BLOCK), error
+func mlScoreFraud(amountKobo int64, hour int, dayOfWeek int, velocity1H int, velocity24H int, isInternational bool, accountAgeDays int) (float64, string, error) {
+	amount := float64(amountKobo) / 100.0
+	intlFlag := 0
+	if isInternational {
+		intlFlag = 1
+	}
+	payload := map[string]interface{}{
+		"amount": amount, "hour": hour, "day_of_week": dayOfWeek,
+		"velocity_1h": velocity1H, "velocity_24h": velocity24H,
+		"amount_vs_avg": amount / 50000.0, "geo_distance_km": 10.0,
+		"device_age_days": 180, "is_new_beneficiary": 0,
+		"is_international": intlFlag, "account_age_days": accountAgeDays,
+		"balance_ratio": 0.3,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return 0, "ALLOW", fmt.Errorf("ml_fraud: marshal: %w", err)
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	resp, err := client.Post(mlInferenceURL_payments+"/v1/fraud/predict", "application/json", bytes.NewReader(body))
+	if err != nil {
+		// ML service unavailable — graceful degradation, allow transaction
+		log.Printf("WARN: ML fraud scoring unavailable, falling back to rules: %v", err)
+		return 0, "ALLOW", nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("WARN: ML fraud scoring returned %d, falling back to rules", resp.StatusCode)
+		return 0, "ALLOW", nil
+	}
+
+	var result struct {
+		Predictions []struct {
+			FraudProbability float64 `json:"fraud_probability"`
+			RiskAction       string  `json:"risk_action"`
+		} `json:"predictions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, "ALLOW", nil
+	}
+	if len(result.Predictions) == 0 {
+		return 0, "ALLOW", nil
+	}
+	return result.Predictions[0].FraudProbability, result.Predictions[0].RiskAction, nil
+}
+
+// enforceMLFraudDecision applies the ML model's risk action to the payment
+func enforceMLFraudDecision(w http.ResponseWriter, action string, fraudProb float64, paymentID string) bool {
+	switch action {
+	case "BLOCK":
+		log.Printf("ML_FRAUD_BLOCK: payment=%s probability=%.4f — transaction declined", paymentID, fraudProb)
+		jsonResp(w, 403, map[string]interface{}{
+			"error": "transaction_blocked_fraud",
+			"fraud_probability": fraudProb,
+			"action": "BLOCK",
+			"message": "Transaction declined by ML fraud detection. A SAR has been auto-generated.",
+		})
+		return true
+	case "HOLD":
+		log.Printf("ML_FRAUD_HOLD: payment=%s probability=%.4f — held for manual review", paymentID, fraudProb)
+		jsonResp(w, 202, map[string]interface{}{
+			"status": "held_for_review",
+			"fraud_probability": fraudProb,
+			"action": "HOLD",
+			"message": "Transaction held for fraud team review (1-hour SLA).",
+		})
+		return true
+	case "STEP_UP":
+		log.Printf("ML_FRAUD_STEP_UP: payment=%s probability=%.4f — OTP required", paymentID, fraudProb)
+		jsonResp(w, 428, map[string]interface{}{
+			"status": "step_up_required",
+			"fraud_probability": fraudProb,
+			"action": "STEP_UP",
+			"message": "Additional authentication required (OTP/biometric).",
+		})
+		return true
+	default:
+		// ALLOW or FLAG — continue processing
+		if action == "FLAG" {
+			log.Printf("ML_FRAUD_FLAG: payment=%s probability=%.4f — flagged for review", paymentID, fraudProb)
+		}
+		return false
+	}
+}
+
 func main() {
 	port := os.Getenv("PORT")
 

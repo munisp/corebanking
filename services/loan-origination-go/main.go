@@ -1419,6 +1419,88 @@ func handleDLQReplay(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{"status": "replayed", "replayed": replayed, "remaining": len(remaining)})
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ML CREDIT SCORING INTEGRATION
+// Calls ML inference server for real-time credit assessment on loan applications
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var mlInferenceURL_loans = os.Getenv("ML_INFERENCE_URL")
+
+func init() {
+	if mlInferenceURL_loans == "" {
+		mlInferenceURL_loans = "http://ml-inference-server:8500"
+	}
+}
+
+// MLCreditDecision represents the ML model's credit assessment
+type MLCreditDecision struct {
+	CreditScore    float64 `json:"credit_score"`
+	CreditBand     string  `json:"credit_band"`
+	Approved       bool    `json:"approved"`
+	MaxLoanAmount  float64 `json:"max_loan_amount"`
+	DefaultProb    float64 `json:"default_probability"`
+	Model          string  `json:"model"`
+	LatencyMs      float64 `json:"latency_ms"`
+}
+
+// mlScoreCredit calls the ML credit scoring model for a loan application
+func mlScoreCredit(age int, monthlyIncome int64, totalDebt int64, dtiRatio float64,
+	employmentYears int, numPriorLoans int, numDefaults int,
+	loanAmount int64, tenureMonths int, collateralValue int64,
+	hasGuarantor int, accountAgeMonths int) (*MLCreditDecision, error) {
+
+	payload := map[string]interface{}{
+		"age": age, "monthly_income": monthlyIncome, "total_debt": totalDebt,
+		"dti_ratio": dtiRatio, "employment_years": employmentYears,
+		"num_prior_loans": numPriorLoans, "num_defaults": numDefaults,
+		"loan_amount_requested": loanAmount, "loan_tenure_months": tenureMonths,
+		"collateral_value": collateralValue, "has_guarantor": hasGuarantor,
+		"account_age_months": accountAgeMonths, "avg_monthly_balance": monthlyIncome * 3,
+		"num_dependents": 2, "sector_idx": 1, "state_idx": 5,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(mlInferenceURL_loans+"/v1/credit/predict", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("WARN: ML credit scoring unavailable: %v — falling back to rule-based assessment", err)
+		return nil, nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		log.Printf("WARN: ML credit scoring returned %d", resp.StatusCode)
+		return nil, nil
+	}
+
+	var result MLCreditDecision
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+	log.Printf("ML_CREDIT_SCORE: score=%.0f band=%s approved=%v max_loan=%.0f latency=%.1fms",
+		result.CreditScore, result.CreditBand, result.Approved, result.MaxLoanAmount, result.LatencyMs)
+	return &result, nil
+}
+
+// applyMLCreditDecision uses ML model output to determine loan approval
+func applyMLCreditDecision(decision *MLCreditDecision, requestedAmount int64) (bool, string, float64) {
+	if decision == nil {
+		return false, "ml_unavailable_fallback_to_rules", 0
+	}
+	if !decision.Approved {
+		return false, fmt.Sprintf("ml_declined: score=%.0f band=%s default_prob=%.4f",
+			decision.CreditScore, decision.CreditBand, decision.DefaultProb), decision.CreditScore
+	}
+	if float64(requestedAmount) > decision.MaxLoanAmount {
+		return false, fmt.Sprintf("ml_amount_exceeds_max: requested=%.0f max=%.0f",
+			float64(requestedAmount), decision.MaxLoanAmount), decision.CreditScore
+	}
+	return true, fmt.Sprintf("ml_approved: score=%.0f band=%s", decision.CreditScore, decision.CreditBand), decision.CreditScore
+}
+
 func main() {
 
 	dbURL := os.Getenv("DATABASE_URL")

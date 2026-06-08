@@ -1,66 +1,435 @@
 #!/usr/bin/env python3
-"""Real-time analytics pipeline — streaming aggregation, live dashboards"""
-import os, json, logging, uuid, re
-from datetime import datetime, timezone
+"""Real-time streaming analytics — transaction aggregation, anomaly detection, dashboard metrics"""
+import os, json, logging, uuid, re, time, hashlib, threading, math, collections
+from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("realtime-analytics-py")
 
-PORT = int(os.environ.get("PORT", "8110"))
+PORT = int(os.environ.get("PORT", "8107"))
+# ═══════════════════════════════════════════════════════════════════════════════
+# ML ANOMALY DETECTION INTEGRATION
+# Calls ML inference server for real-time transaction anomaly scoring
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# --- PII Masking (NDPR) ---
+ML_INFERENCE_URL = os.environ.get("ML_INFERENCE_URL", "http://ml-inference-server:8500")
+
+
+def ml_score_anomaly(amount: float, hour: int, day_of_week: int,
+                     velocity_1h: int, velocity_24h: int,
+                     amount_vs_avg: float, balance_ratio: float,
+                     merchant_cat_idx: int = 0, channel_idx: int = 0):
+    """Call ML anomaly detection model. Returns dict or None on failure."""
+    try:
+        payload = json.dumps({
+            "amount": amount, "hour": hour, "day_of_week": day_of_week,
+            "velocity_1h": velocity_1h, "velocity_24h": velocity_24h,
+            "amount_vs_avg": amount_vs_avg, "balance_ratio": balance_ratio,
+            "merchant_cat_idx": merchant_cat_idx, "channel_idx": channel_idx,
+        }).encode()
+        req = urllib.request.Request(
+            f"{ML_INFERENCE_URL}/v1/anomaly/score",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            result = json.loads(resp.read().decode())
+            logger.info(f"ML_ANOMALY: score={result.get('anomaly_score', 0):.4f} "
+                       f"is_anomaly={result.get('is_anomaly', False)}")
+            return result
+    except Exception as e:
+        logger.debug(f"ML anomaly scoring unavailable: {e}")
+        return None
+
+
+def process_transaction_with_ml(transaction: dict):
+    """Process a transaction through both rule-based and ML anomaly detection.
+    
+    Returns: {"rule_score": float, "ml_score": float|None, "is_anomaly": bool, "action": str}
+    """
+    amount = transaction.get("amount", 0)
+    hour = transaction.get("hour", 12)
+    day = transaction.get("day_of_week", 3)
+    velocity_1h = transaction.get("velocity_1h", 1)
+    velocity_24h = transaction.get("velocity_24h", 5)
+    avg = transaction.get("customer_avg_amount", 50000)
+    balance = transaction.get("balance", 500000)
+    
+    amount_vs_avg = amount / max(avg, 1)
+    balance_ratio = amount / max(balance, 1)
+    
+    # Call ML model
+    ml_result = ml_score_anomaly(amount, hour, day, velocity_1h, velocity_24h, amount_vs_avg, balance_ratio)
+    
+    ml_score = ml_result.get("anomaly_score") if ml_result else None
+    is_anomaly = ml_result.get("is_anomaly", False) if ml_result else False
+    
+    # Combined decision: ML model + rule-based z-score
+    rule_score = amount_vs_avg  # simplified rule-based
+    
+    if ml_score is not None and ml_score > 0.7:
+        action = "block"
+    elif ml_score is not None and ml_score > 0.4:
+        action = "flag"
+    elif is_anomaly:
+        action = "review"
+    elif rule_score > 5.0:
+        action = "flag"
+    else:
+        action = "allow"
+    
+    return {
+        "rule_score": round(rule_score, 4),
+        "ml_score": round(ml_score, 4) if ml_score is not None else None,
+        "is_anomaly": is_anomaly,
+        "action": action,
+        "ml_available": ml_result is not None,
+    }
+
+SERVICE_NAME = "realtime-analytics-py"
+START_TIME = time.time()
+_request_count = 0; _error_count = 0; _counter_lock = threading.Lock()
+
 def mask_pii(value: str, field_type: str = "generic") -> str:
     if not value: return "***"
-    if field_type in ("bvn", "nin"):
-        return f"***{value[-4:]}" if len(value) >= 4 else "***"
-    elif field_type == "phone":
-        return f"+234***{value[-4:]}" if len(value) >= 4 else "+234***"
-    elif field_type == "email" and "@" in value:
-        local, domain = value.split("@", 1)
-        return f"{local[0]}***@{domain}"
-    elif field_type == "account":
-        return f"****{value[-4:]}" if len(value) >= 4 else "****"
+    if field_type in ("bvn", "nin"): return f"***{value[-4:]}" if len(value) >= 4 else "***"
     return "***"
+def inc_requests():
+    global _request_count
+    with _counter_lock: _request_count += 1
+def inc_errors():
+    global _error_count
+    with _counter_lock: _error_count += 1
 
-def sanitize_log(msg: str) -> str:
-    msg = re.sub(r"\b\d{11}\b", lambda m: f"***{m.group()[-4:]}", msg)
-    msg = re.sub(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "***@***", msg)
-    return msg
+_db = None
+def get_db():
+    global _db
+    if _db is None:
+        db_url = os.environ.get("DATABASE_URL")
+        if db_url:
+            try:
+                import psycopg2; _db = psycopg2.connect(db_url); _db.autocommit = True
+            except Exception as e: logger.error(f"DB failed: {e}")
+    return _db
+def db_insert(table, data):
+    db = get_db()
+    if not db: raise ConnectionError("database_unavailable")
+    cur = db.cursor()
+    cur.execute(f"INSERT INTO {table} (id, data, created_at) VALUES (%s, %s, NOW()) RETURNING id",
+                (data.get("id", str(uuid.uuid4())), json.dumps(data)))
+    return cur.fetchone()[0]
+def validate_jwt(headers):
+    auth = headers.get("Authorization", "")
+    if not auth.startswith("Bearer "): return None, "missing_bearer_token"
+    parts = auth[7:].split(".")
+    if len(parts) != 3: return None, "invalid_jwt_format"
+    try:
+        import base64
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=="))
+        if payload.get("exp", float("inf")) < time.time(): return None, "token_expired"
+        return payload, None
+    except Exception: return None, "jwt_decode_failed"
 
-records = []
+_rl_tokens = 100.0; _rl_last = time.time(); _rl_lock = threading.Lock()
+def _rl_allow():
+    global _rl_tokens, _rl_last
+    with _rl_lock:
+        now = time.time(); _rl_tokens = min(100.0, _rl_tokens + (now - _rl_last) * 10); _rl_last = now
+        if _rl_tokens >= 1: _rl_tokens -= 1; return True
+        return False
+
+# ─── Sliding Window Aggregation ───
+class SlidingWindow:
+    """Time-based sliding window for streaming aggregation."""
+    def __init__(self, window_seconds: int = 300, slide_seconds: int = 60):
+        self.window_seconds = window_seconds
+        self.slide_seconds = slide_seconds
+        self.events = collections.deque()
+        self.lock = threading.Lock()
+
+    def add(self, event: dict):
+        with self.lock:
+            event["_ts"] = time.time()
+            self.events.append(event)
+            self._evict()
+
+    def _evict(self):
+        cutoff = time.time() - self.window_seconds
+        while self.events and self.events[0]["_ts"] < cutoff:
+            self.events.popleft()
+
+    def aggregate(self) -> dict:
+        with self.lock:
+            self._evict()
+            events = list(self.events)
+
+        if not events:
+            return {"count": 0, "window_seconds": self.window_seconds}
+
+        amounts = [e.get("amount_kobo", 0) for e in events]
+        channels = collections.Counter(e.get("channel", "unknown") for e in events)
+        statuses = collections.Counter(e.get("status", "unknown") for e in events)
+        types = collections.Counter(e.get("txn_type", "unknown") for e in events)
+
+        return {
+            "count": len(events),
+            "window_seconds": self.window_seconds,
+            "total_amount_kobo": sum(amounts),
+            "avg_amount_kobo": int(sum(amounts) / len(amounts)) if amounts else 0,
+            "min_amount_kobo": min(amounts) if amounts else 0,
+            "max_amount_kobo": max(amounts) if amounts else 0,
+            "tps": round(len(events) / self.window_seconds, 2),
+            "channel_distribution": dict(channels),
+            "status_distribution": dict(statuses),
+            "type_distribution": dict(types),
+            "p50_amount_kobo": sorted(amounts)[len(amounts) // 2] if amounts else 0,
+            "p99_amount_kobo": sorted(amounts)[int(len(amounts) * 0.99)] if len(amounts) > 1 else (amounts[0] if amounts else 0),
+        }
+
+# Per-channel windows
+_windows = {
+    "global": SlidingWindow(300, 60),
+    "nip": SlidingWindow(300, 60),
+    "ussd": SlidingWindow(300, 60),
+    "pos": SlidingWindow(300, 60),
+    "atm": SlidingWindow(300, 60),
+    "mobile": SlidingWindow(300, 60),
+    "web": SlidingWindow(300, 60),
+}
+
+# ─── Anomaly Detection (Z-Score) ───
+class StreamingStats:
+    """Welford's online algorithm for streaming mean/variance."""
+    def __init__(self):
+        self.n = 0
+        self.mean = 0.0
+        self.M2 = 0.0
+        self.lock = threading.Lock()
+
+    def update(self, value: float):
+        with self.lock:
+            self.n += 1
+            delta = value - self.mean
+            self.mean += delta / self.n
+            delta2 = value - self.mean
+            self.M2 += delta * delta2
+
+    def variance(self) -> float:
+        with self.lock:
+            return self.M2 / self.n if self.n > 1 else 0.0
+
+    def std(self) -> float:
+        return math.sqrt(self.variance())
+
+    def z_score(self, value: float) -> float:
+        s = self.std()
+        return abs(value - self.mean) / s if s > 0 else 0.0
+
+    def stats(self) -> dict:
+        return {"n": self.n, "mean": round(self.mean, 2), "std": round(self.std(), 2),
+                "variance": round(self.variance(), 2)}
+
+_amount_stats = StreamingStats()
+_velocity_stats = StreamingStats()
+
+def detect_anomaly(txn: dict) -> dict:
+    """Detect anomalous transactions using streaming z-score."""
+    amount = txn.get("amount_kobo", 0)
+    _amount_stats.update(amount)
+
+    amount_z = _amount_stats.z_score(amount)
+    velocity_z = 0.0
+
+    # Velocity check
+    account_id = txn.get("account_id", "")
+    if account_id:
+        # Count recent transactions for this account
+        with _windows["global"].lock:
+            recent = sum(1 for e in _windows["global"].events if e.get("account_id") == account_id)
+        _velocity_stats.update(recent)
+        velocity_z = _velocity_stats.z_score(recent)
+
+    is_anomaly = amount_z > 3.0 or velocity_z > 3.0
+    risk_factors = []
+    if amount_z > 3.0: risk_factors.append(f"amount_z_score:{amount_z:.2f}")
+    if velocity_z > 3.0: risk_factors.append(f"velocity_z_score:{velocity_z:.2f}")
+
+    # NFIU threshold check
+    nfiu_flags = []
+    if amount >= 5_000_000_00:  # ₦5M in kobo
+        nfiu_flags.append("cash_threshold_5M")
+    if amount >= 10_000_000_00:  # ₦10M in kobo
+        nfiu_flags.append("transfer_threshold_10M")
+
+    return {
+        "is_anomaly": is_anomaly,
+        "amount_z_score": round(amount_z, 4),
+        "velocity_z_score": round(velocity_z, 4),
+        "risk_factors": risk_factors,
+        "nfiu_flags": nfiu_flags,
+        "amount_stats": _amount_stats.stats(),
+        "threshold": {"amount_z": 3.0, "velocity_z": 3.0},
+        "recommendation": "flag_for_review" if is_anomaly else "allow",
+    }
+
+# ─── KPI Computation ───
+def compute_kpis(window_data: dict) -> dict:
+    """Compute real-time banking KPIs from window aggregation."""
+    count = window_data.get("count", 0)
+    total = window_data.get("total_amount_kobo", 0)
+    statuses = window_data.get("status_distribution", {})
+
+    success = statuses.get("success", 0) + statuses.get("completed", 0)
+    failed = statuses.get("failed", 0) + statuses.get("error", 0)
+    pending = statuses.get("pending", 0)
+
+    success_rate = success / count * 100 if count > 0 else 0
+    tps = window_data.get("tps", 0)
+
+    # SLA thresholds
+    sla_success_target = 99.5
+    sla_latency_p99_ms = 500
+
+    return {
+        "transaction_count": count,
+        "total_volume_kobo": total,
+        "tps": tps,
+        "success_rate_pct": round(success_rate, 2),
+        "failure_count": failed,
+        "pending_count": pending,
+        "avg_transaction_kobo": window_data.get("avg_amount_kobo", 0),
+        "sla_compliance": {
+            "success_rate_target": sla_success_target,
+            "success_rate_met": success_rate >= sla_success_target,
+            "latency_target_ms": sla_latency_p99_ms,
+        },
+        "channel_breakdown": window_data.get("channel_distribution", {}),
+        "alerts": [
+            {"type": "low_success_rate", "active": success_rate < sla_success_target,
+             "threshold": sla_success_target, "current": round(success_rate, 2)},
+            {"type": "high_failure_rate", "active": failed > count * 0.05 if count > 0 else False,
+             "threshold": "5%", "current": round(failed / count * 100, 2) if count > 0 else 0},
+        ],
+    }
+
+# ─── Heatmap Data ───
+def generate_heatmap(events: list, group_by: str = "hour") -> dict:
+    """Generate transaction heatmap data grouped by time."""
+    if not events:
+        return {"groups": [], "group_by": group_by}
+
+    groups = collections.defaultdict(lambda: {"count": 0, "total_kobo": 0, "channels": collections.Counter()})
+
+    for e in events:
+        ts = e.get("_ts", time.time())
+        dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+        if group_by == "hour":
+            key = dt.strftime("%Y-%m-%d %H:00")
+        elif group_by == "minute":
+            key = dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            key = dt.strftime("%Y-%m-%d")
+
+        groups[key]["count"] += 1
+        groups[key]["total_kobo"] += e.get("amount_kobo", 0)
+        groups[key]["channels"][e.get("channel", "unknown")] += 1
+
+    result = []
+    for key in sorted(groups.keys()):
+        g = groups[key]
+        result.append({
+            "period": key, "count": g["count"], "total_kobo": g["total_kobo"],
+            "avg_kobo": g["total_kobo"] // g["count"] if g["count"] else 0,
+            "channels": dict(g["channels"]),
+        })
+
+    return {"groups": result, "group_by": group_by, "total_periods": len(result)}
+
+def add_security_headers(handler):
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("X-Frame-Options", "DENY")
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
-    
-    def _json(self, code, data):
+    def respond(self, code, data):
+        if code >= 400: inc_errors()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Content-Security-Policy", "default-src 'self'")
+        add_security_headers(self)
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
-    
+
     def do_GET(self):
-        if self.path == "/healthz":
-            self._json(200, {"status": "healthy", "service": "realtime-analytics-py", "version": "1.0.0", "records": len(records)})
-        elif self.path.startswith("/api/v1/"):
-            self._json(200, {"records": records, "count": len(records)})
-        else:
-            self._json(404, {"error": "Not found"})
-    
+        inc_requests()
+        if not _rl_allow(): self.respond(429, {"error": "rate_limit_exceeded"}); return
+        path = urlparse(self.path).path
+        params = parse_qs(urlparse(self.path).query)
+        if path == "/healthz":
+            db = get_db()
+            self.respond(200, {"status": "healthy", "service": SERVICE_NAME,
+                               "checks": {"database": "connected" if db else "not_configured"},
+                               "windows": {k: v.aggregate()["count"] for k, v in _windows.items()},
+                               "uptime_secs": round(time.time() - START_TIME)})
+        elif path == "/readyz": self.respond(200, {"ready": True})
+        elif path == "/livez": self.respond(200, {"alive": True})
+        elif path == "/metrics":
+            self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
+            self.wfile.write(f'requests_total{{service="{SERVICE_NAME}"}} {_request_count}\n'.encode())
+        elif path == "/v1/aggregate":
+            channel = params.get("channel", ["global"])[0]
+            window = _windows.get(channel, _windows["global"])
+            self.respond(200, window.aggregate())
+        elif path == "/v1/aggregate/all":
+            self.respond(200, {ch: w.aggregate() for ch, w in _windows.items()})
+        elif path == "/v1/kpis":
+            self.respond(200, compute_kpis(_windows["global"].aggregate()))
+        elif path == "/v1/heatmap":
+            group_by = params.get("group_by", ["hour"])[0]
+            with _windows["global"].lock:
+                events = list(_windows["global"].events)
+            self.respond(200, generate_heatmap(events, group_by))
+        elif path == "/v1/anomaly/stats":
+            self.respond(200, {"amount_stats": _amount_stats.stats(), "velocity_stats": _velocity_stats.stats()})
+        else: self.respond(404, {"error": "not_found"})
+
     def do_POST(self):
-        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or "{}")
-        rec = {
-            "id": f"REA-{uuid.uuid4().hex[:12].upper()}",
-            "data": body,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "status": "active"
-        }
-        records.append(rec)
-        self._json(201, {"status": "created", "record": rec})
+        inc_requests()
+        if not _rl_allow(): self.respond(429, {"error": "rate_limit_exceeded"}); return
+        try:
+            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()) if int(self.headers.get("Content-Length", 0)) > 0 else {}
+        except json.JSONDecodeError: self.respond(400, {"error": "invalid_json"}); return
+        path = urlparse(self.path).path
+        claims, err = validate_jwt(dict(self.headers))
+        if err: self.respond(401, {"error": "unauthorized", "detail": err}); return
+        if path == "/v1/ingest":
+            events = body.get("events", [body] if "amount_kobo" in body else [])
+            ingested = 0
+            for event in events:
+                channel = event.get("channel", "unknown")
+                _windows["global"].add(event)
+                if channel in _windows:
+                    _windows[channel].add(event)
+                ingested += 1
+            self.respond(200, {"ingested": ingested, "window_count": _windows["global"].aggregate()["count"]})
+        elif path == "/v1/detect-anomaly":
+            self.respond(200, detect_anomaly(body))
+        elif path == "/v1/create":
+            try:
+                body["id"] = f"ANA-{uuid.uuid4().hex[:12].upper()}"
+                body["created_at"] = datetime.now(timezone.utc).isoformat()
+                db_insert("analytics_events", body)
+                self.respond(201, {"created": True, "data": body})
+            except ConnectionError: self.respond(503, {"error": "database_unavailable"})
+            except Exception as e: logger.error(f"Write failed: {e}"); self.respond(500, {"error": "write_failed"})
+        else: self.respond(404, {"error": "not_found"})
 
 if __name__ == "__main__":
+    get_db()
     server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(f"Real-time analytics pipeline — streaming aggregation, live dashboards listening on :{PORT}")
+    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "Realtime analytics started",
+                            "windows": list(_windows.keys())}))
     server.serve_forever()

@@ -1,4 +1,86 @@
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ML FRAUD MODEL INTEGRATION
+# Calls ML inference server for neural network fraud detection
+# Supplements GNN graph-based patterns with deep learning probabilities
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ML_INFERENCE_URL = os.environ.get("ML_INFERENCE_URL", "http://ml-inference-server:8500")
+
+
+def ml_score_fraud_neural(amount: float, hour: int, day_of_week: int,
+                          velocity_1h: int, velocity_24h: int,
+                          amount_vs_avg: float, geo_distance_km: float = 0,
+                          device_age_days: int = 365, is_new_beneficiary: int = 0,
+                          is_international: int = 0, account_age_days: int = 365,
+                          balance_ratio: float = 0.1):
+    """Call ML fraud detection neural network for probability scoring.
+    Returns: {"predictions": [{"fraud_probability": float, "risk_action": str}]}
+    or None if ML service unavailable.
+    """
+    try:
+        payload = json.dumps({
+            "amount": amount, "hour": hour, "day_of_week": day_of_week,
+            "velocity_1h": velocity_1h, "velocity_24h": velocity_24h,
+            "amount_vs_avg": amount_vs_avg, "geo_distance_km": geo_distance_km,
+            "device_age_days": device_age_days, "is_new_beneficiary": is_new_beneficiary,
+            "is_international": is_international, "account_age_days": account_age_days,
+            "balance_ratio": balance_ratio,
+        }).encode()
+        req = urllib.request.Request(
+            f"{ML_INFERENCE_URL}/v1/fraud/predict",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            result = json.loads(resp.read().decode())
+            preds = result.get("predictions", [])
+            if preds:
+                prob = preds[0].get("fraud_probability", 0)
+                action = preds[0].get("risk_action", "ALLOW")
+                logger.info(f"ML_FRAUD_NEURAL: prob={prob:.4f} action={action}")
+            return result
+    except Exception as e:
+        logger.debug(f"ML fraud neural scoring unavailable: {e}")
+        return None
+
+
+def ensemble_fraud_score(graph_score: float, ml_neural_result: dict, rule_score: float = 0):
+    """Combine GNN graph score + ML neural network + rules into final fraud decision.
+    
+    Weights: GNN=0.35, Neural=0.45, Rules=0.20
+    """
+    ml_prob = 0.0
+    if ml_neural_result and ml_neural_result.get("predictions"):
+        ml_prob = ml_neural_result["predictions"][0].get("fraud_probability", 0)
+    
+    # Weighted ensemble
+    final_score = (graph_score * 0.35) + (ml_prob * 0.45) + (rule_score * 0.20)
+    
+    # Decision thresholds (CBN-aligned)
+    if final_score >= 0.95:
+        action = "BLOCK"
+    elif final_score >= 0.80:
+        action = "HOLD"
+    elif final_score >= 0.60:
+        action = "STEP_UP"
+    elif final_score >= 0.30:
+        action = "FLAG"
+    else:
+        action = "ALLOW"
+    
+    return {
+        "ensemble_score": round(final_score, 4),
+        "components": {
+            "gnn_graph": round(graph_score, 4),
+            "ml_neural": round(ml_prob, 4),
+            "rules": round(rule_score, 4),
+        },
+        "weights": {"gnn": 0.35, "neural": 0.45, "rules": 0.20},
+        "action": action,
+    }
+
 # --- PII Masking (NDPR Compliance) ---
 import re as _pii_re
 
@@ -1046,10 +1128,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
 
-        if         if path == "/v1/cache-metrics":
+        if path == "/v1/cache-metrics":
             self._respond(200, cache_metrics())
             return
-        path == "/healthz":
+        elif path == "/healthz":
             db = get_db()
             db_status = "not_configured"
             redis_status = "not_configured"
@@ -1089,10 +1171,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/livez":
             self.respond(200, {"alive": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "gnn-fraud-detection-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "gnn-fraud-detection-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             body = (
                 f'# HELP requests_total Total requests\n'
                 f'# TYPE requests_total counter\n'
@@ -1153,7 +1235,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/v1/create":
             try:
                 result = db_insert("gnn_fraud_detection_py", body)
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
+                cache_set(f"{self.get_tenant_id()}:last_post", str(body))
                 self.respond(201, {"created": True, "data": result})
             except ConnectionError as ce:
                 self.respond(503, {"error": "database_unavailable", "detail": str(ce)})

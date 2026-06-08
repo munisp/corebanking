@@ -1,4 +1,77 @@
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# ML AML RISK SCORING INTEGRATION
+# Calls ML inference server for real-time AML risk assessment during KYC
+# ═══════════════════════════════════════════════════════════════════════════════
+
+ML_INFERENCE_URL = os.environ.get("ML_INFERENCE_URL", "http://ml-inference-server:8500")
+
+
+def ml_score_aml(transaction_count_30d: int, unique_counterparties_30d: int,
+                 cash_ratio: float, international_ratio: float,
+                 avg_transaction_amount: float, max_transaction_amount: float,
+                 round_amount_ratio: float = 0.0, night_ratio: float = 0.0,
+                 structuring_score: float = 0.0, days_since_last_kyc: int = 30,
+                 pep_flag: int = 0, high_risk_country: int = 0):
+    """Call ML AML risk scoring model. Returns dict or None on failure."""
+    try:
+        payload = json.dumps({
+            "transaction_count_30d": transaction_count_30d,
+            "unique_counterparties_30d": unique_counterparties_30d,
+            "cash_ratio": cash_ratio, "international_ratio": international_ratio,
+            "avg_transaction_amount": avg_transaction_amount,
+            "max_transaction_amount": max_transaction_amount,
+            "round_amount_ratio": round_amount_ratio, "night_ratio": night_ratio,
+            "structuring_score": structuring_score,
+            "days_since_last_kyc_update": days_since_last_kyc,
+            "pep_flag": pep_flag, "high_risk_country": high_risk_country,
+            "account_type_idx": 0, "kyc_level_idx": 1,
+        }).encode()
+        req = urllib.request.Request(
+            f"{ML_INFERENCE_URL}/v1/aml/predict",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            result = json.loads(resp.read().decode())
+            logger.info(f"ML_AML_SCORE: prob={result.get('suspicious_probability', 0):.4f} "
+                       f"tier={result.get('risk_tier', 'unknown')} "
+                       f"str={result.get('requires_str', False)} "
+                       f"edd={result.get('requires_edd', False)}")
+            return result
+    except Exception as e:
+        logger.warning(f"ML AML scoring unavailable, falling back to rules: {e}")
+        return None
+
+
+def apply_ml_aml_decision(ml_result, customer_id: str):
+    """Apply ML AML decision to customer risk profile.
+    
+    Returns: (risk_tier, requires_str, requires_edd, action)
+    """
+    if ml_result is None:
+        return "unknown", False, False, "fallback_to_rules"
+    
+    risk_tier = ml_result.get("risk_tier", "low")
+    requires_str = ml_result.get("requires_str", False)
+    requires_edd = ml_result.get("requires_edd", False)
+    prob = ml_result.get("suspicious_probability", 0)
+    
+    if prob >= 0.9:
+        action = "block_and_report"
+        logger.critical(f"ML_AML_CRITICAL: customer={customer_id} prob={prob:.4f} — auto-filing SAR")
+    elif prob >= 0.7:
+        action = "enhanced_due_diligence"
+        logger.warning(f"ML_AML_HIGH: customer={customer_id} prob={prob:.4f} — EDD required")
+    elif prob >= 0.4:
+        action = "flag_for_review"
+        logger.info(f"ML_AML_MEDIUM: customer={customer_id} prob={prob:.4f} — flagged")
+    else:
+        action = "clear"
+    
+    return risk_tier, requires_str, requires_edd, action
+
 # --- PII Masking (NDPR Compliance) ---
 import re as _pii_re
 
