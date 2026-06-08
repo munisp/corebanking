@@ -1,9 +1,10 @@
 use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use serde_json::json;
 use std::env;
+use tokio_postgres::NoTls;
 
 fn check_jwt(req: &HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
@@ -89,6 +90,69 @@ struct AppState {
     breakers: Mutex<Vec<CircuitBreaker>>,
     events: Mutex<Vec<CBEvent>>,
     configs: Mutex<Vec<CBConfig>>,
+    db: Option<Arc<tokio_postgres::Client>>,
+}
+
+async fn init_db() -> Option<Arc<tokio_postgres::Client>> {
+    let db_url = env::var("DATABASE_URL").ok()?;
+    match tokio_postgres::connect(&db_url, NoTls).await {
+        Ok((client, connection)) => {
+            tokio::spawn(async move {
+                if let Err(e) = connection.await {
+                    eprintln!("[circuit-breaker] DB connection error: {}", e);
+                }
+            });
+            let _ = client.execute(
+                "CREATE TABLE IF NOT EXISTS circuit_breaker_state (
+                    service TEXT PRIMARY KEY,
+                    state TEXT NOT NULL DEFAULT 'closed',
+                    failure_count INTEGER DEFAULT 0,
+                    total_requests BIGINT DEFAULT 0,
+                    data JSONB DEFAULT '{}',
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )", &[]).await;
+            let _ = client.execute(
+                "CREATE TABLE IF NOT EXISTS circuit_breaker_events (
+                    id TEXT PRIMARY KEY,
+                    service TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    from_state TEXT,
+                    to_state TEXT,
+                    reason TEXT,
+                    timestamp TIMESTAMPTZ DEFAULT NOW()
+                )", &[]).await;
+            println!("[circuit-breaker] PostgreSQL connected — state will be persisted");
+            Some(Arc::new(client))
+        }
+        Err(e) => {
+            eprintln!("[circuit-breaker] DB connect failed: {} — in-memory only", e);
+            None
+        }
+    }
+}
+
+async fn db_persist_state(db: &Option<Arc<tokio_postgres::Client>>, breaker: &CircuitBreaker) {
+    if let Some(ref client) = db {
+        let state_str = match breaker.state {
+            CBState::Closed => "closed",
+            CBState::Open => "open",
+            CBState::HalfOpen => "half_open",
+        };
+        let data = serde_json::to_string(breaker).unwrap_or_default();
+        let _ = client.execute(
+            "INSERT INTO circuit_breaker_state (service, state, failure_count, total_requests, data) VALUES ($1,$2,$3,$4,$5::jsonb) ON CONFLICT (service) DO UPDATE SET state=$2, failure_count=$3, total_requests=$4, data=$5::jsonb, updated_at=NOW()",
+            &[&breaker.service, &state_str.to_string(), &(breaker.failure_count as i32), &(breaker.total_requests as i64), &data],
+        ).await;
+    }
+}
+
+async fn db_persist_event(db: &Option<Arc<tokio_postgres::Client>>, event: &CBEvent) {
+    if let Some(ref client) = db {
+        let _ = client.execute(
+            "INSERT INTO circuit_breaker_events (id, service, event_type, from_state, to_state, reason) VALUES ($1,$2,$3,$4,$5,$6)",
+            &[&event.id, &event.service, &event.event_type, &event.from_state, &event.to_state, &event.reason],
+        ).await;
+    }
 }
 
 fn compute_failure_rate(failures: u32, total: u64) -> f64 {
@@ -332,8 +396,6 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
-#[actix_web::main]
-async 
 // --- PII Masking (NDPR Compliance) ---
 fn mask_pii(value: &str, field_type: &str) -> String {
     if value.is_empty() { return "***".to_string(); }
@@ -364,12 +426,15 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8260".to_string()).parse().unwrap_or(8260);
+    let db = init_db().await;
     let state = web::Data::new(AppState {
         breakers: Mutex::new(seed_breakers()),
         events: Mutex::new(seed_events()),
         configs: Mutex::new(seed_configs()),
+        db,
     });
     println!("circuit-breaker-rs listening on :{}", port);
     HttpServer::new(move || {

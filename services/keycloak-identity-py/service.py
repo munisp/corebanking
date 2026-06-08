@@ -20,6 +20,51 @@ from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
 
+
+SERVICE_NAME = "keycloak-identity-py"
+
+# ─── PostgreSQL Persistence ───
+import time as _time
+
+_db_conn = None
+
+def _init_db():
+    global _db_conn
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return
+    try:
+        import psycopg2
+        _db_conn = psycopg2.connect(db_url)
+        _db_conn.autocommit = True
+        cur = _db_conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
+            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
+        cur.close()
+    except Exception as e:
+        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
+        _db_conn = None
+
+
+def db_persist(record_type: str, data: dict, status: str = "active"):
+    if _db_conn is None:
+        return
+    try:
+        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
+        cur = _db_conn.cursor()
+        cur.execute(
+            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
+            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
+        )
+        cur.close()
+    except Exception as e:
+        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
+
+
 realms: list[dict] = []
 clients: list[dict] = []
 users: list[dict] = []
@@ -57,6 +102,7 @@ def init_data() -> None:
         "createdAt": now_iso(),
     }
     realms.append(realm)
+    db_persist("realms", realm.to_dict() if hasattr(realm, "to_dict") else realm if isinstance(realm, dict) else {"value": str(realm)})
 
     client_defs = [
         {"name": "54bank-web", "type": "public", "redirectUris": ["https://app.54bank.io/*"], "webOrigins": ["https://app.54bank.io"]},
@@ -160,6 +206,7 @@ def create_user(body: dict) -> tuple[dict, int]:
         "lastLogin": None,
     }
     users.append(user)
+    db_persist("users", user.to_dict() if hasattr(user, "to_dict") else user if isinstance(user, dict) else {"value": str(user)})
     return user, 201
 
 
@@ -205,6 +252,7 @@ def generate_token(body: dict) -> tuple[dict, int]:
         "issuedAt": now_iso(),
     }
     tokens.append(token)
+    db_persist("tokens", token.to_dict() if hasattr(token, "to_dict") else token if isinstance(token, dict) else {"value": str(token)})
 
     if user:
         session = {
@@ -218,6 +266,7 @@ def generate_token(body: dict) -> tuple[dict, int]:
             "active": True,
         }
         sessions.append(session)
+        db_persist("sessions", session.to_dict() if hasattr(session, "to_dict") else session if isinstance(session, dict) else {"value": str(session)})
 
     return token, 200
 
@@ -320,6 +369,7 @@ class KeycloakHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    _init_db()
     port = int(os.environ.get("PORT", "8130"))
     server = HTTPServer(("0.0.0.0", port), KeycloakHandler)
     print(f"Keycloak Identity Service starting on :{port}")

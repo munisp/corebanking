@@ -1,0 +1,83 @@
+# 54Bank Rollback Pipeline
+# Manual trigger to rollback a deployment to a previous revision
+
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment to rollback'
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+      revision:
+        description: 'Helm revision number (leave empty for previous)'
+        required: false
+        type: string
+
+jobs:
+  rollback:
+    name: Rollback ${{ github.event.inputs.environment }}
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ github.event.inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.14.0'
+
+      - name: Configure kubectl
+        uses: azure/k8s-set-context@v3
+        with:
+          method: kubeconfig
+          kubeconfig: ${{ github.event.inputs.environment == 'production' && secrets.PRODUCTION_KUBECONFIG || secrets.STAGING_KUBECONFIG }}
+
+      - name: Execute rollback
+        run: |
+          NAMESPACE="54bank-${{ github.event.inputs.environment }}"
+          REVISION="${{ github.event.inputs.revision }}"
+
+          echo "=== Current release status ==="
+          helm status 54bank -n $NAMESPACE 2>/dev/null || echo "No existing release found"
+
+          echo ""
+          echo "=== Rolling back ==="
+          if [ -n "$REVISION" ]; then
+            echo "Rolling back to revision $REVISION..."
+            helm rollback 54bank "$REVISION" -n $NAMESPACE --wait --timeout 10m
+          else
+            echo "Rolling back to previous revision..."
+            helm rollback 54bank -n $NAMESPACE --wait --timeout 10m
+          fi
+
+          echo ""
+          echo "=== Post-rollback status ==="
+          helm status 54bank -n $NAMESPACE
+
+      - name: Verify rollback health
+        run: |
+          NAMESPACE="54bank-${{ github.event.inputs.environment }}"
+          echo "Waiting for pods to stabilize..."
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/instance=54bank \
+            -n $NAMESPACE --timeout=300s || true
+
+          echo ""
+          echo "Pod status:"
+          kubectl get pods -n $NAMESPACE -l app.kubernetes.io/instance=54bank --no-headers | head -20
+
+      - name: Post rollback summary
+        if: always()
+        run: |
+          echo "## Rollback Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Item | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | ${{ github.event.inputs.environment }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Revision | ${{ github.event.inputs.revision || 'previous' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY

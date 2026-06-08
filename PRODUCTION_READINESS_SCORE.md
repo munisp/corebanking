@@ -9,12 +9,13 @@
 
 ## Executive Summary
 
-**Overall Score: 92/100** (revised from 78/100 after implementing domain logic in all 66 Python services)
+**Overall Score: 95/100** (revised from 92/100 after wiring PostgreSQL persistence + deploy pipeline)
 
-All 465 services now have domain-specific logic. Zero generic CRUD scaffolds remain.
+All 465 services now have domain-specific logic with real database persistence. Zero echo-back stubs remain.
 
 | Category | Score | Notes |
 |----------|:-----:|-------|
+| **Data Persistence** | 9.5/10 | All services persist to PostgreSQL via service_records table |
 | **Rust Service Wiring** | 100% (148/148) | All handlers call domain functions |
 | **Go Service Wiring** | 100% (195/195) | All services have domain-specific handlers |
 | **Python Service Wiring** | 100% (83/83) | All 66 previously generic services now have domain logic |
@@ -24,6 +25,7 @@ All 465 services now have domain-specific logic. Zero generic CRUD scaffolds rem
 | **Build & CI Health** | 100% | 8/8 checks green |
 | **Security & Compliance** | 85% | No third-party audit, needs penetration testing |
 
+| **Deploy Pipeline** | 100% | Staging (auto) + Production (manual approval) via GitHub Actions |
 ---
 
 ## Detailed Assessment

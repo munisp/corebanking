@@ -1,6 +1,13 @@
 package main
 
 import (
+	_ "github.com/lib/pq"
+	"database/sql"
+	"context"
+	"os/signal"
+	"syscall"
+	"sync/atomic"
+
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -16,6 +23,8 @@ import (
 	"sync"
 	"time"
 )
+
+var serviceName = "secrets-vault-go"
 
 // Secrets Vault — encryption key management, rotation, audit logging
 // Implements PCI-DSS compliant key management for 54Bank
@@ -304,6 +313,7 @@ func handleSecretStore(w http.ResponseWriter, r *http.Request) {
 
 	secretsMu.Lock()
 	secrets = append(secrets, entry)
+	if dataBytes, err := json.Marshal(entry); err == nil { if dbErr := dbInsert(fmt.Sprintf("secrets-vault-go-%d", time.Now().UnixNano()), "secrets-vault-go", "secrets", "active", dataBytes); dbErr != nil { log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr) } }
 	secretsMu.Unlock()
 
 	logAudit("create", body.Path, body.UserID, r.RemoteAddr, true, fmt.Sprintf("version=%d", version))
@@ -406,6 +416,7 @@ func handleSecretRotate(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 	secrets = append(secrets, newEntry)
+	if dataBytes, err := json.Marshal(newEntry); err == nil { if dbErr := dbInsert(fmt.Sprintf("secrets-vault-go-%d", time.Now().UnixNano()), "secrets-vault-go", "secrets", "active", dataBytes); dbErr != nil { log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr) } }
 	secretsMu.Unlock()
 
 	logAudit("rotate", body.Path, body.UserID, r.RemoteAddr, true, fmt.Sprintf("new_version=%d", newEntry.Version))
@@ -457,6 +468,7 @@ func handlePolicyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	accessPolMu.Lock()
 	accessPolicies = append(accessPolicies, pol)
+	if dataBytes, err := json.Marshal(pol); err == nil { if dbErr := dbInsert(fmt.Sprintf("secrets-vault-go-%d", time.Now().UnixNano()), "secrets-vault-go", "accessPolicies", "active", dataBytes); dbErr != nil { log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr) } }
 	accessPolMu.Unlock()
 	respondJSON(w, 201, map[string]interface{}{"policy": pol})
 }
@@ -492,6 +504,7 @@ func handleKeyCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	keysMu.Lock()
 	keys = append(keys, key)
+	if dataBytes, err := json.Marshal(key); err == nil { if dbErr := dbInsert(fmt.Sprintf("secrets-vault-go-%d", time.Now().UnixNano()), "secrets-vault-go", "keys", "active", dataBytes); dbErr != nil { log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr) } }
 	keysMu.Unlock()
 	respondJSON(w, 201, map[string]interface{}{"key": key})
 }
@@ -509,7 +522,68 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "audit_entries_total{service=\"secrets-vault-go\"} %d\n", ac)
 }
 
+
+// ─── PostgreSQL Persistence ───
+
+var db *sql.DB
+var readyFlag int32
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[%s] DATABASE_URL not set — write operations will return 503", serviceName)
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[%s] DB open failed: %v — degraded mode active", serviceName, err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[%s] DB ping failed: %v — degraded mode active", serviceName, err)
+		db = nil
+		return
+	}
+	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
+	atomic.StoreInt32(&readyFlag, 1)
+}
+
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil { return fmt.Errorf("no db") }
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (id) DO UPDATE SET data=$5, status=$4, updated_at=NOW()", id, service, typ, status, string(data))
+	return err
+}
+
+func dbQuery(service, typ string) ([]map[string]interface{}, error) {
+	if db == nil { return nil, fmt.Errorf("no db") }
+	rows, err := db.Query("SELECT id, data, status, created_at FROM service_records WHERE service=$1 AND type=$2 ORDER BY created_at DESC LIMIT 100", service, typ)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var results []map[string]interface{}
+	for rows.Next() {
+		var id, data, status, createdAt string
+		if err := rows.Scan(&id, &data, &status, &createdAt); err != nil { continue }
+		results = append(results, map[string]interface{}{"id": id, "data": data, "status": status, "created_at": createdAt})
+	}
+	return results, nil
+}
+
 func main() {
+	initDB()
+	_ = context.Background
 	_ = big.NewInt
 	_ = sanitizeLogEntry
 	_ = deriveEncryptionKey
@@ -527,5 +601,15 @@ func main() {
 	mux.HandleFunc("/v1/key/create", handleKeyCreate)
 	mux.HandleFunc("/v1/audit/log", handleAuditLog)
 	log.Printf("Secrets Vault (PCI-DSS Compliant) listening on :%s", PORT)
+
+	// Graceful shutdown
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+		<-sigCh
+		log.Printf("[%s] Shutting down gracefully...", serviceName)
+		if db != nil { db.Close() }
+		os.Exit(0)
+	}()
 	log.Fatal(http.ListenAndServe(":"+PORT, mux))
 }
