@@ -76,24 +76,104 @@ self.addEventListener('sync', event => {
   }
 });
 
-// Push Notifications
-self.addEventListener('push', event => {
-  const data = event.data ? event.data.json() : { title: '54Bank', body: 'New notification' };
-  event.waitUntil(
-    self.registration.showNotification(data.title || '54Bank', {
-      body: data.body, icon: '/icons/icon-192.png', badge: '/icons/badge-72.png',
-      data: data.url ? { url: data.url } : undefined,
-      actions: data.actions || [],
-      tag: data.tag || 'default',
-    })
-  );
-});
-
 self.addEventListener('notificationclick', event => {
   event.notification.close();
-  if (event.notification.data && event.notification.data.url) {
-    event.waitUntil(clients.openWindow(event.notification.data.url));
+  const action = event.action;
+  const data = event.notification.data || {};
+  
+  if (action === 'view-transaction') {
+    event.waitUntil(clients.openWindow(data.url || '/transactions'));
+  } else if (action === 'approve-transfer') {
+    event.waitUntil(
+      fetch('/api/v1/transfers/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ transferId: data.transferId })
+      }).then(() => self.registration.showNotification('Transfer Approved', {
+        body: 'Transfer has been approved successfully',
+        icon: '/icons/icon-192.png', tag: 'approval-confirm'
+      }))
+    );
+  } else if (action === 'block-card') {
+    event.waitUntil(
+      fetch('/api/v1/cards/block', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cardId: data.cardId })
+      }).then(() => self.registration.showNotification('Card Blocked', {
+        body: 'Your card has been blocked for security',
+        icon: '/icons/icon-192.png', tag: 'card-blocked'
+      }))
+    );
+  } else if (data.url) {
+    event.waitUntil(clients.openWindow(data.url));
+  } else {
+    event.waitUntil(clients.openWindow('/'));
   }
+});
+
+// ─── Push Notification Handlers for Banking Events ──────────────────────────
+self.addEventListener('push', event => {
+  // Override default push to handle specific banking event types
+  if (!event.data) return;
+  
+  let data;
+  try { data = event.data.json(); } catch { return; }
+  
+  const type = data.type || 'generic';
+  
+  const notificationMap = {
+    'transaction_credit': {
+      icon: '/icons/credit.png',
+      actions: [{ action: 'view-transaction', title: 'View Details' }],
+      tag: `txn-${data.ref || Date.now()}`,
+      requireInteraction: false,
+    },
+    'transaction_debit': {
+      icon: '/icons/debit.png',
+      actions: [{ action: 'view-transaction', title: 'View Details' }],
+      tag: `txn-${data.ref || Date.now()}`,
+      requireInteraction: false,
+    },
+    'security_alert': {
+      icon: '/icons/security.png',
+      actions: [
+        { action: 'block-card', title: 'Block Card' },
+        { action: 'view-transaction', title: 'Review' }
+      ],
+      tag: 'security-alert',
+      requireInteraction: true,
+    },
+    'maker_checker': {
+      icon: '/icons/approval.png',
+      actions: [
+        { action: 'approve-transfer', title: 'Approve' },
+        { action: 'view-transaction', title: 'Review' }
+      ],
+      tag: `approval-${data.transferId || Date.now()}`,
+      requireInteraction: true,
+    },
+    'loan_reminder': {
+      icon: '/icons/loan.png',
+      actions: [{ action: 'view-transaction', title: 'Pay Now' }],
+      tag: 'loan-reminder',
+    },
+  };
+
+  const config = notificationMap[type] || {};
+  
+  event.waitUntil(
+    self.registration.showNotification(data.title || '54Bank', {
+      body: data.body || '',
+      icon: config.icon || '/icons/icon-192.png',
+      badge: '/icons/badge-72.png',
+      actions: config.actions || [],
+      tag: config.tag || 'default',
+      requireInteraction: config.requireInteraction || false,
+      data: { url: data.url, transferId: data.transferId, cardId: data.cardId, type },
+      vibrate: type === 'security_alert' ? [200, 100, 200, 100, 200] : [200, 100, 200],
+    })
+  );
 });
 
 // FIX: Service Workers cannot access localStorage. Use IndexedDB instead.

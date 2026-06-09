@@ -1007,7 +1007,8 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8097".into());
     println!("Banking Clearing & Ops (Rust) listening on :{} — Gaps 13-16, 14 middleware", port);
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();

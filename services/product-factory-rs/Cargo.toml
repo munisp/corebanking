@@ -8,6 +8,8 @@ name = "product_factory"
 path = "src/main.rs"
 
 [dependencies]
+sha2 = "0.10"
+lazy_static = "1"
 tokio-postgres = { version = "0.7", features = ["default"] }
 actix-web = "4"
 serde = { version = "1", features = ["derive"] }

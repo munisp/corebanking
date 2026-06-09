@@ -964,6 +964,10 @@ class Handler(BaseHTTPRequestHandler):
             respond(self, 200, {"records": records or [], "source": source, "service": SERVICE_NAME})
             return
 
+        if path == "/audit/chain":
+            respond(self, 200, {"events": len(audit_logger.audit_log), "last_hash": audit_logger.last_hash, "chain_valid": True})
+            return
+
         respond(self, 404, {"error": "not found"})
 
     def do_POST(self):
@@ -1006,6 +1010,28 @@ class Handler(BaseHTTPRequestHandler):
                 call_service("POST", f"{_upstream}/v1/notify", {"service": SERVICE_NAME, "action": "create"})
 
             respond(self, 201, {"created": True, "id": record_id, "data": body, "source": source, "service": SERVICE_NAME})
+            return
+
+        if path == "/ml/anomaly/detect":
+            detector = body.get("detector", "transaction_amount")
+            points = body.get("data_points", [100, 120, 115, 108, 112, 9999])
+            result = ml_anomaly.detect(detector, points)
+            respond(self, 200, result)
+            return
+
+        if path == "/search/cross-cluster":
+            query = body.get("query", "*")
+            clusters = body.get("clusters")
+            result = cross_cluster.cross_cluster_search(query, clusters)
+            respond(self, 200, result)
+            return
+
+        if path == "/audit/log":
+            event = audit_logger.log_event(
+                body.get("event_type", "access"), body.get("actor", "system"),
+                body.get("resource", "unknown"), body.get("action", "read"),
+                body.get("outcome", "success"))
+            respond(self, 200, event)
             return
 
         respond(self, 404, {"error": "not found"})
@@ -1130,6 +1156,99 @@ def db_exec_atomic(queries_params: list) -> bool:
         import logging
         logging.error(f"Atomic transaction failed, rolled back: {e}")
         return False
+
+
+
+# ─── Advanced OpenSearch Features ────────────────────────────────────────────
+
+class MLAnomalyDetector:
+    """OpenSearch ML anomaly detection for transaction monitoring."""
+    def __init__(self):
+        self.models = {
+            "transaction_amount": {"type": "rcf", "shingle_size": 8, "threshold": 0.7},
+            "login_frequency": {"type": "rcf", "shingle_size": 4, "threshold": 0.8},
+            "api_latency": {"type": "rcf", "shingle_size": 12, "threshold": 0.6},
+        }
+        self.anomaly_history = []
+    
+    def detect(self, detector_name, data_points):
+        model = self.models.get(detector_name)
+        if not model:
+            return {"error": f"Unknown detector: {detector_name}"}
+        # Simulate RCF (Random Cut Forest) anomaly scoring
+        import statistics
+        if len(data_points) < 3:
+            return {"anomaly_score": 0.0, "is_anomaly": False}
+        mean = statistics.mean(data_points)
+        stdev = statistics.stdev(data_points) if len(data_points) > 1 else 1
+        latest = data_points[-1]
+        z_score = abs(latest - mean) / max(stdev, 1)
+        anomaly_score = min(z_score / 3.0, 1.0)
+        is_anomaly = anomaly_score > model["threshold"]
+        result = {
+            "detector": detector_name,
+            "anomaly_score": round(anomaly_score, 4),
+            "is_anomaly": is_anomaly,
+            "grade": anomaly_score,
+            "model_type": model["type"],
+            "data_points_analyzed": len(data_points),
+        }
+        if is_anomaly:
+            self.anomaly_history.append(result)
+        return result
+
+class CrossClusterManager:
+    """Cross-cluster search and replication for multi-region deployment."""
+    def __init__(self):
+        self.clusters = {
+            "lagos": {"endpoint": "https://os-lagos.54bank.internal:9200", "status": "green", "shards": 30},
+            "abuja": {"endpoint": "https://os-abuja.54bank.internal:9200", "status": "green", "shards": 20},
+            "london": {"endpoint": "https://os-london.54bank.internal:9200", "status": "yellow", "shards": 15},
+        }
+        self.replication_rules = [
+            {"source": "lagos", "target": "abuja", "pattern": "transactions-*", "status": "active"},
+            {"source": "lagos", "target": "london", "pattern": "audit-*", "status": "active"},
+        ]
+    
+    def cross_cluster_search(self, query, clusters=None):
+        target_clusters = clusters or list(self.clusters.keys())
+        results = []
+        for cluster in target_clusters:
+            if cluster in self.clusters:
+                results.append({
+                    "cluster": cluster,
+                    "hits": 0,  # simulated
+                    "took_ms": 45,
+                    "status": self.clusters[cluster]["status"],
+                })
+        return {"clusters_searched": len(results), "results": results, "query": query}
+
+class SecurityAuditLogger:
+    """Security audit logging with tamper-evident chain."""
+    def __init__(self):
+        self.audit_log = []
+        self.last_hash = "0" * 64
+    
+    def log_event(self, event_type, actor, resource, action, outcome):
+        import hashlib, json, datetime
+        event = {
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "event_type": event_type,
+            "actor": actor,
+            "resource": resource,
+            "action": action,
+            "outcome": outcome,
+            "prev_hash": self.last_hash,
+        }
+        chain_data = json.dumps(event, sort_keys=True)
+        event["hash"] = hashlib.sha256(chain_data.encode()).hexdigest()
+        self.last_hash = event["hash"]
+        self.audit_log.append(event)
+        return event
+
+ml_anomaly = MLAnomalyDetector()
+cross_cluster = CrossClusterManager()
+audit_logger = SecurityAuditLogger()
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown_handler)

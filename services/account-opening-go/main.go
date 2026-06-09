@@ -536,8 +536,8 @@ func dataHandler(w http.ResponseWriter, r *http.Request) {
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
+    requestCount  uint64
+    errorCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -554,8 +554,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
+    reqs := atomic.LoadUint64(&requestCount)
+    errs := atomic.LoadUint64(&errorCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"account-opening-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"account-opening-go\"} %d\n", errs)
@@ -660,11 +660,11 @@ func callCreateAccount(customerID string, accountType string) (map[string]interf
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
+        atomic.AddUint64(&requestCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
+            atomic.AddUint64(&errorCount, 1)
         }
     })
 }
@@ -1089,7 +1089,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }

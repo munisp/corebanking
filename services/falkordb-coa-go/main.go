@@ -10,6 +10,7 @@ import (
 	"net"
 	"log"
 	"net/http"
+	"regexp"
 	"os"
 	"os/signal"
 	"strings"
@@ -81,7 +82,8 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
         r.Header.Set("X-User-Id", "validated")
         next.ServeHTTP(w, r)
     })
-}; next.ServeHTTP(w, r) }) }
+}
+
 func metricsHandler(w http.ResponseWriter, _ *http.Request) { r2 := atomic.LoadUint64(&requestCount); e2 := atomic.LoadUint64(&errorCount); w.Header().Set("Content-Type", "text/plain"); fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"%s\"} %d\n# TYPE errors_total counter\nerrors_total{service=\"%s\"} %d\n", serviceName, r2, serviceName, e2) }
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	dbStatus := "not_configured"
@@ -337,7 +339,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }

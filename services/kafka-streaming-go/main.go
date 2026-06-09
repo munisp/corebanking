@@ -27,6 +27,8 @@ import (
 	"net"
 
 	"regexp"
+
+	"github.com/IBM/sarama"
 )
 
 // secureRandUint32 generates a cryptographically secure random uint32
@@ -336,8 +338,8 @@ func kafka_streamingPartitionHandler(w http.ResponseWriter, r *http.Request) {
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
+    requestCount  uint64
+    errorCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -354,8 +356,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
+    reqs := atomic.LoadUint64(&requestCount)
+    errs := atomic.LoadUint64(&errorCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"kafka-streaming-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"kafka-streaming-go\"} %d\n", errs)
@@ -366,11 +368,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
+        atomic.AddUint64(&requestCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
+            atomic.AddUint64(&errorCount, 1)
         }
     })
 }
@@ -778,9 +780,6 @@ func computePartitionKey(key string, numPartitions int) int {
 // --- Kafka SDK Integration (sarama) ---
 // Real producer/consumer with exactly-once semantics, consumer groups, DLQ
 
-import (
-	"github.com/IBM/sarama"
-)
 
 type KafkaProducer struct {
 	producer   sarama.SyncProducer
@@ -1030,7 +1029,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -1516,6 +1515,193 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+// ─── Transaction Coordinator (Exactly-Once Semantics) ───────────────────────
+type TransactionCoordinator struct {
+	producerID    string
+	epoch         int32
+	sequenceNum   int64
+	mu            sync.Mutex
+	pendingTxns   map[string]*PendingTransaction
+	abortedTxns   map[string]time.Time
+}
+
+type PendingTransaction struct {
+	ID        string
+	Topic     string
+	Partition int32
+	Messages  []map[string]interface{}
+	StartTime time.Time
+	Status    string // "init", "prepared", "committed", "aborted"
+}
+
+func NewTransactionCoordinator(producerID string) *TransactionCoordinator {
+	return &TransactionCoordinator{
+		producerID:  producerID,
+		epoch:       1,
+		pendingTxns: make(map[string]*PendingTransaction),
+		abortedTxns: make(map[string]time.Time),
+	}
+}
+
+func (tc *TransactionCoordinator) BeginTransaction(txnID, topic string) *PendingTransaction {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	txn := &PendingTransaction{
+		ID: txnID, Topic: topic, StartTime: time.Now(), Status: "init",
+	}
+	tc.pendingTxns[txnID] = txn
+	atomic.AddInt64(&tc.sequenceNum, 1)
+	return txn
+}
+
+func (tc *TransactionCoordinator) PrepareTransaction(txnID string) error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	txn, ok := tc.pendingTxns[txnID]
+	if !ok { return fmt.Errorf("transaction %s not found", txnID) }
+	if txn.Status != "init" { return fmt.Errorf("transaction %s in wrong state: %s", txnID, txn.Status) }
+	txn.Status = "prepared"
+	return nil
+}
+
+func (tc *TransactionCoordinator) CommitTransaction(txnID string) error {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	txn, ok := tc.pendingTxns[txnID]
+	if !ok { return fmt.Errorf("transaction %s not found", txnID) }
+	if txn.Status != "prepared" { return fmt.Errorf("cannot commit: state=%s", txn.Status) }
+	txn.Status = "committed"
+	tc.epoch++
+	delete(tc.pendingTxns, txnID)
+	return nil
+}
+
+func (tc *TransactionCoordinator) AbortTransaction(txnID string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if txn, ok := tc.pendingTxns[txnID]; ok {
+		txn.Status = "aborted"
+		tc.abortedTxns[txnID] = time.Now()
+		delete(tc.pendingTxns, txnID)
+	}
+}
+
+// ─── DLQ Retry Engine ───────────────────────────────────────────────────────
+type DLQRetryEngine struct {
+	maxRetries    int
+	retryDelays   []time.Duration
+	dlqTopic      string
+	retryCounts   map[string]int
+	mu            sync.Mutex
+}
+
+func NewDLQRetryEngine(dlqTopic string) *DLQRetryEngine {
+	return &DLQRetryEngine{
+		maxRetries:  5,
+		retryDelays: []time.Duration{1*time.Second, 5*time.Second, 30*time.Second, 2*time.Minute, 10*time.Minute},
+		dlqTopic:    dlqTopic,
+		retryCounts: make(map[string]int),
+	}
+}
+
+func (d *DLQRetryEngine) ShouldRetry(messageID string) (bool, time.Duration) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	count := d.retryCounts[messageID]
+	if count >= d.maxRetries { return false, 0 }
+	delay := d.retryDelays[count]
+	d.retryCounts[messageID] = count + 1
+	return true, delay
+}
+
+func (d *DLQRetryEngine) MoveToDLQ(messageID string, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	log.Printf("[DLQ] Message %s moved to %s after %d retries: %v", messageID, d.dlqTopic, d.retryCounts[messageID], err)
+	delete(d.retryCounts, messageID)
+}
+
+// ─── Partition Rebalance Handler ────────────────────────────────────────────
+type ConsumerGroupRebalancer struct {
+	groupID          string
+	generation       int32
+	assignedParts    map[string][]int32
+	rebalanceCount   int64
+	strategy         string // "range", "roundrobin", "sticky"
+	mu               sync.Mutex
+}
+
+func NewConsumerGroupRebalancer(groupID, strategy string) *ConsumerGroupRebalancer {
+	return &ConsumerGroupRebalancer{
+		groupID: groupID, strategy: strategy, assignedParts: make(map[string][]int32),
+	}
+}
+
+func (cgr *ConsumerGroupRebalancer) OnPartitionsAssigned(topic string, partitions []int32) {
+	cgr.mu.Lock()
+	defer cgr.mu.Unlock()
+	cgr.assignedParts[topic] = partitions
+	cgr.generation++
+	atomic.AddInt64(&cgr.rebalanceCount, 1)
+	log.Printf("[Rebalance] Group=%s gen=%d assigned %s:%v strategy=%s", cgr.groupID, cgr.generation, topic, partitions, cgr.strategy)
+}
+
+func (cgr *ConsumerGroupRebalancer) OnPartitionsRevoked(topic string) {
+	cgr.mu.Lock()
+	defer cgr.mu.Unlock()
+	delete(cgr.assignedParts, topic)
+	log.Printf("[Rebalance] Group=%s revoked partitions for %s", cgr.groupID, topic)
+}
+
+var txnCoordinator *TransactionCoordinator
+var dlqEngine *DLQRetryEngine
+var rebalancer *ConsumerGroupRebalancer
+
+func initKafkaAdvanced() {
+	txnCoordinator = NewTransactionCoordinator("54bank-producer-1")
+	dlqEngine = NewDLQRetryEngine("54bank.dlq")
+	rebalancer = NewConsumerGroupRebalancer("54bank-consumer-group", "sticky")
+}
+
+func handleTransactionalProduce(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct {
+		TxnID    string                   `json:"txn_id"`
+		Topic    string                   `json:"topic"`
+		Messages []map[string]interface{} `json:"messages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid request"})
+		return
+	}
+	txn := txnCoordinator.BeginTransaction(req.TxnID, req.Topic)
+	txn.Messages = req.Messages
+	if err := txnCoordinator.PrepareTransaction(req.TxnID); err != nil {
+		txnCoordinator.AbortTransaction(req.TxnID)
+		respondJSON(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	if err := txnCoordinator.CommitTransaction(req.TxnID); err != nil {
+		txnCoordinator.AbortTransaction(req.TxnID)
+		respondJSON(w, 500, map[string]interface{}{"error": err.Error()})
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"txn_id": req.TxnID, "status": "committed", "messages": len(req.Messages), "epoch": txnCoordinator.epoch})
+}
+
+func handleDLQRetry(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { MessageID string `json:"message_id"`; Error string `json:"error"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	shouldRetry, delay := dlqEngine.ShouldRetry(req.MessageID)
+	if !shouldRetry {
+		dlqEngine.MoveToDLQ(req.MessageID, fmt.Errorf(req.Error))
+		respondJSON(w, 200, map[string]interface{}{"action": "moved_to_dlq", "message_id": req.MessageID})
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"action": "retry_scheduled", "message_id": req.MessageID, "delay_ms": delay.Milliseconds()})
+}
 
 func main() {
 	port := os.Getenv("PORT")

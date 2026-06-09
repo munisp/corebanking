@@ -4,6 +4,8 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
+sha2 = "0.10"
+lazy_static = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 tokio-postgres = { version = "0.7", features = ["default"] }

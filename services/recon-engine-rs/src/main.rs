@@ -1015,7 +1015,8 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8233".to_string());
     let state = web::Data::new(AppState {
         start_time: Instant::now(),

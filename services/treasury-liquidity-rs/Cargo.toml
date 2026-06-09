@@ -5,6 +5,8 @@ edition = "2021"
 description = "54Bank Treasury & Liquidity Management — FX positions, money market, ALM, liquidity ratios"
 
 [dependencies]
+sha2 = "0.10"
+lazy_static = "1"
 tokio-postgres = { version = "0.7", features = ["default"] }
 actix-web = "4"
 actix-rt = "2"

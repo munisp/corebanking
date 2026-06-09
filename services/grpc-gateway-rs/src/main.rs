@@ -787,7 +787,8 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8218);
     let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
         match init_db(&url).await {

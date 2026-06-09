@@ -27,6 +27,11 @@ import (
 	"net"
 
 	"regexp"
+
+	"go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
+	"go.temporal.io/sdk/activity"
 )
 
 // secureRandUint32 generates a cryptographically secure random uint32
@@ -338,8 +343,8 @@ func temporal_workerValidateRequestHandler(w http.ResponseWriter, r *http.Reques
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
+    requestCount  uint64
+    errorCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -356,8 +361,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
+    reqs := atomic.LoadUint64(&requestCount)
+    errs := atomic.LoadUint64(&errorCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"temporal-worker-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"temporal-worker-go\"} %d\n", errs)
@@ -368,11 +373,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
+        atomic.AddUint64(&requestCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
+            atomic.AddUint64(&errorCount, 1)
         }
     })
 }
@@ -779,12 +784,6 @@ func computeRetryBackoff(attempt int, initialDelay float64) float64 {
 // --- Temporal SDK Integration (go.temporal.io/sdk) ---
 // Real workflow definitions, activities, saga compensation
 
-import (
-	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/temporal"
-	"go.temporal.io/sdk/workflow"
-	"go.temporal.io/sdk/activity"
-)
 
 const TaskQueue = "54bank-financial-operations"
 
@@ -1123,7 +1122,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -1574,6 +1573,202 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+// ─── Workflow Versioning Engine ─────────────────────────────────────────────
+type WorkflowVersioning struct {
+	versions    map[string][]WorkflowVersion
+	mu          sync.RWMutex
+}
+
+type WorkflowVersion struct {
+	Version     int    `json:"version"`
+	ChangeID    string `json:"change_id"`
+	MinSupported int   `json:"min_supported"`
+	MaxSupported int   `json:"max_supported"`
+	Handler     string `json:"handler"`
+}
+
+func NewWorkflowVersioning() *WorkflowVersioning {
+	return &WorkflowVersioning{versions: make(map[string][]WorkflowVersion)}
+}
+
+func (wv *WorkflowVersioning) RegisterVersion(workflowType string, v WorkflowVersion) {
+	wv.mu.Lock()
+	defer wv.mu.Unlock()
+	wv.versions[workflowType] = append(wv.versions[workflowType], v)
+}
+
+func (wv *WorkflowVersioning) GetVersion(workflowType string, changeID string) int {
+	wv.mu.RLock()
+	defer wv.mu.RUnlock()
+	versions := wv.versions[workflowType]
+	for _, v := range versions {
+		if v.ChangeID == changeID { return v.Version }
+	}
+	return -1 // default branch
+}
+
+// ─── Continue-As-New Handler ────────────────────────────────────────────────
+type ContinueAsNewConfig struct {
+	MaxIterations    int           `json:"max_iterations"`
+	MaxHistorySize   int           `json:"max_history_size"` // events
+	CheckInterval    time.Duration `json:"check_interval"`
+	currentIteration int
+}
+
+func NewContinueAsNewConfig() *ContinueAsNewConfig {
+	return &ContinueAsNewConfig{
+		MaxIterations:  1000,
+		MaxHistorySize: 10000,
+		CheckInterval:  time.Minute,
+	}
+}
+
+func (c *ContinueAsNewConfig) ShouldContinueAsNew(historySize int) bool {
+	c.currentIteration++
+	return c.currentIteration >= c.MaxIterations || historySize >= c.MaxHistorySize
+}
+
+// ─── Child Workflow Orchestrator ────────────────────────────────────────────
+type ChildWorkflowOrchestrator struct {
+	parentRunID   string
+	children      map[string]*ChildWorkflowExecution
+	mu            sync.Mutex
+}
+
+type ChildWorkflowExecution struct {
+	WorkflowID   string    `json:"workflow_id"`
+	RunID        string    `json:"run_id"`
+	Type         string    `json:"type"`
+	Status       string    `json:"status"`
+	Input        interface{} `json:"input"`
+	Output       interface{} `json:"output"`
+	StartTime    time.Time `json:"start_time"`
+	EndTime      *time.Time `json:"end_time,omitempty"`
+	ParentClose  string    `json:"parent_close_policy"` // TERMINATE, ABANDON, REQUEST_CANCEL
+}
+
+func NewChildWorkflowOrchestrator(parentRunID string) *ChildWorkflowOrchestrator {
+	return &ChildWorkflowOrchestrator{
+		parentRunID: parentRunID, children: make(map[string]*ChildWorkflowExecution),
+	}
+}
+
+func (cwo *ChildWorkflowOrchestrator) StartChild(workflowID, wfType string, input interface{}) *ChildWorkflowExecution {
+	cwo.mu.Lock()
+	defer cwo.mu.Unlock()
+	child := &ChildWorkflowExecution{
+		WorkflowID: workflowID, RunID: fmt.Sprintf("run-%d", time.Now().UnixNano()),
+		Type: wfType, Status: "running", Input: input, StartTime: time.Now(),
+		ParentClose: "TERMINATE",
+	}
+	cwo.children[workflowID] = child
+	return child
+}
+
+func (cwo *ChildWorkflowOrchestrator) CompleteChild(workflowID string, output interface{}) {
+	cwo.mu.Lock()
+	defer cwo.mu.Unlock()
+	if child, ok := cwo.children[workflowID]; ok {
+		child.Status = "completed"
+		child.Output = output
+		now := time.Now()
+		child.EndTime = &now
+	}
+}
+
+// ─── Query Handler ──────────────────────────────────────────────────────────
+type WorkflowQueryHandler struct {
+	handlers map[string]func([]byte) (interface{}, error)
+	mu       sync.RWMutex
+}
+
+func NewWorkflowQueryHandler() *WorkflowQueryHandler {
+	return &WorkflowQueryHandler{handlers: make(map[string]func([]byte) (interface{}, error))}
+}
+
+func (wqh *WorkflowQueryHandler) RegisterQuery(name string, handler func([]byte) (interface{}, error)) {
+	wqh.mu.Lock()
+	defer wqh.mu.Unlock()
+	wqh.handlers[name] = handler
+}
+
+func (wqh *WorkflowQueryHandler) HandleQuery(name string, args []byte) (interface{}, error) {
+	wqh.mu.RLock()
+	handler, ok := wqh.handlers[name]
+	wqh.mu.RUnlock()
+	if !ok { return nil, fmt.Errorf("unknown query: %s", name) }
+	return handler(args)
+}
+
+// ─── Search Attributes ──────────────────────────────────────────────────────
+type SearchAttributeManager struct {
+	customAttributes map[string]string // name -> type
+	values          map[string]map[string]interface{} // runID -> attrs
+	mu              sync.RWMutex
+}
+
+func NewSearchAttributeManager() *SearchAttributeManager {
+	return &SearchAttributeManager{
+		customAttributes: map[string]string{
+			"CustomerID": "Keyword", "TransactionType": "Keyword",
+			"AmountKobo": "Int", "RiskLevel": "Keyword",
+			"CompletionTime": "Datetime",
+		},
+		values: make(map[string]map[string]interface{}),
+	}
+}
+
+func (sam *SearchAttributeManager) UpsertSearchAttributes(runID string, attrs map[string]interface{}) {
+	sam.mu.Lock()
+	defer sam.mu.Unlock()
+	if sam.values[runID] == nil { sam.values[runID] = make(map[string]interface{}) }
+	for k, v := range attrs { sam.values[runID][k] = v }
+}
+
+var wfVersioning *WorkflowVersioning
+var continueAsNew *ContinueAsNewConfig
+var childOrchestrator *ChildWorkflowOrchestrator
+var queryHandler *WorkflowQueryHandler
+var searchAttrMgr *SearchAttributeManager
+
+func initTemporalAdvanced() {
+	wfVersioning = NewWorkflowVersioning()
+	wfVersioning.RegisterVersion("TransferWorkflow", WorkflowVersion{Version: 2, ChangeID: "add-compliance-check", MinSupported: 1, MaxSupported: 2})
+	wfVersioning.RegisterVersion("TransferWorkflow", WorkflowVersion{Version: 3, ChangeID: "add-fx-conversion", MinSupported: 2, MaxSupported: 3})
+	continueAsNew = NewContinueAsNewConfig()
+	childOrchestrator = NewChildWorkflowOrchestrator("root")
+	queryHandler = NewWorkflowQueryHandler()
+	queryHandler.RegisterQuery("getStatus", func(args []byte) (interface{}, error) {
+		return map[string]string{"status": "running"}, nil
+	})
+	searchAttrMgr = NewSearchAttributeManager()
+}
+
+func handleWorkflowVersion(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { WorkflowType string `json:"workflow_type"`; ChangeID string `json:"change_id"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	version := wfVersioning.GetVersion(req.WorkflowType, req.ChangeID)
+	respondJSON(w, 200, map[string]interface{}{"workflow_type": req.WorkflowType, "version": version, "change_id": req.ChangeID})
+}
+
+func handleChildWorkflow(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { WorkflowID string `json:"workflow_id"`; Type string `json:"type"`; Input interface{} `json:"input"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	child := childOrchestrator.StartChild(req.WorkflowID, req.Type, req.Input)
+	respondJSON(w, 200, child)
+}
+
+func handleWorkflowQuery(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { QueryName string `json:"query_name"`; Args json.RawMessage `json:"args"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	result, err := queryHandler.HandleQuery(req.QueryName, req.Args)
+	if err != nil { respondJSON(w, 400, map[string]interface{}{"error": err.Error()}); return }
+	respondJSON(w, 200, map[string]interface{}{"query": req.QueryName, "result": result})
+}
 
 func main() {
 	port := os.Getenv("PORT")

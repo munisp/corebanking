@@ -3,6 +3,7 @@ use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::env;
 use std::sync::Mutex;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -1381,7 +1382,8 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8226".to_string());
     let state = web::Data::new(AppState {
         start_time: Instant::now(),

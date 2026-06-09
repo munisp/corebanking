@@ -338,8 +338,8 @@ func mojaloop_connectorValidateRequestHandler(w http.ResponseWriter, r *http.Req
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
+    requestCount  uint64
+    errorCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -356,8 +356,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
+    reqs := atomic.LoadUint64(&requestCount)
+    errs := atomic.LoadUint64(&errorCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"mojaloop-connector-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"mojaloop-connector-go\"} %d\n", errs)
@@ -368,11 +368,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
+        atomic.AddUint64(&requestCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
+            atomic.AddUint64(&errorCount, 1)
         }
     })
 }
@@ -970,7 +970,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -1421,6 +1421,146 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+// ─── Settlement Window Manager ──────────────────────────────────────────────
+type SettlementWindowManager struct {
+	windows     map[string]*SettlementWindow
+	current     string
+	mu          sync.Mutex
+}
+
+type SettlementWindow struct {
+	ID         string    `json:"id"`
+	State      string    `json:"state"` // "OPEN", "CLOSED", "PENDING_SETTLEMENT", "SETTLED", "ABORTED"
+	OpenedAt   time.Time `json:"opened_at"`
+	ClosedAt   *time.Time `json:"closed_at,omitempty"`
+	Transfers  int       `json:"transfers"`
+	TotalKobo  int64     `json:"total_kobo"`
+	Participants []string `json:"participants"`
+}
+
+func NewSettlementWindowManager() *SettlementWindowManager {
+	mgr := &SettlementWindowManager{windows: make(map[string]*SettlementWindow)}
+	windowID := fmt.Sprintf("SW-%d", time.Now().Unix())
+	mgr.windows[windowID] = &SettlementWindow{ID: windowID, State: "OPEN", OpenedAt: time.Now()}
+	mgr.current = windowID
+	return mgr
+}
+
+func (swm *SettlementWindowManager) CloseWindow() (*SettlementWindow, error) {
+	swm.mu.Lock()
+	defer swm.mu.Unlock()
+	w := swm.windows[swm.current]
+	if w == nil { return nil, fmt.Errorf("no open window") }
+	if w.State != "OPEN" { return nil, fmt.Errorf("window %s not open", w.ID) }
+	now := time.Now()
+	w.State = "CLOSED"; w.ClosedAt = &now
+	newID := fmt.Sprintf("SW-%d", time.Now().Unix())
+	swm.windows[newID] = &SettlementWindow{ID: newID, State: "OPEN", OpenedAt: time.Now()}
+	swm.current = newID
+	return w, nil
+}
+
+func (swm *SettlementWindowManager) SettleWindow(windowID string) error {
+	swm.mu.Lock()
+	defer swm.mu.Unlock()
+	w := swm.windows[windowID]
+	if w == nil { return fmt.Errorf("window %s not found", windowID) }
+	if w.State != "CLOSED" { return fmt.Errorf("window must be CLOSED") }
+	w.State = "SETTLED"
+	return nil
+}
+
+// ─── Liquidity Manager ──────────────────────────────────────────────────────
+type LiquidityManager struct {
+	positions map[string]*LiquidityPosition
+	mu        sync.RWMutex
+}
+
+type LiquidityPosition struct {
+	DFSPID    string `json:"dfsp_id"`
+	Currency  string `json:"currency"`
+	NDC       int64  `json:"ndc_kobo"`       // Net Debit Cap
+	Position  int64  `json:"position_kobo"`   // Current position
+	Available int64  `json:"available_kobo"`  // NDC - Position
+}
+
+func NewLiquidityManager() *LiquidityManager {
+	return &LiquidityManager{
+		positions: map[string]*LiquidityPosition{
+			"dfsp-a": {DFSPID: "dfsp-a", Currency: "NGN", NDC: 10000000000, Position: 2500000000, Available: 7500000000},
+			"dfsp-b": {DFSPID: "dfsp-b", Currency: "NGN", NDC: 5000000000, Position: 1200000000, Available: 3800000000},
+		},
+	}
+}
+
+func (lm *LiquidityManager) CheckLiquidity(dfspID string, amountKobo int64) (bool, *LiquidityPosition) {
+	lm.mu.RLock()
+	defer lm.mu.RUnlock()
+	pos := lm.positions[dfspID]
+	if pos == nil { return false, nil }
+	return pos.Available >= amountKobo, pos
+}
+
+// ─── FX Quote Engine ────────────────────────────────────────────────────────
+type FXQuoteEngine struct {
+	rates map[string]float64
+	mu    sync.RWMutex
+}
+
+func NewFXQuoteEngine() *FXQuoteEngine {
+	return &FXQuoteEngine{rates: map[string]float64{
+		"NGN/USD": 0.000625, "USD/NGN": 1600.0,
+		"NGN/GBP": 0.000488, "GBP/NGN": 2050.0,
+		"NGN/EUR": 0.000556, "EUR/NGN": 1800.0,
+		"NGN/GHS": 0.0094,   "GHS/NGN": 106.0,
+		"NGN/KES": 0.0806,   "KES/NGN": 12.4,
+	}}
+}
+
+func (fxe *FXQuoteEngine) GetQuote(from, to string, amountKobo int64) (int64, float64, error) {
+	fxe.mu.RLock()
+	defer fxe.mu.RUnlock()
+	pair := from + "/" + to
+	rate, ok := fxe.rates[pair]
+	if !ok { return 0, 0, fmt.Errorf("unsupported pair: %s", pair) }
+	converted := int64(float64(amountKobo) * rate)
+	return converted, rate, nil
+}
+
+var settlementMgr *SettlementWindowManager
+var liquidityMgr *LiquidityManager
+var fxEngine *FXQuoteEngine
+
+func initMojaAdvanced() {
+	settlementMgr = NewSettlementWindowManager()
+	liquidityMgr = NewLiquidityManager()
+	fxEngine = NewFXQuoteEngine()
+}
+
+func handleSettlementClose(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	window, err := settlementMgr.CloseWindow()
+	if err != nil { respondJSON(w, 400, map[string]interface{}{"error": err.Error()}); return }
+	respondJSON(w, 200, window)
+}
+
+func handleLiquidityCheck(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { DFSPID string `json:"dfsp_id"`; AmountKobo int64 `json:"amount_kobo"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	ok, pos := liquidityMgr.CheckLiquidity(req.DFSPID, req.AmountKobo)
+	respondJSON(w, 200, map[string]interface{}{"sufficient": ok, "position": pos})
+}
+
+func handleFXQuote(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { From string `json:"from"`; To string `json:"to"`; AmountKobo int64 `json:"amount_kobo"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	converted, rate, err := fxEngine.GetQuote(req.From, req.To, req.AmountKobo)
+	if err != nil { respondJSON(w, 400, map[string]interface{}{"error": err.Error()}); return }
+	respondJSON(w, 200, map[string]interface{}{"from": req.From, "to": req.To, "rate": rate, "input_kobo": req.AmountKobo, "output_kobo": converted})
+}
 
 func main() {
 	port := os.Getenv("PORT")

@@ -1174,7 +1174,7 @@ func NewBundle() *Bundle {
 	return &Bundle{
 		Kafka:       NewKafkaClient(),
 		Redis:       NewRedisClient(),
-		Cache:       NewCacheManager("54bank"),
+		Cache:       NewCacheManager(),
 		Temporal:    NewTemporalClient(),
 		Keycloak:    NewKeycloakClient(),
 		Permify:     NewPermifyClient(),

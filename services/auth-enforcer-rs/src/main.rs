@@ -802,7 +802,8 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8201);
     let state = web::Data::new(AppState {
         policies: Mutex::new(Vec::new()),

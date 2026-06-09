@@ -978,5 +978,155 @@ class App {
   }
 }
 
+// ─── WebSocket Reconnect with Exponential Backoff ───────────────────────────
+class WebSocketManager {
+  constructor(url) {
+    this.url = url;
+    this.ws = null;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 10;
+    this.baseDelay = 1000;
+    this.maxDelay = 30000;
+    this.listeners = new Map();
+    this.messageQueue = [];
+    this.heartbeatInterval = null;
+    this.connect();
+  }
+
+  connect() {
+    try {
+      this.ws = new WebSocket(this.url);
+      
+      this.ws.onopen = () => {
+        console.log('[WS] Connected');
+        this.reconnectAttempts = 0;
+        this.startHeartbeat();
+        // Flush queued messages
+        while (this.messageQueue.length > 0) {
+          const msg = this.messageQueue.shift();
+          this.ws.send(JSON.stringify(msg));
+        }
+        this.emit('connected');
+      };
+      
+      this.ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === 'pong') return;
+          this.emit('message', data);
+          if (data.type) this.emit(data.type, data);
+          
+          // Handle banking-specific events
+          if (data.type === 'transaction') {
+            this.emit('transaction', data);
+            if (Notification.permission === 'granted') {
+              new Notification(data.amount > 0 ? 'Credit Alert' : 'Debit Alert', {
+                body: `${data.amount > 0 ? '+' : ''}NGN ${Math.abs(data.amount).toLocaleString()} - ${data.description}`,
+                icon: '/icons/icon-192.png'
+              });
+            }
+          }
+        } catch (e) { console.warn('[WS] Parse error:', e); }
+      };
+      
+      this.ws.onclose = (event) => {
+        console.log(`[WS] Closed: ${event.code} ${event.reason}`);
+        this.stopHeartbeat();
+        this.emit('disconnected', { code: event.code, reason: event.reason });
+        if (event.code !== 1000) this.scheduleReconnect();
+      };
+      
+      this.ws.onerror = (error) => {
+        console.error('[WS] Error:', error);
+        this.emit('error', error);
+      };
+    } catch (e) {
+      console.error('[WS] Connection failed:', e);
+      this.scheduleReconnect();
+    }
+  }
+
+  scheduleReconnect() {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error('[WS] Max reconnect attempts reached');
+      this.emit('max_reconnects');
+      return;
+    }
+    const delay = Math.min(this.baseDelay * Math.pow(2, this.reconnectAttempts), this.maxDelay);
+    const jitter = delay * 0.2 * Math.random();
+    this.reconnectAttempts++;
+    console.log(`[WS] Reconnecting in ${Math.round(delay + jitter)}ms (attempt ${this.reconnectAttempts})`);
+    setTimeout(() => this.connect(), delay + jitter);
+  }
+
+  send(type, payload) {
+    const msg = { type, ...payload, timestamp: Date.now() };
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(msg));
+    } else {
+      this.messageQueue.push(msg);
+    }
+  }
+
+  startHeartbeat() {
+    this.heartbeatInterval = setInterval(() => {
+      if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 25000);
+  }
+
+  stopHeartbeat() {
+    if (this.heartbeatInterval) { clearInterval(this.heartbeatInterval); this.heartbeatInterval = null; }
+  }
+
+  on(event, callback) {
+    if (!this.listeners.has(event)) this.listeners.set(event, []);
+    this.listeners.get(event).push(callback);
+  }
+
+  emit(event, data) {
+    const handlers = this.listeners.get(event) || [];
+    handlers.forEach(h => { try { h(data); } catch (e) { console.error('[WS] Handler error:', e); } });
+  }
+
+  disconnect() {
+    this.stopHeartbeat();
+    if (this.ws) { this.ws.close(1000, 'Client disconnect'); this.ws = null; }
+  }
+}
+
+// ─── App Shell Pre-caching ──────────────────────────────────────────────────
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', async () => {
+    try {
+      const reg = await navigator.serviceWorker.register('/sw.js');
+      console.log('[SW] Registered:', reg.scope);
+      
+      // Request push notification permission
+      if ('Notification' in window && Notification.permission === 'default') {
+        const permission = await Notification.requestPermission();
+        if (permission === 'granted' && reg.pushManager) {
+          try {
+            const sub = await reg.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: new Uint8Array(65) // Replace with VAPID key
+            });
+            console.log('[Push] Subscribed:', sub.endpoint);
+          } catch (e) { console.warn('[Push] Subscribe failed:', e); }
+        }
+      }
+    } catch (e) { console.error('[SW] Registration failed:', e); }
+  });
+}
+
 // Boot
-new App();
+const app = new App();
+const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+const wsManager = new WebSocketManager(wsUrl);
+wsManager.on('transaction', (data) => {
+  console.log('[App] Transaction event:', data);
+});
+wsManager.on('disconnected', () => {
+  console.log('[App] WebSocket disconnected, will auto-reconnect');
+});

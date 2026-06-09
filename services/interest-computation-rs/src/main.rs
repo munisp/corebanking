@@ -35,24 +35,8 @@ struct AppState {
 }
 
 
-fn compute_simple_interest(principal: f64, rate: f64, days: u32, day_basis: u32) -> f64 {
-    principal * (rate / 100.0) * (days as f64 / day_basis as f64)
-}
 
-fn compute_compound_interest(principal: f64, rate: f64, days: u32, day_basis: u32, freq: u32) -> f64 {
-    let periods = days as f64 / (day_basis as f64 / freq as f64);
-    let rate_per_period = rate / 100.0 / freq as f64;
-    principal * (1.0 + rate_per_period).powf(periods) - principal
-}
 
-fn get_day_basis(convention: &str) -> u32 {
-    match convention {
-        "ACT/360" => 360,
-        "ACT/365" => 365,
-        "30/360" => 360,
-        "ACT/ACT" => 365,
-        _ => 365,
-    }
 }
 
 fn generate_accrual_schedule(principal: f64, rate: f64, days: u32, freq: &str) -> Vec<serde_json::Value> {
@@ -839,7 +823,8 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8103);
     let state = web::Data::new(AppState {
             db_url: std::env::var("DATABASE_URL").ok(),

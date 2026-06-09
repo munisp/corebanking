@@ -1049,7 +1049,8 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
-fn main() -> std::io::Result<()> {
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8106".into());
     println!("Platform Hardening (Rust) on :{} — Enhancements 21-28 + Quick Wins", port);
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();

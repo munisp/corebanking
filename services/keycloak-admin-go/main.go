@@ -338,8 +338,8 @@ func keycloak_adminValidateRequestHandler(w http.ResponseWriter, r *http.Request
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
+    requestCount  uint64
+    errorCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -356,8 +356,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
+    reqs := atomic.LoadUint64(&requestCount)
+    errs := atomic.LoadUint64(&errorCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"keycloak-admin-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"keycloak-admin-go\"} %d\n", errs)
@@ -368,11 +368,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
+        atomic.AddUint64(&requestCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
+            atomic.AddUint64(&errorCount, 1)
         }
     })
 }
@@ -951,7 +951,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -1402,6 +1402,153 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+// ─── MFA Policy Engine ──────────────────────────────────────────────────────
+type MFAPolicyEngine struct {
+	policies map[string]*MFAPolicy
+	mu       sync.RWMutex
+}
+
+type MFAPolicy struct {
+	Name           string   `json:"name"`
+	RequireMFA     bool     `json:"require_mfa"`
+	AllowedMethods []string `json:"allowed_methods"` // "totp", "sms", "email", "webauthn"
+	GracePeriod    int      `json:"grace_period_days"`
+	MinStrength    string   `json:"min_strength"` // "low", "medium", "high"
+	RiskThreshold  float64  `json:"risk_threshold"`
+	Conditions     struct {
+		MinAmount   int64    `json:"min_amount_kobo"`
+		IpWhitelist []string `json:"ip_whitelist"`
+		Roles       []string `json:"roles"`
+	} `json:"conditions"`
+}
+
+func NewMFAPolicyEngine() *MFAPolicyEngine {
+	engine := &MFAPolicyEngine{policies: make(map[string]*MFAPolicy)}
+	engine.policies["high_value_transfer"] = &MFAPolicy{
+		Name: "high_value_transfer", RequireMFA: true,
+		AllowedMethods: []string{"totp", "webauthn"}, MinStrength: "high", RiskThreshold: 0.7,
+	}
+	engine.policies["high_value_transfer"].Conditions.MinAmount = 100000000 // 1M NGN
+	engine.policies["admin_actions"] = &MFAPolicy{
+		Name: "admin_actions", RequireMFA: true,
+		AllowedMethods: []string{"totp", "webauthn", "sms"}, MinStrength: "medium",
+	}
+	engine.policies["admin_actions"].Conditions.Roles = []string{"admin", "super_admin"}
+	return engine
+}
+
+func (mpe *MFAPolicyEngine) EvaluatePolicy(action string, amountKobo int64, role string) (*MFAPolicy, bool) {
+	mpe.mu.RLock()
+	defer mpe.mu.RUnlock()
+	for _, policy := range mpe.policies {
+		if policy.Conditions.MinAmount > 0 && amountKobo >= policy.Conditions.MinAmount {
+			return policy, true
+		}
+		for _, r := range policy.Conditions.Roles {
+			if r == role { return policy, true }
+		}
+	}
+	return nil, false
+}
+
+// ─── Session Management ─────────────────────────────────────────────────────
+type SessionManager struct {
+	sessions      map[string]*UserSession
+	maxPerUser    int
+	idleTimeout   time.Duration
+	absTimeout    time.Duration
+	mu            sync.RWMutex
+}
+
+type UserSession struct {
+	SessionID  string    `json:"session_id"`
+	UserID     string    `json:"user_id"`
+	ClientID   string    `json:"client_id"`
+	IPAddress  string    `json:"ip_address"`
+	UserAgent  string    `json:"user_agent"`
+	CreatedAt  time.Time `json:"created_at"`
+	LastActive time.Time `json:"last_active"`
+	MFAVerified bool    `json:"mfa_verified"`
+}
+
+func NewSessionManager() *SessionManager {
+	return &SessionManager{
+		sessions: make(map[string]*UserSession),
+		maxPerUser: 5, idleTimeout: 30 * time.Minute, absTimeout: 8 * time.Hour,
+	}
+}
+
+func (sm *SessionManager) CreateSession(userID, clientID, ip, ua string) *UserSession {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	// Enforce max sessions per user
+	count := 0
+	var oldest string
+	var oldestTime time.Time
+	for id, s := range sm.sessions {
+		if s.UserID == userID {
+			count++
+			if oldest == "" || s.CreatedAt.Before(oldestTime) {
+				oldest = id; oldestTime = s.CreatedAt
+			}
+		}
+	}
+	if count >= sm.maxPerUser && oldest != "" { delete(sm.sessions, oldest) }
+	session := &UserSession{
+		SessionID: fmt.Sprintf("ses-%d", time.Now().UnixNano()),
+		UserID: userID, ClientID: clientID, IPAddress: ip, UserAgent: ua,
+		CreatedAt: time.Now(), LastActive: time.Now(),
+	}
+	sm.sessions[session.SessionID] = session
+	return session
+}
+
+func (sm *SessionManager) RevokeUserSessions(userID string) int {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	revoked := 0
+	for id, s := range sm.sessions {
+		if s.UserID == userID { delete(sm.sessions, id); revoked++ }
+	}
+	return revoked
+}
+
+var mfaEngine *MFAPolicyEngine
+var sessionMgr *SessionManager
+
+func initKeycloakAdvanced() {
+	mfaEngine = NewMFAPolicyEngine()
+	sessionMgr = NewSessionManager()
+}
+
+func handleMFAEvaluate(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { Action string `json:"action"`; AmountKobo int64 `json:"amount_kobo"`; Role string `json:"role"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	policy, required := mfaEngine.EvaluatePolicy(req.Action, req.AmountKobo, req.Role)
+	if required {
+		respondJSON(w, 200, map[string]interface{}{"mfa_required": true, "policy": policy})
+	} else {
+		respondJSON(w, 200, map[string]interface{}{"mfa_required": false})
+	}
+}
+
+func handleSessionCreate(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { UserID string `json:"user_id"`; ClientID string `json:"client_id"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	session := sessionMgr.CreateSession(req.UserID, req.ClientID, r.RemoteAddr, r.UserAgent())
+	respondJSON(w, 200, session)
+}
+
+func handleSessionRevoke(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { UserID string `json:"user_id"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	revoked := sessionMgr.RevokeUserSessions(req.UserID)
+	respondJSON(w, 200, map[string]interface{}{"revoked": revoked, "user_id": req.UserID})
+}
 
 func main() {
 	port := os.Getenv("PORT")

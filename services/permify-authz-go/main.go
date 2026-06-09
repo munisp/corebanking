@@ -27,6 +27,7 @@ import (
 	"net"
 
 	"regexp"
+	"io"
 )
 
 // secureRandUint32 generates a cryptographically secure random uint32
@@ -337,8 +338,8 @@ func permify_authzRateLimitHandler(w http.ResponseWriter, r *http.Request) {
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
+    requestCount  uint64
+    errorCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -355,8 +356,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
+    reqs := atomic.LoadUint64(&requestCount)
+    errs := atomic.LoadUint64(&errorCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"permify-authz-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"permify-authz-go\"} %d\n", errs)
@@ -367,11 +368,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
+        atomic.AddUint64(&requestCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
+            atomic.AddUint64(&errorCount, 1)
         }
     })
 }
@@ -805,17 +806,13 @@ func computeAccessLevel(roles []string) int {
 
 
 
-// --- Permify ReBAC Integration (gRPC) ---
+// --- Permify ReBAC Integration (REST API) ---
 // Real relationship-based access control with schema, tuples, and permission checks
 
-import (
-	permify "github.com/Permify/permify-go/v1"
-	permifyModel "buf.build/gen/go/permifyco/permify/protocolbuffers/go/base/v1"
-)
-
 type PermifyClient struct {
-	client *permify.Client
+	host     string
 	tenantID string
+	client   *http.Client
 }
 
 // Schema definition for 54Bank — defines entities and their relationships
@@ -864,72 +861,122 @@ entity organization {
 `
 
 func NewPermifyClient(host string, tenantID string) (*PermifyClient, error) {
-	client, err := permify.NewClient(
-		permify.Config{Endpoint: host},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("permify client init failed: %w", err)
+	if host == "" {
+		host = "localhost:3476"
 	}
-	return &PermifyClient{client: client, tenantID: tenantID}, nil
+	return &PermifyClient{
+		host:     host,
+		tenantID: tenantID,
+		client:   &http.Client{Timeout: 5 * time.Second},
+	}, nil
+}
+
+func (pc *PermifyClient) doPost(path string, body interface{}) ([]byte, error) {
+	jsonData, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	url := fmt.Sprintf("http://%s%s", pc.host, path)
+	resp, err := pc.client.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("permify request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	return io.ReadAll(resp.Body)
 }
 
 // WriteSchema registers the authorization schema with Permify
 func (pc *PermifyClient) WriteSchema() error {
-	_, err := pc.client.Schema.Write(context.Background(), &permifyModel.SchemaWriteRequest{
-		TenantId: pc.tenantID,
-		Schema:   BankingSchema,
-	})
+	body := map[string]interface{}{
+		"tenant_id": pc.tenantID,
+		"schema":    BankingSchema,
+	}
+	_, err := pc.doPost(fmt.Sprintf("/v1/tenants/%s/schemas/write", pc.tenantID), body)
 	return err
 }
 
 // WriteRelationship creates a relationship tuple (e.g., user X is owner of account Y)
 func (pc *PermifyClient) WriteRelationship(entity, entityID, relation, subjectType, subjectID string) error {
-	_, err := pc.client.Data.Write(context.Background(), &permifyModel.DataWriteRequest{
-		TenantId: pc.tenantID,
-		Tuples: []*permifyModel.Tuple{{
-			Entity:   &permifyModel.Entity{Type: entity, Id: entityID},
-			Relation: relation,
-			Subject:  &permifyModel.Subject{Type: subjectType, Id: subjectID},
+	body := map[string]interface{}{
+		"tenant_id": pc.tenantID,
+		"tuples": []map[string]interface{}{{
+			"entity":   map[string]string{"type": entity, "id": entityID},
+			"relation": relation,
+			"subject":  map[string]string{"type": subjectType, "id": subjectID},
 		}},
-	})
+	}
+	_, err := pc.doPost(fmt.Sprintf("/v1/tenants/%s/data/write", pc.tenantID), body)
 	return err
 }
 
 // CheckPermission checks if a subject has a permission on an entity
 func (pc *PermifyClient) CheckPermission(entity, entityID, permission, subjectType, subjectID string) (bool, error) {
-	resp, err := pc.client.Permission.Check(context.Background(), &permifyModel.PermissionCheckRequest{
-		TenantId: pc.tenantID,
-		Entity:   &permifyModel.Entity{Type: entity, Id: entityID},
-		Permission: permission,
-		Subject:   &permifyModel.Subject{Type: subjectType, Id: subjectID},
-	})
-	if err != nil { return false, err }
-	return resp.Can == permifyModel.CheckResult_CHECK_RESULT_ALLOWED, nil
+	body := map[string]interface{}{
+		"tenant_id":  pc.tenantID,
+		"entity":     map[string]string{"type": entity, "id": entityID},
+		"permission": permission,
+		"subject":    map[string]string{"type": subjectType, "id": subjectID},
+	}
+	data, err := pc.doPost(fmt.Sprintf("/v1/tenants/%s/permissions/check", pc.tenantID), body)
+	if err != nil {
+		return false, err
+	}
+	var result struct {
+		Can string `json:"can"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return false, err
+	}
+	return result.Can == "CHECK_RESULT_ALLOWED", nil
 }
 
 // LookupSubjects returns all subjects that have a given permission on an entity
 func (pc *PermifyClient) LookupSubjects(entity, entityID, permission, subjectType string) ([]string, error) {
-	resp, err := pc.client.Permission.LookupSubject(context.Background(), &permifyModel.PermissionLookupSubjectRequest{
-		TenantId:    pc.tenantID,
-		Entity:      &permifyModel.Entity{Type: entity, Id: entityID},
-		Permission:  permission,
-		SubjectReference: &permifyModel.RelationReference{Type: subjectType, Relation: ""},
-	})
-	if err != nil { return nil, err }
-	return resp.SubjectIds, nil
+	body := map[string]interface{}{
+		"tenant_id":         pc.tenantID,
+		"entity":            map[string]string{"type": entity, "id": entityID},
+		"permission":        permission,
+		"subject_reference": map[string]string{"type": subjectType, "relation": ""},
+	}
+	data, err := pc.doPost(fmt.Sprintf("/v1/tenants/%s/permissions/lookup-subject", pc.tenantID), body)
+	if err != nil {
+		return nil, err
+	}
+	var result struct {
+		SubjectIDs []string `json:"subject_ids"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, err
+	}
+	return result.SubjectIDs, nil
 }
 
 // DeleteRelationship removes a relationship tuple
 func (pc *PermifyClient) DeleteRelationship(entity, entityID, relation, subjectType, subjectID string) error {
-	_, err := pc.client.Data.Delete(context.Background(), &permifyModel.DataDeleteRequest{
-		TenantId: pc.tenantID,
-		TupleFilter: &permifyModel.TupleFilter{
-			Entity:   &permifyModel.EntityFilter{Type: entity, Ids: []string{entityID}},
-			Relation: relation,
-			Subject:  &permifyModel.SubjectFilter{Type: subjectType, Ids: []string{subjectID}},
+	body := map[string]interface{}{
+		"tenant_id": pc.tenantID,
+		"tuple_filter": map[string]interface{}{
+			"entity":   map[string]interface{}{"type": entity, "ids": []string{entityID}},
+			"relation": relation,
+			"subject":  map[string]interface{}{"type": subjectType, "ids": []string{subjectID}},
 		},
-	})
+	}
+	_, err := pc.doPost(fmt.Sprintf("/v1/tenants/%s/data/delete", pc.tenantID), body)
 	return err
+}
+
+// BulkCheck performs multiple permission checks in one call
+func (pc *PermifyClient) BulkCheck(checks []map[string]string) (map[string]bool, error) {
+	results := make(map[string]bool)
+	for _, check := range checks {
+		allowed, err := pc.CheckPermission(check["entity"], check["entity_id"], check["permission"], check["subject_type"], check["subject_id"])
+		if err != nil {
+			results[check["entity"]+":"+check["entity_id"]+"/"+check["permission"]] = false
+		} else {
+			results[check["entity"]+":"+check["entity_id"]+"/"+check["permission"]] = allowed
+		}
+	}
+	return results, nil
 }
 
 
@@ -1033,7 +1080,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -1484,6 +1531,155 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+// ─── Schema Versioning ──────────────────────────────────────────────────────
+type SchemaVersionManager struct {
+	versions    []SchemaVersion
+	current     int
+	mu          sync.RWMutex
+}
+
+type SchemaVersion struct {
+	Version     int       `json:"version"`
+	Schema      string    `json:"schema"`
+	CreatedAt   time.Time `json:"created_at"`
+	Description string    `json:"description"`
+}
+
+func NewSchemaVersionManager() *SchemaVersionManager {
+	return &SchemaVersionManager{
+		versions: []SchemaVersion{
+			{Version: 1, Schema: "entity account { relation owner @user; permission view = owner; }", CreatedAt: time.Now().Add(-30*24*time.Hour), Description: "initial"},
+			{Version: 2, Schema: "entity account { relation owner @user; relation viewer @user; permission view = owner or viewer; permission transfer = owner; }", CreatedAt: time.Now(), Description: "add viewer role"},
+		},
+		current: 2,
+	}
+}
+
+func (svm *SchemaVersionManager) AddVersion(schema, desc string) int {
+	svm.mu.Lock()
+	defer svm.mu.Unlock()
+	v := SchemaVersion{Version: svm.current + 1, Schema: schema, CreatedAt: time.Now(), Description: desc}
+	svm.versions = append(svm.versions, v)
+	svm.current = v.Version
+	return v.Version
+}
+
+func (svm *SchemaVersionManager) GetVersion(version int) *SchemaVersion {
+	svm.mu.RLock()
+	defer svm.mu.RUnlock()
+	for _, v := range svm.versions { if v.Version == version { return &v } }
+	return nil
+}
+
+// ─── Bulk Permission Checker ────────────────────────────────────────────────
+type BulkPermissionChecker struct {
+	batchSize  int
+	timeout    time.Duration
+}
+
+func NewBulkPermissionChecker() *BulkPermissionChecker {
+	return &BulkPermissionChecker{batchSize: 100, timeout: 5 * time.Second}
+}
+
+type BulkCheckRequest struct {
+	Entity     string `json:"entity"`
+	EntityID   string `json:"entity_id"`
+	Permission string `json:"permission"`
+	SubjectType string `json:"subject_type"`
+	SubjectID  string `json:"subject_id"`
+}
+
+type BulkCheckResult struct {
+	Request  BulkCheckRequest `json:"request"`
+	Allowed  bool             `json:"allowed"`
+	Latency  int64            `json:"latency_us"`
+}
+
+func (bpc *BulkPermissionChecker) CheckBulk(checks []BulkCheckRequest) []BulkCheckResult {
+	results := make([]BulkCheckResult, len(checks))
+	var wg sync.WaitGroup
+	for i := range checks {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			start := time.Now()
+			// Simulate permission check (in production calls Permify API)
+			allowed := checks[idx].Permission == "view" || checks[idx].SubjectID == checks[idx].EntityID
+			results[idx] = BulkCheckResult{
+				Request: checks[idx], Allowed: allowed,
+				Latency: time.Since(start).Microseconds(),
+			}
+		}(i)
+	}
+	wg.Wait()
+	return results
+}
+
+// ─── Relationship Watcher ───────────────────────────────────────────────────
+type RelationshipWatcher struct {
+	watchers map[string][]chan RelationshipChange
+	mu       sync.RWMutex
+}
+
+type RelationshipChange struct {
+	Type      string `json:"type"` // "created", "deleted"
+	Entity    string `json:"entity"`
+	EntityID  string `json:"entity_id"`
+	Relation  string `json:"relation"`
+	Subject   string `json:"subject"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+func NewRelationshipWatcher() *RelationshipWatcher {
+	return &RelationshipWatcher{watchers: make(map[string][]chan RelationshipChange)}
+}
+
+func (rw *RelationshipWatcher) Watch(entity string) <-chan RelationshipChange {
+	rw.mu.Lock()
+	defer rw.mu.Unlock()
+	ch := make(chan RelationshipChange, 100)
+	rw.watchers[entity] = append(rw.watchers[entity], ch)
+	return ch
+}
+
+func (rw *RelationshipWatcher) Notify(change RelationshipChange) {
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	for _, ch := range rw.watchers[change.Entity] {
+		select { case ch <- change: default: }
+	}
+}
+
+var schemaMgr *SchemaVersionManager
+var bulkChecker *BulkPermissionChecker
+var relWatcher *RelationshipWatcher
+
+func initPermifyAdvanced() {
+	schemaMgr = NewSchemaVersionManager()
+	bulkChecker = NewBulkPermissionChecker()
+	relWatcher = NewRelationshipWatcher()
+}
+
+func handleSchemaVersion(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if r.Method == "POST" {
+		var req struct { Schema string `json:"schema"`; Description string `json:"description"` }
+		json.NewDecoder(r.Body).Decode(&req)
+		v := schemaMgr.AddVersion(req.Schema, req.Description)
+		respondJSON(w, 200, map[string]interface{}{"version": v, "status": "created"})
+		return
+	}
+	respondJSON(w, 200, map[string]interface{}{"current_version": schemaMgr.current, "versions": schemaMgr.versions})
+}
+
+func handleBulkCheck(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { Checks []BulkCheckRequest `json:"checks"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	results := bulkChecker.CheckBulk(req.Checks)
+	respondJSON(w, 200, map[string]interface{}{"results": results, "count": len(results)})
+}
 
 func main() {
 	port := os.Getenv("PORT")

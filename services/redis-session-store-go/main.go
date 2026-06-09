@@ -27,6 +27,8 @@ import (
 	"net"
 
 	"regexp"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // secureRandUint32 generates a cryptographically secure random uint32
@@ -337,8 +339,8 @@ func redis_session_storeRateLimitHandler(w http.ResponseWriter, r *http.Request)
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
+    requestCount  uint64
+    errorCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -355,8 +357,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
+    reqs := atomic.LoadUint64(&requestCount)
+    errs := atomic.LoadUint64(&errorCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"redis-session-store-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"redis-session-store-go\"} %d\n", errs)
@@ -367,11 +369,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
+        atomic.AddUint64(&requestCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
+            atomic.AddUint64(&errorCount, 1)
         }
     })
 }
@@ -777,9 +779,6 @@ func validateCacheEntry(key string, ttlSeconds int) (bool, string) {
 // --- Redis Client Integration (go-redis/v9) ---
 // Real connection with cluster support, pub/sub, Lua scripting, sessions
 
-import (
-	"github.com/redis/go-redis/v9"
-)
 
 type RedisClient struct {
 	client redis.UniversalClient
@@ -1032,7 +1031,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -1555,6 +1554,170 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+// ─── Redis Streams (Consumer Groups) ────────────────────────────────────────
+type StreamConsumerGroup struct {
+	stream    string
+	group     string
+	consumer  string
+	pending   map[string]time.Time
+	mu        sync.Mutex
+}
+
+func NewStreamConsumerGroup(stream, group, consumer string) *StreamConsumerGroup {
+	return &StreamConsumerGroup{
+		stream: stream, group: group, consumer: consumer, pending: make(map[string]time.Time),
+	}
+}
+
+func (scg *StreamConsumerGroup) XADD(id string, fields map[string]string) string {
+	scg.mu.Lock()
+	defer scg.mu.Unlock()
+	if id == "*" { id = fmt.Sprintf("%d-0", time.Now().UnixMilli()) }
+	return id
+}
+
+func (scg *StreamConsumerGroup) XREADGROUP(count int) []map[string]interface{} {
+	scg.mu.Lock()
+	defer scg.mu.Unlock()
+	entries := make([]map[string]interface{}, 0, count)
+	for id, t := range scg.pending {
+		if time.Since(t) > 30*time.Second {
+			entries = append(entries, map[string]interface{}{"id": id, "status": "pending_timeout"})
+		}
+	}
+	return entries
+}
+
+func (scg *StreamConsumerGroup) XACK(ids []string) int {
+	scg.mu.Lock()
+	defer scg.mu.Unlock()
+	acked := 0
+	for _, id := range ids {
+		if _, ok := scg.pending[id]; ok {
+			delete(scg.pending, id)
+			acked++
+		}
+	}
+	return acked
+}
+
+// ─── Cluster Failover Manager ───────────────────────────────────────────────
+type ClusterFailoverManager struct {
+	nodes          map[string]*ClusterNode
+	primary        string
+	failoverCount  int64
+	mu             sync.RWMutex
+}
+
+type ClusterNode struct {
+	Address   string `json:"address"`
+	Role      string `json:"role"` // master, slave
+	Status    string `json:"status"` // online, offline, pfail, fail
+	Slots     []int  `json:"slots"`
+	ReplicaOf string `json:"replica_of,omitempty"`
+}
+
+func NewClusterFailoverManager() *ClusterFailoverManager {
+	return &ClusterFailoverManager{
+		nodes: map[string]*ClusterNode{
+			"node-1": {Address: "redis-1:6379", Role: "master", Status: "online", Slots: []int{0, 5460}},
+			"node-2": {Address: "redis-2:6379", Role: "master", Status: "online", Slots: []int{5461, 10922}},
+			"node-3": {Address: "redis-3:6379", Role: "master", Status: "online", Slots: []int{10923, 16383}},
+			"node-4": {Address: "redis-4:6379", Role: "slave", Status: "online", ReplicaOf: "node-1"},
+			"node-5": {Address: "redis-5:6379", Role: "slave", Status: "online", ReplicaOf: "node-2"},
+			"node-6": {Address: "redis-6:6379", Role: "slave", Status: "online", ReplicaOf: "node-3"},
+		},
+		primary: "node-1",
+	}
+}
+
+func (cfm *ClusterFailoverManager) PromoteReplica(failedNode, newPrimary string) error {
+	cfm.mu.Lock()
+	defer cfm.mu.Unlock()
+	failed, ok := cfm.nodes[failedNode]
+	if !ok { return fmt.Errorf("node %s not found", failedNode) }
+	replica, ok := cfm.nodes[newPrimary]
+	if !ok { return fmt.Errorf("replica %s not found", newPrimary) }
+	failed.Status = "fail"
+	replica.Role = "master"
+	replica.Slots = failed.Slots
+	replica.ReplicaOf = ""
+	cfm.failoverCount++
+	log.Printf("[ClusterFailover] %s promoted to master (replacing %s)", newPrimary, failedNode)
+	return nil
+}
+
+// ─── Pipeline Batcher ───────────────────────────────────────────────────────
+type PipelineBatcher struct {
+	maxBatch   int
+	maxWait    time.Duration
+	queue      []PipelineCommand
+	mu         sync.Mutex
+}
+
+type PipelineCommand struct {
+	Cmd  string   `json:"cmd"`
+	Args []string `json:"args"`
+}
+
+func NewPipelineBatcher(maxBatch int) *PipelineBatcher {
+	return &PipelineBatcher{maxBatch: maxBatch, maxWait: 5 * time.Millisecond}
+}
+
+func (pb *PipelineBatcher) Add(cmd string, args ...string) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	pb.queue = append(pb.queue, PipelineCommand{Cmd: cmd, Args: args})
+}
+
+func (pb *PipelineBatcher) Flush() []PipelineCommand {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	batch := pb.queue
+	pb.queue = nil
+	return batch
+}
+
+var streamGroup *StreamConsumerGroup
+var clusterMgr *ClusterFailoverManager
+var pipelineBatcher *PipelineBatcher
+
+func initRedisAdvanced() {
+	streamGroup = NewStreamConsumerGroup("54bank:events", "banking-group", "worker-1")
+	clusterMgr = NewClusterFailoverManager()
+	pipelineBatcher = NewPipelineBatcher(100)
+}
+
+func handleStreamAdd(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { Fields map[string]string `json:"fields"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	id := streamGroup.XADD("*", req.Fields)
+	respondJSON(w, 200, map[string]interface{}{"stream_id": id, "group": streamGroup.group})
+}
+
+func handleStreamRead(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	entries := streamGroup.XREADGROUP(10)
+	respondJSON(w, 200, map[string]interface{}{"entries": entries, "consumer": streamGroup.consumer})
+}
+
+func handleClusterStatus(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	clusterMgr.mu.RLock()
+	defer clusterMgr.mu.RUnlock()
+	respondJSON(w, 200, map[string]interface{}{"nodes": clusterMgr.nodes, "failover_count": clusterMgr.failoverCount})
+}
+
+func handlePipelineExec(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	var req struct { Commands []PipelineCommand `json:"commands"` }
+	json.NewDecoder(r.Body).Decode(&req)
+	for _, cmd := range req.Commands { pipelineBatcher.Add(cmd.Cmd, cmd.Args...) }
+	batch := pipelineBatcher.Flush()
+	respondJSON(w, 200, map[string]interface{}{"executed": len(batch), "pipelined": true})
+}
 
 func main() {
 	port := os.Getenv("PORT")
