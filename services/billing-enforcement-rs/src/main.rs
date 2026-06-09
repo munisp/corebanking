@@ -406,17 +406,29 @@ fn sanitize_input(s: &str) -> String {
         .replace('"', "&quot;").chars().take(2000).collect()
 }
 
-fn security_headers() -> actix_web::middleware::DefaultHeaders {
-    actix_web::middleware::DefaultHeaders::new()
-        .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-        .add(("X-Content-Type-Options", "nosniff"))
-        .add(("X-Frame-Options", "DENY"))
-        .add(("X-XSS-Protection", "1; mode=block"))
-        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
+fn security_headers_str() -> &'static str {
+    "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nX-XSS-Protection: 1; mode=block\r\nReferrer-Policy: strict-origin-when-cross-origin"
 }
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
 static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// --- Retry with Exponential Backoff ---
+fn retry_with_backoff<F, T, E>(max_retries: u32, mut f: F) -> Result<T, E>
+where F: FnMut() -> Result<T, E> {
+    let mut attempt = 0;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_retries { return Err(e); }
+                let delay = std::cmp::min(100 * (1 << attempt), 5000);
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+        }
+    }
+}
 fn main() {
     init_tracing("billing-enforcement-rs");
     let db_url = std::env::var("DATABASE_URL").unwrap_or_default();

@@ -376,6 +376,23 @@ fn security_headers() -> actix_web::middleware::DefaultHeaders {
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
 static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// --- Retry with Exponential Backoff ---
+fn retry_with_backoff<F, T, E>(max_retries: u32, mut f: F) -> Result<T, E>
+where F: FnMut() -> Result<T, E> {
+    let mut attempt = 0;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_retries { return Err(e); }
+                let delay = std::cmp::min(100 * (1 << attempt), 5000);
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+        }
+    }
+}
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8098".to_string()).parse().unwrap_or(8098);

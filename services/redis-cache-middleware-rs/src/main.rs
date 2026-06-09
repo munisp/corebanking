@@ -234,6 +234,23 @@ fn security_headers() -> actix_web::middleware::DefaultHeaders {
         .add(("X-XSS-Protection", "1; mode=block"))
         .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
 }
+
+// --- Retry with Exponential Backoff ---
+fn retry_with_backoff<F, T, E>(max_retries: u32, mut f: F) -> Result<T, E>
+where F: FnMut() -> Result<T, E> {
+    let mut attempt = 0;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                attempt += 1;
+                if attempt >= max_retries { return Err(e); }
+                let delay = std::cmp::min(100 * (1 << attempt), 5000);
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+        }
+    }
+}
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8307);
