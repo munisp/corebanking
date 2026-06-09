@@ -1,103 +1,55 @@
 import 'package:flutter/material.dart';
-import 'package:provider/provider.dart';
-import '../services/connectivity_service.dart';
-import '../services/offline_service.dart';
 
-class SettingsScreen extends StatelessWidget {
+class SettingsScreen extends StatefulWidget {
   const SettingsScreen({super.key});
-
   @override
-  Widget build(BuildContext context) {
-    final connectivity = context.watch<ConnectivityService>();
-    final offline = context.read<OfflineService>();
-
-    return Scaffold(
-      appBar: AppBar(title: const Text('Settings')),
-      body: ListView(
-        children: [
-          // Connection status
-          Container(
-            margin: const EdgeInsets.all(16),
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: connectivity.isOnline ? Colors.green.shade50 : Colors.red.shade50,
-              borderRadius: BorderRadius.circular(12),
-              border: Border.all(color: connectivity.isOnline ? Colors.green.shade200 : Colors.red.shade200),
-            ),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Icon(connectivity.isOnline ? Icons.wifi : Icons.wifi_off,
-                        color: connectivity.isOnline ? Colors.green : Colors.red),
-                    const SizedBox(width: 8),
-                    Text('Connection: ${connectivity.qualityLabel}',
-                        style: const TextStyle(fontWeight: FontWeight.bold)),
-                  ],
-                ),
-                const SizedBox(height: 4),
-                Text('Bandwidth: ${connectivity.bandwidthKbps.toStringAsFixed(0)} kbps'),
-                Text('Recommended batch size: ${connectivity.recommendedBatchSize}'),
-                Text('Queued operations: ${offline.pendingCount}'),
-              ],
-            ),
-          ),
-
-          const _SectionHeader('Account'),
-          const ListTile(leading: Icon(Icons.person), title: Text('Profile'), trailing: Icon(Icons.chevron_right)),
-          const ListTile(leading: Icon(Icons.security), title: Text('Security & PIN'), trailing: Icon(Icons.chevron_right)),
-          const ListTile(leading: Icon(Icons.fingerprint), title: Text('Biometric Login'), trailing: Icon(Icons.chevron_right)),
-
-          const _SectionHeader('Preferences'),
-          const ListTile(leading: Icon(Icons.language), title: Text('Language'), trailing: Text('English')),
-          const ListTile(leading: Icon(Icons.dark_mode), title: Text('Theme'), trailing: Text('System')),
-          const ListTile(leading: Icon(Icons.notifications), title: Text('Notifications'), trailing: Icon(Icons.chevron_right)),
-
-          const _SectionHeader('Data & Sync'),
-          ListTile(
-            leading: const Icon(Icons.sync),
-            title: const Text('Sync Now'),
-            subtitle: Text('${offline.pendingCount} pending operations'),
-            trailing: const Icon(Icons.chevron_right),
-            onTap: () {},
-          ),
-          const ListTile(leading: Icon(Icons.storage), title: Text('Clear Cache'), trailing: Icon(Icons.chevron_right)),
-          const ListTile(leading: Icon(Icons.download), title: Text('Download for Offline'), trailing: Icon(Icons.chevron_right)),
-
-          const _SectionHeader('About'),
-          const ListTile(leading: Icon(Icons.info), title: Text('Version'), trailing: Text('1.0.0')),
-          const ListTile(leading: Icon(Icons.description), title: Text('Terms & Conditions')),
-          const ListTile(leading: Icon(Icons.privacy_tip), title: Text('Privacy Policy')),
-
-          const SizedBox(height: 24),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: OutlinedButton.icon(
-              onPressed: () {},
-              icon: const Icon(Icons.logout, color: Colors.red),
-              label: const Text('Sign Out', style: TextStyle(color: Colors.red)),
-              style: OutlinedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(vertical: 14),
-                side: const BorderSide(color: Colors.red),
-              ),
-            ),
-          ),
-          const SizedBox(height: 32),
-        ],
-      ),
-    );
-  }
+  State<SettingsScreen> createState() => _SettingsScreenState();
 }
 
-class _SectionHeader extends StatelessWidget {
-  final String title;
-  const _SectionHeader(this.title);
+class _SettingsScreenState extends State<SettingsScreen> {
+  bool _twoFactorAuth = true;
+  bool _sessionTimeout = true;
+  int _sessionMinutes = 15;
+  bool _ipWhitelist = false;
+  bool _auditLogging = true;
+  String _dateFormat = 'DD/MM/YYYY';
+  String _timezone = 'Africa/Lagos (WAT)';
+
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
-      child: Text(title, style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: Colors.grey.shade600)),
+    return Scaffold(
+      appBar: AppBar(title: const Text('System Settings')),
+      body: ListView(children: [
+        _sectionHeader('Security'),
+        SwitchListTile(title: const Text('Two-Factor Authentication'), subtitle: const Text('Require TOTP for admin access'),
+          value: _twoFactorAuth, onChanged: (v) => setState(() => _twoFactorAuth = v), secondary: const Icon(Icons.security)),
+        SwitchListTile(title: const Text('Session Auto-Timeout'), subtitle: Text('Logout after $_sessionMinutes minutes of inactivity'),
+          value: _sessionTimeout, onChanged: (v) => setState(() => _sessionTimeout = v), secondary: const Icon(Icons.timer)),
+        if (_sessionTimeout) ListTile(title: Slider(value: _sessionMinutes.toDouble(), min: 5, max: 60, divisions: 11,
+          label: '$_sessionMinutes min', onChanged: (v) => setState(() => _sessionMinutes = v.round()))),
+        SwitchListTile(title: const Text('IP Whitelist'), subtitle: const Text('Restrict admin access to approved IPs'),
+          value: _ipWhitelist, onChanged: (v) => setState(() => _ipWhitelist = v), secondary: const Icon(Icons.vpn_lock)),
+        SwitchListTile(title: const Text('Audit Logging'), subtitle: const Text('Log all admin actions (CBN requirement)'),
+          value: _auditLogging, onChanged: (v) => setState(() => _auditLogging = v), secondary: const Icon(Icons.history)),
+        _sectionHeader('Regional'),
+        ListTile(leading: const Icon(Icons.calendar_today), title: const Text('Date Format'),
+          trailing: DropdownButton<String>(value: _dateFormat,
+            items: ['DD/MM/YYYY', 'MM/DD/YYYY', 'YYYY-MM-DD'].map((f) => DropdownMenuItem(value: f, child: Text(f))).toList(),
+            onChanged: (v) => setState(() => _dateFormat = v!))),
+        ListTile(leading: const Icon(Icons.public), title: const Text('Timezone'), subtitle: Text(_timezone)),
+        _sectionHeader('System'),
+        ListTile(leading: const Icon(Icons.storage), title: const Text('Database Status'), subtitle: const Text('PostgreSQL 16.1 | 234 GB used'), trailing: const Icon(Icons.check_circle, color: Colors.green)),
+        ListTile(leading: const Icon(Icons.memory), title: const Text('Cache Status'), subtitle: const Text('Redis Cluster | 48 GB | 99.9% hit rate'), trailing: const Icon(Icons.check_circle, color: Colors.green)),
+        ListTile(leading: const Icon(Icons.cloud), title: const Text('API Gateway'), subtitle: const Text('APISIX 3.8 | 12,500 req/s'), trailing: const Icon(Icons.check_circle, color: Colors.green)),
+        _sectionHeader('Maintenance'),
+        ListTile(leading: const Icon(Icons.backup), title: const Text('Backup Schedule'), subtitle: const Text('Daily at 02:00 WAT | Last: Jan 15, 2024'), trailing: const Icon(Icons.chevron_right), onTap: () {}),
+        ListTile(leading: const Icon(Icons.update), title: const Text('System Updates'), subtitle: const Text('Version 3.2.1 | Up to date'), trailing: const Icon(Icons.chevron_right), onTap: () {}),
+      ]),
     );
+  }
+
+  Widget _sectionHeader(String title) {
+    return Padding(padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
+      child: Text(title, style: TextStyle(fontSize: 14, fontWeight: FontWeight.bold, color: Colors.grey[600])));
   }
 }
