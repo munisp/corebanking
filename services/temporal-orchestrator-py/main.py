@@ -798,8 +798,81 @@ def create_workflow(workflow_type, params, timeout_seconds=3600):
     return {"workflow_id": workflow_id, "type": workflow_type, "status": "running", "params": params, "timeout_seconds": timeout_seconds, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
 def check_workflow_status(workflow_id):
-    return {"workflow_id": workflow_id, "status": "completed", "progress": 100, "duration_ms": 1500}
+    """Query actual workflow status from Temporal server (not hardcoded)."""
+    temporal_host = os.environ.get("TEMPORAL_HOST", "localhost:7233")
+    temporal_ns = os.environ.get("TEMPORAL_NAMESPACE", "54bank")
+    try:
+        # Query Temporal API for workflow execution status
+        url = f"http://{temporal_host}/api/v1/namespaces/{temporal_ns}/workflows/{workflow_id}"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            status = data.get("workflowExecutionInfo", {}).get("status", "UNKNOWN")
+            start_time = data.get("workflowExecutionInfo", {}).get("startTime", "")
+            return {"workflow_id": workflow_id, "status": status, "start_time": start_time}
+    except Exception as e:
+        # Fallback: return unknown status if Temporal server unreachable
+        logger.warning(f"Cannot reach Temporal server for workflow {workflow_id}: {e}")
+        return {"workflow_id": workflow_id, "status": "UNKNOWN", "error": str(e)}
 
+
+
+
+# --- Temporal SDK Integration (temporalio) ---
+# Real workflow client for starting, querying, and signaling workflows
+
+TEMPORAL_HOST = os.environ.get("TEMPORAL_HOST", "localhost:7233")
+TEMPORAL_NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "54bank")
+
+class TemporalWorkflowClient:
+    """Temporal client for orchestrating banking workflows."""
+
+    def __init__(self, host: str, namespace: str):
+        self.host = host
+        self.namespace = namespace
+
+    async def start_transfer_workflow(self, source_account, dest_account, amount_kobo, reference, idempotency_key):
+        """Start a two-phase transfer workflow with saga compensation."""
+        import temporalio.client
+        client = await temporalio.client.Client.connect(self.host, namespace=self.namespace)
+        handle = await client.start_workflow(
+            "TransferWorkflow",
+            args=[{"source_account_id": source_account, "dest_account_id": dest_account,
+                   "amount_kobo": amount_kobo, "reference": reference, "idempotency_key": idempotency_key}],
+            id=f"transfer-{idempotency_key}",
+            task_queue="54bank-financial-operations",
+        )
+        return {"workflow_id": handle.id, "run_id": handle.result_run_id, "status": "started"}
+
+    async def get_workflow_status(self, workflow_id):
+        """Query the current status of a workflow execution."""
+        import temporalio.client
+        client = await temporalio.client.Client.connect(self.host, namespace=self.namespace)
+        handle = client.get_workflow_handle(workflow_id)
+        desc = await handle.describe()
+        return {
+            "workflow_id": workflow_id,
+            "status": desc.status.name,
+            "start_time": str(desc.start_time),
+            "execution_time": str(desc.execution_time) if desc.execution_time else None,
+        }
+
+    async def signal_approval(self, workflow_id, approved: bool):
+        """Signal maker-checker approval to a waiting workflow."""
+        import temporalio.client
+        client = await temporalio.client.Client.connect(self.host, namespace=self.namespace)
+        handle = client.get_workflow_handle(workflow_id)
+        await handle.signal("approval-signal", approved)
+        return {"workflow_id": workflow_id, "signal": "approval-signal", "value": approved}
+
+    async def cancel_workflow(self, workflow_id):
+        """Cancel a running workflow."""
+        import temporalio.client
+        client = await temporalio.client.Client.connect(self.host, namespace=self.namespace)
+        handle = client.get_workflow_handle(workflow_id)
+        await handle.cancel()
+        return {"workflow_id": workflow_id, "status": "cancelled"}
 
 
 # --- HTTP Handler ---

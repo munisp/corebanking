@@ -219,6 +219,155 @@ def validate_keycloak_identity_input(data):
     return {"valid": True, "fields": len(data)}
 
 
+
+# --- Keycloak Admin REST API Integration ---
+# Real realm, client, user, and role management
+
+import urllib.request
+import urllib.error
+
+class KeycloakAdmin:
+    """Keycloak Admin REST API client for 54Bank identity management."""
+
+    def __init__(self, server_url: str, realm: str = "54bank", client_id: str = "admin-cli"):
+        self.server_url = server_url.rstrip("/")
+        self.realm = realm
+        self.client_id = client_id
+        self.token = None
+        self._token_expires = 0
+
+    def authenticate(self, username: str, password: str) -> bool:
+        """Authenticate with Keycloak using client credentials or password grant."""
+        url = f"{self.server_url}/realms/master/protocol/openid-connect/token"
+        data = urllib.parse.urlencode({
+            "grant_type": "password",
+            "client_id": self.client_id,
+            "username": username,
+            "password": password,
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode())
+                self.token = result["access_token"]
+                self._token_expires = time.time() + result.get("expires_in", 300) - 30
+                return True
+        except Exception as e:
+            logger.error(f"Keycloak auth failed: {e}")
+            return False
+
+    def _request(self, method, path, body=None):
+        """Make authenticated request to Keycloak Admin API."""
+        if time.time() > self._token_expires:
+            raise Exception("Token expired — re-authenticate")
+        url = f"{self.server_url}/admin/realms/{self.realm}{path}"
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Authorization", f"Bearer {self.token}")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status == 204:
+                return None
+            return json.loads(resp.read().decode())
+
+    # --- User Management ---
+    def create_user(self, username, email, first_name, last_name, password=None, groups=None):
+        """Create a user in the realm."""
+        user = {
+            "username": username,
+            "email": email,
+            "firstName": first_name,
+            "lastName": last_name,
+            "enabled": True,
+            "emailVerified": True,
+            "groups": groups or [],
+            "credentials": [{"type": "password", "value": password, "temporary": False}] if password else [],
+        }
+        return self._request("POST", "/users", user)
+
+    def get_user(self, user_id):
+        return self._request("GET", f"/users/{user_id}")
+
+    def search_users(self, query, max_results=20):
+        return self._request("GET", f"/users?search={query}&max={max_results}")
+
+    def update_user(self, user_id, updates):
+        return self._request("PUT", f"/users/{user_id}", updates)
+
+    def delete_user(self, user_id):
+        return self._request("DELETE", f"/users/{user_id}")
+
+    def get_user_sessions(self, user_id):
+        return self._request("GET", f"/users/{user_id}/sessions")
+
+    def logout_user(self, user_id):
+        """Force logout all sessions for a user."""
+        return self._request("POST", f"/users/{user_id}/logout")
+
+    # --- Role Management ---
+    def create_role(self, role_name, description=""):
+        return self._request("POST", "/roles", {"name": role_name, "description": description})
+
+    def assign_role(self, user_id, role_name):
+        roles = self._request("GET", f"/roles/{role_name}")
+        return self._request("POST", f"/users/{user_id}/role-mappings/realm", [roles])
+
+    def get_user_roles(self, user_id):
+        return self._request("GET", f"/users/{user_id}/role-mappings/realm")
+
+    # --- Client Management ---
+    def create_client(self, client_id, name, redirect_uris=None, public=False):
+        client = {
+            "clientId": client_id,
+            "name": name,
+            "enabled": True,
+            "publicClient": public,
+            "redirectUris": redirect_uris or ["*"],
+            "webOrigins": ["+"],
+            "standardFlowEnabled": True,
+            "directAccessGrantsEnabled": not public,
+        }
+        return self._request("POST", "/clients", client)
+
+    def get_client_secret(self, client_uuid):
+        return self._request("GET", f"/clients/{client_uuid}/client-secret")
+
+    # --- Token Introspection ---
+    def introspect_token(self, token, client_id, client_secret):
+        """Validate and introspect an access token."""
+        url = f"{self.server_url}/realms/{self.realm}/protocol/openid-connect/token/introspect"
+        data = urllib.parse.urlencode({
+            "token": token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            return {"active": result.get("active", False), "sub": result.get("sub"), "roles": result.get("realm_access", {}).get("roles", [])}
+
+    # --- Group Management ---
+    def create_group(self, name, parent_id=None):
+        path = f"/groups/{parent_id}/children" if parent_id else "/groups"
+        return self._request("POST", path, {"name": name})
+
+    def add_user_to_group(self, user_id, group_id):
+        return self._request("PUT", f"/users/{user_id}/groups/{group_id}")
+
+    # --- Event Listeners ---
+    def get_events(self, event_type=None, max_results=100):
+        """Get realm events (login failures, brute force, etc.)."""
+        params = f"?max={max_results}"
+        if event_type:
+            params += f"&type={event_type}"
+        return self._request("GET", f"/events{params}")
+
+    def get_admin_events(self, max_results=100):
+        return self._request("GET", f"/admin-events?max={max_results}")
+
+
 # --- HTTP Handler ---
 def respond(handler, code, body):
     handler.send_response(code)

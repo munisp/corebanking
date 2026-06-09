@@ -19,6 +19,69 @@ struct AppState {
 fn eviction_policy(memory_pct: f64) -> &'static str { if memory_pct > 90.0 { "allkeys-lru" } else if memory_pct > 70.0 { "volatile-lru" } else { "noeviction" } }
 
 
+
+// --- Redis Client Integration (redis-rs) ---
+use redis::{Client as RedisRsClient, Commands, AsyncCommands};
+
+struct RedisCacheClient {
+    client: RedisRsClient,
+    prefix: String,
+}
+
+impl RedisCacheClient {
+    fn new(url: &str) -> Result<Self, redis::RedisError> {
+        let client = RedisRsClient::open(url)?;
+        Ok(Self { client, prefix: "54bank:".to_string() })
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>, redis::RedisError> {
+        let mut conn = self.client.get_connection()?;
+        let full_key = format!("{}{}", self.prefix, key);
+        conn.get(&full_key)
+    }
+
+    fn set_ex(&self, key: &str, value: &str, ttl_secs: u64) -> Result<(), redis::RedisError> {
+        let mut conn = self.client.get_connection()?;
+        let full_key = format!("{}{}", self.prefix, key);
+        conn.set_ex(&full_key, value, ttl_secs)?;
+        Ok(())
+    }
+
+    fn del(&self, key: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.client.get_connection()?;
+        conn.del(format!("{}{}", self.prefix, key))?;
+        Ok(())
+    }
+
+    /// Sliding window rate limiting using sorted sets
+    fn rate_limit(&self, identifier: &str, window_secs: i64, max_requests: i64) -> Result<bool, redis::RedisError> {
+        let mut conn = self.client.get_connection()?;
+        let key = format!("{}rl:{}", self.prefix, identifier);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let window_ms = window_secs * 1000;
+        redis::pipe()
+            .cmd("ZREMRANGEBYSCORE").arg(&key).arg(0).arg(now - window_ms)
+            .ignore()
+            .execute(&mut conn);
+        let count: i64 = conn.zcard(&key)?;
+        if count < max_requests {
+            conn.zadd(&key, now.to_string(), now)?;
+            conn.expire(&key, window_secs as i64)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Pub/Sub publish
+    fn publish(&self, channel: &str, message: &str) -> Result<(), redis::RedisError> {
+        let mut conn = self.client.get_connection()?;
+        conn.publish(format!("{}{}", self.prefix, channel), message)?;
+        Ok(())
+    }
+}
+
+
 // --- Graceful Degradation ---
 use std::sync::atomic::AtomicBool;
 

@@ -773,6 +773,165 @@ func validateCacheEntry(key string, ttlSeconds int) (bool, string) {
 }
 
 
+
+// --- Redis Client Integration (go-redis/v9) ---
+// Real connection with cluster support, pub/sub, Lua scripting, sessions
+
+import (
+	"github.com/redis/go-redis/v9"
+)
+
+type RedisClient struct {
+	client redis.UniversalClient
+	prefix string
+}
+
+func NewRedisClient(addrs []string, password string, db int) *RedisClient {
+	var client redis.UniversalClient
+	if len(addrs) > 1 {
+		// Cluster mode
+		client = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:    addrs,
+			Password: password,
+			PoolSize: 50,
+			MinIdleConns: 10,
+			ReadTimeout:  3 * time.Second,
+			WriteTimeout: 3 * time.Second,
+		})
+	} else {
+		// Standalone
+		client = redis.NewClient(&redis.Options{
+			Addr:     addrs[0],
+			Password: password,
+			DB:       db,
+			PoolSize: 50,
+			MinIdleConns: 10,
+		})
+	}
+	return &RedisClient{client: client, prefix: "54bank:"}
+}
+
+// --- Session Management ---
+func (rc *RedisClient) CreateSession(sessionID, userID string, data map[string]interface{}, ttl time.Duration) error {
+	key := rc.prefix + "session:" + sessionID
+	pipe := rc.client.Pipeline()
+	for k, v := range data {
+		pipe.HSet(context.Background(), key, k, v)
+	}
+	pipe.HSet(context.Background(), key, "user_id", userID)
+	pipe.HSet(context.Background(), key, "created_at", time.Now().Unix())
+	pipe.Expire(context.Background(), key, ttl)
+	_, err := pipe.Exec(context.Background())
+	return err
+}
+
+func (rc *RedisClient) GetSession(sessionID string) (map[string]string, error) {
+	key := rc.prefix + "session:" + sessionID
+	return rc.client.HGetAll(context.Background(), key).Result()
+}
+
+func (rc *RedisClient) DestroySession(sessionID string) error {
+	return rc.client.Del(context.Background(), rc.prefix+"session:"+sessionID).Err()
+}
+
+// --- Distributed Rate Limiting (sliding window with Lua) ---
+var rateLimitScript = redis.NewScript(`
+local key = KEYS[1]
+local window = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+redis.call("ZREMRANGEBYSCORE", key, 0, now - window)
+local count = redis.call("ZCARD", key)
+if count < limit then
+    redis.call("ZADD", key, now, now .. "-" .. math.random(1000000))
+    redis.call("EXPIRE", key, window)
+    return 1
+end
+return 0
+`)
+
+func (rc *RedisClient) RateLimit(identifier string, windowSecs, maxRequests int) (bool, error) {
+	key := rc.prefix + "rl:" + identifier
+	now := time.Now().UnixMilli()
+	result, err := rateLimitScript.Run(context.Background(), rc.client,
+		[]string{key}, windowSecs*1000, maxRequests, now).Int()
+	if err != nil { return false, err }
+	return result == 1, nil
+}
+
+// --- Pub/Sub for real-time notifications ---
+func (rc *RedisClient) Publish(channel string, message interface{}) error {
+	data, _ := json.Marshal(message)
+	return rc.client.Publish(context.Background(), rc.prefix+channel, data).Err()
+}
+
+func (rc *RedisClient) Subscribe(channel string, handler func(msg string)) {
+	sub := rc.client.Subscribe(context.Background(), rc.prefix+channel)
+	go func() {
+		ch := sub.Channel()
+		for msg := range ch {
+			handler(msg.Payload)
+		}
+	}()
+}
+
+// --- Distributed Lock (Redlock pattern) ---
+func (rc *RedisClient) AcquireLock(resource string, ttl time.Duration) (string, bool) {
+	lockKey := rc.prefix + "lock:" + resource
+	token := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	ok, err := rc.client.SetNX(context.Background(), lockKey, token, ttl).Result()
+	if err != nil || !ok { return "", false }
+	return token, true
+}
+
+func (rc *RedisClient) ReleaseLock(resource, token string) bool {
+	script := redis.NewScript(`
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("DEL", KEYS[1])
+		end
+		return 0
+	`)
+	result, _ := script.Run(context.Background(), rc.client,
+		[]string{rc.prefix + "lock:" + resource}, token).Int()
+	return result == 1
+}
+
+// --- Cache with stampede protection ---
+func (rc *RedisClient) CacheGetOrSet(key string, ttl time.Duration, fetcher func() (interface{}, error)) (string, error) {
+	fullKey := rc.prefix + "cache:" + key
+	val, err := rc.client.Get(context.Background(), fullKey).Result()
+	if err == nil { return val, nil }
+
+	// Acquire lock to prevent stampede
+	lockToken, acquired := rc.AcquireLock("fetch:"+key, 10*time.Second)
+	if !acquired {
+		// Another goroutine is fetching — wait and retry
+		time.Sleep(100 * time.Millisecond)
+		return rc.client.Get(context.Background(), fullKey).Result()
+	}
+	defer rc.ReleaseLock("fetch:"+key, lockToken)
+
+	data, err := fetcher()
+	if err != nil { return "", err }
+	jsonData, _ := json.Marshal(data)
+	rc.client.Set(context.Background(), fullKey, string(jsonData), ttl)
+	return string(jsonData), nil
+}
+
+// --- Sorted Set for leaderboards/rankings ---
+func (rc *RedisClient) AddToLeaderboard(board, member string, score float64) error {
+	return rc.client.ZAdd(context.Background(), rc.prefix+"lb:"+board,
+		redis.Z{Score: score, Member: member}).Err()
+}
+
+func (rc *RedisClient) GetLeaderboard(board string, top int) ([]redis.Z, error) {
+	return rc.client.ZRevRangeWithScores(context.Background(), rc.prefix+"lb:"+board, 0, int64(top-1)).Result()
+}
+
+func (rc *RedisClient) Close() error { return rc.client.Close() }
+
+
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
     failures    int

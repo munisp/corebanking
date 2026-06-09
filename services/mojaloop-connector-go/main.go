@@ -776,6 +776,100 @@ func computeMojaloopFee(amount float64, transferType string) float64 {
 }
 
 
+
+// --- Mojaloop FSPIOP Client (Go) ---
+// Party lookup, quotes, two-phase transfers, settlement
+
+type FSPIOPClient struct {
+	switchURL string
+	dfspID    string
+}
+
+func NewFSPIOPClient(switchURL, dfspID string) *FSPIOPClient {
+	return &FSPIOPClient{switchURL: switchURL, dfspID: dfspID}
+}
+
+func (fc *FSPIOPClient) LookupParty(idType, idValue string) (map[string]interface{}, error) {
+	url := fmt.Sprintf("%s/parties/%s/%s", fc.switchURL, idType, idValue)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("FSPIOP-Source", fc.dfspID)
+	req.Header.Set("Accept", "application/vnd.interoperability.parties+json;version=1.1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result, nil
+}
+
+func (fc *FSPIOPClient) RequestQuote(quoteID, payerFSP, payeeFSP string, amountKobo int64, currency string) (map[string]interface{}, error) {
+	amountStr := fmt.Sprintf("%d.%02d", amountKobo/100, amountKobo%100)
+	body := map[string]interface{}{
+		"quoteId": quoteID,
+		"payer": map[string]interface{}{"partyIdInfo": map[string]string{"fspId": payerFSP}},
+		"payee": map[string]interface{}{"partyIdInfo": map[string]string{"fspId": payeeFSP}},
+		"amount": map[string]string{"currency": currency, "amount": amountStr},
+		"transactionType": map[string]string{"scenario": "TRANSFER", "initiator": "PAYER"},
+	}
+	return fc.postJSON("/quotes", body, payeeFSP)
+}
+
+func (fc *FSPIOPClient) PrepareTransfer(transferID, payeeFSP string, amountKobo int64, currency, ilpPacket, condition string) (map[string]interface{}, error) {
+	amountStr := fmt.Sprintf("%d.%02d", amountKobo/100, amountKobo%100)
+	body := map[string]interface{}{
+		"transferId": transferID, "payeeFsp": payeeFSP, "payerFsp": fc.dfspID,
+		"amount": map[string]string{"currency": currency, "amount": amountStr},
+		"ilpPacket": ilpPacket, "condition": condition,
+		"expiration": time.Now().Add(30*time.Second).Format(time.RFC3339),
+	}
+	return fc.postJSON("/transfers", body, payeeFSP)
+}
+
+func (fc *FSPIOPClient) FulfilTransfer(transferID, fulfilment string) (map[string]interface{}, error) {
+	body := map[string]interface{}{
+		"fulfilment": fulfilment, "transferState": "COMMITTED",
+		"completedTimestamp": time.Now().Format(time.RFC3339),
+	}
+	return fc.putJSON(fmt.Sprintf("/transfers/%s", transferID), body)
+}
+
+func (fc *FSPIOPClient) postJSON(path string, body interface{}, destFSP string) (map[string]interface{}, error) {
+	jsonData, _ := json.Marshal(body)
+	req, _ := http.NewRequest("POST", fc.switchURL+path, bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/vnd.interoperability.transfers+json;version=1.1")
+	req.Header.Set("FSPIOP-Source", fc.dfspID)
+	if destFSP != "" { req.Header.Set("FSPIOP-Destination", destFSP) }
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result, nil
+}
+
+func (fc *FSPIOPClient) putJSON(path string, body interface{}) (map[string]interface{}, error) {
+	jsonData, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PUT", fc.switchURL+path, bytes.NewBuffer(jsonData))
+	req.Header.Set("Content-Type", "application/vnd.interoperability.transfers+json;version=1.1")
+	req.Header.Set("FSPIOP-Source", fc.dfspID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result, nil
+}
+
+// Integer kobo fee computation (no floats)
+func computeFeesKobo(amountKobo int64, corridor string) map[string]int64 {
+	ratesBPS := map[string]int64{"ngn_to_ghs": 150, "ngn_to_kes": 200, "ngn_to_xof": 100, "domestic": 50, "default": 250}
+	rate := ratesBPS["default"]
+	if r, ok := ratesBPS[corridor]; ok { rate = r }
+	feeKobo := (amountKobo * rate) / 10000
+	return map[string]int64{"amount_kobo": amountKobo, "fee_kobo": feeKobo, "total_kobo": amountKobo + feeKobo, "rate_bps": rate}
+}
+
+
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
     failures    int

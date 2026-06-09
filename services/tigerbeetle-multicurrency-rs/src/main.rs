@@ -19,6 +19,223 @@ struct AppState {
 fn currency_code_to_ledger(code: &str) -> u32 { match code { "NGN" => 566, "USD" => 840, "GBP" => 826, "EUR" => 978, _ => 0 } }
 
 
+
+// --- TigerBeetle Client Integration ---
+// Real batch account creation, double-entry transfers, two-phase commit
+
+use tigerbeetle_client::{Client, Account, Transfer, AccountFlags, TransferFlags, CreateAccountError, CreateTransferError};
+
+const TB_CLUSTER_ID: u128 = 0;
+const TB_ADDRESSES: &[&str] = &["3000"];
+
+struct TigerBeetleClient {
+    client: Client,
+}
+
+impl TigerBeetleClient {
+    async fn connect() -> Result<Self, Box<dyn std::error::Error>> {
+        let client = Client::new(TB_CLUSTER_ID, TB_ADDRESSES)?;
+        Ok(Self { client })
+    }
+
+    /// Create accounts in batch (up to 8190 per batch)
+    async fn create_accounts(&self, accounts: Vec<AccountSpec>) -> Result<Vec<AccountResult>, String> {
+        let tb_accounts: Vec<Account> = accounts.iter().map(|spec| {
+            Account {
+                id: spec.id,
+                debits_pending: 0,
+                debits_posted: 0,
+                credits_pending: 0,
+                credits_posted: 0,
+                user_data_128: spec.user_data,
+                user_data_64: 0,
+                user_data_32: 0,
+                reserved: 0,
+                ledger: spec.ledger,
+                code: spec.account_type,
+                flags: if spec.debits_must_not_exceed_credits {
+                    AccountFlags::DEBITS_MUST_NOT_EXCEED_CREDITS
+                } else {
+                    AccountFlags::empty()
+                },
+                timestamp: 0,
+            }
+        }).collect();
+
+        let results = self.client.create_accounts(&tb_accounts);
+        let mut output = Vec::new();
+        for (i, account) in tb_accounts.iter().enumerate() {
+            let status = results.iter().find(|r| r.index == i as u32)
+                .map(|r| match r.result {
+                    CreateAccountError::Exists => "exists",
+                    _ => "error",
+                }).unwrap_or("ok");
+            output.push(AccountResult { id: account.id, status: status.to_string() });
+        }
+        Ok(output)
+    }
+
+    /// Create a double-entry transfer (debit one account, credit another)
+    async fn create_transfer(&self, transfer: TransferSpec) -> Result<TransferResult, String> {
+        let tb_transfer = Transfer {
+            id: transfer.id,
+            debit_account_id: transfer.debit_account_id,
+            credit_account_id: transfer.credit_account_id,
+            amount: transfer.amount,
+            pending_id: 0,
+            user_data_128: transfer.reference,
+            user_data_64: 0,
+            user_data_32: 0,
+            timeout: 0,
+            ledger: transfer.ledger,
+            code: transfer.transfer_code,
+            flags: TransferFlags::empty(),
+            timestamp: 0,
+        };
+        let results = self.client.create_transfers(&[tb_transfer]);
+        if results.is_empty() {
+            Ok(TransferResult { id: transfer.id, status: "posted".to_string() })
+        } else {
+            Err(format!("transfer failed: {:?}", results[0].result))
+        }
+    }
+
+    /// Two-phase transfer: pending → post/void
+    async fn create_pending_transfer(&self, transfer: TransferSpec, timeout_secs: u32) -> Result<TransferResult, String> {
+        let tb_transfer = Transfer {
+            id: transfer.id,
+            debit_account_id: transfer.debit_account_id,
+            credit_account_id: transfer.credit_account_id,
+            amount: transfer.amount,
+            pending_id: 0,
+            user_data_128: transfer.reference,
+            user_data_64: 0,
+            user_data_32: 0,
+            timeout: timeout_secs,
+            ledger: transfer.ledger,
+            code: transfer.transfer_code,
+            flags: TransferFlags::PENDING,
+            timestamp: 0,
+        };
+        let results = self.client.create_transfers(&[tb_transfer]);
+        if results.is_empty() {
+            Ok(TransferResult { id: transfer.id, status: "pending".to_string() })
+        } else {
+            Err(format!("pending transfer failed: {:?}", results[0].result))
+        }
+    }
+
+    /// Post a pending transfer (finalize)
+    async fn post_pending_transfer(&self, pending_id: u128, transfer_id: u128) -> Result<(), String> {
+        let tb_transfer = Transfer {
+            id: transfer_id,
+            debit_account_id: 0,
+            credit_account_id: 0,
+            amount: 0,
+            pending_id,
+            user_data_128: 0,
+            user_data_64: 0,
+            user_data_32: 0,
+            timeout: 0,
+            ledger: 0,
+            code: 0,
+            flags: TransferFlags::POST_PENDING_TRANSFER,
+            timestamp: 0,
+        };
+        let results = self.client.create_transfers(&[tb_transfer]);
+        if results.is_empty() { Ok(()) } else { Err("post failed".into()) }
+    }
+
+    /// Void a pending transfer (cancel)
+    async fn void_pending_transfer(&self, pending_id: u128, transfer_id: u128) -> Result<(), String> {
+        let tb_transfer = Transfer {
+            id: transfer_id,
+            debit_account_id: 0,
+            credit_account_id: 0,
+            amount: 0,
+            pending_id,
+            user_data_128: 0,
+            user_data_64: 0,
+            user_data_32: 0,
+            timeout: 0,
+            ledger: 0,
+            code: 0,
+            flags: TransferFlags::VOID_PENDING_TRANSFER,
+            timestamp: 0,
+        };
+        let results = self.client.create_transfers(&[tb_transfer]);
+        if results.is_empty() { Ok(()) } else { Err("void failed".into()) }
+    }
+
+    /// Lookup account balances
+    async fn lookup_accounts(&self, ids: &[u128]) -> Vec<AccountBalance> {
+        let accounts = self.client.lookup_accounts(ids);
+        accounts.iter().map(|a| AccountBalance {
+            id: a.id,
+            debits_pending: a.debits_pending,
+            debits_posted: a.debits_posted,
+            credits_pending: a.credits_pending,
+            credits_posted: a.credits_posted,
+            available_balance: (a.credits_posted + a.credits_pending) as i128 - (a.debits_posted + a.debits_pending) as i128,
+        }).collect()
+    }
+
+    /// Linked transfers (batch of transfers that all succeed or all fail)
+    async fn create_linked_transfers(&self, transfers: Vec<TransferSpec>) -> Result<Vec<TransferResult>, String> {
+        let mut tb_transfers: Vec<Transfer> = transfers.iter().enumerate().map(|(i, t)| {
+            let mut flags = TransferFlags::empty();
+            if i < transfers.len() - 1 {
+                flags |= TransferFlags::LINKED; // Link all except last
+            }
+            Transfer {
+                id: t.id, debit_account_id: t.debit_account_id,
+                credit_account_id: t.credit_account_id, amount: t.amount,
+                pending_id: 0, user_data_128: t.reference,
+                user_data_64: 0, user_data_32: 0, timeout: 0,
+                ledger: t.ledger, code: t.transfer_code, flags, timestamp: 0,
+            }
+        }).collect();
+        let results = self.client.create_transfers(&tb_transfers);
+        if results.is_empty() {
+            Ok(transfers.iter().map(|t| TransferResult { id: t.id, status: "posted".into() }).collect())
+        } else {
+            Err(format!("linked transfers failed at index {}: {:?}", results[0].index, results[0].result))
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AccountSpec {
+    id: u128,
+    ledger: u32,
+    account_type: u16,
+    user_data: u128,
+    debits_must_not_exceed_credits: bool,
+}
+
+#[derive(Clone)]
+struct TransferSpec {
+    id: u128,
+    debit_account_id: u128,
+    credit_account_id: u128,
+    amount: u128,
+    ledger: u32,
+    transfer_code: u16,
+    reference: u128,
+}
+
+struct TransferResult { id: u128, status: String }
+struct AccountResult { id: u128, status: String }
+struct AccountBalance {
+    id: u128,
+    debits_pending: u128,
+    debits_posted: u128,
+    credits_pending: u128,
+    credits_posted: u128,
+    available_balance: i128,
+}
+
+
 // --- Graceful Degradation ---
 use std::sync::atomic::AtomicBool;
 

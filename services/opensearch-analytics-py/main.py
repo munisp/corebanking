@@ -219,6 +219,161 @@ def validate_opensearch_analytics_input(data):
     return {"valid": True, "fields": len(data)}
 
 
+
+# --- OpenSearch Client Integration ---
+# Real bulk indexing, query DSL, mapping management, aggregations
+
+OPENSEARCH_URL = os.environ.get("OPENSEARCH_URL", "http://localhost:9200")
+OPENSEARCH_USER = os.environ.get("OPENSEARCH_USER", "admin")
+OPENSEARCH_PASS = os.environ.get("OPENSEARCH_PASS", "admin")
+
+class OpenSearchClient:
+    """OpenSearch REST client for 54Bank transaction indexing and search."""
+
+    def __init__(self, url: str, username: str = None, password: str = None):
+        self.url = url.rstrip("/")
+        self.auth = None
+        if username and password:
+            import base64
+            self.auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+
+    def _request(self, method, path, body=None):
+        url = f"{self.url}{path}"
+        data = json.dumps(body).encode() if body else None
+        req = urllib.request.Request(url, data=data, method=method)
+        req.add_header("Content-Type", "application/json")
+        if self.auth:
+            req.add_header("Authorization", f"Basic {self.auth}")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+
+    # --- Index Management ---
+    def create_index(self, index_name: str, mappings: dict, settings: dict = None):
+        """Create an index with explicit mappings."""
+        body = {"mappings": mappings}
+        if settings:
+            body["settings"] = settings
+        return self._request("PUT", f"/{index_name}", body)
+
+    def create_transaction_index(self):
+        """Create the standard 54Bank transaction index with proper mappings."""
+        return self.create_index("transactions-54bank", {
+            "properties": {
+                "transaction_id": {"type": "keyword"},
+                "account_id": {"type": "keyword"},
+                "customer_id": {"type": "keyword"},
+                "type": {"type": "keyword"},
+                "amount_kobo": {"type": "long"},
+                "currency": {"type": "keyword"},
+                "status": {"type": "keyword"},
+                "channel": {"type": "keyword"},
+                "branch_code": {"type": "keyword"},
+                "description": {"type": "text", "analyzer": "standard"},
+                "reference": {"type": "keyword"},
+                "created_at": {"type": "date"},
+                "metadata": {"type": "object", "enabled": False},
+                "geo_location": {"type": "geo_point"},
+            }
+        }, {
+            "number_of_shards": 3,
+            "number_of_replicas": 1,
+            "refresh_interval": "5s",
+            "index.lifecycle.name": "transactions-lifecycle",
+        })
+
+    # --- Bulk Indexing ---
+    def bulk_index(self, index_name: str, documents: list) -> dict:
+        """Bulk index documents using the _bulk API."""
+        bulk_body = ""
+        for doc in documents:
+            doc_id = doc.get("transaction_id") or doc.get("id") or str(int(time.time() * 1000000))
+            bulk_body += json.dumps({"index": {"_index": index_name, "_id": doc_id}}) + "\n"
+            bulk_body += json.dumps(doc) + "\n"
+        url = f"{self.url}/_bulk"
+        data = bulk_body.encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("Content-Type", "application/x-ndjson")
+        if self.auth:
+            req.add_header("Authorization", f"Basic {self.auth}")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode())
+            return {"took": result["took"], "errors": result["errors"], "indexed": len(documents)}
+
+    # --- Search with Query DSL ---
+    def search(self, index_name: str, query: dict, size: int = 20, from_: int = 0, sort: list = None) -> dict:
+        """Execute a search query with full Query DSL support."""
+        body = {"query": query, "size": size, "from": from_}
+        if sort:
+            body["sort"] = sort
+        return self._request("POST", f"/{index_name}/_search", body)
+
+    def search_transactions(self, account_id: str = None, amount_min: int = None,
+                           amount_max: int = None, status: str = None,
+                           date_from: str = None, date_to: str = None,
+                           text_query: str = None) -> dict:
+        """Search transactions with multi-field filtering."""
+        must = []
+        if account_id:
+            must.append({"term": {"account_id": account_id}})
+        if status:
+            must.append({"term": {"status": status}})
+        if amount_min or amount_max:
+            range_q = {}
+            if amount_min: range_q["gte"] = amount_min
+            if amount_max: range_q["lte"] = amount_max
+            must.append({"range": {"amount_kobo": range_q}})
+        if date_from or date_to:
+            range_q = {}
+            if date_from: range_q["gte"] = date_from
+            if date_to: range_q["lte"] = date_to
+            must.append({"range": {"created_at": range_q}})
+        if text_query:
+            must.append({"match": {"description": text_query}})
+        query = {"bool": {"must": must}} if must else {"match_all": {}}
+        return self.search("transactions-54bank", query, sort=[{"created_at": "desc"}])
+
+    # --- Aggregations ---
+    def aggregate_transactions(self, account_id: str, interval: str = "day") -> dict:
+        """Aggregate transaction volumes and amounts by time interval."""
+        body = {
+            "size": 0,
+            "query": {"term": {"account_id": account_id}},
+            "aggs": {
+                "by_date": {
+                    "date_histogram": {"field": "created_at", "calendar_interval": interval},
+                    "aggs": {
+                        "total_amount": {"sum": {"field": "amount_kobo"}},
+                        "avg_amount": {"avg": {"field": "amount_kobo"}},
+                        "transaction_count": {"value_count": {"field": "transaction_id"}},
+                    }
+                },
+                "by_type": {
+                    "terms": {"field": "type", "size": 20},
+                    "aggs": {"total": {"sum": {"field": "amount_kobo"}}}
+                },
+                "by_channel": {
+                    "terms": {"field": "channel", "size": 10}
+                }
+            }
+        }
+        return self._request("POST", "/transactions-54bank/_search", body)
+
+    # --- Index Lifecycle Management ---
+    def create_ilm_policy(self):
+        """Create ILM policy for transaction data retention."""
+        policy = {
+            "policy": {
+                "phases": {
+                    "hot": {"actions": {"rollover": {"max_size": "50gb", "max_age": "7d"}}},
+                    "warm": {"min_age": "30d", "actions": {"shrink": {"number_of_shards": 1}, "forcemerge": {"max_num_segments": 1}}},
+                    "cold": {"min_age": "90d", "actions": {"freeze": {}}},
+                    "delete": {"min_age": "365d", "actions": {"delete": {}}},
+                }
+            }
+        }
+        return self._request("PUT", "/_plugins/_ism/policies/transactions-lifecycle", policy)
+
+
 # --- HTTP Handler ---
 def respond(handler, code, body):
     handler.send_response(code)

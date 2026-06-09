@@ -19,6 +19,56 @@ struct AppState {
 fn optimal_batch_size(msg_size_bytes: u64, max_batch_bytes: u64) -> u64 { max_batch_bytes / msg_size_bytes.max(1) }
 
 
+
+// --- Kafka Batch Producer (rdkafka) ---
+// Real batch production with delivery guarantees
+
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::config::ClientConfig;
+
+struct KafkaBatchProducer {
+    producer: FutureProducer,
+    topic: String,
+    batch_size: usize,
+    buffer: Vec<(String, Vec<u8>)>,
+}
+
+impl KafkaBatchProducer {
+    fn new(brokers: &str, topic: &str, batch_size: usize) -> Self {
+        let producer: FutureProducer = ClientConfig::new()
+            .set("bootstrap.servers", brokers)
+            .set("message.timeout.ms", "5000")
+            .set("enable.idempotence", "true")
+            .set("acks", "all")
+            .set("retries", "3")
+            .set("linger.ms", "5")
+            .set("batch.num.messages", &batch_size.to_string())
+            .create()
+            .expect("Failed to create Kafka producer");
+        Self { producer, topic: topic.to_string(), batch_size, buffer: Vec::new() }
+    }
+
+    async fn send(&mut self, key: &str, payload: &[u8]) -> Result<(), String> {
+        self.buffer.push((key.to_string(), payload.to_vec()));
+        if self.buffer.len() >= self.batch_size {
+            self.flush().await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> Result<(), String> {
+        let futures: Vec<_> = self.buffer.drain(..).map(|(key, payload)| {
+            let record = FutureRecord::to(&self.topic).key(&key).payload(&payload);
+            self.producer.send(record, std::time::Duration::from_secs(5))
+        }).collect();
+        for fut in futures {
+            fut.await.map_err(|(e, _)| format!("Kafka send error: {:?}", e))?;
+        }
+        Ok(())
+    }
+}
+
+
 // --- Graceful Degradation ---
 use std::sync::atomic::AtomicBool;
 

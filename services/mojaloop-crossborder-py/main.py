@@ -801,12 +801,182 @@ def validate_transfer(payer, payee, amount, currency):
     if payer.get("fspId") == payee.get("fspId"): issues.append("Intra-FSP transfer not allowed via Mojaloop")
     return {"valid": len(issues) == 0, "issues": issues, "payer_fsp": payer.get("fspId",""), "payee_fsp": payee.get("fspId",""), "amount": amount, "currency": currency}
 
-def compute_fees(amount, currency, corridor):
-    fee_rates = {"ngn_to_ghs": 0.015, "ngn_to_kes": 0.02, "ngn_to_xof": 0.01, "default": 0.025}
-    rate = fee_rates.get(corridor, fee_rates["default"])
-    fee = round(amount * rate, 2)
-    return {"amount": amount, "currency": currency, "corridor": corridor, "fee": fee, "total": round(amount + fee, 2), "fee_rate_pct": rate * 100}
+def compute_fees(amount_kobo, currency, corridor):
+    """Compute transfer fees using integer kobo arithmetic (no floats for money)."""
+    fee_rates_bps = {"ngn_to_ghs": 150, "ngn_to_kes": 200, "ngn_to_xof": 100, "ngn_to_zar": 125, "domestic": 50, "default": 250}
+    rate_bps = fee_rates_bps.get(corridor, fee_rates_bps["default"])
+    fee_kobo = (amount_kobo * rate_bps) // 10000  # Integer division only
+    total_kobo = amount_kobo + fee_kobo
+    return {"amount_kobo": amount_kobo, "currency": currency, "corridor": corridor, "fee_kobo": fee_kobo, "total_kobo": total_kobo, "fee_rate_bps": rate_bps}
 
+
+
+
+# --- Mojaloop FSPIOP Integration ---
+# Real Interledger Protocol endpoints, two-phase transfers, party lookup
+
+import urllib.request
+import urllib.parse
+from datetime import datetime, timezone
+
+MOJALOOP_SWITCH_URL = os.environ.get("MOJALOOP_SWITCH_URL", "http://localhost:4003")
+DFSP_ID = os.environ.get("DFSP_ID", "54bank")
+
+class FSPIOPClient:
+    """Mojaloop Financial Service Provider Interoperability Protocol client."""
+
+    def __init__(self, switch_url: str, dfsp_id: str):
+        self.switch_url = switch_url.rstrip("/")
+        self.dfsp_id = dfsp_id
+
+    def _headers(self, dest_fsp: str = None) -> dict:
+        """Standard FSPIOP headers per Mojaloop specification."""
+        headers = {
+            "Content-Type": "application/vnd.interoperability.transfers+json;version=1.1",
+            "Accept": "application/vnd.interoperability.transfers+json;version=1.1",
+            "FSPIOP-Source": self.dfsp_id,
+            "Date": datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT"),
+        }
+        if dest_fsp:
+            headers["FSPIOP-Destination"] = dest_fsp
+        return headers
+
+    # --- Party Lookup (Account Discovery) ---
+    def lookup_party(self, id_type: str, id_value: str) -> dict:
+        """GET /parties/{Type}/{ID} — Discover which DFSP owns an identifier."""
+        url = f"{self.switch_url}/parties/{id_type}/{id_value}"
+        req = urllib.request.Request(url, method="GET")
+        for k, v in self._headers().items():
+            req.add_header(k, v)
+        req.add_header("Accept", "application/vnd.interoperability.parties+json;version=1.1")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    # --- Quote (Agreement Phase) ---
+    def request_quote(self, quote_id: str, payer_fsp: str, payee_fsp: str,
+                      amount_kobo: int, currency: str = "NGN") -> dict:
+        """POST /quotes — Request a transfer quote including fees."""
+        amount_units = amount_kobo // 100
+        amount_cents = amount_kobo % 100
+        body = {
+            "quoteId": quote_id,
+            "transactionId": str(int(time.time() * 1000)),
+            "payer": {
+                "partyIdInfo": {"partyIdType": "MSISDN", "partyIdentifier": payer_fsp, "fspId": self.dfsp_id}
+            },
+            "payee": {
+                "partyIdInfo": {"partyIdType": "MSISDN", "partyIdentifier": payee_fsp, "fspId": payee_fsp}
+            },
+            "amountType": "SEND",
+            "amount": {"currency": currency, "amount": f"{amount_units}.{amount_cents:02d}"},
+            "transactionType": {"scenario": "TRANSFER", "initiator": "PAYER", "initiatorType": "CONSUMER"},
+        }
+        url = f"{self.switch_url}/quotes"
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        for k, v in self._headers(payee_fsp).items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    # --- Transfer (Two-Phase Commit) ---
+    def prepare_transfer(self, transfer_id: str, payee_fsp: str,
+                         amount_kobo: int, currency: str, ilp_packet: str,
+                         condition: str, expiry_seconds: int = 30) -> dict:
+        """POST /transfers — Prepare phase of two-phase transfer."""
+        amount_units = amount_kobo // 100
+        amount_cents = amount_kobo % 100
+        expiry = (datetime.now(timezone.utc) + timedelta(seconds=expiry_seconds)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        body = {
+            "transferId": transfer_id,
+            "payeeFsp": payee_fsp,
+            "payerFsp": self.dfsp_id,
+            "amount": {"currency": currency, "amount": f"{amount_units}.{amount_cents:02d}"},
+            "ilpPacket": ilp_packet,
+            "condition": condition,
+            "expiration": expiry,
+        }
+        url = f"{self.switch_url}/transfers"
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        for k, v in self._headers(payee_fsp).items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    def fulfil_transfer(self, transfer_id: str, fulfilment: str) -> dict:
+        """PUT /transfers/{id} — Fulfil phase (commit the transfer)."""
+        body = {
+            "fulfilment": fulfilment,
+            "completedTimestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "transferState": "COMMITTED",
+        }
+        url = f"{self.switch_url}/transfers/{transfer_id}"
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method="PUT")
+        for k, v in self._headers().items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    def reject_transfer(self, transfer_id: str, reason: str) -> dict:
+        """PUT /transfers/{id}/error — Reject/abort the transfer."""
+        body = {
+            "errorInformation": {
+                "errorCode": "5100",
+                "errorDescription": reason,
+            }
+        }
+        url = f"{self.switch_url}/transfers/{transfer_id}/error"
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method="PUT")
+        for k, v in self._headers().items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    # --- Settlement ---
+    def get_settlement_windows(self, state: str = "OPEN") -> list:
+        url = f"{self.switch_url}/settlementWindows?state={state}"
+        req = urllib.request.Request(url, method="GET")
+        for k, v in self._headers().items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    def close_settlement_window(self, window_id: str, reason: str) -> dict:
+        body = {"state": "CLOSED", "reason": reason}
+        url = f"{self.switch_url}/settlementWindows/{window_id}"
+        data = json.dumps(body).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        for k, v in self._headers().items():
+            req.add_header(k, v)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+
+# Integer kobo fee computation (replaces float)
+def compute_fees_kobo(amount_kobo: int, currency: str, corridor: str) -> dict:
+    """Compute transfer fees in kobo (integer arithmetic only)."""
+    fee_rates_bps = {
+        "ngn_to_ghs": 150,   # 1.5% = 150 basis points
+        "ngn_to_kes": 200,   # 2.0%
+        "ngn_to_xof": 100,   # 1.0%
+        "ngn_to_zar": 125,   # 1.25%
+        "domestic": 50,       # 0.5%
+        "default": 250,       # 2.5%
+    }
+    rate_bps = fee_rates_bps.get(corridor, fee_rates_bps["default"])
+    fee_kobo = (amount_kobo * rate_bps) // 10000  # Integer division
+    total_kobo = amount_kobo + fee_kobo
+    return {
+        "amount_kobo": amount_kobo,
+        "fee_kobo": fee_kobo,
+        "total_kobo": total_kobo,
+        "currency": currency,
+        "corridor": corridor,
+        "fee_rate_bps": rate_bps,
+    }
 
 
 # --- HTTP Handler ---

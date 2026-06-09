@@ -801,11 +801,13 @@ def validate_transfer(payer, payee, amount, currency):
     if payer.get("fspId") == payee.get("fspId"): issues.append("Intra-FSP transfer not allowed via Mojaloop")
     return {"valid": len(issues) == 0, "issues": issues, "payer_fsp": payer.get("fspId",""), "payee_fsp": payee.get("fspId",""), "amount": amount, "currency": currency}
 
-def compute_fees(amount, currency, corridor):
-    fee_rates = {"ngn_to_ghs": 0.015, "ngn_to_kes": 0.02, "ngn_to_xof": 0.01, "default": 0.025}
-    rate = fee_rates.get(corridor, fee_rates["default"])
-    fee = round(amount * rate, 2)
-    return {"amount": amount, "currency": currency, "corridor": corridor, "fee": fee, "total": round(amount + fee, 2), "fee_rate_pct": rate * 100}
+def compute_fees(amount_kobo, currency, corridor):
+    """Compute transfer fees using integer kobo arithmetic (no floats for money)."""
+    fee_rates_bps = {"ngn_to_ghs": 150, "ngn_to_kes": 200, "ngn_to_xof": 100, "ngn_to_zar": 125, "domestic": 50, "default": 250}
+    rate_bps = fee_rates_bps.get(corridor, fee_rates_bps["default"])
+    fee_kobo = (amount_kobo * rate_bps) // 10000  # Integer division only
+    total_kobo = amount_kobo + fee_kobo
+    return {"amount_kobo": amount_kobo, "currency": currency, "corridor": corridor, "fee_kobo": fee_kobo, "total_kobo": total_kobo, "fee_rate_bps": rate_bps}
 
 
 

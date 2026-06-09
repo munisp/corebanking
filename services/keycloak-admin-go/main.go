@@ -776,6 +776,81 @@ func computeNextRotation(lastRotated int, keyType string) int {
 }
 
 
+
+// --- Keycloak Admin REST API Client ---
+type KeycloakClient struct {
+	baseURL  string
+	realm    string
+	token    string
+	expiry   time.Time
+}
+
+func NewKeycloakClient(baseURL, realm string) *KeycloakClient {
+	return &KeycloakClient{baseURL: baseURL, realm: realm}
+}
+
+func (kc *KeycloakClient) Authenticate(clientID, clientSecret string) error {
+	url := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token", kc.baseURL, kc.realm)
+	data := fmt.Sprintf("grant_type=client_credentials&client_id=%s&client_secret=%s", clientID, clientSecret)
+	resp, err := http.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data))
+	if err != nil { return err }
+	defer resp.Body.Close()
+	var result struct { AccessToken string `json:"access_token"`; ExpiresIn int `json:"expires_in"` }
+	json.NewDecoder(resp.Body).Decode(&result)
+	kc.token = result.AccessToken
+	kc.expiry = time.Now().Add(time.Duration(result.ExpiresIn-30) * time.Second)
+	return nil
+}
+
+func (kc *KeycloakClient) CreateUser(username, email, firstName, lastName, password string) error {
+	user := map[string]interface{}{
+		"username": username, "email": email, "firstName": firstName, "lastName": lastName,
+		"enabled": true, "credentials": []map[string]interface{}{{"type": "password", "value": password, "temporary": false}},
+	}
+	return kc.adminRequest("POST", "/users", user)
+}
+
+func (kc *KeycloakClient) GetUsers(search string) ([]map[string]interface{}, error) {
+	url := fmt.Sprintf("%s/admin/realms/%s/users?search=%s&max=20", kc.baseURL, kc.realm, search)
+	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("Authorization", "Bearer "+kc.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	var users []map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&users)
+	return users, nil
+}
+
+func (kc *KeycloakClient) AssignRole(userID, roleName string) error {
+	return kc.adminRequest("POST", fmt.Sprintf("/users/%s/role-mappings/realm", userID),
+		[]map[string]interface{}{{"name": roleName}})
+}
+
+func (kc *KeycloakClient) IntrospectToken(token, clientID, clientSecret string) (map[string]interface{}, error) {
+	url := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token/introspect", kc.baseURL, kc.realm)
+	data := fmt.Sprintf("token=%s&client_id=%s&client_secret=%s", token, clientID, clientSecret)
+	resp, err := http.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data))
+	if err != nil { return nil, err }
+	defer resp.Body.Close()
+	var result map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&result)
+	return result, nil
+}
+
+func (kc *KeycloakClient) adminRequest(method, path string, body interface{}) error {
+	url := fmt.Sprintf("%s/admin/realms/%s%s", kc.baseURL, kc.realm, path)
+	jsonData, _ := json.Marshal(body)
+	req, _ := http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+	req.Header.Set("Authorization", "Bearer "+kc.token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil { return err }
+	resp.Body.Close()
+	return nil
+}
+
+
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
     failures    int

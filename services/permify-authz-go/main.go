@@ -766,13 +766,170 @@ func validatePermission(subject, resource, action string) (bool, string) {
 	if action == "" { return false, "Action required" }
 	validActions := map[string]bool{"read": true, "write": true, "delete": true, "admin": true, "approve": true}
 	if !validActions[action] { return false, "Invalid action: " + action }
-	return true, "Permission check valid"
+
+	// FIX: Actually check permission via Permify gRPC instead of always granting
+	permifyHost := os.Getenv("PERMIFY_HOST")
+	if permifyHost == "" { permifyHost = "localhost:3476" }
+	// Parse resource format: "entity_type:entity_id"
+	parts := strings.SplitN(resource, ":", 2)
+	if len(parts) != 2 { return false, "Resource must be in format entity_type:entity_id" }
+	entityType, entityID := parts[0], parts[1]
+
+	// Call Permify Check API
+	checkURL := fmt.Sprintf("http://%s/v1/tenants/54bank/permissions/check", permifyHost)
+	reqBody := map[string]interface{}{
+		"entity": map[string]string{"type": entityType, "id": entityID},
+		"permission": action,
+		"subject": map[string]interface{}{"type": "user", "id": subject},
+	}
+	jsonData, _ := json.Marshal(reqBody)
+	resp, err := http.Post(checkURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		// If Permify is unreachable, deny by default (fail-closed)
+		return false, fmt.Sprintf("Permission service unavailable: %v", err)
+	}
+	defer resp.Body.Close()
+	var result struct { Can string `json:"can"` }
+	json.NewDecoder(resp.Body).Decode(&result)
+	if result.Can == "CHECK_RESULT_ALLOWED" {
+		return true, "Permission granted by Permify"
+	}
+	return false, "Permission denied by Permify"
 }
 func computeAccessLevel(roles []string) int {
 	maxLevel := 0
 	roleLevels := map[string]int{"viewer": 1, "editor": 2, "manager": 3, "admin": 4, "super_admin": 5}
 	for _, r := range roles { if l := roleLevels[r]; l > maxLevel { maxLevel = l } }
 	return maxLevel
+}
+
+
+
+// --- Permify ReBAC Integration (gRPC) ---
+// Real relationship-based access control with schema, tuples, and permission checks
+
+import (
+	permify "github.com/Permify/permify-go/v1"
+	permifyModel "buf.build/gen/go/permifyco/permify/protocolbuffers/go/base/v1"
+)
+
+type PermifyClient struct {
+	client *permify.Client
+	tenantID string
+}
+
+// Schema definition for 54Bank — defines entities and their relationships
+const BankingSchema = `
+entity user {}
+
+entity account {
+    relation owner @user
+    relation authorized_signer @user
+    relation viewer @user
+
+    permission view = owner or authorized_signer or viewer
+    permission transact = owner or authorized_signer
+    permission manage = owner
+}
+
+entity branch {
+    relation manager @user
+    relation teller @user
+    relation member @user
+
+    permission approve_large_transaction = manager
+    permission process_transaction = manager or teller
+    permission view_reports = manager or teller or member
+}
+
+entity loan {
+    relation borrower @user
+    relation relationship_manager @user
+    relation credit_committee @user
+
+    permission view = borrower or relationship_manager or credit_committee
+    permission approve = credit_committee
+    permission disburse = relationship_manager and credit_committee
+}
+
+entity organization {
+    relation admin @user
+    relation compliance_officer @user
+    relation auditor @user
+
+    permission manage_users = admin
+    permission view_audit_trail = admin or compliance_officer or auditor
+    permission manage_compliance = admin or compliance_officer
+}
+`
+
+func NewPermifyClient(host string, tenantID string) (*PermifyClient, error) {
+	client, err := permify.NewClient(
+		permify.Config{Endpoint: host},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("permify client init failed: %w", err)
+	}
+	return &PermifyClient{client: client, tenantID: tenantID}, nil
+}
+
+// WriteSchema registers the authorization schema with Permify
+func (pc *PermifyClient) WriteSchema() error {
+	_, err := pc.client.Schema.Write(context.Background(), &permifyModel.SchemaWriteRequest{
+		TenantId: pc.tenantID,
+		Schema:   BankingSchema,
+	})
+	return err
+}
+
+// WriteRelationship creates a relationship tuple (e.g., user X is owner of account Y)
+func (pc *PermifyClient) WriteRelationship(entity, entityID, relation, subjectType, subjectID string) error {
+	_, err := pc.client.Data.Write(context.Background(), &permifyModel.DataWriteRequest{
+		TenantId: pc.tenantID,
+		Tuples: []*permifyModel.Tuple{{
+			Entity:   &permifyModel.Entity{Type: entity, Id: entityID},
+			Relation: relation,
+			Subject:  &permifyModel.Subject{Type: subjectType, Id: subjectID},
+		}},
+	})
+	return err
+}
+
+// CheckPermission checks if a subject has a permission on an entity
+func (pc *PermifyClient) CheckPermission(entity, entityID, permission, subjectType, subjectID string) (bool, error) {
+	resp, err := pc.client.Permission.Check(context.Background(), &permifyModel.PermissionCheckRequest{
+		TenantId: pc.tenantID,
+		Entity:   &permifyModel.Entity{Type: entity, Id: entityID},
+		Permission: permission,
+		Subject:   &permifyModel.Subject{Type: subjectType, Id: subjectID},
+	})
+	if err != nil { return false, err }
+	return resp.Can == permifyModel.CheckResult_CHECK_RESULT_ALLOWED, nil
+}
+
+// LookupSubjects returns all subjects that have a given permission on an entity
+func (pc *PermifyClient) LookupSubjects(entity, entityID, permission, subjectType string) ([]string, error) {
+	resp, err := pc.client.Permission.LookupSubject(context.Background(), &permifyModel.PermissionLookupSubjectRequest{
+		TenantId:    pc.tenantID,
+		Entity:      &permifyModel.Entity{Type: entity, Id: entityID},
+		Permission:  permission,
+		SubjectReference: &permifyModel.RelationReference{Type: subjectType, Relation: ""},
+	})
+	if err != nil { return nil, err }
+	return resp.SubjectIds, nil
+}
+
+// DeleteRelationship removes a relationship tuple
+func (pc *PermifyClient) DeleteRelationship(entity, entityID, relation, subjectType, subjectID string) error {
+	_, err := pc.client.Data.Delete(context.Background(), &permifyModel.DataDeleteRequest{
+		TenantId: pc.tenantID,
+		TupleFilter: &permifyModel.TupleFilter{
+			Entity:   &permifyModel.EntityFilter{Type: entity, Ids: []string{entityID}},
+			Relation: relation,
+			Subject:  &permifyModel.SubjectFilter{Type: subjectType, Ids: []string{subjectID}},
+		},
+	})
+	return err
 }
 
 

@@ -96,24 +96,57 @@ self.addEventListener('notificationclick', event => {
   }
 });
 
+// FIX: Service Workers cannot access localStorage. Use IndexedDB instead.
+const DB_NAME = '54bank-offline-queue';
+const STORE_NAME = 'requests';
+
+function openQueueDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'id', autoIncrement: true });
+      }
+    };
+    req.onsuccess = (e) => resolve(e.target.result);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+
 async function queueOfflineRequest(request) {
-  const queue = JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || '[]');
+  const db = await openQueueDB();
   const body = await request.text();
-  queue.push({
+  const entry = {
     url: request.url, method: request.method,
     headers: Object.fromEntries(request.headers.entries()),
     body, timestamp: Date.now()
+  };
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).add(entry);
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(e.target.error);
   });
-  localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(queue));
 }
 
 async function processOfflineQueue() {
-  const queue = JSON.parse(localStorage.getItem(OFFLINE_QUEUE_KEY) || '[]');
+  const db = await openQueueDB();
+  const entries = await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).getAll();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = (e) => reject(e.target.error);
+  });
   const failed = [];
-  for (const req of queue) {
+  for (const entry of entries) {
     try {
-      await fetch(req.url, { method: req.method, headers: req.headers, body: req.body });
-    } catch { failed.push(req); }
+      await fetch(entry.url, { method: entry.method, headers: entry.headers, body: entry.body });
+    } catch { failed.push(entry); }
   }
-  localStorage.setItem(OFFLINE_QUEUE_KEY, JSON.stringify(failed));
+  // Clear processed, re-queue failures
+  const tx = db.transaction(STORE_NAME, 'readwrite');
+  tx.objectStore(STORE_NAME).clear();
+  for (const f of failed) { tx.objectStore(STORE_NAME).add(f); }
+  await new Promise(r => { tx.oncomplete = r; });
 }
