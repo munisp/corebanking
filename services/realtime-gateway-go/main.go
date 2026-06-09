@@ -452,11 +452,20 @@ func main() {
 	initTracing()
 	go hub.run()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/events/stream", handleSSE)
-	mux.HandleFunc("/events/publish", handlePublish)
-	mux.HandleFunc("/events/types", handleEventTypes)
-	mux.HandleFunc("/connections", handleConnections)
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"status":"ready"}`))
+	})
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"requests": requestCount, "errors": errorCount})
+	})
+mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/v1/realtime-gateway/events/stream", handleSSE)
+	mux.HandleFunc("/v1/realtime-gateway/events/publish", handlePublish)
+	mux.HandleFunc("/v1/realtime-gateway/events/types", handleEventTypes)
+	mux.HandleFunc("/v1/realtime-gateway/connections", handleConnections)
 	log.Printf("54Bank Real-Time Gateway listening on :%s (SSE + REST)", PORT)
 	server := &http.Server{Addr: ":"+PORT, Handler: rateLimitMiddleware(mux)}
 	go func() {

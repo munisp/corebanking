@@ -143,11 +143,11 @@ async fn apply_smartmodule(body: web::Json<serde_json::Value>) -> HttpResponse {
 }
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/produce", web::post().to(produce_event))
+    cfg.route("/v1/fluvio-streams/produce", web::post().to(produce_event))
             .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(healthz))
-       .route("/topics", web::get().to(list_topics))
-       .route("/smartmodule/apply", web::post().to(apply_smartmodule));
+       .route("/v1/fluvio-streams/topics", web::get().to(list_topics))
+       .route("/v1/fluvio-streams/smartmodule/apply", web::post().to(apply_smartmodule));
 }
 
 
@@ -346,6 +346,24 @@ fn extract_request_id(req: &actix_web::HttpRequest) -> String {
         .to_string()
 }
 
+
+fn mask_pii(value: &str, field_type: &str) -> String {
+    if value.len() < 4 { return "***".to_string(); }
+    match field_type {
+        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
+        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
+        "email" => {
+            if let Some(at) = value.find('@') {
+                format!("{}***@{}", &value[..1], &value[at+1..])
+            } else { "***".to_string() }
+        }
+        _ => format!("{}{}{}",
+            &value[..2],
+            "*".repeat(value.len().saturating_sub(4)),
+            &value[value.len().saturating_sub(2)..])
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8304);
@@ -374,9 +392,9 @@ async fn main() -> std::io::Result<()> {
                     .max_age(86400)
             )
             .app_data(state.clone())
-            .route("/aggregate/window", web::post().to(handle_windowed_aggregation))
-                .route("/produce/exactly-once", web::post().to(handle_exactly_once_produce))
-                .route("/connector", web::post().to(handle_smart_connector))
+            .route("/v1/fluvio-streams/aggregate/window", web::post().to(handle_windowed_aggregation))
+                .route("/v1/fluvio-streams/produce/exactly-once", web::post().to(handle_exactly_once_produce))
+                .route("/v1/fluvio-streams/connector", web::post().to(handle_smart_connector))
                 .route("/health", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(livez))

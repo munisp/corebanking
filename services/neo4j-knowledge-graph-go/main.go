@@ -104,7 +104,7 @@ func queryHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"nodes": 0, "query": "MATCH (n) RETURN count(n)"})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/query", queryHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/neo4j-knowledge-graph/query", queryHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"neo4j-knowledge-graph-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

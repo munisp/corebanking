@@ -104,7 +104,7 @@ func entitlementHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"entitled": true, "tier": "premium"})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/entitlements", entitlementHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/feature-entitlement/entitlements", entitlementHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"feature-entitlement-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

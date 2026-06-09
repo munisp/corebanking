@@ -104,7 +104,7 @@ func lcHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"lc_id": "LC-001", "type": "irrevocable"})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/letter-of-credit", lcHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/trade-finance-gl/letter-of-credit", lcHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"trade-finance-gl-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

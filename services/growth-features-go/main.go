@@ -104,7 +104,7 @@ func featuresHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"features": []string{"referral", "savings_goals", "cashback"}})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/features", featuresHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/growth-features/features", featuresHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"growth-features-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

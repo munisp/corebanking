@@ -104,7 +104,7 @@ func kpiHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"nps": 72, "churn_rate": 0.023})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/kpis", kpiHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/kpi-engine/kpis", kpiHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"kpi-engine-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

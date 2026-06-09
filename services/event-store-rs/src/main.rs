@@ -418,6 +418,24 @@ struct PaginationParams {
 fn default_page() -> u32 { 1 }
 fn default_limit() -> u32 { 50 }
 
+
+fn mask_pii(value: &str, field_type: &str) -> String {
+    if value.len() < 4 { return "***".to_string(); }
+    match field_type {
+        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
+        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
+        "email" => {
+            if let Some(at) = value.find('@') {
+                format!("{}***@{}", &value[..1], &value[at+1..])
+            } else { "***".to_string() }
+        }
+        _ => format!("{}{}{}",
+            &value[..2],
+            "*".repeat(value.len().saturating_sub(4)),
+            &value[value.len().saturating_sub(2)..])
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8098".to_string()).parse().unwrap_or(8098);
@@ -444,11 +462,11 @@ async fn main() -> std::io::Result<()> {
             .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(healthz))
             .route("/livez", web::get().to(healthz))
-            .route("/events", web::post().to(append_event))
+            .route("/v1/event-store/events", web::post().to(append_event))
             .route("/events/{aggregate_id}", web::get().to(get_events))
             .route("/events/type/{agg_type}/{event_type}", web::get().to(get_events_by_type))
-            .route("/snapshots", web::post().to(create_snapshot))
-            .route("/stats", web::get().to(stats))
+            .route("/v1/event-store/snapshots", web::post().to(create_snapshot))
+            .route("/v1/event-store/stats", web::get().to(stats))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()

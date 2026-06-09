@@ -139,11 +139,11 @@ async fn linked_transfers(req: actix_web::HttpRequest, body: web::Json<serde_jso
 }
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/transfers/create", web::post().to(create_transfer))
+    cfg.route("/v1/tigerbeetle-protocol/transfers/create", web::post().to(create_transfer))
             .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(healthz))
-       .route("/transfers/commit", web::post().to(commit_pending))
-       .route("/transfers/linked", web::post().to(linked_transfers));
+       .route("/v1/tigerbeetle-protocol/transfers/commit", web::post().to(commit_pending))
+       .route("/v1/tigerbeetle-protocol/transfers/linked", web::post().to(linked_transfers));
 }
 
 
@@ -253,6 +253,24 @@ fn extract_request_id(req: &actix_web::HttpRequest) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string()
+}
+
+
+fn mask_pii(value: &str, field_type: &str) -> String {
+    if value.len() < 4 { return "***".to_string(); }
+    match field_type {
+        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
+        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
+        "email" => {
+            if let Some(at) = value.find('@') {
+                format!("{}***@{}", &value[..1], &value[at+1..])
+            } else { "***".to_string() }
+        }
+        _ => format!("{}{}{}",
+            &value[..2],
+            "*".repeat(value.len().saturating_sub(4)),
+            &value[value.len().saturating_sub(2)..])
+    }
 }
 
 #[actix_web::main]

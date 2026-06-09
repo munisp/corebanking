@@ -259,6 +259,24 @@ fn validate_request(body: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+
+fn mask_pii(value: &str, field_type: &str) -> String {
+    if value.len() < 4 { return "***".to_string(); }
+    match field_type {
+        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
+        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
+        "email" => {
+            if let Some(at) = value.find('@') {
+                format!("{}***@{}", &value[..1], &value[at+1..])
+            } else { "***".to_string() }
+        }
+        _ => format!("{}{}{}",
+            &value[..2],
+            "*".repeat(value.len().saturating_sub(4)),
+            &value[value.len().saturating_sub(2)..])
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8309);

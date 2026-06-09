@@ -177,11 +177,11 @@ async fn waf_stats() -> HttpResponse {
 }
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/waf/inspect", web::post().to(inspect_request))
+    cfg.route("/v1/openappsec-waf/waf/inspect", web::post().to(inspect_request))
             .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(healthz))
-       .route("/waf/block", web::post().to(block_ip))
-       .route("/waf/stats", web::get().to(waf_stats));
+       .route("/v1/openappsec-waf/waf/block", web::post().to(block_ip))
+       .route("/v1/openappsec-waf/waf/stats", web::get().to(waf_stats));
 }
 
 
@@ -379,6 +379,24 @@ fn extract_request_id(req: &actix_web::HttpRequest) -> String {
         .to_string()
 }
 
+
+fn mask_pii(value: &str, field_type: &str) -> String {
+    if value.len() < 4 { return "***".to_string(); }
+    match field_type {
+        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
+        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
+        "email" => {
+            if let Some(at) = value.find('@') {
+                format!("{}***@{}", &value[..1], &value[at+1..])
+            } else { "***".to_string() }
+        }
+        _ => format!("{}{}{}",
+            &value[..2],
+            "*".repeat(value.len().saturating_sub(4)),
+            &value[value.len().saturating_sub(2)..])
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8310);
@@ -407,9 +425,9 @@ async fn main() -> std::io::Result<()> {
                     .max_age(86400)
             )
             .app_data(state.clone())
-            .route("/rules/custom", web::post().to(handle_custom_rule))
-                .route("/threat-intel/query", web::post().to(handle_threat_intel))
-                .route("/rate-limit/coordinate", web::post().to(handle_rate_coordination))
+            .route("/v1/openappsec-waf/rules/custom", web::post().to(handle_custom_rule))
+                .route("/v1/openappsec-waf/threat-intel/query", web::post().to(handle_threat_intel))
+                .route("/v1/openappsec-waf/rate-limit/coordinate", web::post().to(handle_rate_coordination))
                 .route("/health", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(livez))

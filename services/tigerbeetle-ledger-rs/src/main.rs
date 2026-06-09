@@ -170,12 +170,12 @@ async fn lookup_accounts(req: actix_web::HttpRequest, body: web::Json<serde_json
 }
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/accounts/create", web::post().to(create_accounts))
+    cfg.route("/v1/tigerbeetle-ledger/accounts/create", web::post().to(create_accounts))
             .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(healthz))
-       .route("/transfers/create", web::post().to(create_transfers))
-       .route("/transfers/commit", web::post().to(commit_transfer))
-       .route("/accounts/lookup", web::post().to(lookup_accounts));
+       .route("/v1/tigerbeetle-ledger/transfers/create", web::post().to(create_transfers))
+       .route("/v1/tigerbeetle-ledger/transfers/commit", web::post().to(commit_transfer))
+       .route("/v1/tigerbeetle-ledger/accounts/lookup", web::post().to(lookup_accounts));
 }
 
 
@@ -380,6 +380,24 @@ fn validate_request(body: &serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+
+fn mask_pii(value: &str, field_type: &str) -> String {
+    if value.len() < 4 { return "***".to_string(); }
+    match field_type {
+        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
+        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
+        "email" => {
+            if let Some(at) = value.find('@') {
+                format!("{}***@{}", &value[..1], &value[at+1..])
+            } else { "***".to_string() }
+        }
+        _ => format!("{}{}{}",
+            &value[..2],
+            "*".repeat(value.len().saturating_sub(4)),
+            &value[value.len().saturating_sub(2)..])
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8301);
@@ -408,9 +426,9 @@ async fn main() -> std::io::Result<()> {
                     .max_age(86400)
             )
             .app_data(state.clone())
-            .route("/lookup/filter", web::post().to(handle_lookup_filters))
-                .route("/balance/assert", web::post().to(handle_balance_assertion))
-                .route("/transfers/linked", web::post().to(handle_linked_transfers))
+            .route("/v1/tigerbeetle-ledger/lookup/filter", web::post().to(handle_lookup_filters))
+                .route("/v1/tigerbeetle-ledger/balance/assert", web::post().to(handle_balance_assertion))
+                .route("/v1/tigerbeetle-ledger/transfers/linked", web::post().to(handle_linked_transfers))
                 .route("/health", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(livez))

@@ -104,7 +104,7 @@ func accrueHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"status": "accrued", "method": "actual/365"})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/accrue", accrueHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/interest-accrual-engine/accrue", accrueHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"interest-accrual-engine-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

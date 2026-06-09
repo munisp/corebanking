@@ -104,7 +104,7 @@ func routePayment(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"payment_id": "PMT-001", "channel": "NIP"})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/route", routePayment)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/payments-hub/route", routePayment)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"payments-hub-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

@@ -359,10 +359,19 @@ func main() {
 	initTracing()
 	fmt.Printf("54Bank Feature Flags Service listening on :%s\n", PORT)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/flags", handleList)
-	mux.HandleFunc("/flags/check", handleCheck)
-	mux.HandleFunc("/flags/toggle", handleToggle)
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"status":"ready"}`))
+	})
+		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"requests": requestCount, "errors": errorCount})
+	})
+mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/v1/feature-flags/flags", handleList)
+	mux.HandleFunc("/v1/feature-flags/flags/check", handleCheck)
+	mux.HandleFunc("/v1/feature-flags/flags/toggle", handleToggle)
 	server := &http.Server{Addr: ":"+PORT, Handler: corsMiddleware(rateLimitMiddleware(mux))}
 	go func() {
 		log.Printf("[feature-flags-go] Starting on :%s", PORT)

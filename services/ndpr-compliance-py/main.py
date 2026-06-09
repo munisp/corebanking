@@ -287,6 +287,10 @@ class NDPRHandler(BaseHTTPRequestHandler):
         
         if path == "/healthz":
             self._json(200, {"status": "healthy", "service": "ndpr-compliance", "version": "1.0.0"})
+        elif path == "/readyz":
+            self._json(200, {"status": "ready"})
+        elif path == "/metrics":
+            self._json(200, {"requests": _request_counter, "errors": _error_counter})
         elif path == "/privacy-policy":
             self._json(200, {
                 "title": "54Bank Privacy Policy",

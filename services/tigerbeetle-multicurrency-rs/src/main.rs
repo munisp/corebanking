@@ -138,10 +138,10 @@ async fn list_ledgers() -> HttpResponse {
 }
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/fx/transfer", web::post().to(create_fx_transfer))
+    cfg.route("/v1/tigerbeetle-multicurrency/fx/transfer", web::post().to(create_fx_transfer))
             .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(healthz))
-       .route("/ledgers", web::get().to(list_ledgers));
+       .route("/v1/tigerbeetle-multicurrency/ledgers", web::get().to(list_ledgers));
 }
 
 
@@ -252,6 +252,24 @@ fn validate_request(body: &serde_json::Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+
+fn mask_pii(value: &str, field_type: &str) -> String {
+    if value.len() < 4 { return "***".to_string(); }
+    match field_type {
+        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
+        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
+        "email" => {
+            if let Some(at) = value.find('@') {
+                format!("{}***@{}", &value[..1], &value[at+1..])
+            } else { "***".to_string() }
+        }
+        _ => format!("{}{}{}",
+            &value[..2],
+            "*".repeat(value.len().saturating_sub(4)),
+            &value[value.len().saturating_sub(2)..])
+    }
 }
 
 #[actix_web::main]

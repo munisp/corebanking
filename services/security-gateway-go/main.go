@@ -104,7 +104,7 @@ func inspectHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"threat_level": "low", "blocked": false})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/inspect", inspectHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/security-gateway/inspect", inspectHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"security-gateway-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

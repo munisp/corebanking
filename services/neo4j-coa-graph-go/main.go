@@ -104,7 +104,7 @@ func coaHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"chart_of_accounts": []string{"Assets", "Liabilities", "Equity"}})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/coa", coaHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/neo4j-coa-graph/coa", coaHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"neo4j-coa-graph-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

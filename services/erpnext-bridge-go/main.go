@@ -104,7 +104,7 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"status": "synced", "service": serviceName})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/sync", syncHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/erpnext-bridge/sync", syncHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"erpnext-bridge-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

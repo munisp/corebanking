@@ -137,10 +137,10 @@ async fn list_transforms() -> HttpResponse {
 }
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/transform", web::post().to(transform))
+    cfg.route("/v1/fluvio-wasm-transform/transform", web::post().to(transform))
             .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(healthz))
-       .route("/transforms", web::get().to(list_transforms));
+       .route("/v1/fluvio-wasm-transform/transforms", web::get().to(list_transforms));
 }
 
 

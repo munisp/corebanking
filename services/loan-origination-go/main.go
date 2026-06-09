@@ -104,7 +104,7 @@ func originateHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"loan_id": "LN-001", "status": "approved"})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/originate", originateHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/loan-origination/originate", originateHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"loan-origination-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {

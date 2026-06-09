@@ -104,7 +104,7 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"consent_id": "CNS-001", "status": "authorized"})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/consents", consentHandler)
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/open-banking-baas/consents", consentHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"open-banking-baas-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {
