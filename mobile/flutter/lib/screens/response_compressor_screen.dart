@@ -7,8 +7,6 @@ class ResponseCompressorScreen extends StatefulWidget {
 }
 
 class _ResponseCompressorScreenState extends State<ResponseCompressorScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _ResponseCompressorScreenState extends State<ResponseCompressorScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Compression', 'gzip+br', Icons.compress),
+              _kpi('Avg Ratio', '72%', Icons.compress),
+              _kpi('Bandwidth Saved', '850GB/day', Icons.data_usage),
+              _kpi('CPU Overhead', '2%', Icons.memory),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Response Compressor Primary'),
-              subtitle: Text('Production'),
+              title: Text('Brotli (br)'),
+              subtitle: Text('Default'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Response Compressor Secondary'),
-              subtitle: Text('Standby'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Response Compressor Canary'),
-              subtitle: Text('Test'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('72% compression', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('gzip Fallback'),
+              subtitle: Text('Legacy clients'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('65% compression', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Min Size Threshold'),
+              subtitle: Text('1KB'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Skip small responses', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Content-Type Filter'),
+              subtitle: Text('JSON/HTML only'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Skip binary/images', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

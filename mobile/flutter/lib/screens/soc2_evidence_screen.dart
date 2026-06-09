@@ -7,8 +7,6 @@ class Soc2EvidenceScreen extends StatefulWidget {
 }
 
 class _Soc2EvidenceScreenState extends State<Soc2EvidenceScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _Soc2EvidenceScreenState extends State<Soc2EvidenceScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Controls', '125', Icons.fact_check),
+              _kpi('Evidence Items', '850', Icons.description),
+              _kpi('Auto-collected', '92%', Icons.auto_fix_high),
+              _kpi('Audit Ready', '100%', Icons.verified),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Soc2 Evidence Primary'),
-              subtitle: Text('Production'),
+              title: Text('CC6.1 Access Control'),
+              subtitle: Text('Logical Access'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('45 evidence items', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Soc2 Evidence Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('CC7.2 System Monitoring'),
+              subtitle: Text('Monitoring'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('85 evidence items', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Soc2 Evidence Canary'),
-              subtitle: Text('Test'),
+              title: Text('CC8.1 Change Management'),
+              subtitle: Text('SDLC'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('120 evidence items', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('A1.2 Availability'),
+              subtitle: Text('Uptime SLA'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('99.95% proven', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

@@ -7,8 +7,6 @@ class ParametricInsuranceIotScreen extends StatefulWidget {
 }
 
 class _ParametricInsuranceIotScreenState extends State<ParametricInsuranceIotScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _ParametricInsuranceIotScreenState extends State<ParametricInsuranceIotScr
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Farmers', '85K', Icons.agriculture),
-              _kpi('Loan Portfolio', '₦25B', Icons.account_balance),
-              _kpi('Hectares Covered', '1.2M', Icons.landscape),
-              _kpi('Yield Avg', '4.5 t/ha', Icons.trending_up),
+              _kpi('IoT Sensors', '25K', Icons.sensors),
+              _kpi('Auto-payouts', '₦850M/yr', Icons.payments),
+              _kpi('Trigger Events', '450', Icons.bolt),
+              _kpi('Avg Payout', '₦1.8M', Icons.receipt),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Maize Belt - Kaduna'),
-              subtitle: Text('Rainfed'),
+              title: Text('Rainfall Sensor Network'),
+              subtitle: Text('Weather Station'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('250K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('8K stations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Rice Paddy - Kebbi'),
-              subtitle: Text('Irrigated'),
+              title: Text('Soil Moisture Probes'),
+              subtitle: Text('Underground'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('180K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('12K probes', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Cassava - Ogun'),
-              subtitle: Text('Rainfed'),
+              title: Text('Temperature Monitors'),
+              subtitle: Text('Greenhouse'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('120K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('3K sensors', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Soybean - Benue'),
-              subtitle: Text('Rainfed'),
+              title: Text('Smart Contract Payout'),
+              subtitle: Text('Blockchain'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('95K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Auto-trigger + pay', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

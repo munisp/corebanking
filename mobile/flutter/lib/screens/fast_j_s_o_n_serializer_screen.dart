@@ -7,8 +7,6 @@ class FastJSONSerializerScreen extends StatefulWidget {
 }
 
 class _FastJSONSerializerScreenState extends State<FastJSONSerializerScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _FastJSONSerializerScreenState extends State<FastJSONSerializerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Serialize/s', '2.5M', Icons.speed),
+              _kpi('Avg Size', '1.2KB', Icons.straighten),
+              _kpi('Schemas', '285', Icons.schema),
+              _kpi('Validation', '100%', Icons.verified),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Fast J S O N Serializer Primary'),
-              subtitle: Text('Production'),
+              title: Text('Transaction Payload'),
+              subtitle: Text('JSON Schema v7'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Fast J S O N Serializer Secondary'),
-              subtitle: Text('Standby'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Fast J S O N Serializer Canary'),
-              subtitle: Text('Test'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('850B avg', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Account Response'),
+              subtitle: Text('JSON Schema v7'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('2.1KB avg', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Statement Export'),
+              subtitle: Text('JSON Lines'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('45KB avg', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Batch Payload'),
+              subtitle: Text('JSON Array'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('250KB avg', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

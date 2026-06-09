@@ -7,8 +7,6 @@ class PermifyScreen extends StatefulWidget {
 }
 
 class _PermifyScreenState extends State<PermifyScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _PermifyScreenState extends State<PermifyScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Total', '12,500', Icons.analytics),
-              _kpi('Active', '11,800', Icons.check_circle),
-              _kpi('Growth', '+15.2%', Icons.trending_up),
-              _kpi('Revenue', '₦2.8B', Icons.money),
+              _kpi('Schemas', '12', Icons.schema),
+              _kpi('Relations', '85K', Icons.link),
+              _kpi('Checks/s', '45K', Icons.speed),
+              _kpi('Denied', '32%', Icons.block),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Permify - Standard'),
-              subtitle: Text('Core Product'),
+              title: Text('Account Owner Check'),
+              subtitle: Text('Direct Relation'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦5.2B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('owner:user#...', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Permify - Premium'),
-              subtitle: Text('Enhanced'),
+              title: Text('Branch Manager Approve'),
+              subtitle: Text('Hierarchical'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦3.8B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('manager:branch#...', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Permify - Enterprise'),
-              subtitle: Text('Corporate'),
+              title: Text('Maker-Checker Transfer'),
+              subtitle: Text('Computed'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦8.5B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Dual approval > ₦1M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Permify - Digital'),
-              subtitle: Text('Online Channel'),
+              title: Text('Audit Viewer (Read-only)'),
+              subtitle: Text('Attribute'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦2.1B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('role:auditor', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

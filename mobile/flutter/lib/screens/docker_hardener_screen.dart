@@ -7,8 +7,6 @@ class DockerHardenerScreen extends StatefulWidget {
 }
 
 class _DockerHardenerScreenState extends State<DockerHardenerScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _DockerHardenerScreenState extends State<DockerHardenerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Containers', '1,024', Icons.view_in_ar),
+              _kpi('Vulnerabilities', '0 critical', Icons.shield),
+              _kpi('Base Images', '12', Icons.layers),
+              _kpi('Scan Freq', 'Hourly', Icons.schedule),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Docker Hardener Primary'),
-              subtitle: Text('Production'),
+              title: Text('Distroless (Go services)'),
+              subtitle: Text('gcr.io/distroless'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('211 services', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Hardened', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Docker Hardener Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Python Slim'),
+              subtitle: Text('python:3.12-slim'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('141 services', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Hardened', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Docker Hardener Canary'),
-              subtitle: Text('Test'),
+              title: Text('Rust Scratch'),
+              subtitle: Text('scratch'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('159 services', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Hardened', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Trivy Scanner'),
+              subtitle: Text('CVE Detection'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('0 HIGH/CRITICAL', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Clean', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

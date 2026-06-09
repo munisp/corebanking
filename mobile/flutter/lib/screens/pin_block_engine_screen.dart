@@ -7,8 +7,6 @@ class PinBlockEngineScreen extends StatefulWidget {
 }
 
 class _PinBlockEngineScreenState extends State<PinBlockEngineScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _PinBlockEngineScreenState extends State<PinBlockEngineScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('PIN Blocks/s', '25K', Icons.lock),
+              _kpi('Format', 'ISO 9564', Icons.verified),
+              _kpi('HSM Calls/s', '12K', Icons.security),
+              _kpi('Validation', '100%', Icons.check),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Pin Block Engine Primary'),
-              subtitle: Text('Production'),
+              title: Text('Format 0 (ISO 9564-1)'),
+              subtitle: Text('ATM/POS'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Pin Block Engine Secondary'),
-              subtitle: Text('Standby'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Pin Block Engine Canary'),
-              subtitle: Text('Test'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('XOR with PAN', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Format 3 (ISO 9564-3)'),
+              subtitle: Text('Interchange'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Random pad', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('PIN Translation'),
+              subtitle: Text('HSM'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Zone→Zone encrypt', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('PIN Verification'),
+              subtitle: Text('IBM 3624'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Offset derivation', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

@@ -7,8 +7,6 @@ class PEPDatabaseScreen extends StatefulWidget {
 }
 
 class _PEPDatabaseScreenState extends State<PEPDatabaseScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _PEPDatabaseScreenState extends State<PEPDatabaseScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Checks Today', '45K', Icons.search),
-              _kpi('Pass Rate', '98.5%', Icons.check_circle),
-              _kpi('Flags', '85', Icons.flag),
-              _kpi('SLA Met', '99.2%', Icons.verified),
+              _kpi('PEP Records', '25K', Icons.people),
+              _kpi('Countries', '195', Icons.public),
+              _kpi('Last Update', 'Today', Icons.update),
+              _kpi('Sources', '12', Icons.source),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Pep Database - Automated Check'),
-              subtitle: Text('Real-time'),
+              title: Text('Nigerian PEPs'),
+              subtitle: Text('Government Officials'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('8,500 records', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Manual Review Queue'),
-              subtitle: Text('Escalated'),
+              title: Text('International PEPs'),
+              subtitle: Text('Heads of State/Govt'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 pending', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('In Progress', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('12K records', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Regulatory Report'),
-              subtitle: Text('CBN/NFIU'),
+              title: Text('Family/Associates'),
+              subtitle: Text('RCA'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Submitted', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Filed', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('4.5K records', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Audit Trail'),
-              subtitle: Text('Immutable'),
+              title: Text('State-Owned Enterprise'),
+              subtitle: Text('SOE Officials'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2.5M entries', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('2K records', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

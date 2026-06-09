@@ -7,8 +7,6 @@ class SeedRegistryScreen extends StatefulWidget {
 }
 
 class _SeedRegistryScreenState extends State<SeedRegistryScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _SeedRegistryScreenState extends State<SeedRegistryScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Farmers', '85K', Icons.agriculture),
-              _kpi('Loan Portfolio', '₦25B', Icons.account_balance),
-              _kpi('Hectares Covered', '1.2M', Icons.landscape),
-              _kpi('Yield Avg', '4.5 t/ha', Icons.trending_up),
+              _kpi('Varieties', '2,500', Icons.grass),
+              _kpi('Certified Seeds', '85K lots', Icons.verified),
+              _kpi('Suppliers', '450', Icons.business),
+              _kpi('QC Tested', '100%', Icons.science),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Maize Belt - Kaduna'),
-              subtitle: Text('Rainfed'),
+              title: Text('Rice (FARO 44/52/66)'),
+              subtitle: Text('Paddy'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('250K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('850 certified lots', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Rice Paddy - Kebbi'),
-              subtitle: Text('Irrigated'),
+              title: Text('Maize (Hybrid/OPV)'),
+              subtitle: Text('Grain'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('180K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('650 certified lots', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Cassava - Ogun'),
-              subtitle: Text('Rainfed'),
+              title: Text('Cassava (TME 419/NR)'),
+              subtitle: Text('Root Crop'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('120K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('400 certified lots', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Soybean - Benue'),
-              subtitle: Text('Rainfed'),
+              title: Text('Sorghum (CSR-01/02)'),
+              subtitle: Text('Grain'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('95K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('250 certified lots', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

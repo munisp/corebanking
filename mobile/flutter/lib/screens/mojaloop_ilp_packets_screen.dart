@@ -1,14 +1,12 @@
 import 'package:flutter/material.dart';
 
-class MojaloopIlpPacketsScreen extends StatefulWidget {
-  const MojaloopIlpPacketsScreen({super.key});
+class MojaloopILPPacketsScreen extends StatefulWidget {
+  const MojaloopILPPacketsScreen({super.key});
   @override
-  State<MojaloopIlpPacketsScreen> createState() => _MojaloopIlpPacketsScreenState();
+  State<MojaloopILPPacketsScreen> createState() => _MojaloopILPPacketsScreenState();
 }
 
-class _MojaloopIlpPacketsScreenState extends State<MojaloopIlpPacketsScreen> {
-  bool _isLoading = false;
-
+class _MojaloopILPPacketsScreenState extends State<MojaloopILPPacketsScreen> {
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -29,7 +27,7 @@ class _MojaloopIlpPacketsScreenState extends State<MojaloopIlpPacketsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Mojaloop Ilp Packets'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('Mojaloop ILP Packets'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,46 +41,46 @@ class _MojaloopIlpPacketsScreenState extends State<MojaloopIlpPacketsScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('DFSP Participants', '18', Icons.account_balance),
-              _kpi('Daily Transfers', '2.5M', Icons.swap_horiz),
-              _kpi('Settlement Batches', '48', Icons.receipt),
-              _kpi('FSPIOP Compliance', '100%', Icons.verified),
+              _kpi('ILP Packets/s', '8,500', Icons.description),
+              _kpi('Fulfillment Rate', '99.8%', Icons.check),
+              _kpi('Condition Size', '32 bytes', Icons.data_array),
+              _kpi('Packet TTL', '30s', Icons.timer),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Payer DFSP Lookup'),
-              subtitle: Text('FSPIOP GET /parties'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('800K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('Transfer Prepare'),
-              subtitle: Text('FSPIOP POST /transfers'),
+              subtitle: Text('ILP Condition'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('SHA-256 preimage hash', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('Transfer Fulfil'),
-              subtitle: Text('FSPIOP PUT /transfers'),
+              subtitle: Text('ILP Fulfillment'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('32-byte preimage', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Settlement Window'),
-              subtitle: Text('Net Settlement'),
+              title: Text('Quote Request'),
+              subtitle: Text('ILP Condition'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Every 30 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Deterministic amount', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Error Notification'),
+              subtitle: Text('ILP Error Code'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('5xxx series', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

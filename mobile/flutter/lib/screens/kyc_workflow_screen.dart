@@ -7,8 +7,6 @@ class KYCWorkflowScreen extends StatefulWidget {
 }
 
 class _KYCWorkflowScreenState extends State<KYCWorkflowScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _KYCWorkflowScreenState extends State<KYCWorkflowScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Checks Today', '45K', Icons.search),
-              _kpi('Pass Rate', '98.5%', Icons.check_circle),
-              _kpi('Flags', '85', Icons.flag),
-              _kpi('SLA Met', '99.2%', Icons.verified),
+              _kpi('Workflows Running', '3,000', Icons.account_tree),
+              _kpi('Avg Completion', '2.5hr', Icons.timer),
+              _kpi('Auto-approved', '72%', Icons.auto_fix_high),
+              _kpi('Pending Review', '850', Icons.pending),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Kyc Workflow - Automated Check'),
-              subtitle: Text('Real-time'),
+              title: Text('BVN Verification Step'),
+              subtitle: Text('API Call'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('NIBSS BVN API', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Auto', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Manual Review Queue'),
-              subtitle: Text('Escalated'),
+              title: Text('NIN Verification Step'),
+              subtitle: Text('API Call'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 pending', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('In Progress', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('NIMC NIN API', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Auto', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Regulatory Report'),
-              subtitle: Text('CBN/NFIU'),
+              title: Text('Liveness Check Step'),
+              subtitle: Text('Video KYC'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Submitted', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Filed', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('AI face match', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Auto', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Audit Trail'),
-              subtitle: Text('Immutable'),
+              title: Text('Manual Review Step'),
+              subtitle: Text('Human-in-loop'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2.5M entries', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Compliance officer', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Queue', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

@@ -7,8 +7,6 @@ class KeycloakScreen extends StatefulWidget {
 }
 
 class _KeycloakScreenState extends State<KeycloakScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _KeycloakScreenState extends State<KeycloakScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Sessions', '125K', Icons.people),
-              _kpi('Auth/Min', '8,500', Icons.login),
-              _kpi('MFA Enabled', '85%', Icons.security),
-              _kpi('SSO Providers', '12', Icons.key),
+              _kpi('Realms', '4', Icons.domain),
+              _kpi('Users', '8.5M', Icons.people),
+              _kpi('Sessions', '125K active', Icons.login),
+              _kpi('SSO Apps', '25', Icons.apps),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Password + TOTP'),
-              subtitle: Text('2FA'),
+              title: Text('Production Realm'),
+              subtitle: Text('Customer-facing'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('8.5M users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('WebAuthn/FIDO2'),
-              subtitle: Text('Passwordless'),
+              title: Text('Admin Realm'),
+              subtitle: Text('Staff'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('3,500 users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Social Login (Google/Apple)'),
-              subtitle: Text('Federation'),
+              title: Text('Partner Realm'),
+              subtitle: Text('API Consumers'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('450 clients', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Enterprise SSO (SAML)'),
-              subtitle: Text('Corporate'),
+              title: Text('Development Realm'),
+              subtitle: Text('Testing'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('8 organizations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('500 test users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

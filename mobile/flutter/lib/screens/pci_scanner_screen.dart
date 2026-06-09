@@ -7,8 +7,6 @@ class PCIScannerScreen extends StatefulWidget {
 }
 
 class _PCIScannerScreenState extends State<PCIScannerScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -29,7 +27,7 @@ class _PCIScannerScreenState extends State<PCIScannerScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Pci Scanner'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('PCI Scanner'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,47 +41,47 @@ class _PCIScannerScreenState extends State<PCIScannerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Scans/Week', '4', Icons.security),
+              _kpi('PAN Exposure', '0', Icons.credit_card),
+              _kpi('CVV Storage', '0', Icons.lock),
+              _kpi('Compliance', '100%', Icons.verified),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Pci Scanner Primary'),
-              subtitle: Text('Production'),
+              title: Text('Cardholder Data Scan'),
+              subtitle: Text('PCI Req 3'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('0 PAN in logs', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Clean', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Pci Scanner Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Network Segment Test'),
+              subtitle: Text('PCI Req 1'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('CDE isolated', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Clean', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Pci Scanner Canary'),
-              subtitle: Text('Test'),
+              title: Text('Encryption Validation'),
+              subtitle: Text('PCI Req 4'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('TLS 1.3 only', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Clean', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Access Control Audit'),
+              subtitle: Text('PCI Req 7'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Least privilege', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Clean', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

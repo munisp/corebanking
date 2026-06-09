@@ -7,8 +7,6 @@ class USSDMultilingualScreen extends StatefulWidget {
 }
 
 class _USSDMultilingualScreenState extends State<USSDMultilingualScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _USSDMultilingualScreenState extends State<USSDMultilingualScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Users', '850K', Icons.people),
-              _kpi('Messages/Day', '2.5M', Icons.message),
-              _kpi('Success Rate', '99.5%', Icons.check_circle),
-              _kpi('Avg Response', '1.2s', Icons.timer),
+              _kpi('Languages', '4', Icons.translate),
+              _kpi('Sessions/day', '450K', Icons.phone),
+              _kpi('Success', '95.5%', Icons.check),
+              _kpi('Avg Duration', '45s', Icons.timer),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Balance Inquiry'),
-              subtitle: Text('Self-Service'),
+              title: Text('English (en)'),
+              subtitle: Text('Primary'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('250K sessions/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Fund Transfer'),
-              subtitle: Text('Transactional'),
+              title: Text('Hausa (ha)'),
+              subtitle: Text('North'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('100K sessions/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Bill Payment'),
-              subtitle: Text('Utility'),
+              title: Text('Yoruba (yo)'),
+              subtitle: Text('Southwest'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('280K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('65K sessions/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Statement'),
-              subtitle: Text('Information'),
+              title: Text('Igbo (ig)'),
+              subtitle: Text('Southeast'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('35K sessions/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

@@ -7,8 +7,6 @@ class SecurityAuditLoggerScreen extends StatefulWidget {
 }
 
 class _SecurityAuditLoggerScreenState extends State<SecurityAuditLoggerScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _SecurityAuditLoggerScreenState extends State<SecurityAuditLoggerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Events/day', '500K', Icons.history),
+              _kpi('Retention', '7 years', Icons.lock),
+              _kpi('Tamper-proof', '100%', Icons.shield),
+              _kpi('Compliance', 'SOC 2', Icons.verified),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Security Audit Logger Primary'),
-              subtitle: Text('Production'),
+              title: Text('Login Events'),
+              subtitle: Text('Auth'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Success + Failed', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Logging', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Security Audit Logger Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Data Access Events'),
+              subtitle: Text('Read/Write'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Who, When, What', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Logging', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Security Audit Logger Canary'),
-              subtitle: Text('Test'),
+              title: Text('Admin Actions'),
+              subtitle: Text('Privileged'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('All config changes', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Logging', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Export Events'),
+              subtitle: Text('Data Movement'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Bulk downloads', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Logging', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

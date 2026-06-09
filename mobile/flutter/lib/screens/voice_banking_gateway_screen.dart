@@ -7,8 +7,6 @@ class VoiceBankingGatewayScreen extends StatefulWidget {
 }
 
 class _VoiceBankingGatewayScreenState extends State<VoiceBankingGatewayScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _VoiceBankingGatewayScreenState extends State<VoiceBankingGatewayScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Users', '850K', Icons.people),
-              _kpi('Messages/Day', '2.5M', Icons.message),
-              _kpi('Success Rate', '99.5%', Icons.check_circle),
-              _kpi('Avg Response', '1.2s', Icons.timer),
+              _kpi('Calls/day', '85K', Icons.phone),
+              _kpi('IVR Containment', '78%', Icons.auto_fix_high),
+              _kpi('Avg Duration', '2.5 min', Icons.timer),
+              _kpi('Lines', '500', Icons.call),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Balance Inquiry'),
-              subtitle: Text('Self-Service'),
+              title: Text('Balance Inquiry (IVR)'),
+              subtitle: Text('Press 1'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('35K calls/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Fund Transfer'),
-              subtitle: Text('Transactional'),
+              title: Text('Fund Transfer (IVR)'),
+              subtitle: Text('Press 2'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('15K calls/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Bill Payment'),
-              subtitle: Text('Utility'),
+              title: Text('Card Block (IVR)'),
+              subtitle: Text('Press 3'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('280K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('5K calls/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Statement'),
-              subtitle: Text('Information'),
+              title: Text('Agent Connect'),
+              subtitle: Text('Press 0'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('18K calls/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

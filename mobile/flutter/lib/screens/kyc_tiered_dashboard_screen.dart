@@ -7,8 +7,6 @@ class KYCTieredDashboardScreen extends StatefulWidget {
 }
 
 class _KYCTieredDashboardScreenState extends State<KYCTieredDashboardScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _KYCTieredDashboardScreenState extends State<KYCTieredDashboardScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Checks Today', '45K', Icons.search),
-              _kpi('Pass Rate', '98.5%', Icons.check_circle),
-              _kpi('Flags', '85', Icons.flag),
-              _kpi('SLA Met', '99.2%', Icons.verified),
+              _kpi('Tier 1', '2.5M', Icons.person),
+              _kpi('Tier 2', '1.8M', Icons.person_add),
+              _kpi('Tier 3', '500K', Icons.verified_user),
+              _kpi('Unverified', '125K', Icons.warning),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Kyc Tiered Dashboard - Automated Check'),
-              subtitle: Text('Real-time'),
+              title: Text('Tier 1 Limits'),
+              subtitle: Text('CBN'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦50K single, ₦300K daily', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Manual Review Queue'),
-              subtitle: Text('Escalated'),
+              title: Text('Tier 2 Limits'),
+              subtitle: Text('CBN'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 pending', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('In Progress', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('₦200K single, ₦500K daily', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Regulatory Report'),
-              subtitle: Text('CBN/NFIU'),
+              title: Text('Tier 3 Limits'),
+              subtitle: Text('CBN'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Submitted', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Filed', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('₦5M single, unlimited', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Audit Trail'),
-              subtitle: Text('Immutable'),
+              title: Text('Upgrade Campaigns'),
+              subtitle: Text('Marketing'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2.5M entries', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('250K eligible for T2→T3', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

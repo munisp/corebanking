@@ -7,8 +7,6 @@ class GNNFraudDetectionScreen extends StatefulWidget {
 }
 
 class _GNNFraudDetectionScreenState extends State<GNNFraudDetectionScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _GNNFraudDetectionScreenState extends State<GNNFraudDetectionScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Threats Blocked', '12K/day', Icons.shield),
-              _kpi('Risk Score', 'Low', Icons.security),
-              _kpi('Rules Active', '450', Icons.rule),
-              _kpi('False Positive', '0.2%', Icons.error),
+              _kpi('Graph Nodes', '12M', Icons.hub),
+              _kpi('Predictions/s', '8K', Icons.speed),
+              _kpi('AUC', '0.93', Icons.analytics),
+              _kpi('Fraud Caught', '₦2.5B/mo', Icons.security),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transaction Fraud Detection'),
-              subtitle: Text('Real-time ML'),
+              title: Text('Transaction Graph'),
+              subtitle: Text('Bipartite'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12K alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Accounts ↔ Transfers', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Takeover Prevention'),
-              subtitle: Text('Behavioral'),
+              title: Text('Neighborhood Aggregation'),
+              subtitle: Text('GraphSAGE'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 blocked/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('2-hop features', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Card Fraud Rules Engine'),
-              subtitle: Text('Rule-based'),
+              title: Text('Fraud Ring Embedding'),
+              subtitle: Text('Node2Vec'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450 rules active', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Community detection', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Synthetic Identity Detection'),
-              subtitle: Text('Graph Analysis'),
+              title: Text('Real-time Scoring'),
+              subtitle: Text('Inference'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12 flagged/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('< 10ms per txn', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

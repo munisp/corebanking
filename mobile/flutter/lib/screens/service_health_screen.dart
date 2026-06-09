@@ -7,8 +7,6 @@ class ServiceHealthScreen extends StatefulWidget {
 }
 
 class _ServiceHealthScreenState extends State<ServiceHealthScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _ServiceHealthScreenState extends State<ServiceHealthScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Services', '512', Icons.monitor_heart),
+              _kpi('Healthy', '512', Icons.check_circle),
+              _kpi('Degraded', '0', Icons.warning),
+              _kpi('Down', '0', Icons.cancel),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Service Health Primary'),
-              subtitle: Text('Production'),
+              title: Text('Go Services (211)'),
+              subtitle: Text('HTTP /healthz'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('All responding', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Service Health Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Rust Services (159)'),
+              subtitle: Text('HTTP /health'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('All responding', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Service Health Canary'),
-              subtitle: Text('Test'),
+              title: Text('Python Services (141)'),
+              subtitle: Text('HTTP /healthz'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('All responding', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Infrastructure (Kafka/Redis/PG)'),
+              subtitle: Text('TCP Check'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('All ports open', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

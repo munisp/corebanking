@@ -7,8 +7,6 @@ class PEPEnhancedDdScreen extends StatefulWidget {
 }
 
 class _PEPEnhancedDdScreenState extends State<PEPEnhancedDdScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _PEPEnhancedDdScreenState extends State<PEPEnhancedDdScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Checks Today', '45K', Icons.search),
-              _kpi('Pass Rate', '98.5%', Icons.check_circle),
-              _kpi('Flags', '85', Icons.flag),
-              _kpi('SLA Met', '99.2%', Icons.verified),
+              _kpi('Active EDD Cases', '450', Icons.search),
+              _kpi('Approved', '380', Icons.check),
+              _kpi('Declined', '25', Icons.close),
+              _kpi('Under Review', '45', Icons.pending),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Pep Enhanced Dd - Automated Check'),
-              subtitle: Text('Real-time'),
+              title: Text('Source of Wealth Verification'),
+              subtitle: Text('Documentation'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Bank + Tax records', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Required', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Ongoing Transaction Review'),
+              subtitle: Text('Quarterly'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Pattern analysis', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Manual Review Queue'),
-              subtitle: Text('Escalated'),
+              title: Text('Senior Mgmt Approval'),
+              subtitle: Text('MLRO Sign-off'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 pending', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('In Progress', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('All PEP accounts', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Enforced', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Regulatory Report'),
-              subtitle: Text('CBN/NFIU'),
+              title: Text('Adverse Media Screening'),
+              subtitle: Text('Daily'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Submitted', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Filed', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Audit Trail'),
-              subtitle: Text('Immutable'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2.5M entries', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('News + social media', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

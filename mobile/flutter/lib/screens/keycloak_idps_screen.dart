@@ -7,8 +7,6 @@ class KeycloakIdpsScreen extends StatefulWidget {
 }
 
 class _KeycloakIdpsScreenState extends State<KeycloakIdpsScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _KeycloakIdpsScreenState extends State<KeycloakIdpsScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Sessions', '125K', Icons.people),
-              _kpi('Auth/Min', '8,500', Icons.login),
-              _kpi('MFA Enabled', '85%', Icons.security),
-              _kpi('SSO Providers', '12', Icons.key),
+              _kpi('Identity Providers', '6', Icons.link),
+              _kpi('Federated Logins/day', '25K', Icons.login),
+              _kpi('SAML', '2', Icons.security),
+              _kpi('OIDC', '4', Icons.vpn_key),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Password + TOTP'),
-              subtitle: Text('2FA'),
+              title: Text('Google (OIDC)'),
+              subtitle: Text('Social Login'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('12K logins/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('WebAuthn/FIDO2'),
-              subtitle: Text('Passwordless'),
+              title: Text('Apple (OIDC)'),
+              subtitle: Text('Social Login'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('8K logins/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Social Login (Google/Apple)'),
-              subtitle: Text('Federation'),
+              title: Text('Active Directory (SAML)'),
+              subtitle: Text('Staff SSO'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('3.5K logins/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Enterprise SSO (SAML)'),
-              subtitle: Text('Corporate'),
+              title: Text('BVN Identity (Custom)'),
+              subtitle: Text('National ID'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('8 organizations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('1.5K logins/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

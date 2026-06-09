@@ -7,8 +7,6 @@ class RiskBasedApproachScreen extends StatefulWidget {
 }
 
 class _RiskBasedApproachScreenState extends State<RiskBasedApproachScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _RiskBasedApproachScreenState extends State<RiskBasedApproachScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Checks Today', '45K', Icons.search),
-              _kpi('Pass Rate', '98.5%', Icons.check_circle),
-              _kpi('Flags', '85', Icons.flag),
-              _kpi('SLA Met', '99.2%', Icons.verified),
+              _kpi('Risk Categories', '5', Icons.category),
+              _kpi('Customers Scored', '8.5M', Icons.people),
+              _kpi('High-risk', '2.5%', Icons.warning),
+              _kpi('Model Accuracy', '94%', Icons.analytics),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Risk Based Approach - Automated Check'),
-              subtitle: Text('Real-time'),
+              title: Text('Low Risk (Tier 1 retail)'),
+              subtitle: Text('Simplified DD'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('72% of customers', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Manual Review Queue'),
-              subtitle: Text('Escalated'),
+              title: Text('Medium Risk (Tier 2)'),
+              subtitle: Text('Standard DD'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 pending', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('In Progress', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('20% of customers', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Regulatory Report'),
-              subtitle: Text('CBN/NFIU'),
+              title: Text('High Risk (PEP/HNW)'),
+              subtitle: Text('Enhanced DD'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Submitted', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Filed', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('6% of customers', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Audit Trail'),
-              subtitle: Text('Immutable'),
+              title: Text('Prohibited (Sanctioned)'),
+              subtitle: Text('Block + Report'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2.5M entries', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('0.5% flagged', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Enforced', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

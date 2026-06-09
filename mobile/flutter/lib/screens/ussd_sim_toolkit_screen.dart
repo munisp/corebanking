@@ -7,8 +7,6 @@ class USSDSimToolkitScreen extends StatefulWidget {
 }
 
 class _USSDSimToolkitScreenState extends State<USSDSimToolkitScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _USSDSimToolkitScreenState extends State<USSDSimToolkitScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Users', '850K', Icons.people),
-              _kpi('Messages/Day', '2.5M', Icons.message),
-              _kpi('Success Rate', '99.5%', Icons.check_circle),
-              _kpi('Avg Response', '1.2s', Icons.timer),
+              _kpi('STK Apps', '4', Icons.sim_card),
+              _kpi('Carriers', '4', Icons.cell_tower),
+              _kpi('Users', '2.5M', Icons.people),
+              _kpi('Txns/day', '125K', Icons.swap_horiz),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Balance Inquiry'),
-              subtitle: Text('Self-Service'),
+              title: Text('MTN STK App'),
+              subtitle: Text('SIM Toolkit'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('1M users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Fund Transfer'),
-              subtitle: Text('Transactional'),
+              title: Text('Airtel STK App'),
+              subtitle: Text('SIM Toolkit'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('800K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Bill Payment'),
-              subtitle: Text('Utility'),
+              title: Text('Glo STK App'),
+              subtitle: Text('SIM Toolkit'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('280K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('450K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Statement'),
-              subtitle: Text('Information'),
+              title: Text('9mobile STK App'),
+              subtitle: Text('SIM Toolkit'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('250K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

@@ -7,8 +7,6 @@ class DaprSidecarScreen extends StatefulWidget {
 }
 
 class _DaprSidecarScreenState extends State<DaprSidecarScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _DaprSidecarScreenState extends State<DaprSidecarScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Sidecars', '512', Icons.widgets),
+              _kpi('Pub/Sub Events', '8.5M/hr', Icons.message),
+              _kpi('State Ops', '2.1M/hr', Icons.storage),
+              _kpi('Bindings', '450K/hr', Icons.link),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Dapr Sidecar Primary'),
-              subtitle: Text('Production'),
+              title: Text('Redis State Store'),
+              subtitle: Text('State Mgmt'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('2.1M ops/hr', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Connected', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Dapr Sidecar Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Kafka Pub/Sub'),
+              subtitle: Text('Messaging'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('8.5M events/hr', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Connected', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Dapr Sidecar Canary'),
-              subtitle: Text('Test'),
+              title: Text('PostgreSQL Binding'),
+              subtitle: Text('Output'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('450K invocations/hr', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Connected', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Service Invocation'),
+              subtitle: Text('gRPC Proxy'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('12M calls/hr', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

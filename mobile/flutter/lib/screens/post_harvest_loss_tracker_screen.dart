@@ -7,8 +7,6 @@ class PostHarvestLossTrackerScreen extends StatefulWidget {
 }
 
 class _PostHarvestLossTrackerScreenState extends State<PostHarvestLossTrackerScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _PostHarvestLossTrackerScreenState extends State<PostHarvestLossTrackerScr
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Farmers', '85K', Icons.agriculture),
-              _kpi('Loan Portfolio', '₦25B', Icons.account_balance),
-              _kpi('Hectares Covered', '1.2M', Icons.landscape),
-              _kpi('Yield Avg', '4.5 t/ha', Icons.trending_up),
+              _kpi('Tracked Harvests', '85K', Icons.agriculture),
+              _kpi('Avg Loss', '12.5%', Icons.trending_down),
+              _kpi('Value Lost', '₦125B/yr', Icons.money_off),
+              _kpi('Interventions', '450', Icons.build),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Maize Belt - Kaduna'),
-              subtitle: Text('Rainfed'),
+              title: Text('Storage Loss Monitor'),
+              subtitle: Text('IoT Sensors'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('250K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Temperature + humidity', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Rice Paddy - Kebbi'),
-              subtitle: Text('Irrigated'),
+              title: Text('Transportation Loss'),
+              subtitle: Text('GPS + vibration'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('180K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Truck monitoring', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Cassava - Ogun'),
-              subtitle: Text('Rainfed'),
+              title: Text('Market Price Delta'),
+              subtitle: Text('Analytics'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('120K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Farm vs market price', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Soybean - Benue'),
-              subtitle: Text('Rainfed'),
+              title: Text('Cold Chain Finance'),
+              subtitle: Text('Working Capital'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('95K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦8.5B for cold storage', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

@@ -7,8 +7,6 @@ class MojaloopAdminLimitsScreen extends StatefulWidget {
 }
 
 class _MojaloopAdminLimitsScreenState extends State<MojaloopAdminLimitsScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _MojaloopAdminLimitsScreenState extends State<MojaloopAdminLimitsScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('DFSP Participants', '18', Icons.account_balance),
-              _kpi('Daily Transfers', '2.5M', Icons.swap_horiz),
-              _kpi('Settlement Batches', '48', Icons.receipt),
-              _kpi('FSPIOP Compliance', '100%', Icons.verified),
+              _kpi('Limit Rules', '85', Icons.tune),
+              _kpi('Net Debit Cap', '₦5B', Icons.account_balance),
+              _kpi('Position Alerts', '12/day', Icons.warning),
+              _kpi('Auto-suspend', '₦4.5B', Icons.block),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Payer DFSP Lookup'),
-              subtitle: Text('FSPIOP GET /parties'),
+              title: Text('Net Debit Cap (NIBSS)'),
+              subtitle: Text('Per-DFSP'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('800K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦5B per window', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transfer Prepare'),
-              subtitle: Text('FSPIOP POST /transfers'),
+              title: Text('Single Transfer Max'),
+              subtitle: Text('Global'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦50M per transfer', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transfer Fulfil'),
-              subtitle: Text('FSPIOP PUT /transfers'),
+              title: Text('Position Threshold Alert'),
+              subtitle: Text('90% of NDC'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Email + Slack', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Settlement Window'),
-              subtitle: Text('Net Settlement'),
+              title: Text('Auto-suspend Rule'),
+              subtitle: Text('95% of NDC'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Every 30 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Block new transfers', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

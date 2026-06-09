@@ -7,8 +7,6 @@ class VoiceTTSNigerianScreen extends StatefulWidget {
 }
 
 class _VoiceTTSNigerianScreenState extends State<VoiceTTSNigerianScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _VoiceTTSNigerianScreenState extends State<VoiceTTSNigerianScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Users', '850K', Icons.people),
-              _kpi('Messages/Day', '2.5M', Icons.message),
-              _kpi('Success Rate', '99.5%', Icons.check_circle),
-              _kpi('Avg Response', '1.2s', Icons.timer),
+              _kpi('Voices', '8', Icons.record_voice_over),
+              _kpi('Languages', '4', Icons.translate),
+              _kpi('Utterances/day', '250K', Icons.volume_up),
+              _kpi('Naturalness', '4.2/5 MOS', Icons.star),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Balance Inquiry'),
-              subtitle: Text('Self-Service'),
+              title: Text('English Female (Amina)'),
+              subtitle: Text('Neural TTS'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('MOS: 4.5', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Fund Transfer'),
-              subtitle: Text('Transactional'),
+              title: Text('English Male (Chidi)'),
+              subtitle: Text('Neural TTS'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('MOS: 4.3', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Bill Payment'),
-              subtitle: Text('Utility'),
+              title: Text('Hausa Female (Hauwa)'),
+              subtitle: Text('Neural TTS'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('280K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('MOS: 4.0', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Statement'),
-              subtitle: Text('Information'),
+              title: Text('Yoruba Male (Ade)'),
+              subtitle: Text('Neural TTS'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('MOS: 4.1', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

@@ -7,8 +7,6 @@ class FraudfusionEnsembleScreen extends StatefulWidget {
 }
 
 class _FraudfusionEnsembleScreenState extends State<FraudfusionEnsembleScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _FraudfusionEnsembleScreenState extends State<FraudfusionEnsembleScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Threats Blocked', '12K/day', Icons.shield),
-              _kpi('Risk Score', 'Low', Icons.security),
-              _kpi('Rules Active', '450', Icons.rule),
-              _kpi('False Positive', '0.2%', Icons.error),
+              _kpi('Models', '5', Icons.psychology),
+              _kpi('Predictions/s', '12K', Icons.speed),
+              _kpi('Precision', '97.5%', Icons.analytics),
+              _kpi('Recall', '94.2%', Icons.search),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transaction Fraud Detection'),
-              subtitle: Text('Real-time ML'),
+              title: Text('Random Forest (Tabular)'),
+              subtitle: Text('Feature-based'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12K alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('AUC: 0.95', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Takeover Prevention'),
-              subtitle: Text('Behavioral'),
+              title: Text('GNN (Graph)'),
+              subtitle: Text('Network patterns'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 blocked/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('AUC: 0.93', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Card Fraud Rules Engine'),
-              subtitle: Text('Rule-based'),
+              title: Text('LSTM (Sequence)'),
+              subtitle: Text('Time-series'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450 rules active', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('AUC: 0.91', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Synthetic Identity Detection'),
-              subtitle: Text('Graph Analysis'),
+              title: Text('Ensemble Voting'),
+              subtitle: Text('Weighted Avg'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12 flagged/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Final score 0-100', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

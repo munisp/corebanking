@@ -7,8 +7,6 @@ class IdentityChannelsScreen extends StatefulWidget {
 }
 
 class _IdentityChannelsScreenState extends State<IdentityChannelsScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _IdentityChannelsScreenState extends State<IdentityChannelsScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Sessions', '125K', Icons.people),
-              _kpi('Auth/Min', '8,500', Icons.login),
-              _kpi('MFA Enabled', '85%', Icons.security),
-              _kpi('SSO Providers', '12', Icons.key),
+              _kpi('Channels', '8', Icons.devices),
+              _kpi('Auth/day', '500K', Icons.login),
+              _kpi('Success', '99.5%', Icons.check),
+              _kpi('MFA Rate', '85%', Icons.security),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Password + TOTP'),
-              subtitle: Text('2FA'),
+              title: Text('Mobile App (Biometric)'),
+              subtitle: Text('Face/Fingerprint'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('250K auth/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('WebAuthn/FIDO2'),
-              subtitle: Text('Passwordless'),
+              title: Text('Web Portal (Password+OTP)'),
+              subtitle: Text('MFA Required'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('125K auth/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Social Login (Google/Apple)'),
-              subtitle: Text('Federation'),
+              title: Text('USSD (PIN)'),
+              subtitle: Text('4-digit PIN'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('85K auth/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Enterprise SSO (SAML)'),
-              subtitle: Text('Corporate'),
+              title: Text('API (OAuth 2.0)'),
+              subtitle: Text('Client Credentials'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('8 organizations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('45K auth/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

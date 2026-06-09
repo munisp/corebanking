@@ -7,8 +7,6 @@ class MojaloopCallbacksScreen extends StatefulWidget {
 }
 
 class _MojaloopCallbacksScreenState extends State<MojaloopCallbacksScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _MojaloopCallbacksScreenState extends State<MojaloopCallbacksScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('DFSP Participants', '18', Icons.account_balance),
-              _kpi('Daily Transfers', '2.5M', Icons.swap_horiz),
-              _kpi('Settlement Batches', '48', Icons.receipt),
-              _kpi('FSPIOP Compliance', '100%', Icons.verified),
+              _kpi('Callbacks/day', '5M', Icons.call_made),
+              _kpi('Success Rate', '99.5%', Icons.check_circle),
+              _kpi('Retry Queue', '250', Icons.replay),
+              _kpi('Avg Response', '120ms', Icons.timer),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Payer DFSP Lookup'),
-              subtitle: Text('FSPIOP GET /parties'),
+              title: Text('PUT /transfers/{id}'),
+              subtitle: Text('Transfer Fulfil'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('800K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('2.5M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transfer Prepare'),
-              subtitle: Text('FSPIOP POST /transfers'),
+              title: Text('PUT /quotes/{id}'),
+              subtitle: Text('Quote Response'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('1.5M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transfer Fulfil'),
-              subtitle: Text('FSPIOP PUT /transfers'),
+              title: Text('PUT /parties/{type}/{id}'),
+              subtitle: Text('Party Lookup'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('850K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Settlement Window'),
-              subtitle: Text('Net Settlement'),
+              title: Text('PUT /transfers/{id}/error'),
+              subtitle: Text('Error Callback'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Every 30 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('25K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

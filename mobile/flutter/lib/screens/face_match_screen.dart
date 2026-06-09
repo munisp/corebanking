@@ -7,8 +7,6 @@ class FaceMatchScreen extends StatefulWidget {
 }
 
 class _FaceMatchScreenState extends State<FaceMatchScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _FaceMatchScreenState extends State<FaceMatchScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Sessions', '125K', Icons.people),
-              _kpi('Auth/Min', '8,500', Icons.login),
-              _kpi('MFA Enabled', '85%', Icons.security),
-              _kpi('SSO Providers', '12', Icons.key),
+              _kpi('Matches/day', '45K', Icons.face),
+              _kpi('Accuracy', '99.2%', Icons.analytics),
+              _kpi('FAR', '0.01%', Icons.security),
+              _kpi('Avg Time', '1.5s', Icons.timer),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Password + TOTP'),
-              subtitle: Text('2FA'),
+              title: Text('BVN Photo Match'),
+              subtitle: Text('1:1 Verification'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('NIBSS database', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('WebAuthn/FIDO2'),
-              subtitle: Text('Passwordless'),
+              title: Text('NIN Photo Match'),
+              subtitle: Text('1:1 Verification'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('NIMC database', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Social Login (Google/Apple)'),
-              subtitle: Text('Federation'),
+              title: Text('Liveness Detection'),
+              subtitle: Text('Anti-spoofing'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('3D depth + blink', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Enterprise SSO (SAML)'),
-              subtitle: Text('Corporate'),
+              title: Text('Selfie vs ID Match'),
+              subtitle: Text('Mobile KYC'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('8 organizations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('25K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

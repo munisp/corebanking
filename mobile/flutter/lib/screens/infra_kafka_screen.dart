@@ -7,8 +7,6 @@ class InfraKafkaScreen extends StatefulWidget {
 }
 
 class _InfraKafkaScreenState extends State<InfraKafkaScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _InfraKafkaScreenState extends State<InfraKafkaScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Brokers', '6', Icons.dns),
+              _kpi('Topics', '285', Icons.topic),
+              _kpi('Messages/s', '250K', Icons.speed),
+              _kpi('Consumer Groups', '48', Icons.group),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Kafka Primary'),
-              subtitle: Text('Production'),
+              title: Text('Broker 1 (kafka-01)'),
+              subtitle: Text('Leader: 95 partitions'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('85K msg/s', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Online', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Kafka Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Broker 2 (kafka-02)'),
+              subtitle: Text('Leader: 92 partitions'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('82K msg/s', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Online', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Kafka Canary'),
-              subtitle: Text('Test'),
+              title: Text('Broker 3 (kafka-03)'),
+              subtitle: Text('Leader: 88 partitions'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('83K msg/s', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Online', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('ISR Status'),
+              subtitle: Text('In-Sync Replicas'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('100% in-sync', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

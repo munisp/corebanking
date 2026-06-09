@@ -7,8 +7,6 @@ class HAServicesScreen extends StatefulWidget {
 }
 
 class _HAServicesScreenState extends State<HAServicesScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _HAServicesScreenState extends State<HAServicesScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Monitored', '512', Icons.monitor_heart),
+              _kpi('Healthy', '512', Icons.check_circle),
+              _kpi('Degraded', '0', Icons.warning),
+              _kpi('Circuits Open', '0', Icons.shield),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Ha Services Primary'),
-              subtitle: Text('Production'),
+              title: Text('Critical (Transfers)'),
+              subtitle: Text('3x redundancy'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('99.999% SLA', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('99.999%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Ha Services Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Core (Accounts)'),
+              subtitle: Text('2x redundancy'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('99.99% SLA', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('99.99%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Ha Services Canary'),
-              subtitle: Text('Test'),
+              title: Text('Supporting (Reports)'),
+              subtitle: Text('1x+standby'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('99.9% SLA', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('99.95%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Background (ETL)'),
+              subtitle: Text('Retry-safe'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('99.5% SLA', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('99.8%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

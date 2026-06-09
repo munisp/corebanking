@@ -7,8 +7,6 @@ class VoiceBiometricAuthScreen extends StatefulWidget {
 }
 
 class _VoiceBiometricAuthScreenState extends State<VoiceBiometricAuthScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _VoiceBiometricAuthScreenState extends State<VoiceBiometricAuthScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Users', '850K', Icons.people),
-              _kpi('Messages/Day', '2.5M', Icons.message),
-              _kpi('Success Rate', '99.5%', Icons.check_circle),
-              _kpi('Avg Response', '1.2s', Icons.timer),
+              _kpi('Enrolled', '500K', Icons.mic),
+              _kpi('Auth/day', '45K', Icons.fingerprint),
+              _kpi('FAR', '0.01%', Icons.security),
+              _kpi('FRR', '2.5%', Icons.error),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Balance Inquiry'),
-              subtitle: Text('Self-Service'),
+              title: Text('Voiceprint Enrollment'),
+              subtitle: Text('3 phrases'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('500K enrolled', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Fund Transfer'),
-              subtitle: Text('Transactional'),
+              title: Text('Speaker Verification'),
+              subtitle: Text('1:1 match'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('45K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Bill Payment'),
-              subtitle: Text('Utility'),
+              title: Text('Anti-spoofing'),
+              subtitle: Text('Liveness'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('280K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Replay detection', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Statement'),
-              subtitle: Text('Information'),
+              title: Text('Continuous Auth'),
+              subtitle: Text('Passive'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('During call', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

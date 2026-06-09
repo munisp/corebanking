@@ -7,18 +7,6 @@ class WorkflowInstancesScreen extends StatefulWidget {
 }
 
 class _WorkflowInstancesScreenState extends State<WorkflowInstancesScreen> {
-  String _searchQuery = '';
-  final List<Map<String, dynamic>> _items = [
-    {'name': 'Workflow Instances - Standard', 'type': 'Core Product', 'value': '₦5.2B', 'status': 'Active'},
-    {'name': 'Workflow Instances - Premium', 'type': 'Enhanced', 'value': '₦3.8B', 'status': 'Active'},
-    {'name': 'Workflow Instances - Enterprise', 'type': 'Corporate', 'value': '₦8.5B', 'status': 'Active'},
-    {'name': 'Workflow Instances - Digital', 'type': 'Online Channel', 'value': '₦2.1B', 'status': 'Active'},
-  ];
-
-  List<Map<String, dynamic>> get _filteredItems => _searchQuery.isEmpty
-      ? _items
-      : _items.where((i) => i.values.any((v) => v.toString().toLowerCase().contains(_searchQuery.toLowerCase()))).toList();
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -40,9 +28,10 @@ class _WorkflowInstancesScreenState extends State<WorkflowInstancesScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Workflow Instances'), backgroundColor: Colors.green[700]),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             GridView.count(
               crossAxisCount: 2,
@@ -52,45 +41,49 @@ class _WorkflowInstancesScreenState extends State<WorkflowInstancesScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Total', '12,500', Icons.analytics),
-              _kpi('Active', '11,800', Icons.check_circle),
-              _kpi('Growth', '+15.2%', Icons.trending_up),
-              _kpi('Revenue', '₦2.8B', Icons.money),
+              _kpi('Running', '12,500', Icons.play_circle),
+              _kpi('Completed Today', '8,500', Icons.check_circle),
+              _kpi('Failed', '12', Icons.error),
+              _kpi('Avg Duration', '4.5hr', Icons.timer),
               ],
             ),
-            const SizedBox(height: 12),
-            TextField(
-              decoration: InputDecoration(
-                hintText: 'Search workflow instances...',
-                prefixIcon: const Icon(Icons.search),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-              ),
-              onChanged: (v) => setState(() => _searchQuery = v),
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: ListView.builder(
-                itemCount: _filteredItems.length,
-                itemBuilder: (context, index) {
-                  final item = _filteredItems[index];
-                  return Card(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    child: ListTile(
-                      leading: CircleAvatar(
-                        backgroundColor: Colors.green[100],
-                        child: Text(item['name'].toString().substring(0, 1)),
-                      ),
-                      title: Text(item['name'].toString()),
-                      subtitle: Text('${item['type']} — ${item['value']}'),
-                      trailing: Chip(
-                        label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
-                        backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Account Opening Instances'),
+              subtitle: Text('5,000 running'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Avg 2hr completion', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Loan Processing'),
+              subtitle: Text('2,500 running'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Avg 48hr completion', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('KYC Verification'),
+              subtitle: Text('3,000 running'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Avg 1hr completion', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Card Issuance'),
+              subtitle: Text('2,000 running'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Avg 72hr completion', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
           ],
         ),
       ),

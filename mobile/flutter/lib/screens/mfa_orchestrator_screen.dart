@@ -7,8 +7,6 @@ class MFAOrchestratorScreen extends StatefulWidget {
 }
 
 class _MFAOrchestratorScreenState extends State<MFAOrchestratorScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _MFAOrchestratorScreenState extends State<MFAOrchestratorScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Sessions', '125K', Icons.people),
-              _kpi('Auth/Min', '8,500', Icons.login),
               _kpi('MFA Enabled', '85%', Icons.security),
-              _kpi('SSO Providers', '12', Icons.key),
+              _kpi('Methods', '4', Icons.devices),
+              _kpi('Challenges/day', '250K', Icons.quiz),
+              _kpi('Fallback Rate', '2%', Icons.swap_horiz),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Password + TOTP'),
-              subtitle: Text('2FA'),
+              title: Text('TOTP (Authenticator App)'),
+              subtitle: Text('Primary'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('45% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('WebAuthn/FIDO2'),
-              subtitle: Text('Passwordless'),
+              title: Text('SMS OTP'),
+              subtitle: Text('Fallback'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('35% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Social Login (Google/Apple)'),
-              subtitle: Text('Federation'),
+              title: Text('Biometric (Face/Finger)'),
+              subtitle: Text('Mobile'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('45K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('15% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Enterprise SSO (SAML)'),
-              subtitle: Text('Corporate'),
+              title: Text('WebAuthn (Security Key)'),
+              subtitle: Text('Advanced'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('8 organizations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('5% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

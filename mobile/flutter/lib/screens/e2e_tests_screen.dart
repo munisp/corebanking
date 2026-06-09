@@ -7,8 +7,6 @@ class E2ETestsScreen extends StatefulWidget {
 }
 
 class _E2ETestsScreenState extends State<E2ETestsScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _E2ETestsScreenState extends State<E2ETestsScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Total Tests', '2,500', Icons.science),
+              _kpi('Passing', '2,455', Icons.check),
+              _kpi('Failing', '12', Icons.close),
+              _kpi('Skipped', '33', Icons.skip_next),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('E2E Tests Primary'),
-              subtitle: Text('Production'),
+              title: Text('API Contract Tests'),
+              subtitle: Text('OpenAPI'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('850 tests', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('98.8%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('E2E Tests Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Integration Tests'),
+              subtitle: Text('Service-to-Service'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('650 tests', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('99.1%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('E2E Tests Canary'),
-              subtitle: Text('Test'),
+              title: Text('Performance Benchmarks'),
+              subtitle: Text('Load Testing'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('250 tests', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('97.5%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Security Scan Tests'),
+              subtitle: Text('OWASP ZAP'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('750 tests', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('100%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

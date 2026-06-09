@@ -7,8 +7,6 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _HomeScreenState extends State<HomeScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Total Assets', '₦1.2T', Icons.account_balance),
-              _kpi('Customers', '8.5M', Icons.people),
-              _kpi('Daily Txns', '15M', Icons.swap_horiz),
-              _kpi('Uptime', '99.99%', Icons.check_circle),
+              _kpi('Total Assets', '₦2.5T', Icons.account_balance),
+              _kpi('Active Customers', '8.5M', Icons.people),
+              _kpi('Daily Transactions', '₦125B', Icons.swap_horiz),
+              _kpi('Services Online', '512/512', Icons.check_circle),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Customer Accounts'),
-              subtitle: Text('Deposits'),
+              title: Text('Net Interest Margin'),
+              subtitle: Text('Revenue Metric'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦850B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('6.8% (Target: 6.5%)', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Above Target', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Loan Portfolio'),
-              subtitle: Text('Credit'),
+              title: Text('NPL Ratio'),
+              subtitle: Text('Asset Quality'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦320B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('4.2% (CBN Max: 5%)', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Investment AUM'),
-              subtitle: Text('Wealth'),
+              title: Text('Capital Adequacy'),
+              subtitle: Text('Regulatory'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦580B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('18.5% (Min: 15%)', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Digital Channels'),
-              subtitle: Text('Mobile + Web'),
+              title: Text('Liquidity Ratio'),
+              subtitle: Text('CBN Requirement'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('6.2M active users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('42% (Min: 30%)', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

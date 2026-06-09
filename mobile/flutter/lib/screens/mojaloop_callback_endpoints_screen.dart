@@ -7,8 +7,6 @@ class MojaloopCallbackEndpointsScreen extends StatefulWidget {
 }
 
 class _MojaloopCallbackEndpointsScreenState extends State<MojaloopCallbackEndpointsScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _MojaloopCallbackEndpointsScreenState extends State<MojaloopCallbackEndpoi
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('DFSP Participants', '18', Icons.account_balance),
-              _kpi('Daily Transfers', '2.5M', Icons.swap_horiz),
-              _kpi('Settlement Batches', '48', Icons.receipt),
-              _kpi('FSPIOP Compliance', '100%', Icons.verified),
+              _kpi('Registered Endpoints', '72', Icons.link),
+              _kpi('TLS Verified', '100%', Icons.lock),
+              _kpi('Health Check', '10s', Icons.favorite),
+              _kpi('Timeout', '30s', Icons.timer),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Payer DFSP Lookup'),
-              subtitle: Text('FSPIOP GET /parties'),
+              title: Text('fspiop-callback-url-transfer'),
+              subtitle: Text('Per-DFSP'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('800K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('36 endpoints', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Verified', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transfer Prepare'),
-              subtitle: Text('FSPIOP POST /transfers'),
+              title: Text('fspiop-callback-url-quotes'),
+              subtitle: Text('Per-DFSP'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('36 endpoints', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Verified', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transfer Fulfil'),
-              subtitle: Text('FSPIOP PUT /transfers'),
+              title: Text('fspiop-callback-url-parties'),
+              subtitle: Text('Per-DFSP'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('36 endpoints', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Verified', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Settlement Window'),
-              subtitle: Text('Net Settlement'),
+              title: Text('fspiop-callback-url-auth'),
+              subtitle: Text('Per-DFSP'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Every 30 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('12 endpoints', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Verified', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

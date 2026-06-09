@@ -7,8 +7,6 @@ class ERPNextScreen extends StatefulWidget {
 }
 
 class _ERPNextScreenState extends State<ERPNextScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _ERPNextScreenState extends State<ERPNextScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Total', '12,500', Icons.analytics),
-              _kpi('Active', '11,800', Icons.check_circle),
-              _kpi('Growth', '+15.2%', Icons.trending_up),
-              _kpi('Revenue', '₦2.8B', Icons.money),
+              _kpi('Modules Active', '12', Icons.apps),
+              _kpi('Users', '850', Icons.people),
+              _kpi('Transactions/day', '25K', Icons.receipt),
+              _kpi('Uptime', '99.9%', Icons.check_circle),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Erp Next - Standard'),
-              subtitle: Text('Core Product'),
+              title: Text('General Ledger'),
+              subtitle: Text('Finance'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦5.2B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦2.5T entries/yr', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Erp Next - Premium'),
-              subtitle: Text('Enhanced'),
+              title: Text('Fixed Assets'),
+              subtitle: Text('Asset Mgmt'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦3.8B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('45K assets tracked', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Erp Next - Enterprise'),
-              subtitle: Text('Corporate'),
+              title: Text('Procurement'),
+              subtitle: Text('Supply Chain'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦8.5B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦8.5B annual spend', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Erp Next - Digital'),
-              subtitle: Text('Online Channel'),
+              title: Text('HR & Payroll'),
+              subtitle: Text('People'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦2.1B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('3,500 employees', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

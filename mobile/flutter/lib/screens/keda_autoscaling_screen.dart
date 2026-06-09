@@ -7,8 +7,6 @@ class KEDAAutoscalingScreen extends StatefulWidget {
 }
 
 class _KEDAAutoscalingScreenState extends State<KEDAAutoscalingScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _KEDAAutoscalingScreenState extends State<KEDAAutoscalingScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Scaled Objects', '32', Icons.auto_graph),
+              _kpi('Triggers', '48', Icons.bolt),
+              _kpi('Scale-to-Zero', '8 svc', Icons.remove_circle),
+              _kpi('Cooldown', '5 min', Icons.timer),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Keda Autoscaling Primary'),
-              subtitle: Text('Production'),
+              title: Text('Batch Processor'),
+              subtitle: Text('Kafka Trigger'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('0→12 replicas', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Scaled: 4', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Keda Autoscaling Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Report Generator'),
+              subtitle: Text('Redis Trigger'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('0→8 replicas', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Scaled: 0', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Keda Autoscaling Canary'),
-              subtitle: Text('Test'),
+              title: Text('Email Sender'),
+              subtitle: Text('Prometheus'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('1→6 replicas', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Scaled: 2', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Statement Gen'),
+              subtitle: Text('Cron Trigger'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('0→4 at 23:00', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Scheduled', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

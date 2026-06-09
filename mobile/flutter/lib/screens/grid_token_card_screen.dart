@@ -7,8 +7,6 @@ class GridTokenCardScreen extends StatefulWidget {
 }
 
 class _GridTokenCardScreenState extends State<GridTokenCardScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _GridTokenCardScreenState extends State<GridTokenCardScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Threats Blocked', '12K/day', Icons.shield),
-              _kpi('Risk Score', 'Low', Icons.security),
-              _kpi('Rules Active', '450', Icons.rule),
-              _kpi('False Positive', '0.2%', Icons.error),
+              _kpi('Cards Issued', '2.5M', Icons.credit_card),
+              _kpi('Grid Challenges/day', '85K', Icons.grid_view),
+              _kpi('Success Rate', '98.5%', Icons.check),
+              _kpi('Blocked', '250', Icons.block),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transaction Fraud Detection'),
-              subtitle: Text('Real-time ML'),
+              title: Text('Grid Card Generation'),
+              subtitle: Text('5x5 Matrix'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12K alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Unique per customer', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Takeover Prevention'),
-              subtitle: Text('Behavioral'),
+              title: Text('Challenge-Response Auth'),
+              subtitle: Text('Row+Col lookup'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 blocked/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('2 values per auth', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Card Fraud Rules Engine'),
-              subtitle: Text('Rule-based'),
+              title: Text('Rate Limiting'),
+              subtitle: Text('3 failures = lock'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450 rules active', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('15 min cooldown', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Synthetic Identity Detection'),
-              subtitle: Text('Graph Analysis'),
+              title: Text('Digital Grid (App)'),
+              subtitle: Text('In-app display'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12 flagged/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Replace physical card', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

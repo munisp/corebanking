@@ -7,8 +7,6 @@ class FalkordbGraphScreen extends StatefulWidget {
 }
 
 class _FalkordbGraphScreenState extends State<FalkordbGraphScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _FalkordbGraphScreenState extends State<FalkordbGraphScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Threats Blocked', '12K/day', Icons.shield),
-              _kpi('Risk Score', 'Low', Icons.security),
-              _kpi('Rules Active', '450', Icons.rule),
-              _kpi('False Positive', '0.2%', Icons.error),
+              _kpi('Nodes', '12M', Icons.hub),
+              _kpi('Edges', '45M', Icons.link),
+              _kpi('Queries/s', '25K', Icons.speed),
+              _kpi('Fraud Rings', '85', Icons.group),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transaction Fraud Detection'),
-              subtitle: Text('Real-time ML'),
+              title: Text('Account Node'),
+              subtitle: Text('Entity'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12K alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('8.5M accounts', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Takeover Prevention'),
-              subtitle: Text('Behavioral'),
+              title: Text('Transfer Edge'),
+              subtitle: Text('Relationship'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 blocked/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('25M transfers', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Card Fraud Rules Engine'),
-              subtitle: Text('Rule-based'),
+              title: Text('Fraud Ring Detection'),
+              subtitle: Text('Graph Algorithm'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450 rules active', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Connected components', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Synthetic Identity Detection'),
-              subtitle: Text('Graph Analysis'),
+              title: Text('Money Mule Pathfinder'),
+              subtitle: Text('Shortest Path'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12 flagged/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('A→B→C→...→Target', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

@@ -1,14 +1,12 @@
 import 'package:flutter/material.dart';
 
-class MojaloopPispScreen extends StatefulWidget {
-  const MojaloopPispScreen({super.key});
+class MojaloopPISPScreen extends StatefulWidget {
+  const MojaloopPISPScreen({super.key});
   @override
-  State<MojaloopPispScreen> createState() => _MojaloopPispScreenState();
+  State<MojaloopPISPScreen> createState() => _MojaloopPISPScreenState();
 }
 
-class _MojaloopPispScreenState extends State<MojaloopPispScreen> {
-  bool _isLoading = false;
-
+class _MojaloopPISPScreenState extends State<MojaloopPISPScreen> {
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -29,7 +27,7 @@ class _MojaloopPispScreenState extends State<MojaloopPispScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Mojaloop Pisp'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('Mojaloop PISP'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,46 +41,46 @@ class _MojaloopPispScreenState extends State<MojaloopPispScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('DFSP Participants', '18', Icons.account_balance),
-              _kpi('Daily Transfers', '2.5M', Icons.swap_horiz),
-              _kpi('Settlement Batches', '48', Icons.receipt),
-              _kpi('FSPIOP Compliance', '100%', Icons.verified),
+              _kpi('PISPs', '8', Icons.payment),
+              _kpi('Linked Accounts', '250K', Icons.link),
+              _kpi('Consent Flows/day', '12K', Icons.verified),
+              _kpi('FIDO2 Keys', '125K', Icons.fingerprint),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Payer DFSP Lookup'),
-              subtitle: Text('FSPIOP GET /parties'),
+              title: Text('Account Linking'),
+              subtitle: Text('Consent'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('800K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('OTP + FIDO2 challenge', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transfer Prepare'),
-              subtitle: Text('FSPIOP POST /transfers'),
+              title: Text('Payment Initiation'),
+              subtitle: Text('3PPI'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Third-party transfer', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transfer Fulfil'),
-              subtitle: Text('FSPIOP PUT /transfers'),
+              title: Text('Consent Management'),
+              subtitle: Text('Lifecycle'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Grant/Revoke/Verify', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Settlement Window'),
-              subtitle: Text('Net Settlement'),
+              title: Text('FIDO2 Attestation'),
+              subtitle: Text('WebAuthn'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Every 30 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Platform authenticator', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

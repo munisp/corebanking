@@ -7,8 +7,6 @@ class FieldLevelEncryptionScreen extends StatefulWidget {
 }
 
 class _FieldLevelEncryptionScreenState extends State<FieldLevelEncryptionScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _FieldLevelEncryptionScreenState extends State<FieldLevelEncryptionScreen>
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Encrypted Fields', '45', Icons.lock),
+              _kpi('Ops/s', '25K', Icons.vpn_key),
+              _kpi('Key Rotations', 'Quarterly', Icons.sync),
+              _kpi('PCI Fields', '12', Icons.credit_card),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Field Level Encryption Primary'),
-              subtitle: Text('Production'),
+              title: Text('Card PAN'),
+              subtitle: Text('AES-256-GCM'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('PCI DSS L1', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Encrypted', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Field Level Encryption Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('BVN'),
+              subtitle: Text('AES-256-GCM'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('CBN Mandated', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Encrypted', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Field Level Encryption Canary'),
-              subtitle: Text('Test'),
+              title: Text('NIN'),
+              subtitle: Text('AES-256-GCM'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('NIMC Compliant', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Encrypted', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Password Hash'),
+              subtitle: Text('bcrypt+pepper'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('NIST 800-63B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

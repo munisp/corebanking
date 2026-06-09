@@ -7,18 +7,6 @@ class TxnMonitoringRulesScreen extends StatefulWidget {
 }
 
 class _TxnMonitoringRulesScreenState extends State<TxnMonitoringRulesScreen> {
-  String _searchQuery = '';
-  final List<Map<String, dynamic>> _items = [
-    {'name': 'Txn Monitoring Rules - Standard', 'type': 'Core Product', 'value': '₦5.2B', 'status': 'Active'},
-    {'name': 'Txn Monitoring Rules - Premium', 'type': 'Enhanced', 'value': '₦3.8B', 'status': 'Active'},
-    {'name': 'Txn Monitoring Rules - Enterprise', 'type': 'Corporate', 'value': '₦8.5B', 'status': 'Active'},
-    {'name': 'Txn Monitoring Rules - Digital', 'type': 'Online Channel', 'value': '₦2.1B', 'status': 'Active'},
-  ];
-
-  List<Map<String, dynamic>> get _filteredItems => _searchQuery.isEmpty
-      ? _items
-      : _items.where((i) => i.values.any((v) => v.toString().toLowerCase().contains(_searchQuery.toLowerCase()))).toList();
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -40,9 +28,10 @@ class _TxnMonitoringRulesScreenState extends State<TxnMonitoringRulesScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Txn Monitoring Rules'), backgroundColor: Colors.green[700]),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             GridView.count(
               crossAxisCount: 2,
@@ -52,45 +41,49 @@ class _TxnMonitoringRulesScreenState extends State<TxnMonitoringRulesScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Total', '12,500', Icons.analytics),
-              _kpi('Active', '11,800', Icons.check_circle),
-              _kpi('Growth', '+15.2%', Icons.trending_up),
-              _kpi('Revenue', '₦2.8B', Icons.money),
+              _kpi('Rules', '250', Icons.rule),
+              _kpi('Alerts/day', '12K', Icons.notifications),
+              _kpi('Auto-blocked', '850', Icons.block),
+              _kpi('False Positive', '2.5%', Icons.error),
               ],
             ),
-            const SizedBox(height: 12),
-            TextField(
-              decoration: InputDecoration(
-                hintText: 'Search txn monitoring rules...',
-                prefixIcon: const Icon(Icons.search),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-              ),
-              onChanged: (v) => setState(() => _searchQuery = v),
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: ListView.builder(
-                itemCount: _filteredItems.length,
-                itemBuilder: (context, index) {
-                  final item = _filteredItems[index];
-                  return Card(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    child: ListTile(
-                      leading: CircleAvatar(
-                        backgroundColor: Colors.green[100],
-                        child: Text(item['name'].toString().substring(0, 1)),
-                      ),
-                      title: Text(item['name'].toString()),
-                      subtitle: Text('${item['type']} — ${item['value']}'),
-                      trailing: Chip(
-                        label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
-                        backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Velocity Check (> 10 txn/min)'),
+              subtitle: Text('Speed Rule'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('2.5K alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Amount Threshold (> ₦5M)'),
+              subtitle: Text('Value Rule'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('4K alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Geo-anomaly (2 cities/1hr)'),
+              subtitle: Text('Location Rule'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('500 alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Dormant Account Activity'),
+              subtitle: Text('Behavior Rule'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('250 alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
           ],
         ),
       ),

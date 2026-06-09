@@ -7,8 +7,6 @@ class HelmValidatorScreen extends StatefulWidget {
 }
 
 class _HelmValidatorScreenState extends State<HelmValidatorScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _HelmValidatorScreenState extends State<HelmValidatorScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Charts', '85', Icons.fact_check),
+              _kpi('Releases', '512', Icons.rocket),
+              _kpi('Lint Errors', '0', Icons.check),
+              _kpi('Dry-Run', '100%', Icons.verified),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Helm Validator Primary'),
-              subtitle: Text('Production'),
+              title: Text('54bank-services (Umbrella)'),
+              subtitle: Text('v3.2.1'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('512 sub-charts', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Valid', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Helm Validator Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('54bank-infra'),
+              subtitle: Text('v2.8.0'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('8 sub-charts', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Valid', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Helm Validator Canary'),
-              subtitle: Text('Test'),
+              title: Text('54bank-monitoring'),
+              subtitle: Text('v1.5.0'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('4 sub-charts', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Valid', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Values Schema'),
+              subtitle: Text('JSON Schema'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('85 schemas pass', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Valid', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

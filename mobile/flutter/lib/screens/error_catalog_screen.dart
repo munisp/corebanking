@@ -7,8 +7,6 @@ class ErrorCatalogScreen extends StatefulWidget {
 }
 
 class _ErrorCatalogScreenState extends State<ErrorCatalogScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _ErrorCatalogScreenState extends State<ErrorCatalogScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Error Codes', '450', Icons.error),
+              _kpi('Active Errors', '12', Icons.warning),
+              _kpi('Resolved Today', '28', Icons.check_circle),
+              _kpi('P1 Incidents', '0', Icons.priority_high),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Error Catalog Primary'),
-              subtitle: Text('Production'),
+              title: Text('ERR_INSUFFICIENT_BALANCE'),
+              subtitle: Text('Business'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('45K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Expected', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Error Catalog Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('ERR_KYC_TIER_EXCEEDED'),
+              subtitle: Text('Compliance'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('12K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Expected', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Error Catalog Canary'),
-              subtitle: Text('Test'),
+              title: Text('ERR_DUPLICATE_TXN'),
+              subtitle: Text('Idempotency'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('8.5K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Expected', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('ERR_DB_TIMEOUT'),
+              subtitle: Text('Infrastructure'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('0/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Resolved', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

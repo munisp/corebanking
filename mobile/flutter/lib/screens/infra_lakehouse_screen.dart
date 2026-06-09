@@ -7,8 +7,6 @@ class InfraLakehouseScreen extends StatefulWidget {
 }
 
 class _InfraLakehouseScreenState extends State<InfraLakehouseScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _InfraLakehouseScreenState extends State<InfraLakehouseScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Bronze Tables', '850', Icons.layers),
+              _kpi('Silver Tables', '450', Icons.auto_awesome),
+              _kpi('Gold Tables', '120', Icons.star),
+              _kpi('Daily Ingest', '85GB', Icons.cloud_upload),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Lakehouse Primary'),
-              subtitle: Text('Production'),
+              title: Text('Transaction Bronze'),
+              subtitle: Text('Raw CDC'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('2.5M rows/hr', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Streaming', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Lakehouse Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Customer Silver'),
+              subtitle: Text('Deduplicated'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('8.5M profiles', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Lakehouse Canary'),
-              subtitle: Text('Test'),
+              title: Text('Risk Score Gold'),
+              subtitle: Text('ML Features'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('15min refresh', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Delta Compaction'),
+              subtitle: Text('Z-ORDER'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Nightly 01:00', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Scheduled', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

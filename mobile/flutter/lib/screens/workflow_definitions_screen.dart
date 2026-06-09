@@ -7,18 +7,6 @@ class WorkflowDefinitionsScreen extends StatefulWidget {
 }
 
 class _WorkflowDefinitionsScreenState extends State<WorkflowDefinitionsScreen> {
-  String _searchQuery = '';
-  final List<Map<String, dynamic>> _items = [
-    {'name': 'Workflow Definitions - Standard', 'type': 'Core Product', 'value': '₦5.2B', 'status': 'Active'},
-    {'name': 'Workflow Definitions - Premium', 'type': 'Enhanced', 'value': '₦3.8B', 'status': 'Active'},
-    {'name': 'Workflow Definitions - Enterprise', 'type': 'Corporate', 'value': '₦8.5B', 'status': 'Active'},
-    {'name': 'Workflow Definitions - Digital', 'type': 'Online Channel', 'value': '₦2.1B', 'status': 'Active'},
-  ];
-
-  List<Map<String, dynamic>> get _filteredItems => _searchQuery.isEmpty
-      ? _items
-      : _items.where((i) => i.values.any((v) => v.toString().toLowerCase().contains(_searchQuery.toLowerCase()))).toList();
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -40,9 +28,10 @@ class _WorkflowDefinitionsScreenState extends State<WorkflowDefinitionsScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Workflow Definitions'), backgroundColor: Colors.green[700]),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             GridView.count(
               crossAxisCount: 2,
@@ -52,45 +41,49 @@ class _WorkflowDefinitionsScreenState extends State<WorkflowDefinitionsScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Total', '12,500', Icons.analytics),
-              _kpi('Active', '11,800', Icons.check_circle),
-              _kpi('Growth', '+15.2%', Icons.trending_up),
-              _kpi('Revenue', '₦2.8B', Icons.money),
+              _kpi('Definitions', '85', Icons.description),
+              _kpi('Active', '78', Icons.check),
+              _kpi('Draft', '7', Icons.edit),
+              _kpi('Avg Steps', '12', Icons.format_list_numbered),
               ],
             ),
-            const SizedBox(height: 12),
-            TextField(
-              decoration: InputDecoration(
-                hintText: 'Search workflow definitions...',
-                prefixIcon: const Icon(Icons.search),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-              ),
-              onChanged: (v) => setState(() => _searchQuery = v),
-            ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: ListView.builder(
-                itemCount: _filteredItems.length,
-                itemBuilder: (context, index) {
-                  final item = _filteredItems[index];
-                  return Card(
-                    margin: const EdgeInsets.only(bottom: 8),
-                    child: ListTile(
-                      leading: CircleAvatar(
-                        backgroundColor: Colors.green[100],
-                        child: Text(item['name'].toString().substring(0, 1)),
-                      ),
-                      title: Text(item['name'].toString()),
-                      subtitle: Text('${item['type']} — ${item['value']}'),
-                      trailing: Chip(
-                        label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
-                        backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Account Opening'),
+              subtitle: Text('8 steps, 2 approvals'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('KYC+BVN+NIN+photo', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Loan Origination'),
+              subtitle: Text('15 steps, 3 approvals'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Scoring+docs+disburse', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Card Issuance'),
+              subtitle: Text('6 steps, 1 approval'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Request→personalize→deliver', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Account Closure'),
+              subtitle: Text('10 steps, 2 approvals'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Balance→fees→archive', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
           ],
         ),
       ),

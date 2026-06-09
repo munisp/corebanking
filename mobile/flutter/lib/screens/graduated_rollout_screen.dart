@@ -7,8 +7,6 @@ class GraduatedRolloutScreen extends StatefulWidget {
 }
 
 class _GraduatedRolloutScreenState extends State<GraduatedRolloutScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _GraduatedRolloutScreenState extends State<GraduatedRolloutScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Active Rollouts', '8', Icons.rocket_launch),
+              _kpi('Canary', '5%', Icons.science),
+              _kpi('Error Budget', '0.05%', Icons.data_usage),
+              _kpi('Rollback Ready', '100%', Icons.undo),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Graduated Rollout Primary'),
-              subtitle: Text('Production'),
+              title: Text('Transfer Engine v3.2'),
+              subtitle: Text('Canary→Linear'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('5%→25%→50%→100%', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('At 25%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Graduated Rollout Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Islamic Banking Module'),
+              subtitle: Text('Feature Flag'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Islamic accounts', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('At 100%', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Graduated Rollout Canary'),
-              subtitle: Text('Test'),
+              title: Text('WhatsApp Banking v2'),
+              subtitle: Text('Ring-based'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Internal→Beta→GA', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Beta', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('New KYC OCR Engine'),
+              subtitle: Text('Shadow Mode'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Running parallel', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Monitoring', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

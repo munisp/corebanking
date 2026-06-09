@@ -1,14 +1,12 @@
 import 'package:flutter/material.dart';
 
-class SqlParameterizerScreen extends StatefulWidget {
-  const SqlParameterizerScreen({super.key});
+class SQLParameterizerScreen extends StatefulWidget {
+  const SQLParameterizerScreen({super.key});
   @override
-  State<SqlParameterizerScreen> createState() => _SqlParameterizerScreenState();
+  State<SQLParameterizerScreen> createState() => _SQLParameterizerScreenState();
 }
 
-class _SqlParameterizerScreenState extends State<SqlParameterizerScreen> {
-  bool _isLoading = false;
-
+class _SQLParameterizerScreenState extends State<SQLParameterizerScreen> {
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -29,7 +27,7 @@ class _SqlParameterizerScreenState extends State<SqlParameterizerScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Sql Parameterizer'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('SQL Parameterizer'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,47 +41,47 @@ class _SqlParameterizerScreenState extends State<SqlParameterizerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Parameterized', '100%', Icons.security),
+              _kpi('Injection Blocked', '0', Icons.shield),
+              _kpi('Prepared Stmts', '2,500', Icons.cached),
+              _kpi('Dynamic SQL', '0%', Icons.block),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Sql Parameterizer Primary'),
-              subtitle: Text('Production'),
+              title: Text('SELECT Parameterization'),
+              subtitle: Text('$1, $2 placeholders'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('All queries', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Enforced', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Sql Parameterizer Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('INSERT Parameterization'),
+              subtitle: Text('Prepared Statement'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('All mutations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Enforced', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Sql Parameterizer Canary'),
-              subtitle: Text('Test'),
+              title: Text('ORM Query Builder'),
+              subtitle: Text('sqlx/GORM'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Type-safe queries', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Enforced', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('SQL Injection Scanner'),
+              subtitle: Text('CI Gate'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('SAST + runtime', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

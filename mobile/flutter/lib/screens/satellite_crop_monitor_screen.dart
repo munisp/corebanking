@@ -7,8 +7,6 @@ class SatelliteCropMonitorScreen extends StatefulWidget {
 }
 
 class _SatelliteCropMonitorScreenState extends State<SatelliteCropMonitorScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _SatelliteCropMonitorScreenState extends State<SatelliteCropMonitorScreen>
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Farmers', '85K', Icons.agriculture),
-              _kpi('Loan Portfolio', '₦25B', Icons.account_balance),
-              _kpi('Hectares Covered', '1.2M', Icons.landscape),
-              _kpi('Yield Avg', '4.5 t/ha', Icons.trending_up),
+              _kpi('Farms Monitored', '125K', Icons.satellite),
+              _kpi('NDVI Coverage', '2.5M ha', Icons.landscape),
+              _kpi('Revisit', '5 days', Icons.schedule),
+              _kpi('Alerts/week', '850', Icons.notifications),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Maize Belt - Kaduna'),
-              subtitle: Text('Rainfed'),
+              title: Text('Sentinel-2 NDVI'),
+              subtitle: Text('Vegetation Health'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('250K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('10m resolution, 5d', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Rice Paddy - Kebbi'),
-              subtitle: Text('Irrigated'),
+              title: Text('Landsat-8 Thermal'),
+              subtitle: Text('Water Stress'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('180K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('30m resolution, 16d', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Cassava - Ogun'),
-              subtitle: Text('Rainfed'),
+              title: Text('Planet Labs Daily'),
+              subtitle: Text('Change Detection'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('120K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('3m resolution, daily', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Soybean - Benue'),
-              subtitle: Text('Rainfed'),
+              title: Text('Crop Yield Prediction'),
+              subtitle: Text('ML Model'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('95K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('85% accuracy at 30d', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

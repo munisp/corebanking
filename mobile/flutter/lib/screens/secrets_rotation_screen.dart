@@ -7,8 +7,6 @@ class SecretsRotationScreen extends StatefulWidget {
 }
 
 class _SecretsRotationScreenState extends State<SecretsRotationScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _SecretsRotationScreenState extends State<SecretsRotationScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Secrets', '350', Icons.vpn_key),
+              _kpi('Auto-rotated', '100%', Icons.sync),
+              _kpi('Next Rotation', 'Feb 01', Icons.event),
+              _kpi('Vault', 'HashiCorp', Icons.lock),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Secrets Rotation Primary'),
-              subtitle: Text('Production'),
+              title: Text('DB Passwords'),
+              subtitle: Text('Dynamic'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('24hr TTL, auto-rotate', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Secrets Rotation Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('API Keys'),
+              subtitle: Text('KV v2'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('90d rotation', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Secrets Rotation Canary'),
-              subtitle: Text('Test'),
+              title: Text('JWT Signing Keys'),
+              subtitle: Text('RSA-4096'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Weekly rotation', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('TLS Certs'),
+              subtitle: Text('cert-manager'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('30d auto-renew', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Current', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

@@ -7,8 +7,6 @@ class HPAAutoscalerScreen extends StatefulWidget {
 }
 
 class _HPAAutoscalerScreenState extends State<HPAAutoscalerScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _HPAAutoscalerScreenState extends State<HPAAutoscalerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Scaled Services', '85', Icons.auto_graph),
+              _kpi('Replicas', '1,024', Icons.copy_all),
+              _kpi('CPU Target', '70%', Icons.memory),
+              _kpi('Scale Events/day', '125', Icons.trending_up),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('H P A Autoscaler Primary'),
-              subtitle: Text('Production'),
+              title: Text('transfer-service (Go)'),
+              subtitle: Text('CPU+Custom'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('12-48 pods', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('32 pods', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('H P A Autoscaler Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('balance-inquiry (Go)'),
+              subtitle: Text('CPU'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('8-24 pods', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('16 pods', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('H P A Autoscaler Canary'),
-              subtitle: Text('Test'),
+              title: Text('kyc-engine (Python)'),
+              subtitle: Text('Queue Depth'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('4-16 pods', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('8 pods', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('notification-svc'),
+              subtitle: Text('Message Rate'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('4-12 pods', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('6 pods', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

@@ -7,8 +7,6 @@ class E2EOrchestratorScreen extends StatefulWidget {
 }
 
 class _E2EOrchestratorScreenState extends State<E2EOrchestratorScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _E2EOrchestratorScreenState extends State<E2EOrchestratorScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Test Suites', '85', Icons.playlist_play),
+              _kpi('Pass Rate', '98.2%', Icons.check_circle),
+              _kpi('Avg Duration', '12 min', Icons.timer),
+              _kpi('Last Run', '02:00 UTC', Icons.schedule),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('E2E Orchestrator Primary'),
-              subtitle: Text('Production'),
+              title: Text('Transfer E2E (NIP/NEFT)'),
+              subtitle: Text('Critical Path'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('45 steps, 8 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Passing', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('E2E Orchestrator Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Account Opening Flow'),
+              subtitle: Text('Critical Path'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('32 steps, 5 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Passing', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('E2E Orchestrator Canary'),
-              subtitle: Text('Test'),
+              title: Text('Loan Origination E2E'),
+              subtitle: Text('Business Flow'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('58 steps, 12 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Passing', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('Card Issuance + Activation'),
+              subtitle: Text('Business Flow'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('28 steps, 6 min', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Passing', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

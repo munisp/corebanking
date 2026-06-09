@@ -7,8 +7,6 @@ class ScratchCardPinScreen extends StatefulWidget {
 }
 
 class _ScratchCardPinScreenState extends State<ScratchCardPinScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _ScratchCardPinScreenState extends State<ScratchCardPinScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Threats Blocked', '12K/day', Icons.shield),
-              _kpi('Risk Score', 'Low', Icons.security),
-              _kpi('Rules Active', '450', Icons.rule),
-              _kpi('False Positive', '0.2%', Icons.error),
+              _kpi('PINs Generated', '500K/mo', Icons.pin),
+              _kpi('Redeemed', '450K/mo', Icons.check),
+              _kpi('Expired', '25K/mo', Icons.timer_off),
+              _kpi('Fraud Blocked', '850', Icons.block),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Transaction Fraud Detection'),
-              subtitle: Text('Real-time ML'),
+              title: Text('16-digit PIN Generation'),
+              subtitle: Text('Crypto Random'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12K alerts/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('HSM-protected', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Account Takeover Prevention'),
-              subtitle: Text('Behavioral'),
+              title: Text('Airtime Top-up PIN'),
+              subtitle: Text('Telco Integration'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('85 blocked/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('MTN/Airtel/Glo/9mobile', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Card Fraud Rules Engine'),
-              subtitle: Text('Rule-based'),
+              title: Text('Gift Card PIN'),
+              subtitle: Text('Stored Value'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('450 rules active', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦500-₦50K denominations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Synthetic Identity Detection'),
-              subtitle: Text('Graph Analysis'),
+              title: Text('Anti-fraud Validation'),
+              subtitle: Text('Velocity Check'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('12 flagged/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Max 5 redemptions/hr', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

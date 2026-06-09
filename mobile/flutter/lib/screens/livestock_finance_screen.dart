@@ -7,8 +7,6 @@ class LivestockFinanceScreen extends StatefulWidget {
 }
 
 class _LivestockFinanceScreenState extends State<LivestockFinanceScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,46 +41,46 @@ class _LivestockFinanceScreenState extends State<LivestockFinanceScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Active Farmers', '85K', Icons.agriculture),
-              _kpi('Loan Portfolio', '₦25B', Icons.account_balance),
-              _kpi('Hectares Covered', '1.2M', Icons.landscape),
-              _kpi('Yield Avg', '4.5 t/ha', Icons.trending_up),
+              _kpi('Loans Active', '₦5.2B', Icons.payments),
+              _kpi('Herds Financed', '25K', Icons.pets),
+              _kpi('Default Rate', '3.8%', Icons.warning),
+              _kpi('GPS Tracked', '12K', Icons.location_on),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Maize Belt - Kaduna'),
-              subtitle: Text('Rainfed'),
+              title: Text('Cattle Fattening Loan'),
+              subtitle: Text('6-month term'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('250K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦2.5B, 15K herds', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Rice Paddy - Kebbi'),
-              subtitle: Text('Irrigated'),
+              title: Text('Dairy Farm Finance'),
+              subtitle: Text('3-year term'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('180K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦1.5B, 5K farms', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Cassava - Ogun'),
-              subtitle: Text('Rainfed'),
+              title: Text('Poultry Layer Finance'),
+              subtitle: Text('1-year term'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('120K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('₦800M, 3K farms', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Soybean - Benue'),
-              subtitle: Text('Rainfed'),
+              title: Text('RFID Collateral Track'),
+              subtitle: Text('IoT'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('95K hectares', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('12K GPS tags active', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),

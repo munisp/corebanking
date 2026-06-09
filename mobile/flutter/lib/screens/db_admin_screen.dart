@@ -7,8 +7,6 @@ class DBAdminScreen extends StatefulWidget {
 }
 
 class _DBAdminScreenState extends State<DBAdminScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _DBAdminScreenState extends State<DBAdminScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Tables', '8,500', Icons.table_chart),
+              _kpi('Indexes', '12,200', Icons.list),
+              _kpi('Dead Tuples', '0.8%', Icons.delete),
+              _kpi('Vacuum', 'Current', Icons.cleaning_services),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Db Admin Primary'),
-              subtitle: Text('Production'),
+              title: Text('accounts (850M rows)'),
+              subtitle: Text('Core'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('12 idx, 180GB', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Db Admin Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('transactions (2.5B rows)'),
+              subtitle: Text('Core'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('18 idx, 1.2TB', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Db Admin Canary'),
-              subtitle: Text('Test'),
+              title: Text('audit_trail (5B rows)'),
+              subtitle: Text('Append-only'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('8 idx, 800GB', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('kyc_documents (45M rows)'),
+              subtitle: Text('Compliance'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('6 idx, 250GB', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

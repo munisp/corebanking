@@ -7,8 +7,6 @@ class InventoryScreen extends StatefulWidget {
 }
 
 class _InventoryScreenState extends State<InventoryScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _InventoryScreenState extends State<InventoryScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Total', '12,500', Icons.analytics),
-              _kpi('Active', '11,800', Icons.check_circle),
-              _kpi('Growth', '+15.2%', Icons.trending_up),
-              _kpi('Revenue', '₦2.8B', Icons.money),
+              _kpi('Items', '12,500', Icons.inventory_2),
+              _kpi('Warehouses', '8', Icons.warehouse),
+              _kpi('Value', '₦2.8B', Icons.payments),
+              _kpi('Reorder', '45 items', Icons.shopping_cart),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Inventory - Standard'),
-              subtitle: Text('Core Product'),
+              title: Text('Cheque Books'),
+              subtitle: Text('Banking Supply'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦5.2B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('250K units, 3 warehouses', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('In Stock', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('POS Terminals'),
+              subtitle: Text('Hardware'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('8,500 units deployed', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Inventory - Premium'),
-              subtitle: Text('Enhanced'),
+              title: Text('ATM Cash Cassettes'),
+              subtitle: Text('Cash Mgmt'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦3.8B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('1,200 units', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('In Stock', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Inventory - Enterprise'),
-              subtitle: Text('Corporate'),
+              title: Text('Card Stock (Visa/MC)'),
+              subtitle: Text('Card Supply'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦8.5B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
-              ]),
-            )),
-            Card(child: ListTile(
-              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Inventory - Digital'),
-              subtitle: Text('Online Channel'),
-              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('₦2.1B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('500K blanks', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('In Stock', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

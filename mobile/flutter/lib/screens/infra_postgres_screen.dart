@@ -7,8 +7,6 @@ class InfraPostgresScreen extends StatefulWidget {
 }
 
 class _InfraPostgresScreenState extends State<InfraPostgresScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _InfraPostgresScreenState extends State<InfraPostgresScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Clusters', '4', Icons.storage),
+              _kpi('Total Size', '8.5TB', Icons.disc_full),
+              _kpi('Connections', '5,000', Icons.cable),
+              _kpi('Repl Lag', '0.2ms', Icons.sync),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Postgres Primary'),
-              subtitle: Text('Production'),
+              title: Text('pg-core (Accounts/Txns)'),
+              subtitle: Text('Primary + 2 Replicas'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('4.2TB', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Postgres Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('pg-audit (Immutable)'),
+              subtitle: Text('Append-only'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('2.8TB', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Infra Postgres Canary'),
-              subtitle: Text('Test'),
+              title: Text('pg-analytics (Read)'),
+              subtitle: Text('Logical Replication'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('1.2TB', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Synced', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('pg-config (System)'),
+              subtitle: Text('Single Node'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('300GB', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

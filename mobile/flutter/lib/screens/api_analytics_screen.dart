@@ -1,69 +1,92 @@
 import 'package:flutter/material.dart';
 
-class ApiAnalyticsScreen extends StatefulWidget {
-  const ApiAnalyticsScreen({super.key});
+class APIAnalyticsScreen extends StatefulWidget {
+  const APIAnalyticsScreen({super.key});
   @override
-  State<ApiAnalyticsScreen> createState() => _ApiAnalyticsScreenState();
+  State<APIAnalyticsScreen> createState() => _APIAnalyticsScreenState();
 }
 
-class _ApiAnalyticsScreenState extends State<ApiAnalyticsScreen> {
-  String _period = '24h';
+class _APIAnalyticsScreenState extends State<APIAnalyticsScreen> {
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('API Analytics'), actions: [
-        SegmentedButton<String>(segments: const [
-          ButtonSegment(value: '1h', label: Text('1H')), ButtonSegment(value: '24h', label: Text('24H')),
-          ButtonSegment(value: '7d', label: Text('7D')), ButtonSegment(value: '30d', label: Text('30D')),
-        ], selected: {_period}, onSelectionChanged: (v) => setState(() => _period = v.first)),
-      ]),
-      body: SingleChildScrollView(padding: const EdgeInsets.all(16), child: Column(children: [
-        Row(children: [
-          Expanded(child: _kpiCard('Requests', '14.8M', Colors.blue)),
-          Expanded(child: _kpiCard('Avg Latency', '23ms', Colors.green)),
-          Expanded(child: _kpiCard('Error Rate', '0.12%', Colors.orange)),
-          Expanded(child: _kpiCard('Uptime', '99.99%', Colors.purple)),
-        ]),
-        const SizedBox(height: 16),
-        Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('Top Endpoints by Volume', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-          _endpointRow('POST /api/v1/transfers', '3.2M', '18ms', '0.05%'),
-          _endpointRow('POST /api/v1/auth/token', '2.8M', '12ms', '0.02%'),
-          _endpointRow('GET /api/v1/accounts/:id', '2.1M', '8ms', '0.01%'),
-          _endpointRow('POST /api/v1/payments', '1.5M', '45ms', '0.15%'),
-          _endpointRow('GET /api/v1/transactions', '1.2M', '32ms', '0.08%'),
-        ]))),
-        const SizedBox(height: 16),
-        Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('Status Code Distribution', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-          _statusBar('200 OK', 0.89, Colors.green),
-          _statusBar('201 Created', 0.06, Colors.blue),
-          _statusBar('400 Bad Request', 0.025, Colors.orange),
-          _statusBar('401 Unauthorized', 0.015, Colors.red),
-          _statusBar('500 Server Error', 0.001, Colors.red[900]!),
-        ]))),
-      ])),
+      appBar: AppBar(title: const Text('Api Analytics'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+              _kpi('API Calls/Day', '12.5M', Icons.api),
+              _kpi('Avg Latency', '28ms', Icons.speed),
+              _kpi('Error Rate', '0.08%', Icons.error_outline),
+              _kpi('Top Endpoint', '/v1/transfers', Icons.star),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('POST /v1/transfers'),
+              subtitle: Text('Write'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('3.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('GET /v1/accounts/balance'),
+              subtitle: Text('Read'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('5.8M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('POST /v1/payments/nibss'),
+              subtitle: Text('Write'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('GET /v1/statements'),
+              subtitle: Text('Read'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('850K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+          ],
+        ),
+      ),
     );
-  }
-
-  Widget _kpiCard(String label, String value, Color color) {
-    return Card(child: Padding(padding: const EdgeInsets.all(12), child: Column(children: [
-      Text(value, style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: color)),
-      Text(label, style: const TextStyle(fontSize: 11, color: Colors.grey)),
-    ])));
-  }
-
-  Widget _endpointRow(String endpoint, String volume, String latency, String errorRate) {
-    return ListTile(dense: true, title: Text(endpoint, style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
-      trailing: Text('$volume | $latency | $errorRate'));
-  }
-
-  Widget _statusBar(String label, double value, Color color) {
-    return Padding(padding: const EdgeInsets.symmetric(vertical: 4), child: Row(children: [
-      SizedBox(width: 130, child: Text(label, style: const TextStyle(fontSize: 12))),
-      Expanded(child: LinearProgressIndicator(value: value, color: color, minHeight: 8)),
-      const SizedBox(width: 8), Text('${(value * 100).toStringAsFixed(1)}%', style: const TextStyle(fontSize: 12)),
-    ]));
   }
 }

@@ -7,8 +7,6 @@ class SecurityHardeningScreen extends StatefulWidget {
 }
 
 class _SecurityHardeningScreenState extends State<SecurityHardeningScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _SecurityHardeningScreenState extends State<SecurityHardeningScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('CIS Controls', '256', Icons.security),
+              _kpi('Compliant', '256', Icons.check),
+              _kpi('Exceptions', '0', Icons.warning),
+              _kpi('Score', '100%', Icons.star),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Security Hardening Primary'),
-              subtitle: Text('Production'),
+              title: Text('Container Hardening'),
+              subtitle: Text('CIS Docker'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Distroless + non-root', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Hardened', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Security Hardening Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('Kubernetes Hardening'),
+              subtitle: Text('CIS K8s'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('PSP + NetworkPolicy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Hardened', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Security Hardening Canary'),
-              subtitle: Text('Test'),
+              title: Text('OS Hardening'),
+              subtitle: Text('CIS Ubuntu'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Minimal attack surface', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Hardened', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('TLS Configuration'),
+              subtitle: Text('Mozilla Modern'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('TLS 1.3 only', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Hardened', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],

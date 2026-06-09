@@ -7,8 +7,6 @@ class KafkaConsumerOptimizerScreen extends StatefulWidget {
 }
 
 class _KafkaConsumerOptimizerScreenState extends State<KafkaConsumerOptimizerScreen> {
-  bool _isLoading = false;
-
   Widget _kpi(String label, String value, IconData icon) {
     return Card(
       child: Padding(
@@ -43,47 +41,47 @@ class _KafkaConsumerOptimizerScreenState extends State<KafkaConsumerOptimizerScr
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Uptime', '99.99%', Icons.check_circle),
-              _kpi('Requests/s', '12,500', Icons.speed),
-              _kpi('P95 Latency', '45ms', Icons.timer),
-              _kpi('Error Rate', '0.01%', Icons.error),
+              _kpi('Groups', '48', Icons.group),
+              _kpi('Partitions', '1,024', Icons.grid_view),
+              _kpi('Max Lag', '250', Icons.schedule),
+              _kpi('Rebalances/day', '3', Icons.sync),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Kafka Consumer Optimizer Primary'),
-              subtitle: Text('Production'),
+              title: Text('txn-processors (32)'),
+              subtitle: Text('Range Assignor'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Lag 0-50', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Optimal', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Kafka Consumer Optimizer Secondary'),
-              subtitle: Text('Standby'),
+              title: Text('audit-writers (16)'),
+              subtitle: Text('Sticky Assignor'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Lag 0-100', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Optimal', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Kafka Consumer Optimizer Canary'),
-              subtitle: Text('Test'),
+              title: Text('notif-senders (8)'),
+              subtitle: Text('Cooperative'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Lag 0-250', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Acceptable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
-              title: Text('Last Deployment'),
-              subtitle: Text('v2.4.1'),
+              title: Text('analytics-agg (4)'),
+              subtitle: Text('Round-Robin'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
-                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
-                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+                Text('Lag 0-500', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Acceptable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
               ]),
             )),
           ],
