@@ -262,6 +262,14 @@ where F: FnMut() -> Result<T, E> {
         }
     }
 }
+
+fn extract_request_id(req: &actix_web::HttpRequest) -> String {
+    req.headers().get("X-Request-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8306);

@@ -1,6 +1,7 @@
 use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::collections::HashMap;
 use serde_json::json;
 use std::env;
@@ -567,6 +568,31 @@ fn security_headers() -> actix_web::middleware::DefaultHeaders {
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
 static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn validate_request(body: &serde_json::Value) -> Result<(), String> {
+    if body.is_null() { return Err("Request body is required".into()); }
+    if let Some(obj) = body.as_object() {
+        for (k, v) in obj {
+            if k.len() > 256 { return Err(format!("Field name too long: {}", &k[..32])); }
+            if let Some(s) = v.as_str() {
+                if s.len() > 10000 { return Err(format!("Field {} value too long", k)); }
+            }
+        }
+    }
+    Ok(())
+}
+
+
+#[derive(serde::Deserialize)]
+struct PaginationParams {
+    #[serde(default = "default_page")]
+    page: u32,
+    #[serde(default = "default_limit")]
+    limit: u32,
+}
+fn default_page() -> u32 { 1 }
+fn default_limit() -> u32 { 50 }
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8260".to_string()).parse().unwrap_or(8260);

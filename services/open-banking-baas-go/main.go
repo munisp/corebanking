@@ -260,6 +260,17 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+func requestIDMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rid := r.Header.Get("X-Request-Id")
+		if rid == "" {
+			rid = fmt.Sprintf("%d", time.Now().UnixNano())
+		}
+		w.Header().Set("X-Request-Id", rid)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initTracing()
 	port := os.Getenv("PORT")

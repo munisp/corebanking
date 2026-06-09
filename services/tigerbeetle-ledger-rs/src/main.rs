@@ -358,6 +358,28 @@ where F: FnMut() -> Result<T, E> {
         }
     }
 }
+
+fn extract_request_id(req: &actix_web::HttpRequest) -> String {
+    req.headers().get("X-Request-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+
+fn validate_request(body: &serde_json::Value) -> Result<(), String> {
+    if body.is_null() { return Err("Request body is required".into()); }
+    if let Some(obj) = body.as_object() {
+        for (k, v) in obj {
+            if k.len() > 256 { return Err(format!("Field name too long: {}", &k[..32])); }
+            if let Some(s) = v.as_str() {
+                if s.len() > 10000 { return Err(format!("Field {} value too long", k)); }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8301);
