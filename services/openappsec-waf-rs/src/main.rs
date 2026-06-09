@@ -105,6 +105,7 @@ async fn metrics() -> HttpResponse {
 
 // OpenAppSec WAF — Web Application Firewall with OWASP CRS patterns
 use std::sync::RwLock;
+use actix_cors::Cors;
 
 lazy_static::lazy_static! {
     static ref BLOCKED_IPS: RwLock<Vec<String>> = RwLock::new(Vec::new());
@@ -299,6 +300,13 @@ async fn main() -> std::io::Result<()> {
     println!("openappsec-waf-rs v2.0 on :{}", port);
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
+                    .max_age(86400)
+            )
             .app_data(state.clone())
             .route("/rules/custom", web::post().to(handle_custom_rule))
                 .route("/threat-intel/query", web::post().to(handle_threat_intel))

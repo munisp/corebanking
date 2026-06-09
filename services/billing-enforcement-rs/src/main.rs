@@ -340,6 +340,7 @@ fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
 
 // ─── Immutable Audit Trail ──────────────────────────────────────────────────
 use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
+use actix_cors::Cors;
 
 #[derive(Clone, serde::Serialize)]
 struct AuditEntry {

@@ -807,6 +807,7 @@ fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
 
 // ─── Immutable Audit Trail ──────────────────────────────────────────────────
 use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
+use actix_cors::Cors;
 
 #[derive(Clone, serde::Serialize)]
 struct AuditEntry {
@@ -887,6 +888,13 @@ async fn main() -> std::io::Result<()> {
     start_grpc_server("sanctions-screening-rs", 10343);
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
+                    .max_age(86400)
+            )
                 .wrap(
                     actix_web::middleware::DefaultHeaders::new()
                         .add(("X-Content-Type-Options", "nosniff"))

@@ -21,6 +21,7 @@ struct AppState {
 
 // Rate limiter
 use std::sync::atomic::AtomicI64;
+use actix_cors::Cors;
 static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
 static RL_LAST: AtomicU64 = AtomicU64::new(0);
 fn rl_allow() -> bool {
@@ -213,6 +214,13 @@ async fn main() -> std::io::Result<()> {
     println!("kafka-batch-producer-rs v2.0 on :{}", port);
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
+                    .max_age(86400)
+            )
             .app_data(state.clone())
             .route("/health", web::get().to(health))
             .route("/readyz", web::get().to(readyz))

@@ -5,6 +5,7 @@ edition = "2021"
 description = "54Bank FX & Rates Engine — exchange rates, currency conversion, spreads, rate history"
 
 [dependencies]
+actix-cors = "0.7"
 sha2 = "0.10"
 lazy_static = "1"
 tokio-postgres = { version = "0.7", features = ["default"] }

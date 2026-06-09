@@ -867,6 +867,7 @@ fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
 
 // ─── Immutable Audit Trail ──────────────────────────────────────────────────
 use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
+use actix_cors::Cors;
 
 #[derive(Clone, serde::Serialize)]
 struct AuditEntry {
@@ -958,6 +959,13 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         let trace_id = format!("trace-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
+                    .max_age(86400)
+            )
             .app_data(state.clone())
             .wrap(actix_web::middleware::DefaultHeaders::new()
                 .add(("X-Content-Type-Options", "nosniff"))

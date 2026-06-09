@@ -6,6 +6,7 @@ edition = "2021"
 name = "sanctions-engine-rs"
 path = "src/main.rs"
 [dependencies]
+actix-cors = "0.7"
 tokio-postgres = "0.7"
 sha2 = "0.10"
 lazy_static = "1"

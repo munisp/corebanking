@@ -399,6 +399,59 @@ import hashlib as _audit_hashlib
 import signal
 import sys
 
+# --- Rate Limiting ---
+import time as _time
+import threading as _threading
+
+class _RateLimiter:
+    """Token bucket rate limiter (100 req/s per IP)."""
+    def __init__(self, rate=100, burst=200):
+        self._rate = rate
+        self._burst = burst
+        self._tokens = {}
+        self._lock = _threading.Lock()
+
+    def allow(self, key="global"):
+        with self._lock:
+            now = _time.monotonic()
+            if key not in self._tokens:
+                self._tokens[key] = (self._burst, now)
+                return True
+            tokens, last = self._tokens[key]
+            elapsed = now - last
+            tokens = min(self._burst, tokens + elapsed * self._rate)
+            if tokens >= 1:
+                self._tokens[key] = (tokens - 1, now)
+                return True
+            return False
+
+_rate_limiter = _RateLimiter()
+
+
+# --- CORS & Security Headers ---
+CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+}
+
+def add_cors_headers(handler_self):
+    """Add CORS + security headers to HTTP response."""
+    for k, v in SECURITY_HEADERS.items():
+        handler_self.send_header(k, v)
+    origin = handler_self.headers.get("Origin", "") if hasattr(handler_self, 'headers') else ""
+    if origin in [o.strip() for o in CORS_ALLOWED_ORIGINS]:
+        handler_self.send_header("Access-Control-Allow-Origin", origin)
+    else:
+        handler_self.send_header("Access-Control-Allow-Origin", "https://dashboard.54bank.ng")
+    handler_self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+    handler_self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+    handler_self.send_header("Access-Control-Max-Age", "86400")
+
+
 def _graceful_shutdown(signum, frame):
     print(f"[ndpr-compliance-py] Received signal {signum}, shutting down gracefully...")
     sys.exit(0)

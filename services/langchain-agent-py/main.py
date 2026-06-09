@@ -1021,6 +1021,30 @@ def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload
 
 # ─── Immutable Audit Trail ───────────────────────────────────────────────────
 import hashlib as _audit_hashlib
+
+# --- CORS & Security Headers ---
+CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+}
+
+def add_cors_headers(handler_self):
+    """Add CORS + security headers to HTTP response."""
+    for k, v in SECURITY_HEADERS.items():
+        handler_self.send_header(k, v)
+    origin = handler_self.headers.get("Origin", "") if hasattr(handler_self, 'headers') else ""
+    if origin in [o.strip() for o in CORS_ALLOWED_ORIGINS]:
+        handler_self.send_header("Access-Control-Allow-Origin", origin)
+    else:
+        handler_self.send_header("Access-Control-Allow-Origin", "https://dashboard.54bank.ng")
+    handler_self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+    handler_self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+    handler_self.send_header("Access-Control-Max-Age", "86400")
+
 _audit_log = []  # Append-only. No deletion permitted.
 
 def append_audit_entry(service: str, operation: str, actor_id: str, entity_id: str,

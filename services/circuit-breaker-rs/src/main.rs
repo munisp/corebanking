@@ -483,6 +483,7 @@ fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
 
 // ─── Immutable Audit Trail ──────────────────────────────────────────────────
 use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
+use actix_cors::Cors;
 
 #[derive(Clone, serde::Serialize)]
 struct AuditEntry {
@@ -526,6 +527,13 @@ async fn main() -> std::io::Result<()> {
     println!("circuit-breaker-rs listening on :{}", port);
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
+                    .max_age(86400)
+            )
             .app_data(state.clone())
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(healthz))

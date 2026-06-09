@@ -5,6 +5,7 @@ edition = "2021"
 description = "54Bank Bulk Payment Processor — salary batch, NIBSS bulk transfers, reconciliation"
 
 [dependencies]
+actix-cors = "0.7"
 sha2 = "0.10"
 lazy_static = "1"
 tokio-postgres = { version = "0.7", features = ["default"] }

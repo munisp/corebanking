@@ -105,6 +105,7 @@ async fn metrics() -> HttpResponse {
 
 // Redis cache middleware — HTTP caching layer with stale-while-revalidate
 use std::sync::RwLock;
+use actix_cors::Cors;
 lazy_static::lazy_static! {
     static ref MIDDLEWARE_CACHE: RwLock<HashMap<String, (String, Instant, u64)>> = RwLock::new(HashMap::new());
 }
@@ -179,6 +180,13 @@ async fn main() -> std::io::Result<()> {
     println!("redis-cache-middleware-rs v2.0 on :{}", port);
     HttpServer::new(move || {
         App::new()
+            .wrap(
+                Cors::default()
+                    .allow_any_origin()
+                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
+                    .max_age(86400)
+            )
             .app_data(state.clone())
             .route("/health", web::get().to(health))
             .route("/readyz", web::get().to(readyz))

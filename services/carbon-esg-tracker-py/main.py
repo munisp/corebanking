@@ -369,6 +369,30 @@ import hashlib as _audit_hashlib
 import signal
 import sys
 
+# --- CORS & Security Headers ---
+CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+}
+
+def add_cors_headers(handler_self):
+    """Add CORS + security headers to HTTP response."""
+    for k, v in SECURITY_HEADERS.items():
+        handler_self.send_header(k, v)
+    origin = handler_self.headers.get("Origin", "") if hasattr(handler_self, 'headers') else ""
+    if origin in [o.strip() for o in CORS_ALLOWED_ORIGINS]:
+        handler_self.send_header("Access-Control-Allow-Origin", origin)
+    else:
+        handler_self.send_header("Access-Control-Allow-Origin", "https://dashboard.54bank.ng")
+    handler_self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+    handler_self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+    handler_self.send_header("Access-Control-Max-Age", "86400")
+
+
 def _graceful_shutdown(signum, frame):
     print(f"[carbon-esg-tracker-py] Received signal {signum}, shutting down gracefully...")
     sys.exit(0)
