@@ -57,7 +57,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn evaluate_waf(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -66,14 +65,14 @@ async fn evaluate_waf(req: actix_web::HttpRequest, state: web::Data<AppState>, b
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let input = body.into_inner();
-    let input_s = input.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let input = input_s.as_str();
-    let pattern_s = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let body_json = body.into_inner();
+    let input_s = body_json.get("input").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let input_val = input_s.as_str();
+    let pattern_s = body_json.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let pattern = pattern_s.as_str();
-    let mode_s = input.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let mode_s = body_json.get("mode").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mode = mode_s.as_str();
-    let result = match_rule(input, pattern, mode);
+    let result = match_rule(input_val, pattern, mode);
     let _result_data = json!({"endpoint": "evaluate_waf"});
     db_persist(&state, "evaluate_waf", &_result_data).await;
     // Inter-service call

@@ -5,6 +5,7 @@
 //! Batch rescreening, false positive management, decision audit trail, NFIU/GoAML reporting.
 //! Middleware: Kafka, Postgres, Redis, Temporal, OpenSearch
 
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
@@ -140,54 +141,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         "checks": {
             "database": db_status,
         },
-    }))
-}));
-    }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    let watchlist = state.watchlist.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("sanctions-engine-rs: upstream call ok"),
-        Err(e) => eprintln!("sanctions-engine-rs: upstream call failed: {}", e),
-    }
-    db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "service": "sanctions-engine-rs",
-        "status": "healthy",
-        "version": "3.0.0",
-        "uptime_secs": state.start_time.elapsed().as_secs(),
-        "domain": "Sanctions Screening Engine",
-        "watchlist_entries": watchlist.len(),
-        "total_screenings": screenings.len(),
-        "capabilities": [
-            "ofac_sdn_screening", "eu_consolidated_screening", "un_security_council",
-            "cbn_watchlist", "interpol_red_notice", "nfiu_watchlist", "pep_database",
-            "fuzzy_matching_levenshtein", "jaro_winkler", "soundex", "nysiis",
-            "transliteration", "alias_expansion", "batch_rescreening",
-            "false_positive_management", "decision_audit_trail",
-            "goaml_reporting", "nfiu_str_filing", "real_time_screening",
-            "transaction_screening", "customer_screening", "periodic_rescreening",
-        ],
-        "lists": {
-            "OFAC_SDN": {"entries": 12450, "last_updated": "2026-05-09"},
-            "EU_CONSOLIDATED": {"entries": 8920, "last_updated": "2026-05-08"},
-            "UN_SECURITY_COUNCIL": {"entries": 1245, "last_updated": "2026-05-07"},
-            "CBN_WATCHLIST": {"entries": 3200, "last_updated": "2026-05-09"},
-            "INTERPOL_RED": {"entries": 7890, "last_updated": "2026-05-06"},
-            "NFIU_WATCHLIST": {"entries": 1580, "last_updated": "2026-05-09"},
-            "PEP_DATABASE": {"entries": 45600, "last_updated": "2026-05-05"},
-        },
-        "thresholds": {"auto_clear": 0.3, "potential_match": 0.7, "high_confidence": 0.9, "auto_block": 0.95},
-        "algorithms": ["exact_match", "levenshtein", "jaro_winkler", "soundex", "nysiis", "transliteration", "alias_expansion", "phonetic_matching"],
-        "middleware": {
-            "kafka": "sanctions.screenings, sanctions.alerts, sanctions.decisions, sanctions.str-filings",
-            "postgres": "sanctions_screenings, sanctions_decisions, watchlist_entries, false_positives",
-            "redis": "screening_cache (dedup by name+list hash), watchlist_index",
-            "temporal": "BatchRescreenWorkflow, AlertEscalationWorkflow, STRFilingWorkflow",
-            "opensearch": "sanctions-audit-2026",
-        }
     }))
 }
 
@@ -1048,6 +1001,7 @@ async fn main() -> std::io::Result<()> {
             Screening { id: "SCR-SEED-002".into(), entity_name: "AL-RASHID TRADING COMPANY".into(), entity_type: "organization".into(), match_score: 0.87, status: "potential_match".into(), matched_entry: Some("AL RASHID TRADING COMPANY (OFAC SDN)".into()), matched_list: Some("OFAC_SDN".into()), decision: "escalate".into(), algorithms_used: vec!["exact_match".into(), "fuzzy_overlap".into(), "alias_expansion".into()], lists_screened: vec!["OFAC_SDN".into(), "EU_CONSOLIDATED".into(), "UN_SECURITY_COUNCIL".into(), "CBN_WATCHLIST".into(), "INTERPOL_RED".into()], screening_type: "transaction".into(), risk_level: "high".into(), screened_by: "system".into(), screened_at: "2026-05-09T14:35:00Z".into(), decision_by: None, decision_at: None, notes: None },
         ]),
         watchlist: Mutex::new(seed_watchlist()),
+        db_client: None,
     });
     println!("Sanctions Screening Engine v3.0 (Rust) on :{} — OFAC/EU/UN/CBN/INTERPOL/NFIU/PEP", port);
     start_grpc_server("sanctions-engine-rs", 10321);

@@ -57,7 +57,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn trace_animal(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -67,12 +66,12 @@ async fn trace_animal(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     let input = body.into_inner();
-    let state_s = input.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let state = state_s.as_str();
+    let animal_state_s = input.get("state").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let animal_state = animal_state_s.as_str();
     let species_s = input.get("species").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let species = species_s.as_str();
     let seq = input.get("seq").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    let result = generate_nlis_tag(state, species, seq);
+    let result = generate_nlis_tag(animal_state, species, seq);
     // Inter-service call: register_animal
     let _upstream_url = std::env::var("AGRI_BANKING_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     match call_service_sync(&format!("{}/v1/register", _upstream_url), "{}") {

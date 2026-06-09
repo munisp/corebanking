@@ -1064,8 +1064,6 @@ fn append_audit_entry(service: &str, operation: &str, actor_id: &str, entity_id:
 }
 
 
-#[actix_web::main]
-
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
         let id = format!("{}-{}", endpoint, chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
@@ -1120,6 +1118,7 @@ async fn main() -> std::io::Result<()> {
     let data = web::Data::new(AppState {
         db_url,
         reports: Mutex::new(Vec::new()),
+        db_client: None,
     });
 
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
@@ -1184,10 +1183,7 @@ mod tests {
     #[test]
     fn test_generate_efass_exists() {
         // Verify generate_efass compiles and is callable
-        // Domain function: generate_efass(
-    data: web::Data<AppState>,
-    query: web::Query<HashMap<String, String>>,
-) -> HttpResponse
+        // Domain function: generate_efass(data: web::Data<AppState>, query: web::Query<HashMap<String, String>>) -> HttpResponse
         assert!(true, "generate_efass should be defined");
     }
 
@@ -1201,9 +1197,7 @@ mod tests {
     #[test]
     fn test_validate_report_endpoint_exists() {
         // Verify validate_report_endpoint compiles and is callable
-        // Domain function: validate_report_endpoint(
-    query: web::Query<HashMap<String, String>>,
-) -> HttpResponse
+        // Domain function: validate_report_endpoint(query: web::Query<HashMap<String, String>>) -> HttpResponse
         assert!(true, "validate_report_endpoint should be defined");
     }
 

@@ -591,35 +591,21 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}", e); e.into_inner() });
-    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    let _cbn = cbn_reporting_threshold_ngn();
-    HttpResponse::Ok().json(json!({
-        "status": "healthy",
-        "service": "falkordb-graph-engine-rs",
-        "version": "1.0.0",
-        "falkordb": {"url": state.falkordb.redis_url, "graph": state.falkordb.graph_name},
-        "graph": {"entities": entities.len(), "edges": edges.len()},
-        "capabilities": [
-            "entity_resolution", "transaction_network_analysis", "circular_transaction_detection",
-            "community_detection", "centrality_computation", "path_finding",
-            "aml_pattern_detection", "fibo_coa_graph", "real_time_risk_scoring"
-        ]
-    }))
 }
 
 async fn metrics() -> HttpResponse {
     let r = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
     let e = ERROR_COUNT.load(AtomicOrdering::Relaxed);
+    let svc = "falkordb-graph-engine-rs";
     HttpResponse::Ok().body(format!(
-        "# TYPE requests_total counter\nrequests_total{{service=\"falkordb-graph-engine-rs\"}} {}\n# TYPE errors_total counter\nerrors_total{{service=\"falkordb-graph-engine-rs\"}} {}\n", r, e))
+        "# TYPE requests_total counter\nrequests_total{{service=\"{svc}\"}} {r}\n# TYPE errors_total counter\nerrors_total{{service=\"{svc}\"}} {e}\n"))
 }
 
 
 // --- Alerting ---
 async fn alerts_endpoint() -> HttpResponse {
-    let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
-    let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
+    let reqs = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
+    let errs = ERROR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
     let mut fired = Vec::<serde_json::Value>::new();
     if error_rate > 0.05 {
@@ -692,7 +678,8 @@ async fn detect_circular(req: actix_web::HttpRequest, state: web::Data<AppState>
 
     // Inter-service: notify AML engine
     let upstream = env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://aml-engine-rs:8080".to_string());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!("{{\"source\": \"falkordb-graph-engine-rs\", \"circular_txns\": {}}}", cycles.len()));
+    let notify_body = serde_json::json!({"source": "falkordb-graph-engine-rs", "circular_txns": cycles.len()}).to_string();
+    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &notify_body);
 
     db_persist(&state, "detect_circular", &json!({"cycles_found": cycles.len()})).await;
     HttpResponse::Ok().json(json!({"circularTransactions": cycles, "count": cycles.len()}))

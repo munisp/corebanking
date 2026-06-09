@@ -3,6 +3,7 @@
 //! Closes gaps 13-16: Cheque Clearing, Collateral, Cash Management, SWIFT/Correspondent
 //! All post double-entry journal entries to GL with 14 middleware integration.
 
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde_json::json;
@@ -322,22 +323,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         },
     }))
 }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    HttpResponse::Ok().json(json!({
-        "status": "healthy",
-        "service": "banking-clearing-ops-rs",
-        "version": "1.0.0",
-        "gaps_closed": ["Gap 13: Cheque Clearing → GL", "Gap 14: Collateral → GL", "Gap 15: Cash Management → GL", "Gap 16: SWIFT/Correspondent → GL"],
-        "middleware": {
-            "kafka": "connected", "dapr": "connected", "fluvio": "connected",
-            "temporal": "connected", "postgres": "connected", "keycloak": "connected",
-            "permify": "connected", "redis": "connected", "mojaloop": "connected",
-            "opensearch": "connected", "openappsec": "connected", "apisix": "connected",
-            "tigerbeetle": "connected", "lakehouse": "connected"
-        }
-    }))
-}
-
 
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);

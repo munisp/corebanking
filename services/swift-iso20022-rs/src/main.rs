@@ -3,6 +3,7 @@
 // MT103 (Customer Credit Transfer), MT202 (Bank-to-Bank), MT760 (Guarantee)
 // pacs.008 (FI to FI Customer Credit), pacs.009 (FI to FI Institution Credit)
 // camt.053 (Bank-to-Customer Statement), SWIFT gpi tracking (UETR)
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 #[derive(Clone)]
-struct AppState { start_time: Instant     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+struct AppState { start_time: Instant, db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -69,26 +70,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         },
     }))
 }
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "service": "swift-iso20022-rs",
-        "status": "healthy",
-        "protocol": ["MT103", "MT202", "MT760", "pacs.008", "pacs.009", "camt.053"],
-        "gpi": "SWIFT_gpi_4.0",
-        "uptime_secs": state.start_time.elapsed().as_secs(),
-        "middleware": {
-            "kafka": "topics: swift.outbound, swift.inbound, swift.gpi.tracker",
-            "postgres": "tables: swift_messages, gpi_tracking, correspondent_banks",
-            "redis": "uetr_cache, bic_directory_cache",
-            "tigerbeetle": "nostro_ledger_accounts (1101-1108)",
-            "opensearch": "swift-messages-2026, swift-audit-2026",
-            "temporal": "SWIFTMessageRoutingWorkflow, GpiTrackingWorkflow",
-            "permify": "swift:send_mt103, swift:approve_mt760",
-            "fluvio": "swift-realtime-tracking",
-            "apisix": "swift-api-gateway",
-            "keycloak": "swift-operators-realm"
-        }
-    }))
-}
 
 async fn list_messages() -> HttpResponse {
     let messages = vec![
@@ -139,7 +120,6 @@ async fn validate_mt103(req: actix_web::HttpRequest, state: web::Data<AppState>,
         HttpResponse::BadRequest().json(json!({"valid": false, "errors": errors}))
     }
 }
-
 
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -834,7 +814,7 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8112".to_string());
-    let state = AppState { start_time: Instant::now() };
+    let state = AppState { start_time: Instant::now(), db_client: None };
     println!("SWIFT/ISO 20022 Engine (Rust) on :{} — MT + MX protocol", port);
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
     let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };

@@ -3,6 +3,7 @@
 //! Enhancements 3, 4: eNaira/CBDC Integration, Real-Time Fraud Detection (ML)
 //! High-performance sub-100ms scoring on every transaction
 
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde_json::json;
@@ -219,13 +220,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         },
     }))
 }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    HttpResponse::Ok().json(json!({
-        "status": "healthy", "service": "ai-fraud-scoring-rs", "version": "1.0.0",
-        "enhancements": ["3: eNaira/CBDC", "4: Real-Time Fraud ML"]
-    }))
-}
-
 
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);

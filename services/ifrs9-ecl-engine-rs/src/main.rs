@@ -5,6 +5,7 @@
 //! Pipeline: Loan Book → Credit Risk Assessment → Stage Classification → ECL Computation → GL Provisioning
 //! Integrates with all 14 middleware.
 
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
@@ -223,22 +224,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         },
     }))
 }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    HttpResponse::Ok().json(json!({
-        "status": "healthy",
-        "service": "ifrs9-ecl-engine-rs",
-        "version": "1.0.0",
-        "pipeline": "Loan Book → IFRS9 Stage → PD/LGD/EAD → ECL → GL Provisioning (1355-1357)",
-        "middleware": {
-            "kafka": "connected", "dapr": "connected", "fluvio": "connected",
-            "temporal": "connected", "postgres": "connected", "keycloak": "connected",
-            "permify": "connected", "redis": "connected", "mojaloop": "connected",
-            "opensearch": "connected", "openappsec": "connected", "apisix": "connected",
-            "tigerbeetle": "connected", "lakehouse": "connected"
-        }
-    }))
-}
-
 
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -348,9 +333,7 @@ fn add_security_headers(resp: &mut actix_web::HttpResponse) {
 fn sanitize_input(s: &str) -> String {
     let s = s.replace('<', "&lt;").replace('>', "&gt;")
         .replace('\'', "&#39;").replace('"', "&quot;");
-    if s.len() > 10000 { s[..10000].to_string() } else { s } else {
-        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
-    }
+    if s.len() > 10000 { s[..10000].to_string() } else { s }
 }
 
 

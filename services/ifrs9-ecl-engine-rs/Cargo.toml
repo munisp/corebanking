@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
+tokio-postgres = "0.7"
 sha2 = "0.10"
 lazy_static = "1"
 uuid = { version = "1", features = ["v4"] }

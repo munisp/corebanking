@@ -2,6 +2,7 @@
 //! 54Bank Operations Control GL Engine — Rust
 //! Closes gaps 21-23: Maker-Checker Execution, Limit Management, Product→GL Mapping
 
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde_json::json;
@@ -342,15 +343,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         },
     }))
 }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    HttpResponse::Ok().json(json!({
-        "status": "healthy",
-        "service": "operations-control-gl-rs",
-        "version": "1.0.0",
-        "gaps_closed": ["Gap 21: Maker-Checker → GL", "Gap 22: Limits → Off-BS GL", "Gap 23: Product → GL Mapping"]
-    }))
-}
-
 
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);

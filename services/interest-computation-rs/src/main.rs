@@ -34,11 +34,6 @@ struct AppState {
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
-
-
-
-}
-
 fn generate_accrual_schedule(principal: f64, rate: f64, days: u32, freq: &str) -> Vec<serde_json::Value> {
     let periods = match freq {
         "daily" => days,
@@ -418,16 +413,15 @@ fn compute_dti(monthly_income: AmountKobo, existing_debt: AmountKobo, proposed_e
 }
 
 /// Interest computation with day-count conventions
-fn compute_simple_interest(principal: AmountKobo, annual_rate_pct: f64, days: u32, day_basis: u32) -> AmountKobo {
-    let interest = principal.0 as f64 * (annual_rate_pct / 100.0) * (days as f64 / day_basis as f64);
-    AmountKobo(interest.round() as i64)
+fn compute_simple_interest(principal: f64, annual_rate_pct: f64, days: u32, day_basis: u32) -> f64 {
+    principal * (annual_rate_pct / 100.0) * (days as f64 / day_basis as f64)
 }
 
-fn compute_compound_interest(principal: AmountKobo, annual_rate_pct: f64, days: u32, day_basis: u32, freq: u32) -> AmountKobo {
+fn compute_compound_interest(principal: f64, annual_rate_pct: f64, days: u32, day_basis: u32, freq: u32) -> f64 {
     let periods = days as f64 / (day_basis as f64 / freq as f64);
     let rate_per_period = annual_rate_pct / 100.0 / freq as f64;
-    let amount = principal.0 as f64 * (1.0 + rate_per_period).powf(periods);
-    AmountKobo((amount - principal.0 as f64).round() as i64)
+    let amount = principal * (1.0 + rate_per_period).powf(periods);
+    amount - principal
 }
 
 fn get_day_basis(convention: &str) -> u32 {

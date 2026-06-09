@@ -86,7 +86,7 @@ struct UpsertRequest {
     pub points: Vec<VectorPoint>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CollectionConfig {
     pub name: String,
     pub vector_size: u32,
@@ -604,37 +604,21 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}", e); e.into_inner() });
-    let points = state.points.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    let total_points: usize = points.values().map(|v| v.len()).sum();
-    let _cbn = cbn_reporting_threshold_ngn();
-    HttpResponse::Ok().json(json!({
-        "status": "healthy",
-        "service": "qdrant-vector-store-rs",
-        "version": "1.0.0",
-        "qdrant": {"url": state.qdrant.base_url},
-        "collections": collections.len(),
-        "totalVectors": total_points,
-        "capabilities": [
-            "semantic_search", "regulatory_document_retrieval", "entity_deduplication",
-            "transaction_similarity", "rag_retrieval", "ontology_embedding",
-            "cosine_similarity", "document_classification"
-        ]
-    }))
 }
 
 async fn metrics() -> HttpResponse {
     let r = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
     let e = ERROR_COUNT.load(AtomicOrdering::Relaxed);
+    let svc = "qdrant-vector-store-rs";
     HttpResponse::Ok().body(format!(
-        "# TYPE requests_total counter\nrequests_total{{service=\"qdrant-vector-store-rs\"}} {}\n# TYPE errors_total counter\nerrors_total{{service=\"qdrant-vector-store-rs\"}} {}\n", r, e))
+        "# TYPE requests_total counter\nrequests_total{{service=\"{svc}\"}} {r}\n# TYPE errors_total counter\nerrors_total{{service=\"{svc}\"}} {e}\n"))
 }
 
 
 // --- Alerting ---
 async fn alerts_endpoint() -> HttpResponse {
-    let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
-    let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
+    let reqs = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
+    let errs = ERROR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
     let mut fired = Vec::<serde_json::Value>::new();
     if error_rate > 0.05 {
@@ -738,7 +722,8 @@ async fn search_regulations(req: actix_web::HttpRequest, state: web::Data<AppSta
 
     // Inter-service: notify knowledge graph
     let upstream = env::var("NEO4J_KG_URL").unwrap_or_else(|_| "http://neo4j-knowledge-graph-go:8080".to_string());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!("{{\"source\": \"qdrant-vector-store-rs\", \"action\": \"regulation_search\", \"query\": \"{}\"}}", query_text));
+    let notify_body = serde_json::json!({"source": "qdrant-vector-store-rs", "action": "regulation_search", "query": query_text}).to_string();
+    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &notify_body);
 
     HttpResponse::Ok().json(json!({"query": query_text, "results": results, "count": results.len(), "engine": "qdrant"}))
 }

@@ -8,6 +8,7 @@ name = "reconciliation-engine-rs"
 path = "src/main.rs"
 
 [dependencies]
+tokio-postgres = "0.7"
 sha2 = "0.10"
 lazy_static = "1"
 chrono = { version = "0.4", features = ["serde"] }

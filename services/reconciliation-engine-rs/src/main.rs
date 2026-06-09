@@ -5,6 +5,7 @@
 //! GL suspense clearance, and generates CBN reconciliation returns.
 //! Middleware: Kafka, Postgres, Redis, Temporal, OpenSearch
 
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
@@ -122,42 +123,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         "checks": {
             "database": db_status,
         },
-    }))
-}));
-    }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("reconciliation-engine-rs: upstream call ok"),
-        Err(e) => eprintln!("reconciliation-engine-rs: upstream call failed: {}", e),
-    }
-    db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "service": "reconciliation-engine-rs",
-        "status": "healthy",
-        "version": "3.0.0",
-        "uptime_secs": state.start_time.elapsed().as_secs(),
-        "domain": "Settlement & GL Reconciliation Engine",
-        "capabilities": [
-            "gl_nostro_reconciliation", "settlement_position_matching",
-            "suspense_clearance", "cbn_reserve_recon", "vostro_matching",
-            "auto_reconciliation", "aging_analysis", "cbn_returns_generation",
-            "inter_branch_balancing", "fx_position_recon", "treasury_position_match",
-            "eod_balance_verification", "audit_trail",
-        ],
-        "gl_codes_reconciled": [
-            "1101 (CBN Reserve)", "1102 (Nostro Accounts)", "1103 (Vostro Accounts)",
-            "1104 (Interbank Settlement)", "1410 (Suspense - Uncleared)",
-            "1999 (Reconciliation Suspense)", "9201 (Contingent - LC/BG)",
-        ],
-        "middleware": {
-            "kafka": "recon.settlement, recon.nostro, recon.suspense-clearance",
-            "postgres": "settlement_recons, nostro_positions, suspense_items, recon_audit",
-            "redis": "eod_positions (TTL: end of day)",
-            "temporal": "SettlementReconWorkflow, SuspenseClearanceWorkflow",
-            "opensearch": "settlement-recon-2026",
-        }
     }))
 }
 
@@ -975,6 +940,7 @@ async fn main() -> std::io::Result<()> {
             SuspenseItem { id: "SUS-002".into(), gl_code: "1999".into(), gl_name: "Recon Suspense".into(), amount: 345_678.50, aging_days: 5, source: "POS_ISW".into(), reason: "Duplicate settlement reference".into(), status: "open".into(), assigned_to: None, created_at: "2026-05-04T10:00:00Z".into() },
             SuspenseItem { id: "SUS-003".into(), gl_code: "1410".into(), gl_name: "Uncleared Effects".into(), amount: 750_000.0, aging_days: 1, source: "RTGS_inward".into(), reason: "Awaiting confirmation from CBN".into(), status: "open".into(), assigned_to: Some("Treasury".into()), created_at: "2026-05-08T16:00:00Z".into() },
         ]),
+        db_client: None,
     });
     println!("Settlement Reconciliation Engine v3.0 (Rust) on :{}", port);
     start_grpc_server("reconciliation-engine-rs", 10440);

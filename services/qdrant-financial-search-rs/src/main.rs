@@ -446,7 +446,7 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-})) }
+}
 async fn ready() -> HttpResponse { HttpResponse::Ok().json(json!({"ready": true, "service": "qdrant-financial-search-rs"})) }
 async fn live() -> HttpResponse { HttpResponse::Ok().json(json!({"live": true})) }
 async fn metrics() -> HttpResponse {
@@ -464,7 +464,7 @@ async fn semantic_search(req: actix_web::HttpRequest, state: web::Data<AppState>
     let input = body.into_inner();
     db_persist(&state, "semantic_search", &input).await;
     let upstream = env::var("GL_ENGINE_URL").unwrap_or_else(|_| "http://gl-engine-rs:8080".into());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!(r#"{"source": "qdrant-financial-search-rs", "action": "semantic_search"}"#));
+    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &r#"{"source": "qdrant-financial-search-rs", "action": "semantic_search"}"#.to_string());
     HttpResponse::Ok().json(json!({"service": "qdrant-financial-search-rs", "endpoint": "semantic_search", "result": input}))
 }
 
@@ -476,7 +476,7 @@ async fn index_document(req: actix_web::HttpRequest, state: web::Data<AppState>,
     let input = body.into_inner();
     db_persist(&state, "index_document", &input).await;
     let upstream = env::var("GL_ENGINE_URL").unwrap_or_else(|_| "http://gl-engine-rs:8080".into());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!(r#"{"source": "qdrant-financial-search-rs", "action": "index_document"}"#));
+    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &r#"{"source": "qdrant-financial-search-rs", "action": "index_document"}"#.to_string());
     HttpResponse::Ok().json(json!({"service": "qdrant-financial-search-rs", "endpoint": "index_document", "result": input}))
 }
 

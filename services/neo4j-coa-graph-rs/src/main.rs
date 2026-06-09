@@ -554,7 +554,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn ready() -> HttpResponse { HttpResponse::Ok().json(json!({"ready": true, "service": "neo4j-coa-graph-rs"})) }

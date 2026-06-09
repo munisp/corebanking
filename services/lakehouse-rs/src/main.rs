@@ -65,7 +65,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 // query_lake: Proxies SQL queries to the DuckDB lakehouse query engine.

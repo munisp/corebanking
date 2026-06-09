@@ -16,7 +16,6 @@ struct AppState {
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
-fn validate_nuban(account: &str) -> bool { account.len() == 10 && account.chars().all(|c| c.is_ascii_digit()) }
 fn compute_batch_hash(amounts: &[f64]) -> f64 { amounts.iter().sum() }
 fn batch_success_rate(total: u32, successful: u32) -> f64 { if total == 0 { 0.0 } else { successful as f64 / total as f64 * 100.0 } }
 fn nibss_fee(amount: f64) -> f64 {
@@ -60,7 +59,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn process_batch(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -72,7 +70,8 @@ async fn process_batch(req: actix_web::HttpRequest, state: web::Data<AppState>, 
     let input = body.into_inner();
     let account_s = input.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let account = account_s.as_str();
-    let result = validate_nuban(account);
+    let bank_code = input.get("bank_code").and_then(|v| v.as_str()).unwrap_or("000");
+    let result = validate_nuban(bank_code, account);
     let _result_data = json!({"endpoint": "process_batch"});
     db_persist(&state, "process_batch", &_result_data).await;
     // Inter-service call

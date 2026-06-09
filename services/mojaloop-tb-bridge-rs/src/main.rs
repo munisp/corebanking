@@ -18,7 +18,7 @@ struct AppState {
 
 fn dfsp_position(credits: f64, debits: f64) -> f64 { credits - debits }
 fn settlement_eligible(position: f64, ndc: f64) -> bool { position.abs() <= ndc }
-fn window_status(open: bool, settled: bool) -> &str {
+fn window_status(open: bool, settled: bool) -> &'static str {
     if settled { "SETTLED" } else if open { "OPEN" } else { "CLOSED" }
 }
 
@@ -59,7 +59,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn sync_transfer(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {

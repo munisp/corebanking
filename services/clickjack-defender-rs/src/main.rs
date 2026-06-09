@@ -55,7 +55,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn check_frame(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -69,7 +68,7 @@ async fn check_frame(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
     let origin = origin_s.as_str();
     let allowed_s = input.get("allowed").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let allowed = allowed_s.as_str();
-    let result = frame_policy(origin, allowed);
+    let result = frame_policy(origin, &[allowed]);
     let _result_data = json!({"endpoint": "check_frame"});
     db_persist(&state, "check_frame", &_result_data).await;
     // Inter-service call

@@ -1,4 +1,5 @@
 #![allow(unused)]
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
@@ -254,42 +255,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         "checks": {
             "database": db_status,
         },
-    }))
-}));
-    }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    // Inter-service call
-    let _upstream_url = std::env::var("KYC_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8122".to_string());
-    match call_service_sync(&format!("{}/v1/verify", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("cbn-tiered-kyc-rs: upstream call ok"),
-        Err(e) => eprintln!("cbn-tiered-kyc-rs: upstream call failed: {}", e),
-    }
-    db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "service": "cbn-tiered-kyc-rs",
-        "status": "healthy",
-        "version": "2.0.0",
-        "uptime_secs": state.start_time.elapsed().as_secs(),
-        "domain": "CBN Tiered KYC Rules Engine",
-        "capabilities": [
-            "tier1_basic_mobile_money", "tier2_standard",
-            "tier3_enhanced_full_banking", "limit_enforcement",
-            "upgrade_path_assessment", "compliance_scoring",
-            "cbn_circular_compliance", "real_time_limit_check",
-            "tier_downgrade_detection", "regulatory_reporting",
-        ],
-        "tiers": {
-            "tier1": {"max_balance": 300000, "daily_limit": 50000, "docs": 3},
-            "tier2": {"max_balance": 500000, "daily_limit": 200000, "docs": 5},
-            "tier3": {"max_balance": "unlimited", "daily_limit": "unlimited", "docs": 9},
-        },
-        "middleware": {
-            "kafka": "cbn-kyc.assessments, cbn-kyc.limit-checks, cbn-kyc.compliance",
-            "postgres": "cbn_tier_assessments, cbn_limit_checks",
-            "redis": "tier_cache (TTL 5min), limit_counters (TTL 24h)",
-            "temporal": "CBNTierAssessmentWorkflow",
-            "opensearch": "cbn-tiered-kyc-2026",
-        }
     }))
 }
 
@@ -1060,6 +1025,7 @@ async fn main() -> std::io::Result<()> {
         start_time: Instant::now(),
         assessments: Mutex::new(vec![]),
         limit_checks: Mutex::new(vec![]),
+        db_client: None,
     };
     println!("CBN Tiered KYC Rules Engine v2.0 (Rust) on :{}", port);
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
@@ -1096,6 +1062,7 @@ async fn main() -> std::io::Result<()> {
                 start_time: state.start_time,
                 assessments: Mutex::new(vec![]),
                 limit_checks: Mutex::new(vec![]),
+                db_client: None,
             }))
             .wrap(actix_web::middleware::DefaultHeaders::new()
                 .add(("X-Content-Type-Options", "nosniff"))

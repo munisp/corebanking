@@ -16,7 +16,7 @@ struct AppState {
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
-fn select_voice(language: &str, gender: &str) -> &str {
+fn select_voice(language: &str, gender: &str) -> &'static str {
     match (language, gender) { ("en-NG", "male") => "ng-en-male-1", ("en-NG", "female") => "ng-en-female-1",
         ("yo", _) => "ng-yo-1", ("ig", _) => "ng-ig-1", ("ha", _) => "ng-ha-1", ("pcm", _) => "ng-pcm-1", _ => "ng-en-male-1" }
 }
@@ -60,7 +60,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn synthesize(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {

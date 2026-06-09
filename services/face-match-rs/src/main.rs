@@ -1,4 +1,5 @@
 #![allow(unused)]
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
@@ -105,45 +106,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         "checks": {
             "database": db_status,
         },
-    }))
-}));
-    }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("face-match-rs: upstream call ok"),
-        Err(e) => eprintln!("face-match-rs: upstream call failed: {}", e),
-    }
-    db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "service": "face-match-engine-rs",
-        "status": "healthy",
-        "version": "2.0.0",
-        "uptime_secs": state.start_time.elapsed().as_secs(),
-        "model": "ArcFace-R100 (512-dim cosine similarity) + DeepFace routing",
-        "deepface_integration": {
-            "enabled": true,
-            "inference_url": std::env::var("LIVENESS_INFERENCE_URL").unwrap_or_else(|_| "http://localhost:8230".into()),
-            "supported_models": ["VGG-Face", "FaceNet", "FaceNet512", "OpenFace", "DeepFace", "DeepID", "ArcFace", "Dlib", "SFace", "GhostFaceNet", "Buffalo_L"],
-            "supported_backends": ["postgres", "pgvector", "mongo", "pinecone", "weaviate"],
-            "endpoints": ["/v1/face-match", "/v1/face/search", "/v1/face/register", "/v1/dedup/check"],
-        },
-        "threshold": 0.68,
-        "capabilities": [
-            "1:1_face_comparison", "1:N_gallery_search",
-            "age_estimation", "gender_estimation",
-            "quality_assessment", "adaptive_threshold",
-            "deepface_routing", "pgvector_search",
-            "customer_deduplication", "multi_model_ensemble",
-        ],
-        "middleware": {
-            "kafka": "face-match.events, face-match.audit",
-            "postgres": "face_matches, face_embeddings (pgvector)",
-            "redis": "embedding_cache (TTL 10min)",
-            "temporal": "FaceMatchWorkflow",
-            "opensearch": "face-match-2026",
-        }
     }))
 }
 

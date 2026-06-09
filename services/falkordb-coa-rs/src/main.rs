@@ -454,7 +454,7 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-})) }
+}
 async fn ready() -> HttpResponse { HttpResponse::Ok().json(json!({"ready": true, "service": "falkordb-coa-rs"})) }
 async fn live() -> HttpResponse { HttpResponse::Ok().json(json!({"live": true})) }
 async fn metrics() -> HttpResponse {
@@ -472,7 +472,7 @@ async fn graph_query(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
     let input = body.into_inner();
     db_persist(&state, "graph_query", &input).await;
     let upstream = env::var("GL_ENGINE_URL").unwrap_or_else(|_| "http://gl-engine-rs:8080".into());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!(r#"{"source": "falkordb-coa-rs", "action": "graph_query"}"#));
+    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &r#"{"source": "falkordb-coa-rs", "action": "graph_query"}"#.to_string());
     HttpResponse::Ok().json(json!({"service": "falkordb-coa-rs", "endpoint": "graph_query", "result": input}))
 }
 

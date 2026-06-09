@@ -16,8 +16,6 @@ struct AppState {
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
-fn validate_bvn(bvn: &str) -> bool { bvn.len() == 11 && bvn.chars().all(|c| c.is_ascii_digit()) }
-fn validate_nin(nin: &str) -> bool { nin.len() == 11 && nin.chars().all(|c| c.is_ascii_digit()) }
 fn kyc_step_name(step: u8) -> &'static str {
     match step { 1 => "bvn_capture", 2 => "nin_capture", 3 => "selfie_upload", 4 => "document_upload", 5 => "review", _ => "complete" }
 }
@@ -59,7 +57,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn initiate_kyc(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {

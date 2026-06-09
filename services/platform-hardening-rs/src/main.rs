@@ -4,6 +4,7 @@
 //! Test Coverage, Security Scanning, DB Indexing, API Versioning,
 //! Feature Flags, Secrets Management, GraphQL, Event Sourcing
 
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde_json::json;
@@ -373,13 +374,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         },
     }))
 }
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    HttpResponse::Ok().json(json!({
-        "status": "healthy", "service": "platform-hardening-rs", "version": "1.0.0",
-        "enhancements": ["21: Test Coverage", "22: Security Scanning", "23: DB Indexing", "24: API Versioning", "25: Feature Flags", "26: Secrets Mgmt", "27: GraphQL", "28: Event Sourcing", "Quick Wins 1-5"]
-    }))
-}
-
 
 // --- Production Hardening: readyz / livez / metrics ---
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);

@@ -57,7 +57,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn process_claim(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -71,7 +70,7 @@ async fn process_claim(req: actix_web::HttpRequest, state: web::Data<AppState>, 
     let cause = cause_s.as_str();
     let covered_causes_s = input.get("covered_causes").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let covered_causes = covered_causes_s.as_str();
-    let result = verify_claim(cause, covered_causes);
+    let result = verify_claim(cause, &[covered_causes]);
     let _result_data = json!({"endpoint": "process_claim"});
     db_persist(&state, "process_claim", &_result_data).await;
     // Inter-service call

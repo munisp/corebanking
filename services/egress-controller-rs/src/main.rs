@@ -55,7 +55,6 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
             "database": db_status,
         },
     }))
-}))
 }
 
 async fn check_egress(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -69,7 +68,7 @@ async fn check_egress(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     let host = host_s.as_str();
     let whitelist_s = input.get("whitelist").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let whitelist = whitelist_s.as_str();
-    let result = allowed_destination(host, whitelist);
+    let result = allowed_destination(host, &[whitelist]);
     let _result_data = json!({"endpoint": "check_egress"});
     db_persist(&state, "check_egress", &_result_data).await;
     // Inter-service call

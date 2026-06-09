@@ -5,6 +5,7 @@
 //! Matching: exact hash, fuzzy (amount tolerance ±₦0.01), date window (T±1).
 //! Middleware: Kafka, Postgres, Redis, Temporal, OpenSearch
 
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
@@ -123,44 +124,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         "checks": {
             "database": db_status,
         },
-    }))
-}));
-    }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("recon-engine-rs: upstream call ok"),
-        Err(e) => eprintln!("recon-engine-rs: upstream call failed: {}", e),
-    }
-    db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "service": "recon-engine-rs",
-        "status": "healthy",
-        "version": "3.0.0",
-        "uptime_secs": state.start_time.elapsed().as_secs(),
-        "domain": "Transaction Reconciliation Engine",
-        "capabilities": [
-            "3_way_reconciliation", "nip_nibss_matching", "pos_isw_matching",
-            "card_visa_mc_matching", "enaira_cbdc_matching", "inter_branch_matching",
-            "fuzzy_amount_tolerance", "date_window_matching", "exception_management",
-            "auto_resolution", "batch_processing", "real_time_streaming",
-            "gl_suspense_posting", "audit_trail", "sla_monitoring",
-        ],
-        "channels": ["NIP", "NEFT", "POS_ISW", "POS_NIBSS", "VISA", "MASTERCARD", "VERVE", "eNaira", "RTGS", "INTER_BRANCH", "ATM", "USSD"],
-        "matching_rules": {
-            "exact": "Reference hash match (STAN + RRN + amount + date)",
-            "fuzzy_amount": "Tolerance ±₦0.01 for rounding differences",
-            "date_window": "T±1 business day for settlement delays",
-            "partial": "Amount split detection (one source → multiple targets)",
-        },
-        "middleware": {
-            "kafka": "recon.jobs, recon.exceptions, recon.resolutions",
-            "postgres": "recon_jobs, recon_exceptions, recon_matched, recon_suspense",
-            "redis": "recon_progress (real-time job tracking)",
-            "temporal": "ReconBatchWorkflow, ExceptionEscalationWorkflow",
-            "opensearch": "recon-audit-2026",
-        }
     }))
 }
 

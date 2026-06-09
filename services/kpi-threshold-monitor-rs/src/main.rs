@@ -1,9 +1,10 @@
 #![allow(unused)]
-use tokio_postgres;
+use tokio_postgres::{self, NoTls};
 // kpi-threshold-monitor-rs — Real-time KPI threshold monitoring with Kafka alert publishing
 // Port: 8501
 // Middleware: Postgres, Redis, Kafka, Dapr, Fluvio, Temporal, OpenSearch, Permify
 mod middleware_integration;
+use std::env;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
@@ -102,32 +103,6 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         "checks": {
             "database": db_status,
         },
-    }))
-}
-    let uptime = state.start_time.elapsed();
-    let alerts = state.alerts.read().unwrap();
-    let thresholds = state.thresholds.read().unwrap();
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("kpi-threshold-monitor-rs: upstream call ok"),
-        Err(e) => eprintln!("kpi-threshold-monitor-rs: upstream call failed: {}", e),
-    }
-    db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "service": state.service_name,
-        "status": "healthy",
-        "version": "1.0.0",
-        "uptime_secs": uptime.as_secs(),
-        "database": if state.db_url.is_empty() { "not_configured" } else { "configured" },
-        "active_alerts": alerts.iter().filter(|a| a.status == "active").count(),
-        "total_rules": thresholds.len(),
-        "enabled_rules": thresholds.iter().filter(|t| t.enabled).count(),
-        "middleware": {
-            "postgres": "configured",
-            "kafka": "configured",
-            "redis": "configured"
-        }
     }))
 }
 
@@ -1070,6 +1045,7 @@ async fn main() -> std::io::Result<()> {
         service_name: "kpi-threshold-monitor-rs".into(),
         alerts: Arc::new(RwLock::new(Vec::new())),
         thresholds: Arc::new(RwLock::new(default_thresholds())),
+        db_client: None,
     };
     
     println!("kpi-threshold-monitor-rs starting on :{} (8 threshold rules, Kafka alert publishing)", port);
