@@ -1394,7 +1394,7 @@ mux := http.NewServeMux()
 	_ = tlsEnabled
 	server := &http.Server{
         Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(idempotencyMiddleware(traceMiddleware(countingMiddleware(mux)))))),
         ReadTimeout:  15 * time.Second,
         WriteTimeout: 30 * time.Second,
         IdleTimeout:  60 * time.Second,
