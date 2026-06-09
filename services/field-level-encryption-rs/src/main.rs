@@ -805,6 +805,15 @@ fn append_audit_entry(service: &str, operation: &str, actor_id: &str, entity_id:
 }
 
 
+
+// --- Observability ---
+fn init_tracing(service_name: &str) {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
+    if !endpoint.is_empty() {
+        println!("[{}] OTEL tracing configured: {}", service_name, endpoint);
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8215);

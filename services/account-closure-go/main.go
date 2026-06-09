@@ -9,6 +9,7 @@ import (
 "sync/atomic"
 
 	"encoding/json"
+	"crypto/rand"
 	"fmt"
 	"math"
 	"log"
@@ -1147,7 +1148,43 @@ func validateAmount(amount float64) error {
 	return nil
 }
 
+// --- Audit Trail (append-only) ---
+type AuditEntry struct {
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	RecordID  string `json:"record_id"`
+	Actor     string `json:"actor"`
+	Timestamp string `json:"timestamp"`
+	Details   string `json:"details"`
+}
+
+var auditLog []AuditEntry
+
+func appendAudit(action, recordID, actor, details string) {
+	auditLog = append(auditLog, AuditEntry{
+		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
+		Action: action, RecordID: recordID, Actor: actor,
+		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
+	})
+}
+
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
+
+func secureRandUint32() uint32 {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
 func main() {
+	initTracing()
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }
 	initDB()

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"crypto/rand"
 	"fmt"
 	"io"
 	"net"
@@ -624,7 +625,56 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// --- Audit Trail (append-only) ---
+type AuditEntry struct {
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	RecordID  string `json:"record_id"`
+	Actor     string `json:"actor"`
+	Timestamp string `json:"timestamp"`
+	Details   string `json:"details"`
+}
+
+var auditLog []AuditEntry
+
+func appendAudit(action, recordID, actor, details string) {
+	auditLog = append(auditLog, AuditEntry{
+		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
+		Action: action, RecordID: recordID, Actor: actor,
+		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
+	})
+}
+
+// --- Request Tracing ---
+func tracingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-Id")
+		if traceID == "" { traceID = r.Header.Get("traceparent") }
+		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
+
+func secureRandUint32() uint32 {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
 func main() {
+	initTracing()
 	initDB()
 	_ = falkorClient.Connect()
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()

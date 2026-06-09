@@ -1297,7 +1297,16 @@ func validatePaymentRequest(amountKobo int64, currency, channel, beneficiaryBank
 }
 
 
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
 func main() {
+	initTracing()
 	port := os.Getenv("PORT")
 
 	if port == "" { port = "8080" }

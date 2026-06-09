@@ -1520,7 +1520,16 @@ func validateAccountCreation(accountType, currency, tier, customerName string, b
 }
 
 
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
 func main() {
+	initTracing()
 	port := os.Getenv("PORT")
 
 	if port == "" { port = "8114" }

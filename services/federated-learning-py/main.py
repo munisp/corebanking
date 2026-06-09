@@ -364,7 +364,6 @@ def requires_maker_checker(operation: str, amount_kobo: int) -> bool:
 
 def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload: dict) -> dict:
     """Submit operation for maker-checker approval."""
-    import time
     req = {
         "request_id": f"MCR-{int(time.time()*1000000)}",
         "operation": operation, "maker_id": maker_id, "amount_kobo": amount_kobo,
@@ -380,6 +379,33 @@ import hashlib as _audit_hashlib
 
 import signal
 import sys
+
+# --- Circuit Breaker ---
+import time as _cb_time
+
+class CircuitBreaker:
+    """Circuit breaker: opens after threshold failures, resets after timeout."""
+    CLOSED, OPEN, HALF_OPEN = 0, 1, 2
+    def __init__(self, threshold=5, timeout=30):
+        self.state = self.CLOSED
+        self.fail_count = 0
+        self.threshold = threshold
+        self.timeout = timeout
+        self.last_fail = 0
+    def allow(self):
+        if self.state == self.CLOSED: return True
+        if self.state == self.OPEN and _cb_time.monotonic() - self.last_fail > self.timeout:
+            self.state = self.HALF_OPEN
+            return True
+        return self.state == self.HALF_OPEN
+    def record_success(self): self.fail_count = 0; self.state = self.CLOSED
+    def record_failure(self):
+        self.fail_count += 1
+        self.last_fail = _cb_time.monotonic()
+        if self.fail_count >= self.threshold: self.state = self.OPEN
+
+_circuit_breaker = CircuitBreaker()
+
 
 # --- Monetary Safety (kobo precision) ---
 def round_naira(amount):
@@ -406,6 +432,21 @@ def validate_amount(amount):
 
 # --- CORS & Security Headers ---
 CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
+
+# --- Retry with Exponential Backoff ---
+import time as _retry_time
+
+def retry_with_backoff(fn, max_retries=3, base_delay=0.1):
+    """Retry a function with exponential backoff."""
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            delay = min(base_delay * (2 ** attempt), 5.0)
+            _retry_time.sleep(delay)
+
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",
@@ -427,6 +468,28 @@ def add_cors_headers(handler_self):
     handler_self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
     handler_self.send_header("Access-Control-Max-Age", "86400")
 
+# --- Observability (OpenTelemetry) ---
+def init_tracing():
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.resources import Resource
+        resource = Resource.create({"service.name": os.path.basename(os.path.dirname(__file__))})
+        provider = TracerProvider(resource=resource)
+        trace.set_tracer_provider(provider)
+    except ImportError:
+        pass
+
+        handler_self.send_header("Access-Control-Allow-Origin", origin)
+    else:
+        handler_self.send_header("Access-Control-Allow-Origin", "https://dashboard.54bank.ng")
+    handler_self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+    handler_self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+    handler_self.send_header("Access-Control-Max-Age", "86400")
+
 
 def _graceful_shutdown(signum, frame):
     print(f"[federated-learning-py] Received signal {signum}, shutting down gracefully...")
@@ -440,7 +503,6 @@ _audit_log = []  # Append-only. No deletion permitted.
 def append_audit_entry(service: str, operation: str, actor_id: str, entity_id: str,
                        entity_type: str, old_state: str = "", new_state: str = "", ip: str = ""):
     """Append immutable audit entry with tamper-detection checksum."""
-    import time
     entry_id = f"AUD-{int(time.time()*1000000)}"
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
     raw = f"{entry_id}|{timestamp}|{service}|{operation}|{actor_id}|{entity_id}|{old_state}|{new_state}|{ip}"

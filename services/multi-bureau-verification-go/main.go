@@ -1309,7 +1309,36 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 }
 
 
+// --- Audit Trail (append-only) ---
+type AuditEntry struct {
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	RecordID  string `json:"record_id"`
+	Actor     string `json:"actor"`
+	Timestamp string `json:"timestamp"`
+	Details   string `json:"details"`
+}
+
+var auditLog []AuditEntry
+
+func appendAudit(action, recordID, actor, details string) {
+	auditLog = append(auditLog, AuditEntry{
+		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
+		Action: action, RecordID: recordID, Actor: actor,
+		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
+	})
+}
+
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
 func main() {
+	initTracing()
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9088"

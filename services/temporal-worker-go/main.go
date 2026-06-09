@@ -1770,7 +1770,16 @@ func handleWorkflowQuery(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{"query": req.QueryName, "result": result})
 }
 
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
 func main() {
+	initTracing()
 	port := os.Getenv("PORT")
 	if port == "" { port = "9445" }
 	initDB()

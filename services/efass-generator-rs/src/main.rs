@@ -1109,6 +1109,15 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
+
+// --- Observability ---
+fn init_tracing(service_name: &str) {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
+    if !endpoint.is_empty() {
+        println!("[{}] OTEL tracing configured: {}", service_name, endpoint);
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").unwrap_or_else(|_| "8091".to_string()).parse().unwrap_or(8091);

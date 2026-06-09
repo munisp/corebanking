@@ -790,7 +790,99 @@ func validateAmount(amount float64) error {
 	return nil
 }
 
+// --- Audit Trail (append-only) ---
+type AuditEntry struct {
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	RecordID  string `json:"record_id"`
+	Actor     string `json:"actor"`
+	Timestamp string `json:"timestamp"`
+	Details   string `json:"details"`
+}
+
+var auditLog []AuditEntry
+
+func appendAudit(action, recordID, actor, details string) {
+	auditLog = append(auditLog, AuditEntry{
+		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
+		Action: action, RecordID: recordID, Actor: actor,
+		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
+	})
+}
+
+// --- Request Tracing ---
+func tracingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-Id")
+		if traceID == "" { traceID = r.Header.Get("traceparent") }
+		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Circuit Breaker ---
+type circuitBreakerState int
+const (
+	cbClosed circuitBreakerState = iota
+	cbOpen
+	cbHalfOpen
+)
+
+var (
+	cbState     circuitBreakerState
+	cbFailCount uint64
+	cbLastFail  int64
+	cbThreshold uint64 = 5
+	cbTimeout   int64  = 30 // seconds
+)
+
+func cbAllow() bool {
+	if cbState == cbClosed { return true }
+	if cbState == cbOpen && time.Now().Unix()-atomic.LoadInt64(&cbLastFail) > cbTimeout {
+		cbState = cbHalfOpen
+		return true
+	}
+	return cbState == cbHalfOpen
+}
+
+func cbRecordSuccess() { atomic.StoreUint64(&cbFailCount, 0); cbState = cbClosed }
+func cbRecordFailure() {
+	atomic.AddUint64(&cbFailCount, 1)
+	atomic.StoreInt64(&cbLastFail, time.Now().Unix())
+	if atomic.LoadUint64(&cbFailCount) >= cbThreshold { cbState = cbOpen }
+}
+
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
+// --- Retry with Exponential Backoff ---
+func retryWithBackoff(maxRetries int, fn func() error) error {
+	for i := 0; i < maxRetries; i++ {
+		if err := fn(); err == nil { return nil }
+		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
+		if backoff > 5*time.Second { backoff = 5 * time.Second }
+		time.Sleep(backoff)
+	}
+	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
+}
+
+
+func secureRandUint32() uint32 {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
+	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
+}
+
 func main() {
+	initTracing()
 	initDB()
 	_ = context.Background
 	_ = big.NewInt

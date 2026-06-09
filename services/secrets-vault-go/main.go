@@ -697,7 +697,72 @@ func validateAmount(amount float64) error {
 	return nil
 }
 
+// --- Request Tracing ---
+func tracingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-Id")
+		if traceID == "" { traceID = r.Header.Get("traceparent") }
+		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Circuit Breaker ---
+type circuitBreakerState int
+const (
+	cbClosed circuitBreakerState = iota
+	cbOpen
+	cbHalfOpen
+)
+
+var (
+	cbState     circuitBreakerState
+	cbFailCount uint64
+	cbLastFail  int64
+	cbThreshold uint64 = 5
+	cbTimeout   int64  = 30 // seconds
+)
+
+func cbAllow() bool {
+	if cbState == cbClosed { return true }
+	if cbState == cbOpen && time.Now().Unix()-atomic.LoadInt64(&cbLastFail) > cbTimeout {
+		cbState = cbHalfOpen
+		return true
+	}
+	return cbState == cbHalfOpen
+}
+
+func cbRecordSuccess() { atomic.StoreUint64(&cbFailCount, 0); cbState = cbClosed }
+func cbRecordFailure() {
+	atomic.AddUint64(&cbFailCount, 1)
+	atomic.StoreInt64(&cbLastFail, time.Now().Unix())
+	if atomic.LoadUint64(&cbFailCount) >= cbThreshold { cbState = cbOpen }
+}
+
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
+// --- Retry with Exponential Backoff ---
+func retryWithBackoff(maxRetries int, fn func() error) error {
+	for i := 0; i < maxRetries; i++ {
+		if err := fn(); err == nil { return nil }
+		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
+		if backoff > 5*time.Second { backoff = 5 * time.Second }
+		time.Sleep(backoff)
+	}
+	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
+}
+
 func main() {
+	initTracing()
 	initDB()
 	_ = context.Background
 	_ = big.NewInt

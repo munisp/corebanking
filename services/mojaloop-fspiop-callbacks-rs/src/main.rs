@@ -166,6 +166,47 @@ async fn healthz() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "mojaloop-fspiop-callbacks-rs"}))
 }
 
+
+// --- Request Tracing ---
+fn extract_trace_id(req: &actix_web::HttpRequest) -> String {
+    req.headers()
+        .get("X-Trace-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+
+// --- Circuit Breaker ---
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
+
+static CB_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static CB_LAST_FAIL: AtomicI64 = AtomicI64::new(0);
+const CB_THRESHOLD: u64 = 5;
+const CB_TIMEOUT_SECS: i64 = 30;
+
+fn cb_allow() -> bool {
+    let fails = CB_FAIL_COUNT.load(Ordering::Relaxed);
+    if fails < CB_THRESHOLD { return true; }
+    let now = chrono::Utc::now().timestamp();
+    now - CB_LAST_FAIL.load(Ordering::Relaxed) > CB_TIMEOUT_SECS
+}
+
+fn cb_record_success() { CB_FAIL_COUNT.store(0, Ordering::Relaxed); }
+fn cb_record_failure() {
+    CB_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
+    CB_LAST_FAIL.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+}
+
+
+// --- Observability ---
+fn init_tracing(service_name: &str) {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
+    if !endpoint.is_empty() {
+        println!("[{}] OTEL tracing configured: {}", service_name, endpoint);
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8309);

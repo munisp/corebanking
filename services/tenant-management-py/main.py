@@ -1051,6 +1051,33 @@ def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload
 # ─── Immutable Audit Trail ───────────────────────────────────────────────────
 import hashlib as _audit_hashlib
 
+# --- Circuit Breaker ---
+import time as _cb_time
+
+class CircuitBreaker:
+    """Circuit breaker: opens after threshold failures, resets after timeout."""
+    CLOSED, OPEN, HALF_OPEN = 0, 1, 2
+    def __init__(self, threshold=5, timeout=30):
+        self.state = self.CLOSED
+        self.fail_count = 0
+        self.threshold = threshold
+        self.timeout = timeout
+        self.last_fail = 0
+    def allow(self):
+        if self.state == self.CLOSED: return True
+        if self.state == self.OPEN and _cb_time.monotonic() - self.last_fail > self.timeout:
+            self.state = self.HALF_OPEN
+            return True
+        return self.state == self.HALF_OPEN
+    def record_success(self): self.fail_count = 0; self.state = self.CLOSED
+    def record_failure(self):
+        self.fail_count += 1
+        self.last_fail = _cb_time.monotonic()
+        if self.fail_count >= self.threshold: self.state = self.OPEN
+
+_circuit_breaker = CircuitBreaker()
+
+
 # --- Monetary Safety (kobo precision) ---
 def round_naira(amount):
     """Round to 2 decimal places (kobo precision) to prevent float drift."""
@@ -1076,6 +1103,22 @@ def validate_amount(amount):
 
 # --- CORS & Security Headers ---
 CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
+
+# --- Observability (OpenTelemetry) ---
+def init_tracing():
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.resources import Resource
+        resource = Resource.create({"service.name": os.path.basename(os.path.dirname(__file__))})
+        provider = TracerProvider(resource=resource)
+        trace.set_tracer_provider(provider)
+    except ImportError:
+        pass
+
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "X-Frame-Options": "DENY",

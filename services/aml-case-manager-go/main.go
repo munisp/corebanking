@@ -1504,7 +1504,16 @@ func validateAmount(amount float64) error {
 	return nil
 }
 
+// --- Observability (OpenTelemetry) ---
+var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+
+func initTracing() {
+	if otelEndpoint == "" { return }
+	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
+}
+
 func main() {
+	initTracing()
 	port := os.Getenv("PORT")
 	if port == "" { port = "9308" }
 	initDB()

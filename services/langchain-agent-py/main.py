@@ -1022,6 +1022,22 @@ def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload
 # ─── Immutable Audit Trail ───────────────────────────────────────────────────
 import hashlib as _audit_hashlib
 
+# --- Observability (OpenTelemetry) ---
+def init_tracing():
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        return
+    try:
+        from opentelemetry import trace
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.resources import Resource
+        resource = Resource.create({"service.name": os.path.basename(os.path.dirname(__file__))})
+        provider = TracerProvider(resource=resource)
+        trace.set_tracer_provider(provider)
+    except ImportError:
+        pass
+
+
 # --- Monetary Safety (kobo precision) ---
 def round_naira(amount):
     """Round to 2 decimal places (kobo precision) to prevent float drift."""
