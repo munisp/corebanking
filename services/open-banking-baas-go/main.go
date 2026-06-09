@@ -15,6 +15,8 @@ import (
 	"crypto/sha256"
 
 	_ "github.com/lib/pq"
+		"os/signal"
+	"syscall"
 )
 
 var (
@@ -113,9 +115,22 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 	registerRoutes(mux)
 	handler := rateLimitMiddleware(authMiddleware(mux))
-	log.Printf("%s v2.0 on :%s", serviceName, port)
-	log.Fatal(http.ListenAndServe(":"+port, handler))
+	server := &http.Server{Addr: ":"+port, Handler: handler}
+	go func() {
+		log.Printf("[open-banking-baas-go] Starting on :%s", port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[open-banking-baas-go] ListenAndServe error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("[open-banking-baas-go] Shutdown signal received")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[open-banking-baas-go] Server stopped gracefully")
 }
 
-var _ = context.Background
-var _ = time.Now

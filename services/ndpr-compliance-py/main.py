@@ -395,6 +395,17 @@ def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload
 
 # ─── Immutable Audit Trail ───────────────────────────────────────────────────
 import hashlib as _audit_hashlib
+
+import signal
+import sys
+
+def _graceful_shutdown(signum, frame):
+    print(f"[ndpr-compliance-py] Received signal {signum}, shutting down gracefully...")
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, _graceful_shutdown)
+signal.signal(signal.SIGINT, _graceful_shutdown)
+
 _audit_log = []  # Append-only. No deletion permitted.
 
 def append_audit_entry(service: str, operation: str, actor_id: str, entity_id: str,

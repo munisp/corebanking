@@ -9,6 +9,9 @@ import (
 	"sync"
 	"time"
 	"crypto/rand"
+		"os/signal"
+	"syscall"
+	"context"
 )
 
 // --- 54Bank Real-Time WebSocket Gateway ---
@@ -270,5 +273,21 @@ func main() {
 	mux.HandleFunc("/events/types", handleEventTypes)
 	mux.HandleFunc("/connections", handleConnections)
 	log.Printf("54Bank Real-Time Gateway listening on :%s (SSE + REST)", PORT)
-	log.Fatal(http.ListenAndServe(":"+PORT, mux))
+	server := &http.Server{Addr: ":"+PORT, Handler: mux}
+	go func() {
+		log.Printf("[realtime-gateway-go] Starting on :%s", PORT)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[realtime-gateway-go] ListenAndServe error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("[realtime-gateway-go] Shutdown signal received")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[realtime-gateway-go] Server stopped gracefully")
 }

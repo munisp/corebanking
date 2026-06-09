@@ -10,6 +10,9 @@ import (
 	"os"
 	"sync"
 	"time"
+		"os/signal"
+	"syscall"
+	"context"
 )
 
 var PORT = "8097"
@@ -161,5 +164,21 @@ func main() {
 	mux.HandleFunc("/flags", handleList)
 	mux.HandleFunc("/flags/check", handleCheck)
 	mux.HandleFunc("/flags/toggle", handleToggle)
-	log.Fatal(http.ListenAndServe(":"+PORT, mux))
+	server := &http.Server{Addr: ":"+PORT, Handler: mux}
+	go func() {
+		log.Printf("[feature-flags-go] Starting on :%s", PORT)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[feature-flags-go] ListenAndServe error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Println("[feature-flags-go] Shutdown signal received")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[feature-flags-go] Server stopped gracefully")
 }
