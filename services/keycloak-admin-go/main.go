@@ -1554,6 +1554,7 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9380" }
 	initDB()
+	initKeycloakAdvanced()
 mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 

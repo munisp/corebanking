@@ -1566,6 +1566,7 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9392" }
 	initDB()
+	initMojaAdvanced()
 mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 

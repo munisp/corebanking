@@ -1774,6 +1774,7 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9445" }
 	initDB()
+	initTemporalAdvanced()
 mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 

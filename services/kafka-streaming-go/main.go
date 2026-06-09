@@ -1707,6 +1707,7 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9377" }
 	initDB()
+	initKafkaAdvanced()
 mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 

@@ -1723,6 +1723,7 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9417" }
 	initDB()
+	initRedisAdvanced()
 mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 

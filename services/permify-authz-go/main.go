@@ -1604,10 +1604,32 @@ func (bpc *BulkPermissionChecker) CheckBulk(checks []BulkCheckRequest) []BulkChe
 		go func(idx int) {
 			defer wg.Done()
 			start := time.Now()
-			// Simulate permission check (in production calls Permify API)
-			allowed := checks[idx].Permission == "view" || checks[idx].SubjectID == checks[idx].EntityID
+			c := checks[idx]
+			// Banking RBAC: check via Permify API, fail-closed on error
+			allowed := false
+			permifyHost := os.Getenv("PERMIFY_HOST")
+			if permifyHost == "" { permifyHost = "localhost:3476" }
+			reqBody := map[string]interface{}{
+				"tenant_id":  "54bank",
+				"entity":     map[string]string{"type": c.Entity, "id": c.EntityID},
+				"permission": c.Permission,
+				"subject":    map[string]string{"type": c.SubjectType, "id": c.SubjectID},
+			}
+			jsonData, _ := json.Marshal(reqBody)
+			client := &http.Client{Timeout: bpc.timeout}
+			resp, err := client.Post(
+				fmt.Sprintf("http://%s/v1/tenants/54bank/permissions/check", permifyHost),
+				"application/json", bytes.NewBuffer(jsonData),
+			)
+			if err == nil {
+				defer resp.Body.Close()
+				var result struct { Can string `json:"can"` }
+				json.NewDecoder(resp.Body).Decode(&result)
+				allowed = result.Can == "CHECK_RESULT_ALLOWED"
+			}
+			// Fail-closed: if Permify unreachable, deny access
 			results[idx] = BulkCheckResult{
-				Request: checks[idx], Allowed: allowed,
+				Request: c, Allowed: allowed,
 				Latency: time.Since(start).Microseconds(),
 			}
 		}(i)
@@ -1685,6 +1707,7 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9406" }
 	initDB()
+	initPermifyAdvanced()
 mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
