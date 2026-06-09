@@ -138,9 +138,9 @@ async fn db_persist_state(db: &Option<Arc<tokio_postgres::Client>>, breaker: &Ci
             CBState::Open => "open",
             CBState::HalfOpen => "half_open",
         };
-        let data = serde_json::to_string(breaker).unwrap_or_default();
+        let data = serde_json::to_value(breaker).unwrap_or(serde_json::Value::Null);
         let _ = client.execute(
-            "INSERT INTO circuit_breaker_state (service, state, failure_count, total_requests, data) VALUES ($1,$2,$3,$4,$5::jsonb) ON CONFLICT (service) DO UPDATE SET state=$2, failure_count=$3, total_requests=$4, data=$5::jsonb, updated_at=NOW()",
+            "INSERT INTO circuit_breaker_state (service, state, failure_count, total_requests, data) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (service) DO UPDATE SET state=$2, failure_count=$3, total_requests=$4, data=$5, updated_at=NOW()",
             &[&breaker.service, &state_str.to_string(), &(breaker.failure_count as i32), &(breaker.total_requests as i64), &data],
         ).await;
     }

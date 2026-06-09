@@ -90,12 +90,10 @@ async fn init_db() -> Option<Arc<tokio_postgres::Client>> {
 
 async fn db_persist_event(db: &Option<Arc<tokio_postgres::Client>>, event: &Event) {
     if let Some(ref client) = db {
-        let data_str = serde_json::to_string(&event.event_data).unwrap_or_default();
-        let meta_str = serde_json::to_string(&event.metadata).unwrap_or_default();
         if let Err(e) = client.execute(
-            "INSERT INTO event_store (id, aggregate_id, aggregate_type, event_type, event_data, metadata, version, tenant_id, created_at) VALUES ($1,$2,$3,$4,$5::jsonb,$6::jsonb,$7,$8,$9::timestamptz)",
+            "INSERT INTO event_store (id, aggregate_id, aggregate_type, event_type, event_data, metadata, version, tenant_id, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())",
             &[&event.id, &event.aggregate_id, &event.aggregate_type, &event.event_type,
-              &data_str, &meta_str, &(event.version as i64), &event.tenant_id, &event.created_at],
+              &event.event_data, &event.metadata, &(event.version as i64), &event.tenant_id],
         ).await {
             eprintln!("[event-store] CRITICAL: DB persist event failed: {}", e);
         }
@@ -104,10 +102,9 @@ async fn db_persist_event(db: &Option<Arc<tokio_postgres::Client>>, event: &Even
 
 async fn db_persist_snapshot(db: &Option<Arc<tokio_postgres::Client>>, snap: &Snapshot) {
     if let Some(ref client) = db {
-        let state_str = serde_json::to_string(&snap.state).unwrap_or_default();
         if let Err(e) = client.execute(
-            "INSERT INTO event_snapshots (aggregate_id, aggregate_type, state, version, created_at) VALUES ($1,$2,$3::jsonb,$4,$5::timestamptz) ON CONFLICT (aggregate_id, version) DO NOTHING",
-            &[&snap.aggregate_id, &snap.aggregate_type, &state_str, &(snap.version as i64), &snap.created_at],
+            "INSERT INTO event_snapshots (aggregate_id, aggregate_type, state, version, created_at) VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (aggregate_id, version) DO NOTHING",
+            &[&snap.aggregate_id, &snap.aggregate_type, &snap.state, &(snap.version as i64)],
         ).await {
             eprintln!("[event-store] DB persist snapshot failed: {}", e);
         }
