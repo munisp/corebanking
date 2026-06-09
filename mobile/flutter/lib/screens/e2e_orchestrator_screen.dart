@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class E2eOrchestratorScreen extends StatefulWidget {
-  const E2eOrchestratorScreen({super.key});
+class E2EOrchestratorScreen extends StatefulWidget {
+  const E2EOrchestratorScreen({super.key});
   @override
-  State<E2eOrchestratorScreen> createState() => _E2eOrchestratorScreenState();
+  State<E2EOrchestratorScreen> createState() => _E2EOrchestratorScreenState();
 }
 
-class _E2eOrchestratorScreenState extends State<E2eOrchestratorScreen> {
+class _E2EOrchestratorScreenState extends State<E2EOrchestratorScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -43,24 +43,48 @@ class _E2eOrchestratorScreenState extends State<E2eOrchestratorScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Uptime', '99.99%', Icons.check_circle),
+              _kpi('Requests/s', '12,500', Icons.speed),
+              _kpi('P95 Latency', '45ms', Icons.timer),
+              _kpi('Error Rate', '0.01%', Icons.error),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('E2E Orchestrator Primary'),
+              subtitle: Text('Production'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Healthy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('E2E Orchestrator Secondary'),
+              subtitle: Text('Standby'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Synced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Running', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('E2E Orchestrator Canary'),
+              subtitle: Text('Test'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Validating', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Last Deployment'),
+              subtitle: Text('v2.4.1'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('2024-01-15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Stable', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

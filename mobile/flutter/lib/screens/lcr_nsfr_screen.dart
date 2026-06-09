@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class LcrNsfrScreen extends StatefulWidget {
-  const LcrNsfrScreen({super.key});
+class LCRNSFRScreen extends StatefulWidget {
+  const LCRNSFRScreen({super.key});
   @override
-  State<LcrNsfrScreen> createState() => _LcrNsfrScreenState();
+  State<LCRNSFRScreen> createState() => _LCRNSFRScreenState();
 }
 
-class _LcrNsfrScreenState extends State<LcrNsfrScreen> {
+class _LCRNSFRScreenState extends State<LCRNSFRScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -43,24 +43,48 @@ class _LcrNsfrScreenState extends State<LcrNsfrScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('LCR', '185%', Icons.shield),
+              _kpi('NSFR', '125%', Icons.security),
+              _kpi('HQLA', '₦250B', Icons.account_balance),
+              _kpi('Net Outflow', '₦135B', Icons.trending_down),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Level 1 HQLA (Cash + T-Bills)'),
+              subtitle: Text('100% weight'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦180B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Level 2A HQLA (Corp Bonds)'),
+              subtitle: Text('85% weight'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦50B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Level 2B HQLA (Equities)'),
+              subtitle: Text('50% weight'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦20B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Compliant', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('30-Day Net Cash Outflow'),
+              subtitle: Text('Stress Scenario'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦135B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Within Limit', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

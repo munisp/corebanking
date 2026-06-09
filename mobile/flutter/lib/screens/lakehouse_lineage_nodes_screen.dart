@@ -9,15 +9,32 @@ class LakehouseLineageNodesScreen extends StatefulWidget {
 class _LakehouseLineageNodesScreenState extends State<LakehouseLineageNodesScreen> {
   String _searchQuery = '';
   final List<Map<String, dynamic>> _items = [
-    {'name': 'Item 1', 'type': 'Standard', 'value': '₦100K', 'status': 'Active', },
-    {'name': 'Item 2', 'type': 'Standard', 'value': '₦200K', 'status': 'Active', },
-    {'name': 'Item 3', 'type': 'Standard', 'value': '₦300K', 'status': 'Active', },
-    {'name': 'Item 4', 'type': 'Standard', 'value': '₦400K', 'status': 'Pending', },
+    {'name': 'Bronze Layer (Raw)', 'type': 'Landing Zone', 'value': '85GB/day ingested', 'status': 'Active'},
+    {'name': 'Silver Layer (Cleaned)', 'type': 'Validated', 'value': '1,200 tables', 'status': 'Active'},
+    {'name': 'Gold Layer (Curated)', 'type': 'Business-Ready', 'value': '450 tables', 'status': 'Active'},
+    {'name': 'Delta Lake Compaction', 'type': 'Maintenance', 'value': 'Nightly', 'status': 'Scheduled'},
   ];
 
   List<Map<String, dynamic>> get _filteredItems => _searchQuery.isEmpty
       ? _items
       : _items.where((i) => i.values.any((v) => v.toString().toLowerCase().contains(_searchQuery.toLowerCase()))).toList();
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -27,9 +44,24 @@ class _LakehouseLineageNodesScreenState extends State<LakehouseLineageNodesScree
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+              _kpi('Tables', '2,500', Icons.table_chart),
+              _kpi('Daily Ingestion', '85GB', Icons.cloud_upload),
+              _kpi('Queries/Day', '45K', Icons.search),
+              _kpi('Freshness', '< 5min', Icons.update),
+              ],
+            ),
+            const SizedBox(height: 12),
             TextField(
               decoration: InputDecoration(
-                hintText: 'Search...',
+                hintText: 'Search lakehouse lineage nodes...',
                 prefixIcon: const Icon(Icons.search),
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
               ),
@@ -49,19 +81,11 @@ class _LakehouseLineageNodesScreenState extends State<LakehouseLineageNodesScree
                         child: Text(item['name'].toString().substring(0, 1)),
                       ),
                       title: Text(item['name'].toString()),
-                      subtitle: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                    Text('Type: ${item["type"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
-                    Text('Value: ${item["value"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
-                    Chip(
-                      label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
-                      backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
-                    ),
-                        ],
+                      subtitle: Text('${item['type']} — ${item['value']}'),
+                      trailing: Chip(
+                        label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
+                        backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
                       ),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () {},
                     ),
                   );
                 },

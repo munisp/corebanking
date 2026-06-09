@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class FxPositionsScreen extends StatefulWidget {
-  const FxPositionsScreen({super.key});
+class FXPositionsScreen extends StatefulWidget {
+  const FXPositionsScreen({super.key});
   @override
-  State<FxPositionsScreen> createState() => _FxPositionsScreenState();
+  State<FXPositionsScreen> createState() => _FXPositionsScreenState();
 }
 
-class _FxPositionsScreenState extends State<FxPositionsScreen> {
+class _FXPositionsScreenState extends State<FXPositionsScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -29,7 +29,7 @@ class _FxPositionsScreenState extends State<FxPositionsScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Fx Positions'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('FX Positions'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,24 +43,48 @@ class _FxPositionsScreenState extends State<FxPositionsScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Net Position', '$12.5M Long', Icons.trending_up),
+              _kpi('Limit Used', '62%', Icons.data_usage),
+              _kpi('Unrealised P&L', '+₦45M', Icons.money),
+              _kpi('Open Deals', '28', Icons.receipt_long),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('USD Long Position'),
+              subtitle: Text('Spot + Forward'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('$8.2M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Within Limit', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('EUR Short Position'),
+              subtitle: Text('Forward'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('-€2.1M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Within Limit', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('GBP Long Position'),
+              subtitle: Text('Spot'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('£1.5M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Within Limit', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('CNY Long Position'),
+              subtitle: Text('NDF'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('¥15M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Approaching Limit', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

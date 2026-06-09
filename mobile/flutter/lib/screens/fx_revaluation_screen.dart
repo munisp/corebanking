@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class FxRevaluationScreen extends StatefulWidget {
-  const FxRevaluationScreen({super.key});
+class FXRevaluationScreen extends StatefulWidget {
+  const FXRevaluationScreen({super.key});
   @override
-  State<FxRevaluationScreen> createState() => _FxRevaluationScreenState();
+  State<FXRevaluationScreen> createState() => _FXRevaluationScreenState();
 }
 
-class _FxRevaluationScreenState extends State<FxRevaluationScreen> {
+class _FXRevaluationScreenState extends State<FXRevaluationScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -29,7 +29,7 @@ class _FxRevaluationScreenState extends State<FxRevaluationScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Fx Revaluation'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('FX Revaluation'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,24 +43,48 @@ class _FxRevaluationScreenState extends State<FxRevaluationScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Revaluation P&L', '₦2.8B', Icons.calculate),
+              _kpi('FX Assets', '₦125B', Icons.trending_up),
+              _kpi('FX Liabilities', '₦118B', Icons.trending_down),
+              _kpi('Net Exposure', '₦7B', Icons.balance),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('USD Asset Revaluation'),
+              subtitle: Text('Month-End'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('+₦1.2B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Posted to GL', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('EUR Liability Revaluation'),
+              subtitle: Text('Month-End'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('-₦450M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Posted to GL', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('GBP Position Revaluation'),
+              subtitle: Text('Month-End'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('+₦280M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Posted to GL', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Nostro Account Reconciliation'),
+              subtitle: Text('Daily'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦85B balanced', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Reconciled', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

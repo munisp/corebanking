@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class ErpNextScreen extends StatefulWidget {
-  const ErpNextScreen({super.key});
+class ERPNextScreen extends StatefulWidget {
+  const ERPNextScreen({super.key});
   @override
-  State<ErpNextScreen> createState() => _ErpNextScreenState();
+  State<ERPNextScreen> createState() => _ERPNextScreenState();
 }
 
-class _ErpNextScreenState extends State<ErpNextScreen> {
+class _ERPNextScreenState extends State<ERPNextScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -43,24 +43,48 @@ class _ErpNextScreenState extends State<ErpNextScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Total', '12,500', Icons.analytics),
+              _kpi('Active', '11,800', Icons.check_circle),
+              _kpi('Growth', '+15.2%', Icons.trending_up),
+              _kpi('Revenue', '₦2.8B', Icons.money),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Erp Next - Standard'),
+              subtitle: Text('Core Product'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦5.2B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Erp Next - Premium'),
+              subtitle: Text('Enhanced'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦3.8B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Erp Next - Enterprise'),
+              subtitle: Text('Corporate'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦8.5B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Erp Next - Digital'),
+              subtitle: Text('Online Channel'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦2.1B', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

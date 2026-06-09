@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class EodProcessorScreen extends StatefulWidget {
-  const EodProcessorScreen({super.key});
+class EODProcessorScreen extends StatefulWidget {
+  const EODProcessorScreen({super.key});
   @override
-  State<EodProcessorScreen> createState() => _EodProcessorScreenState();
+  State<EODProcessorScreen> createState() => _EODProcessorScreenState();
 }
 
-class _EodProcessorScreenState extends State<EodProcessorScreen> {
+class _EODProcessorScreenState extends State<EODProcessorScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -29,7 +29,7 @@ class _EodProcessorScreenState extends State<EodProcessorScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Eod Processor'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('EOD Processor'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,24 +43,48 @@ class _EodProcessorScreenState extends State<EodProcessorScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('EOD Status', 'Completed', Icons.check_circle),
+              _kpi('Run Time', '42 min', Icons.timer),
+              _kpi('GL Entries', '2.5M', Icons.receipt),
+              _kpi('Exceptions', '12', Icons.warning),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Interest Accrual Batch'),
+              subtitle: Text('Daily'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦2.8B posted', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Completed', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('GL Day-End Balancing'),
+              subtitle: Text('Daily'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦0.00 variance', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Balanced', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Dormancy Check'),
+              subtitle: Text('Daily'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('45 accounts flagged', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Completed', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('CBN Regulatory Returns'),
+              subtitle: Text('Daily'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('e-FASS submitted', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Submitted', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

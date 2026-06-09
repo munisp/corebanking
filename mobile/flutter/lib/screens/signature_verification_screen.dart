@@ -9,15 +9,32 @@ class SignatureVerificationScreen extends StatefulWidget {
 class _SignatureVerificationScreenState extends State<SignatureVerificationScreen> {
   String _searchQuery = '';
   final List<Map<String, dynamic>> _items = [
-    {'name': 'Item 1', 'type': 'Standard', 'value': '₦100K', 'status': 'Active', },
-    {'name': 'Item 2', 'type': 'Standard', 'value': '₦200K', 'status': 'Active', },
-    {'name': 'Item 3', 'type': 'Standard', 'value': '₦300K', 'status': 'Active', },
-    {'name': 'Item 4', 'type': 'Standard', 'value': '₦400K', 'status': 'Pending', },
+    {'name': 'Cheque Signature Check', 'type': 'Image Matching', 'value': '15K/day', 'status': 'Active'},
+    {'name': 'Mandate Card Verification', 'type': 'Reference Match', 'value': '5K/day', 'status': 'Active'},
+    {'name': 'High-Value Txn Signature', 'type': 'Dual Sign (>₦10M)', 'value': '2K/day', 'status': 'Active'},
+    {'name': 'Corporate Resolution Verify', 'type': 'Board Signatories', 'value': '500/day', 'status': 'Active'},
   ];
 
   List<Map<String, dynamic>> get _filteredItems => _searchQuery.isEmpty
       ? _items
       : _items.where((i) => i.values.any((v) => v.toString().toLowerCase().contains(_searchQuery.toLowerCase()))).toList();
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -27,9 +44,24 @@ class _SignatureVerificationScreenState extends State<SignatureVerificationScree
         padding: const EdgeInsets.all(16),
         child: Column(
           children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+              _kpi('Verified Today', '25K', Icons.draw),
+              _kpi('Mismatches', '120', Icons.warning),
+              _kpi('Auto-Match Rate', '92%', Icons.auto_awesome),
+              _kpi('Manual Queue', '450', Icons.person_search),
+              ],
+            ),
+            const SizedBox(height: 12),
             TextField(
               decoration: InputDecoration(
-                hintText: 'Search...',
+                hintText: 'Search signature verification...',
                 prefixIcon: const Icon(Icons.search),
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
               ),
@@ -49,19 +81,11 @@ class _SignatureVerificationScreenState extends State<SignatureVerificationScree
                         child: Text(item['name'].toString().substring(0, 1)),
                       ),
                       title: Text(item['name'].toString()),
-                      subtitle: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                    Text('Type: ${item["type"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
-                    Text('Value: ${item["value"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
-                    Chip(
-                      label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
-                      backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
-                    ),
-                        ],
+                      subtitle: Text('${item['type']} — ${item['value']}'),
+                      trailing: Chip(
+                        label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
+                        backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
                       ),
-                      trailing: const Icon(Icons.chevron_right),
-                      onTap: () {},
                     ),
                   );
                 },

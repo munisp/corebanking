@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class FxDealingRoomScreen extends StatefulWidget {
-  const FxDealingRoomScreen({super.key});
+class FXDealingRoomScreen extends StatefulWidget {
+  const FXDealingRoomScreen({super.key});
   @override
-  State<FxDealingRoomScreen> createState() => _FxDealingRoomScreenState();
+  State<FXDealingRoomScreen> createState() => _FXDealingRoomScreenState();
 }
 
-class _FxDealingRoomScreenState extends State<FxDealingRoomScreen> {
+class _FXDealingRoomScreenState extends State<FXDealingRoomScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -29,7 +29,7 @@ class _FxDealingRoomScreenState extends State<FxDealingRoomScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Fx Dealing Room'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('FX Dealing Room'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,24 +43,48 @@ class _FxDealingRoomScreenState extends State<FxDealingRoomScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Daily Volume', '$85M', Icons.currency_exchange),
+              _kpi('Open Positions', '42', Icons.swap_vert),
+              _kpi('P&L Today', '+₦125M', Icons.trending_up),
+              _kpi('USD/NGN', '₦1,580', Icons.show_chart),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('USD/NGN Spot'),
+              subtitle: Text('Spot'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦1,580.50/1,582.00', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('EUR/NGN Forward 3M'),
+              subtitle: Text('Forward'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦1,720.00/1,725.00', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Open', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('GBP/NGN Swap'),
+              subtitle: Text('Swap'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦2,010.00/2,015.00', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('CNY/NGN NDF'),
+              subtitle: Text('Non-Deliverable'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦218.50/219.00', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

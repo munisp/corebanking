@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class MultiCurrencyFxScreen extends StatefulWidget {
-  const MultiCurrencyFxScreen({super.key});
+class MultiCurrencyFXScreen extends StatefulWidget {
+  const MultiCurrencyFXScreen({super.key});
   @override
-  State<MultiCurrencyFxScreen> createState() => _MultiCurrencyFxScreenState();
+  State<MultiCurrencyFXScreen> createState() => _MultiCurrencyFXScreenState();
 }
 
-class _MultiCurrencyFxScreenState extends State<MultiCurrencyFxScreen> {
+class _MultiCurrencyFXScreenState extends State<MultiCurrencyFXScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -43,24 +43,48 @@ class _MultiCurrencyFxScreenState extends State<MultiCurrencyFxScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Currencies', '18', Icons.currency_exchange),
+              _kpi('FX Volume', '$85M/day', Icons.swap_horiz),
+              _kpi('Domiciliary Accts', '450K', Icons.account_balance),
+              _kpi('SWIFT Messages', '12K/day', Icons.message),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('USD Domiciliary Account'),
+              subtitle: Text('Foreign Currency'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Balance: $125M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('GBP Domiciliary Account'),
+              subtitle: Text('Foreign Currency'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Balance: £45M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('EUR Domiciliary Account'),
+              subtitle: Text('Foreign Currency'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Balance: €38M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('CNY Trade Settlement'),
+              subtitle: Text('Bilateral Swap'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Balance: ¥85M', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

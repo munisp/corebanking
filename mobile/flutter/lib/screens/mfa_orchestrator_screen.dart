@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class MfaOrchestratorScreen extends StatefulWidget {
-  const MfaOrchestratorScreen({super.key});
+class MFAOrchestratorScreen extends StatefulWidget {
+  const MFAOrchestratorScreen({super.key});
   @override
-  State<MfaOrchestratorScreen> createState() => _MfaOrchestratorScreenState();
+  State<MFAOrchestratorScreen> createState() => _MFAOrchestratorScreenState();
 }
 
-class _MfaOrchestratorScreenState extends State<MfaOrchestratorScreen> {
+class _MFAOrchestratorScreenState extends State<MFAOrchestratorScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -43,24 +43,48 @@ class _MfaOrchestratorScreenState extends State<MfaOrchestratorScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Active Sessions', '125K', Icons.people),
+              _kpi('Auth/Min', '8,500', Icons.login),
+              _kpi('MFA Enabled', '85%', Icons.security),
+              _kpi('SSO Providers', '12', Icons.key),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Password + TOTP'),
+              subtitle: Text('2FA'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('85% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('WebAuthn/FIDO2'),
+              subtitle: Text('Passwordless'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('12% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Social Login (Google/Apple)'),
+              subtitle: Text('Federation'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('45K users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Enterprise SSO (SAML)'),
+              subtitle: Text('Corporate'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('8 organizations', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

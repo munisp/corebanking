@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class FxRatesScreen extends StatefulWidget {
-  const FxRatesScreen({super.key});
+class FXRatesScreen extends StatefulWidget {
+  const FXRatesScreen({super.key});
   @override
-  State<FxRatesScreen> createState() => _FxRatesScreenState();
+  State<FXRatesScreen> createState() => _FXRatesScreenState();
 }
 
-class _FxRatesScreenState extends State<FxRatesScreen> {
+class _FXRatesScreenState extends State<FXRatesScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -29,7 +29,7 @@ class _FxRatesScreenState extends State<FxRatesScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Fx Rates'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('FX Rates'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,24 +43,48 @@ class _FxRatesScreenState extends State<FxRatesScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Pairs Monitored', '18', Icons.currency_exchange),
+              _kpi('Last Update', '2s ago', Icons.update),
+              _kpi('CBN Rate', '₦1,535', Icons.account_balance),
+              _kpi('Parallel Rate', '₦1,580', Icons.swap_horiz),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('USD/NGN'),
+              subtitle: Text('CBN Official'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦1,535.00', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Updated', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('USD/NGN'),
+              subtitle: Text('I&E Window'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦1,580.50', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Updated', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('EUR/NGN'),
+              subtitle: Text('Cross Rate'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦1,702.15', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Updated', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('GBP/NGN'),
+              subtitle: Text('Cross Rate'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦1,998.30', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Updated', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

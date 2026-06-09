@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class VoiceAsrNigerianScreen extends StatefulWidget {
-  const VoiceAsrNigerianScreen({super.key});
+class VoiceASRNigerianScreen extends StatefulWidget {
+  const VoiceASRNigerianScreen({super.key});
   @override
-  State<VoiceAsrNigerianScreen> createState() => _VoiceAsrNigerianScreenState();
+  State<VoiceASRNigerianScreen> createState() => _VoiceASRNigerianScreenState();
 }
 
-class _VoiceAsrNigerianScreenState extends State<VoiceAsrNigerianScreen> {
+class _VoiceASRNigerianScreenState extends State<VoiceASRNigerianScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -29,7 +29,7 @@ class _VoiceAsrNigerianScreenState extends State<VoiceAsrNigerianScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Voice Asr Nigerian'), backgroundColor: Colors.green[700]),
+      appBar: AppBar(title: const Text('Voice ASR Nigerian'), backgroundColor: Colors.green[700]),
       body: SingleChildScrollView(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -43,24 +43,48 @@ class _VoiceAsrNigerianScreenState extends State<VoiceAsrNigerianScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Active Users', '850K', Icons.people),
+              _kpi('Messages/Day', '2.5M', Icons.message),
+              _kpi('Success Rate', '99.5%', Icons.check_circle),
+              _kpi('Avg Response', '1.2s', Icons.timer),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Balance Inquiry'),
+              subtitle: Text('Self-Service'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('1.2M/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Fund Transfer'),
+              subtitle: Text('Transactional'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('450K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Bill Payment'),
+              subtitle: Text('Utility'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('280K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Account Statement'),
+              subtitle: Text('Information'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('85K/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class EnairaCbdcScreen extends StatefulWidget {
-  const EnairaCbdcScreen({super.key});
+class EnairaCBDCScreen extends StatefulWidget {
+  const EnairaCBDCScreen({super.key});
   @override
-  State<EnairaCbdcScreen> createState() => _EnairaCbdcScreenState();
+  State<EnairaCBDCScreen> createState() => _EnairaCBDCScreenState();
 }
 
-class _EnairaCbdcScreenState extends State<EnairaCbdcScreen> {
+class _EnairaCBDCScreenState extends State<EnairaCBDCScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -43,24 +43,48 @@ class _EnairaCbdcScreenState extends State<EnairaCbdcScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('eNaira Wallets', '13M', Icons.account_balance_wallet),
+              _kpi('Tx Volume', '₦22B', Icons.swap_horiz),
+              _kpi('Merchant Adoption', '45,000', Icons.store),
+              _kpi('Daily Avg', '₦185M', Icons.show_chart),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Speed Wallet Top-up'),
+              subtitle: Text('NFC Tap'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦50K limit', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Merchant QR Payment'),
+              subtitle: Text('eNaira Pay'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦500K limit', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('P2P eNaira Transfer'),
+              subtitle: Text('Wallet-to-Wallet'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('₦200K limit', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('CBN eNaira Settlement'),
+              subtitle: Text('Batch'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Real-time', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),

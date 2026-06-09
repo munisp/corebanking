@@ -1,12 +1,12 @@
 import 'package:flutter/material.dart';
 
-class LakehouseDomainCdcScreen extends StatefulWidget {
-  const LakehouseDomainCdcScreen({super.key});
+class LakehouseDomainCDCScreen extends StatefulWidget {
+  const LakehouseDomainCDCScreen({super.key});
   @override
-  State<LakehouseDomainCdcScreen> createState() => _LakehouseDomainCdcScreenState();
+  State<LakehouseDomainCDCScreen> createState() => _LakehouseDomainCDCScreenState();
 }
 
-class _LakehouseDomainCdcScreenState extends State<LakehouseDomainCdcScreen> {
+class _LakehouseDomainCDCScreenState extends State<LakehouseDomainCDCScreen> {
   bool _isLoading = false;
 
   Widget _kpi(String label, String value, IconData icon) {
@@ -43,24 +43,48 @@ class _LakehouseDomainCdcScreenState extends State<LakehouseDomainCdcScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Total', '1,245', Icons.analytics),
-            _kpi('Active', '1,200', Icons.check_circle),
-            _kpi('Success', '99.5%', Icons.trending_up),
-            _kpi('Alerts', '3', Icons.warning),
+              _kpi('Tables', '2,500', Icons.table_chart),
+              _kpi('Daily Ingestion', '85GB', Icons.cloud_upload),
+              _kpi('Queries/Day', '45K', Icons.search),
+              _kpi('Freshness', '< 5min', Icons.update),
               ],
             ),
             const SizedBox(height: 16),
             Card(child: ListTile(
-              leading: Icon(Icons.check_circle, color: Colors.green),
-              title: Text('Primary'),
-              subtitle: Text('Main functionality'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Bronze Layer (Raw)'),
+              subtitle: Text('Landing Zone'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('85GB/day ingested', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
             Card(child: ListTile(
-              leading: Icon(Icons.settings, color: Colors.green),
-              title: Text('Secondary'),
-              subtitle: Text('Supporting feature'),
-              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Silver Layer (Cleaned)'),
+              subtitle: Text('Validated'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('1,200 tables', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Gold Layer (Curated)'),
+              subtitle: Text('Business-Ready'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('450 tables', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
+              title: Text('Delta Lake Compaction'),
+              subtitle: Text('Maintenance'),
+              trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
+                Text('Nightly', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
+                Text('Scheduled', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
+              ]),
             )),
           ],
         ),
