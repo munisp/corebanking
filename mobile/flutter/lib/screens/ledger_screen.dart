@@ -43,7 +43,7 @@ class _LedgerScreenState extends State<LedgerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('GL Accounts', '12,500', Icons.book),
+              _kpi('GL Accounts', '412,890', Icons.book),
               _kpi('Daily Entries', '2.5M', Icons.receipt_long),
               _kpi('Trial Balance', '₦0.00', Icons.balance),
               _kpi('Unposted', '45', Icons.pending),

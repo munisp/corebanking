@@ -808,5 +808,18 @@ func main() {
 		if db != nil { db.Close() }
 		os.Exit(0)
 	}()
-	log.Fatal(http.ListenAndServe(":"+PORT, corsMiddleware(rateLimitMiddleware(mux))))
+		srv := &http.Server{Addr: ":"+PORT, Handler: corsMiddleware(rateLimitMiddleware(mux))}
+	go func() {
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+		<-quit
+		log.Println("[secrets-vault-go] Shutting down gracefully...")
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+	log.Printf("[secrets-vault-go] listening on %s", ":"+PORT)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("Server error: %v", err)
+	}
 }

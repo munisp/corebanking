@@ -45,7 +45,7 @@ class _AgriEsgImpactScreenState extends State<AgriEsgImpactScreen> {
               children: [
             _kpi('Carbon Offset', '2,450t', Icons.eco),
             _kpi('Water Saved', '15M L', Icons.water_drop),
-            _kpi('Farmers', '12,500', Icons.people),
+            _kpi('Farmers', '9,231', Icons.people),
             _kpi('ESG Score', '78/100', Icons.assessment),
               ],
             ),

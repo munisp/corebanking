@@ -42,7 +42,7 @@ class _WarehouseManagementScreenState extends State<WarehouseManagementScreen> {
               childAspectRatio: 1.6,
               children: [
               _kpi('Warehouses', '8', Icons.warehouse),
-              _kpi('SKUs', '12,500', Icons.inventory),
+              _kpi('SKUs', '3,847', Icons.inventory),
               _kpi('Shipments/day', '450', Icons.local_shipping),
               _kpi('Value', '₦2.8B', Icons.payments),
               ],

@@ -42,7 +42,7 @@ class _WorkflowEngineScreenState extends State<WorkflowEngineScreen> {
               childAspectRatio: 1.6,
               children: [
               _kpi('Workflows', '85', Icons.account_tree),
-              _kpi('Running', '12,500', Icons.play_circle),
+              _kpi('Running', '63,740', Icons.play_circle),
               _kpi('Completed/day', '45K', Icons.check_circle),
               _kpi('Failed/day', '12', Icons.error),
               ],

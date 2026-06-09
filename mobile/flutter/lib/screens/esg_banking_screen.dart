@@ -44,7 +44,7 @@ class _EsgBankingScreenState extends State<EsgBankingScreen> {
               childAspectRatio: 1.6,
               children: [
               _kpi('Green Loans', '₦35B', Icons.eco),
-              _kpi('Carbon Credits', '12,500', Icons.energy_savings_leaf),
+              _kpi('Carbon Credits', '14,078', Icons.energy_savings_leaf),
               _kpi('ESG Score', '82/100', Icons.score),
               _kpi('Sustainable Projects', '145', Icons.solar_power),
               ],

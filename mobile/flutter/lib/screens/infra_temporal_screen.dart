@@ -41,7 +41,7 @@ class _InfraTemporalScreenState extends State<InfraTemporalScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Workflows', '12,500', Icons.account_tree),
+              _kpi('Workflows', '156,200', Icons.account_tree),
               _kpi('Activities/s', '8,500', Icons.bolt),
               _kpi('Namespaces', '8', Icons.folder),
               _kpi('Retention', '30 days', Icons.history),

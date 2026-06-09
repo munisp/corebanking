@@ -41,7 +41,7 @@ class _InventoryScreenState extends State<InventoryScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Items', '12,500', Icons.inventory_2),
+              _kpi('Items', '2,156', Icons.inventory_2),
               _kpi('Warehouses', '8', Icons.warehouse),
               _kpi('Value', '₦2.8B', Icons.payments),
               _kpi('Reorder', '45 items', Icons.shopping_cart),

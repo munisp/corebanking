@@ -41,7 +41,7 @@ class _WorkflowInstancesScreenState extends State<WorkflowInstancesScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Running', '12,500', Icons.play_circle),
+              _kpi('Running', '87,100', Icons.play_circle),
               _kpi('Completed Today', '8,500', Icons.check_circle),
               _kpi('Failed', '12', Icons.error),
               _kpi('Avg Duration', '4.5hr', Icons.timer),

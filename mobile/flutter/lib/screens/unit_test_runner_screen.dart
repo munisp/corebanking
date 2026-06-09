@@ -41,7 +41,7 @@ class _UnitTestRunnerScreenState extends State<UnitTestRunnerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Tests', '12,500', Icons.science),
+              _kpi('Tests', '48,392', Icons.science),
               _kpi('Pass Rate', '99.2%', Icons.check),
               _kpi('Coverage', '85%', Icons.pie_chart),
               _kpi('Avg Runtime', '8 min', Icons.timer),

@@ -45,7 +45,7 @@ class _CropYieldPredictionScreenState extends State<CropYieldPredictionScreen> {
               children: [
             _kpi('Models', '6', Icons.psychology),
             _kpi('Accuracy', '87%', Icons.gps_fixed),
-            _kpi('Farms Covered', '12,500', Icons.agriculture),
+            _kpi('Farms Covered', '6,543', Icons.agriculture),
             _kpi('Predictions', '45K', Icons.trending_up),
               ],
             ),

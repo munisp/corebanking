@@ -43,7 +43,7 @@ class _SalaryProcessingScreenState extends State<SalaryProcessingScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-              _kpi('Corporate Clients', '12,500', Icons.business),
+              _kpi('Corporate Clients', '28,614', Icons.business),
               _kpi('Employees Paid', '2.8M', Icons.people),
               _kpi('Monthly Volume', '₦450B', Icons.money),
               _kpi('SLA Met', '99.8%', Icons.verified),

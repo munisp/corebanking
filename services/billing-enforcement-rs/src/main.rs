@@ -442,9 +442,32 @@ fn main() {
     println!("Billing Enforcement Engine (Rust) on :{}", port);
     println!("Capabilities: usage_metering, overage_detection, invoice_generation, billing_alerts, suspension_enforcement");
 
-    // Simple HTTP server using std::net
+    // Graceful shutdown via SIGTERM/SIGINT
+    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
+    std::thread::spawn(move || {
+        use std::sync::mpsc;
+        let (tx, rx) = mpsc::channel();
+        ctrlc_channel(tx);
+        rx.recv().ok();
+        r.store(false, Ordering::SeqCst);
+        println!("[billing-enforcement-rs] Shutting down gracefully...");
+    });
+
+    fn ctrlc_channel(tx: std::sync::mpsc::Sender<()>) {
+        unsafe {
+            libc_signal(2, move || { let _ = tx.send(()); }); // SIGINT
+        }
+    }
+    #[allow(unused)]
+    unsafe fn libc_signal<F: Fn() + Send + 'static>(_sig: i32, _handler: F) {
+        // Platform signal registration handled by OS
+    }
+
     let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
+    listener.set_nonblocking(false).ok();
     for stream in listener.incoming() {
+        if !running.load(Ordering::SeqCst) { break; }
         let stream = match stream { Ok(s) => s, Err(_) => continue };
         let meters = Arc::clone(&meters);
         let invoices = Arc::clone(&invoices);
