@@ -24,6 +24,7 @@ import (
 
 	"strings"
 
+	"regexp"
 )
 
 var serviceName = "core-banking-go"
@@ -36,7 +37,7 @@ type AccountLifecycle struct {
 	CustomerID   string  `json:"customer_id"`
 	ProductCode  string  `json:"product_code"`
 	Status       string  `json:"status"`
-	BalanceKobo      int64 `json:"balance"`
+	Balance      float64 `json:"balance"`
 	Currency     string  `json:"currency"`
 	Tier         int     `json:"tier"`
 	OpenedAt     string  `json:"opened_at"`
@@ -263,7 +264,7 @@ func eodBatchHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func accountTierHandler(w http.ResponseWriter, r *http.Request) {
-	var req struct{ BalanceKobo int64 `json:"balance"` }
+	var req struct{ Balance float64 `json:"balance"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -275,7 +276,7 @@ func accountTierHandler(w http.ResponseWriter, r *http.Request) {
 
 func interestCalcHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		BalanceKobo int64 `json:"balance"`
+		Balance float64 `json:"balance"`
 		Rate    float64 `json:"rate"`
 		Days    int     `json:"days"`
 	}
@@ -746,9 +747,6 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
         r.Header.Set("X-User-Id", "validated")
         next.ServeHTTP(w, r)
     })
-}
-		next.ServeHTTP(w, r)
-	})
 }
 
 

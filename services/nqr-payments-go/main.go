@@ -24,6 +24,8 @@ import (
 	"time"
 )
 
+var validCurrencies = map[string]bool{"NGN": true, "USD": true, "GBP": true, "EUR": true}
+
 var serviceName = "nqr-payments-go"
 
 // NIBSS NQR (Nigeria Quick Response) payment gateway — EMV QR standard for Nigerian payments
@@ -992,7 +994,6 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	}
 	return nil
 }
-
 
 
 // ─── Domain-Specific Payment Validation ─────────────────────────────────────

@@ -8,7 +8,6 @@ import (
 "syscall"
 "sync/atomic"
 
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -23,12 +22,10 @@ import (
 
 	"net"
 
+	"regexp"
 )
 
 var serviceName = "account-closure-go"
-
-
-
 
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) {
@@ -197,9 +194,8 @@ func balanceSweepAccount(customerID string) string {
 }
 
 
-
 func closureCheckHandler(w http.ResponseWriter, r *http.Request) {
-	var req struct { BalanceKobo int64 `json:"balance"`; HasLien bool `json:"has_lien"`; HasPending bool `json:"has_pending"` }
+	var req struct { Balance float64 `json:"balance"`; HasLien bool `json:"has_lien"`; HasPending bool `json:"has_pending"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -210,7 +206,7 @@ func closureCheckHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func processClosureHandler(w http.ResponseWriter, r *http.Request) {
-	var req struct { AccountID string `json:"account_id"`; AccountType string `json:"account_type"`; BalanceKobo int64 `json:"balance"` }
+	var req struct { AccountID string `json:"account_id"`; AccountType string `json:"account_type"`; Balance float64 `json:"balance"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -694,7 +690,7 @@ func computeClosurePenalty(accountType string, balance, earnedInterest float64) 
 func handleClosureValidate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body struct {
-		BalanceKobo         int64 `json:"balance"`
+		Balance         float64 `json:"balance"`
 		HasLiens        bool    `json:"has_liens"`
 		HasStandingOrders bool  `json:"has_standing_orders"`
 		AccountAge      int     `json:"account_age_days"`
@@ -993,14 +989,6 @@ func computeSMSAlertCharge(alertCount int, pricePerAlert AmountKobo) AmountKobo 
 }
 
 // Account closure validation
-func validateAccountClosure(balanceKobo AmountKobo, hasActiveLoan, hasPendingTxn, hasLien bool) (bool, []string) {
-	var errors []string
-	if balanceKobo != 0 { errors = append(errors, fmt.Sprintf("account balance must be zero (current: ₦%.2f)", balanceKobo.Naira())) }
-	if hasActiveLoan { errors = append(errors, "active loan linked to account") }
-	if hasPendingTxn { errors = append(errors, "pending transactions exist") }
-	if hasLien { errors = append(errors, "lien placed on account") }
-	return len(errors) == 0, errors
-}
 
 // Interest accrual for savings (daily accrual, monthly capitalization)
 func computeDailyInterestAccrual(balanceKobo AmountKobo, annualRatePct float64) AmountKobo {
@@ -1116,134 +1104,6 @@ type idempotencyRecorder struct {
 
 func (r *idempotencyRecorder) WriteHeader(code int) { r.statusCode = code; r.ResponseWriter.WriteHeader(code) }
 func (r *idempotencyRecorder) Write(b []byte) (int, error) { r.body = append(r.body, b...); return r.ResponseWriter.Write(b) }
-
-
-// ─── Optimistic Locking for Balance Updates ─────────────────────────────────
-// All balance updates use version-checked atomic operations.
-type BalanceLock struct {
-	AccountID string
-	Version   int64
-	Balance   int64 // kobo
-}
-
-func dbUpdateBalanceAtomic(accountID string, deltaKobo int64, currentVersion int64) (int64, error) {
-	if db == nil { return 0, fmt.Errorf("DB not available") }
-	tx, err := db.Begin()
-	if err != nil { return 0, err }
-	defer tx.Rollback()
-	var balance int64
-	var version int64
-	err = tx.QueryRow("SELECT balance_kobo, version FROM account_balances WHERE account_id = $1 FOR UPDATE", accountID).Scan(&balance, &version)
-	if err != nil { return 0, fmt.Errorf("account not found or locked: %v", err) }
-	if version != currentVersion {
-		return 0, fmt.Errorf("optimistic lock conflict: expected version %d, got %d", currentVersion, version)
-	}
-	newBalance := balance + deltaKobo
-	if newBalance < 0 { return 0, fmt.Errorf("insufficient balance: have %d kobo, need %d kobo", balance, -deltaKobo) }
-	_, err = tx.Exec("UPDATE account_balances SET balance_kobo = $1, version = version + 1, updated_at = NOW() WHERE account_id = $2 AND version = $3",
-		newBalance, accountID, currentVersion)
-	if err != nil { return 0, err }
-	err = tx.Commit()
-	if err != nil { return 0, err }
-	return newBalance, nil
-}
-
-
-// ─── Maker-Checker (Dual Authorization) ────────────────────────────────────
-// CBN requires dual control for high-value operations.
-type MakerCheckerRequest struct {
-	RequestID  string      `json:"request_id"`
-	Operation  string      `json:"operation"`
-	MakerID    string      `json:"maker_id"`
-	CheckerID  string      `json:"checker_id,omitempty"`
-	AmountKobo int64       `json:"amount_kobo"`
-	Status     string      `json:"status"` // pending_approval|approved|rejected
-	Payload    interface{} `json:"payload"`
-	CreatedAt  string      `json:"created_at"`
-	DecidedAt  string      `json:"decided_at,omitempty"`
-}
-
-var (
-	makerCheckerRequests []MakerCheckerRequest
-	makerCheckerMu       sync.Mutex
-)
-
-// makerCheckerThresholds defines CBN-required dual authorization thresholds (kobo)
-var makerCheckerThresholds = map[string]int64{
-	"transfer":      100_000_000, // ₦1M
-	"loan_disburse": 100_000_000, // ₦1M
-	"gl_posting":    50_000_000,  // ₦500K
-	"account_close": 0,           // Always requires checker
-}
-
-func requiresMakerChecker(operation string, amountKobo int64) bool {
-	threshold, ok := makerCheckerThresholds[operation]
-	if !ok { threshold = 100_000_000 }
-	return amountKobo >= threshold
-}
-
-func submitForApproval(operation, makerID string, amountKobo int64, payload interface{}) *MakerCheckerRequest {
-	req := MakerCheckerRequest{
-		RequestID: fmt.Sprintf("MCR-%d", time.Now().UnixNano()),
-		Operation: operation, MakerID: makerID, AmountKobo: amountKobo,
-		Status: "pending_approval", Payload: payload,
-		CreatedAt: time.Now().Format(time.RFC3339),
-	}
-	makerCheckerMu.Lock()
-	makerCheckerRequests = append(makerCheckerRequests, req)
-	makerCheckerMu.Unlock()
-	return &req
-}
-
-
-// ─── Immutable Audit Trail ──────────────────────────────────────────────────
-// Append-only audit log. No DELETE or UPDATE permitted on audit records.
-type AuditEntry struct {
-	ID         string `json:"id"`
-	Timestamp  string `json:"timestamp"`
-	Service    string `json:"service"`
-	Operation  string `json:"operation"`
-	ActorID    string `json:"actor_id"`
-	EntityID   string `json:"entity_id"`
-	EntityType string `json:"entity_type"`
-	OldState   string `json:"old_state,omitempty"`
-	NewState   string `json:"new_state,omitempty"`
-	IPAddress  string `json:"ip_address,omitempty"`
-	Checksum   string `json:"checksum"` // SHA256 of entry for tamper detection
-}
-
-var (
-	auditLog   []AuditEntry
-	auditLogMu sync.RWMutex
-)
-
-func appendAuditEntry(service, operation, actorID, entityID, entityType, oldState, newState, ip string) {
-	entry := AuditEntry{
-		ID:         fmt.Sprintf("AUD-%d", time.Now().UnixNano()),
-		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
-		Service:    service,
-		Operation:  operation,
-		ActorID:    actorID,
-		EntityID:   entityID,
-		EntityType: entityType,
-		OldState:   oldState,
-		NewState:   newState,
-		IPAddress:  ip,
-	}
-	// Compute tamper-detection checksum
-	raw := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s", entry.ID, entry.Timestamp, entry.Service, entry.Operation, entry.ActorID, entry.EntityID, entry.OldState, entry.NewState, entry.IPAddress)
-	entry.Checksum = fmt.Sprintf("%x", sha256.Sum256([]byte(raw)))
-	auditLogMu.Lock()
-	auditLog = append(auditLog, entry)
-	auditLogMu.Unlock()
-	// Persist to DB if available (append-only INSERT, never UPDATE/DELETE)
-	if db != nil {
-		go func() {
-			db.Exec("INSERT INTO audit_trail (id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip_address, checksum) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-				entry.ID, entry.Timestamp, entry.Service, entry.Operation, entry.ActorID, entry.EntityID, entry.EntityType, entry.OldState, entry.NewState, entry.IPAddress, entry.Checksum)
-		}()
-	}
-}
 
 
 // ─── Transaction Atomicity ──────────────────────────────────────────────────

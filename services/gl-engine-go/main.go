@@ -26,6 +26,7 @@ import (
 	"net"
 
 	"strings"
+	"regexp"
 )
 
 var db *sql.DB
@@ -70,7 +71,7 @@ type GLAccount struct {
 	Subcategory      string  `json:"subcategory"`
 	ParentCode       *string `json:"parentCode"`
 	Currency         string  `json:"currency"`
-	BalanceKobo          int64 `json:"balance"`
+	Balance          float64 `json:"balance"`
 	Status           string  `json:"status"`
 	IsControlAccount int     `json:"isControlAccount"`
 }
@@ -703,7 +704,7 @@ func gl_engineScoreHandler(w http.ResponseWriter, r *http.Request) {
     }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
-    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
     }
     score := gl_engineComputeScore(req.Value, req.Weight, req.Threshold)
@@ -714,7 +715,7 @@ func gl_engineValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
     if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
-    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
     }
     result := gl_engineValidateRequest(body)
@@ -1095,9 +1096,6 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
         next.ServeHTTP(w, r)
     })
 }
-		next.ServeHTTP(w, r)
-	})
-}
 
 
 // ── Binary RPC Server (stdlib, high-performance inter-service communication) ──
@@ -1321,7 +1319,7 @@ func (am *alertManager) check() []map[string]interface{} {
 func max64(a, b uint64) uint64 { if a > b { return a }; return b }
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+    respondJSON(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Integration Tests ---

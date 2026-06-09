@@ -23,6 +23,7 @@ import (
 
 	"net"
 
+	"regexp"
 )
 
 var serviceName = "card-management-go"
@@ -32,15 +33,12 @@ var kycCardURL = func() string { v := os.Getenv("KYC_SERVICE_URL"); if v == "" {
 var coreBankURL = func() string { v := os.Getenv("CORE_BANKING_URL"); if v == "" { return "http://localhost:8100" }; return v }()
 
 
-
-
 type CardRequest struct {
 	CustomerID string `json:"customer_id"`
 	CardType   string `json:"card_type"`
 	Scheme     string `json:"scheme"`
 	Currency   string `json:"currency"`
 }
-
 
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) {
@@ -212,7 +210,6 @@ func validateCardAction(action string, status string) bool {
 	default: return false
 	}
 }
-
 
 
 func issueCardHandler(w http.ResponseWriter, r *http.Request) {
@@ -864,6 +861,8 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 // ── Deep Domain Logic: Cards ────────────────────────────────────────────────
 
 type AmountKobo int64
+
+var validCurrencies = map[string]bool{"NGN": true, "USD": true, "GBP": true, "EUR": true}
 func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
 func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
 
@@ -932,7 +931,6 @@ func computeCardFraudScore(
 	if score >= 70 { risk = "high" } else if score >= 40 { risk = "medium" }
 	return score, risk
 }
-
 
 
 // ── State Machine & Reversal Logic ──────────────────────────────────────────
@@ -1280,7 +1278,6 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	}
 	return nil
 }
-
 
 
 // ─── Domain-Specific Payment Validation ─────────────────────────────────────

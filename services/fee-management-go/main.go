@@ -11,7 +11,6 @@ import (
 "syscall"
 "sync/atomic"
 
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -27,6 +26,7 @@ import (
 
 	"net"
 
+	"regexp"
 )
 
 // secureRandUint32 generates a cryptographically secure random uint32
@@ -154,7 +154,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 	// Inter-service call: fee_posting
@@ -207,7 +207,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 
@@ -240,7 +240,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 
@@ -318,7 +318,7 @@ func fee_managementScoreHandler(w http.ResponseWriter, r *http.Request) {
     }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
-    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
     }
     score := fee_managementComputeScore(req.Value, req.Weight, req.Threshold)
@@ -329,7 +329,7 @@ func fee_managementValidateRequestHandler(w http.ResponseWriter, r *http.Request
     var body map[string]interface{}
     if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
-    	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+    	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
     }
     result := fee_managementValidateRequest(body)
@@ -818,7 +818,7 @@ func handleFeeCompute(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
 	}
 	if len(body.FeeTypes) == 0 { body.FeeTypes = []string{"transfer_nip", "sms_alert"} }
@@ -937,7 +937,7 @@ func (am *alertManager) check() []map[string]interface{} {
 func max64(a, b uint64) uint64 { if a > b { return a }; return b }
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+    respondJSON(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Graceful Degradation ---
@@ -975,7 +975,7 @@ func (d *degradationState) setUpstream(name string, ok bool) {
 func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     _degrade.mu.RLock()
     defer _degrade.mu.RUnlock()
-    jsonResp(w, 200, map[string]interface{}{
+    respondJSON(w, 200, map[string]interface{}{
         "service":        serviceName,
         "db_available":   _degrade.dbAvailable,
         "cache_available": _degrade.cacheAvailable,
@@ -1433,56 +1433,6 @@ func submitForApproval(operation, makerID string, amountKobo int64, payload inte
 	makerCheckerRequests = append(makerCheckerRequests, req)
 	makerCheckerMu.Unlock()
 	return &req
-}
-
-
-// ─── Immutable Audit Trail ──────────────────────────────────────────────────
-// Append-only audit log. No DELETE or UPDATE permitted on audit records.
-type AuditEntry struct {
-	ID         string `json:"id"`
-	Timestamp  string `json:"timestamp"`
-	Service    string `json:"service"`
-	Operation  string `json:"operation"`
-	ActorID    string `json:"actor_id"`
-	EntityID   string `json:"entity_id"`
-	EntityType string `json:"entity_type"`
-	OldState   string `json:"old_state,omitempty"`
-	NewState   string `json:"new_state,omitempty"`
-	IPAddress  string `json:"ip_address,omitempty"`
-	Checksum   string `json:"checksum"` // SHA256 of entry for tamper detection
-}
-
-var (
-	auditLog   []AuditEntry
-	auditLogMu sync.RWMutex
-)
-
-func appendAuditEntry(service, operation, actorID, entityID, entityType, oldState, newState, ip string) {
-	entry := AuditEntry{
-		ID:         fmt.Sprintf("AUD-%d", time.Now().UnixNano()),
-		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
-		Service:    service,
-		Operation:  operation,
-		ActorID:    actorID,
-		EntityID:   entityID,
-		EntityType: entityType,
-		OldState:   oldState,
-		NewState:   newState,
-		IPAddress:  ip,
-	}
-	// Compute tamper-detection checksum
-	raw := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%s|%s", entry.ID, entry.Timestamp, entry.Service, entry.Operation, entry.ActorID, entry.EntityID, entry.OldState, entry.NewState, entry.IPAddress)
-	entry.Checksum = fmt.Sprintf("%x", sha256.Sum256([]byte(raw)))
-	auditLogMu.Lock()
-	auditLog = append(auditLog, entry)
-	auditLogMu.Unlock()
-	// Persist to DB if available (append-only INSERT, never UPDATE/DELETE)
-	if db != nil {
-		go func() {
-			db.Exec("INSERT INTO audit_trail (id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip_address, checksum) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-				entry.ID, entry.Timestamp, entry.Service, entry.Operation, entry.ActorID, entry.EntityID, entry.EntityType, entry.OldState, entry.NewState, entry.IPAddress, entry.Checksum)
-		}()
-	}
 }
 
 
