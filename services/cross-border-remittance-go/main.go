@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"log"
 	"math/big"
 	"net/http"
@@ -676,6 +677,22 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+
+// --- Monetary Safety (kobo precision) ---
+// roundNaira eliminates floating-point drift by rounding to 2 decimal places (kobo precision).
+func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+
+// validateAmount checks monetary amount is non-negative and within CBN limits.
+func validateAmount(amount float64) error {
+	if amount < 0 {
+		return fmt.Errorf("amount must be non-negative, got %.2f", amount)
+	}
+	if amount > 999_999_999_999.99 {
+		return fmt.Errorf("amount exceeds maximum (₦999,999,999,999.99), got %.2f", amount)
+	}
+	return nil
 }
 
 func main() {

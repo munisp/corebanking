@@ -825,6 +825,7 @@ func handleFacilityEvaluate(w http.ResponseWriter, r *http.Request) {
 		Drawdown float64 `json:"drawdown_amount"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		body.Limit = roundNaira(body.Limit)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -1389,6 +1390,22 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+
+// --- Monetary Safety (kobo precision) ---
+// roundNaira eliminates floating-point drift by rounding to 2 decimal places (kobo precision).
+func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+
+// validateAmount checks monetary amount is non-negative and within CBN limits.
+func validateAmount(amount float64) error {
+	if amount < 0 {
+		return fmt.Errorf("amount must be non-negative, got %.2f", amount)
+	}
+	if amount > 999_999_999_999.99 {
+		return fmt.Errorf("amount exceeds maximum (₦999,999,999,999.99), got %.2f", amount)
+	}
+	return nil
+}
 
 func main() {
 	port := os.Getenv("PORT")

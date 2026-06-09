@@ -10,6 +10,7 @@ import (
 
 	"encoding/json"
 	"fmt"
+	"math"
 	"log"
 	"net/http"
 	"os"
@@ -204,6 +205,7 @@ func shiftReconcile(openBal float64, deposits float64, withdrawals float64) (flo
 func cashDepositHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Amount float64 `json:"amount"`; Account string `json:"account"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		req.Amount = roundNaira(req.Amount)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -215,6 +217,7 @@ func cashDepositHandler(w http.ResponseWriter, r *http.Request) {
 func cashWithdrawalHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Amount float64 `json:"amount"`; Account string `json:"account"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		req.Amount = roundNaira(req.Amount)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -1186,6 +1189,22 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+
+// --- Monetary Safety (kobo precision) ---
+// roundNaira eliminates floating-point drift by rounding to 2 decimal places (kobo precision).
+func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+
+// validateAmount checks monetary amount is non-negative and within CBN limits.
+func validateAmount(amount float64) error {
+	if amount < 0 {
+		return fmt.Errorf("amount must be non-negative, got %.2f", amount)
+	}
+	if amount > 999_999_999_999.99 {
+		return fmt.Errorf("amount exceeds maximum (₦999,999,999,999.99), got %.2f", amount)
+	}
+	return nil
+}
 
 func main() {
 	port := os.Getenv("PORT")

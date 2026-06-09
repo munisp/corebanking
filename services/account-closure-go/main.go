@@ -10,6 +10,7 @@ import (
 
 	"encoding/json"
 	"fmt"
+	"math"
 	"log"
 	"net/http"
 	"os"
@@ -197,6 +198,7 @@ func balanceSweepAccount(customerID string) string {
 func closureCheckHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Balance float64 `json:"balance"`; HasLien bool `json:"has_lien"`; HasPending bool `json:"has_pending"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		req.Balance = roundNaira(req.Balance)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -208,6 +210,7 @@ func closureCheckHandler(w http.ResponseWriter, r *http.Request) {
 func processClosureHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { AccountID string `json:"account_id"`; AccountType string `json:"account_type"`; Balance float64 `json:"balance"` }
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		req.Balance = roundNaira(req.Balance)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -698,6 +701,7 @@ func handleClosureValidate(w http.ResponseWriter, r *http.Request) {
 		EarnedInterest  float64 `json:"earned_interest"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		body.Balance = roundNaira(body.Balance)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -1126,6 +1130,22 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 	return nil
 }
 
+
+
+// --- Monetary Safety (kobo precision) ---
+// roundNaira eliminates floating-point drift by rounding to 2 decimal places (kobo precision).
+func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+
+// validateAmount checks monetary amount is non-negative and within CBN limits.
+func validateAmount(amount float64) error {
+	if amount < 0 {
+		return fmt.Errorf("amount must be non-negative, got %.2f", amount)
+	}
+	if amount > 999_999_999_999.99 {
+		return fmt.Errorf("amount exceeds maximum (₦999,999,999,999.99), got %.2f", amount)
+	}
+	return nil
+}
 
 func main() {
 	port := os.Getenv("PORT")

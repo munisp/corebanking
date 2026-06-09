@@ -1157,6 +1157,29 @@ def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload
 # ─── Immutable Audit Trail ───────────────────────────────────────────────────
 import hashlib as _audit_hashlib
 
+# --- Monetary Safety (kobo precision) ---
+def round_naira(amount):
+    """Round to 2 decimal places (kobo precision) to prevent float drift."""
+    return round(float(amount), 2)
+
+def naira_to_kobo(naira):
+    """Convert naira (float) to kobo (int) for precise storage."""
+    return int(round(float(naira) * 100))
+
+def kobo_to_naira(kobo):
+    """Convert kobo (int) back to naira (float) for display."""
+    return round(int(kobo) / 100.0, 2)
+
+def validate_amount(amount):
+    """Validate monetary amount: non-negative, within CBN limits."""
+    amount = float(amount)
+    if amount < 0:
+        raise ValueError(f"Amount must be non-negative, got {amount:.2f}")
+    if amount > 999_999_999_999.99:
+        raise ValueError(f"Amount exceeds maximum (NGN 999,999,999,999.99)")
+    return round_naira(amount)
+
+
 # --- CORS & Security Headers ---
 CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
 SECURITY_HEADERS = {
