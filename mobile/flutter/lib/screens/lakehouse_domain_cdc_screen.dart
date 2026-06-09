@@ -1,23 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class LakehouseDomainCDCScreen extends StatelessWidget {
-  const LakehouseDomainCDCScreen({super.key});
+class LakehouseDomainCdcScreen extends StatefulWidget {
+  const LakehouseDomainCdcScreen({super.key});
+  @override
+  State<LakehouseDomainCdcScreen> createState() => _LakehouseDomainCdcScreenState();
+}
+
+class _LakehouseDomainCdcScreenState extends State<LakehouseDomainCdcScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Lakehouse Domain CDC',
-      apiEndpoint: '/api/platform/lakehouse/domains',
-      columnKeys: const ['domain', 'avgEventsPerDay', 'avgPayloadBytes'],
-      columnLabels: const ['Domain', 'Events/Day', 'Payload'],
-      seedData: const [
-              {'domain': 'core_banking', 'avgEventsPerDay': '125000', 'avgPayloadBytes': '2048'},
-              {'domain': 'payments', 'avgEventsPerDay': '450000', 'avgPayloadBytes': '1536'},
-              {'domain': 'lending', 'avgEventsPerDay': '85000', 'avgPayloadBytes': '3072'},
-              {'domain': 'gl_accounting', 'avgEventsPerDay': '320000', 'avgPayloadBytes': '1024'},
-              {'domain': 'fraud', 'avgEventsPerDay': '180000', 'avgPayloadBytes': '4096'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Lakehouse Domain Cdc'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

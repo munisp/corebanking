@@ -1,20 +1,75 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class TBPGSagaExecutionsScreen extends StatelessWidget {
-  const TBPGSagaExecutionsScreen({super.key});
+class TbPgSagaExecutionsScreen extends StatefulWidget {
+  const TbPgSagaExecutionsScreen({super.key});
+  @override
+  State<TbPgSagaExecutionsScreen> createState() => _TbPgSagaExecutionsScreenState();
+}
+
+class _TbPgSagaExecutionsScreenState extends State<TbPgSagaExecutionsScreen> {
+  String _searchQuery = '';
+  final List<Map<String, dynamic>> _items = [
+    {'name': 'Item 1', 'type': 'Standard', 'value': '₦100K', 'status': 'Active', },
+    {'name': 'Item 2', 'type': 'Standard', 'value': '₦200K', 'status': 'Active', },
+    {'name': 'Item 3', 'type': 'Standard', 'value': '₦300K', 'status': 'Active', },
+    {'name': 'Item 4', 'type': 'Standard', 'value': '₦400K', 'status': 'Pending', },
+  ];
+
+  List<Map<String, dynamic>> get _filteredItems => _searchQuery.isEmpty
+      ? _items
+      : _items.where((i) => i.values.any((v) => v.toString().toLowerCase().contains(_searchQuery.toLowerCase()))).toList();
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Saga Executions',
-      apiEndpoint: '/api/platform/tb-pg-sync/saga-executions',
-      columnKeys: const ['id', 'sagaName', 'status', 'currentStep', 'tenantId', 'durationMs'],
-      columnLabels: const ['ID', 'Saga', 'Status', 'Step', 'Tenant', 'Duration'],
-      seedData: const [
-              {'id': 'SEXE-001', 'sagaName': 'NIP Transfer Saga', 'status': 'completed', 'currentStep': '4', 'tenantId': 'TEN-GTBANK', 'durationMs': '165'},
-              {'id': 'SEXE-004', 'sagaName': 'Loan Disbursement Saga', 'status': 'compensating', 'currentStep': '2', 'tenantId': 'TEN-UBA', 'durationMs': '1450'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Tb Pg Saga Executions'), backgroundColor: Colors.green[700]),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            TextField(
+              decoration: InputDecoration(
+                hintText: 'Search...',
+                prefixIcon: const Icon(Icons.search),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onChanged: (v) => setState(() => _searchQuery = v),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: ListView.builder(
+                itemCount: _filteredItems.length,
+                itemBuilder: (context, index) {
+                  final item = _filteredItems[index];
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: Colors.green[100],
+                        child: Text(item['name'].toString().substring(0, 1)),
+                      ),
+                      title: Text(item['name'].toString()),
+                      subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                    Text('Type: ${item["type"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+                    Text('Value: ${item["value"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+                    Chip(
+                      label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
+                      backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
+                    ),
+                        ],
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () {},
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

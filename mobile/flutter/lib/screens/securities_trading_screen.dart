@@ -1,21 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class SecuritiesTradingScreen extends StatelessWidget {
+class SecuritiesTradingScreen extends StatefulWidget {
   const SecuritiesTradingScreen({super.key});
+  @override
+  State<SecuritiesTradingScreen> createState() => _SecuritiesTradingScreenState();
+}
+
+class _SecuritiesTradingScreenState extends State<SecuritiesTradingScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Securities Trading',
-      apiEndpoint: '/api/securities/v1/orders',
-      columnKeys: const ['id', 'security', 'exchange', 'side', 'qty', 'price', 'status'],
-      columnLabels: const ['ID', 'Security', 'Exchange', 'Side', 'Qty', 'Price', 'Status'],
-      seedData: const [
-      {'id': 'ORD-001', 'security': 'DANGCEM', 'exchange': 'NGX', 'side': 'Buy', 'qty': '100,000', 'price': '290.50', 'status': 'Filled'},
-      {'id': 'ORD-002', 'security': 'GTCO', 'exchange': 'NGX', 'side': 'Sell', 'qty': '50,000', 'price': '42.00', 'status': 'Filled'},
-      {'id': 'ORD-003', 'security': 'MTNN', 'exchange': 'NGX', 'side': 'Buy', 'qty': '25,000', 'price': '215.00', 'status': 'Partial'},
-    ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Securities Trading'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -1,20 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class PerformanceMetricsScreen extends StatelessWidget {
+class PerformanceMetricsScreen extends StatefulWidget {
   const PerformanceMetricsScreen({super.key});
+  @override
+  State<PerformanceMetricsScreen> createState() => _PerformanceMetricsScreenState();
+}
+
+class _PerformanceMetricsScreenState extends State<PerformanceMetricsScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Performance Metrics',
-      apiEndpoint: '/api/platform/performance/metrics',
-      columnKeys: const ['endpoint', 'p50Ms', 'p99Ms', 'rps', 'compressionSaving'],
-      columnLabels: const ['Endpoint', 'P50ms', 'P99ms', 'RPS', 'Savings'],
-      seedData: const [
-              {'endpoint': '/api/dashboard/overview', 'p50Ms': '12', 'p99Ms': '120', 'rps': '250', 'compressionSaving': '68.8%'},
-              {'endpoint': '/api/payments/v1/transfers', 'p50Ms': '45', 'p99Ms': '450', 'rps': '320', 'compressionSaving': '60.0%'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Performance Metrics'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

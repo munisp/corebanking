@@ -1,20 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class DisasterRecoveryScreen extends StatelessWidget {
+class DisasterRecoveryScreen extends StatefulWidget {
   const DisasterRecoveryScreen({super.key});
+  @override
+  State<DisasterRecoveryScreen> createState() => _DisasterRecoveryScreenState();
+}
+
+class _DisasterRecoveryScreenState extends State<DisasterRecoveryScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Disaster Recovery',
-      apiEndpoint: '/api/dr/v1/replicas',
-      columnKeys: const ['id', 'region', 'role', 'lag', 'status'],
-      columnLabels: const ['ID', 'Region', 'Role', 'Lag', 'Status'],
-      seedData: const [
-      {'id': 'DR-001', 'region': 'Lagos', 'role': 'Primary', 'lag': '0', 'status': 'Online'},
-      {'id': 'DR-002', 'region': 'Abuja', 'role': 'Standby', 'lag': '0.2s', 'status': 'Streaming'},
-    ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Disaster Recovery'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

@@ -1,19 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class I18nServiceScreen extends StatelessWidget {
+class I18nServiceScreen extends StatefulWidget {
   const I18nServiceScreen({super.key});
   @override
+  State<I18nServiceScreen> createState() => _I18nServiceScreenState();
+}
+
+class _I18nServiceScreenState extends State<I18nServiceScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'i18n Localization',
-      apiEndpoint: '/api/production/i18n/config',
-      columnKeys: const ['id', 'status'],
-      columnLabels: const ['ID', 'Status'],
-      seedData: const [
-        {'id': 'I18N_SERVICE_SCREEN-001', 'status': 'active'},
-        {'id': 'I18N_SERVICE_SCREEN-002', 'status': 'pending'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('I18N Service'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

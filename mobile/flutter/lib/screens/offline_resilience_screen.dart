@@ -1,20 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class OfflineResilienceScreen extends StatelessWidget {
+class OfflineResilienceScreen extends StatefulWidget {
   const OfflineResilienceScreen({super.key});
+  @override
+  State<OfflineResilienceScreen> createState() => _OfflineResilienceScreenState();
+}
+
+class _OfflineResilienceScreenState extends State<OfflineResilienceScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Offline Resilience',
-      apiEndpoint: '/api/offline-resilience/v1/offline/profiles',
-      columnKeys: const ['id', 'profile', 'bandwidth', 'strategy', 'score'],
-      columnLabels: const ['ID', 'Profile', 'Bandwidth', 'Strategy', 'Score'],
-      seedData: const [
-      {'id': 'OFF-001', 'profile': 'Lagos Urban', 'bandwidth': '50 Mbps', 'strategy': 'WebSocket', 'score': '99.8'},
-      {'id': 'OFF-002', 'profile': 'Rural Borno', 'bandwidth': '256 Kbps', 'strategy': 'USSD + SMS', 'score': '95.2'},
-    ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Offline Resilience'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

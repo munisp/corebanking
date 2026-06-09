@@ -1,22 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class WhiteLabelEngineScreen extends StatelessWidget {
+class WhiteLabelEngineScreen extends StatefulWidget {
   const WhiteLabelEngineScreen({super.key});
+  @override
+  State<WhiteLabelEngineScreen> createState() => _WhiteLabelEngineScreenState();
+}
+
+class _WhiteLabelEngineScreenState extends State<WhiteLabelEngineScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'White Label Engine',
-      apiEndpoint: '/api/white-label/v1/engine',
-      columnKeys: const ['id', 'partner', 'modules', 'users', 'status'],
-      columnLabels: const ['ID', 'Partner', 'Modules', 'Users', 'Status'],
-      seedData: const [
-      {'id': 'WL-001', 'partner': 'Sterling MFB', 'modules': '12', 'users': '45,000', 'status': 'Active'},
-      {'id': 'WL-002', 'partner': 'ALAT by Wema', 'modules': '18', 'users': '2.1M', 'status': 'Active'},
-      {'id': 'WL-003', 'partner': 'LAPO Microfinance', 'modules': '8', 'users': '890,000', 'status': 'Active'},
-      {'id': 'WL-004', 'partner': 'Kuda Digital', 'modules': '15', 'users': '5.2M', 'status': 'Onboarding'},
-    ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('White Label Engine'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

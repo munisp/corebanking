@@ -1,19 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class PgIndexAdvisoryScreen extends StatelessWidget {
+class PgIndexAdvisoryScreen extends StatefulWidget {
   const PgIndexAdvisoryScreen({super.key});
+  @override
+  State<PgIndexAdvisoryScreen> createState() => _PgIndexAdvisoryScreenState();
+}
+
+class _PgIndexAdvisoryScreenState extends State<PgIndexAdvisoryScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Index Advisory',
-      apiEndpoint: '/api/platform/postgres/index-advisories',
-      columnKeys: const ['id', 'table', 'indexType', 'estimatedSpeedup', 'priority', 'status'],
-      columnLabels: const ['ID', 'Table', 'Type', 'Speedup', 'Priority', 'Status'],
-      seedData: const [
-              {'id': 'IDX-001', 'table': 'audit_trail', 'indexType': 'btree', 'estimatedSpeedup': '25x', 'priority': 'critical', 'status': 'recommended'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Pg Index Advisory'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

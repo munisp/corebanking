@@ -1,21 +1,76 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class CircuitBreakerDashboardScreen extends StatelessWidget {
+class CircuitBreakerDashboardScreen extends StatefulWidget {
   const CircuitBreakerDashboardScreen({super.key});
+  @override
+  State<CircuitBreakerDashboardScreen> createState() => _CircuitBreakerDashboardScreenState();
+}
+
+class _CircuitBreakerDashboardScreenState extends State<CircuitBreakerDashboardScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Circuit Breaker Dashboard',
-      apiEndpoint: '/api/platform/circuit-breakers',
-      columnKeys: const ['service', 'state', 'failureCount', 'successCount', 'fallbackStrategy', 'p50LatencyMs'],
-      columnLabels: const ['Service', 'State', 'Failures', 'Successes', 'Fallback', 'P50ms'],
-      seedData: const [
-              {'service': 'core-banking-go', 'state': 'closed', 'failureCount': '0', 'successCount': '45200', 'fallbackStrategy': 'seed_data_fallback', 'p50LatencyMs': '45'},
-              {'service': 'payments-hub-go', 'state': 'closed', 'failureCount': '1', 'successCount': '38100', 'fallbackStrategy': 'seed_data_fallback', 'p50LatencyMs': '52'},
-              {'service': 'nibss-gateway-go', 'state': 'half_open', 'failureCount': '4', 'successCount': '2100', 'fallbackStrategy': 'queue_and_retry', 'p50LatencyMs': '200'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Circuit Breaker Dashboard'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Services', '512', Icons.dns),
+            _kpi('Open', '0', Icons.error),
+            _kpi('Half-Open', '2', Icons.warning),
+            _kpi('Closed', '510', Icons.check_circle),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.payment, color: Colors.green),
+              title: Text('payment-gateway'),
+              subtitle: Text('Threshold: 5 failures/30s'),
+              trailing: Text('Closed', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.person, color: Colors.green),
+              title: Text('kyc-service'),
+              subtitle: Text('Threshold: 3 failures/60s'),
+              trailing: Text('Half-Open', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.sms, color: Colors.green),
+              title: Text('sms-gateway'),
+              subtitle: Text('Threshold: 10 failures/60s'),
+              trailing: Text('Closed', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

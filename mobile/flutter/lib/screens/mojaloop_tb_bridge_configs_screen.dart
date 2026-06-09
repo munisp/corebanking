@@ -1,20 +1,75 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class MojaloopTBBridgeConfigsScreen extends StatelessWidget {
-  const MojaloopTBBridgeConfigsScreen({super.key});
+class MojaloopTbBridgeConfigsScreen extends StatefulWidget {
+  const MojaloopTbBridgeConfigsScreen({super.key});
+  @override
+  State<MojaloopTbBridgeConfigsScreen> createState() => _MojaloopTbBridgeConfigsScreenState();
+}
+
+class _MojaloopTbBridgeConfigsScreenState extends State<MojaloopTbBridgeConfigsScreen> {
+  String _searchQuery = '';
+  final List<Map<String, dynamic>> _items = [
+    {'name': 'Item 1', 'type': 'Standard', 'value': '₦100K', 'status': 'Active', },
+    {'name': 'Item 2', 'type': 'Standard', 'value': '₦200K', 'status': 'Active', },
+    {'name': 'Item 3', 'type': 'Standard', 'value': '₦300K', 'status': 'Active', },
+    {'name': 'Item 4', 'type': 'Standard', 'value': '₦400K', 'status': 'Pending', },
+  ];
+
+  List<Map<String, dynamic>> get _filteredItems => _searchQuery.isEmpty
+      ? _items
+      : _items.where((i) => i.values.any((v) => v.toString().toLowerCase().contains(_searchQuery.toLowerCase()))).toList();
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'TB Bridge Configs',
-      apiEndpoint: '/api/platform/mojaloop/tb-bridge/configs',
-      columnKeys: const ['id', 'name', 'transferType', 'ledger', 'autoPost'],
-      columnLabels: const ['ID', 'Name', 'Type', 'Ledger', 'Auto-Post'],
-      seedData: const [
-              {'id': 'TBC-001', 'name': 'Domestic Transfer Bridge', 'transferType': 'domestic_nip', 'ledger': '4', 'autoPost': 'true'},
-              {'id': 'TBC-002', 'name': 'Cross-Border Transfer Bridge', 'transferType': 'cross_border', 'ledger': '5', 'autoPost': 'true'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Mojaloop Tb Bridge Configs'), backgroundColor: Colors.green[700]),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            TextField(
+              decoration: InputDecoration(
+                hintText: 'Search...',
+                prefixIcon: const Icon(Icons.search),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onChanged: (v) => setState(() => _searchQuery = v),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: ListView.builder(
+                itemCount: _filteredItems.length,
+                itemBuilder: (context, index) {
+                  final item = _filteredItems[index];
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: Colors.green[100],
+                        child: Text(item['name'].toString().substring(0, 1)),
+                      ),
+                      title: Text(item['name'].toString()),
+                      subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                    Text('Type: ${item["type"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+                    Text('Value: ${item["value"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+                    Chip(
+                      label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
+                      backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
+                    ),
+                        ],
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () {},
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

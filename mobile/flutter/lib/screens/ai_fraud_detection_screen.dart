@@ -1,19 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class AiFraudDetectionScreen extends StatelessWidget {
+class AiFraudDetectionScreen extends StatefulWidget {
   const AiFraudDetectionScreen({super.key});
+  @override
+  State<AiFraudDetectionScreen> createState() => _AiFraudDetectionScreenState();
+}
+
+class _AiFraudDetectionScreenState extends State<AiFraudDetectionScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'AI Fraud Detection',
-      apiEndpoint: '/api/fraud/v1/ml-alerts',
-      columnKeys: const ['id', 'score', 'rule', 'amount', 'action'],
-      columnLabels: const ['ID', 'Score', 'Rule', 'Amount', 'Action'],
-      seedData: const [
-      {'id': 'AIF-001', 'score': '95', 'rule': 'ML Anomaly', 'amount': 'NGN 45M', 'action': 'Blocked'},
-    ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('AI Fraud Detection'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Alerts Today', '23', Icons.warning),
+            _kpi('Blocked', '₦4.2M', Icons.block),
+            _kpi('Accuracy', '99.2%', Icons.psychology),
+            _kpi('False Pos', '1.8%', Icons.cancel),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.speed, color: Colors.green),
+              title: Text('Velocity anomaly'),
+              subtitle: Text('15 txns/2min'),
+              trailing: Text('Blocked', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.location_off, color: Colors.green),
+              title: Text('Geo impossible'),
+              subtitle: Text('Lagos→London 5min'),
+              trailing: Text('Blocked', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

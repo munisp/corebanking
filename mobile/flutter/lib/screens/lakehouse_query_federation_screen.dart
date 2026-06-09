@@ -1,20 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class LakehouseQueryFederationScreen extends StatelessWidget {
+class LakehouseQueryFederationScreen extends StatefulWidget {
   const LakehouseQueryFederationScreen({super.key});
+  @override
+  State<LakehouseQueryFederationScreen> createState() => _LakehouseQueryFederationScreenState();
+}
+
+class _LakehouseQueryFederationScreenState extends State<LakehouseQueryFederationScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Query Federation',
-      apiEndpoint: '/api/platform/lakehouse/queries',
-      columnKeys: const ['id', 'name', 'sourceTable', 'consumingService', 'avgExecutionMs'],
-      columnLabels: const ['ID', 'Name', 'Table', 'Consumer', 'Avg ms'],
-      seedData: const [
-              {'id': 'FQ-001', 'name': 'Customer Risk Profile', 'sourceTable': 'compliance_risk_scores', 'consumingService': 'kyc-engine-py', 'avgExecutionMs': '120'},
-              {'id': 'FQ-002', 'name': 'Transaction Features', 'sourceTable': 'transaction_features', 'consumingService': 'fraud-detection-py', 'avgExecutionMs': '3500'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Lakehouse Query Federation'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }

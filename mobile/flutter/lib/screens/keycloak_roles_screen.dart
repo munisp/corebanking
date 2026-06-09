@@ -1,19 +1,75 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class KeycloakRolesScreen extends StatelessWidget {
+class KeycloakRolesScreen extends StatefulWidget {
   const KeycloakRolesScreen({super.key});
+  @override
+  State<KeycloakRolesScreen> createState() => _KeycloakRolesScreenState();
+}
+
+class _KeycloakRolesScreenState extends State<KeycloakRolesScreen> {
+  String _searchQuery = '';
+  final List<Map<String, dynamic>> _items = [
+    {'name': 'Item 1', 'type': 'Standard', 'value': '₦100K', 'status': 'Active', },
+    {'name': 'Item 2', 'type': 'Standard', 'value': '₦200K', 'status': 'Active', },
+    {'name': 'Item 3', 'type': 'Standard', 'value': '₦300K', 'status': 'Active', },
+    {'name': 'Item 4', 'type': 'Standard', 'value': '₦400K', 'status': 'Pending', },
+  ];
+
+  List<Map<String, dynamic>> get _filteredItems => _searchQuery.isEmpty
+      ? _items
+      : _items.where((i) => i.values.any((v) => v.toString().toLowerCase().contains(_searchQuery.toLowerCase()))).toList();
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'Keycloak Roles',
-      apiEndpoint: '/api/platform/keycloak/roles',
-      columnKeys: const ['name', 'realm', 'usersAssigned', 'composite'],
-      columnLabels: const ['Name', 'Realm', 'Users', 'Composite'],
-      seedData: const [
-              {'name': 'bank_customer', 'realm': '54bank', 'usersAssigned': '1450000', 'composite': 'true'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Keycloak Roles'), backgroundColor: Colors.green[700]),
+      body: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          children: [
+            TextField(
+              decoration: InputDecoration(
+                hintText: 'Search...',
+                prefixIcon: const Icon(Icons.search),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onChanged: (v) => setState(() => _searchQuery = v),
+            ),
+            const SizedBox(height: 12),
+            Expanded(
+              child: ListView.builder(
+                itemCount: _filteredItems.length,
+                itemBuilder: (context, index) {
+                  final item = _filteredItems[index];
+                  return Card(
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      leading: CircleAvatar(
+                        backgroundColor: Colors.green[100],
+                        child: Text(item['name'].toString().substring(0, 1)),
+                      ),
+                      title: Text(item['name'].toString()),
+                      subtitle: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                    Text('Type: ${item["type"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+                    Text('Value: ${item["value"]}', style: TextStyle(color: Colors.grey[600], fontSize: 13)),
+                    Chip(
+                      label: Text(item['status'].toString(), style: const TextStyle(fontSize: 12)),
+                      backgroundColor: item['status'] == 'Active' ? Colors.green[100] : Colors.orange[100],
+                    ),
+                        ],
+                      ),
+                      trailing: const Icon(Icons.chevron_right),
+                      onTap: () {},
+                    ),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

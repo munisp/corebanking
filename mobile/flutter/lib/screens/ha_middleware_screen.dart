@@ -1,20 +1,70 @@
 import 'package:flutter/material.dart';
-import '../widgets/api_list_screen.dart';
 
-class HAMiddlewareScreen extends StatelessWidget {
-  const HAMiddlewareScreen({super.key});
+class HaMiddlewareScreen extends StatefulWidget {
+  const HaMiddlewareScreen({super.key});
+  @override
+  State<HaMiddlewareScreen> createState() => _HaMiddlewareScreenState();
+}
+
+class _HaMiddlewareScreenState extends State<HaMiddlewareScreen> {
+  bool _isLoading = false;
+
+  Widget _kpi(String label, String value, IconData icon) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: Colors.green[700], size: 20),
+            const Spacer(),
+            Text(value, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Text(label, style: TextStyle(fontSize: 12, color: Colors.grey[600])),
+          ],
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
-    return ApiListScreen(
-      title: 'HA Middleware',
-      apiEndpoint: '/api/platform/ha/middleware',
-      columnKeys: const ['name', 'type', 'replicas', 'mode', 'failoverTimeMs', 'rpo', 'rto'],
-      columnLabels: const ['Name', 'Type', 'Replicas', 'Mode', 'Failover ms', 'RPO', 'RTO'],
-      seedData: const [
-              {'name': 'PostgreSQL', 'type': 'database', 'replicas': '3', 'mode': 'streaming-replication', 'failoverTimeMs': '5000', 'rpo': '0s', 'rto': '5s'},
-              {'name': 'TigerBeetle', 'type': 'ledger', 'replicas': '6', 'mode': 'viewstamped-replication', 'failoverTimeMs': '100', 'rpo': '0ms', 'rto': '100ms'},
-      ],
+    return Scaffold(
+      appBar: AppBar(title: const Text('Ha Middleware'), backgroundColor: Colors.green[700]),
+      body: SingleChildScrollView(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            GridView.count(
+              crossAxisCount: 2,
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              mainAxisSpacing: 8,
+              crossAxisSpacing: 8,
+              childAspectRatio: 1.6,
+              children: [
+            _kpi('Total', '1,245', Icons.analytics),
+            _kpi('Active', '1,200', Icons.check_circle),
+            _kpi('Success', '99.5%', Icons.trending_up),
+            _kpi('Alerts', '3', Icons.warning),
+              ],
+            ),
+            const SizedBox(height: 16),
+            Card(child: ListTile(
+              leading: Icon(Icons.check_circle, color: Colors.green),
+              title: Text('Primary'),
+              subtitle: Text('Main functionality'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+            Card(child: ListTile(
+              leading: Icon(Icons.settings, color: Colors.green),
+              title: Text('Secondary'),
+              subtitle: Text('Supporting feature'),
+              trailing: Text('Active', style: const TextStyle(fontWeight: FontWeight.bold)),
+            )),
+          ],
+        ),
+      ),
     );
   }
 }
