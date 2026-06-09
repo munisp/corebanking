@@ -43,7 +43,7 @@ class _ApiKeyEnforcerScreenState extends State<ApiKeyEnforcerScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Active Keys', '1,245', Icons.key),
+            _kpi('Active Keys', '3,200', Icons.key),
             _kpi('Revoked', '23', Icons.block),
             _kpi('Expiring', '15', Icons.schedule),
             _kpi('Usage', '2.4M', Icons.bar_chart),

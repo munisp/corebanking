@@ -43,7 +43,7 @@ class _ArtAdversarialScreenState extends State<ArtAdversarialScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Tests Run', '1,245', Icons.security),
+            _kpi('Tests Run', '2,850', Icons.security),
             _kpi('Vulns Found', '3', Icons.bug_report),
             _kpi('Pass Rate', '99.8%', Icons.check_circle),
             _kpi('Coverage', '94%', Icons.coverage),

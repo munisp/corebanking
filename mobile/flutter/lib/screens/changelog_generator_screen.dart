@@ -46,7 +46,7 @@ class _ChangelogGeneratorScreenState extends State<ChangelogGeneratorScreen> {
             _kpi('Releases', '45', Icons.new_releases),
             _kpi('This Month', '3', Icons.calendar_today),
             _kpi('Contributors', '24', Icons.people),
-            _kpi('Commits', '1,245', Icons.commit),
+            _kpi('Commits', '12,800', Icons.commit),
               ],
             ),
             const SizedBox(height: 16),

@@ -43,7 +43,7 @@ class _CorporateMonitoringScreenState extends State<CorporateMonitoringScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Corporates', '1,245', Icons.business),
+            _kpi('Corporates', '4,500', Icons.business),
             _kpi('Active Alerts', '12', Icons.warning),
             _kpi('Compliance', '98.5%', Icons.check_circle),
             _kpi('Revenue', '₦2.4B', Icons.payments),

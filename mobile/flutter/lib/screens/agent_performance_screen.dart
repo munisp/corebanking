@@ -43,7 +43,7 @@ class _AgentPerformanceScreenState extends State<AgentPerformanceScreen> {
               crossAxisSpacing: 8,
               childAspectRatio: 1.6,
               children: [
-            _kpi('Agents', '1,245', Icons.people),
+            _kpi('Agents', '8,500', Icons.people),
             _kpi('Txns Today', '34,567', Icons.receipt),
             _kpi('Rating', '4.2/5', Icons.star),
             _kpi('Commission', '₦8.5M', Icons.payments),
