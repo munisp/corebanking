@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import '../widgets/api_list_screen.dart';
 
 /// Transfer Screen with NUBAN validation, beneficiary management, and PIN/biometric confirm
 class TransfersScreen extends StatefulWidget {

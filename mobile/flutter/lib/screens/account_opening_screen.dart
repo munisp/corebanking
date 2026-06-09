@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import '../widgets/api_list_screen.dart';
 
 /// Account Opening Screen with Nigerian regulatory compliance
 /// Implements: BVN validation, NIN validation, document upload, selfie capture, tier selection
