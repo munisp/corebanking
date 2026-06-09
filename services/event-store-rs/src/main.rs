@@ -349,6 +349,16 @@ fn init_tracing(service_name: &str) {
     }
 }
 
+
+// --- Rate Limiter ---
+static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
+static RL_LAST: AtomicU64 = AtomicU64::new(0);
+fn rl_allow() -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let last = RL_LAST.load(Ordering::Relaxed);
+    if now > last { RL_TOKENS.store(100, Ordering::Relaxed); RL_LAST.store(now, Ordering::Relaxed); }
+    RL_TOKENS.fetch_sub(1, Ordering::Relaxed) > 0
+}
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8098".to_string()).parse().unwrap_or(8098);

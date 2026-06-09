@@ -533,6 +533,23 @@ fn init_tracing(service_name: &str) {
     }
 }
 
+
+// --- Circuit Breaker ---
+static CB_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static CB_LAST_FAIL: AtomicI64 = AtomicI64::new(0);
+fn cb_allow() -> bool { CB_FAIL_COUNT.load(Ordering::Relaxed) < 5 || chrono::Utc::now().timestamp() - CB_LAST_FAIL.load(Ordering::Relaxed) > 30 }
+fn cb_record_success() { CB_FAIL_COUNT.store(0, Ordering::Relaxed); }
+fn cb_record_failure() { CB_FAIL_COUNT.fetch_add(1, Ordering::Relaxed); CB_LAST_FAIL.store(chrono::Utc::now().timestamp(), Ordering::Relaxed); }
+
+// --- Rate Limiter ---
+static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
+static RL_LAST: AtomicU64 = AtomicU64::new(0);
+fn rl_allow() -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let last = RL_LAST.load(Ordering::Relaxed);
+    if now > last { RL_TOKENS.store(100, Ordering::Relaxed); RL_LAST.store(now, Ordering::Relaxed); }
+    RL_TOKENS.fetch_sub(1, Ordering::Relaxed) > 0
+}
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8260".to_string()).parse().unwrap_or(8260);

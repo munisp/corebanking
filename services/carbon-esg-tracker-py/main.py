@@ -254,6 +254,34 @@ def add_security_headers(handler):
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("X-Frame-Options", "DENY")
 
+
+# --- Rate Limiter (Token Bucket) ---
+import threading as _threading
+import time as _time
+
+class _RateLimiter:
+    def __init__(self, rate=100, burst=200):
+        self._rate = rate
+        self._burst = burst
+        self._tokens = {}
+        self._lock = _threading.Lock()
+
+    def allow(self, key="global"):
+        with self._lock:
+            now = _time.monotonic()
+            if key not in self._tokens:
+                self._tokens[key] = (self._burst, now)
+                return True
+            tokens, last = self._tokens[key]
+            elapsed = now - last
+            tokens = min(self._burst, tokens + elapsed * self._rate)
+            if tokens >= 1:
+                self._tokens[key] = (tokens - 1, now)
+                return True
+            return False
+
+_rate_limiter = _RateLimiter()
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):

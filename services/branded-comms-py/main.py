@@ -761,6 +761,20 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
+
+# --- Retry with Exponential Backoff ---
+import time as _retry_time
+
+def retry_with_backoff(fn, max_retries=3, base_delay=0.1):
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            delay = min(base_delay * (2 ** attempt), 5.0)
+            _retry_time.sleep(delay)
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         trace_id = self.headers.get(_trace_header, "-")

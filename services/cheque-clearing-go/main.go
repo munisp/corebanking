@@ -1326,6 +1326,17 @@ func secureRandUint32() uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
+// --- Retry with Exponential Backoff ---
+func retryWithBackoff(maxRetries int, fn func() error) error {
+	for i := 0; i < maxRetries; i++ {
+		if err := fn(); err == nil { return nil }
+		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
+		if backoff > 5*time.Second { backoff = 5 * time.Second }
+		time.Sleep(backoff)
+	}
+	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
+}
+
 func main() {
 	initTracing()
 	port := os.Getenv("PORT")

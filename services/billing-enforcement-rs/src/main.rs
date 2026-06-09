@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BILLING MODELS
@@ -371,7 +372,36 @@ fn append_audit_entry(service: &str, operation: &str, actor_id: &str, entity_id:
 }
 
 
+// --- Circuit Breaker ---
+static CB_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
+static CB_LAST_FAIL: AtomicI64 = AtomicI64::new(0);
+fn cb_allow() -> bool { CB_FAIL_COUNT.load(Ordering::Relaxed) < 5 }
+fn cb_record_success() { CB_FAIL_COUNT.store(0, Ordering::Relaxed); }
+fn cb_record_failure() { CB_FAIL_COUNT.fetch_add(1, Ordering::Relaxed); CB_LAST_FAIL.store(0, Ordering::Relaxed); }
+
+// --- Rate Limiter ---
+static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
+static RL_LAST: AtomicU64 = AtomicU64::new(0);
+fn rl_allow() -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let last = RL_LAST.load(Ordering::Relaxed);
+    if now > last { RL_TOKENS.store(100, Ordering::Relaxed); RL_LAST.store(now, Ordering::Relaxed); }
+    RL_TOKENS.fetch_sub(1, Ordering::Relaxed) > 0
+}
+
+// --- Request Tracing ---
+fn extract_trace_id(headers: &std::collections::HashMap<String, String>) -> String {
+    headers.get("X-Trace-Id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+// --- Observability ---
+fn init_tracing(service_name: &str) {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
+    if !endpoint.is_empty() { println!("[{}] OTEL tracing: {}", service_name, endpoint); }
+}
+
 fn main() {
+    init_tracing("billing-enforcement-rs");
     let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
     if !db_url.is_empty() { println!("[billing-enforcement-rs] DB configured: {}", &db_url[..db_url.len().min(30)]); }
     let port = std::env::var("PORT").unwrap_or_else(|_| "8108".to_string());

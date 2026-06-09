@@ -1068,6 +1068,48 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
+
+# --- Rate Limiter (Token Bucket) ---
+import threading as _threading
+import time as _time
+
+class _RateLimiter:
+    def __init__(self, rate=100, burst=200):
+        self._rate = rate
+        self._burst = burst
+        self._tokens = {}
+        self._lock = _threading.Lock()
+
+    def allow(self, key="global"):
+        with self._lock:
+            now = _time.monotonic()
+            if key not in self._tokens:
+                self._tokens[key] = (self._burst, now)
+                return True
+            tokens, last = self._tokens[key]
+            elapsed = now - last
+            tokens = min(self._burst, tokens + elapsed * self._rate)
+            if tokens >= 1:
+                self._tokens[key] = (tokens - 1, now)
+                return True
+            return False
+
+_rate_limiter = _RateLimiter()
+
+
+# --- Retry with Exponential Backoff ---
+import time as _retry_time
+
+def retry_with_backoff(fn, max_retries=3, base_delay=0.1):
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            delay = min(base_delay * (2 ** attempt), 5.0)
+            _retry_time.sleep(delay)
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
