@@ -69,6 +69,12 @@ spec:
             - name: pgdata
               mountPath: /var/lib/postgresql/data
           readinessProbe:
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "banking", "-d", "banking54"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
             exec:
               command: ["pg_isready", "-U", "banking", "-d", "banking54"]
             initialDelaySeconds: 5
@@ -118,6 +124,16 @@ spec:
           image: redis:7-alpine
           ports:
             - containerPort: 6379
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
           command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
           readinessProbe:
             exec:
@@ -161,6 +177,16 @@ spec:
           image: confluentinc/cp-kafka:7.6.0
           ports:
             - containerPort: 9092
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 15
+            periodSeconds: 10
           env:
             - { name: KAFKA_NODE_ID, value: "1" }
             - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT" }
@@ -222,6 +248,18 @@ spec:
           image: opensearchproject/opensearch:2.12.0
           ports:
             - containerPort: 9200
+          livenessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 30
+            periodSeconds: 10
           env:
             - { name: discovery.type, value: "single-node" }
             - { name: OPENSEARCH_JAVA_OPTS, value: "-Xms512m -Xmx512m" }
@@ -329,6 +367,18 @@ spec:
           args: ["start", "--optimized"]
           ports:
             - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
           env:
             - { name: KC_HEALTH_ENABLED, value: "true" }
             - { name: KC_DB, value: "postgres" }
