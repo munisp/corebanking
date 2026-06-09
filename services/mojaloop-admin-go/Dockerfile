@@ -8,4 +8,7 @@ FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/mojaloop-admin-go /usr/local/bin/
 EXPOSE 8269
+RUN adduser -D -u 1001 appuser
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8269/healthz || exit 1
 CMD ["mojaloop-admin-go"]

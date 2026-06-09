@@ -9,4 +9,7 @@ RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/
 WORKDIR /app
 COPY --from=builder /app/target/release/falkordb_graph_engine .
 EXPOSE 8080
+RUN adduser -D -u 1001 appuser
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8080/healthz || exit 1
 CMD ["./falkordb_graph_engine"]

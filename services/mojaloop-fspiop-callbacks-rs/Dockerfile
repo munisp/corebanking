@@ -8,4 +8,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/release/mojaloop-fspiop-callbacks-rs /usr/local/bin/
 EXPOSE 8267
+RUN adduser -D -u 1001 appuser
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8267/healthz || exit 1
 CMD ["mojaloop-fspiop-callbacks-rs"]

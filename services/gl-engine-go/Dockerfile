@@ -9,4 +9,7 @@ FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/gl-engine-go /usr/local/bin/
 EXPOSE 8090
+RUN adduser -D -u 1001 appuser
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8090/healthz || exit 1
 CMD ["gl-engine-go"]

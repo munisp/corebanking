@@ -9,4 +9,7 @@ RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/idempotency-go /usr/local/bin/
 ENV PORT=8261
 EXPOSE 8261
+RUN adduser -D -u 1001 appuser
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8261/healthz || exit 1
 CMD ["idempotency-go"]

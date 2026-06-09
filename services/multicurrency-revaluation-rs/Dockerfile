@@ -7,4 +7,7 @@ RUN apk add musl-dev && cargo build --release
 FROM alpine:3.19
 COPY --from=builder /app/target/release/multicurrency-revaluation /service
 EXPOSE 8200
+RUN adduser -D -u 1001 appuser
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8200/healthz || exit 1
 CMD ["/service"]

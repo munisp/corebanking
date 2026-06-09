@@ -12,4 +12,6 @@ ENV ADDR=0.0.0.0:8093
 EXPOSE 8093
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8093/healthz >/dev/null || exit 1
+RUN adduser -D -u 1001 appuser
+USER appuser
 CMD ["trade-finance"]

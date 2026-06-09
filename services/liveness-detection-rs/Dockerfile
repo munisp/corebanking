@@ -11,4 +11,6 @@ ENV ADDR=0.0.0.0:8226
 EXPOSE 8226
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:8226/healthz >/dev/null || exit 1
+RUN adduser -D -u 1001 appuser
+USER appuser
 CMD ["liveness-detection"]

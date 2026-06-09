@@ -1,4 +1,7 @@
 FROM python:3.11-slim
 WORKDIR /app
 COPY main.py .
+RUN adduser -D -u 1001 appuser
+USER appuser
+HEALTHCHECK --interval=30s --timeout=5s CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz')" || exit 1
 CMD ["python", "main.py"]
