@@ -1,3 +1,4 @@
+import sys; sys.path.insert(0, '/home/ubuntu/repos/corebanking/libs/banking-rules-py')
 
 # --- PII Masking (NDPR Compliance) ---
 import re as _pii_re
@@ -1323,6 +1324,109 @@ def init_tracing(service_name):
     except Exception as e:
         logger.warning(f"Failed to init tracing: {e}")
 signal.signal(signal.SIGINT, shutdown_handler)
+
+
+
+# ─── Idempotency Enforcement ────────────────────────────────────────────────
+import hashlib as _idem_hashlib
+_idempotency_cache = {}  # key -> (status_code, response_body, timestamp)
+
+def check_idempotency(key: str) -> tuple:
+    """Check if idempotency key has been seen. Returns (is_duplicate, cached_response)."""
+    if key and key in _idempotency_cache:
+        entry = _idempotency_cache[key]
+        return True, entry
+    return False, None
+
+def store_idempotency(key: str, status_code: int, response: dict):
+    """Store idempotency response for deduplication (24h TTL)."""
+    import time
+    if key:
+        _idempotency_cache[key] = (status_code, response, time.time())
+        # Cleanup entries older than 24h
+        cutoff = time.time() - 86400
+        for k in list(_idempotency_cache.keys()):
+            if _idempotency_cache[k][2] < cutoff:
+                del _idempotency_cache[k]
+
+
+# ─── Maker-Checker (Dual Authorization) ─────────────────────────────────────
+_maker_checker_requests = []
+_MAKER_CHECKER_THRESHOLDS = {
+    "transfer": 100_000_000,       # ₦1M
+    "loan_disburse": 100_000_000,  # ₦1M
+    "gl_posting": 50_000_000,      # ₦500K
+    "account_close": 0,            # Always
+}
+
+def requires_maker_checker(operation: str, amount_kobo: int) -> bool:
+    """Check if operation needs dual authorization per CBN guidelines."""
+    threshold = _MAKER_CHECKER_THRESHOLDS.get(operation, 100_000_000)
+    return amount_kobo >= threshold
+
+def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload: dict) -> dict:
+    """Submit operation for maker-checker approval."""
+    import time
+    req = {
+        "request_id": f"MCR-{int(time.time()*1000000)}",
+        "operation": operation, "maker_id": maker_id, "amount_kobo": amount_kobo,
+        "status": "pending_approval", "payload": payload,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    _maker_checker_requests.append(req)
+    return req
+
+
+# ─── Immutable Audit Trail ───────────────────────────────────────────────────
+import hashlib as _audit_hashlib
+_audit_log = []  # Append-only. No deletion permitted.
+
+def append_audit_entry(service: str, operation: str, actor_id: str, entity_id: str,
+                       entity_type: str, old_state: str = "", new_state: str = "", ip: str = ""):
+    """Append immutable audit entry with tamper-detection checksum."""
+    import time
+    entry_id = f"AUD-{int(time.time()*1000000)}"
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    raw = f"{entry_id}|{timestamp}|{service}|{operation}|{actor_id}|{entity_id}|{old_state}|{new_state}|{ip}"
+    checksum = _audit_hashlib.sha256(raw.encode()).hexdigest()
+    entry = {
+        "id": entry_id, "timestamp": timestamp, "service": service,
+        "operation": operation, "actor_id": actor_id, "entity_id": entity_id,
+        "entity_type": entity_type, "old_state": old_state, "new_state": new_state,
+        "ip_address": ip, "checksum": checksum, "immutable": True,
+    }
+    _audit_log.append(entry)
+    # Persist to DB if available
+    if _db_conn:
+        try:
+            _db_conn.cursor().execute(
+                "INSERT INTO audit_trail (id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip_address, checksum) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (entry_id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip, checksum))
+            _db_conn.commit()
+        except Exception:
+            pass
+    return entry
+
+
+# ─── Transaction Atomicity ───────────────────────────────────────────────────
+def db_exec_atomic(queries_params: list) -> bool:
+    """Execute multiple DB operations in a single atomic transaction.
+    queries_params: [(sql, params_tuple), ...]
+    Returns True on success, False on rollback.
+    """
+    if not _db_conn:
+        return False
+    cur = _db_conn.cursor()
+    try:
+        for sql, params in queries_params:
+            cur.execute(sql, params)
+        _db_conn.commit()
+        return True
+    except Exception as e:
+        _db_conn.rollback()
+        import logging
+        logging.error(f"Atomic transaction failed, rolled back: {e}")
+        return False
 
 if __name__ == "__main__":
     get_db()

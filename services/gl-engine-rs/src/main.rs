@@ -771,6 +771,93 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
+
+// ─── Idempotency Enforcement ────────────────────────────────────────────────
+use std::collections::HashMap as IdempHashMap;
+use std::sync::RwLock as IdempRwLock;
+use std::time::Instant as IdempInstant;
+
+struct IdempotencyEntry {
+    response: Vec<u8>,
+    status_code: u16,
+    created_at: IdempInstant,
+}
+
+lazy_static::lazy_static! {
+    static ref IDEMPOTENCY_CACHE: IdempRwLock<IdempHashMap<String, IdempotencyEntry>> =
+        IdempRwLock::new(IdempHashMap::new());
+}
+
+fn check_idempotency(key: &str) -> Option<(u16, Vec<u8>)> {
+    let cache = IDEMPOTENCY_CACHE.read().unwrap();
+    cache.get(key).map(|e| (e.status_code, e.response.clone()))
+}
+
+fn store_idempotency(key: String, status_code: u16, response: Vec<u8>) {
+    let mut cache = IDEMPOTENCY_CACHE.write().unwrap();
+    cache.insert(key, IdempotencyEntry { response, status_code, created_at: IdempInstant::now() });
+    // Cleanup entries older than 24h
+    let cutoff = std::time::Duration::from_secs(86400);
+    cache.retain(|_, v| v.created_at.elapsed() < cutoff);
+}
+
+
+// ─── Maker-Checker (Dual Authorization) ────────────────────────────────────
+#[derive(Clone, serde::Serialize)]
+struct MakerCheckerRequest {
+    request_id: String,
+    operation: String,
+    maker_id: String,
+    checker_id: Option<String>,
+    amount_kobo: i64,
+    status: String, // pending_approval|approved|rejected
+    created_at: String,
+}
+
+fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
+    let threshold = match operation {
+        "transfer" => 100_000_000,      // ₦1M
+        "loan_disburse" => 100_000_000, // ₦1M
+        "gl_posting" => 50_000_000,     // ₦500K
+        "account_close" => 0,           // Always
+        _ => 100_000_000,               // Default ₦1M
+    };
+    amount_kobo >= threshold
+}
+
+
+// ─── Immutable Audit Trail ──────────────────────────────────────────────────
+use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
+
+#[derive(Clone, serde::Serialize)]
+struct AuditEntry {
+    id: String,
+    timestamp: String,
+    service: String,
+    operation: String,
+    actor_id: String,
+    entity_id: String,
+    entity_type: String,
+    old_state: String,
+    new_state: String,
+    checksum: String,
+    immutable: bool,
+}
+
+fn append_audit_entry(service: &str, operation: &str, actor_id: &str, entity_id: &str,
+                      entity_type: &str, old_state: &str, new_state: &str) -> AuditEntry {
+    let id = format!("AUD-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let raw = format!("{}|{}|{}|{}|{}|{}|{}|{}", id, timestamp, service, operation, actor_id, entity_id, old_state, new_state);
+    let mut hasher = AuditSha256::new();
+    hasher.update(raw.as_bytes());
+    let checksum = format!("{:x}", hasher.finalize());
+    AuditEntry { id, timestamp: timestamp.clone(), service: service.into(), operation: operation.into(),
+                 actor_id: actor_id.into(), entity_id: entity_id.into(), entity_type: entity_type.into(),
+                 old_state: old_state.into(), new_state: new_state.into(), checksum, immutable: true }
+}
+
+
 #[actix_web::main]
 async 
 // --- PII Masking (NDPR Compliance) ---
