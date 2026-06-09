@@ -51,7 +51,7 @@ class _HAZonesScreenState extends State<HAZonesScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('AZ-1 Lagos (Lekki)'),
-              subtitle: Text('Primary'),
+              subtitle: Text('Lagos Zone-1'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('40% traffic', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
@@ -60,7 +60,7 @@ class _HAZonesScreenState extends State<HAZonesScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('AZ-2 Lagos (Ikeja)'),
-              subtitle: Text('Secondary'),
+              subtitle: Text('Abuja Zone-2'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('35% traffic', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Healthy', style: TextStyle(fontSize: 11, color: Colors.grey[600])),

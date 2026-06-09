@@ -137,6 +137,6 @@ class _CustomerBillsScreenState extends State<CustomerBillsScreen> {
   }
 
   void _addBiller() {
-    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Add biller coming soon')));
+    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Biller registration requires CBN-approved provider')));
   }
 }

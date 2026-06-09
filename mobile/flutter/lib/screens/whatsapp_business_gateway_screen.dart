@@ -51,7 +51,7 @@ class _WhatsappBusinessGatewayScreenState extends State<WhatsappBusinessGatewayS
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('Cloud API (Meta)'),
-              subtitle: Text('Primary'),
+              subtitle: Text('WhatsApp Cloud API'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('500K msg/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),

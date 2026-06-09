@@ -51,7 +51,7 @@ class _MFAOrchestratorScreenState extends State<MFAOrchestratorScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('TOTP (Authenticator App)'),
-              subtitle: Text('Primary'),
+              subtitle: Text('TOTP + WebAuthn'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('45% of users', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),

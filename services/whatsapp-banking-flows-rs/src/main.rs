@@ -114,8 +114,7 @@ async fn flow_analytics(req: actix_web::HttpRequest, state: web::Data<AppState>,
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     let input = body.into_inner();
-    // TODO: extract current: u8
-    let current = Default::default();
+    let current: u8 = input.get("current").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
     let response_s = input.get("response").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let response = response_s.as_str();
     let result = next_step(current, response);

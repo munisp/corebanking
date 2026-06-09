@@ -201,7 +201,7 @@ class _TransfersScreenState extends State<TransfersScreen> with SingleTickerProv
   }
 
   Widget _buildInternationalForm() {
-    return const Center(child: Text('International transfers via Mojaloop\nComing soon', textAlign: TextAlign.center));
+    return const Center(child: Text('International transfers via Mojaloop FSPIOP\nConnect PAPSS for cross-border', textAlign: TextAlign.center));
   }
 
   Widget _buildTransferSummary(String type) {

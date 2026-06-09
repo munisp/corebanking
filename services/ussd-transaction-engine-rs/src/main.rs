@@ -99,8 +99,7 @@ async fn menu_navigate(req: actix_web::HttpRequest, state: web::Data<AppState>, 
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     let input = body.into_inner();
-    // TODO: extract level: u8
-    let level = Default::default();
+    let level: u8 = input.get("level").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
     let result = ussd_menu(level);
     let _result_data = json!({"endpoint": "menu_navigate"});
     db_persist(&state, "menu_navigate", &_result_data).await;

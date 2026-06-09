@@ -51,7 +51,7 @@ class _USSDMultilingualScreenState extends State<USSDMultilingualScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('English (en)'),
-              subtitle: Text('Primary'),
+              subtitle: Text('Hausa Session'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('250K sessions/day', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),

@@ -51,7 +51,7 @@ class _OutputEncoderScreenState extends State<OutputEncoderScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('JSON Encoder'),
-              subtitle: Text('Primary'),
+              subtitle: Text('JSON Serializer'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('1.5M/s, UTF-8', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),

@@ -51,7 +51,7 @@ class _I18NServiceScreenState extends State<I18NServiceScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('English (en-NG)'),
-              subtitle: Text('Primary'),
+              subtitle: Text('Hausa Locale'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('8,500 strings', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Complete', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
@@ -60,7 +60,7 @@ class _I18NServiceScreenState extends State<I18NServiceScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('Hausa (ha-NG)'),
-              subtitle: Text('Secondary'),
+              subtitle: Text('Yoruba Locale'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('8,500 strings', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Complete', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
@@ -69,7 +69,7 @@ class _I18NServiceScreenState extends State<I18NServiceScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('Yoruba (yo-NG)'),
-              subtitle: Text('Secondary'),
+              subtitle: Text('Igbo Locale'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('8,500 strings', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Complete', style: TextStyle(fontSize: 11, color: Colors.grey[600])),
@@ -78,7 +78,7 @@ class _I18NServiceScreenState extends State<I18NServiceScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('Igbo (ig-NG)'),
-              subtitle: Text('Secondary'),
+              subtitle: Text('Pidgin Locale'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('8,500 strings', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Complete', style: TextStyle(fontSize: 11, color: Colors.grey[600])),

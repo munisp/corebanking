@@ -51,7 +51,7 @@ class _VoiceASRNigerianScreenState extends State<VoiceASRNigerianScreen> {
             Card(child: ListTile(
               leading: Icon(Icons.circle, color: Colors.green[400], size: 12),
               title: Text('Nigerian English ASR'),
-              subtitle: Text('Primary'),
+              subtitle: Text('Hausa-Yoruba-Igbo ASR'),
               trailing: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.end, children: [
                 Text('95% accuracy', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13)),
                 Text('Active', style: TextStyle(fontSize: 11, color: Colors.grey[600])),

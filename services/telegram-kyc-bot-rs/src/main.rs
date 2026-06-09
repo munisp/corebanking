@@ -110,8 +110,7 @@ async fn kyc_status(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
     let input = body.into_inner();
-    // TODO: extract step: u8
-    let step = Default::default();
+    let step: u8 = input.get("step").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
     let result = kyc_step_name(step);
     let _result_data = json!({"endpoint": "kyc_status"});
     db_persist(&state, "kyc_status", &_result_data).await;
