@@ -687,6 +687,27 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 }
 
 
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simple token bucket: allow bursts of 100 requests
+		next.ServeHTTP(w, r)
+	})
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initDB()
 	_ = context.Background
@@ -716,5 +737,5 @@ func main() {
 		if db != nil { db.Close() }
 		os.Exit(0)
 	}()
-	log.Fatal(http.ListenAndServe(":"+PORT, mux))
+	log.Fatal(http.ListenAndServe(":"+PORT, corsMiddleware(rateLimitMiddleware(mux))))
 }

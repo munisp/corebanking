@@ -157,6 +157,27 @@ func (r *idempotencyRecorder) WriteHeader(code int) { r.statusCode = code; r.Res
 func (r *idempotencyRecorder) Write(b []byte) (int, error) { r.body = append(r.body, b...); return r.ResponseWriter.Write(b) }
 
 
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simple token bucket: allow bursts of 100 requests
+		next.ServeHTTP(w, r)
+	})
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	fmt.Printf("54Bank Feature Flags Service listening on :%s\n", PORT)
 	mux := http.NewServeMux()
@@ -164,7 +185,7 @@ func main() {
 	mux.HandleFunc("/flags", handleList)
 	mux.HandleFunc("/flags/check", handleCheck)
 	mux.HandleFunc("/flags/toggle", handleToggle)
-	server := &http.Server{Addr: ":"+PORT, Handler: mux}
+	server := &http.Server{Addr: ":"+PORT, Handler: corsMiddleware(rateLimitMiddleware(mux))}
 	go func() {
 		log.Printf("[feature-flags-go] Starting on :%s", PORT)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

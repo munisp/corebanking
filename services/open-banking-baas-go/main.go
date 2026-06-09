@@ -104,6 +104,20 @@ func consentHandler(w http.ResponseWriter, r *http.Request) {
 }
 func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/consents", consentHandler) }
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8095" }
@@ -115,7 +129,7 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 	registerRoutes(mux)
 	handler := rateLimitMiddleware(authMiddleware(mux))
-	server := &http.Server{Addr: ":"+port, Handler: handler}
+	server := &http.Server{Addr: ":"+port, Handler: corsMiddleware(handler)}
 	go func() {
 		log.Printf("[open-banking-baas-go] Starting on :%s", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

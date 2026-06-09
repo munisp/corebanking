@@ -565,6 +565,20 @@ func sanitizeLogEntry(msg string) string {
 	return msg
 }
 
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initDB()
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
@@ -583,7 +597,7 @@ func main() {
 
 	port := envOr("PORT", "8080")
 	handler := rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(mux)))
-	srv := &http.Server{Addr: ":" + port, Handler: handler}
+	srv := &http.Server{Addr: ":" + port, Handler: corsMiddleware(handler)}
 	go func() { log.Printf("[%s] listening on port %s", serviceName, port); srv.ListenAndServe() }()
 	quit := make(chan os.Signal, 1); signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT); <-quit
 	log.Println("shutting down"); ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second); defer cancel(); srv.Shutdown(ctx)

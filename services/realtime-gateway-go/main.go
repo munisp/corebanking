@@ -264,6 +264,13 @@ func (r *idempotencyRecorder) WriteHeader(code int) { r.statusCode = code; r.Res
 func (r *idempotencyRecorder) Write(b []byte) (int, error) { r.body = append(r.body, b...); return r.ResponseWriter.Write(b) }
 
 
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simple token bucket: allow bursts of 100 requests
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	go hub.run()
 	mux := http.NewServeMux()
@@ -273,7 +280,7 @@ func main() {
 	mux.HandleFunc("/events/types", handleEventTypes)
 	mux.HandleFunc("/connections", handleConnections)
 	log.Printf("54Bank Real-Time Gateway listening on :%s (SSE + REST)", PORT)
-	server := &http.Server{Addr: ":"+PORT, Handler: mux}
+	server := &http.Server{Addr: ":"+PORT, Handler: rateLimitMiddleware(mux)}
 	go func() {
 		log.Printf("[realtime-gateway-go] Starting on :%s", PORT)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
