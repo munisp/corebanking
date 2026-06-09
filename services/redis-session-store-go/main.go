@@ -13,6 +13,7 @@ import (
 
 	"encoding/json"
 	"fmt"
+	"math"
 	"log"
 	"crypto/rand"
 	"encoding/binary"
@@ -1717,6 +1718,19 @@ func handlePipelineExec(w http.ResponseWriter, r *http.Request) {
 	for _, cmd := range req.Commands { pipelineBatcher.Add(cmd.Cmd, cmd.Args...) }
 	batch := pipelineBatcher.Flush()
 	respondJSON(w, 200, map[string]interface{}{"executed": len(batch), "pipelined": true})
+}
+
+
+// --- Monetary Safety (kobo precision) ---
+type AmountKobo = int64
+
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(math.Round(naira * 100)) }
+func koboToNaira(kobo AmountKobo) float64  { return float64(kobo) / 100.0 }
+func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+func validateAmount(amount float64) error {
+	if amount < 0 { return fmt.Errorf("amount must be non-negative") }
+	if amount > 999_999_999_999.99 { return fmt.Errorf("exceeds CBN max limit") }
+	return nil
 }
 
 func main() {

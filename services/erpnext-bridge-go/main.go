@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"log"
 	"net/http"
 	"os"
@@ -102,7 +103,8 @@ func syncHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	respondJSON(w, map[string]interface{}{"status": "synced", "service": serviceName})
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/sync", syncHandler) }
+func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/sync", syncHandler)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"erpnext-bridge-go"}`))}) }
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -116,6 +118,19 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+
+// --- Monetary Safety (kobo precision) ---
+type AmountKobo = int64
+
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(math.Round(naira * 100)) }
+func koboToNaira(kobo AmountKobo) float64  { return float64(kobo) / 100.0 }
+func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+func validateAmount(amount float64) error {
+	if amount < 0 { return fmt.Errorf("amount must be non-negative") }
+	if amount > 999_999_999_999.99 { return fmt.Errorf("exceeds CBN max limit") }
+	return nil
 }
 
 func main() {

@@ -145,7 +145,9 @@ async fn invalidate(body: web::Json<serde_json::Value>) -> HttpResponse {
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/proxy/{path:.*}", web::to(cached_proxy))
-       .route("/invalidate", web::post().to(invalidate));
+       .route("/invalidate", web::post().to(invalidate))
+            .route("/healthz", web::get().to(healthz))
+            .route("/readyz", web::get().to(healthz));
 }
 
 
@@ -158,6 +160,24 @@ async fn init_db(url: &str) -> Option<tokio_postgres::Client> {
         }
         Err(e) => { eprintln!("DB connect failed: {}", e); None }
     }
+}
+
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "redis-cache-middleware-rs"}))
+}
+
+
+// --- Monetary Safety (kobo precision) ---
+type AmountKobo = i64;
+
+fn naira_to_kobo(naira: f64) -> i64 { (naira * 100.0).round() as i64 }
+fn kobo_to_naira(kobo: i64) -> f64 { kobo as f64 / 100.0 }
+fn round_naira(amount: f64) -> f64 { (amount * 100.0).round() / 100.0 }
+fn validate_amount(amount: f64) -> Result<f64, String> {
+    if amount < 0.0 { return Err("amount must be non-negative".into()); }
+    if amount > 999_999_999_999.99 { return Err("exceeds CBN max limit".into()); }
+    Ok(round_naira(amount))
 }
 
 #[actix_web::main]

@@ -171,6 +171,8 @@ async fn lookup_accounts(req: actix_web::HttpRequest, body: web::Json<serde_json
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/accounts/create", web::post().to(create_accounts))
+            .route("/healthz", web::get().to(healthz))
+            .route("/readyz", web::get().to(healthz))
        .route("/transfers/create", web::post().to(create_transfers))
        .route("/transfers/commit", web::post().to(commit_transfer))
        .route("/accounts/lookup", web::post().to(lookup_accounts));
@@ -278,6 +280,11 @@ async fn handle_linked_transfers(body: web::Json<LinkedTransferChain>) -> HttpRe
         "transfers": results,
         "status": "all_committed",
     }))
+}
+
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "tigerbeetle-ledger-rs"}))
 }
 
 #[actix_web::main]

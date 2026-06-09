@@ -143,6 +143,8 @@ async fn transfer_callback(body: web::Json<serde_json::Value>) -> HttpResponse {
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/parties/{type}/{id}", web::put().to(party_callback))
+            .route("/healthz", web::get().to(healthz))
+            .route("/readyz", web::get().to(healthz))
        .route("/quotes/{id}", web::put().to(quote_callback))
        .route("/transfers/{id}", web::put().to(transfer_callback));
 }
@@ -157,6 +159,11 @@ async fn init_db(url: &str) -> Option<tokio_postgres::Client> {
         }
         Err(e) => { eprintln!("DB connect failed: {}", e); None }
     }
+}
+
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "mojaloop-fspiop-callbacks-rs"}))
 }
 
 #[actix_web::main]

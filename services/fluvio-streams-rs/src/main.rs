@@ -144,6 +144,8 @@ async fn apply_smartmodule(body: web::Json<serde_json::Value>) -> HttpResponse {
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/produce", web::post().to(produce_event))
+            .route("/healthz", web::get().to(healthz))
+            .route("/readyz", web::get().to(healthz))
        .route("/topics", web::get().to(list_topics))
        .route("/smartmodule/apply", web::post().to(apply_smartmodule));
 }
@@ -245,6 +247,24 @@ async fn handle_smart_connector(body: web::Json<SmartConnectorReq>) -> HttpRespo
         "status": status,
         "config": req.config,
     }))
+}
+
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "fluvio-streams-rs"}))
+}
+
+
+// --- Monetary Safety (kobo precision) ---
+type AmountKobo = i64;
+
+fn naira_to_kobo(naira: f64) -> i64 { (naira * 100.0).round() as i64 }
+fn kobo_to_naira(kobo: i64) -> f64 { kobo as f64 / 100.0 }
+fn round_naira(amount: f64) -> f64 { (amount * 100.0).round() / 100.0 }
+fn validate_amount(amount: f64) -> Result<f64, String> {
+    if amount < 0.0 { return Err("amount must be non-negative".into()); }
+    if amount > 999_999_999_999.99 { return Err("exceeds CBN max limit".into()); }
+    Ok(round_naira(amount))
 }
 
 #[actix_web::main]

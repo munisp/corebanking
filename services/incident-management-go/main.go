@@ -11,6 +11,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math"
 	"log"
 	"math/big"
 	"net/http"
@@ -774,6 +775,19 @@ func corsMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+
+// --- Monetary Safety (kobo precision) ---
+type AmountKobo = int64
+
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(math.Round(naira * 100)) }
+func koboToNaira(kobo AmountKobo) float64  { return float64(kobo) / 100.0 }
+func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+func validateAmount(amount float64) error {
+	if amount < 0 { return fmt.Errorf("amount must be non-negative") }
+	if amount > 999_999_999_999.99 { return fmt.Errorf("exceeds CBN max limit") }
+	return nil
 }
 
 func main() {

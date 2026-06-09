@@ -139,6 +139,8 @@ async fn list_ledgers() -> HttpResponse {
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/fx/transfer", web::post().to(create_fx_transfer))
+            .route("/healthz", web::get().to(healthz))
+            .route("/readyz", web::get().to(healthz))
        .route("/ledgers", web::get().to(list_ledgers));
 }
 
@@ -152,6 +154,11 @@ async fn init_db(url: &str) -> Option<tokio_postgres::Client> {
         }
         Err(e) => { eprintln!("DB connect failed: {}", e); None }
     }
+}
+
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "tigerbeetle-multicurrency-rs"}))
 }
 
 #[actix_web::main]
