@@ -1118,6 +1118,9 @@ fn init_tracing(service_name: &str) {
     }
 }
 
+
+static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").unwrap_or_else(|_| "8091".to_string()).parse().unwrap_or(8091);

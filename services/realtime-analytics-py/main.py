@@ -382,6 +382,14 @@ class _RateLimiter:
 
 _rate_limiter = _RateLimiter()
 
+
+# --- Input Sanitization ---
+import html as _html_mod
+
+def sanitize(s):
+    if not isinstance(s, str): return s
+    return _html_mod.escape(s.strip()[:2000])
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):

@@ -783,6 +783,9 @@ fn init_tracing(service_name: &str) {
     }
 }
 
+
+static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 #[actix_web::main]
 async 
 // --- PII Masking (NDPR Compliance) ---

@@ -225,6 +225,41 @@ func secureRandUint32() uint32 {
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
+func sanitizeLogEntry(msg string) string {
+	msg = strings.ReplaceAll(msg, "\n", " ")
+	msg = strings.ReplaceAll(msg, "\r", " ")
+	if len(msg) > 2000 { msg = msg[:2000] }
+	return msg
+}
+
+func maskPII(value, fieldType string) string {
+	if len(value) < 4 { return "***" }
+	switch fieldType {
+	case "bvn":
+		return value[:3] + "****" + value[len(value)-4:]
+	case "phone":
+		return value[:4] + "****" + value[len(value)-2:]
+	case "email":
+		parts := strings.SplitN(value, "@", 2)
+		if len(parts) == 2 { return parts[0][:1] + "***@" + parts[1] }
+		return "***"
+	default:
+		return value[:2] + strings.Repeat("*", len(value)-4) + value[len(value)-2:]
+	}
+}
+
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initTracing()
 	port := os.Getenv("PORT")

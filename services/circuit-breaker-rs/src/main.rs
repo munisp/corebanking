@@ -550,6 +550,23 @@ fn rl_allow() -> bool {
     if now > last { RL_TOKENS.store(100, Ordering::Relaxed); RL_LAST.store(now, Ordering::Relaxed); }
     RL_TOKENS.fetch_sub(1, Ordering::Relaxed) > 0
 }
+
+fn sanitize_input(s: &str) -> String {
+    s.replace('<', "&lt;").replace('>', "&gt;").replace('&', "&amp;")
+        .replace('"', "&quot;").chars().take(2000).collect()
+}
+
+fn security_headers() -> actix_web::middleware::DefaultHeaders {
+    actix_web::middleware::DefaultHeaders::new()
+        .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
+        .add(("X-Content-Type-Options", "nosniff"))
+        .add(("X-Frame-Options", "DENY"))
+        .add(("X-XSS-Protection", "1; mode=block"))
+        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
+}
+
+static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8260".to_string()).parse().unwrap_or(8260);

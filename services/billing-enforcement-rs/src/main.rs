@@ -400,6 +400,23 @@ fn init_tracing(service_name: &str) {
     if !endpoint.is_empty() { println!("[{}] OTEL tracing: {}", service_name, endpoint); }
 }
 
+
+fn sanitize_input(s: &str) -> String {
+    s.replace('<', "&lt;").replace('>', "&gt;").replace('&', "&amp;")
+        .replace('"', "&quot;").chars().take(2000).collect()
+}
+
+fn security_headers() -> actix_web::middleware::DefaultHeaders {
+    actix_web::middleware::DefaultHeaders::new()
+        .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
+        .add(("X-Content-Type-Options", "nosniff"))
+        .add(("X-Frame-Options", "DENY"))
+        .add(("X-XSS-Protection", "1; mode=block"))
+        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
+}
+
+static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 fn main() {
     init_tracing("billing-enforcement-rs");
     let db_url = std::env::var("DATABASE_URL").unwrap_or_default();

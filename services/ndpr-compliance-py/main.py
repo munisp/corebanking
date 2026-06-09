@@ -243,6 +243,33 @@ consent_mgr = ConsentManager()
 dsar_handler = DSARHandler()
 masking_engine = PIIMaskingEngine()
 
+# --- Request Metrics ---
+_request_counter = 0
+_error_counter = 0
+
+def inc_requests():
+    global _request_counter
+    _request_counter += 1
+
+def inc_errors():
+    global _error_counter
+    _error_counter += 1
+
+# --- DB Connection ---
+_db_conn = None
+
+def _init_db():
+    global _db_conn
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return
+    try:
+        import psycopg2
+        _db_conn = psycopg2.connect(db_url)
+        _db_conn.autocommit = True
+    except Exception as e:
+        print(f"[ndpr-compliance-py] DB init failed: {e}")
+
 class NDPRHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     
