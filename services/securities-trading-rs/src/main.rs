@@ -839,6 +839,25 @@ fn init_tracing(service_name: &str) {
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
 static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Monetary safety — prevent float drift in financial calculations
+fn naira_to_kobo(naira: f64) -> i64 {
+    (naira * 100.0 + 0.5) as i64
+}
+
+fn kobo_to_naira(kobo: i64) -> f64 {
+    kobo as f64 / 100.0
+}
+
+fn round_naira(amount: f64) -> f64 {
+    ((amount * 100.0) + 0.5).floor() / 100.0
+}
+
+fn validate_amount(kobo: i64) -> bool {
+    const MAX_AMOUNT: i64 = 500_000_000_000; // ₦5B CBN limit
+    kobo > 0 && kobo <= MAX_AMOUNT
+}
+
 #[actix_web::main]
 async 
 // --- PII Masking (NDPR Compliance) ---

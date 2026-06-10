@@ -293,6 +293,7 @@ def evaluate_green_bond(bond: dict) -> dict:
 def add_security_headers(handler):
     handler.send_header("X-Content-Type-Options", "nosniff")
     handler.send_header("X-Frame-Options", "DENY")
+    handler.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
 
 
 # --- Rate Limiter (Token Bucket) ---
