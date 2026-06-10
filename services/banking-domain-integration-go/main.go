@@ -16,7 +16,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"math"
-	mrand "math/rand"
+
 	"log"
 	"net"
 	"net/http"
@@ -823,7 +823,7 @@ func validateBankingOperation(operationType, accountType string, amount float64)
 	return true, "Banking operation valid"
 }
 func computeTransactionReference() string {
-	return fmt.Sprintf("54BNK%d%08X", time.Now().UnixNano()/1000000, mrand.Uint32())
+	return fmt.Sprintf("54BNK%d%08X", time.Now().UnixNano()/1000000, secureRandUint32())
 }
 
 

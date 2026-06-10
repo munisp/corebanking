@@ -160,6 +160,7 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
 	w.Header().Set("Strict-Transport-Security", "max-age=31536000")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(data)

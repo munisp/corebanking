@@ -1532,6 +1532,7 @@ dependencies = [
  "actix-web",
  "chrono",
  "lazy_static",
+ "once_cell",
  "serde",
  "serde_json",
  "sha2 0.10.9",

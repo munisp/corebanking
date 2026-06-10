@@ -155,7 +155,8 @@ async fn cache_stats() -> HttpResponse {
 
 fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.route("/cache/{key}", web::get().to(cache_get))
-            .route("/healthz", web::get().to(healthz))
+            .route("/audit", web::get().to(audit_handler))
+                .route("/healthz", web::get().to(healthz))
             .route("/readyz", web::get().to(healthz))
        .route("/v1/redis-cache/cache", web::post().to(cache_set))
        .route("/cache/{key}", web::delete().to(cache_del))
@@ -339,6 +340,30 @@ impl RateLimiter {
 
 lazy_static::lazy_static! {
     static ref RATE_LIMITER: RateLimiter = RateLimiter::new(100, 60);
+}
+
+
+// Audit trail for compliance
+static AUDIT_LOG: once_cell::sync::Lazy<std::sync::RwLock<Vec<serde_json::Value>>> =
+    once_cell::sync::Lazy::new(|| std::sync::RwLock::new(Vec::new()));
+
+fn audit_log(action: &str, details: &str) {
+    let entry = serde_json::json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "action": action,
+        "details": details,
+        "service": env!("CARGO_PKG_NAME"),
+    });
+    if let Ok(mut log) = AUDIT_LOG.write() {
+        if log.len() > 10_000 { log.drain(..5_000); }
+        log.push(entry);
+    }
+}
+
+async fn audit_handler() -> impl actix_web::Responder {
+    let log = AUDIT_LOG.read().unwrap_or_else(|e| e.into_inner());
+    let recent: Vec<_> = log.iter().rev().take(100).collect();
+    actix_web::HttpResponse::Ok().json(recent)
 }
 
 #[actix_web::main]
