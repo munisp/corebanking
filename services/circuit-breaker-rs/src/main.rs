@@ -625,7 +625,9 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/circuit-breakers/{service}/success", web::post().to(record_success))
             .route("/v1/circuit-breakers/{service}/reset", web::post().to(reset_breaker))
     })
-    .bind(("0.0.0.0", port))?
+    .keep_alive(std::time::Duration::from_secs(75))
+        .client_request_timeout(std::time::Duration::from_secs(30))
+        .bind(("0.0.0.0", port))?
     .run()
     .await
 }

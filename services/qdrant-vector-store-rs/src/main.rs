@@ -1005,7 +1005,9 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/vectors/embed", web::post().to(embed_text))
             .route("/v1/vectors/regulations", web::post().to(search_regulations))
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .keep_alive(std::time::Duration::from_secs(75))
+        .client_request_timeout(std::time::Duration::from_secs(30))
+        .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
 }

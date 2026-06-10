@@ -927,7 +927,9 @@ const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
             .route("/livez", web::get().to(livez))
             .route("/metrics", web::get().to(prom_metrics))
     })
-    .bind(("0.0.0.0", port))?
+    .keep_alive(std::time::Duration::from_secs(75))
+        .client_request_timeout(std::time::Duration::from_secs(30))
+        .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
     .run()
     .await

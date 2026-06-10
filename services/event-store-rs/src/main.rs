@@ -471,7 +471,9 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/event-store/snapshots", web::post().to(create_snapshot))
             .route("/v1/event-store/stats", web::get().to(stats))
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .keep_alive(std::time::Duration::from_secs(75))
+        .client_request_timeout(std::time::Duration::from_secs(30))
+        .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
 }

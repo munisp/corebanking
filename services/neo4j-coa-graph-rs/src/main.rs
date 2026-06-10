@@ -934,7 +934,9 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/coa/transaction-flow", web::post().to(transaction_flow))
             .route("/v1/create", web::post().to(create_node))
     })
-    .bind(("0.0.0.0", port))?.run().await
+    .keep_alive(std::time::Duration::from_secs(75))
+        .client_request_timeout(std::time::Duration::from_secs(30))
+        .bind(("0.0.0.0", port))?.run().await
 }
 
 #[cfg(test)]

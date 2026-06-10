@@ -1037,7 +1037,9 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/graph/velocity", web::get().to(transaction_velocity))
             .route("/v1/graph/risk", web::post().to(risk_classification))
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .keep_alive(std::time::Duration::from_secs(75))
+        .client_request_timeout(std::time::Duration::from_secs(30))
+        .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
 }

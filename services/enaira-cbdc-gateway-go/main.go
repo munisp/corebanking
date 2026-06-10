@@ -935,26 +935,6 @@ func newSecureServer(addr string, handler http.Handler) *http.Server {
 	}
 }
 
-// Input validation helpers
-func sanitizeInput(s string, maxLen int) string {
-	if len(s) > maxLen { s = s[:maxLen] }
-	var clean []byte
-	for _, b := range []byte(s) { if b >= 32 && b != 127 { clean = append(clean, b) } }
-	return string(clean)
-}
-
-func validateBVN(bvn string) bool {
-	if len(bvn) != 11 { return false }
-	for _, c := range bvn { if c < '0' || c > '9' { return false } }
-	return true
-}
-
-func validateAccountNumber(acctNo string) bool {
-	if len(acctNo) != 10 { return false }
-	for _, c := range acctNo { if c < '0' || c > '9' { return false } }
-	return true
-}
-
 func sanitizeError(err error) string {
 	errStr := err.Error()
 	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") { return "internal error" }
