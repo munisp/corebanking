@@ -296,6 +296,17 @@ TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
 TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
 PORT = int(os.environ.get("PORT", "8080"))
 
+def _safe_table_name(name: str) -> str:
+    """Validate table name to prevent SQL injection."""
+    import re as _re
+    if not _re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+        raise ValueError(f"Invalid table name: {name}")
+    return name
+
+
+MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
+
+
 
 # ─── Domain Logic: Financial Vector Search ───────────────────────────────────
 

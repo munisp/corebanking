@@ -51,6 +51,8 @@ TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54bank/certs/service.crt")
 TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
 TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
 PORT = int(os.environ.get("PORT", "8080"))
+MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
+
 SERVICE_NAME = "kgqa-reasoning-engine-py"
 logger = logging.getLogger(SERVICE_NAME)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')

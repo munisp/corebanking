@@ -811,6 +811,17 @@ func panicRecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// maxBodySize limits request body to prevent memory exhaustion
+const maxBodySize = 1 << 20 // 1MB
+
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initTracing()
 	initDB()

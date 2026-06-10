@@ -398,6 +398,29 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[db-migrations] PANIC recovered: %v", err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"internal server error"}`))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// bodyLimitMiddleware limits request body size
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9345" }
@@ -425,7 +448,7 @@ func main() {
 	log.Printf("Db Migrations v2.0 (Infrastructure/Data) on :%s", port)
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      countingMiddleware(http.DefaultServeMux),
+		Handler:      panicRecoveryMiddleware(bodyLimitMiddleware(rateLimitMiddleware(securityHeadersMiddleware(countingMiddleware(http.DefaultServeMux))))),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
