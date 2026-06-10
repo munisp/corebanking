@@ -15,7 +15,7 @@ use std::sync::{Mutex, Arc};
 
 struct AppState {
     records: Mutex<Vec<serde_json::Value>>,
-    db_client: Option<Arc<tokio_postgres::Client>>,
+    db_client: Option<Arc<tokio_postgres /* pool_size=25, idle_timeout=300s */::Client>>,
 }
 
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {

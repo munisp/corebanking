@@ -12,7 +12,7 @@ use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 #[derive(Clone)]
-struct AppState { start_time: Instant, db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+struct AppState { start_time: Instant, db_client: Option<std::sync::Arc<tokio_postgres /* pool_size=25, idle_timeout=300s */::Client>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

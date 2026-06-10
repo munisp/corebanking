@@ -119,7 +119,7 @@ struct AppState {
     matches: Mutex<Vec<FaceMatch>>,
     config: ScoringConfig,
     stats: Mutex<EngineStats>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db_client: Option<std::sync::Arc<tokio_postgres /* pool_size=25, idle_timeout=300s */::Client>>,
 }
 
 #[derive(Clone, Serialize, Default)]

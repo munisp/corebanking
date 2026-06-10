@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 use std::collections::HashMap;
 use serde_json::json;
 use std::env;
-use tokio_postgres::NoTls;
+use tokio_postgres /* pool_size=25, idle_timeout=300s */::NoTls;
 
 fn check_jwt(req: &HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();

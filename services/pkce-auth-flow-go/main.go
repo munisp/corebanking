@@ -11,6 +11,7 @@ import (
 "syscall"
 "sync/atomic"
 
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -146,7 +147,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 			respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
 			return
 		}
-		log.Printf("pkce-auth-flow-go: DB query failed, DB query failed — returning cached/empty result: %v", err)
+		log.Printf("pkce-[REDACTED]-flow-go: DB query failed, DB query failed — returning cached/empty result: %v", err)
 	}
 	// In-memory fallback
 	mu.Lock()
@@ -168,9 +169,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if _upstreamURL == "" { _upstreamURL = "http://localhost:8100" }
 	_result, _err := callService("POST", _upstreamURL+"/v1/health", nil)
 	if _err != nil {
-		log.Printf("pkce-auth-flow-go: health_check failed: %v", _err)
+		log.Printf("pkce-[REDACTED]-flow-go: health_check failed: %v", _err)
 	} else {
-		log.Printf("pkce-auth-flow-go: health_check ok: %v", _result)
+		log.Printf("pkce-[REDACTED]-flow-go: health_check ok: %v", _result)
 	}
 
 
@@ -1360,6 +1361,51 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-Id", rid)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func validateOrigin(origin string) bool {
+	if origin == "" || origin == "*" {
+		return false // reject wildcards
+	}
+	// Only allow HTTPS origins in production
+	if strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://localhost") {
+		return true
+	}
+	return false
+}
+
+func validateJWTExpiry(tokenStr string) bool {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	// Decode payload (base64url)
+	payload := parts[1]
+	// Add padding if needed
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return false
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return false
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return false
+	}
+	return time.Now().Unix() < int64(exp)
+}
+
+// Handler context with timeout prevents hung requests
+func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 30*time.Second)
 }
 
 func main() {

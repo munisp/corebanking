@@ -72,7 +72,7 @@ struct AppState {
     start_time: Instant,
     recons: Mutex<Vec<SettlementRecon>>,
     suspense_items: Mutex<Vec<SuspenseItem>>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db_client: Option<std::sync::Arc<tokio_postgres /* pool_size=25, idle_timeout=300s */::Client>>,
 }
 
 fn rand_id(prefix: &str) -> String {

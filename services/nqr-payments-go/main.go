@@ -1104,6 +1104,11 @@ func retryWithBackoff(maxRetries int, fn func() error) error {
 	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
 }
 
+// Handler context with timeout prevents hung requests
+func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 30*time.Second)
+}
+
 func main() {
 	initTracing()
 	initDB()

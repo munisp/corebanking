@@ -803,6 +803,11 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// Handler context with timeout prevents hung requests
+func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 30*time.Second)
+}
+
 func main() {
 	initTracing()
 	initDB()

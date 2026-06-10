@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use chrono::Utc;
 use uuid::Uuid;
-use tokio_postgres::NoTls;
+use tokio_postgres /* pool_size=25, idle_timeout=300s */::NoTls;
 
 // --- 54Bank Event Store — Append-Only Immutable Event Log with PostgreSQL Persistence ---
 

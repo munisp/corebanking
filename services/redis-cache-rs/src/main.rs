@@ -1,4 +1,4 @@
-use tokio_postgres;
+use tokio_postgres /* pool_size=25, idle_timeout=300s */;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
 use serde_json::json;

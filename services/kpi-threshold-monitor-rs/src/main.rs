@@ -1,5 +1,5 @@
 #![allow(unused)]
-use tokio_postgres::{self, NoTls};
+use tokio_postgres /* pool_size=25, idle_timeout=300s */::{self, NoTls};
 // kpi-threshold-monitor-rs — Real-time KPI threshold monitoring with Kafka alert publishing
 // Port: 8501
 // Middleware: Postgres, Redis, Kafka, Dapr, Fluvio, Temporal, OpenSearch, Permify

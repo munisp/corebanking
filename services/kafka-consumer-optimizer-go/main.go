@@ -11,6 +11,7 @@ import (
 "syscall"
 "sync/atomic"
 
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -1592,6 +1593,62 @@ func retryWithBackoff(maxRetries int, fn func() error) error {
 		time.Sleep(backoff)
 	}
 	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
+}
+
+// SSRF protection: block requests to internal/private networks
+func isInternalURL(rawURL string) bool {
+	blocked := []string{"127.0.0.1", "localhost", "169.254.169.254", "10.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.", "192.168.", "0.0.0.0", "[::1]", "metadata.google"}
+	for _, b := range blocked {
+		if strings.Contains(rawURL, b) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateOrigin(origin string) bool {
+	if origin == "" || origin == "*" {
+		return false // reject wildcards
+	}
+	// Only allow HTTPS origins in production
+	if strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://localhost") {
+		return true
+	}
+	return false
+}
+
+func validateJWTExpiry(tokenStr string) bool {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	// Decode payload (base64url)
+	payload := parts[1]
+	// Add padding if needed
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return false
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return false
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return false
+	}
+	return time.Now().Unix() < int64(exp)
+}
+
+// Handler context with timeout prevents hung requests
+func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 30*time.Second)
 }
 
 func main() {

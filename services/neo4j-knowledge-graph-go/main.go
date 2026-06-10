@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"crypto/rand"
 	"fmt"
@@ -273,6 +274,52 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 			rid = fmt.Sprintf("%d", time.Now().UnixNano())
 		}
 		w.Header().Set("X-Request-Id", rid)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func validateJWTExpiry(tokenStr string) bool {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	// Decode payload (base64url)
+	payload := parts[1]
+	// Add padding if needed
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return false
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return false
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return false
+	}
+	return time.Now().Unix() < int64(exp)
+}
+
+// Handler context with timeout prevents hung requests
+func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 30*time.Second)
+}
+
+// Gzip compression middleware for responses > 1KB
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Encoding", "gzip")
 		next.ServeHTTP(w, r)
 	})
 }

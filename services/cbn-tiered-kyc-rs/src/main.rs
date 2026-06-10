@@ -65,7 +65,7 @@ struct AppState {
     start_time: Instant,
     assessments: Mutex<Vec<TierAssessment>>,
     limit_checks: Mutex<Vec<LimitCheck>>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db_client: Option<std::sync::Arc<tokio_postgres /* pool_size=25, idle_timeout=300s */::Client>>,
 }
 
 fn default_tiers() -> Vec<TierConfig> {

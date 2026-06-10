@@ -11,6 +11,7 @@ import (
 "syscall"
 "sync/atomic"
 
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -1426,6 +1427,51 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-Id", rid)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func validateOrigin(origin string) bool {
+	if origin == "" || origin == "*" {
+		return false // reject wildcards
+	}
+	// Only allow HTTPS origins in production
+	if strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://localhost") {
+		return true
+	}
+	return false
+}
+
+func validateJWTExpiry(tokenStr string) bool {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	// Decode payload (base64url)
+	payload := parts[1]
+	// Add padding if needed
+	switch len(payload) % 4 {
+	case 2:
+		payload += "=="
+	case 3:
+		payload += "="
+	}
+	decoded, err := base64.URLEncoding.DecodeString(payload)
+	if err != nil {
+		return false
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return false
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return false
+	}
+	return time.Now().Unix() < int64(exp)
+}
+
+// Handler context with timeout prevents hung requests
+func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(r.Context(), 30*time.Second)
 }
 
 func main() {
