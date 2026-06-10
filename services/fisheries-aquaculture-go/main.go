@@ -1499,6 +1499,29 @@ func sanitizeHeader(value string) string {
 	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
 }
 
+func validateBVN(bvn string) bool {
+	if len(bvn) != 11 { return false }
+	for _, c := range bvn { if c < '0' || c > '9' { return false } }
+	return true
+}
+
+func validateAccountNumber(acctNo string) bool {
+	if len(acctNo) != 10 { return false }
+	for _, c := range acctNo { if c < '0' || c > '9' { return false } }
+	return true
+}
+
+func validateNigerianPhone(phone string) bool {
+	clean := strings.ReplaceAll(strings.ReplaceAll(phone, " ", ""), "-", "")
+	if strings.HasPrefix(clean, "+234") && len(clean) == 14 { return true }
+	if strings.HasPrefix(clean, "0") && len(clean) == 11 { return true }
+	return false
+}
+
+func validateAmountKobo(amount int64) bool {
+	return amount > 0 && amount <= 500000000000
+}
+
 func main() {
 	initTracing()
 	port := os.Getenv("PORT")
