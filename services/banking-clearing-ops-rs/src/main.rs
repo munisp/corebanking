@@ -1014,6 +1014,7 @@ async fn main() -> std::io::Result<()> {
         start_grpc_server("banking-clearing-ops-rs", 10484);
     HttpServer::new(|| {
         App::new()
+                .app_data(web::JsonConfig::default().limit(1_048_576))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

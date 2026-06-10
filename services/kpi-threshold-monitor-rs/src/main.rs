@@ -1068,6 +1068,7 @@ async fn main() -> std::io::Result<()> {
         start_grpc_server("kpi-threshold-monitor-rs", 10448);
     HttpServer::new(move || {
         App::new()
+                .app_data(web::JsonConfig::default().limit(1_048_576))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

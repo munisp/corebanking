@@ -1613,6 +1613,33 @@ func validateAmountKobo(amount int64) bool {
 	return amount > 0 && amount <= 500000000000
 }
 
+
+// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"internal server error"}`))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+
+// maxBodySize limits request body to prevent memory exhaustion
+const maxBodySize = 1 << 20 // 1MB
+
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initTracing()
 	port := os.Getenv("PORT")
@@ -1634,19 +1661,13 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/loans/lifecycle-gl", loanLifecycleToGL)
 	mux.HandleFunc("/v1/fx/dealing-gl", fxDealingToGL)
 	mux.HandleFunc("/v1/fd/lifecycle-gl", fixedDepositToGL)
-	mux.HandleFunc("/v1/si/execution-gl", standingInstructionsToGL)
-	log.Printf("Banking Domain Integration (Go) listening on :%s — Gaps 8-12, 14 middleware", port)
-	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
-	_ = tlsCert
-	_ = tlsKey
-	_ = tlsEnabled
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
+		Addr:    ":" + port,
+		Handler: panicRecoveryMiddleware(bodyLimitMiddleware(rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
     quit := make(chan os.Signal, 1)
     signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
     go func() {

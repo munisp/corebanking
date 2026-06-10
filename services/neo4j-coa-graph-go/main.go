@@ -480,6 +480,33 @@ func sanitizeHeader(value string) string {
 	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
 }
 
+
+// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"internal server error"}`))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+
+// maxBodySize limits request body to prevent memory exhaustion
+const maxBodySize = 1 << 20 // 1MB
+
+func bodyLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initTracing()
 	port := os.Getenv("PORT")

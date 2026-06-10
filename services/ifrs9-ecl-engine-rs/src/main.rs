@@ -919,6 +919,7 @@ async fn main() -> std::io::Result<()> {
         start_grpc_server("ifrs9-ecl-engine-rs", 10494);
     HttpServer::new(|| {
         App::new()
+                .app_data(web::JsonConfig::default().limit(1_048_576))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

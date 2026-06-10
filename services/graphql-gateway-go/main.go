@@ -1573,6 +1573,22 @@ func sanitizeHeader(value string) string {
 	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
 }
 
+
+// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"internal server error"}`))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
 func main() {
 	initTracing()
 	port := os.Getenv("PORT")
@@ -1605,7 +1621,7 @@ mux := http.NewServeMux()
 	_ = tlsEnabled
 	server := &http.Server{
         Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+        Handler: panicRecoveryMiddleware(rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux)))))),
         ReadTimeout:  15 * time.Second,
         WriteTimeout: 30 * time.Second,
         IdleTimeout:  60 * time.Second,

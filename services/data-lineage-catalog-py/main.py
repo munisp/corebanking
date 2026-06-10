@@ -79,7 +79,7 @@ def db_insert(table, data):
     db = get_db()
     if not db: raise ConnectionError("database_unavailable")
     cur = db.cursor()
-    cur.execute(f"INSERT INTO {table} (id, data, created_at) VALUES (%s, %s, NOW()) RETURNING id",
+    cur.execute(f"INSERT INTO {_safe_table_name(table)} (id, data, created_at) VALUES (%s, %s, NOW()) RETURNING id",
                 (data.get("id", str(uuid.uuid4())), json.dumps(data)))
     return cur.fetchone()[0]
 def validate_jwt(headers):

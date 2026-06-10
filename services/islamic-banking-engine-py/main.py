@@ -104,7 +104,7 @@ def db_insert(table, data):
     if not db:
         raise ConnectionError("database_unavailable")
     cur = db.cursor()
-    cur.execute(f"INSERT INTO {table} (id, data, created_at) VALUES (%s, %s, NOW()) RETURNING id",
+    cur.execute(f"INSERT INTO {_safe_table_name(table)} (id, data, created_at) VALUES (%s, %s, NOW()) RETURNING id",
                 (data.get("id", str(uuid.uuid4())), json.dumps(data)))
     return cur.fetchone()[0]
 
@@ -113,9 +113,9 @@ def db_query(table, limit=50):
     if not db:
         return [], 0
     cur = db.cursor()
-    cur.execute(f"SELECT data FROM {table} ORDER BY created_at DESC LIMIT %s", (limit,))
+    cur.execute(f"SELECT data FROM {_safe_table_name(table)} ORDER BY created_at DESC LIMIT %s", (limit,))
     rows = [r[0] for r in cur.fetchall()]
-    cur.execute(f"SELECT count(*) FROM {table}")
+    cur.execute(f"SELECT count(*) FROM {_safe_table_name(table)}")
     total = cur.fetchone()[0]
     return rows, total
 

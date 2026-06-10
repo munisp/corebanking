@@ -7,6 +7,7 @@ use std::env;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{Instant, Duration};
 use std::collections::HashMap;
+use std::sync::Mutex as StdMutex;
 use sha2::{Sha256, Digest};
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -289,6 +290,44 @@ fn sanitize_input(s: &str, max_len: usize) -> String {
 
 fn validate_amount_kobo(amount: i64) -> bool {
     amount > 0 && amount <= 500_000_000_000
+}
+
+
+// Rate limiter
+
+struct RateLimiter {
+    visitors: StdMutex<HashMap<String, (u32, std::time::Instant)>>,
+    max_requests: u32,
+    window: std::time::Duration,
+}
+
+impl RateLimiter {
+    fn new(max_requests: u32, window_secs: u64) -> Self {
+        Self {
+            visitors: StdMutex::new(HashMap::new()),
+            max_requests,
+            window: std::time::Duration::from_secs(window_secs),
+        }
+    }
+    
+    fn allow(&self, ip: &str) -> bool {
+        let mut visitors = self.visitors.lock().unwrap();
+        let now = std::time::Instant::now();
+        let entry = visitors.entry(ip.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) > self.window {
+            *entry = (1, now);
+            return true;
+        }
+        if entry.0 >= self.max_requests {
+            return false;
+        }
+        entry.0 += 1;
+        true
+    }
+}
+
+lazy_static::lazy_static! {
+    static ref RATE_LIMITER: RateLimiter = RateLimiter::new(100, 60);
 }
 
 #[actix_web::main]

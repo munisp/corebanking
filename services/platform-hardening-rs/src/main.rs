@@ -1063,6 +1063,7 @@ async fn main() -> std::io::Result<()> {
         start_grpc_server("platform-hardening-rs", 10313);
     HttpServer::new(|| {
         App::new()
+                .app_data(web::JsonConfig::default().limit(1_048_576))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

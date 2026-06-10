@@ -12,6 +12,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -953,6 +954,36 @@ func getClientIP(r *http.Request) string {
 // Prevent HTTP header injection (strip CR/LF)
 func sanitizeHeader(value string) string {
 	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
+}
+
+
+// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusInternalServerError)
+				w.Write([]byte(`{"error":"internal server error"}`))
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+
+// validateJWTExpiry checks JWT token expiry claim
+func validateJWTExpiry(tokenStr string) bool {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 { return false }
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil { return false }
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil { return false }
+	exp, ok := claims["exp"].(float64)
+	if !ok { return false }
+	return time.Now().Unix() < int64(exp)
 }
 
 func main() {
