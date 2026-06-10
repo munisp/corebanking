@@ -1,0 +1,10 @@
+-- Rollback: 001_create_agent_transaction_investigation_tables
+BEGIN;
+DROP TRIGGER IF EXISTS trg_agent_transaction_investigation_updated ON agent_transaction_investigation_records;
+DROP FUNCTION IF EXISTS update_agent_transaction_investigation_timestamp();
+DROP FUNCTION IF EXISTS cleanup_agent_transaction_investigation_idempotency();
+DROP POLICY IF EXISTS agent_transaction_investigation_tenant_isolation ON agent_transaction_investigation_records;
+DROP TABLE IF EXISTS agent_transaction_investigation_idempotency;
+DROP TABLE IF EXISTS agent_transaction_investigation_audit;
+DROP TABLE IF EXISTS agent_transaction_investigation_records;
+COMMIT;

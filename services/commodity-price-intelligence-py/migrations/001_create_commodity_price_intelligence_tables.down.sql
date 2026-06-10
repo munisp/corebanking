@@ -1,0 +1,10 @@
+-- Rollback: 001_create_commodity_price_intelligence_tables
+BEGIN;
+DROP TRIGGER IF EXISTS trg_commodity_price_intelligence_updated ON commodity_price_intelligence_records;
+DROP FUNCTION IF EXISTS update_commodity_price_intelligence_timestamp();
+DROP FUNCTION IF EXISTS cleanup_commodity_price_intelligence_idempotency();
+DROP POLICY IF EXISTS commodity_price_intelligence_tenant_isolation ON commodity_price_intelligence_records;
+DROP TABLE IF EXISTS commodity_price_intelligence_idempotency;
+DROP TABLE IF EXISTS commodity_price_intelligence_audit;
+DROP TABLE IF EXISTS commodity_price_intelligence_records;
+COMMIT;

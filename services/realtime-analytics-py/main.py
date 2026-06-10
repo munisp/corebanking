@@ -30,6 +30,90 @@ def sanitize_log_entry(msg: str) -> str:
 ML_INFERENCE_URL = os.environ.get("ML_INFERENCE_URL", "http://ml-inference-server:8500")
 
 
+
+# ── Database Layer ──────────────────────────────────────────────────────────
+import contextlib
+
+_db_pool = None
+
+def get_db_pool():
+    """Get or create database connection pool."""
+    global _db_pool
+    if _db_pool is not None:
+        return _db_pool
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        return None
+    try:
+        import psycopg2
+        import psycopg2.pool
+        _db_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2, maxconn=10, dsn=db_url,
+            options="-c statement_timeout=30000"  # 30s query timeout
+        )
+        return _db_pool
+    except Exception as e:
+        logging.warning(f"DB pool init failed: {e}")
+        return None
+
+@contextlib.contextmanager
+def db_conn():
+    """Context manager for DB connections with automatic return to pool."""
+    pool = get_db_pool()
+    if pool is None:
+        yield None
+        return
+    conn = None
+    try:
+        conn = pool.getconn()
+        conn.autocommit = False
+        yield conn
+    except Exception:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
+            try:
+                conn.commit()
+            except Exception:
+                conn.rollback()
+            pool.putconn(conn)
+
+def db_query(sql, params=None):
+    """Execute a DB query and return results as list of dicts."""
+    with db_conn() as conn:
+        if conn is None:
+            return None
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params or ())
+            if cur.description:
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+            return []
+        except Exception as e:
+            logging.error(f"DB query error: {sanitize_log_entry(str(e))}")
+            conn.rollback()
+            return None
+
+def db_execute(sql, params=None):
+    """Execute a DB write and return affected row count."""
+    with db_conn() as conn:
+        if conn is None:
+            return None
+        try:
+            cur = conn.cursor()
+            cur.execute(sql, params or ())
+            return cur.rowcount
+        except Exception as e:
+            logging.error(f"DB execute error: {sanitize_log_entry(str(e))}")
+            conn.rollback()
+            return None
+
+STRICT_DB = os.environ.get("STRICT_DB", "false").lower() == "true"
+
+
 def ml_score_anomaly(amount: float, hour: int, day_of_week: int,
                      velocity_1h: int, velocity_24h: int,
                      amount_vs_avg: float, balance_ratio: float,

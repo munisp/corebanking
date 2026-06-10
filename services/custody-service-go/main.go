@@ -153,7 +153,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 	// In-memory fallback
 	mu.Lock()
 	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "database_fallback", "warning": "DB was unavailable during this request"})
+	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "database_fallback", "degraded": true, "warning": "DB unavailable — serving cached data. Set STRICT_DB=true to return 503 instead"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
