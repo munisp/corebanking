@@ -255,10 +255,7 @@ fn init_tracing(service_name: &str) {
 }
 
 
-fn sanitize_input(s: &str) -> String {
-    s.replace('<', "&lt;").replace('>', "&gt;").replace('&', "&amp;")
-        .replace('"', "&quot;").chars().take(2000).collect()
-}
+
 
 fn security_headers() -> actix_web::middleware::DefaultHeaders {
     actix_web::middleware::DefaultHeaders::new()
