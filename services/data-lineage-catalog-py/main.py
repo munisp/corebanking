@@ -41,6 +41,15 @@ def validate_amount_kobo(amount: int) -> bool:
     """Validate transaction amount in kobo (0 < amount <= 5B naira)"""
     return 0 < amount <= 500_000_000_000  # max ₦5B in kobo
 
+
+ALLOWED_TABLES = frozenset(["data_lineage_catalog", "service_records", "audit_log"])
+
+def _safe_table_name(table: str) -> str:
+    """Validate table name to prevent SQL injection via table names"""
+    import re
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', table):
+        raise ValueError(f"Invalid table name: {table}")
+    return table
 SERVICE_NAME = "data-lineage-catalog-py"
 START_TIME = time.time()
 _request_count = 0; _error_count = 0; _counter_lock = threading.Lock()

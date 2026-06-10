@@ -17,6 +17,7 @@ import (
 	"math"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -863,6 +864,100 @@ func newSecureServer(addr string, handler http.Handler) *http.Server {
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    1 << 20, // 1MB
 	}
+}
+
+// Input validation helpers
+func sanitizeInput(s string, maxLen int) string {
+	if len(s) > maxLen { s = s[:maxLen] }
+	var clean []byte
+	for _, b := range []byte(s) { if b >= 32 && b != 127 { clean = append(clean, b) } }
+	return string(clean)
+}
+
+func validateBVN(bvn string) bool {
+	if len(bvn) != 11 { return false }
+	for _, c := range bvn { if c < '0' || c > '9' { return false } }
+	return true
+}
+
+func validateAccountNumber(acctNo string) bool {
+	if len(acctNo) != 10 { return false }
+	for _, c := range acctNo { if c < '0' || c > '9' { return false } }
+	return true
+}
+
+func sanitizeError(err error) string {
+	errStr := err.Error()
+	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") { return "internal error" }
+	if len(errStr) > 200 { return "internal error" }
+	return errStr
+}
+
+// IP-based sliding window rate limiter
+type ipRateLimiter struct {
+	mu       sync.Mutex
+	visitors map[string]*rateBucket
+	rate     int
+	window   time.Duration
+}
+
+type rateBucket struct {
+	count    int
+	lastSeen time.Time
+}
+
+func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
+	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
+	go rl.cleanup()
+	return rl
+}
+
+func (rl *ipRateLimiter) allow(ip string) bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	b, exists := rl.visitors[ip]
+	if !exists || time.Since(b.lastSeen) > rl.window {
+		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
+		return true
+	}
+	if b.count >= rl.rate {
+		return false
+	}
+	b.count++
+	b.lastSeen = time.Now()
+	return true
+}
+
+func (rl *ipRateLimiter) cleanup() {
+	for {
+		time.Sleep(rl.window)
+		rl.mu.Lock()
+		for ip, b := range rl.visitors {
+			if time.Since(b.lastSeen) > rl.window {
+				delete(rl.visitors, ip)
+			}
+		}
+		rl.mu.Unlock()
+	}
+}
+
+var globalIPLimiter = newIPRateLimiter(100, time.Minute)
+
+func getClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		return strings.TrimSpace(parts[0])
+	}
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+	host, _, _ := net.SplitHostPort(r.RemoteAddr)
+	return host
+}
+
+// Prevent HTTP header injection (strip CR/LF)
+func sanitizeHeader(value string) string {
+	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
 }
 
 func main() {
