@@ -1,0 +1,96 @@
+# 54Bank On-Premise Inventory
+# Nigerian Data Center — Lagos (Primary) + Abuja (DR)
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_ssh_private_key_file: ~/.ssh/54bank-onprem.pem
+    cluster_name: 54bank-onprem
+    domain: 54bank.local
+
+  children:
+    # ── Lagos Data Center (Primary) ────────────────────────────────────────
+    lagos:
+      children:
+        control_plane:
+          hosts:
+            k8s-master-1:
+              ansible_host: 10.0.1.10
+              keepalived_priority: 101
+            k8s-master-2:
+              ansible_host: 10.0.1.11
+              keepalived_priority: 100
+            k8s-master-3:
+              ansible_host: 10.0.1.12
+              keepalived_priority: 99
+
+        worker:
+          hosts:
+            k8s-worker-1:
+              ansible_host: 10.0.1.20
+              node_labels: "workload=core-banking"
+            k8s-worker-2:
+              ansible_host: 10.0.1.21
+              node_labels: "workload=core-banking"
+            k8s-worker-3:
+              ansible_host: 10.0.1.22
+              node_labels: "workload=middleware"
+            k8s-worker-4:
+              ansible_host: 10.0.1.23
+              node_labels: "workload=middleware"
+            k8s-worker-5:
+              ansible_host: 10.0.1.24
+              node_labels: "workload=ml-inference"
+            k8s-worker-6:
+              ansible_host: 10.0.1.25
+              node_labels: "workload=channels"
+
+        storage:
+          hosts:
+            storage-node-1:
+              ansible_host: 10.0.1.30
+              ceph_osd_devices: ["/dev/nvme0n1", "/dev/nvme1n1"]
+            storage-node-2:
+              ansible_host: 10.0.1.31
+              ceph_osd_devices: ["/dev/nvme0n1", "/dev/nvme1n1"]
+            storage-node-3:
+              ansible_host: 10.0.1.32
+              ceph_osd_devices: ["/dev/nvme0n1", "/dev/nvme1n1"]
+
+        database:
+          hosts:
+            db-node-1:
+              ansible_host: 10.0.1.40
+              patroni_role: primary
+            db-node-2:
+              ansible_host: 10.0.1.41
+              patroni_role: replica
+            db-node-3:
+              ansible_host: 10.0.1.42
+              patroni_role: replica
+
+    # ── Abuja Data Center (DR) ─────────────────────────────────────────────
+    abuja:
+      children:
+        dr_control_plane:
+          hosts:
+            dr-master-1:
+              ansible_host: 10.1.1.10
+            dr-master-2:
+              ansible_host: 10.1.1.11
+            dr-master-3:
+              ansible_host: 10.1.1.12
+
+        dr_worker:
+          hosts:
+            dr-worker-1:
+              ansible_host: 10.1.1.20
+            dr-worker-2:
+              ansible_host: 10.1.1.21
+            dr-worker-3:
+              ansible_host: 10.1.1.22
+
+        dr_database:
+          hosts:
+            dr-db-1:
+              ansible_host: 10.1.1.40
+              patroni_role: standby_leader

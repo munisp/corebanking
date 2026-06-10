@@ -1,0 +1,288 @@
+# 54Bank Disaster Recovery Configuration
+# Lagos (Primary) → Abuja (DR Standby)
+# RTO: 15 minutes | RPO: 1 minute
+# CBN requires DR site within Nigeria
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: dr-management
+  labels:
+    app.kubernetes.io/part-of: 54bank-dr
+
+---
+# DR Controller ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dr-config
+  namespace: dr-management
+data:
+  dr-config.yaml: |
+    primary_site:
+      name: lagos
+      region: lagos-dc1
+      api_endpoint: https://k8s-api.lagos.54bank.local:6443
+      db_endpoint: postgres-primary.lagos.54bank.local:5432
+      redis_endpoint: redis.lagos.54bank.local:6379
+      kafka_bootstrap: kafka.lagos.54bank.local:9092
+
+    dr_site:
+      name: abuja
+      region: abuja-dc1
+      api_endpoint: https://k8s-api.abuja.54bank.local:6443
+      db_endpoint: postgres-standby.abuja.54bank.local:5432
+      redis_endpoint: redis.abuja.54bank.local:6379
+      kafka_bootstrap: kafka.abuja.54bank.local:9092
+
+    failover:
+      rto_minutes: 15
+      rpo_minutes: 1
+      automatic_failover: false  # Manual trigger required for banking
+      health_check_interval_seconds: 10
+      failure_threshold: 3
+      recovery_threshold: 5
+
+    replication:
+      database:
+        type: streaming  # PostgreSQL streaming replication
+        mode: async      # async for performance; sync available for zero RPO
+        lag_threshold_bytes: 1048576  # 1MB max lag before alert
+
+      redis:
+        type: sentinel
+        mode: async
+        lag_threshold_ms: 1000
+
+      kafka:
+        type: mirrormaker2
+        mode: async
+        topics:
+          - "54bank.*"
+        consumer_group_pattern: "54bank-*"
+
+      storage:
+        type: rook-ceph-mirror  # On-prem
+        aws_type: s3-cross-region  # AWS
+        mode: async
+        schedule: "*/5 * * * *"  # Every 5 minutes
+
+    monitoring:
+      prometheus_url: http://prometheus.monitoring.svc:9090
+      alertmanager_url: http://alertmanager.monitoring.svc:9093
+      pagerduty_integration_key: REPLACE_WITH_PAGERDUTY_KEY
+
+---
+# PostgreSQL Streaming Replication — Lagos → Abuja
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-replication
+  namespace: dr-management
+data:
+  primary-setup.sh: |
+    #!/bin/bash
+    # Run on Lagos primary PostgreSQL
+    set -euo pipefail
+
+    # Create replication user
+    psql -U postgres <<SQL
+    CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD '${REPLICATION_PASSWORD}';
+    GRANT pg_read_all_data TO replicator;
+    SQL
+
+    # Configure pg_hba.conf for Abuja DR site
+    cat >> /etc/postgresql/15/main/pg_hba.conf <<EOF
+    # DR replication from Abuja
+    hostssl replication replicator 10.1.0.0/16 scram-sha-256
+    EOF
+
+    # Configure streaming replication
+    cat >> /etc/postgresql/15/main/postgresql.conf <<EOF
+    # Replication settings for DR
+    wal_level = replica
+    max_wal_senders = 10
+    max_replication_slots = 10
+    wal_keep_size = 1GB
+    hot_standby = on
+    synchronous_commit = on
+    synchronous_standby_names = ''
+    archive_mode = on
+    archive_command = 'test ! -f /archive/%f && cp %p /archive/%f'
+    EOF
+
+    pg_ctl reload
+
+  standby-setup.sh: |
+    #!/bin/bash
+    # Run on Abuja standby PostgreSQL
+    set -euo pipefail
+
+    # Stop PostgreSQL
+    systemctl stop postgresql
+
+    # Clear data directory
+    rm -rf /var/lib/postgresql/15/main/*
+
+    # Base backup from primary
+    pg_basebackup \
+      -h postgres-primary.lagos.54bank.local \
+      -U replicator \
+      -D /var/lib/postgresql/15/main \
+      -Fp -Xs -R -P \
+      --checkpoint=fast
+
+    # Configure standby
+    cat >> /var/lib/postgresql/15/main/postgresql.auto.conf <<EOF
+    primary_conninfo = 'host=postgres-primary.lagos.54bank.local port=5432 user=replicator password=${REPLICATION_PASSWORD} sslmode=require'
+    primary_slot_name = 'abuja_standby'
+    recovery_target_timeline = 'latest'
+    hot_standby = on
+    EOF
+
+    touch /var/lib/postgresql/15/main/standby.signal
+
+    # Start PostgreSQL in standby mode
+    chown -R postgres:postgres /var/lib/postgresql/15/main
+    systemctl start postgresql
+
+  failover.sh: |
+    #!/bin/bash
+    # Failover script — promotes Abuja standby to primary
+    # CAUTION: This is irreversible. Run only during actual DR event.
+    set -euo pipefail
+
+    echo "=== 54Bank DR Failover ==="
+    echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "Promoting Abuja standby to primary..."
+
+    # Step 1: Verify primary is truly down
+    if pg_isready -h postgres-primary.lagos.54bank.local -p 5432; then
+      echo "WARNING: Primary appears to be up! Aborting."
+      echo "Use force-failover if this is intentional."
+      exit 1
+    fi
+
+    # Step 2: Promote standby
+    psql -U postgres -c "SELECT pg_promote();"
+    echo "PostgreSQL promoted."
+
+    # Step 3: Update DNS to point to Abuja
+    # This depends on DNS provider (Route53, Designate, etc.)
+    echo "Update DNS: postgres.54bank.local → 10.1.1.40"
+
+    # Step 4: Update Kubernetes ConfigMaps
+    kubectl patch configmap database-config -n production \
+      -p '{"data":{"DATABASE_HOST":"postgres-standby.abuja.54bank.local"}}'
+
+    # Step 5: Rolling restart all services to pick up new DB
+    kubectl rollout restart deployment -n production
+
+    # Step 6: Verify services are healthy
+    sleep 30
+    kubectl get pods -n production | grep -v Running | grep -v Completed
+
+    echo "=== Failover complete ==="
+    echo "Verify all services at https://api.54bank.ng/healthz"
+
+---
+# Kafka MirrorMaker 2 — Cross-site replication
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-mirrormaker
+  namespace: dr-management
+data:
+  mm2.properties: |
+    # Kafka MirrorMaker 2 — Lagos → Abuja
+    clusters = lagos, abuja
+
+    lagos.bootstrap.servers = kafka.lagos.54bank.local:9092
+    lagos.security.protocol = SASL_SSL
+    lagos.sasl.mechanism = SCRAM-SHA-512
+
+    abuja.bootstrap.servers = kafka.abuja.54bank.local:9092
+    abuja.security.protocol = SASL_SSL
+    abuja.sasl.mechanism = SCRAM-SHA-512
+
+    # Replicate all 54bank topics
+    lagos->abuja.enabled = true
+    lagos->abuja.topics = 54bank\..*
+
+    # Consumer group offset sync
+    sync.group.offsets.enabled = true
+    sync.group.offsets.interval.seconds = 10
+    emit.checkpoints.enabled = true
+    emit.checkpoints.interval.seconds = 10
+
+    # Replication factor
+    replication.factor = 3
+    checkpoints.topic.replication.factor = 3
+    heartbeats.topic.replication.factor = 3
+    offset-syncs.topic.replication.factor = 3
+
+    # Performance
+    tasks.max = 4
+    offset.flush.interval.ms = 10000
+
+---
+# DR Health Monitor CronJob
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: dr-health-check
+  namespace: dr-management
+spec:
+  schedule: "*/1 * * * *"  # Every minute
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          resturityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+          containers:
+            - name: health-check
+              image: curlimages/curl:8.5.0
+              command:
+                - /bin/sh
+                - -c
+                - |
+                  # Check primary site
+                  PRIMARY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                    https://k8s-api.lagos.54bank.local:6443/healthz \
+                    --max-time 5 || echo "000")
+
+                  # Check DR site
+                  DR_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+                    https://k8s-api.abuja.54bank.local:6443/healthz \
+                    --max-time 5 || echo "000")
+
+                  # Check replication lag
+                  REPL_LAG=$(curl -s \
+                    http://prometheus.monitoring.svc:9090/api/v1/query?query=pg_replication_lag \
+                    --max-time 5 | jq -r '.data.result[0].value[1] // "unknown"')
+
+                  echo "Primary: $PRIMARY_STATUS | DR: $DR_STATUS | Repl Lag: ${REPL_LAG}s"
+
+                  # Alert if primary is down
+                  if [ "$PRIMARY_STATUS" != "200" ]; then
+                    curl -s -X POST http://alertmanager.monitoring.svc:9093/api/v2/alerts \
+                      -H "Content-Type: application/json" \
+                      -d '[{"labels":{"alertname":"PrimarySiteDown","severity":"critical"},"annotations":{"summary":"Lagos primary site unreachable"}}]'
+                  fi
+
+                  # Alert if replication lag > 60s
+                  if [ "$REPL_LAG" != "unknown" ] && [ "$(echo "$REPL_LAG > 60" | bc -l)" = "1" ]; then
+                    curl -s -X POST http://alertmanager.monitoring.svc:9093/api/v2/alerts \
+                      -H "Content-Type: application/json" \
+                      -d '[{"labels":{"alertname":"HighReplicationLag","severity":"warning"},"annotations":{"summary":"DB replication lag exceeds 60s"}}]'
+                  fi
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 32Mi
+                limits:
+                  cpu: 100m
+                  memory: 64Mi
+          restartPolicy: OnFailure

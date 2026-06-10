@@ -1,0 +1,341 @@
+# 54Bank On-Premise Node Provisioning
+# Prepares bare-metal servers for Kubernetes deployment
+#
+# Usage:
+#   ansible-playbook -i inventory.yaml site.yaml
+#
+# Node roles:
+#   - control_plane: K8s masters (3 nodes)
+#   - worker: K8s workers (6 nodes)
+#   - storage: Ceph OSD nodes (3 nodes)
+#   - database: PostgreSQL + Redis (3 nodes)
+---
+- name: Common setup for all nodes
+  hosts: all
+  become: true
+  tasks:
+    - name: Set timezone to WAT (West Africa Time)
+      community.general.timezone:
+        name: Africa/Lagos
+
+    - name: Update system packages
+      apt:
+        update_cache: true
+        upgrade: dist
+        autoremove: true
+
+    - name: Install common packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - jq
+          - ntp
+          - chrony
+          - fail2ban
+          - ufw
+          - auditd
+          - aide
+          - unattended-upgrades
+          - net-tools
+          - iotop
+          - htop
+          - sysstat
+        state: present
+
+    - name: Configure NTP for financial transaction timestamps
+      copy:
+        dest: /etc/chrony/chrony.conf
+        content: |
+          # Nigerian NTP servers
+          server ntp.ubuntu.com iburst
+          server time.google.com iburst
+          server time.cloudflare.com iburst
+          # Maximum allowed drift: 100ms for financial transactions
+          maxdistance 0.1
+          driftfile /var/lib/chrony/drift
+          makestep 0.01 3
+          rtcsync
+          logdir /var/log/chrony
+      notify: restart chrony
+
+    - name: Configure kernel parameters for K8s
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: true
+        reload: true
+      loop:
+        - { key: net.bridge.bridge-nf-call-iptables, value: "1" }
+        - { key: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+        - { key: net.ipv4.ip_forward, value: "1" }
+        - { key: net.ipv4.conf.all.rp_filter, value: "1" }
+        - { key: net.ipv4.tcp_syncookies, value: "1" }
+        - { key: vm.swappiness, value: "1" }
+        - { key: vm.max_map_count, value: "262144" }
+        - { key: fs.file-max, value: "2097152" }
+        - { key: net.core.somaxconn, value: "65535" }
+        - { key: net.ipv4.tcp_max_syn_backlog, value: "65535" }
+
+    - name: Disable swap (required for K8s)
+      command: swapoff -a
+      changed_when: false
+
+    - name: Remove swap from fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '\sswap\s'
+        state: absent
+
+    - name: Load required kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+        - ip_vs
+        - ip_vs_rr
+        - ip_vs_wrr
+        - ip_vs_sh
+        - nf_conntrack
+
+    - name: Install containerd
+      block:
+        - name: Add Docker GPG key
+          apt_key:
+            url: https://download.docker.com/linux/ubuntu/gpg
+
+        - name: Add Docker repository
+          apt_repository:
+            repo: "deb https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+
+        - name: Install containerd
+          apt:
+            name: containerd.io
+            state: present
+
+        - name: Configure containerd with systemd cgroup
+          copy:
+            dest: /etc/containerd/config.toml
+            content: |
+              version = 2
+              [plugins."io.containerd.grpc.v1.cri"]
+                sandbox_image = "registry.k8s.io/pause:3.9"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                  runtime_type = "io.containerd.runc.v2"
+                  [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                    SystemdCgroup = true
+          notify: restart containerd
+
+    - name: Install kubeadm, kubelet, kubectl
+      block:
+        - name: Add Kubernetes GPG key
+          apt_key:
+            url: https://pkgs.k8s.io/core:/stable:/v1.29/deb/Release.key
+
+        - name: Add Kubernetes repository
+          apt_repository:
+            repo: "deb https://pkgs.k8s.io/core:/stable:/v1.29/deb/ /"
+
+        - name: Install K8s components
+          apt:
+            name:
+              - kubelet=1.29.*
+              - kubeadm=1.29.*
+              - kubectl=1.29.*
+            state: present
+
+        - name: Hold K8s packages at current version
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop: [kubelet, kubeadm, kubectl]
+
+    - name: Configure auditd for CBN compliance
+      copy:
+        dest: /etc/audit/rules.d/54bank.rules
+        content: |
+          # 54Bank audit rules — CBN IT Standards
+          -w /etc/kubernetes/ -p wa -k kubernetes_config
+          -w /var/lib/etcd/ -p wa -k etcd_data
+          -w /var/log/ -p wa -k log_files
+          -a always,exit -F arch=b64 -S execve -k command_execution
+          -a always,exit -F arch=b64 -S open,openat -F exit=-EACCES -k access_denied
+          -a always,exit -F arch=b64 -S open,openat -F exit=-EPERM -k access_denied
+      notify: restart auditd
+
+    - name: Configure fail2ban
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime = 3600
+          findtime = 600
+          maxretry = 5
+          [sshd]
+          enabled = true
+          port = 22
+          filter = sshd
+          logpath = /var/log/auth.log
+      notify: restart fail2ban
+
+    - name: Configure UFW firewall
+      block:
+        - name: Allow SSH
+          ufw:
+            rule: allow
+            port: "22"
+            proto: tcp
+
+        - name: Allow K8s API
+          ufw:
+            rule: allow
+            port: "6443"
+            proto: tcp
+          when: "'control_plane' in group_names"
+
+        - name: Allow kubelet
+          ufw:
+            rule: allow
+            port: "10250"
+            proto: tcp
+
+        - name: Allow NodePort range
+          ufw:
+            rule: allow
+            port: "30000:32767"
+            proto: tcp
+          when: "'worker' in group_names"
+
+        - name: Enable UFW
+          ufw:
+            state: enabled
+            policy: deny
+
+  handlers:
+    - name: restart chrony
+      service: name=chrony state=restarted
+
+    - name: restart containerd
+      service: name=containerd state=restarted
+
+    - name: restart auditd
+      service: name=auditd state=restarted
+
+    - name: restart fail2ban
+      service: name=fail2ban state=restarted
+
+# ── Storage Nodes ────────────────────────────────────────────────────────────
+
+- name: Configure storage nodes for Rook-Ceph
+  hosts: storage
+  become: true
+  tasks:
+    - name: Install Ceph prerequisites
+      apt:
+        name:
+          - lvm2
+          - gdisk
+          - linux-headers-{{ ansible_kernel }}
+        state: present
+
+    - name: Wipe disks for Ceph OSD
+      command: "sgdisk --zap-all {{ item }}"
+      loop:
+        - /dev/nvme0n1
+        - /dev/nvme1n1
+      changed_when: true
+
+    - name: Label storage nodes
+      command: kubectl label node {{ inventory_hostname }} node-role.kubernetes.io/storage="" --overwrite
+      delegate_to: "{{ groups['control_plane'][0] }}"
+      changed_when: true
+
+# ── Database Nodes ───────────────────────────────────────────────────────────
+
+- name: Configure database nodes
+  hosts: database
+  become: true
+  tasks:
+    - name: Install PostgreSQL 15
+      block:
+        - name: Add PostgreSQL repository
+          apt_repository:
+            repo: "deb http://apt.postgresql.org/pub/repos/apt {{ ansible_distribution_release }}-pgdg main"
+
+        - name: Install PostgreSQL
+          apt:
+            name:
+              - postgresql-15
+              - postgresql-contrib-15
+              - pgbouncer
+              - patroni
+            state: present
+
+    - name: Install Redis 7
+      block:
+        - name: Add Redis repository
+          apt_repository:
+            repo: "ppa:redislabs/redis"
+
+        - name: Install Redis
+          apt:
+            name: redis-server
+            state: present
+
+    - name: Configure PostgreSQL for HA (Patroni)
+      copy:
+        dest: /etc/patroni/patroni.yaml
+        content: |
+          scope: 54bank-postgres
+          namespace: /54bank/
+          name: {{ inventory_hostname }}
+          restapi:
+            listen: 0.0.0.0:8008
+            connect_address: {{ ansible_default_ipv4.address }}:8008
+          etcd3:
+            hosts: {{ groups['control_plane'] | map('regex_replace', '$', ':2379') | join(',') }}
+          bootstrap:
+            dcs:
+              ttl: 30
+              loop_wait: 10
+              retry_timeout: 10
+              maximum_lag_on_failover: 1048576
+              postgresql:
+                use_pg_rewind: true
+                parameters:
+                  max_connections: 500
+                  shared_buffers: 16GB
+                  effective_cache_size: 48GB
+                  work_mem: 64MB
+                  maintenance_work_mem: 2GB
+                  wal_level: replica
+                  max_wal_senders: 10
+                  max_replication_slots: 10
+                  hot_standby: "on"
+                  shared_preload_libraries: "pg_stat_statements,pg_audit"
+                  log_statement: ddl
+                  log_min_duration_statement: 1000
+                  statement_timeout: 30000
+                  idle_in_transaction_session_timeout: 60000
+                  ssl: "on"
+                  ssl_cert_file: /etc/ssl/certs/postgres.crt
+                  ssl_key_file: /etc/ssl/private/postgres.key
+          postgresql:
+            listen: 0.0.0.0:5432
+            connect_address: {{ ansible_default_ipv4.address }}:5432
+            data_dir: /var/lib/postgresql/15/main
+            authentication:
+              replication:
+                username: replicator
+              superuser:
+                username: postgres
+      notify: restart patroni
+
+  handlers:
+    - name: restart patroni
+      service: name=patroni state=restarted

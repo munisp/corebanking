@@ -1,0 +1,407 @@
+heat_template_version: 2021-04-16
+description: >
+  54Bank Core Banking Platform — OpenStack Heat Stack
+  Deploys: Magnum K8s cluster, Trove PostgreSQL, Designate DNS,
+  Octavia LB, Manila shared storage, Barbican secrets
+  CBN-compliant: all resources in Nigerian data center
+
+parameters:
+  cluster_name:
+    type: string
+    default: 54bank-production
+    description: Name prefix for all resources
+
+  key_name:
+    type: string
+    description: SSH keypair for node access
+
+  external_network:
+    type: string
+    default: public-net
+    description: External network for floating IPs
+
+  master_flavor:
+    type: string
+    default: m1.xlarge
+    description: Flavor for K8s master nodes
+
+  worker_flavor:
+    type: string
+    default: m1.2xlarge
+    description: Flavor for K8s worker nodes
+
+  worker_count:
+    type: number
+    default: 6
+    description: Number of K8s worker nodes
+
+  db_flavor:
+    type: string
+    default: db.m1.xlarge
+    description: Flavor for PostgreSQL instances
+
+  db_volume_size:
+    type: number
+    default: 500
+    description: Database volume size in GB
+
+  dns_domain:
+    type: string
+    default: 54bank.local.
+    description: DNS domain for internal services
+
+  availability_zone_1:
+    type: string
+    default: lagos-az1
+    description: Primary availability zone
+
+  availability_zone_2:
+    type: string
+    default: lagos-az2
+    description: Secondary availability zone
+
+resources:
+  # ── Network Infrastructure ─────────────────────────────────────────────────
+
+  internal_network:
+    type: OS::Neutron::Net
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'internal']] }
+      admin_state_up: true
+
+  internal_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network: { get_resource: internal_network }
+      cidr: 10.10.0.0/16
+      gateway_ip: 10.10.0.1
+      dns_nameservers:
+        - 8.8.8.8
+        - 8.8.4.4
+      allocation_pools:
+        - start: 10.10.1.0
+          end: 10.10.254.254
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'subnet']] }
+
+  database_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network: { get_resource: internal_network }
+      cidr: 10.20.0.0/24
+      gateway_ip: 10.20.0.1
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'db-subnet']] }
+
+  router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: external_network }
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'router']] }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: router }
+      subnet: { get_resource: internal_subnet }
+
+  router_db_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: router }
+      subnet: { get_resource: database_subnet }
+
+  # ── Security Groups ────────────────────────────────────────────────────────
+
+  k8s_master_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'k8s-master-sg']] }
+      rules:
+        - protocol: tcp
+          port_range_min: 6443
+          port_range_max: 6443
+          remote_ip_prefix: 10.10.0.0/16
+          description: Kubernetes API server
+        - protocol: tcp
+          port_range_min: 2379
+          port_range_max: 2380
+          remote_ip_prefix: 10.10.0.0/16
+          description: etcd cluster
+        - protocol: tcp
+          port_range_min: 10250
+          port_range_max: 10252
+          remote_ip_prefix: 10.10.0.0/16
+          description: kubelet, controller-manager, scheduler
+
+  k8s_worker_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'k8s-worker-sg']] }
+      rules:
+        - protocol: tcp
+          port_range_min: 10250
+          port_range_max: 10250
+          remote_ip_prefix: 10.10.0.0/16
+          description: kubelet API
+        - protocol: tcp
+          port_range_min: 30000
+          port_range_max: 32767
+          remote_ip_prefix: 10.10.0.0/16
+          description: NodePort services
+        - protocol: tcp
+          port_range_min: 8080
+          port_range_max: 9090
+          remote_ip_prefix: 10.10.0.0/16
+          description: Application ports
+
+  database_sg:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'db-sg']] }
+      rules:
+        - protocol: tcp
+          port_range_min: 5432
+          port_range_max: 5432
+          remote_group: { get_resource: k8s_worker_sg }
+          description: PostgreSQL from K8s workers only
+        - protocol: tcp
+          port_range_min: 6379
+          port_range_max: 6379
+          remote_group: { get_resource: k8s_worker_sg }
+          description: Redis from K8s workers only
+
+  # ── Magnum Kubernetes Cluster ──────────────────────────────────────────────
+
+  k8s_cluster_template:
+    type: OS::Magnum::ClusterTemplate
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'template']] }
+      image: fedora-coreos-39
+      keypair: { get_param: key_name }
+      external_network: { get_param: external_network }
+      fixed_network: { get_resource: internal_network }
+      fixed_subnet: { get_resource: internal_subnet }
+      master_flavor: { get_param: master_flavor }
+      flavor: { get_param: worker_flavor }
+      coe: kubernetes
+      network_driver: calico
+      volume_driver: cinder
+      docker_storage_driver: overlay2
+      dns_nameserver: 8.8.8.8
+      master_lb_enabled: true
+      floating_ip_enabled: true
+      tls_disabled: false
+      labels:
+        kube_tag: v1.29.0
+        container_runtime: containerd
+        ingress_controller: nginx
+        monitoring_enabled: "true"
+        auto_scaling_enabled: "true"
+        auto_healing_enabled: "true"
+        auto_healing_controller: draino
+        min_node_count: 3
+        max_node_count: 20
+        cloud_provider_enabled: "true"
+        cinder_csi_enabled: "true"
+
+  k8s_cluster:
+    type: OS::Magnum::Cluster
+    depends_on: [router_interface]
+    properties:
+      name: { get_param: cluster_name }
+      cluster_template: { get_resource: k8s_cluster_template }
+      master_count: 3
+      node_count: { get_param: worker_count }
+      keypair: { get_param: key_name }
+
+  # ── Trove PostgreSQL Cluster ───────────────────────────────────────────────
+
+  postgres_cluster:
+    type: OS::Trove::Cluster
+    depends_on: [router_db_interface]
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'postgres']] }
+      datastore_type: postgresql
+      datastore_version: "15"
+      instances:
+        - flavor: { get_param: db_flavor }
+          volume_size: { get_param: db_volume_size }
+          volume_type: ssd-encrypted
+          availability_zone: { get_param: availability_zone_1 }
+          nics:
+            - net-id: { get_resource: internal_network }
+        - flavor: { get_param: db_flavor }
+          volume_size: { get_param: db_volume_size }
+          volume_type: ssd-encrypted
+          availability_zone: { get_param: availability_zone_2 }
+          nics:
+            - net-id: { get_resource: internal_network }
+        - flavor: { get_param: db_flavor }
+          volume_size: { get_param: db_volume_size }
+          volume_type: ssd-encrypted
+          availability_zone: { get_param: availability_zone_1 }
+          nics:
+            - net-id: { get_resource: internal_network }
+
+  # ── Redis Cluster (Trove) ──────────────────────────────────────────────────
+
+  redis_cluster:
+    type: OS::Trove::Cluster
+    depends_on: [router_db_interface]
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'redis']] }
+      datastore_type: redis
+      datastore_version: "7.0"
+      instances:
+        - flavor: m1.large
+          volume_size: 50
+          availability_zone: { get_param: availability_zone_1 }
+          nics:
+            - net-id: { get_resource: internal_network }
+        - flavor: m1.large
+          volume_size: 50
+          availability_zone: { get_param: availability_zone_2 }
+          nics:
+            - net-id: { get_resource: internal_network }
+        - flavor: m1.large
+          volume_size: 50
+          availability_zone: { get_param: availability_zone_1 }
+          nics:
+            - net-id: { get_resource: internal_network }
+
+  # ── Octavia Load Balancer ──────────────────────────────────────────────────
+
+  api_loadbalancer:
+    type: OS::Octavia::LoadBalancer
+    depends_on: [router_interface]
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'api-lb']] }
+      vip_subnet: { get_resource: internal_subnet }
+      flavor: lb.medium
+
+  api_lb_listener_https:
+    type: OS::Octavia::Listener
+    properties:
+      loadbalancer: { get_resource: api_loadbalancer }
+      protocol: TERMINATED_HTTPS
+      protocol_port: 443
+      default_tls_container_ref: { get_resource: tls_certificate }
+      allowed_cidrs:
+        - 0.0.0.0/0
+
+  api_lb_listener_http:
+    type: OS::Octavia::Listener
+    properties:
+      loadbalancer: { get_resource: api_loadbalancer }
+      protocol: HTTP
+      protocol_port: 80
+
+  api_lb_pool:
+    type: OS::Octavia::Pool
+    properties:
+      listener: { get_resource: api_lb_listener_https }
+      protocol: HTTP
+      lb_algorithm: ROUND_ROBIN
+      session_persistence:
+        type: SOURCE_IP
+
+  api_lb_healthmonitor:
+    type: OS::Octavia::HealthMonitor
+    properties:
+      pool: { get_resource: api_lb_pool }
+      type: HTTP
+      url_path: /healthz
+      expected_codes: "200"
+      delay: 10
+      timeout: 5
+      max_retries: 3
+
+  api_lb_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: external_network }
+      port_id: { get_attr: [api_loadbalancer, vip_port_id] }
+
+  # ── Barbican TLS Certificate ───────────────────────────────────────────────
+
+  tls_certificate:
+    type: OS::Barbican::CertificateContainer
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'tls']] }
+
+  # ── Manila Shared Storage ──────────────────────────────────────────────────
+
+  shared_storage:
+    type: OS::Manila::Share
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'shared']] }
+      share_protocol: NFS
+      size: 500
+      share_type: default
+      description: Shared storage for 54Bank logs, backups, and ML models
+
+  # ── Designate DNS Records ──────────────────────────────────────────────────
+
+  dns_zone:
+    type: OS::Designate::Zone
+    properties:
+      name: { get_param: dns_domain }
+      email: devops@54bank.ng
+      ttl: 300
+
+  api_dns_record:
+    type: OS::Designate::RecordSet
+    properties:
+      zone: { get_resource: dns_zone }
+      name: { list_join: ['', ['api.', { get_param: dns_domain }]] }
+      type: A
+      records:
+        - { get_attr: [api_lb_floating_ip, floating_ip_address] }
+      ttl: 60
+
+  # ── Cinder Volumes for Kafka ───────────────────────────────────────────────
+
+  kafka_volume_1:
+    type: OS::Cinder::Volume
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'kafka-1']] }
+      size: 1000
+      volume_type: ssd-encrypted
+      availability_zone: { get_param: availability_zone_1 }
+
+  kafka_volume_2:
+    type: OS::Cinder::Volume
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'kafka-2']] }
+      size: 1000
+      volume_type: ssd-encrypted
+      availability_zone: { get_param: availability_zone_2 }
+
+  kafka_volume_3:
+    type: OS::Cinder::Volume
+    properties:
+      name: { list_join: ['-', [{ get_param: cluster_name }, 'kafka-3']] }
+      size: 1000
+      volume_type: ssd-encrypted
+      availability_zone: { get_param: availability_zone_1 }
+
+outputs:
+  k8s_api_endpoint:
+    description: Kubernetes API endpoint
+    value: { get_attr: [k8s_cluster, api_address] }
+
+  api_public_ip:
+    description: Public IP for API gateway
+    value: { get_attr: [api_lb_floating_ip, floating_ip_address] }
+
+  postgres_endpoint:
+    description: PostgreSQL cluster endpoint
+    value: { get_attr: [postgres_cluster, ip] }
+
+  redis_endpoint:
+    description: Redis cluster endpoint
+    value: { get_attr: [redis_cluster, ip] }
+
+  shared_storage_path:
+    description: NFS share path
+    value: { get_attr: [shared_storage, export_locations] }

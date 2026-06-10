@@ -1,0 +1,294 @@
+# APISIX API Gateway for 54Bank
+# Provides: routing, rate limiting, authentication, request/response transformation
+# Works on: AWS EKS, OpenStack, On-Premise K8s
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: apisix
+  labels:
+    app.kubernetes.io/name: apisix
+    app.kubernetes.io/part-of: 54bank-gateway
+
+---
+# APISIX ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apisix-config
+  namespace: apisix
+data:
+  config.yaml: |
+    apisix:
+      node_listen:
+        - port: 9080
+      enable_admin: true
+      admin_listen:
+        - port: 9180
+      ssl:
+        enable: true
+        listen:
+          - port: 9443
+        ssl_protocols: "TLSv1.2 TLSv1.3"
+        ssl_ciphers: "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
+
+    deployment:
+      role: traditional
+      role_traditional:
+        config_provider: etcd
+      admin:
+        admin_key:
+          - name: admin
+            key: REPLACE_WITH_ADMIN_KEY
+            role: admin
+
+    etcd:
+      host:
+        - "http://apisix-etcd:2379"
+
+    plugins:
+      - cors
+      - ip-restriction
+      - limit-req
+      - limit-count
+      - limit-conn
+      - key-auth
+      - jwt-auth
+      - openid-connect
+      - prometheus
+      - request-id
+      - proxy-rewrite
+      - response-rewrite
+      - real-ip
+      - gzip
+      - request-validation
+      - consumer-restriction
+      - traffic-split
+      - api-breaker
+
+    plugin_attr:
+      prometheus:
+        export_addr:
+          ip: 0.0.0.0
+          port: 9091
+
+---
+# APISIX Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apisix
+  namespace: apisix
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: apisix
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: apisix
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      containers:
+        - name: apisix
+          image: apache/apisix:3.8.0-debian
+          ports:
+            - containerPort: 9080
+              name: http
+            - containerPort: 9443
+              name: https
+            - containerPort: 9091
+              name: metrics
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+          readinessProbe:
+            httpGet:
+              path: /apisix/status
+              port: 9080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /apisix/status
+              port: 9080
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          volumeMounts:
+            - name: apisix-config
+              mountPath: /usr/local/apisix/conf/config.yaml
+              subPath: config.yaml
+      volumes:
+        - name: apisix-config
+          configMap:
+            name: apisix-config
+
+---
+# APISIX Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix-gateway
+  namespace: apisix
+  annotations:
+    # AWS: use NLB
+    service.beta.kubernetes.io/aws-load-balancer-type: nlb
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+    # On-prem: MetalLB will assign VIP
+    metallb.universe.tf/address-pool: 54bank-api-pool
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: apisix
+  ports:
+    - name: http
+      port: 80
+      targetPort: 9080
+    - name: https
+      port: 443
+      targetPort: 9443
+
+---
+# etcd for APISIX configuration storage
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: apisix-etcd
+  namespace: apisix
+spec:
+  serviceName: apisix-etcd
+  replicas: 3
+  selector:
+    matchLabels:
+      app: apisix-etcd
+  template:
+    metadata:
+      labels:
+        app: apisix-etcd
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        fsGroup: 1001
+      containers:
+        - name: etcd
+          image: bitnami/etcd:3.5
+          env:
+            - name: ETCD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ETCD_DATA_DIR
+              value: /bitnami/etcd/data
+            - name: ETCD_LISTEN_PEER_URLS
+              value: http://0.0.0.0:2380
+            - name: ETCD_LISTEN_CLIENT_URLS
+              value: http://0.0.0.0:2379
+            - name: ETCD_ADVERTISE_CLIENT_URLS
+              value: http://$(ETCD_NAME).apisix-etcd:2379
+            - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
+              value: http://$(ETCD_NAME).apisix-etcd:2380
+            - name: ETCD_INITIAL_CLUSTER
+              value: apisix-etcd-0=http://apisix-etcd-0.apisix-etcd:2380,apisix-etcd-1=http://apisix-etcd-1.apisix-etcd:2380,apisix-etcd-2=http://apisix-etcd-2.apisix-etcd:2380
+            - name: ALLOW_NONE_AUTHENTICATION
+              value: "yes"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/etcd
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix-etcd
+  namespace: apisix
+spec:
+  clusterIP: None
+  selector:
+    app: apisix-etcd
+  ports:
+    - name: client
+      port: 2379
+    - name: peer
+      port: 2380
+
+---
+# APISIX Routes for 54Bank services
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apisix-routes
+  namespace: apisix
+data:
+  routes.json: |
+    {
+      "routes": [
+        {
+          "uri": "/v1/account-opening/*",
+          "upstream": {"type": "roundrobin", "nodes": {"account-opening-go.production.svc:8080": 1}},
+          "plugins": {
+            "limit-count": {"count": 100, "time_window": 60, "key_type": "var", "key": "remote_addr"},
+            "jwt-auth": {},
+            "request-id": {"include_in_response": true},
+            "cors": {"allow_origins": "https://app.54bank.ng", "allow_methods": "GET,POST,PUT,DELETE,OPTIONS"},
+            "api-breaker": {"break_response_code": 503, "unhealthy": {"http_statuses": [500,502,503], "failures": 3}, "healthy": {"successes": 1}}
+          }
+        },
+        {
+          "uri": "/v1/core-banking/*",
+          "upstream": {"type": "roundrobin", "nodes": {"core-banking-go.production.svc:8080": 1}},
+          "plugins": {
+            "limit-count": {"count": 200, "time_window": 60, "key_type": "var", "key": "remote_addr"},
+            "jwt-auth": {},
+            "request-id": {"include_in_response": true},
+            "cors": {"allow_origins": "https://app.54bank.ng"}
+          }
+        },
+        {
+          "uri": "/v1/nip-gateway/*",
+          "upstream": {"type": "roundrobin", "nodes": {"nip-gateway-go.production.svc:8080": 1}},
+          "plugins": {
+            "limit-count": {"count": 500, "time_window": 60, "key_type": "var", "key": "remote_addr"},
+            "jwt-auth": {},
+            "request-id": {"include_in_response": true},
+            "limit-req": {"rate": 100, "burst": 50}
+          }
+        },
+        {
+          "uri": "/v1/bill-payment/*",
+          "upstream": {"type": "roundrobin", "nodes": {"bill-payment-go.production.svc:8080": 1}},
+          "plugins": {
+            "limit-count": {"count": 100, "time_window": 60, "key_type": "var", "key": "remote_addr"},
+            "jwt-auth": {},
+            "request-id": {"include_in_response": true}
+          }
+        },
+        {
+          "uri": "/healthz",
+          "upstream": {"type": "roundrobin", "nodes": {"core-banking-go.production.svc:8080": 1}},
+          "plugins": {}
+        }
+      ]
+    }
