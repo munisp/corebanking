@@ -9,10 +9,12 @@ import (
 	"os/signal"
 	"syscall"
 	"sync/atomic"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"net/http"
 	"os"
 	"sync"
@@ -23,6 +25,12 @@ import (
 )
 
 var startTime = time.Now()
+
+func secureRandUint32() uint32 {
+	var b [4]byte
+	rand.Read(b[:])
+	return binary.BigEndian.Uint32(b[:])
+}
 var (
 	_reqCount uint64
 	_errCount uint64
@@ -146,7 +154,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("DB--%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("DB--%08X", secureRandUint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -161,7 +169,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	domainStats.TotalRecords = len(records)
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -187,7 +195,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", secureRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -396,6 +404,26 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-Id", rid)
 		next.ServeHTTP(w, r)
 	})
+}
+
+func validateJWTExpiry(tokenStr string) bool {
+	parts := strings.Split(tokenStr, ".")
+	if len(parts) != 3 { return false }
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil { return false }
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil { return false }
+	exp, ok := claims["exp"].(float64)
+	if !ok { return false }
+	return time.Now().Unix() < int64(exp)
+}
+
+func sanitizeInput(s string) string {
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	return s
 }
 
 // panicRecoveryMiddleware catches panics and returns 500 instead of crashing
