@@ -200,6 +200,12 @@ func cbRecordFailure() {
 }
 
 // --- Observability (OpenTelemetry) ---
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 
 func initTracing() {

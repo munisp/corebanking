@@ -726,8 +726,11 @@ async fn main() -> std::io::Result<()> {
     let state = web::Data::new(AppState { records: Mutex::new(Vec::new()), db_url, db_client });
     println!("epr-kgqa-rs listening on port {}", port);
     start_grpc_server("epr-kgqa-rs", 10474);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

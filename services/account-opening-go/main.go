@@ -35,6 +35,12 @@ func secureRandUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "account-opening-go"
 
 // Inter-service URLs
@@ -298,7 +304,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		jsonResp(w, 400, map[string]string{"error": "Invalid JSON body"})
 		return
 	}
@@ -387,7 +393,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 func approveHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { jsonResp(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -423,7 +429,7 @@ func approveHandler(w http.ResponseWriter, r *http.Request) {
 func kycVerifyHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { jsonResp(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -1047,7 +1053,7 @@ func handleAccountValidate(w http.ResponseWriter, r *http.Request) {
 		KYCLevel     string `json:"kyc_level"`
 		Age          int    `json:"age"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return

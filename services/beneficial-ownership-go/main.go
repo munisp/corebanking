@@ -36,6 +36,12 @@ func secureRandUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "beneficial-ownership-go"
 
 var startTime = time.Now()
@@ -236,7 +242,7 @@ func handleTraverseChain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -308,7 +314,7 @@ func handleIdentifyUBOs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -339,7 +345,7 @@ func handleAddToRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -441,7 +447,7 @@ func beneficial_ownershipScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -452,7 +458,7 @@ func beneficial_ownershipScoreHandler(w http.ResponseWriter, r *http.Request) {
 
 func beneficial_ownershipValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return

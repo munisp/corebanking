@@ -817,8 +817,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("virtual-scroll-engine-rs on port {}", port);
     start_grpc_server("virtual-scroll-engine-rs", 10434);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

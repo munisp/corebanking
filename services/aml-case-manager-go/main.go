@@ -38,6 +38,12 @@ func secureRandUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "aml-case-manager-go"
 
 var startTime = time.Now()
@@ -154,7 +160,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("aml_case_manager_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -207,7 +213,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -240,7 +246,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -318,7 +324,7 @@ func aml_case_managerScreenHandler(w http.ResponseWriter, r *http.Request) {
         Currency string  `json:"currency"`
         Country  string  `json:"origin_country"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 					req.Amount = roundNaira(req.Amount)
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -335,7 +341,7 @@ func aml_case_managerRiskScoreHandler(w http.ResponseWriter, r *http.Request) {
         HighRisk     bool    `json:"high_risk_country"`
         CashIntensive bool   `json:"cash_intensive"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 					req.Amount = roundNaira(req.Amount)
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})

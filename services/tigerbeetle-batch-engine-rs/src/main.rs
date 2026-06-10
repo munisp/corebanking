@@ -816,8 +816,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("tigerbeetle-batch-engine-rs on port {}", port);
     start_grpc_server("tigerbeetle-batch-engine-rs", 10415);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

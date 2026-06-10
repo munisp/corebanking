@@ -992,9 +992,12 @@ async fn main() -> std::io::Result<()> {
     println!("falkordb-graph-engine-rs listening on port {}", port);
 
     start_grpc_server("falkordb-graph-engine-rs", 10458);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         let trace_id = format!("trace-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

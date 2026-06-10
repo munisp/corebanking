@@ -27,6 +27,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "core-banking-go"
 
 // Inter-service URLs
@@ -176,7 +182,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-Id")
 	if tenantID == "" { tenantID = "platform" }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -233,7 +239,7 @@ func dormancyStatus(lastTxnDays int) string {
 
 func postingHandler(w http.ResponseWriter, r *http.Request) {
 	var req PostingRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		jsonResp(w, 400, map[string]interface{}{"error": "Invalid request body"})
 		return
 	}
@@ -265,7 +271,7 @@ func eodBatchHandler(w http.ResponseWriter, r *http.Request) {
 
 func accountTierHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct{ Balance float64 `json:"balance"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -280,7 +286,7 @@ func interestCalcHandler(w http.ResponseWriter, r *http.Request) {
 		Rate    float64 `json:"rate"`
 		Days    int     `json:"days"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return

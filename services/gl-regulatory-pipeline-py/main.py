@@ -41,6 +41,7 @@ MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
 TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54bank/certs/service.crt")
 TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
 TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
+MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
 PORT = int(os.environ.get("PORT", 9516))
 
 # --- Observability ---

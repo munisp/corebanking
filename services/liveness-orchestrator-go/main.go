@@ -31,6 +31,12 @@ import (
 
 var db *sql.DB
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "liveness-orchestrator-go"
 
 // Inference engine URL (liveness-inference-py)
@@ -286,7 +292,7 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		DeviceModel    string `json:"deviceModel"`
 		ChallengeCount int    `json:"challengeCount"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -349,7 +355,7 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 		FrameBase64  string `json:"frameBase64"`
 		FrameIndex   int    `json:"frameIndex"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -510,7 +516,7 @@ func handlePassiveLiveness(w http.ResponseWriter, r *http.Request) {
 		ImageBase64    string `json:"imageBase64"`
 		DevicePlatform string `json:"devicePlatform"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -586,7 +592,7 @@ func handleFaceMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body FaceMatchRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -636,7 +642,7 @@ func handleSubmitChallenge(w http.ResponseWriter, r *http.Request) {
 		DevicePlatform string   `json:"devicePlatform"`
 		DeviceModel    string   `json:"deviceModel"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return

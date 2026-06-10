@@ -22,6 +22,12 @@ import (
 	"time"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "graphql-federation-go"
 
 // GraphQL Federation Gateway — schema stitching, query planning, resolver orchestration
@@ -252,7 +258,7 @@ func handleSubgraphRegister(w http.ResponseWriter, r *http.Request) {
 		Version string   `json:"schema_version"`
 		Types   []string `json:"types"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -320,7 +326,7 @@ func handleQueryPlan(w http.ResponseWriter, r *http.Request) {
 		Fields []string `json:"fields"`
 		Role   string   `json:"role"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -439,7 +445,7 @@ func handlePersistedQueryStore(w http.ResponseWriter, r *http.Request) {
 		Query     string   `json:"query"`
 		TTL       int      `json:"ttl_seconds"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -487,7 +493,7 @@ func handlePersistedQueryExecute(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Hash string `json:"hash"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return

@@ -939,8 +939,11 @@ async fn main() -> std::io::Result<()> {
         grpc_service::start_grpc_server(&grpc_svc_name, 9106).await;
     });
 
-HttpServer::new(move || {
+const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
+    HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

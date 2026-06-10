@@ -1018,8 +1018,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("Sanctions Screening Engine v3.0 (Rust) on :{} — OFAC/EU/UN/CBN/INTERPOL/NFIU/PEP", port);
     start_grpc_server("sanctions-engine-rs", 10321);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

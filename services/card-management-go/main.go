@@ -26,6 +26,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "card-management-go"
 
 // Inter-service URLs
@@ -142,7 +148,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-Id")
 	if tenantID == "" { tenantID = "platform" }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -214,7 +220,7 @@ func validateCardAction(action string, status string) bool {
 
 func issueCardHandler(w http.ResponseWriter, r *http.Request) {
 	var req CardRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -227,7 +233,7 @@ func issueCardHandler(w http.ResponseWriter, r *http.Request) {
 
 func cardActionHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { CardID string `json:"card_id"`; Action string `json:"action"`; CurrentStatus string `json:"current_status"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -242,7 +248,7 @@ func cardActionHandler(w http.ResponseWriter, r *http.Request) {
 
 func pinGenHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { CardID string `json:"card_id"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return

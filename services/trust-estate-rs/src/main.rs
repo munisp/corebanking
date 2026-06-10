@@ -898,8 +898,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("trust-estate-rs listening on port {}", port);
     start_grpc_server("trust-estate-rs", 10328);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

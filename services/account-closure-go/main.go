@@ -27,6 +27,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "account-closure-go"
 
 
@@ -132,7 +138,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" { tenantID = "platform" }
 	_ = balanceSweepAccount("")
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -198,7 +204,7 @@ func balanceSweepAccount(customerID string) string {
 
 func closureCheckHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Balance float64 `json:"balance"`; HasLien bool `json:"has_lien"`; HasPending bool `json:"has_pending"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		req.Balance = roundNaira(req.Balance)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -210,7 +216,7 @@ func closureCheckHandler(w http.ResponseWriter, r *http.Request) {
 
 func processClosureHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { AccountID string `json:"account_id"`; AccountType string `json:"account_type"`; Balance float64 `json:"balance"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		req.Balance = roundNaira(req.Balance)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -701,7 +707,7 @@ func handleClosureValidate(w http.ResponseWriter, r *http.Request) {
 		AccountType     string  `json:"account_type"`
 		EarnedInterest  float64 `json:"earned_interest"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		body.Balance = roundNaira(body.Balance)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})

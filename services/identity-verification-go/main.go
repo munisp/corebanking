@@ -39,6 +39,12 @@ func secureRandUint32() uint32 {
 
 var db *sql.DB
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "identity-verification-go"
 
 var startTime = time.Now()
@@ -196,7 +202,7 @@ func handleVerifyBVN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req VerificationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -261,7 +267,7 @@ func handleVerifyNIN(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req VerificationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -316,7 +322,7 @@ func handleLivenessCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -406,7 +412,7 @@ func handleFaceAnalyze(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -441,7 +447,7 @@ func handleDedupCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return

@@ -25,6 +25,12 @@ import (
 	"time"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "secrets-vault-go"
 
 // Secrets Vault — encryption key management, rotation, audit logging
@@ -260,7 +266,7 @@ func handleSecretStore(w http.ResponseWriter, r *http.Request) {
 		UserID    string `json:"user_id"`
 		Role      string `json:"role"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -332,7 +338,7 @@ func handleSecretRetrieve(w http.ResponseWriter, r *http.Request) {
 		UserID  string `json:"user_id"`
 		Role    string `json:"role"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -379,7 +385,7 @@ func handleSecretRotate(w http.ResponseWriter, r *http.Request) {
 		UserID    string `json:"user_id"`
 		Role      string `json:"role"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -452,7 +458,7 @@ func handlePolicyCreate(w http.ResponseWriter, r *http.Request) {
 		Operations  []string `json:"operations"`
 		Roles       []string `json:"roles"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -487,7 +493,7 @@ func handleKeyCreate(w http.ResponseWriter, r *http.Request) {
 		Algorithm string `json:"algorithm"`
 		Purpose   string `json:"purpose"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return

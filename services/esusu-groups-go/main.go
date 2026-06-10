@@ -27,6 +27,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "esusu-groups-go"
 
 
@@ -133,7 +139,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	_ = defaultPenalty(1000.0, 0.05)
 	_ = payoutOrder(10, 1)
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -194,7 +200,7 @@ func payoutOrder(members int, currentRound int) int {
 
 func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Members int `json:"members"`; Amount float64 `json:"amount"`; Frequency string `json:"frequency"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		req.Amount = roundNaira(req.Amount)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -206,7 +212,7 @@ func createGroupHandler(w http.ResponseWriter, r *http.Request) {
 
 func recordContributionHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { GroupID string `json:"group_id"`; MemberID string `json:"member_id"`; Amount float64 `json:"amount"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		req.Amount = roundNaira(req.Amount)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -239,7 +245,7 @@ func esusu_groupsScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -250,7 +256,7 @@ func esusu_groupsScoreHandler(w http.ResponseWriter, r *http.Request) {
 
 func esusu_groupsValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return

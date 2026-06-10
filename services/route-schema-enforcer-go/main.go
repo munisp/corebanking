@@ -36,6 +36,12 @@ func secureRandUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "route-schema-enforcer-go"
 
 var startTime = time.Now()
@@ -152,7 +158,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("route_schema_enforcer_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -205,7 +211,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -238,7 +244,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -310,7 +316,7 @@ func route_schema_enforcerThroughputHandler(w http.ResponseWriter, r *http.Reque
         BatchSize  int `json:"batch_size"`
         IntervalMs int `json:"interval_ms"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -324,7 +330,7 @@ func route_schema_enforcerPartitionHandler(w http.ResponseWriter, r *http.Reques
         CustomerID    string `json:"customer_id"`
         NumPartitions int    `json:"num_partitions"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return

@@ -28,6 +28,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "banking-domain-integration-go"
 
 // ═══════════════════════════════════════════════════════════════════════════════

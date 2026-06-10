@@ -27,6 +27,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "agent-banking-go"
 
 // Inter-service URLs
@@ -147,7 +153,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" { tenantID = "platform" }
 	_ = geoFenceCheck(9.0, 7.4, 9.0, 7.4, 5.0)
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -204,7 +210,7 @@ func geoFenceCheck(agentLat, agentLon, txnLat, txnLon, radiusKm float64) bool {
 
 func commissionCalcHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Amount float64 `json:"amount"`; Rate float64 `json:"rate"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -215,7 +221,7 @@ func commissionCalcHandler(w http.ResponseWriter, r *http.Request) {
 
 func floatCheckHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Balance float64 `json:"balance"`; Amount float64 `json:"amount"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -226,7 +232,7 @@ func floatCheckHandler(w http.ResponseWriter, r *http.Request) {
 
 func tierAssessHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { MonthlyVolume float64 `json:"monthly_volume"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return

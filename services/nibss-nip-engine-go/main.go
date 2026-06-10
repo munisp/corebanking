@@ -34,6 +34,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "nibss-nip-engine-go"
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -191,7 +197,7 @@ func handleNameEnquiry(w http.ResponseWriter, r *http.Request) {
 		AccountNo    string `json:"accountNumber"`
 		ChannelCode  string `json:"channelCode"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 
 	sessionID := fmt.Sprintf("0000002605091%d", time.Now().UnixNano()%10000000000)
 	txn := NIPTransaction{
@@ -231,7 +237,7 @@ func handleFundsTransfer(w http.ResponseWriter, r *http.Request) {
 		Narration     string `json:"narration"`
 		ChannelCode   string `json:"channelCode"`
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 
 	sessionID := fmt.Sprintf("0000002605091%d", time.Now().UnixNano()%10000000000)
 	txn := NIPTransaction{
@@ -269,7 +275,7 @@ func handleMandates(w http.ResponseWriter, r *http.Request) {
 	}
 	// POST — create mandate
 	var req DirectDebitMandate
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 	req.ID = fmt.Sprintf("DDM-%03d", len(mandates)+1)
 	req.Status = "created"
 	req.CreatedAt = time.Now().Format(time.RFC3339)

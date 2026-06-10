@@ -36,6 +36,12 @@ func secureRandUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "mojaloop-connector-go"
 
 var startTime = time.Now()
@@ -152,7 +158,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("mojaloop_connector_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -205,7 +211,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -238,7 +244,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -316,7 +322,7 @@ func mojaloop_connectorScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -327,7 +333,7 @@ func mojaloop_connectorScoreHandler(w http.ResponseWriter, r *http.Request) {
 
 func mojaloop_connectorValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -1548,7 +1554,7 @@ func handleSettlementClose(w http.ResponseWriter, r *http.Request) {
 func handleLiquidityCheck(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	var req struct { DFSPID string `json:"dfsp_id"`; AmountKobo int64 `json:"amount_kobo"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 	ok, pos := liquidityMgr.CheckLiquidity(req.DFSPID, req.AmountKobo)
 	respondJSON(w, 200, map[string]interface{}{"sufficient": ok, "position": pos})
 }
@@ -1556,7 +1562,7 @@ func handleLiquidityCheck(w http.ResponseWriter, r *http.Request) {
 func handleFXQuote(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	var req struct { From string `json:"from"`; To string `json:"to"`; AmountKobo int64 `json:"amount_kobo"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 	converted, rate, err := fxEngine.GetQuote(req.From, req.To, req.AmountKobo)
 	if err != nil { respondJSON(w, 400, map[string]interface{}{"error": err.Error()}); return }
 	respondJSON(w, 200, map[string]interface{}{"from": req.From, "to": req.To, "rate": rate, "input_kobo": req.AmountKobo, "output_kobo": converted})

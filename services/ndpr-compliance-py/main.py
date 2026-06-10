@@ -32,6 +32,7 @@ from urllib.parse import urlparse, parse_qs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("ndpr-compliance")
 
+MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
 PORT = int(os.environ.get("PORT", "8095"))
 
 # --- NDPR Data Processing Purposes (Section 2.2) ---

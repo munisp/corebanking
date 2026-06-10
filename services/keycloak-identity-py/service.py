@@ -16,6 +16,7 @@ import json
 import os
 import uuid
 import hashlib
+import hmac
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
@@ -350,7 +351,7 @@ class KeycloakHandler(BaseHTTPRequestHandler):
             self._send(result, status)
         elif path == "/v1/identity/token/introspect":
             token_val = body.get("token", "")
-            found = next((t for t in tokens if t["accessToken"] == token_val), None)
+            found = next((t for t in tokens if hmac.compare_digest(t["accessToken"], token_val)), None)
             if found:
                 self._send({"active": True, "userId": found["userId"], "clientId": found["clientId"],
                             "scope": found["scope"], "issuedAt": found["issuedAt"]})

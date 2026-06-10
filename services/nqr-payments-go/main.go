@@ -24,6 +24,12 @@ import (
 	"time"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var validCurrencies = map[string]bool{"NGN": true, "USD": true, "GBP": true, "EUR": true}
 
 var serviceName = "nqr-payments-go"
@@ -368,7 +374,7 @@ func handleMerchantRegister(w http.ResponseWriter, r *http.Request) {
 		AccountNo string `json:"account_no"`
 		MCC       string `json:"mcc"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -422,7 +428,7 @@ func handleQRGenerate(w http.ResponseWriter, r *http.Request) {
 		QRType     string `json:"qr_type"` // static or dynamic
 		ExpiryMins int    `json:"expiry_mins"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -503,7 +509,7 @@ func handleQRPayment(w http.ResponseWriter, r *http.Request) {
 		PayerBankCode string `json:"payer_bank_code"`
 		AmountKobo  int64  `json:"amount_kobo"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -620,7 +626,7 @@ func handleQRVerify(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		QRPayload string `json:"qr_payload"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -656,7 +662,7 @@ func handleSettlement(w http.ResponseWriter, r *http.Request) {
 		PeriodStart string `json:"period_start"`
 		PeriodEnd   string `json:"period_end"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return

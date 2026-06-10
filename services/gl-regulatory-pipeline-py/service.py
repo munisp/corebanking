@@ -226,7 +226,8 @@ class GLReportEngine:
                 amount=amount,
                 cbn_code=mapping.cbn_code,
                 gl_codes_used=f"{mapping.gl_code_start}-{mapping.gl_code_end}",
-                computation_sql=f"SELECT SUM(closing_balance) FROM trial_balances WHERE gl_account_code BETWEEN '{mapping.gl_code_start}' AND '{mapping.gl_code_end}' AND period_end = '{period}-30'",
+                computation_sql=f"SELECT SUM(closing_balance) FROM trial_balances WHERE gl_account_code BETWEEN $1 AND $2 AND period_end = $3",
+                computation_params=(mapping.gl_code_start, mapping.gl_code_end, f"{period}-30"),
             ))
 
         totals = self._compute_totals(form_lines)

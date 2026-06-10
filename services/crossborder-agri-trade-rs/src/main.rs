@@ -818,8 +818,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("crossborder-agri-trade-rs on port {}", port);
     start_grpc_server("crossborder-agri-trade-rs", 10457);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

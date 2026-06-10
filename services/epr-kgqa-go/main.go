@@ -22,6 +22,12 @@ import (
 	_ "github.com/lib/pq"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "epr-kgqa-go"
 var db *sql.DB
 var requestCount uint64

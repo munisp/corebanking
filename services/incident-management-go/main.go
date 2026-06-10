@@ -22,6 +22,12 @@ import (
 	"time"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "incident-management-go"
 
 // Incident Management — SLA tracking, escalation, RCA, post-mortem, on-call rotation
@@ -272,7 +278,7 @@ func handleIncidentCreate(w http.ResponseWriter, r *http.Request) {
 		AffectedCustomers int64   `json:"affected_customers"`
 		Tags             []string `json:"tags"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -335,7 +341,7 @@ func handleIncidentUpdate(w http.ResponseWriter, r *http.Request) {
 		RootCause  string `json:"root_cause,omitempty"`
 		Resolution string `json:"resolution,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -391,7 +397,7 @@ func handleIncidentEscalate(w http.ResponseWriter, r *http.Request) {
 		Reason     string `json:"reason"`
 		Actor      string `json:"actor"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -452,7 +458,7 @@ func handlePostMortemCreate(w http.ResponseWriter, r *http.Request) {
 		LessonsLearned     []string     `json:"lessons_learned"`
 		PreventionMeasures []string     `json:"prevention_measures"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -523,7 +529,7 @@ func handleOnCallSchedule(w http.ResponseWriter, r *http.Request) {
 		Rotation []OnCallSlot `json:"rotation"`
 		Timezone string       `json:"timezone"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return

@@ -22,6 +22,12 @@ import (
 // --- 54Bank Real-Time WebSocket Gateway ---
 // Handles live notifications, transaction alerts, approval workflows, dashboard updates
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var PORT = "8096"
 
 func init() {
@@ -148,7 +154,7 @@ func handleSSE(w http.ResponseWriter, r *http.Request) {
 // --- Event Publishing API ---
 func handlePublish(w http.ResponseWriter, r *http.Request) {
 	var event Event
-	if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&event); err != nil {
 		respondJSON(w, 400, map[string]interface{}{"error": "Invalid JSON"})
 		return
 	}

@@ -957,8 +957,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("Face Match Engine v2.0 (Rust, DeepFace-enhanced) on :{}", port);
     start_grpc_server("face-match-rs", 10372);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

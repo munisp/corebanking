@@ -832,8 +832,11 @@ async fn main() -> std::io::Result<()> {
         let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
     let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
         start_grpc_server("swift-iso20022-rs", 10469);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

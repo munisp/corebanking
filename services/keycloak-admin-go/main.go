@@ -29,6 +29,14 @@ import (
 	"regexp"
 )
 
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+
 // secureRandUint32 generates a cryptographically secure random uint32
 func secureRandUint32() uint32 {
 	var b [4]byte
@@ -152,7 +160,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("keycloak_admin_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -205,7 +213,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -238,7 +246,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -316,7 +324,7 @@ func keycloak_adminScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -327,7 +335,7 @@ func keycloak_adminScoreHandler(w http.ResponseWriter, r *http.Request) {
 
 func keycloak_adminValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -792,7 +800,7 @@ func NewKeycloakClient(baseURL, realm string) *KeycloakClient {
 func (kc *KeycloakClient) Authenticate(clientID, clientSecret string) error {
 	url := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token", kc.baseURL, kc.realm)
 	data := fmt.Sprintf("grant_type=client_credentials&client_id=%s&client_secret=%s", clientID, clientSecret)
-	resp, err := http.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data))
+	resp, err := httpClient.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data))
 	if err != nil { return err }
 	defer resp.Body.Close()
 	var result struct { AccessToken string `json:"access_token"`; ExpiresIn int `json:"expires_in"` }
@@ -830,7 +838,7 @@ func (kc *KeycloakClient) AssignRole(userID, roleName string) error {
 func (kc *KeycloakClient) IntrospectToken(token, clientID, clientSecret string) (map[string]interface{}, error) {
 	url := fmt.Sprintf("%s/realms/%s/protocol/openid-connect/token/introspect", kc.baseURL, kc.realm)
 	data := fmt.Sprintf("token=%s&client_id=%s&client_secret=%s", token, clientID, clientSecret)
-	resp, err := http.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data))
+	resp, err := httpClient.Post(url, "application/x-www-form-urlencoded", strings.NewReader(data))
 	if err != nil { return nil, err }
 	defer resp.Body.Close()
 	var result map[string]interface{}
@@ -1525,7 +1533,7 @@ func initKeycloakAdvanced() {
 func handleMFAEvaluate(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	var req struct { Action string `json:"action"`; AmountKobo int64 `json:"amount_kobo"`; Role string `json:"role"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 	policy, required := mfaEngine.EvaluatePolicy(req.Action, req.AmountKobo, req.Role)
 	if required {
 		respondJSON(w, 200, map[string]interface{}{"mfa_required": true, "policy": policy})
@@ -1537,7 +1545,7 @@ func handleMFAEvaluate(w http.ResponseWriter, r *http.Request) {
 func handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	var req struct { UserID string `json:"user_id"`; ClientID string `json:"client_id"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 	session := sessionMgr.CreateSession(req.UserID, req.ClientID, r.RemoteAddr, r.UserAgent())
 	respondJSON(w, 200, session)
 }
@@ -1545,7 +1553,7 @@ func handleSessionCreate(w http.ResponseWriter, r *http.Request) {
 func handleSessionRevoke(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	var req struct { UserID string `json:"user_id"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 	revoked := sessionMgr.RevokeUserSessions(req.UserID)
 	respondJSON(w, 200, map[string]interface{}{"revoked": revoked, "user_id": req.UserID})
 }

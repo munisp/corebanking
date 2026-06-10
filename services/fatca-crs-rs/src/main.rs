@@ -822,8 +822,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("fatca-crs-rs on port {}", port);
     start_grpc_server("fatca-crs-rs", 10433);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

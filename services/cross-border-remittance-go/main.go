@@ -25,6 +25,12 @@ import (
 	"time"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "cross-border-remittance-go"
 
 // Cross-border remittance — SWIFT gpi, NIBSS instant, diaspora transfers, FX conversion
@@ -324,7 +330,7 @@ func handleRemittanceCreate(w http.ResponseWriter, r *http.Request) {
 		Purpose            string `json:"purpose"`
 		Channel            string `json:"channel"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -424,7 +430,7 @@ func handleFXRate(w http.ResponseWriter, r *http.Request) {
 		SendCurrency string `json:"send_currency"`
 		AmountMinor  int64  `json:"amount_minor"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -463,7 +469,7 @@ func handleSanctionsCheck(w http.ResponseWriter, r *http.Request) {
 		Country string `json:"country"`
 		Purpose string `json:"purpose"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -481,7 +487,7 @@ func handleRemittanceStatus(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		RemittanceID string `json:"remittance_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return

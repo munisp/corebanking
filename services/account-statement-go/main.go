@@ -25,6 +25,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "account-statement-go"
 
 
@@ -130,7 +136,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" { tenantID = "platform" }
 	_ = transactionLine("2026-01-01", 0.0, "CR", "system")
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -189,7 +195,7 @@ func transactionLine(date string, amount float64, txnType string, narration stri
 
 func generateStatementHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { AccountNo string `json:"account_no"`; Format string `json:"format"`; From string `json:"from"`; To string `json:"to"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -202,7 +208,7 @@ func generateStatementHandler(w http.ResponseWriter, r *http.Request) {
 
 func mt940Handler(w http.ResponseWriter, r *http.Request) {
 	var req struct { AccountNo string `json:"account_no"`; Date string `json:"date"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -235,7 +241,7 @@ func account_statementScoreHandler(w http.ResponseWriter, r *http.Request) {
         Weight    float64 `json:"weight"`
         Threshold float64 `json:"threshold"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -246,7 +252,7 @@ func account_statementScoreHandler(w http.ResponseWriter, r *http.Request) {
 
 func account_statementValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
     var body map[string]interface{}
-    if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -745,7 +751,7 @@ func handleStatementSummary(w http.ResponseWriter, r *http.Request) {
 		Format       string                   `json:"format"`
 		Transactions []map[string]interface{} `json:"transactions"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return

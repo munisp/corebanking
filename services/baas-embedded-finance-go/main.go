@@ -25,6 +25,12 @@ import (
 	"time"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "baas-embedded-finance-go"
 
 // Banking-as-a-Service (BaaS) — white-label accounts, embedded payments, partner API management
@@ -274,7 +280,7 @@ func handlePartnerRegister(w http.ResponseWriter, r *http.Request) {
 		WebhookURL string `json:"webhook_url"`
 		Sandbox    bool   `json:"sandbox"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -325,7 +331,7 @@ func handleVirtualAccountCreate(w http.ResponseWriter, r *http.Request) {
 		BVN         string `json:"bvn"`
 		Tier        string `json:"tier"` // tier1, tier2, tier3
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -417,7 +423,7 @@ func handlePaymentProcess(w http.ResponseWriter, r *http.Request) {
 		AmountKobo    int64  `json:"amount_kobo"`
 		Narration     string `json:"narration"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -517,7 +523,7 @@ func handleAccountBalance(w http.ResponseWriter, r *http.Request) {
 		AccountNumber string `json:"account_number"`
 		PartnerID     string `json:"partner_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return

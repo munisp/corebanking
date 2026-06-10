@@ -9,6 +9,7 @@ from urllib.parse import urlparse, parse_qs
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("federated-learning-py")
 
+MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
 PORT = int(os.environ.get("PORT", "8106"))
 SERVICE_NAME = "federated-learning-py"
 START_TIME = time.time()

@@ -821,8 +821,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("session-security-rs on port {}", port);
     start_grpc_server("session-security-rs", 10451);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

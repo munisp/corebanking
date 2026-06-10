@@ -24,6 +24,12 @@ import (
 	"time"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "enaira-cbdc-gateway-go"
 
 // eNaira CBDC Gateway — CBN Central Bank Digital Currency integration
@@ -311,7 +317,7 @@ func handleWalletCreate(w http.ResponseWriter, r *http.Request) {
 		OwnerName string `json:"owner_name"`
 		Tier      string `json:"tier"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -376,7 +382,7 @@ func handleWalletBalance(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		WalletID string `json:"wallet_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -410,7 +416,7 @@ func handleTransfer(w http.ResponseWriter, r *http.Request) {
 		AmountKobo     int64  `json:"amount_kobo"`
 		TxnType        string `json:"txn_type"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -490,7 +496,7 @@ func handleMint(w http.ResponseWriter, r *http.Request) {
 		AmountKobo int64  `json:"amount_kobo"`
 		Source     string `json:"source"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -559,7 +565,7 @@ func handleRedeem(w http.ResponseWriter, r *http.Request) {
 		DestBank    string `json:"dest_bank"`
 		DestAccount string `json:"dest_account"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return

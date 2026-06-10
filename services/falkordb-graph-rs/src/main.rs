@@ -823,8 +823,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("falkordb-graph-rs on port {}", port);
     start_grpc_server("falkordb-graph-rs", 10321);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

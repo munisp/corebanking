@@ -891,8 +891,11 @@ async fn main() -> std::io::Result<()> {
     });
     println!("iso20022-hub-rs listening on port {}", port);
     start_grpc_server("iso20022-hub-rs", 10456);
+    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+
     HttpServer::new(move || {
         App::new()
+            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
             .wrap(
                 Cors::default()
                     .allow_any_origin()

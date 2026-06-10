@@ -24,6 +24,12 @@ import (
 	"time"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "open-banking-gateway-go"
 
 // CBN Open Banking Regulatory Framework — AISP (Account Information) + PISP (Payment Initiation) APIs
@@ -275,7 +281,7 @@ func handleConsentCreate(w http.ResponseWriter, r *http.Request) {
 		Permissions []string `json:"permissions"`
 		ExpiresIn   int      `json:"expires_in_days"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -352,7 +358,7 @@ func handleConsentAuthorize(w http.ResponseWriter, r *http.Request) {
 		ConsentID string `json:"consent_id"`
 		Action    string `json:"action"` // authorize or reject
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -390,7 +396,7 @@ func handleTPPRegister(w http.ResponseWriter, r *http.Request) {
 		CallbackURL   string   `json:"callback_url"`
 		Permissions   []string `json:"permissions"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return
@@ -441,7 +447,7 @@ func handlePaymentInitiate(w http.ResponseWriter, r *http.Request) {
 		Narration     string `json:"narration"`
 		Tier          string `json:"tier"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		incErrors()
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json"})
 		return

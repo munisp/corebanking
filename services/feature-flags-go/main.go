@@ -20,6 +20,12 @@ import (
 	"context"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var PORT = "8097"
 func init() { if p := os.Getenv("PORT"); p != "" { PORT = p } }
 
@@ -84,7 +90,7 @@ func handleToggle(w http.ResponseWriter, r *http.Request) {
 		Enabled bool   `json:"enabled"`
 		Rollout int    `json:"rollout_percentage"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		respondJSON(w, 400, map[string]interface{}{"error": "Invalid JSON"})
 		return
 	}

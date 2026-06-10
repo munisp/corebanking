@@ -30,6 +30,14 @@ import (
 	"io"
 )
 
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
+
 // secureRandUint32 generates a cryptographically secure random uint32
 func secureRandUint32() uint32 {
 	var b [4]byte
@@ -153,7 +161,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheInvalidate("permify_authz_list")
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -206,7 +214,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -239,7 +247,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -312,7 +320,7 @@ func permify_authzValidateHandler(w http.ResponseWriter, r *http.Request) {
         Token  string `json:"token"`
         MaxAge int    `json:"max_age"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -327,7 +335,7 @@ func permify_authzRateLimitHandler(w http.ResponseWriter, r *http.Request) {
         RequestCount int    `json:"request_count"`
         WindowSec    int    `json:"window_seconds"`
     }
-    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
     	log.Printf("[%s] JSON decode error: %v", serviceName, err)
     	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
     	return
@@ -784,7 +792,7 @@ func validatePermission(subject, resource, action string) (bool, string) {
 		"subject": map[string]interface{}{"type": "user", "id": subject},
 	}
 	jsonData, _ := json.Marshal(reqBody)
-	resp, err := http.Post(checkURL, "application/json", bytes.NewBuffer(jsonData))
+	resp, err := httpClient.Post(checkURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		// If Permify is unreachable, deny by default (fail-closed)
 		return false, fmt.Sprintf("Permission service unavailable: %v", err)
@@ -1687,7 +1695,7 @@ func handleSchemaVersion(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	if r.Method == "POST" {
 		var req struct { Schema string `json:"schema"`; Description string `json:"description"` }
-		json.NewDecoder(r.Body).Decode(&req)
+		json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 		v := schemaMgr.AddVersion(req.Schema, req.Description)
 		respondJSON(w, 200, map[string]interface{}{"version": v, "status": "created"})
 		return
@@ -1698,7 +1706,7 @@ func handleSchemaVersion(w http.ResponseWriter, r *http.Request) {
 func handleBulkCheck(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	var req struct { Checks []BulkCheckRequest `json:"checks"` }
-	json.NewDecoder(r.Body).Decode(&req)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req)
 	results := bulkChecker.CheckBulk(req.Checks)
 	respondJSON(w, 200, map[string]interface{}{"results": results, "count": len(results)})
 }

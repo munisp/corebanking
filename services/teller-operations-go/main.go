@@ -27,6 +27,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "teller-operations-go"
 
 
@@ -132,7 +138,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" { tenantID = "platform" }
 	_, _ = shiftReconcile(0.0, 0.0, 0.0)
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -205,7 +211,7 @@ func shiftReconcile(openBal float64, deposits float64, withdrawals float64) (flo
 
 func cashDepositHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Amount float64 `json:"amount"`; Account string `json:"account"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		req.Amount = roundNaira(req.Amount)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
@@ -217,7 +223,7 @@ func cashDepositHandler(w http.ResponseWriter, r *http.Request) {
 
 func cashWithdrawalHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { Amount float64 `json:"amount"`; Account string `json:"account"` }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		req.Amount = roundNaira(req.Amount)
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})

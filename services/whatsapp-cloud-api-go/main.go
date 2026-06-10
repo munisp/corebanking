@@ -25,6 +25,12 @@ import (
 	"regexp"
 )
 
+
+// Concurrency limiter prevents goroutine explosion
+var semaphore = make(chan struct{}, 100)
+
+func acquireSem() { semaphore <- struct{}{} }
+func releaseSem() { <-semaphore }
 var serviceName = "whatsapp-cloud-api-go"
 
 
@@ -144,7 +150,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-Id")
 	if tenantID == "" { tenantID = "platform" }
 	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -214,7 +220,7 @@ func classifyWebhook(event WebhookEvent) string {
 
 func sendTemplateHandler(w http.ResponseWriter, r *http.Request) {
 	var req TemplateMessage
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
 		log.Printf("[%s] JSON decode error: %v", serviceName, err)
 		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
 		return
@@ -229,7 +235,7 @@ func sendTemplateHandler(w http.ResponseWriter, r *http.Request) {
 
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	var event WebhookEvent
-	json.NewDecoder(r.Body).Decode(&event)
+	json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&event)
 	classification := classifyWebhook(event)
 	jsonResp(w, 200, map[string]interface{}{"classification": classification, "from": event.From, "processed": true})
 }
