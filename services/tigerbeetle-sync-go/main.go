@@ -1424,6 +1424,32 @@ func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), 30*time.Second)
 }
 
+// Secure HTTP server configuration
+func newSecureServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
+	}
+}
+
+// Sanitize errors before sending to clients (prevent info leakage)
+func sanitizeError(err error) string {
+	errStr := err.Error()
+	// Strip file paths, stack traces, internal IPs
+	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") {
+		return "internal error"
+	}
+	if len(errStr) > 200 {
+		return "internal error"
+	}
+	return errStr
+}
+
 func main() {
 	initTracing()
 	port := os.Getenv("PORT")

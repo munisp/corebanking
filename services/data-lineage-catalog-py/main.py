@@ -11,6 +11,36 @@ logger = logging.getLogger("data-lineage-catalog-py")
 
 MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
 PORT = int(os.environ.get("PORT", "8108"))
+
+# Nigerian banking input validation
+import re as _re
+
+def validate_bvn(bvn: str) -> bool:
+    """Validate 11-digit BVN"""
+    return bool(bvn and len(bvn) == 11 and bvn.isdigit())
+
+def validate_nuban(account_no: str) -> bool:
+    """Validate 10-digit NUBAN account number"""
+    return bool(account_no and len(account_no) == 10 and account_no.isdigit())
+
+def validate_nigerian_phone(phone: str) -> bool:
+    """Validate Nigerian phone number (+234... or 0...)"""
+    clean = phone.replace(" ", "").replace("-", "")
+    if clean.startswith("+234") and len(clean) == 14 and clean[1:].isdigit():
+        return True
+    if clean.startswith("0") and len(clean) == 11 and clean.isdigit():
+        return True
+    return False
+
+def sanitize_input(s: str, max_len: int = 1000) -> str:
+    """Strip control chars, limit length"""
+    s = s[:max_len]
+    return "".join(c for c in s if ord(c) >= 32 and ord(c) != 127)
+
+def validate_amount_kobo(amount: int) -> bool:
+    """Validate transaction amount in kobo (0 < amount <= 5B naira)"""
+    return 0 < amount <= 500_000_000_000  # max ₦5B in kobo
+
 SERVICE_NAME = "data-lineage-catalog-py"
 START_TIME = time.time()
 _request_count = 0; _error_count = 0; _counter_lock = threading.Lock()

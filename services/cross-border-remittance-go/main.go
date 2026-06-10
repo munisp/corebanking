@@ -808,6 +808,87 @@ func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), 30*time.Second)
 }
 
+// Input validation helpers
+func sanitizeInput(s string, maxLen int) string {
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	// Strip null bytes and control characters
+	var clean []byte
+	for _, b := range []byte(s) {
+		if b >= 32 && b != 127 {
+			clean = append(clean, b)
+		}
+	}
+	return string(clean)
+}
+
+func validateEmail(email string) bool {
+	if len(email) > 254 || len(email) < 3 {
+		return false
+	}
+	atIdx := strings.LastIndex(email, "@")
+	if atIdx < 1 || atIdx > len(email)-3 {
+		return false
+	}
+	domain := email[atIdx+1:]
+	if !strings.Contains(domain, ".") {
+		return false
+	}
+	return true
+}
+
+func validateNigerianPhone(phone string) bool {
+	// Nigerian numbers: +234XXXXXXXXXX or 0XXXXXXXXXXX
+	clean := strings.ReplaceAll(phone, " ", "")
+	clean = strings.ReplaceAll(clean, "-", "")
+	if strings.HasPrefix(clean, "+234") && len(clean) == 14 {
+		return true
+	}
+	if strings.HasPrefix(clean, "0") && len(clean) == 11 {
+		return true
+	}
+	return false
+}
+
+func validateBVN(bvn string) bool {
+	if len(bvn) != 11 {
+		return false
+	}
+	for _, c := range bvn {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func validateAccountNumber(acctNo string) bool {
+	// NUBAN: 10 digits
+	if len(acctNo) != 10 {
+		return false
+	}
+	for _, c := range acctNo {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// Secure HTTP server configuration
+func newSecureServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 5 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
+	}
+}
+
 func main() {
 	initTracing()
 	initDB()
