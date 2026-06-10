@@ -322,6 +322,15 @@ class _RateLimiter:
 
 _rate_limiter = _RateLimiter()
 
+
+def _get_request_id(handler):
+    """Extract or generate X-Request-Id for tracing."""
+    import uuid
+    request_id = handler.headers.get('X-Request-Id', str(uuid.uuid4()))
+    handler.send_header('X-Request-Id', request_id)
+    return request_id
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):

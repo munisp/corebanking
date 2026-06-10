@@ -700,6 +700,15 @@ def retry_with_backoff(fn, max_retries=3, base_delay=0.1):
             _retry_time.sleep(delay)
 
 # --- Handler ---
+
+def _get_request_id(handler):
+    """Extract or generate X-Request-Id for tracing."""
+    import uuid
+    request_id = handler.headers.get('X-Request-Id', str(uuid.uuid4()))
+    handler.send_header('X-Request-Id', request_id)
+    return request_id
+
+
 class TenantHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 

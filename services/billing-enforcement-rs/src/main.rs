@@ -404,7 +404,7 @@ fn init_tracing(service_name: &str) {
 
 
 fn security_headers_str() -> &'static str {
-    "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nX-XSS-Protection: 1; mode=block\r\nReferrer-Policy: strict-origin-when-cross-origin"
+    "Content-Security-Policy: default-src 'self'; frame-ancestors 'none'\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nX-XSS-Protection: 1; mode=block\r\nReferrer-Policy: strict-origin-when-cross-origin"
 }
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);

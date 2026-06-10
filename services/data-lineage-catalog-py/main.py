@@ -12,6 +12,17 @@ logger = logging.getLogger("data-lineage-catalog-py")
 MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
 PORT = int(os.environ.get("PORT", "8108"))
 
+def sanitize_log_entry(msg: str) -> str:
+    """Remove sensitive data from log messages."""
+    import re as _re
+    msg = _re.sub(r'\b\d{11}\b', '***BVN***', msg)  # BVN
+    msg = _re.sub(r'\b\d{10}\b', '***NUBAN***', msg)  # NUBAN
+    msg = _re.sub(r'[\w.+-]+@[\w-]+\.[\w.]+', '***EMAIL***', msg)  # Email
+    msg = _re.sub(r'\+?234\d{10}', '***PHONE***', msg)  # Nigerian phone
+    return msg
+
+
+
 # Nigerian banking input validation
 import re as _re
 
@@ -343,6 +354,15 @@ import html as _html_mod
 def sanitize(s):
     if not isinstance(s, str): return s
     return _html_mod.escape(s.strip()[:2000])
+
+
+def _get_request_id(handler):
+    """Extract or generate X-Request-Id for tracing."""
+    import uuid
+    request_id = handler.headers.get('X-Request-Id', str(uuid.uuid4()))
+    handler.send_header('X-Request-Id', request_id)
+    return request_id
+
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass

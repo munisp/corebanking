@@ -449,6 +449,28 @@ func bodyLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+
+// Monetary safety — prevent float drift in financial calculations
+type AmountKobo int64
+
+func roundNaira(amount float64) float64 {
+	if amount < 0 { return -roundNaira(-amount) }
+	return float64(int64(amount*100+0.5)) / 100
+}
+
+func nairaToKobo(naira float64) AmountKobo {
+	return AmountKobo(int64(naira*100 + 0.5))
+}
+
+func koboToNaira(kobo AmountKobo) float64 {
+	return float64(kobo) / 100
+}
+
+func validateAmount(kobo AmountKobo) bool {
+	const maxAmount AmountKobo = 500_000_000_000 // ₦5B CBN limit
+	return kobo > 0 && kobo <= maxAmount
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9345" }

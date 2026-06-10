@@ -364,6 +364,7 @@ fn rl_allow() -> bool {
 
 fn security_headers() -> actix_web::middleware::DefaultHeaders {
     actix_web::middleware::DefaultHeaders::new()
+        .add(("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'"))
         .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
         .add(("X-Content-Type-Options", "nosniff"))
         .add(("X-Frame-Options", "DENY"))
