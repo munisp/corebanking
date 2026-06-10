@@ -10,8 +10,8 @@ class TestHealthEndpoint(unittest.TestCase):
 
 class TestCircuitBreaker(unittest.TestCase):
     def test_circuit_breaker_lifecycle(self):
-        from main import _CircuitBreaker
-        cb = _CircuitBreaker(threshold=2, reset_after=1)
+        from main import CircuitBreaker as _CircuitBreaker
+        cb = _CircuitBreaker(threshold=2, timeout=1)
         self.assertTrue(cb.allow())
         cb.record_failure()
         cb.record_failure()

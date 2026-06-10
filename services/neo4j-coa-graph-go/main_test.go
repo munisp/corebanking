@@ -33,7 +33,7 @@ func TestMetricsEndpoint(t *testing.T) {
 func TestJWTRequired(t *testing.T) {
     req := httptest.NewRequest("GET", "/api/list", nil)
     w := httptest.NewRecorder()
-    handler := jwtAuthMiddleware(http.HandlerFunc(listHandler))
+    handler := authMiddleware(http.HandlerFunc(readyzHandler))
     handler.ServeHTTP(w, req)
     if w.Code != 401 { t.Errorf("expected 401 without JWT, got %d", w.Code) }
 }

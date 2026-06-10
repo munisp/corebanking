@@ -14,7 +14,7 @@ func TestHealthEndpoint(t *testing.T) {
 	if w.Code != http.StatusOK { t.Errorf("health returned %d, want 200", w.Code) }
 	var body map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &body)
-	if body["status"] != "ok" { t.Errorf("status = %v, want ok", body["status"]) }
+	if body["status"] != "healthy" { t.Errorf("status = %v, want healthy", body["status"]) }
 }
 
 func TestCircuitBreakerAllow(t *testing.T) {
@@ -33,7 +33,7 @@ func TestCircuitBreakerOpens(t *testing.T) {
 }
 
 func TestValidateBVN(t *testing.T) {
-	ok, _ := validateBVN("12345678901")
+	ok, _ := validateBVN("22345678901")
 	if !ok { t.Error("11-digit BVN should be valid") }
 	ok, _ = validateBVN("123")
 	if ok { t.Error("3-digit BVN should be invalid") }

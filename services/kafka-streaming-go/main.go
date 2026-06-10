@@ -1696,7 +1696,7 @@ func handleDLQRetry(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&req)
 	shouldRetry, delay := dlqEngine.ShouldRetry(req.MessageID)
 	if !shouldRetry {
-		dlqEngine.MoveToDLQ(req.MessageID, fmt.Errorf(req.Error))
+		dlqEngine.MoveToDLQ(req.MessageID, fmt.Errorf("%s", req.Error))
 		respondJSON(w, 200, map[string]interface{}{"action": "moved_to_dlq", "message_id": req.MessageID})
 		return
 	}

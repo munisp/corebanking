@@ -10,13 +10,13 @@ class TestHealthEndpoint(unittest.TestCase):
 
 class TestCircuitBreaker(unittest.TestCase):
     def test_initial_allows(self):
-        from main import _CircuitBreaker
-        cb = _CircuitBreaker(threshold=3, reset_after=1)
+        from main import CircuitBreaker as _CircuitBreaker
+        cb = _CircuitBreaker(threshold=3, timeout=1)
         self.assertTrue(cb.allow())
 
     def test_opens_on_failures(self):
-        from main import _CircuitBreaker
-        cb = _CircuitBreaker(threshold=2, reset_after=60)
+        from main import CircuitBreaker as _CircuitBreaker
+        cb = _CircuitBreaker(threshold=2, timeout=60)
         cb.record_failure()
         cb.record_failure()
         self.assertFalse(cb.allow())

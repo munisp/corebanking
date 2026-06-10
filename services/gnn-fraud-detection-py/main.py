@@ -1,4 +1,5 @@
 import sys; sys.path.insert(0, '/home/ubuntu/repos/corebanking/libs/banking-rules-py')
+import os
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ML FRAUD MODEL INTEGRATION

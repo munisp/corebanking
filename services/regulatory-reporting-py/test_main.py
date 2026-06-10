@@ -13,8 +13,8 @@ class TestHealthEndpoints(unittest.TestCase):
 
     def test_circuit_breaker_opens(self):
         """Circuit breaker opens after threshold failures."""
-        from main import _CircuitBreaker
-        cb = _CircuitBreaker(threshold=3, reset_after=1)
+        from main import CircuitBreaker as _CircuitBreaker
+        cb = _CircuitBreaker(threshold=3, reset_timeout=1)
         for _ in range(3):
             cb.record_failure()
         self.assertFalse(cb.allow())
@@ -22,8 +22,8 @@ class TestHealthEndpoints(unittest.TestCase):
     def test_circuit_breaker_resets(self):
         """Circuit breaker resets after timeout."""
         import time
-        from main import _CircuitBreaker
-        cb = _CircuitBreaker(threshold=2, reset_after=0.1)
+        from main import CircuitBreaker as _CircuitBreaker
+        cb = _CircuitBreaker(threshold=2, reset_timeout=0.1)
         cb.record_failure()
         cb.record_failure()
         self.assertFalse(cb.allow())

@@ -20,6 +20,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "actix-cors"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "daa239b93927be1ff123eebada5a3ff23e89f0124ccb8609234e5103d5a5ae6d"
+dependencies = [
+ "actix-utils",
+ "actix-web",
+ "derive_more",
+ "futures-util",
+ "log",
+ "once_cell",
+ "smallvec",
+]
+
+[[package]]
 name = "actix-http"
 version = "3.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -384,6 +399,7 @@ checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 name = "continuous-liveness-rs"
 version = "0.1.0"
 dependencies = [
+ "actix-cors",
  "actix-web",
  "chrono",
  "lazy_static",
