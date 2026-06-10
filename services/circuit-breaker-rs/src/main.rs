@@ -593,6 +593,23 @@ struct PaginationParams {
 fn default_page() -> u32 { 1 }
 fn default_limit() -> u32 { 50 }
 
+
+fn validate_bvn(bvn: &str) -> bool {
+    bvn.len() == 11 && bvn.chars().all(|c| c.is_ascii_digit())
+}
+
+fn validate_nuban(account_no: &str) -> bool {
+    account_no.len() == 10 && account_no.chars().all(|c| c.is_ascii_digit())
+}
+
+fn sanitize_input(s: &str, max_len: usize) -> String {
+    s.chars().take(max_len).filter(|c| *c >= ' ' && *c != '\x7f').collect()
+}
+
+fn validate_amount_kobo(amount: i64) -> bool {
+    amount > 0 && amount <= 500_000_000_000
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8260".to_string()).parse().unwrap_or(8260);

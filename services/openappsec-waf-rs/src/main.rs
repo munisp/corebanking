@@ -397,6 +397,23 @@ fn mask_pii(value: &str, field_type: &str) -> String {
     }
 }
 
+
+fn validate_bvn(bvn: &str) -> bool {
+    bvn.len() == 11 && bvn.chars().all(|c| c.is_ascii_digit())
+}
+
+fn validate_nuban(account_no: &str) -> bool {
+    account_no.len() == 10 && account_no.chars().all(|c| c.is_ascii_digit())
+}
+
+fn sanitize_input(s: &str, max_len: usize) -> String {
+    s.chars().take(max_len).filter(|c| *c >= ' ' && *c != '\x7f').collect()
+}
+
+fn validate_amount_kobo(amount: i64) -> bool {
+    amount > 0 && amount <= 500_000_000_000
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8310);
