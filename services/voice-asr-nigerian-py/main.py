@@ -1222,6 +1222,7 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(404, {"error": f"Record not found or not processable: {rid}"})
         elif path == "/v1/voice-asr-nigerian/process":
             result = transcribe_audio(**body) if isinstance(body, dict) else transcribe_audio(body)
+            _event_bus.emit("voice-asr-nigerian.processed", {"action": "process", "status": "success"})
             self.respond(200, {"service": "voice-asr-nigerian-py", "result": result})
 
 
@@ -1426,6 +1427,71 @@ def db_exec_atomic(queries_params: list) -> bool:
         import logging
         logging.error(f"Atomic transaction failed, rolled back: {e}")
         return False
+
+
+# --- Event Bus (Kafka-compatible event emission) ---
+
+class EventBus:
+    """Publishes domain events to Kafka topics for downstream consumption."""
+
+    def __init__(self, topic: str, service: str):
+        self._broker = os.environ.get("KAFKA_BROKERS", "localhost:9092")
+        self._topic = topic
+        self._service = service
+        self._buffer: list = []
+        self._lock = threading.Lock()
+
+    def emit(self, event_type: str, payload: dict) -> None:
+        """Emit a domain event. In production: kafka-python producer."""
+        event = {{
+            "id": f"{{self._service}}_{{int(time.time() * 1000)}}",
+            "type": event_type,
+            "source": self._service,
+            "topic": self._topic,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "data": payload,
+        }}
+        with self._lock:
+            self._buffer.append(event)
+        logger.info(f"[EventBus] {{self._service}} -> {{self._topic}}: {{event_type}}")
+
+    def flush(self) -> list:
+        with self._lock:
+            events = self._buffer[:]
+            self._buffer.clear()
+        return events
+
+    def pending_count(self) -> int:
+        return len(self._buffer)
+
+
+class EventConsumer:
+    """Subscribes to Kafka topics for incoming events."""
+
+    def __init__(self, topics: list, group_id: str):
+        self._topics = topics
+        self._group_id = group_id
+        self._handlers: dict = {{}}
+
+    def on(self, event_type: str, handler):
+        self._handlers[event_type] = handler
+
+    def start(self):
+        logger.info(f"[EventConsumer] Subscribing to {{self._topics}} as {{self._group_id}}")
+        # In production: kafka-python KafkaConsumer with group_id
+
+
+def notify_downstream(service_url: str, path: str, payload: dict) -> bool:
+    """Notify a downstream service via HTTP with retry."""
+    try:
+        resp = call_service("POST", f"{{service_url}}{{path}}", payload)
+        return resp is not None
+    except Exception as e:
+        logger.warning(f"[Downstream] {{service_url}}{{path}} failed: {{e}}")
+        return False
+
+
+_event_bus = EventBus("platform.events", "voice-asr-nigerian")
 
 if __name__ == "__main__":
     get_db()

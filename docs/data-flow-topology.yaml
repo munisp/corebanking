@@ -1,0 +1,373 @@
+version: '1.0'
+description: "54Bank Platform Data Flow Topology \u2014 ensures no orphaned services"
+kafka_topics:
+  banking.accounts:
+    producers:
+    - account-opening-go
+    - account-upgrade-go
+    - dormancy-management-rs
+    - savings-automation-go
+    consumers:
+    - kyc-verification-py
+    - aml-engine-rs
+    - notification-service-py
+    - efass-generator-rs
+    - cbn-tiered-kyc-rs
+    retention_days: 30
+    partitions: 12
+    replication_factor: 3
+  banking.payments:
+    producers:
+    - payments-hub-go
+    - nip-gateway-go
+    - neft-processor-go
+    - rtgs-gateway-go
+    - bulk-payments-rs
+    - pos-acquiring-go
+    consumers:
+    - aml-engine-rs
+    - fraud-detection-rs
+    - gl-engine-rs
+    - notification-service-py
+    - reconciliation-engine-go
+    - settlement-engine-go
+    retention_days: 90
+    partitions: 24
+    replication_factor: 3
+  banking.lending:
+    producers:
+    - loan-origination-go
+    - credit-scorer-rs
+    - mortgage-servicing-rs
+    - interest-accrual-engine-go
+    consumers:
+    - ifrs9-ecl-engine-rs
+    - basel-engine-rs
+    - gl-engine-rs
+    - credit-bureau-rs
+    - collateral-valuation-rs
+    retention_days: 365
+    partitions: 6
+    replication_factor: 3
+  compliance.screening:
+    producers:
+    - aml-engine-rs
+    - fraud-detection-rs
+    - fraudfusion-ensemble-rs
+    - sanction-screening-rs
+    consumers:
+    - compliance-dashboard-py
+    - efass-generator-rs
+    - notification-service-py
+    - case-management-py
+    retention_days: 2555
+    partitions: 6
+    replication_factor: 3
+  compliance.fraud:
+    producers:
+    - fraud-detection-rs
+    - fraudfusion-ensemble-rs
+    - ai-fraud-scoring-rs
+    consumers:
+    - aml-engine-rs
+    - notification-service-py
+    - case-management-py
+    - account-freeze-go
+    retention_days: 2555
+    partitions: 12
+    replication_factor: 3
+  identity.verification:
+    producers:
+    - kyc-verification-py
+    - biometric-auth-rs
+    - face-match-rs
+    - bvn-verification-rs
+    - nin-verification-rs
+    consumers:
+    - account-opening-go
+    - cbn-tiered-kyc-rs
+    - compliance-dashboard-py
+    retention_days: 2555
+    partitions: 6
+    replication_factor: 3
+  accounting.ledger:
+    producers:
+    - gl-engine-rs
+    - journal-posting-go
+    - reconciliation-engine-go
+    consumers:
+    - efass-generator-rs
+    - ifrs9-ecl-engine-rs
+    - lakehouse-rs
+    - reporting-engine-py
+    retention_days: 2555
+    partitions: 12
+    replication_factor: 3
+  agriculture.operations:
+    producers:
+    - agriculture-banking-rs
+    - agri-iot-sensor-rs
+    - farm-boundary-mapping-rs
+    - livestock-management-rs
+    - commodity-exchange-rs
+    consumers:
+    - credit-scorer-rs
+    - insurance-claims-py
+    - lakehouse-rs
+    retention_days: 365
+    partitions: 6
+    replication_factor: 3
+  treasury.operations:
+    producers:
+    - fx-rates-engine-rs
+    - money-market-rs
+    - interbank-lending-rs
+    consumers:
+    - gl-engine-rs
+    - risk-engine-go
+    - lakehouse-rs
+    retention_days: 90
+    partitions: 6
+    replication_factor: 3
+  notifications.delivery:
+    producers:
+    - notification-service-py
+    - sms-gateway-py
+    - email-service-py
+    - push-notification-py
+    consumers:
+    - audit-trail-go
+    - analytics-pipeline-py
+    retention_days: 30
+    partitions: 12
+    replication_factor: 3
+  risk.computation:
+    producers:
+    - basel-engine-rs
+    - ifrs9-ecl-engine-rs
+    - ifrs9-engine-rs
+    - lcr-nsfr-rs
+    - interest-computation-rs
+    consumers:
+    - efass-generator-rs
+    - compliance-dashboard-py
+    - gl-engine-rs
+    retention_days: 365
+    partitions: 6
+    replication_factor: 3
+  security.events:
+    producers:
+    - auth-enforcer-rs
+    - biometric-auth-rs
+    - jwt-validator-rs
+    - session-manager-rs
+    - waf-analytics-rs
+    consumers:
+    - fraud-detection-rs
+    - audit-trail-go
+    - siem-integration-py
+    retention_days: 365
+    partitions: 6
+    replication_factor: 3
+  trading.operations:
+    producers:
+    - etd-trading-rs
+    - trade-finance-gl-go
+    consumers:
+    - gl-engine-rs
+    - risk-engine-go
+    - compliance-dashboard-py
+    retention_days: 365
+    partitions: 6
+    replication_factor: 3
+  data.pipeline:
+    producers:
+    - lakehouse-rs
+    - data-export-rs
+    - reporting-engine-py
+    consumers:
+    - analytics-pipeline-py
+    - compliance-dashboard-py
+    retention_days: 90
+    partitions: 6
+    replication_factor: 3
+  observability.metrics:
+    producers:
+    - kpi-threshold-monitor-rs
+    - otel-collector-rs
+    - monitoring-dashboard-py
+    consumers:
+    - alert-manager-py
+    - lakehouse-rs
+    retention_days: 30
+    partitions: 6
+    replication_factor: 3
+  platform.events:
+    producers:
+    - '*'
+    consumers:
+    - event-store-rs
+    - event-dedup-engine-rs
+    - audit-trail-go
+    - lakehouse-rs
+    retention_days: 365
+    partitions: 24
+    replication_factor: 3
+critical_flows:
+- name: "Account Opening \u2192 KYC \u2192 Activation"
+  steps:
+  - service: account-opening-go
+    action: create_account
+    emits: banking.accounts:account.created
+  - service: kyc-engine-py
+    consumes: banking.accounts:account.created
+    action: initiate_kyc
+    emits: identity.verification:kyc.initiated
+  - service: biometric-auth-rs
+    consumes: identity.verification:kyc.initiated
+    action: verify_biometric
+    emits: identity.verification:biometric.verified
+  - service: cbn-tiered-kyc-rs
+    consumes: identity.verification:biometric.verified
+    action: assign_tier
+    emits: banking.accounts:account.activated
+  - service: notification-service-go
+    consumes: banking.accounts:account.activated
+    action: send_welcome
+- name: Fund Transfer (NIP)
+  steps:
+  - service: payments-hub-go
+    action: initiate_transfer
+    emits: banking.payments:transfer.initiated
+  - service: aml-engine-rs
+    consumes: banking.payments:transfer.initiated
+    action: screen_transaction
+    emits: compliance.screening:aml.cleared
+  - service: fraud-detection-rs
+    consumes: banking.payments:transfer.initiated
+    action: score_transaction
+    emits: compliance.fraud:fraud.cleared
+  - service: nibss-nip-engine-go
+    consumes: compliance.screening:aml.cleared
+    action: send_to_nibss
+    emits: banking.payments:transfer.completed
+  - service: gl-engine-rs
+    consumes: banking.payments:transfer.completed
+    action: post_journal_entry
+    emits: accounting.ledger:entry.posted
+  - service: notification-service-go
+    consumes: banking.payments:transfer.completed
+    action: notify_customer
+- name: "Loan Origination \u2192 Disbursement"
+  steps:
+  - service: loan-origination-go
+    action: apply_loan
+    emits: banking.lending:loan.applied
+  - service: credit-bureau-rs
+    consumes: banking.lending:loan.applied
+    action: score_applicant
+    emits: banking.lending:credit.scored
+  - service: collateral-valuation-rs
+    consumes: banking.lending:loan.applied
+    action: value_collateral
+    emits: banking.lending:collateral.valued
+  - service: loan-origination-go
+    consumes: banking.lending:credit.scored
+    action: approve_loan
+    emits: banking.lending:loan.approved
+  - service: payments-hub-go
+    consumes: banking.lending:loan.approved
+    action: disburse
+    emits: banking.payments:disbursement.completed
+  - service: gl-engine-rs
+    consumes: banking.payments:disbursement.completed
+    action: post_loan_entries
+    emits: accounting.ledger:loan.booked
+  - service: ifrs9-ecl-engine-rs
+    consumes: accounting.ledger:loan.booked
+    action: compute_ecl
+    emits: risk.computation:ecl.computed
+- name: "Fraud Detection \u2192 Account Freeze"
+  steps:
+  - service: fraud-detection-rs
+    consumes: banking.payments:*
+    action: realtime_scoring
+    emits: compliance.fraud:fraud.detected
+  - service: fraudfusion-ensemble-rs
+    consumes: compliance.fraud:fraud.detected
+    action: ensemble_confirm
+    emits: compliance.fraud:fraud.confirmed
+  - service: aml-engine-rs
+    consumes: compliance.fraud:fraud.confirmed
+    action: open_case
+    emits: compliance.screening:case.opened
+  - service: pin-block-engine-rs
+    consumes: compliance.fraud:fraud.confirmed
+    action: block_account
+    emits: banking.accounts:account.frozen
+  - service: notification-service-go
+    consumes: banking.accounts:account.frozen
+    action: notify_fraud_alert
+- name: Regulatory Reporting (CBN/NDPR)
+  steps:
+  - service: efass-generator-rs
+    consumes: accounting.ledger:*
+    action: generate_efass_xml
+    emits: compliance.screening:report.generated
+  - service: fatca-crs-rs
+    consumes: banking.accounts:account.created
+    action: check_reportable
+    emits: compliance.screening:fatca.filed
+  - service: ndpr-compliance-py
+    consumes: identity.verification:*
+    action: validate_data_handling
+    emits: compliance.screening:ndpr.checked
+- name: Agriculture Lending Cycle
+  steps:
+  - service: farm-boundary-mapping-rs
+    action: map_farm
+    emits: agriculture.operations:farm.mapped
+  - service: agri-iot-sensor-rs
+    consumes: agriculture.operations:farm.mapped
+    action: attach_sensors
+    emits: agriculture.operations:sensors.active
+  - service: agriculture-banking-rs
+    consumes: agriculture.operations:farm.mapped
+    action: create_agri_loan
+    emits: banking.lending:agri_loan.applied
+  - service: credit-bureau-rs
+    consumes: banking.lending:agri_loan.applied
+    action: score_with_agri_data
+    emits: banking.lending:credit.scored
+  - service: commodity-exchange-rs
+    consumes: agriculture.operations:*
+    action: price_commodity
+    emits: agriculture.operations:price.updated
+service_registry:
+  core_banking_hub:
+    url: http://core-banking:8100
+    role: Central account/balance management
+  aml_engine:
+    url: http://aml-engine:8120
+    role: Transaction screening + sanctions
+  kyc_engine:
+    url: http://kyc-engine:8122
+    role: KYC verification orchestrator
+  gl_engine:
+    url: http://gl-engine:8130
+    role: General ledger + journal posting
+  agri_banking:
+    url: http://agriculture-banking:8140
+    role: Agriculture-specific banking
+  fraud_detection:
+    url: http://fraud-detection:8150
+    role: Real-time fraud scoring
+  payments_hub:
+    url: http://payments-hub:8160
+    role: Payment orchestration
+  notification_service:
+    url: http://notification-service:8170
+    role: Multi-channel notifications (Go)
+  ml_inference:
+    url: http://ml-inference:8500
+    role: ML model predictions

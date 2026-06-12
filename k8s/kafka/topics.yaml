@@ -1,0 +1,220 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: banking-accounts
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: banking.accounts
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: "2592000000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: banking-payments
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: banking.payments
+  partitions: 24
+  replicas: 3
+  config:
+    retention.ms: "7776000000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: banking-lending
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: banking.lending
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "31536000000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: compliance-screening
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: compliance.screening
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "220752000000"
+    cleanup.policy: compact,delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: compliance-fraud
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: compliance.fraud
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: "220752000000"
+    cleanup.policy: compact,delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: identity-verification
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: identity.verification
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "220752000000"
+    cleanup.policy: compact,delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: accounting-ledger
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: accounting.ledger
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: "220752000000"
+    cleanup.policy: compact,delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: agriculture-operations
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: agriculture.operations
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "31536000000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: treasury-operations
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: treasury.operations
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "7776000000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: notifications-delivery
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: notifications.delivery
+  partitions: 12
+  replicas: 3
+  config:
+    retention.ms: "2592000000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: risk-computation
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: risk.computation
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "31536000000"
+    cleanup.policy: compact,delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: security-events
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: security.events
+  partitions: 6
+  replicas: 3
+  config:
+    retention.ms: "31536000000"
+    cleanup.policy: compact,delete
+    min.insync.replicas: "2"
+    compression.type: lz4
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: platform-events
+  namespace: 54bank
+  labels:
+    strimzi.io/cluster: 54bank-kafka
+spec:
+  topicName: platform.events
+  partitions: 24
+  replicas: 3
+  config:
+    retention.ms: "31536000000"
+    cleanup.policy: delete
+    min.insync.replicas: "2"
+    compression.type: lz4

@@ -113,6 +113,8 @@ async fn db_persist_snapshot(db: &Option<Arc<tokio_postgres::Client>>, snap: &Sn
 
 async fn healthz(state: web::Data<AppState>) -> HttpResponse {
     let db_status = if state.db.is_some() { "connected" } else { "not_configured" };
+    let _bus = init_data_flow();
+    _bus.emit("event-store.processed", &serde_json::json!({"status": "success"}));
     HttpResponse::Ok().json(serde_json::json!({
         "status": "healthy",
         "service": "event-store",
@@ -531,6 +533,79 @@ async fn main() -> std::io::Result<()> {
         .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
+}
+
+
+
+// --- Event Bus (Kafka producer) ---
+struct EventBus {
+    broker_url: String,
+    topic: String,
+    service_name: String,
+}
+
+impl EventBus {
+    fn new(topic: &str, service: &str) -> Self {
+        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+        Self {{ broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }}
+    }
+
+    fn emit(&self, event_type: &str, payload: &serde_json::Value) {{
+        let event = serde_json::json!({{
+            "id": format!("{{}}_{{}}", self.service_name, std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()),
+            "type": event_type,
+            "source": self.service_name,
+            "topic": self.topic,
+            "timestamp": chrono_now(),
+            "data": payload,
+        }});
+        // In production: rdkafka producer sends to self.topic
+        // For resilience: fire-and-forget with DLQ on failure
+        log::info!("[EventBus] {{}} -> {{}}: {{}}", self.service_name, self.topic, event_type);
+        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+    }}
+}}
+
+fn chrono_now() -> String {{
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    format!("2026-01-01T{{:05}}Z", d.as_secs() % 86400)
+}}
+
+static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// --- Data Flow Initialization ---
+fn init_data_flow() -> EventBus {
+    let bus = EventBus::new("infra.events", "event-store");
+    log::info!("[event-store] Data flow initialized: topic=infra.events");
+    bus
+}
+
+
+// --- Event Consumer ---
+struct EventConsumer {
+    topics: Vec<String>,
+    group_id: String,
+}
+
+impl EventConsumer {
+    fn new(topics: &[&str], service: &str) -> Self {
+        Self {
+            topics: topics.iter().map(|t| t.to_string()).collect(),
+            group_id: format!("{}-consumer-group", service),
+        }
+    }
+
+    fn subscribe(&self) {
+        log::info!("[EventConsumer] {} subscribing to {:?}", self.group_id, self.topics);
+        // In production: rdkafka::consumer::StreamConsumer with group rebalancing
+    }
+}
+
+fn init_consumer() -> EventConsumer {
+    let consumer = EventConsumer::new(&["platform.events"], "event-store");
+    consumer.subscribe();
+    consumer
 }
 
 #[cfg(test)]

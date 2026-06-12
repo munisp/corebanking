@@ -33,6 +33,8 @@ fn degradation_mode() -> &'static str {
 }
 
 async fn degradation_status() -> HttpResponse {
+    let _bus = init_data_flow();
+    _bus.emit("txn-monitoring-rules.processed", &serde_json::json!({"status": "success"}));
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -951,6 +953,52 @@ const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
     .shutdown_timeout(30)
     .run()
     .await
+}
+
+
+
+// --- Event Bus (Kafka producer) ---
+struct EventBus {
+    broker_url: String,
+    topic: String,
+    service_name: String,
+}
+
+impl EventBus {
+    fn new(topic: &str, service: &str) -> Self {
+        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+        Self {{ broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }}
+    }
+
+    fn emit(&self, event_type: &str, payload: &serde_json::Value) {{
+        let event = serde_json::json!({{
+            "id": format!("{{}}_{{}}", self.service_name, std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()),
+            "type": event_type,
+            "source": self.service_name,
+            "topic": self.topic,
+            "timestamp": chrono_now(),
+            "data": payload,
+        }});
+        // In production: rdkafka producer sends to self.topic
+        // For resilience: fire-and-forget with DLQ on failure
+        log::info!("[EventBus] {{}} -> {{}}: {{}}", self.service_name, self.topic, event_type);
+        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+    }}
+}}
+
+fn chrono_now() -> String {{
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    format!("2026-01-01T{{:05}}Z", d.as_secs() % 86400)
+}}
+
+static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// --- Data Flow Initialization ---
+fn init_data_flow() -> EventBus {
+    let bus = EventBus::new("observability.metrics", "txn-monitoring-rules");
+    log::info!("[txn-monitoring-rules] Data flow initialized: topic=observability.metrics");
+    bus
 }
 
 #[cfg(test)]

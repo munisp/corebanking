@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	_ "github.com/lib/pq"
 	"database/sql"
 	"context"
@@ -33,6 +34,8 @@ var semaphore = make(chan struct{}, 100)
 func acquireSem() { semaphore <- struct{}{} }
 func releaseSem() { <-semaphore }
 var serviceName = "open-banking-gateway-go"
+
+var eventBus = newEventBus("platform.events", "open-banking-gateway")
 
 // CBN Open Banking Regulatory Framework — AISP (Account Information) + PISP (Payment Initiation) APIs
 // Implements CBN Open Banking Guidelines 2023
@@ -352,6 +355,7 @@ func handleConsentCreate(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[OB] Consent created: %s type=%s tpp=%s customer=%s",
 		consent.ID, consent.ConsentType, consent.TPPId, maskPII(consent.CustomerID, "account"))
+		eventBus.Emit("open-banking-gateway.processed", map[string]interface{}{"status": "success"})
 	respondJSON(w, 201, map[string]interface{}{"consent": consent})
 }
 
@@ -737,6 +741,7 @@ func appendAudit(action, recordID, actor, details string) {
 		Action: action, RecordID: recordID, Actor: actor,
 		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
 	})
+
 }
 
 // --- Request Tracing ---
@@ -1063,3 +1068,70 @@ func main() {
 		log.Printf("Server error: %v", err)
 	}
 }
+
+// --- Event Bus (Kafka-compatible event emission) ---
+
+type EventBus struct {
+	brokerURL   string
+	topic       string
+	serviceName string
+	mu          sync.Mutex
+	buffer      []map[string]interface{}
+}
+
+func newEventBus(topic, service string) *EventBus {
+	broker := os.Getenv("KAFKA_BROKERS")
+	if broker == "" {
+		broker = "localhost:9092"
+	}
+	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
+}
+
+func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
+	event := map[string]interface{}{
+		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
+		"type":      eventType,
+		"source":    eb.serviceName,
+		"topic":     eb.topic,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"data":      payload,
+	}
+	eb.mu.Lock()
+	eb.buffer = append(eb.buffer, event)
+	eb.mu.Unlock()
+	// In production: sarama.SyncProducer.SendMessage to eb.topic
+	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
+}
+
+func (eb *EventBus) Flush() []map[string]interface{} {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	events := eb.buffer
+	eb.buffer = nil
+	return events
+}
+
+// --- Downstream Notifier ---
+
+func notifyDownstream(serviceURL, path string, payload interface{}) error {
+	body, _ := json.Marshal(payload)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Source-Service", serviceName)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[Downstream] %s%s failed: %v", serviceURL, path, err)
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("downstream %s returned %d", path, resp.StatusCode)
+	}
+	return nil
+}
+

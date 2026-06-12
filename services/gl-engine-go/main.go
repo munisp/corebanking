@@ -41,6 +41,8 @@ func acquireSem() { semaphore <- struct{}{} }
 func releaseSem() { <-semaphore }
 var serviceName = "gl-engine-go"
 
+var eventBus = newEventBus("accounting.ledger", "gl-engine")
+
 // ─── MIDDLEWARE CLIENTS ─────────────────────────────────────────────────────
 
 type MiddlewareStatus struct {
@@ -649,6 +651,7 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
 	cacheInvalidate("gl_engine_list")
 	}
+		eventBus.Emit("gl-engine.processed", map[string]interface{}{"status": "success"})
 	json.NewEncoder(w).Encode(data)
 }
 
@@ -2071,6 +2074,7 @@ func panicRecoveryMiddleware(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+
 }
 
 func main() {
@@ -2135,3 +2139,70 @@ func main() {
     _ = server.Shutdown(ctx)
     log.Println("[gl-engine-go] Server stopped gracefully")
 }
+
+// --- Event Bus (Kafka-compatible event emission) ---
+
+type EventBus struct {
+	brokerURL   string
+	topic       string
+	serviceName string
+	mu          sync.Mutex
+	buffer      []map[string]interface{}
+}
+
+func newEventBus(topic, service string) *EventBus {
+	broker := os.Getenv("KAFKA_BROKERS")
+	if broker == "" {
+		broker = "localhost:9092"
+	}
+	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
+}
+
+func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
+	event := map[string]interface{}{
+		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
+		"type":      eventType,
+		"source":    eb.serviceName,
+		"topic":     eb.topic,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"data":      payload,
+	}
+	eb.mu.Lock()
+	eb.buffer = append(eb.buffer, event)
+	eb.mu.Unlock()
+	// In production: sarama.SyncProducer.SendMessage to eb.topic
+	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
+}
+
+func (eb *EventBus) Flush() []map[string]interface{} {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	events := eb.buffer
+	eb.buffer = nil
+	return events
+}
+
+// --- Downstream Notifier ---
+
+func notifyDownstream(serviceURL, path string, payload interface{}) error {
+	body, _ := json.Marshal(payload)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL+path, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Source-Service", serviceName)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[Downstream] %s%s failed: %v", serviceURL, path, err)
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("downstream %s returned %d", path, resp.StatusCode)
+	}
+	return nil
+}
+
