@@ -1,0 +1,1806 @@
+# KEDA ScaledObjects for ALL Kafka Consumer Services
+# Auto-generated from docs/data-flow-topology.yaml
+# Total: 28 ScaledObjects
+#
+# Tier scaling parameters:
+#   critical-financial: min=3, max=30, lag=50, poll=10s, cooldown=120s
+#   security-compliance: min=2, max=20, lag=10, poll=10s, cooldown=60s
+#   ml-inference:        min=1, max=15, lag=20, poll=30s, cooldown=300s
+#   batch-processing:    min=1, max=10, lag=500, poll=60s, cooldown=600s
+#   standard:            min=1, max=8,  lag=100, poll=30s, cooldown=300s
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-account-freeze-go
+  namespace: 54bank
+  labels:
+    app: account-freeze-go
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: account-freeze-go
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: account-freeze
+      topic: compliance.fraud
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="account-freeze-go"}[5m])
+      threshold: '200'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-account-opening-go
+  namespace: 54bank
+  labels:
+    app: account-opening-go
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: account-opening-go
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: account-opening
+      topic: identity.verification
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-alert-manager-py
+  namespace: 54bank
+  labels:
+    app: alert-manager-py
+    tier: ml-inference
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: alert-manager-py
+  minReplicaCount: 1
+  maxReplicaCount: 15
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: alert-manager
+      topic: observability.metrics
+      lagThreshold: '20'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-aml-engine-rs
+  namespace: 54bank
+  labels:
+    app: aml-engine-rs
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: aml-engine-rs
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: aml-engine
+      topic: banking.accounts
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: aml-engine
+      topic: banking.payments
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: aml-engine
+      topic: compliance.fraud
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="aml-engine-rs"}[5m])
+      threshold: '200'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-analytics-pipeline-py
+  namespace: 54bank
+  labels:
+    app: analytics-pipeline-py
+    tier: ml-inference
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: analytics-pipeline-py
+  minReplicaCount: 1
+  maxReplicaCount: 15
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: analytics-pipeline
+      topic: notifications.delivery
+      lagThreshold: '20'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: analytics-pipeline
+      topic: data.pipeline
+      lagThreshold: '20'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-audit-trail-go
+  namespace: 54bank
+  labels:
+    app: audit-trail-go
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: audit-trail-go
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: audit-trail
+      topic: notifications.delivery
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: audit-trail
+      topic: security.events
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: audit-trail
+      topic: platform.events
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-basel-engine-rs
+  namespace: 54bank
+  labels:
+    app: basel-engine-rs
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: basel-engine-rs
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: basel-engine
+      topic: banking.lending
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-case-management-py
+  namespace: 54bank
+  labels:
+    app: case-management-py
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: case-management-py
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: case-management
+      topic: compliance.screening
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: case-management
+      topic: compliance.fraud
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="case-management-py"}[5m])
+      threshold: '200'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-cbn-tiered-kyc-rs
+  namespace: 54bank
+  labels:
+    app: cbn-tiered-kyc-rs
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: cbn-tiered-kyc-rs
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: cbn-tiered-kyc
+      topic: banking.accounts
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: cbn-tiered-kyc
+      topic: identity.verification
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="cbn-tiered-kyc-rs"}[5m])
+      threshold: '200'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-collateral-valuation-rs
+  namespace: 54bank
+  labels:
+    app: collateral-valuation-rs
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: collateral-valuation-rs
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: collateral-valuation
+      topic: banking.lending
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-compliance-dashboard-py
+  namespace: 54bank
+  labels:
+    app: compliance-dashboard-py
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: compliance-dashboard-py
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: compliance-dashboard
+      topic: compliance.screening
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: compliance-dashboard
+      topic: identity.verification
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: compliance-dashboard
+      topic: risk.computation
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: compliance-dashboard
+      topic: trading.operations
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: compliance-dashboard
+      topic: data.pipeline
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="compliance-dashboard-py"}[5m])
+      threshold: '200'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-credit-bureau-rs
+  namespace: 54bank
+  labels:
+    app: credit-bureau-rs
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: credit-bureau-rs
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: credit-bureau
+      topic: banking.lending
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-credit-scorer-rs
+  namespace: 54bank
+  labels:
+    app: credit-scorer-rs
+    tier: ml-inference
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: credit-scorer-rs
+  minReplicaCount: 1
+  maxReplicaCount: 15
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: credit-scorer
+      topic: agriculture.operations
+      lagThreshold: '20'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-efass-generator-rs
+  namespace: 54bank
+  labels:
+    app: efass-generator-rs
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: efass-generator-rs
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: efass-generator
+      topic: banking.accounts
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: efass-generator
+      topic: compliance.screening
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: efass-generator
+      topic: accounting.ledger
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: efass-generator
+      topic: risk.computation
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="efass-generator-rs"}[5m])
+      threshold: '200'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-event-dedup-engine-rs
+  namespace: 54bank
+  labels:
+    app: event-dedup-engine-rs
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: event-dedup-engine-rs
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 600
+  pollingInterval: 60
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: event-dedup-engine
+      topic: platform.events
+      lagThreshold: '500'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-event-store-rs
+  namespace: 54bank
+  labels:
+    app: event-store-rs
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: event-store-rs
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: event-store
+      topic: platform.events
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-fraud-detection-rs
+  namespace: 54bank
+  labels:
+    app: fraud-detection-rs
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: fraud-detection-rs
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: fraud-detection
+      topic: banking.payments
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: fraud-detection
+      topic: security.events
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="fraud-detection-rs"}[5m])
+      threshold: '200'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-gl-engine-rs
+  namespace: 54bank
+  labels:
+    app: gl-engine-rs
+    tier: critical-financial
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: gl-engine-rs
+  minReplicaCount: 3
+  maxReplicaCount: 30
+  cooldownPeriod: 120
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 3
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: gl-engine
+      topic: banking.payments
+      lagThreshold: '50'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: gl-engine
+      topic: banking.lending
+      lagThreshold: '50'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: gl-engine
+      topic: treasury.operations
+      lagThreshold: '50'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: gl-engine
+      topic: risk.computation
+      lagThreshold: '50'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: gl-engine
+      topic: trading.operations
+      lagThreshold: '50'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="gl-engine-rs"}[5m])
+      threshold: '500'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-ifrs9-ecl-engine-rs
+  namespace: 54bank
+  labels:
+    app: ifrs9-ecl-engine-rs
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: ifrs9-ecl-engine-rs
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: ifrs9-ecl-engine
+      topic: banking.lending
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: ifrs9-ecl-engine
+      topic: accounting.ledger
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-insurance-claims-py
+  namespace: 54bank
+  labels:
+    app: insurance-claims-py
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: insurance-claims-py
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: insurance-claims
+      topic: agriculture.operations
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-kyc-verification-py
+  namespace: 54bank
+  labels:
+    app: kyc-verification-py
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: kyc-verification-py
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: kyc-verification
+      topic: banking.accounts
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="kyc-verification-py"}[5m])
+      threshold: '200'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-lakehouse-rs
+  namespace: 54bank
+  labels:
+    app: lakehouse-rs
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: lakehouse-rs
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 600
+  pollingInterval: 60
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: lakehouse
+      topic: accounting.ledger
+      lagThreshold: '500'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: lakehouse
+      topic: agriculture.operations
+      lagThreshold: '500'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: lakehouse
+      topic: treasury.operations
+      lagThreshold: '500'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: lakehouse
+      topic: observability.metrics
+      lagThreshold: '500'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: lakehouse
+      topic: platform.events
+      lagThreshold: '500'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-notification-service-py
+  namespace: 54bank
+  labels:
+    app: notification-service-py
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: notification-service-py
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: notification-service
+      topic: banking.accounts
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: notification-service
+      topic: banking.payments
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: notification-service
+      topic: compliance.screening
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: notification-service
+      topic: compliance.fraud
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-reconciliation-engine-go
+  namespace: 54bank
+  labels:
+    app: reconciliation-engine-go
+    tier: critical-financial
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: reconciliation-engine-go
+  minReplicaCount: 3
+  maxReplicaCount: 30
+  cooldownPeriod: 120
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 3
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: reconciliation-engine
+      topic: banking.payments
+      lagThreshold: '50'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="reconciliation-engine-go"}[5m])
+      threshold: '500'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-reporting-engine-py
+  namespace: 54bank
+  labels:
+    app: reporting-engine-py
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: reporting-engine-py
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 600
+  pollingInterval: 60
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: reporting-engine
+      topic: accounting.ledger
+      lagThreshold: '500'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-risk-engine-go
+  namespace: 54bank
+  labels:
+    app: risk-engine-go
+    tier: standard
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: risk-engine-go
+  minReplicaCount: 1
+  maxReplicaCount: 8
+  cooldownPeriod: 300
+  pollingInterval: 30
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 1
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: risk-engine
+      topic: treasury.operations
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: risk-engine
+      topic: trading.operations
+      lagThreshold: '100'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-settlement-engine-go
+  namespace: 54bank
+  labels:
+    app: settlement-engine-go
+    tier: critical-financial
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: settlement-engine-go
+  minReplicaCount: 3
+  maxReplicaCount: 30
+  cooldownPeriod: 120
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 3
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: settlement-engine
+      topic: banking.payments
+      lagThreshold: '50'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="settlement-engine-go"}[5m])
+      threshold: '500'
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: so-siem-integration-py
+  namespace: 54bank
+  labels:
+    app: siem-integration-py
+    tier: security-compliance
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+  annotations:
+    keda.sh/transfer-hpa-ownership: 'true'
+spec:
+  scaleTargetRef:
+    name: siem-integration-py
+  minReplicaCount: 2
+  maxReplicaCount: 20
+  cooldownPeriod: 60
+  pollingInterval: 10
+  advanced:
+    restoreToOriginalReplicaCount: true
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+          policies:
+          - type: Percent
+            value: 25
+            periodSeconds: 60
+        scaleUp:
+          stabilizationWindowSeconds: 30
+          policies:
+          - type: Percent
+            value: 100
+            periodSeconds: 15
+          - type: Pods
+            value: 4
+            periodSeconds: 15
+          selectPolicy: Max
+  fallback:
+    failureThreshold: 3
+    replicas: 2
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: siem-integration
+      topic: security.events
+      lagThreshold: '10'
+      offsetResetPolicy: latest
+    authenticationRef:
+      name: keda-kafka-auth
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus.monitoring.svc.cluster.local:9090
+      query: rate(http_requests_total{service="siem-integration-py"}[5m])
+      threshold: '200'

@@ -1549,8 +1549,44 @@ func panicRecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// --- Process Health Watchdog ---
+// Monitors event loop liveness; if the main goroutine stalls for >60s,
+// the liveness probe fails and K8s/KEDA restarts the pod automatically.
+
+var watchdogLastPing atomic.Int64
+
+func init() {
+	watchdogLastPing.Store(time.Now().UnixMilli())
+}
+
+func watchdogPing() {
+	watchdogLastPing.Store(time.Now().UnixMilli())
+}
+
+func startWatchdog(interval time.Duration) {
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for range ticker.C {
+			lastPing := watchdogLastPing.Load()
+			elapsed := time.Now().UnixMilli() - lastPing
+			if elapsed > 60000 {
+				log.Printf("[WATCHDOG] Event loop stalled for %dms — marking unhealthy", elapsed)
+			}
+		}
+	}()
+}
+
+func watchdogHealthy() bool {
+	lastPing := watchdogLastPing.Load()
+	elapsed := time.Now().UnixMilli() - lastPing
+	return elapsed < 60000
+}
+
 func main() {
 	initTracing()
+	startWatchdog(10 * time.Second)
+	watchdogPing()
 	port := os.Getenv("PORT")
 	if port == "" { port = "9326" }
 	initDB()

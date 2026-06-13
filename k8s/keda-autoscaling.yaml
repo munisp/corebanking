@@ -1,6 +1,13 @@
 ---
-# KEDA ScaledObjects for 54Bank Platform
-# Requires: KEDA operator installed in the cluster
+# KEDA ScaledObjects for 54Bank Platform (LEGACY — see k8s/keda/ for comprehensive setup)
+# Comprehensive KEDA configs are in k8s/keda/:
+#   - operator.yaml        — KEDA operator HA deployment (v2.14)
+#   - trigger-auth.yaml    — Kafka/Postgres/Redis TriggerAuthentication
+#   - scaled-objects.yaml  — 28 ScaledObjects for all Kafka consumers
+#   - scaled-jobs.yaml     — 8 ScaledJobs for batch processing
+#   - monitoring.yaml      — Prometheus ServiceMonitor + Grafana dashboard + alerts
+#
+# Original 8 ScaledObjects kept below for backward compatibility:
 # kubectl apply -f https://github.com/kedacore/keda/releases/download/v2.14.0/keda-2.14.0.yaml
 
 apiVersion: keda.sh/v1alpha1

@@ -38,10 +38,42 @@ spec:
     spec:
       serviceAccountName: table-partitioner-rs
       terminationGracePeriodSeconds: 30
+      restartPolicy: Always
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
         fsGroup: 1000
+      initContainers:
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z kafka-broker.54bank.svc.cluster.local 9092; do echo "Waiting for Kafka..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgresql.54bank.svc.cluster.local 5432; do echo "Waiting for PostgreSQL..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+        - name: wait-for-redis
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redis-cache.54bank.svc.cluster.local 6379; do echo "Waiting for Redis..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
       containers:
         - name: table-partitioner-rs
           image: ghcr.io/54bank/table-partitioner-rs:latest

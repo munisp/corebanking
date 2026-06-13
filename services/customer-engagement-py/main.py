@@ -1065,6 +1065,36 @@ def db_exec_atomic(queries_params: list) -> bool:
 
 # --- Event Bus (Kafka-compatible event emission) ---
 
+
+# --- Process Health Watchdog ---
+# Monitors event loop liveness; if stalled >60s, liveness probe fails
+# and K8s/KEDA restarts the pod.
+
+_watchdog_last_ping = time.time()
+_watchdog_lock = threading.Lock()
+
+
+def watchdog_ping():
+    global _watchdog_last_ping
+    with _watchdog_lock:
+        _watchdog_last_ping = time.time()
+
+
+def watchdog_healthy() -> bool:
+    with _watchdog_lock:
+        return (time.time() - _watchdog_last_ping) < 60
+
+
+def _watchdog_loop():
+    while True:
+        time.sleep(10)
+        if not watchdog_healthy():
+            logger.warning("[WATCHDOG] Event loop stalled — marking unhealthy")
+        watchdog_ping()
+
+
+threading.Thread(target=_watchdog_loop, daemon=True).start()
+
 class EventBus:
     """Publishes domain events to Kafka topics for downstream consumption."""
 

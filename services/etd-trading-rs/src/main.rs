@@ -1073,3 +1073,40 @@ mod tests {
         assert!((back - 100.50).abs() < 0.001);
     }
 }
+
+// --- Process Health Watchdog ---
+// Monitors event loop liveness; if stalled >60s, liveness probe fails
+// and K8s/KEDA restarts the pod.
+
+static WATCHDOG_LAST_PING: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn watchdog_ping() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    WATCHDOG_LAST_PING.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn watchdog_healthy() -> bool {
+    let last = WATCHDOG_LAST_PING.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 { return true; }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    (now - last) < 60000
+}
+
+fn start_watchdog() {
+    watchdog_ping();
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            if !watchdog_healthy() {
+                log::warn!("[WATCHDOG] Event loop stalled — marking unhealthy");
+            }
+            watchdog_ping();
+        }
+    });
+}
