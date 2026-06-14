@@ -49,6 +49,26 @@ func secureRandUint32() uint32 {
 
 var serviceName = "kafka-streaming-go"
 
+// --- EventBus ---
+type EventBus struct {
+	broker  string
+	topic   string
+	service string
+}
+
+func newEventBus(topic string) *EventBus {
+	broker := os.Getenv("KAFKA_BROKERS")
+	if broker == "" { broker = "localhost:9092" }
+	return &EventBus{broker: broker, topic: topic, service: serviceName}
+}
+
+func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
+	log.Printf("[EventBus] %s -> %s: %s", eb.service, eb.topic, eventType)
+}
+
+var eventBus = newEventBus("platform.events")
+
+
 var startTime = time.Now()
 
 // ─── Domain Types ───────────────────────────────────────────────────────────
