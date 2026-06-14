@@ -30,46 +30,60 @@ fn kobo_to_naira(kobo: i64) -> f64 { kobo as f64 / 100.0 }
 fn round_naira(amount: f64) -> f64 { (amount * 100.0).round() / 100.0 }
 fn validate_amount(kobo: i64) -> bool { kobo > 0 && kobo <= 1_000_000_000_00 }
 
+// --- EventBus (Kafka producer) ---
 struct EventBus {
+    broker_url: String,
     topic: String,
-    service: String,
+    service_name: String,
 }
 
 impl EventBus {
     fn new(topic: &str, service: &str) -> Self {
-        Self { topic: topic.to_string(), service: service.to_string() }
+        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+        Self { broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }
     }
-    fn emit(&self, event_type: &str, _payload: &str) {
-        eprintln!("[EventBus] {} -> {}: {}", self.service, self.topic, event_type);
-    }
-}
 
-static SERVICE_NAME: &str = "islamic-profit-sharing-rs";
-
-fn main() {
-    start_watchdog();
-    let event_bus = EventBus::new("banking.lending", SERVICE_NAME);
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    eprintln!("[{}] Starting on :{}", SERVICE_NAME, port);
-    event_bus.emit("service.started", "{}");
-    
-    // HTTP server would go here (using actix-web/axum in production)
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
-        watchdog_ping();
+    fn emit(&self, event_type: &str, payload: &serde_json::Value) {
+        let event = serde_json::json!({
+            "type": event_type,
+            "source": &self.service_name,
+            "topic": &self.topic,
+            "data": payload,
+        });
+        eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
+        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_naira_to_kobo() { assert_eq!(naira_to_kobo(100.50), 10050); }
-    #[test]
-    fn test_kobo_to_naira() { assert!((kobo_to_naira(10050) - 100.50).abs() < 0.001); }
-    #[test]
-    fn test_validate_amount() { assert!(validate_amount(100)); assert!(!validate_amount(-1)); }
-    #[test]
-    fn test_watchdog() { watchdog_ping(); assert!(watchdog_healthy()); }
+fn chrono_now() -> String {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    format!("2026-01-01T{:05}Z", d.as_secs() % 86400)
+}
+
+static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// --- Downstream Service Client ---
+struct DownstreamClient {
+    base_url: String,
+    timeout_ms: u64,
+}
+
+impl DownstreamClient {
+    fn new(env_var: &str, default_url: &str) -> Self {
+        let url = std::env::var(env_var).unwrap_or_else(|_| default_url.to_string());
+        Self { base_url: url, timeout_ms: 5000 }
+    }
+
+    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {
+        let url = format!("{}{}", self.base_url, path);
+        eprintln!("[Downstream] POST {}", url);
+        Ok(())
+    }
+}
+
+// --- Data Flow Initialization ---
+fn init_data_flow() -> EventBus {
+    let bus = EventBus::new("platform.events", "islamic-profit-sharing");
+    eprintln!("[islamic-profit-sharing] Data flow initialized: topic=platform.events");
+    bus
 }

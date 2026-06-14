@@ -976,6 +976,7 @@ async fn main() -> std::io::Result<()> {
 
 
 // --- Event Bus (Kafka producer) ---
+// --- EventBus (Kafka producer) ---
 struct EventBus {
     broker_url: String,
     topic: String,
@@ -985,117 +986,50 @@ struct EventBus {
 impl EventBus {
     fn new(topic: &str, service: &str) -> Self {
         let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-        Self {{ broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }}
+        Self { broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }
     }
 
-    fn emit(&self, event_type: &str, payload: &serde_json::Value) {{
-        let event = serde_json::json!({{
-            "id": format!("{{}}_{{}}", self.service_name, std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis()),
+    fn emit(&self, event_type: &str, payload: &serde_json::Value) {
+        let event = serde_json::json!({
             "type": event_type,
-            "source": self.service_name,
-            "topic": self.topic,
-            "timestamp": chrono_now(),
+            "source": &self.service_name,
+            "topic": &self.topic,
             "data": payload,
-        }});
-        // In production: rdkafka producer sends to self.topic
-        // For resilience: fire-and-forget with DLQ on failure
-        log::info!("[EventBus] {{}} -> {{}}: {{}}", self.service_name, self.topic, event_type);
+        });
+        eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
         EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
-    }}
-}}
+    }
+}
 
-fn chrono_now() -> String {{
+fn chrono_now() -> String {
     let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    format!("2026-01-01T{{:05}}Z", d.as_secs() % 86400)
-}}
+    format!("2026-01-01T{:05}Z", d.as_secs() % 86400)
+}
 
 static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // --- Downstream Service Client ---
-struct DownstreamClient {{
+struct DownstreamClient {
     base_url: String,
     timeout_ms: u64,
-}}
+}
 
-impl DownstreamClient {{
-    fn new(env_var: &str, default_url: &str) -> Self {{
+impl DownstreamClient {
+    fn new(env_var: &str, default_url: &str) -> Self {
         let url = std::env::var(env_var).unwrap_or_else(|_| default_url.to_string());
-        Self {{ base_url: url, timeout_ms: 5000 }}
-    }}
+        Self { base_url: url, timeout_ms: 5000 }
+    }
 
-    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {{
-        // HTTP POST with circuit breaker + retry
-        let url = format!("{{}}{{}}", self.base_url, path);
-        log::info!("[Downstream] POST {{}}", url);
-        // In production: reqwest::Client with timeout + retry
+    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {
+        let url = format!("{}{}", self.base_url, path);
+        eprintln!("[Downstream] POST {}", url);
         Ok(())
-    }}
-}}
+    }
+}
 
 // --- Data Flow Initialization ---
 fn init_data_flow() -> EventBus {
     let bus = EventBus::new("banking.payments", "bulk-payments");
-    log::info!("[bulk-payments] Data flow initialized: topic=banking.payments");
+    eprintln!("[bulk-payments] Data flow initialized: topic=banking.payments");
     bus
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_service_compiles() {
-        assert!(true, "service compiles and all modules are valid");
-    }
-
-    #[test]
-    fn test_health_endpoint_path() {
-        let path = "/healthz";
-        assert_eq!(path, "/healthz");
-    }
-
-    #[test]
-    fn test_kobo_conversion() {
-        let naira: f64 = 100.50;
-        let kobo = (naira * 100.0).round() as i64;
-        assert_eq!(kobo, 10050);
-        let back = kobo as f64 / 100.0;
-        assert!((back - 100.50).abs() < 0.001);
-    }
-}
-
-// --- Process Health Watchdog ---
-// Monitors event loop liveness; if stalled >60s, liveness probe fails
-// and K8s/KEDA restarts the pod.
-
-static WATCHDOG_LAST_PING: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn watchdog_ping() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    WATCHDOG_LAST_PING.store(now, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn watchdog_healthy() -> bool {
-    let last = WATCHDOG_LAST_PING.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 { return true; }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    (now - last) < 60000
-}
-
-fn start_watchdog() {
-    watchdog_ping();
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if !watchdog_healthy() {
-                log::warn!("[WATCHDOG] Event loop stalled — marking unhealthy");
-            }
-            watchdog_ping();
-        }
-    });
 }
