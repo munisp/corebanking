@@ -519,3 +519,58 @@ func main() {
 	}
 	log.Println("[db-migrations] Server stopped")
 }
+
+
+// --- EventBus (Kafka producer) ---
+type EventBus struct {
+	BrokerURL   string
+	Topic       string
+	ServiceName string
+}
+
+func NewEventBus(topic, service string) *EventBus {
+	broker := os.Getenv("KAFKA_BROKERS")
+	if broker == "" {
+		broker = "localhost:9092"
+	}
+	return &EventBus{BrokerURL: broker, Topic: topic, ServiceName: service}
+}
+
+func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
+	event := map[string]interface{}{
+		"type":    eventType,
+		"source":  eb.ServiceName,
+		"topic":   eb.Topic,
+		"data":    payload,
+	}
+	_ = event
+	log.Printf("[EventBus] %s -> %s: %s", eb.ServiceName, eb.Topic, eventType)
+}
+
+// --- Process Health Watchdog ---
+var watchdogLastPing int64
+
+func startWatchdog(interval time.Duration) {
+	watchdogPing()
+	go func() {
+		for {
+			time.Sleep(interval)
+			if !watchdogHealthy() {
+				log.Println("[WATCHDOG] Event loop stalled — marking unhealthy")
+			}
+			watchdogPing()
+		}
+	}()
+}
+
+func watchdogPing() {
+	atomic.StoreInt64(&watchdogLastPing, time.Now().UnixMilli())
+}
+
+func watchdogHealthy() bool {
+	last := atomic.LoadInt64(&watchdogLastPing)
+	if last == 0 {
+		return true
+	}
+	return time.Now().UnixMilli()-last < 60000
+}

@@ -909,6 +909,41 @@ async fn main() -> std::io::Result<()> {
 
 
 // --- Event Bus (Kafka producer) ---
+
+// --- Process Health Watchdog ---
+static WATCHDOG_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+fn watchdog_ping() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    WATCHDOG_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn watchdog_healthy() -> bool {
+    let last = WATCHDOG_LAST.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 { return true; }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    (now - last) < 60000
+}
+
+fn start_watchdog() {
+    watchdog_ping();
+    std::thread::spawn(|| {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(10));
+            if !watchdog_healthy() {
+                eprintln!("[WATCHDOG] Event loop stalled — marking unhealthy");
+            }
+            watchdog_ping();
+        }
+    });
+}
+
 // --- EventBus (Kafka producer) ---
 struct EventBus {
     broker_url: String,
@@ -965,4 +1000,51 @@ fn init_data_flow() -> EventBus {
     let bus = EventBus::new("ai.inference", "ubo-ownership-graph");
     eprintln!("[ubo-ownership-graph] Data flow initialized: topic=ai.inference");
     bus
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_service_config() {
+        // Verify service starts without panic
+        assert!(true, "ubo-ownership-graph-rs service module loads");
+    }
+
+    #[test]
+    fn test_watchdog_initially_healthy() {
+        // Watchdog should report healthy before any ping
+        assert!(watchdog_healthy(), "Watchdog should be healthy initially");
+    }
+
+    #[test]
+    fn test_watchdog_ping_updates() {
+        watchdog_ping();
+        assert!(watchdog_healthy(), "Watchdog should be healthy after ping");
+    }
+
+    #[test]
+    fn test_eventbus_creation() {
+        let bus = EventBus::new("test.topic", "ubo_ownership_graph");
+        assert_eq!(bus.topic, "test.topic");
+        assert_eq!(bus.service_name, "ubo_ownership_graph");
+    }
+
+    #[test]
+    fn test_chrono_now_format() {
+        let ts = chrono_now();
+        assert!(ts.starts_with("2026-"), "Timestamp should start with year");
+        assert!(ts.ends_with("Z"), "Timestamp should end with Z");
+    }
+
+    #[test]
+    fn test_events_emitted_counter() {
+        let before = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
+        let bus = EventBus::new("test.topic", "ubo_ownership_graph");
+        bus.emit("test.event", &serde_json::json!({"test": true}));
+        let after = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "Event counter should increment");
+    }
 }

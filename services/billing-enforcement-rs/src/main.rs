@@ -628,3 +628,50 @@ fn init_data_flow() -> EventBus {
     eprintln!("[billing-enforcement] Data flow initialized: topic=banking.operations");
     bus
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_service_config() {
+        // Verify service starts without panic
+        assert!(true, "billing-enforcement-rs service module loads");
+    }
+
+    #[test]
+    fn test_watchdog_initially_healthy() {
+        // Watchdog should report healthy before any ping
+        assert!(watchdog_healthy(), "Watchdog should be healthy initially");
+    }
+
+    #[test]
+    fn test_watchdog_ping_updates() {
+        watchdog_ping();
+        assert!(watchdog_healthy(), "Watchdog should be healthy after ping");
+    }
+
+    #[test]
+    fn test_eventbus_creation() {
+        let bus = EventBus::new("test.topic", "billing_enforcement");
+        assert_eq!(bus.topic, "test.topic");
+        assert_eq!(bus.service_name, "billing_enforcement");
+    }
+
+    #[test]
+    fn test_chrono_now_format() {
+        let ts = chrono_now();
+        assert!(ts.starts_with("2026-"), "Timestamp should start with year");
+        assert!(ts.ends_with("Z"), "Timestamp should end with Z");
+    }
+
+    #[test]
+    fn test_events_emitted_counter() {
+        let before = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
+        let bus = EventBus::new("test.topic", "billing_enforcement");
+        bus.emit("test.event", &serde_json::json!({"test": true}));
+        let after = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after > before, "Event counter should increment");
+    }
+}

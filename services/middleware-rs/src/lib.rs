@@ -756,3 +756,21 @@ pub fn middleware_config(service_name: &str) -> Value {
         "openappsec": { "url": env_or("OPENAPPSEC_URL", "http://localhost:4000") }
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_env_or_fallback() {
+        let val = env_or("__NONEXISTENT_TEST_VAR__", "default_val");
+        assert_eq!(val, "default_val");
+    }
+
+    #[test]
+    fn test_postgres_url_default() {
+        // Should return a postgres URL even without env var
+        let url = postgres_url();
+        assert!(url.contains("postgres"), "URL should contain postgres");
+    }
+}

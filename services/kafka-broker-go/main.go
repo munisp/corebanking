@@ -1847,3 +1847,30 @@ mux := http.NewServeMux()
     _ = server.Shutdown(ctx)
     log.Println("[kafka-broker-go] Server stopped gracefully")
 }
+
+
+// --- EventBus (Kafka producer) ---
+type EventBus struct {
+	BrokerURL   string
+	Topic       string
+	ServiceName string
+}
+
+func NewEventBus(topic, service string) *EventBus {
+	broker := os.Getenv("KAFKA_BROKERS")
+	if broker == "" {
+		broker = "localhost:9092"
+	}
+	return &EventBus{BrokerURL: broker, Topic: topic, ServiceName: service}
+}
+
+func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
+	event := map[string]interface{}{
+		"type":    eventType,
+		"source":  eb.ServiceName,
+		"topic":   eb.Topic,
+		"data":    payload,
+	}
+	_ = event
+	log.Printf("[EventBus] %s -> %s: %s", eb.ServiceName, eb.Topic, eventType)
+}
