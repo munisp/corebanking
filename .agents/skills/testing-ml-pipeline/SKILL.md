@@ -27,13 +27,15 @@ fuser -k 8500/tcp 2>/dev/null; fuser -k 8501/tcp 2>/dev/null
 ```bash
 cd /home/ubuntu/repos/corebanking
 python -m ml.inference.server 2>&1 &
-sleep 3
+sleep 5
 curl -s http://localhost:8500/healthz
 ```
 
 **Expected**: `{"status": "healthy", "models_loaded": 6, "device": "cpu"}`
 
 If `models_loaded` < 6, check that all .pt weight files exist in `ml/weights/`.
+
+**Tip**: The server starts fast (~0.06s to load all 6 models on CPU). If it takes longer than 10s, something is wrong.
 
 ## Step 2: Test Inference Endpoints
 
@@ -67,10 +69,10 @@ curl -s -X POST http://localhost:8500/v1/churn/predict \
 ```
 
 **Key assertions**:
-- Fraud: `fraud_probability` > 0.5 for suspicious input, `predictions` is an array
-- Credit: `credit_score` is a float, `credit_band` in [poor, fair, good, excellent]
-- AML: `suspicious_probability` is a float, `risk_tier` in [low, medium, high, critical]
-- Anomaly: `anomaly_score` >= 0, `is_anomaly` is boolean
+- Fraud: `fraud_probability` > 0.5 for suspicious input (typically ~0.935), `predictions` is an array
+- Credit: `credit_score` is a float (e.g. 733.0), `credit_band` in [poor, fair, good, excellent]
+- AML: `suspicious_probability` is a float (1.0 for high-risk PEP), `risk_tier` in [low, medium, high, critical]
+- Anomaly: `anomaly_score` >= 0 (typically ~0.018 for normal), `is_anomaly` is boolean (false for normal)
 - Churn: `attention_weights` is list of 12 floats summing to ~1.0, `critical_months` has 3 entries
 
 ## Step 3: Test Continuous Training Pipeline
@@ -91,6 +93,8 @@ python -m ml.continuous_training.orchestrator --mode full --model credit_scorer 
 - Champion-challenger: `recommendation` is one of: promote, keep_champion, inconclusive
 - Pipeline result saved to `ml/weights/ct_pipeline_*.json`
 
+**Note**: Training requires parquet dataset files in `ml/data/datasets/`. If these don't exist (0 files found), training will fail but inference still works.
+
 ## Step 4: Test Model Promoter
 
 ```bash
@@ -108,52 +112,40 @@ try:
     p.promote_to_production('fraud_detector', approved_by='auto')
     print('ERROR: Should have raised PermissionError')
 except PermissionError as e:
-    print(f'PASS: {e}')
-except FileNotFoundError as e:
-    print(f'SKIP (no staging): {e}')
+    print(f'Approval gate works: {e}')
 "
 ```
 
 **Key assertions**:
-- 6 models in status, all with `production: True`
-- fraud_detector and aml_scorer require human approval (REQUIRES_APPROVAL set)
+- `get_model_status()` returns dict with all 6 model names
+- Promoting `fraud_detector` with `approved_by='auto'` raises `PermissionError` (human approval required for high-risk models)
 
-## Step 5: Test Monitoring Server
+## Step 5: Test Monitoring Dashboard API
 
 ```bash
 cd /home/ubuntu/repos/corebanking
-python -m ml.continuous_training.monitoring 2>&1 &
-sleep 2
-
-curl -s http://localhost:8501/monitoring/healthz
-curl -s http://localhost:8501/monitoring/status | python3 -m json.tool
-curl -s http://localhost:8501/monitoring/prometheus
-curl -s http://localhost:8501/monitoring/dashboard | head -5
-
-# Manual retrain trigger
-curl -s -X POST http://localhost:8501/monitoring/trigger/credit_scorer
-curl -s -X POST http://localhost:8501/monitoring/trigger/nonexistent_model
+python -m ml.monitoring.dashboard 2>&1 &
+sleep 3
+curl -s http://localhost:8501/api/metrics | python3 -m json.tool | head -20
+curl -s http://localhost:8501/api/drift | python3 -m json.tool | head -20
 ```
 
 **Key assertions**:
-- `/monitoring/status`: 6 models with production/staging/canary flags
-- `/monitoring/prometheus`: `ml_model_weight_exists{model="..."}` = 1 for all 6
-- `/monitoring/dashboard`: HTML starts with `<!DOCTYPE html>`, title "54Bank ML Monitoring"
-- Valid trigger returns `{"status": "triggered"}`, invalid returns 400
+- `/api/metrics` returns JSON with model performance metrics
+- `/api/drift` returns JSON with drift detection results
 
-## Step 6: Browser Dashboard Verification
+## Step 6: Cleanup
 
-Open `http://localhost:8501/monitoring/dashboard` in the browser. Verify:
-- Title "54Bank ML Model Monitoring"
-- 6 model cards with AUC-ROC, F1, Parameters, Weight Size, Epochs
-- PROD/STAGING badges on cards
-- Active Alerts section at bottom
+```bash
+fuser -k 8500/tcp 2>/dev/null
+fuser -k 8501/tcp 2>/dev/null
+```
 
-## Known Issues / Gotchas
+## Testing Tips
 
-- **Port conflicts**: Always kill existing processes on 8500/8501 before starting servers (`fuser -k PORT/tcp`)
-- **GNN endpoint**: The `/v1/gnn/predict` endpoint might not be wired in `do_POST` — the model loads but the router might be missing the route. Check `ml/inference/server.py` POST handler.
-- **cd + && in exec**: Some shell environments block `cd X && cmd`. Use separate commands or absolute paths.
-- **Retrain time**: credit_scorer retrain takes ~45-60s on CPU. Don't set short timeouts.
-- **Staging files**: After forced retrain, `credit_scorer_staging.pt` remains in `ml/weights/`. The monitoring dashboard will show a STAGING badge.
-- **System restarts**: If the VM restarts, all running servers are killed. Files on disk are preserved — just restart the servers.
+- This is all shell-only testing — do NOT start a recording
+- The inference server loads all 6 models in ~0.06s on CPU — if it hangs, check for port conflicts
+- Fraud detection model is highly sensitive — the test input with international + new beneficiary + high amount at 2AM reliably produces >0.9 probability
+- AML model with PEP flag + structuring score 0.9 consistently returns 1.0 suspicious probability
+- The churn model uses attention mechanism — verify that `attention_weights` sums to ~1.0 (within 0.95-1.05 tolerance)
+- If disk space is low, model weights are ~1.8MB total — not a concern
