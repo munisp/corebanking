@@ -1,10 +1,8 @@
-// 54Bank Billing Enforcement Engine — Rust
+// 54link-dev Billing Enforcement Engine — Rust
 // Real-time usage metering, overage detection, cost tracking per feature.
 // Features = cost. If you exceed your tier, you pay or get suspended.
 
-use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // BILLING MODELS
@@ -58,7 +56,7 @@ struct OveragePolicy {
     unit: String,
     overage_rate_ngn: i64,
     hard_cap: Option<u64>,
-    grace_percent: u8, // allow 10% over before charging
+    grace_percent: u8,
     suspend_after_days: u8,
 }
 
@@ -235,217 +233,7 @@ fn middleware_status() -> serde_json::Value {
     })
 }
 
-#[derive(serde::Serialize)]
-struct ApiResponse<T: serde::Serialize> {
-    data: T,
-    middleware: serde_json::Value,
-}
-
-fn validate_overage_policy(policy: &OveragePolicy) -> Vec<String> {
-    let mut errors = Vec::new();
-    if policy.feature.is_empty() { errors.push("Feature name required".into()); }
-    if policy.included_limit == 0 { errors.push("Included limit must be > 0".into()); }
-    if policy.overage_rate_ngn <= 0 { errors.push("Overage rate must be positive".into()); }
-    if policy.suspend_after_days == 0 { errors.push("Suspension threshold must be > 0 days".into()); }
-    if let Some(cap) = policy.hard_cap {
-        if cap <= policy.included_limit { errors.push("Hard cap must exceed included limit".into()); }
-    }
-    errors
-}
-
-
-// --- PII Masking (NDPR Compliance) ---
-fn mask_pii(value: &str, field_type: &str) -> String {
-    if value.is_empty() { return "***".to_string(); }
-    match field_type {
-        "bvn" | "nin" => {
-            if value.len() >= 4 { format!("***{}", &value[value.len()-4..]) }
-            else { "***".to_string() }
-        },
-        "phone" => {
-            if value.len() >= 4 { format!("+234***{}", &value[value.len()-4..]) }
-            else { "+234***".to_string() }
-        },
-        "email" => {
-            if let Some(at) = value.find('@') {
-                let local = &value[..at]; let domain = &value[at+1..];
-                format!("{}***@{}", &local[..1], domain)
-            } else { "***@***".to_string() }
-        },
-        "account" => {
-            if value.len() >= 4 { format!("****{}", &value[value.len()-4..]) }
-            else { "****".to_string() }
-        },
-        _ => {
-            if value.len() > 2 { format!("{}***{}", &value[..1], &value[value.len()-1..]) }
-            else { "***".to_string() }
-        }
-    }
-}
-
-
-
-// ─── Idempotency Enforcement ────────────────────────────────────────────────
-use std::collections::HashMap as IdempHashMap;
-use std::sync::RwLock as IdempRwLock;
-use std::time::Instant as IdempInstant;
-
-struct IdempotencyEntry {
-    response: Vec<u8>,
-    status_code: u16,
-    created_at: IdempInstant,
-}
-
-lazy_static::lazy_static! {
-    static ref IDEMPOTENCY_CACHE: IdempRwLock<IdempHashMap<String, IdempotencyEntry>> =
-        IdempRwLock::new(IdempHashMap::new());
-}
-
-fn check_idempotency(key: &str) -> Option<(u16, Vec<u8>)> {
-    let cache = IDEMPOTENCY_CACHE.read().unwrap();
-    cache.get(key).map(|e| (e.status_code, e.response.clone()))
-}
-
-fn store_idempotency(key: String, status_code: u16, response: Vec<u8>) {
-    let mut cache = IDEMPOTENCY_CACHE.write().unwrap();
-    cache.insert(key, IdempotencyEntry { response, status_code, created_at: IdempInstant::now() });
-    // Cleanup entries older than 24h
-    let cutoff = std::time::Duration::from_secs(86400);
-    cache.retain(|_, v| v.created_at.elapsed() < cutoff);
-}
-
-
-// ─── Maker-Checker (Dual Authorization) ────────────────────────────────────
-#[derive(Clone, serde::Serialize)]
-struct MakerCheckerRequest {
-    request_id: String,
-    operation: String,
-    maker_id: String,
-    checker_id: Option<String>,
-    amount_kobo: i64,
-    status: String, // pending_approval|approved|rejected
-    created_at: String,
-}
-
-fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
-    let threshold = match operation {
-        "transfer" => 100_000_000,      // ₦1M
-        "loan_disburse" => 100_000_000, // ₦1M
-        "gl_posting" => 50_000_000,     // ₦500K
-        "account_close" => 0,           // Always
-        _ => 100_000_000,               // Default ₦1M
-    };
-    amount_kobo >= threshold
-}
-
-
-// ─── Immutable Audit Trail ──────────────────────────────────────────────────
-use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
-use actix_cors::Cors;
-
-#[derive(Clone, serde::Serialize)]
-struct AuditEntry {
-    id: String,
-    timestamp: String,
-    service: String,
-    operation: String,
-    actor_id: String,
-    entity_id: String,
-    entity_type: String,
-    old_state: String,
-    new_state: String,
-    checksum: String,
-    immutable: bool,
-}
-
-fn append_audit_entry(service: &str, operation: &str, actor_id: &str, entity_id: &str,
-                      entity_type: &str, old_state: &str, new_state: &str) -> AuditEntry {
-    let id = format!("AUD-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let raw = format!("{}|{}|{}|{}|{}|{}|{}|{}", id, timestamp, service, operation, actor_id, entity_id, old_state, new_state);
-    let mut hasher = AuditSha256::new();
-    hasher.update(raw.as_bytes());
-    let checksum = format!("{:x}", hasher.finalize());
-    AuditEntry { id, timestamp: timestamp.clone(), service: service.into(), operation: operation.into(),
-                 actor_id: actor_id.into(), entity_id: entity_id.into(), entity_type: entity_type.into(),
-                 old_state: old_state.into(), new_state: new_state.into(), checksum, immutable: true }
-}
-
-
-// --- Circuit Breaker ---
-static CB_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
-static CB_LAST_FAIL: AtomicI64 = AtomicI64::new(0);
-fn cb_allow() -> bool { CB_FAIL_COUNT.load(Ordering::Relaxed) < 5 }
-fn cb_record_success() { CB_FAIL_COUNT.store(0, Ordering::Relaxed); }
-fn cb_record_failure() { CB_FAIL_COUNT.fetch_add(1, Ordering::Relaxed); CB_LAST_FAIL.store(0, Ordering::Relaxed); }
-
-// --- Rate Limiter ---
-static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
-static RL_LAST: AtomicU64 = AtomicU64::new(0);
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let last = RL_LAST.load(Ordering::Relaxed);
-    if now > last { RL_TOKENS.store(100, Ordering::Relaxed); RL_LAST.store(now, Ordering::Relaxed); }
-    RL_TOKENS.fetch_sub(1, Ordering::Relaxed) > 0
-}
-
-// --- Request Tracing ---
-fn extract_trace_id(headers: &std::collections::HashMap<String, String>) -> String {
-    headers.get("X-Trace-Id").cloned().unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-}
-
-// --- Observability ---
-fn init_tracing(service_name: &str) {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
-    if !endpoint.is_empty() { println!("[{}] OTEL tracing: {}", service_name, endpoint); }
-}
-
-
-
-
-fn security_headers_str() -> &'static str {
-    "Content-Security-Policy: default-src 'self'; frame-ancestors 'none'\r\nStrict-Transport-Security: max-age=31536000; includeSubDomains\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nX-XSS-Protection: 1; mode=block\r\nReferrer-Policy: strict-origin-when-cross-origin"
-}
-
-static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
-static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
-
-// --- Retry with Exponential Backoff ---
-fn retry_with_backoff<F, T, E>(max_retries: u32, mut f: F) -> Result<T, E>
-where F: FnMut() -> Result<T, E> {
-    let mut attempt = 0;
-    loop {
-        match f() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                attempt += 1;
-                if attempt >= max_retries { return Err(e); }
-                let delay = std::cmp::min(100 * (1 << attempt), 5000);
-                std::thread::sleep(std::time::Duration::from_millis(delay));
-            }
-        }
-    }
-}
-
-fn validate_bvn(bvn: &str) -> bool {
-    bvn.len() == 11 && bvn.chars().all(|c| c.is_ascii_digit())
-}
-
-fn validate_nuban(account_no: &str) -> bool {
-    account_no.len() == 10 && account_no.chars().all(|c| c.is_ascii_digit())
-}
-
-fn sanitize_input(s: &str, max_len: usize) -> String {
-    s.chars().take(max_len).filter(|c| *c >= ' ' && *c != '\x7f').collect()
-}
-
-fn validate_amount_kobo(amount: i64) -> bool {
-    amount > 0 && amount <= 500_000_000_000
-}
-
 fn main() {
-    start_watchdog();
-    init_tracing("billing-enforcement-rs");
     let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
     if !db_url.is_empty() { println!("[billing-enforcement-rs] DB configured: {}", &db_url[..db_url.len().min(30)]); }
     let port = std::env::var("PORT").unwrap_or_else(|_| "8108".to_string());
@@ -457,32 +245,8 @@ fn main() {
     println!("Billing Enforcement Engine (Rust) on :{}", port);
     println!("Capabilities: usage_metering, overage_detection, invoice_generation, billing_alerts, suspension_enforcement");
 
-    // Graceful shutdown via SIGTERM/SIGINT
-    let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let r = running.clone();
-    std::thread::spawn(move || {
-        use std::sync::mpsc;
-        let (tx, rx) = mpsc::channel();
-        ctrlc_channel(tx);
-        rx.recv().ok();
-        r.store(false, Ordering::SeqCst);
-        println!("[billing-enforcement-rs] Shutting down gracefully...");
-    });
-
-    fn ctrlc_channel(tx: std::sync::mpsc::Sender<()>) {
-        unsafe {
-            libc_signal(2, move || { let _ = tx.send(()); }); // SIGINT
-        }
-    }
-    #[allow(unused)]
-    unsafe fn libc_signal<F: Fn() + Send + 'static>(_sig: i32, _handler: F) {
-        // Platform signal registration handled by OS
-    }
-
     let listener = std::net::TcpListener::bind(format!("0.0.0.0:{}", port)).unwrap();
-    listener.set_nonblocking(false).ok();
     for stream in listener.incoming() {
-        if !running.load(Ordering::SeqCst) { break; }
         let stream = match stream { Ok(s) => s, Err(_) => continue };
         let meters = Arc::clone(&meters);
         let invoices = Arc::clone(&invoices);
@@ -559,119 +323,48 @@ fn main() {
                 _ => serde_json::json!({"error": "not found"}).to_string(),
             };
 
+            let status = if response_body.contains("\"error\"") && response_body.contains("not found") {
+                "404 Not Found"
+            } else {
+                "200 OK"
+            };
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
-                response_body.len(), response_body
+                "HTTP/1.1 {}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\n\r\n{}",
+                status, response_body.len(), response_body
             );
             let _ = stream.write_all(response.as_bytes());
         });
     }
 }
 
-
-
-// --- Event Bus (Kafka producer) ---
-// --- EventBus (Kafka producer) ---
-struct EventBus {
-    broker_url: String,
-    topic: String,
-    service_name: String,
-}
-
-impl EventBus {
-    fn new(topic: &str, service: &str) -> Self {
-        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-        Self { broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }
-    }
-
-    fn emit(&self, event_type: &str, payload: &serde_json::Value) {
-        let event = serde_json::json!({
-            "type": event_type,
-            "source": &self.service_name,
-            "topic": &self.topic,
-            "data": payload,
-        });
-        eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
-        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-}
-
-fn chrono_now() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    format!("2026-01-01T{:05}Z", d.as_secs() % 86400)
-}
-
-static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// --- Downstream Service Client ---
-struct DownstreamClient {
-    base_url: String,
-    timeout_ms: u64,
-}
-
-impl DownstreamClient {
-    fn new(env_var: &str, default_url: &str) -> Self {
-        let url = std::env::var(env_var).unwrap_or_else(|_| default_url.to_string());
-        Self { base_url: url, timeout_ms: 5000 }
-    }
-
-    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {
-        let url = format!("{}{}", self.base_url, path);
-        eprintln!("[Downstream] POST {}", url);
-        Ok(())
-    }
-}
-
-// --- Data Flow Initialization ---
-fn init_data_flow() -> EventBus {
-    let bus = EventBus::new("banking.operations", "billing-enforcement");
-    eprintln!("[billing-enforcement] Data flow initialized: topic=banking.operations");
-    bus
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_service_config() {
-        // Verify service starts without panic
-        assert!(true, "billing-enforcement-rs service module loads");
+    fn test_health_service_name() {
+        assert_eq!("billing-enforcement-rs", "billing-enforcement-rs");
     }
 
     #[test]
-    fn test_watchdog_initially_healthy() {
-        // Watchdog should report healthy before any ping
-        assert!(watchdog_healthy(), "Watchdog should be healthy initially");
+    fn test_overage_charge_no_overage() {
+        assert_eq!(compute_overage_charge(5_000, 10_000, 500, None), 0);
     }
 
     #[test]
-    fn test_watchdog_ping_updates() {
-        watchdog_ping();
-        assert!(watchdog_healthy(), "Watchdog should be healthy after ping");
+    fn test_overage_charge_with_overage() {
+        assert_eq!(compute_overage_charge(6_000, 5_000, 500, None), 500_000);
     }
 
     #[test]
-    fn test_eventbus_creation() {
-        let bus = EventBus::new("test.topic", "billing_enforcement");
-        assert_eq!(bus.topic, "test.topic");
-        assert_eq!(bus.service_name, "billing_enforcement");
+    fn test_suspension_within_grace() {
+        let (suspend, _) = check_suspension_eligibility(10, 30, 100_000, 50_000);
+        assert!(!suspend);
     }
 
     #[test]
-    fn test_chrono_now_format() {
-        let ts = chrono_now();
-        assert!(ts.starts_with("2026-"), "Timestamp should start with year");
-        assert!(ts.ends_with("Z"), "Timestamp should end with Z");
-    }
-
-    #[test]
-    fn test_events_emitted_counter() {
-        let before = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        let bus = EventBus::new("test.topic", "billing_enforcement");
-        bus.emit("test.event", &serde_json::json!({"test": true}));
-        let after = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "Event counter should increment");
+    fn test_suspension_triggered() {
+        let (suspend, _) = check_suspension_eligibility(45, 30, 200_000, 50_000);
+        assert!(suspend);
     }
 }

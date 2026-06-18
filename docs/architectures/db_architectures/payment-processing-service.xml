@@ -1,0 +1,31 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Payment Processing Service DB Architecture" id="0">
+    <mxGraphModel dx="1414" dy="2010" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="note1" parent="1" style="text;html=1;strokeColor=#b85450;fillColor=#f8cecc;align=left;verticalAlign=top;spacingLeft=4;" value="Payment Processing is primarily a stateless&#xa;orchestrator. Transaction state is owned by:&#xa;  - TigerBeetle (ledger entries / balances)&#xa;  - Account service (account metadata)&#xa;  - Audit service (HTTP event log)&#xa;&#xa;QR codes use RSA signing (qr_private.key)&#xa;No dedicated tables — uses SQLAlchemy Base&#xa;(schema defined but minimal persistence)." vertex="1">
+          <mxGeometry height="180" width="360" x="40" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="transfer_flow" parent="1" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="TransferFlow (stateless)&#xa;----------------------&#xa;sender_account_id (varchar)&#xa;recipient_account_id (varchar)&#xa;amount (decimal)&#xa;currency (varchar)&#xa;narration (varchar)&#xa;transaction_type (varchar: p2p/bill/salary/...)&#xa;reference (varchar, UUID)&#xa;tenant_id (varchar)&#xa;keycloak_id (varchar)&#xa;&#xa;→ Debit TigerBeetle (sender)&#xa;→ Credit TigerBeetle (recipient)&#xa;→ Emit Kafka event" vertex="1">
+          <mxGeometry height="280" width="280" x="460" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="qr_flow" parent="1" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="QRPayment (stateless)&#xa;----------------------&#xa;qr_code (varchar, signed JWT)&#xa;amount (decimal)&#xa;merchant_id (varchar)&#xa;customer_id (varchar)&#xa;expiry (timestamp)&#xa;reference (varchar)&#xa;&#xa;→ RSA-signed payload&#xa;→ Validated at scan&#xa;→ Routed to transfer flow" vertex="1">
+          <mxGeometry height="220" width="280" x="460" y="360" as="geometry" />
+        </mxCell>
+        <mxCell id="deposit_flow" parent="1" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" value="DepositFlow (stateless)&#xa;----------------------&#xa;account_id (varchar)&#xa;amount (decimal)&#xa;channel (varchar: bank_transfer/agent/atm)&#xa;reference (varchar)&#xa;tenant_id (varchar)&#xa;&#xa;→ Credit TigerBeetle&#xa;→ Emit deposit event to Kafka" vertex="1">
+          <mxGeometry height="200" width="260" x="800" y="40" as="geometry" />
+        </mxCell>
+        <mxCell id="e1" edge="1" parent="1" source="transfer_flow" style="endArrow=none;dashed=1;strokeColor=#6c8ebf;" target="deposit_flow">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="qr_flow" style="endArrow=block;strokeColor=#82b366;" target="transfer_flow">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="Jlw4SiuEyk49Kks-3_jL-1" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="Text" vertex="1">
+          <mxGeometry height="30" width="60" x="580" y="-200" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

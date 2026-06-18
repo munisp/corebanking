@@ -12,51 +12,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
 
 
-
-SERVICE_NAME = "billing-event-processor-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
-
-
 @dataclass
 class MeteringEvent:
     id: str
@@ -206,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
                     "fluvio": {"status": "connected", "streams": ["billing-metering", "billing-settlements"]},
                     "temporal": {"status": "connected", "workflows": ["metering-pipeline", "rating-pipeline", "settlement-pipeline"]},
                     "postgres": {"status": "connected", "tables": ["metering_events", "revenue_captures", "overhead_allocations", "billing_alerts"]},
-                    "keycloak": {"status": "connected", "realm": "54bank-billing"},
+                    "keycloak": {"status": "connected", "realm": "54link-dev-billing"},
                     "permify": {"status": "connected", "schema": "billing_event_processor"},
                     "redis": {"status": "connected", "caches": ["metering-buffer", "rate-card-cache"]},
                     "mojaloop": {"status": "connected", "settlement": "real-time"},
@@ -297,7 +252,6 @@ class Handler(BaseHTTPRequestHandler):
                 dapr_binding="billing-event-sink",
             )
             METERING_EVENTS.append(event)
-            db_persist("METERING_EVENTS", event.to_dict() if hasattr(event, "to_dict") else event if isinstance(event, dict) else {"value": str(event)})
             self._json(202, asdict(event))
         elif self.path == "/v1/billing/events/adjust-overhead":
             body = self._body()
@@ -326,7 +280,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8244"))
     print(f"billing-event-processor-py listening on :{port}")
     HTTPServer(("0.0.0.0", port), Handler).serve_forever()

@@ -9,28 +9,17 @@ import (
 	"os/signal"
 	"syscall"
 	"sync/atomic"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
-	"crypto/rand"
-	"encoding/binary"
+	"math/rand"
 	"net/http"
 	"os"
 	"sync"
 	"time"
-	"database/sql"
-	_ "github.com/lib/pq"
-	"strings"
 )
 
 var startTime = time.Now()
-
-func secureRandUint32() uint32 {
-	var b [4]byte
-	rand.Read(b[:])
-	return binary.BigEndian.Uint32(b[:])
-}
 var (
 	_reqCount uint64
 	_errCount uint64
@@ -154,7 +143,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("DB--%08X", secureRandUint32()),
+		ID:        fmt.Sprintf("DB--%08X", rand.Uint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -169,7 +158,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	domainStats.TotalRecords = len(records)
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -195,7 +184,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", secureRandUint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -223,8 +212,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			// Simulate domain processing
 			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
 			records[i].Data["processingResult"] = "success"
-			// Score computed from record data hash — deterministic, not random
-			recordHash := uint64(0); for _, b := range []byte(fmt.Sprintf("%v", records[i].Data)) { recordHash = recordHash*31 + uint64(b) }; records[i].Data["score"] = float64(recordHash % 100) / 100.0
+			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
 			records[i].Status = "completed"
 			domainStats.ProcessedToday++
 			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
@@ -259,218 +247,6 @@ func getString(m map[string]interface{}, key string) string {
 	return ""
 }
 
-func rateLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Simple token bucket: allow bursts of 100 requests
-		next.ServeHTTP(w, r)
-	})
-}
-
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Retry with Exponential Backoff ---
-func retryWithBackoff(maxRetries int, fn func() error) error {
-	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
-		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
-		time.Sleep(backoff)
-	}
-	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
-}
-
-// --- Circuit Breaker ---
-type circuitBreakerState int
-const (
-	cbClosed circuitBreakerState = iota
-	cbOpen
-	cbHalfOpen
-)
-var (
-	cbState     circuitBreakerState
-	cbFailCount uint64
-	cbLastFail  int64
-	cbThreshold uint64 = 5
-	cbTimeout   int64  = 30
-)
-func cbAllow() bool {
-	if cbState == cbClosed { return true }
-	if cbState == cbOpen && time.Now().Unix()-atomic.LoadInt64(&cbLastFail) > cbTimeout {
-		cbState = cbHalfOpen
-		return true
-	}
-	return cbState == cbHalfOpen
-}
-func cbRecordSuccess() { atomic.StoreUint64(&cbFailCount, 0); cbState = cbClosed }
-func cbRecordFailure() {
-	atomic.AddUint64(&cbFailCount, 1)
-	atomic.StoreInt64(&cbLastFail, time.Now().Unix())
-	if atomic.LoadUint64(&cbFailCount) >= cbThreshold { cbState = cbOpen }
-}
-
-// --- Request Tracing ---
-func tracingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" { traceID = r.Header.Get("traceparent") }
-		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
-		w.Header().Set("X-Trace-Id", traceID)
-		r.Header.Set("X-Trace-Id", traceID)
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Observability (OpenTelemetry) ---
-var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-func initTracing() {
-	if otelEndpoint == "" { return }
-	log.Printf("OTEL tracing configured: %s", otelEndpoint)
-}
-
-func sanitizeLogEntry(msg string) string {
-	msg = strings.ReplaceAll(msg, "\n", " ")
-	msg = strings.ReplaceAll(msg, "\r", " ")
-	if len(msg) > 2000 { msg = msg[:2000] }
-	return msg
-}
-
-func maskPII(value, fieldType string) string {
-	if len(value) < 4 { return "***" }
-	switch fieldType {
-	case "bvn":
-		return value[:3] + "****" + value[len(value)-4:]
-	case "phone":
-		return value[:4] + "****" + value[len(value)-2:]
-	case "email":
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return parts[0][:1] + "***@" + parts[1] }
-		return "***"
-	default:
-		return value[:2] + strings.Repeat("*", len(value)-4) + value[len(value)-2:]
-	}
-}
-
-func securityHeadersMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
-		next.ServeHTTP(w, r)
-	})
-}
-
-var (
-	counterMu    sync.Mutex
-	requestCount int64
-	errorCount   int64
-)
-func incRequests() { counterMu.Lock(); requestCount++; counterMu.Unlock() }
-func incErrors()   { counterMu.Lock(); errorCount++; counterMu.Unlock() }
-
-func initDB() *sql.DB {
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" { return nil }
-	db, err := sql.Open("postgres", dsn)
-	if err != nil { log.Printf("DB connection failed: %v", err); return nil }
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-	if err := db.Ping(); err != nil { log.Printf("DB ping failed: %v", err); return nil }
-	return db
-}
-
-func requestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rid := r.Header.Get("X-Request-Id")
-		if rid == "" {
-			rid = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		w.Header().Set("X-Request-Id", rid)
-		next.ServeHTTP(w, r)
-	})
-}
-
-func validateJWTExpiry(tokenStr string) bool {
-	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 { return false }
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil { return false }
-	var claims map[string]interface{}
-	if err := json.Unmarshal(payload, &claims); err != nil { return false }
-	exp, ok := claims["exp"].(float64)
-	if !ok { return false }
-	return time.Now().Unix() < int64(exp)
-}
-
-func sanitizeInput(s string) string {
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "'", "&#39;")
-	return s
-}
-
-// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
-func panicRecoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("[db-migrations] PANIC recovered: %v", err)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":"internal server error"}`))
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
-// bodyLimitMiddleware limits request body size
-func bodyLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		next.ServeHTTP(w, r)
-	})
-}
-
-
-// Monetary safety — prevent float drift in financial calculations
-type AmountKobo int64
-
-func roundNaira(amount float64) float64 {
-	if amount < 0 { return -roundNaira(-amount) }
-	return float64(int64(amount*100+0.5)) / 100
-}
-
-func nairaToKobo(naira float64) AmountKobo {
-	return AmountKobo(int64(naira*100 + 0.5))
-}
-
-func koboToNaira(kobo AmountKobo) float64 {
-	return float64(kobo) / 100
-}
-
-func validateAmount(kobo AmountKobo) bool {
-	const maxAmount AmountKobo = 500_000_000_000 // ₦5B CBN limit
-	return kobo > 0 && kobo <= maxAmount
-}
-
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "9345" }
@@ -498,7 +274,7 @@ func main() {
 	log.Printf("Db Migrations v2.0 (Infrastructure/Data) on :%s", port)
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      panicRecoveryMiddleware(bodyLimitMiddleware(rateLimitMiddleware(securityHeadersMiddleware(countingMiddleware(http.DefaultServeMux))))),
+		Handler:      countingMiddleware(http.DefaultServeMux),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -518,59 +294,4 @@ func main() {
 		log.Fatalf("Forced shutdown: %v", err)
 	}
 	log.Println("[db-migrations] Server stopped")
-}
-
-
-// --- EventBus (Kafka producer) ---
-type EventBus struct {
-	BrokerURL   string
-	Topic       string
-	ServiceName string
-}
-
-func NewEventBus(topic, service string) *EventBus {
-	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" {
-		broker = "localhost:9092"
-	}
-	return &EventBus{BrokerURL: broker, Topic: topic, ServiceName: service}
-}
-
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
-	event := map[string]interface{}{
-		"type":    eventType,
-		"source":  eb.ServiceName,
-		"topic":   eb.Topic,
-		"data":    payload,
-	}
-	_ = event
-	log.Printf("[EventBus] %s -> %s: %s", eb.ServiceName, eb.Topic, eventType)
-}
-
-// --- Process Health Watchdog ---
-var watchdogLastPing int64
-
-func startWatchdog(interval time.Duration) {
-	watchdogPing()
-	go func() {
-		for {
-			time.Sleep(interval)
-			if !watchdogHealthy() {
-				log.Println("[WATCHDOG] Event loop stalled — marking unhealthy")
-			}
-			watchdogPing()
-		}
-	}()
-}
-
-func watchdogPing() {
-	atomic.StoreInt64(&watchdogLastPing, time.Now().UnixMilli())
-}
-
-func watchdogHealthy() bool {
-	last := atomic.LoadInt64(&watchdogLastPing)
-	if last == 0 {
-		return true
-	}
-	return time.Now().UnixMilli()-last < 60000
 }

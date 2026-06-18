@@ -1,4 +1,4 @@
-module github.com/54bank/equipment-leasing-go
+module github.com/54link-dev/equipment-leasing-go
 
 go 1.21
 

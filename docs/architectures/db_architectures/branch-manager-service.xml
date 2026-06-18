@@ -1,0 +1,66 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Branch Manager Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- BRANCH (core) -->
+        <mxCell id="branch" value="Branch&#xa;----------------------&#xa;branch_id (PK, varchar)&#xa;tenant_id (varchar)&#xa;branch_name / branch_code (varchar)&#xa;branch_type (varchar: full/mini/agency/digital)&#xa;address / city / state / lga (varchar)&#xa;phone / email (varchar)&#xa;manager_id (FK -> BranchStaff)&#xa;status (varchar: active/inactive/suspended)&#xa;opening_time / closing_time (time)&#xa;working_days (JSONB array)&#xa;cash_limit / daily_transaction_limit (bigint)&#xa;coordinates lat/lng (float)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="360" y="40" width="300" height="360" as="geometry"/>
+        </mxCell>
+
+        <!-- BRANCH STAFF -->
+        <mxCell id="branch_staff" value="BranchStaff&#xa;----------------------&#xa;staff_id (PK, varchar)&#xa;branch_id (FK -> Branch)&#xa;tenant_id (varchar)&#xa;employee_id (varchar)&#xa;first_name / last_name (varchar)&#xa;email / phone (varchar)&#xa;role (varchar: teller/officer/supervisor/manager)&#xa;department (varchar)&#xa;status (varchar: active/on_leave/suspended)&#xa;permissions (JSONB)&#xa;hire_date (date)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="280" height="320" as="geometry"/>
+        </mxCell>
+
+        <!-- STAFF SCHEDULES -->
+        <mxCell id="schedules" value="StaffSchedule&#xa;----------------------&#xa;schedule_id (PK, varchar)&#xa;branch_id (FK -> Branch)&#xa;staff_id (FK -> BranchStaff)&#xa;shift_type (varchar: morning/afternoon/night)&#xa;shift_date (date)&#xa;start_time / end_time (time)&#xa;status (varchar: scheduled/completed/absent)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="400" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- LEAVE REQUESTS -->
+        <mxCell id="leave_requests" value="LeaveRequest&#xa;----------------------&#xa;leave_id (PK, varchar)&#xa;staff_id (FK -> BranchStaff)&#xa;branch_id (FK)&#xa;tenant_id (varchar)&#xa;leave_type (varchar: annual/sick/maternity/emergency)&#xa;start_date / end_date (date)&#xa;reason (text)&#xa;status (varchar: pending/approved/rejected)&#xa;approved_by / approved_at&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="680" width="280" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- BRANCH TARGETS -->
+        <mxCell id="targets" value="BranchTarget&#xa;----------------------&#xa;target_id (PK, varchar)&#xa;branch_id (FK -> Branch)&#xa;tenant_id (varchar)&#xa;period_type (varchar: monthly/quarterly/annual)&#xa;period_start / period_end (date)&#xa;target_type (varchar: deposits/loans/accounts/revenue)&#xa;target_value (bigint)&#xa;achieved_value (bigint)&#xa;status (varchar: active/achieved/missed)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="720" y="40" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- CASH MANAGEMENT -->
+        <mxCell id="cash_management" value="CashManagement&#xa;----------------------&#xa;cash_id (PK, varchar)&#xa;branch_id (FK -> Branch)&#xa;tenant_id (varchar)&#xa;request_type (varchar: replenishment/transfer/vault)&#xa;amount (bigint)&#xa;currency (varchar)&#xa;from_branch_id / to_branch_id (varchar)&#xa;authorized_by / approved_by (varchar)&#xa;status (varchar: pending/approved/completed/rejected)&#xa;reason (text)&#xa;created_at / completed_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="720" y="360" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- BRANCH INCIDENTS -->
+        <mxCell id="incidents" value="BranchIncident&#xa;----------------------&#xa;incident_id (PK, varchar)&#xa;branch_id (FK -> Branch)&#xa;tenant_id (varchar)&#xa;incident_type (varchar: security/operational/compliance/...)&#xa;severity (varchar: low/medium/high/critical)&#xa;title / description (text)&#xa;reported_by (varchar)&#xa;status (varchar: open/investigating/resolved/closed)&#xa;resolved_by / resolved_at&#xa;resolution_notes (text)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="360" y="440" width="300" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="branch" target="branch_staff" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="branch_staff" target="schedules" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="branch_staff" target="leave_requests" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="branch" target="targets" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="branch" target="cash_management" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="branch" target="incidents" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

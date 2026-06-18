@@ -1,0 +1,33 @@
+# cbn-agsmeis-go
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: 54link-dev-cbn-agsmeis-go-route
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-1
+      priority: 10
+      match:
+        hosts:
+          - 54link-dev.upi.dev
+        paths:
+          - /cbn-agsmeis/*
+      backends:
+        - serviceName: compliance-regulatory
+          servicePort: 9248
+      plugins:
+        - name: proxy-rewrite
+          enable: true
+          config:
+            regex_uri:
+              - "^/cbn-agsmeis/(.*)"
+              - "/$1"
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"

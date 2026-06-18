@@ -1,4 +1,4 @@
-module github.com/54bank/cbn-anchor-borrowers-go
+module github.com/54link-dev/cbn-anchor-borrowers-go
 
 go 1.21
 

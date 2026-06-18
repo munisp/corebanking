@@ -8,7 +8,7 @@ MW = {
     "redis": {"url": os.environ.get("REDIS_URL", "redis://localhost:6379")},
     "postgres": {"url": os.environ.get("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db")},
     "opensearch": {"url": os.environ.get("OPENSEARCH_URL", "http://localhost:9200")},
-    "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank"},
+    "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev"},
     "permify": {"url": os.environ.get("PERMIFY_URL", "http://localhost:3476")},
     "dapr": {"url": os.environ.get("DAPR_URL", "http://localhost:3500"), "app_id": "insurance-py"},
     "fluvio": {"url": os.environ.get("FLUVIO_URL", "localhost:9003")},

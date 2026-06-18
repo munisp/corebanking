@@ -1,0 +1,33 @@
+# db-migration-manager-go
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: 54link-dev-db-migration-manager-go-route
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-1
+      priority: 10
+      match:
+        hosts:
+          - 54link-dev.upi.dev
+        paths:
+          - /db-migration-manager/*
+      backends:
+        - serviceName: infra-database
+          servicePort: 9403
+      plugins:
+        - name: proxy-rewrite
+          enable: true
+          config:
+            regex_uri:
+              - "^/db-migration-manager/(.*)"
+              - "/$1"
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"

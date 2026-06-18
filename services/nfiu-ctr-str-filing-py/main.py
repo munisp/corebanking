@@ -1,1554 +1,909 @@
-import sys; sys.path.insert(0, '/home/ubuntu/repos/corebanking/libs/banking-rules-py')
-
-# --- PII Masking (NDPR Compliance) ---
-import re as _pii_re
-
-def mask_pii(value: str, field_type: str = "generic") -> str:
-    if not value: return "***"
-    if field_type in ("bvn", "nin"):
-        return f"***{value[-4:]}" if len(value) >= 4 else "***"
-    elif field_type == "phone":
-        return f"+234***{value[-4:]}" if len(value) >= 4 else "+234***"
-    elif field_type == "email" and "@" in value:
-        local, domain = value.split("@", 1)
-        return f"{local[0]}***@{domain}"
-    elif field_type == "account":
-        return f"****{value[-4:]}" if len(value) >= 4 else "****"
-    return f"{value[0]}***{value[-1]}" if len(value) > 2 else "***"
-
-def sanitize_log(msg: str) -> str:
-    msg = _pii_re.sub(r"\b\d{11}\b", lambda m: f"***{m.group()[-4:]}", msg)
-    msg = _pii_re.sub(r"\b\d{10}\b", lambda m: f"****{m.group()[-4:]}", msg)
-    msg = _pii_re.sub(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "***@***", msg)
-    return msg
-
 """
-nfiu-ctr-str-filing-py — Production-hardened service
+NFIU CTR/STR Filing Service — Production Implementation
+
+Generates FATF goAML-compliant XML filings for the Nigeria Financial
+Intelligence Unit (NFIU) per CBN AML/CFT Regulations 2022 and NFIU
+goAML Filing Guide v3.0:
+
+  CTR (Currency Transaction Report):
+    • Individual: transactions ≥ ₦5,000,000
+    • Corporate:  transactions ≥ ₦10,000,000
+    • Deadline:   same business day (by 23:59)
+
+  STR (Suspicious Transaction Report):
+    • Any amount — triggered by AML rules or manual referral
+    • Deadline:   within 72 hours of detection
+    • Tipping-off restriction enforced
+
+XML Format: FATF goAML v3.1 (NFIU-adapted)
+Submission:  HTTPS POST to NFIU goAML portal
+SLA:        Tracked per filing; breach alerts sent via Dapr pub/sub
+
+Port: 8283
+
+Required environment variables:
+  DATABASE_URL        — PostgreSQL DSN
+  GOAML_API_URL       — NFIU goAML portal endpoint
+  GOAML_API_KEY       — NFIU API key / bearer token
+  GOAML_BANK_CODE     — CBN bank code (e.g. "044" for Access Bank)
+  GOAML_REPORTER_NAME — Registered institution name in goAML
+  DAPR_URL            — Dapr sidecar URL (default: http://localhost:3500)
+  DAPR_PUBSUB         — Dapr pub/sub component (default: nfiu-pubsub)
 """
+
+from __future__ import annotations
+
 import os
-import sys
-import json
-import urllib.request
-import time
-import signal
-import logging
-import threading
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-from datetime import datetime, timezone
-
-# --- Structured Logging ---
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "service": "nfiu-ctr-str-filing-py",
-            "message": record.getMessage(),
-        })
-
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[handler])
-logger = logging.getLogger("nfiu-ctr-str-filing-py")
-
-# --- Redis Caching Layer ---
-import socket as _socket
-
-# Rate limiting
-import threading as _rl_threading
-_rl_tokens = 100
-_rl_lock = _rl_threading.Lock()
-_rl_last_refill = [0.0]
-
-def _rl_allow():
-    global _rl_tokens
-    import time as _t
-    now = _t.time()
-    with _rl_lock:
-        if now - _rl_last_refill[0] >= 1.0:
-            _rl_tokens = 100
-            _rl_last_refill[0] = now
-        if _rl_tokens <= 0:
-            return False
-        _rl_tokens -= 1
-        return True
-
-# --- Production Cache (connection-pooled, multi-level L1+L2, stampede protection, metrics) ---
-import socket as _cache_socket
-import threading as _cache_threading
-
-_REDIS_URL = os.environ.get("REDIS_URL", "localhost:6379")
-_CACHE_POOL_SIZE = int(os.environ.get("REDIS_POOL_SIZE", "8"))
-
-class _CachePool:
-    """Thread-safe Redis connection pool with health checks."""
-    def __init__(self, url, size=8):
-        parts = url.rsplit(":", 1)
-        self.host = parts[0] if parts else "localhost"
-        self.port = int(parts[1]) if len(parts) > 1 else 6379
-        self.pool = []
-        self.lock = _cache_threading.Lock()
-        self.max_size = size
-        # Pre-warm 2 connections
-        for _ in range(2):
-            c = self._dial()
-            if c: self.pool.append(c)
-
-    def _dial(self):
-        try:
-            s = _cache_socket.create_connection((self.host, self.port), timeout=2)
-            s.settimeout(3)
-            s.sendall(b"*1\r\n$4\r\nPING\r\n")
-            resp = s.recv(64)
-            if resp and resp[0:1] == b'+':
-                return s
-            s.close()
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
-        return None
-
-    def get(self):
-        with self.lock:
-            while self.pool:
-                conn = self.pool.pop()
-                try:
-                    conn.settimeout(1)
-                    conn.sendall(b"*1\r\n$4\r\nPING\r\n")
-                    r = conn.recv(64)
-                    if r and r[0:1] == b'+':
-                        conn.settimeout(3)
-                        return conn
-                except Exception as _exc:
-                    logger.debug(f"Suppressed error: {_exc}")
-                try: conn.close()
-                except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-        return self._dial()
-
-    def put(self, conn):
-        if conn is None: return
-        with self.lock:
-            if len(self.pool) < self.max_size:
-                self.pool.append(conn)
-            else:
-                try: conn.close()
-                except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-    def health(self):
-        c = self.get()
-        if c:
-            self.put(c)
-            return True
-        return False
-
-_cache_pool = _CachePool(_REDIS_URL, _CACHE_POOL_SIZE)
-_l1_cache = {}  # key -> (value, expiry_time)
-_l1_lock = _cache_threading.Lock()
-_l1_max_size = int(os.environ.get("CACHE_L1_MAX_SIZE", "500"))
-_cache_hits = 0
-_cache_misses = 0
-_cache_stampedes = 0
-_cache_metrics_lock = _cache_threading.Lock()
-
-def _l1_get(key):
-    with _l1_lock:
-        entry = _l1_cache.get(key)
-        if entry:
-            val, exp = entry
-            if time.time() < exp:
-                return val
-            del _l1_cache[key]
-    return None
-
-def _l1_set(key, value, ttl=10):
-    with _l1_lock:
-        if len(_l1_cache) >= _l1_max_size:
-            # Evict oldest
-            oldest_k = min(_l1_cache, key=lambda k: _l1_cache[k][1])
-            del _l1_cache[oldest_k]
-        _l1_cache[key] = (value, time.time() + ttl)
-
-def _l1_delete(key):
-    with _l1_lock:
-        _l1_cache.pop(key, None)
-
-def cache_get(key):
-    global _cache_hits, _cache_misses
-    # L1: in-process
-    val = _l1_get(key)
-    if val is not None:
-        with _cache_metrics_lock: _cache_hits += 1
-        return val
-    # L2: Redis via pool
-    conn = _cache_pool.get()
-    if conn is None:
-        with _cache_metrics_lock: _cache_misses += 1
-        return None
-    try:
-        conn.sendall(f"*2\r\n$3\r\nGET\r\n${len(key)}\r\n{key}\r\n".encode())
-        data = conn.recv(8192).decode()
-        _cache_pool.put(conn)
-        if data.startswith("$-1"):
-            with _cache_metrics_lock: _cache_misses += 1
-            return None
-        parts = data.split("\r\n", 2)
-        if len(parts) >= 3 and parts[1]:
-            with _cache_metrics_lock: _cache_hits += 1
-            _l1_set(key, parts[1])  # Promote to L1
-            return parts[1]
-    except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-    with _cache_metrics_lock: _cache_misses += 1
-    return None
-
-def cache_set(key, value, ttl=300):
-    # L1 store
-    _l1_set(key, str(value), min(ttl, 30))
-    # L2: Redis via pool
-    conn = _cache_pool.get()
-    if conn is None: return
-    try:
-        v = str(value)
-        t = str(ttl)
-        cmd = f"*6\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(v)}\r\n{v}\r\n$2\r\nEX\r\n${len(t)}\r\n{t}\r\n$2\r\nNX\r\n"
-        conn.sendall(cmd.encode())
-        conn.recv(256)
-        _cache_pool.put(conn)
-    except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-def cache_invalidate(key):
-    _l1_delete(key)
-    conn = _cache_pool.get()
-    if conn is None: return
-    try:
-        conn.sendall(f"*2\r\n$3\r\nDEL\r\n${len(key)}\r\n{key}\r\n".encode())
-        conn.recv(64)
-        # Distributed invalidation via PUBLISH
-        channel = "54bank:cache:invalidate"
-        conn.sendall(f"*3\r\n$7\r\nPUBLISH\r\n${len(channel)}\r\n{channel}\r\n${len(key)}\r\n{key}\r\n".encode())
-        conn.recv(64)
-        _cache_pool.put(conn)
-    except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-def cache_get_or_load(key, loader, ttl=300):
-    """Get from cache or load with stampede protection."""
-    global _cache_stampedes
-    val = cache_get(key)
-    if val is not None: return val
-    # Stampede lock via SETNX
-    lock_key = key + ":lock"
-    conn = _cache_pool.get()
-    if conn:
-        try:
-            conn.sendall(f"*6\r\n$3\r\nSET\r\n${len(lock_key)}\r\n{lock_key}\r\n$1\r\n1\r\n$2\r\nNX\r\n$2\r\nEX\r\n$1\r\n5\r\n".encode())
-            resp = conn.recv(64).decode()
-            _cache_pool.put(conn)
-            if "$-1" in resp or resp.startswith("-"):
-                with _cache_metrics_lock: _cache_stampedes += 1
-                time.sleep(0.05)
-                val = cache_get(key)
-                if val is not None: return val
-        except Exception:
-            try: conn.close()
-            except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-    # Load from source
-    result = loader()
-    if result is not None:
-        cache_set(key, result if isinstance(result, str) else json.dumps(result, default=str), ttl)
-    return result
-
-def cache_metrics():
-    with _cache_metrics_lock:
-        total = _cache_hits + _cache_misses
-        rate = (_cache_hits / total * 100) if total > 0 else 0
-    return {
-        "hits": _cache_hits, "misses": _cache_misses,
-        "hit_rate_pct": round(rate, 2),
-        "stampedes_prevented": _cache_stampedes,
-        "l1_size": len(_l1_cache),
-        "pool_connected": _cache_pool.health(),
-    }
-
-# --- gRPC Server (binary protocol, length-prefixed, with circuit breaker + retry) ---
-import socket as _grpc_socket
-import struct as _grpc_struct
-import threading as _grpc_threading
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Deep Domain Logic — Production-Ready Business Rules
-# ══════════════════════════════════════════════════════════════════════════════
-
-class AmountKobo:
-    """Monetary amounts in kobo (smallest unit) to avoid float precision errors."""
-    __slots__ = ('_value',)
-
-    def __init__(self, kobo: int):
-        self._value = int(kobo)
-
-    @classmethod
-    def from_naira(cls, naira: float) -> 'AmountKobo':
-        return cls(int(round(naira * 100)))
-
-    @property
-    def kobo(self) -> int:
-        return self._value
-
-    @property
-    def naira(self) -> float:
-        return self._value / 100.0
-
-    def __repr__(self):
-        return f"₦{self._value // 100}.{abs(self._value % 100):02d}"
-
-    def __add__(self, other): return AmountKobo(self._value + other._value)
-    def __sub__(self, other): return AmountKobo(self._value - other._value)
-    def __gt__(self, other): return self._value > other._value
-    def __ge__(self, other): return self._value >= other._value
-    def __lt__(self, other): return self._value < other._value
-    def __eq__(self, other): return self._value == other._value
-
-
-# ── State Machine ────────────────────────────────────────────────────────────
-
-class StateMachine:
-    """Formal state machine with transition guards."""
-
-    TRANSITIONS = {
-        "draft": ["submitted", "cancelled"],
-        "submitted": ["under_review", "rejected", "cancelled"],
-        "under_review": ["approved", "rejected"],
-        "approved": ["processing", "cancelled"],
-        "processing": ["completed", "failed"],
-        "completed": ["reversed"],
-        "failed": ["submitted"],  # retry
-    }
-
-    @classmethod
-    def can_transition(cls, from_state: str, to_state: str) -> bool:
-        allowed = cls.TRANSITIONS.get(from_state, [])
-        return to_state in allowed
-
-    @classmethod
-    def transition(cls, entity_id: str, from_state: str, to_state: str) -> dict:
-        if not cls.can_transition(from_state, to_state):
-            return {"error": f"Invalid transition: {from_state} → {to_state}", "entity_id": entity_id}
-        return {"entity_id": entity_id, "from": from_state, "to": to_state, "transitioned_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ")}
-
-
-# ── Nigerian Regulatory Rules ────────────────────────────────────────────────
-
-CBN_TIER_LIMITS = {
-    "tier1": {"max_single_debit_kobo": 5_000_000, "max_daily_kobo": 30_000_000, "max_balance_kobo": 30_000_000, "required_docs": ["phone"]},
-    "tier2": {"max_single_debit_kobo": 20_000_000, "max_daily_kobo": 50_000_000, "max_balance_kobo": 50_000_000, "required_docs": ["bvn", "phone", "dob"]},
-    "tier3": {"max_single_debit_kobo": 500_000_000, "max_daily_kobo": 1_000_000_000, "max_balance_kobo": 0, "required_docs": ["bvn", "nin", "address_proof", "passport_photo", "utility_bill"]},
-}
-
-def validate_tier_transaction(tier: str, amount_kobo: int, daily_total_kobo: int) -> tuple:
-    """Validate transaction against CBN tier limits."""
-    limits = CBN_TIER_LIMITS.get(tier)
-    if not limits:
-        return False, "Unknown KYC tier"
-    if amount_kobo > limits["max_single_debit_kobo"]:
-        return False, f"Exceeds {tier} single debit limit ₦{limits['max_single_debit_kobo'] // 100:,}"
-    if daily_total_kobo + amount_kobo > limits["max_daily_kobo"]:
-        return False, f"Exceeds {tier} daily cumulative limit ₦{limits['max_daily_kobo'] // 100:,}"
-    return True, ""
-
-
-def validate_bvn(bvn: str) -> tuple:
-    """Validate Bank Verification Number (11 digits)."""
-    if len(bvn) != 11:
-        return False, "BVN must be 11 digits"
-    if not bvn.isdigit():
-        return False, "BVN must contain only digits"
-    if bvn[:2] == "00":
-        return False, "Invalid BVN issuer code"
-    return True, ""
-
-
-def validate_nin(nin: str) -> tuple:
-    """Validate National Identification Number (11 digits)."""
-    if len(nin) != 11:
-        return False, "NIN must be 11 digits"
-    if not nin.isdigit():
-        return False, "NIN must contain only digits"
-    return True, ""
-
-
-def validate_nuban(bank_code: str, account_number: str) -> tuple:
-    """Validate NUBAN (Nigerian Uniform Bank Account Number) with check digit."""
-    if len(account_number) != 10:
-        return False, "NUBAN must be 10 digits"
-    if len(bank_code) != 3:
-        return False, "Bank code must be 3 digits"
-    serial = bank_code + account_number[:9]
-    weights = [3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3]
-    total = sum(int(serial[i]) * weights[i] for i in range(min(len(serial), len(weights))))
-    check_digit = (10 - (total % 10)) % 10
-    if check_digit != int(account_number[9]):
-        return False, f"NUBAN check digit mismatch: expected {check_digit}"
-    return True, ""
-
-
-# ── NFIU Threshold Reporting ─────────────────────────────────────────────────
-
-def check_nfiu_threshold(amount_kobo: int, txn_type: str) -> tuple:
-    """Check if transaction triggers NFIU Currency Transaction Report."""
-    if txn_type in ("cash_deposit", "cash_withdrawal"):
-        if amount_kobo >= 500_000_000:  # ₦5M
-            return True, "NFIU: Cash transaction ≥₦5M requires CTR filing"
-    elif txn_type in ("transfer", "wire"):
-        if amount_kobo >= 1_000_000_000:  # ₦10M
-            return True, "NFIU: Transfer ≥₦10M requires CTR filing"
-    return False, ""
-
-
-def generate_ctr(customer_id: str, txn_id: str, amount_kobo: int, txn_type: str) -> dict:
-    """Generate Currency Transaction Report for NFIU."""
-    import time
-    threshold_hit, reason = check_nfiu_threshold(amount_kobo, txn_type)
-    if not threshold_hit:
-        return None
-    return {
-        "report_id": f"CTR-{int(time.time()*1000)}",
-        "customer_id": customer_id,
-        "transaction_id": txn_id,
-        "amount_kobo": amount_kobo,
-        "type": txn_type,
-        "reason": reason,
-        "filed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "status": "pending",
-    }
-
-
-# ── AML Risk Scoring ─────────────────────────────────────────────────────────
-
-SANCTIONED_COUNTRIES = {"KP", "IR", "SY", "CU", "VE", "MM", "BY", "ZW", "SD"}
-
-def compute_aml_risk_score(
-    txn_amount_kobo: int, is_pep: bool = False, is_high_risk_country: bool = False,
-    cash_intensive: bool = False, is_structuring: bool = False,
-    has_adverse_media: bool = False, account_age_months: int = 12
-) -> tuple:
-    """Multi-factor AML risk scoring."""
-    score = 0.0
-    indicators = []
-    if is_pep: score += 30; indicators.append("PEP_STATUS")
-    if is_high_risk_country: score += 25; indicators.append("HIGH_RISK_JURISDICTION")
-    if cash_intensive: score += 15; indicators.append("CASH_INTENSIVE")
-    if is_structuring: score += 35; indicators.append("STRUCTURING_DETECTED")
-    if has_adverse_media: score += 20; indicators.append("ADVERSE_MEDIA")
-    if txn_amount_kobo > 1_000_000_000: score += 10; indicators.append("HIGH_VALUE_TXN")
-    if account_age_months < 3: score += 10; indicators.append("NEW_ACCOUNT")
-    return min(score, 100.0), indicators
-
-
-def detect_structuring(transactions: list, threshold_kobo: int = 500_000_000) -> bool:
-    """Detect structuring: multiple just-below-threshold transactions."""
-    count = sum(1 for t in transactions if t.get("amount_kobo", 0) >= threshold_kobo * 0.8 and t.get("amount_kobo", 0) < threshold_kobo)
-    return count >= 3
-
-
-# ── Financial Calculations ───────────────────────────────────────────────────
-
-def compute_emi(principal_kobo: int, annual_rate_pct: float, tenor_months: int) -> int:
-    """Compute Equated Monthly Installment in kobo."""
-    if tenor_months <= 0: return 0
-    if annual_rate_pct == 0: return principal_kobo // tenor_months
-    monthly_rate = annual_rate_pct / 12.0 / 100.0
-    power = (1 + monthly_rate) ** tenor_months
-    emi = principal_kobo * monthly_rate * power / (power - 1)
-    return int(round(emi))
-
-
-def generate_amortization_schedule(principal_kobo: int, annual_rate_pct: float, tenor_months: int) -> list:
-    """Generate full amortization schedule."""
-    if tenor_months <= 0: return []
-    monthly_rate = annual_rate_pct / 12.0 / 100.0
-    emi = compute_emi(principal_kobo, annual_rate_pct, tenor_months)
-    schedule = []
-    balance = principal_kobo
-    cumulative_interest = 0
-    for period in range(1, tenor_months + 1):
-        interest = int(balance * monthly_rate)
-        principal_part = emi - interest
-        if period == tenor_months: principal_part = balance  # settle rounding
-        balance -= principal_part
-        cumulative_interest += interest
-        schedule.append({
-            "period": period, "emi_kobo": emi, "principal_kobo": principal_part,
-            "interest_kobo": interest, "balance_kobo": max(balance, 0),
-            "cumulative_interest_kobo": cumulative_interest,
-        })
-    return schedule
-
-
-def compute_dti(monthly_income_kobo: int, existing_debt_kobo: int, proposed_emi_kobo: int) -> float:
-    """Compute Debt-to-Income ratio as percentage."""
-    if monthly_income_kobo <= 0: return 100.0
-    return (existing_debt_kobo + proposed_emi_kobo) / monthly_income_kobo * 100.0
-
-
-def compute_provisioning_rate(days_past_due: int) -> float:
-    """CBN Prudential Guidelines provisioning rates."""
-    if days_past_due <= 90: return 1.0      # Performing
-    if days_past_due <= 180: return 10.0    # Watchlist
-    if days_past_due <= 360: return 50.0    # Substandard
-    if days_past_due <= 720: return 75.0    # Doubtful
-    return 100.0                              # Lost
-
-
-def compute_interest_daily_accrual(balance_kobo: int, annual_rate_pct: float) -> int:
-    """Daily interest accrual for savings accounts."""
-    daily_rate = annual_rate_pct / 365.0 / 100.0
-    return int(balance_kobo * daily_rate)
-
-
-def compute_wht(interest_kobo: int) -> int:
-    """Withholding Tax on interest — 10% per Nigerian tax law."""
-    return int(interest_kobo * 0.10)
-
-
-# ── Validation with Error Accumulation ───────────────────────────────────────
-
-def validate_loan_application(
-    customer_id: str, amount_kobo: int, tenor_months: int, annual_rate: float,
-    monthly_income_kobo: int, existing_debt_kobo: int, kyc_level: str,
-    employment_years: float = 0, age: int = 30,
-) -> tuple:
-    """Comprehensive loan validation with error accumulation."""
-    errors = []
-    if amount_kobo < 1_000_000: errors.append("Amount below CBN minimum ₦10,000")
-    if amount_kobo > 5_000_000_000: errors.append("Amount exceeds ₦50M max single obligor limit")
-    if tenor_months < 1: errors.append("Tenor must be at least 1 month")
-    if tenor_months > 360: errors.append("Tenor exceeds 30-year maximum")
-    if annual_rate <= 0: errors.append("Interest rate must be positive")
-    if annual_rate > 30: errors.append("Rate exceeds CBN maximum lending rate")
-
-    # DTI check
-    emi = compute_emi(amount_kobo, annual_rate, tenor_months)
-    dti = compute_dti(monthly_income_kobo, existing_debt_kobo, emi)
-    if dti > 60: errors.append(f"DTI ratio {dti:.1f}% exceeds 60% maximum")
-
-    # KYC tier limits
-    tier_limits = {"tier1": 30_000_000, "tier2": 500_000_000, "tier3": 0}
-    if kyc_level in tier_limits and tier_limits[kyc_level] > 0:
-        if amount_kobo > tier_limits[kyc_level]:
-            errors.append(f"{kyc_level} KYC max loan ₦{tier_limits[kyc_level] // 100:,}")
-
-    # Age check
-    if age < 18: errors.append("Applicant must be 18+")
-    if age + tenor_months // 12 > 65: errors.append(f"Applicant will be {age + tenor_months // 12} at maturity (max 65)")
-
-    # Employment
-    if employment_years < 0.5: errors.append("Minimum 6 months employment required")
-
-    return len(errors) == 0, errors
-
-
-# ── Payment Reversal & Reconciliation ────────────────────────────────────────
-
-def reverse_transaction(txn_id: str, amount_kobo: int, sender: str, receiver: str, reason: str) -> dict:
-    """Generate reversal with GL entries."""
-    import time
-    return {
-        "reversal_id": f"REV-{txn_id}-{int(time.time()*1000)}",
-        "original_txn_id": txn_id,
-        "amount_kobo": amount_kobo,
-        "reason": reason,
-        "status": "reversed",
-        "reversed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "gl_entries": [
-            {"debit": receiver, "credit": sender, "amount_kobo": amount_kobo, "narration": f"Reversal: {reason}"},
-        ],
-    }
-
-
-def reconcile_transactions(internal: list, external: list) -> dict:
-    """Match internal records vs external (NIBSS/processor) records."""
-    ext_map = {t.get("session_id", ""): t for t in external if t.get("session_id")}
-    matched, unmatched, amount_mismatches = 0, 0, 0
-    for txn in internal:
-        sid = txn.get("session_id", "")
-        if sid in ext_map:
-            if txn.get("amount_kobo") == ext_map[sid].get("amount_kobo"):
-                matched += 1
-            else:
-                amount_mismatches += 1
-        else:
-            unmatched += 1
-    return {
-        "matched": matched, "unmatched": unmatched,
-        "amount_mismatches": amount_mismatches,
-        "total_internal": len(internal), "total_external": len(external),
-        "exceptions": len(external) - matched,
-    }
-
-
-# ── Velocity & Fraud Detection ───────────────────────────────────────────────
-
-VELOCITY_RULES = [
-    {"max_amount_kobo": 490_000_000, "max_count": 3, "window_hours": 24, "description": "3x near-threshold in 24h"},
-    {"max_amount_kobo": 100_000_000, "max_count": 10, "window_hours": 1, "description": "10 transfers in 1h"},
-    {"max_amount_kobo": 50_000_000, "max_count": 20, "window_hours": 24, "description": "20 transfers in 24h"},
+import logging
+import asyncio
+from datetime import datetime, timedelta, timezone, date
+from decimal import Decimal
+from enum import Enum
+from typing import Optional, List
+from contextlib import asynccontextmanager
+from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.dom.minidom import parseString
+
+import asyncpg
+import httpx
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from pydantic import BaseModel, field_validator
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("nfiu-ctr-str")
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+GOAML_API_URL = os.getenv("GOAML_API_URL", "").rstrip("/")
+GOAML_API_KEY = os.getenv("GOAML_API_KEY", "")
+GOAML_BANK_CODE = os.getenv("GOAML_BANK_CODE", "054")
+GOAML_REPORTER_NAME = os.getenv("GOAML_REPORTER_NAME", "54link-dev")
+DAPR_URL = os.getenv("DAPR_URL", "http://localhost:3500").rstrip("/")
+DAPR_PUBSUB = os.getenv("DAPR_PUBSUB", "nfiu-pubsub")
+
+# CBN AML thresholds (in kobo)
+CTR_INDIVIDUAL_THRESHOLD_KOBO = 500_000_000   # ₦5,000,000
+CTR_CORPORATE_THRESHOLD_KOBO  = 1_000_000_000 # ₦10,000,000
+STR_SLA_HOURS = 72
+CTR_SLA_EOD = True  # CTR must be filed same business day
+
+_CORS_ORIGINS = [
+    o.strip()
+    for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://localhost:8080").split(",")
+    if o.strip()
 ]
 
-def check_velocity(recent_transactions: list, new_amount_kobo: int) -> tuple:
-    """Check velocity limits to detect potential fraud/structuring."""
-    for rule in VELOCITY_RULES:
-        count = sum(1 for t in recent_transactions if t.get("amount_kobo", 0) >= rule["max_amount_kobo"])
-        if count >= rule["max_count"]:
-            return False, f"Velocity breach: {rule['description']}"
-    return True, ""
+# ── Database pool ──────────────────────────────────────────────────────────────
+
+_pool: asyncpg.Pool | None = None
 
 
-def compute_fraud_score(
-    amount_kobo: int, is_international: bool = False, is_new_beneficiary: bool = False,
-    unusual_time: bool = False, device_changed: bool = False, failed_attempts: int = 0,
-) -> tuple:
-    """Multi-factor transaction fraud scoring."""
-    score = 0.0
-    if is_international: score += 20
-    if is_new_beneficiary: score += 15
-    if unusual_time: score += 10
-    if device_changed: score += 25
-    if failed_attempts >= 3: score += 30
-    if amount_kobo > 500_000_000: score += 15
-    risk = "low" if score < 40 else ("medium" if score < 70 else "high")
-    return min(score, 100.0), risk
+async def get_pool() -> asyncpg.Pool:
+    if _pool is None:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    return _pool
 
 
+async def init_db(dsn: str) -> asyncpg.Pool:
+    pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10, command_timeout=30)
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS nfiu_ctrs (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id       TEXT NOT NULL,
+                customer_id     TEXT NOT NULL,
+                customer_name   TEXT NOT NULL,
+                customer_type   TEXT NOT NULL CHECK (customer_type IN ('individual', 'corporate')),
+                customer_bvn    TEXT,
+                customer_nin    TEXT,
+                transaction_id  TEXT NOT NULL,
+                transaction_type TEXT NOT NULL,
+                amount_kobo     BIGINT NOT NULL,
+                currency        TEXT NOT NULL DEFAULT 'NGN',
+                channel         TEXT,
+                branch_code     TEXT,
+                branch_name     TEXT,
+                teller_id       TEXT,
+                teller_name     TEXT,
+                counterparty_name TEXT,
+                threshold_kobo  BIGINT NOT NULL,
+                goaml_xml       TEXT,
+                fiu_ref_no      TEXT UNIQUE,
+                goaml_ref       TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending'
+                                   CHECK (status IN ('pending','generating','generated','submitted','filed','failed')),
+                filing_deadline TIMESTAMPTZ NOT NULL,
+                filed_at        TIMESTAMPTZ,
+                filed_by        TEXT,
+                cbn_reference   TEXT,
+                sla_breached    BOOLEAN NOT NULL DEFAULT false,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE TABLE IF NOT EXISTS nfiu_strs (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                tenant_id       TEXT NOT NULL,
+                customer_id     TEXT NOT NULL,
+                customer_name   TEXT NOT NULL,
+                customer_type   TEXT NOT NULL,
+                customer_bvn    TEXT,
+                reason          TEXT NOT NULL,
+                category        TEXT NOT NULL,
+                total_amount_kobo BIGINT NOT NULL,
+                transaction_count INT NOT NULL,
+                period_start    DATE NOT NULL,
+                period_end      DATE NOT NULL,
+                detection_method TEXT NOT NULL,
+                rule_id         TEXT,
+                risk_score      INT NOT NULL DEFAULT 0,
+                risk_level      TEXT NOT NULL DEFAULT 'high',
+                transaction_ids TEXT[] NOT NULL DEFAULT '{}',
+                goaml_xml       TEXT,
+                fiu_ref_no      TEXT UNIQUE,
+                goaml_ref       TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending'
+                                   CHECK (status IN ('pending','under_review','approved','submitted','filed','rejected','failed')),
+                filing_deadline TIMESTAMPTZ NOT NULL,
+                filed_at        TIMESTAMPTZ,
+                reviewed_by     TEXT,
+                approved_by     TEXT,
+                cbn_reference   TEXT,
+                sla_breached    BOOLEAN NOT NULL DEFAULT false,
+                tipping_off_restricted BOOLEAN NOT NULL DEFAULT true,
+                created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE TABLE IF NOT EXISTS nfiu_audit_log (
+                id          SERIAL PRIMARY KEY,
+                tenant_id   TEXT NOT NULL,
+                report_type TEXT NOT NULL,
+                report_id   UUID NOT NULL,
+                action      TEXT NOT NULL,
+                detail      JSONB,
+                performed_by TEXT NOT NULL DEFAULT 'system',
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_nfiu_ctrs_tenant ON nfiu_ctrs (tenant_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_nfiu_strs_tenant ON nfiu_strs (tenant_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_nfiu_ctrs_deadline ON nfiu_ctrs (filing_deadline, sla_breached, status);
+            CREATE INDEX IF NOT EXISTS idx_nfiu_strs_deadline ON nfiu_strs (filing_deadline, sla_breached, status);
+        """)
+    return pool
 
 
-class GrpcServicer:
-    """gRPC handler for inter-service calls."""
-    def __init__(self, service_name):
-        self.service_name = service_name
-        self.request_count = 0
+# ── HTTP client ────────────────────────────────────────────────────────────────
 
-    def Process(self, request_data):
-        self.request_count += 1
-        trace_id = f"grpc-{int(time.time()*1000)}-{os.getpid()}"
-        return {"status": "processed", "service": self.service_name, "trace_id": trace_id}
+_http: httpx.AsyncClient | None = None
 
-def start_grpc_server(service_name, port):
-    """Start TCP-based gRPC server for inter-service calls."""
-    def handle_client(conn, addr, servicer):
+
+def get_http() -> httpx.AsyncClient:
+    if _http is None:
+        raise RuntimeError("HTTP client not initialised")
+    return _http
+
+
+# ── Lifespan ───────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _pool, _http
+    _http = httpx.AsyncClient(timeout=30.0)
+    if DATABASE_URL:
         try:
-            data = conn.recv(4096)
-            if not data: return
-            result = servicer.Process(data)
-            response = json.dumps(result).encode()
-            conn.sendall(_grpc_struct.pack(">I", len(response)) + response)
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
-        finally:
-            conn.close()
-
-    def serve():
-        servicer = GrpcServicer(service_name)
-        sock = _grpc_socket.socket(_grpc_socket.AF_INET, _grpc_socket.SOCK_STREAM)
-        sock.setsockopt(_grpc_socket.SOL_SOCKET, _grpc_socket.SO_REUSEADDR, 1)
-        sock.bind(("0.0.0.0", int(port)))
-        sock.listen(32)
-        logger.info(f"[{service_name}] gRPC server on :{port}")
-        while True:
-            try:
-                conn, addr = sock.accept()
-                _grpc_threading.Thread(target=handle_client, args=(conn, addr, servicer), daemon=True).start()
-            except Exception:
-                break
-
-    t = _grpc_threading.Thread(target=serve, daemon=True)
-    t.start()
-    return t
-
-# --- Configuration ---
-DB_URL = os.environ.get("DATABASE_URL", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "${JWT_SECRET}")
-AML_ENGINE_URL = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-
-# --- mTLS Configuration ---
-MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
-TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54bank/certs/service.crt")
-TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
-TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
-MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
-PORT = int(os.environ.get("PORT", "9624"))
-START_TIME = time.time()
-
-# --- Metrics ---
-request_count = 0
-error_count = 0
-metrics_lock = threading.Lock()
-
-def inc_requests():
-    global request_count
-    with metrics_lock:
-        request_count += 1
-
-def inc_errors():
-    global error_count
-    with metrics_lock:
-        error_count += 1
-
-# --- Database ---
-_db_pool = None
-
-def get_db():
-    global _db_pool
-    if not DB_URL:
-        return None
-    try:
-        if _db_pool is None:
-            from psycopg2.pool import SimpleConnectionPool
-            _db_pool = SimpleConnectionPool(minconn=2, maxconn=10, dsn=DB_URL)
-            logger.info("Database connection pool initialized (2-10 connections)")
-        conn = _db_pool.getconn()
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        logger.warning(f"DB pool connection failed: {e}")
-        return None
-
-def release_db(conn):
-    """Return a connection to the pool."""
-    global _db_pool
-    if _db_pool and conn:
-        try:
-            _db_pool.putconn(conn)
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
-
-def db_insert(table, record):
-    conn = get_db()
-    if not conn:
-        logger.error(f"[{SERVICE_NAME}] CRITICAL: No database connection — refusing write to prevent data loss")
-        raise ConnectionError(f"Database unavailable for {SERVICE_NAME}. Set DATABASE_URL environment variable.")
-    try:
-        cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "nfiu-ctr-str-filing-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"[{SERVICE_NAME}] DB insert failed: {e}")
-        raise
-
-def db_query(table, page=1, limit=50):
-    conn = get_db()
-    if not conn:
-        return [], 0
-    try:
-        cur = conn.cursor()
-        offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("nfiu-ctr-str-filing-py", limit, offset))
-        rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("nfiu-ctr-str-filing-py",))
-        total = cur.fetchone()[0]
-        return items, total
-    except Exception as e:
-        logger.error(f"DB query failed: {e}")
-        return [], 0
-
-# --- JWT Auth ---
-def validate_jwt(headers):
-    auth = headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return None, "Missing Bearer token"
-    token = auth[7:]
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None, "Invalid token format"
-    # In production: verify JWT signature with JWT_SECRET
-    return {"sub": "authenticated"}, None
-
-# --- Domain Logic ---
-def gen_id():
-    return "NFI-" + "".join(random.choices(string.hexdigits[:16].upper(), k=8))
-
-
-def now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-def generate_ctr(transaction, customer):
-    amount = transaction.get("amount", 0)
-    currency = transaction.get("currency", "NGN")
-    threshold = 5000000 if currency == "NGN" else 10000
-    reportable = amount >= threshold
-    return {"reportable": reportable, "report_type": "CTR", "threshold": threshold, "currency": currency, "amount": amount, "customer_name": customer.get("name",""), "bvn": customer.get("bvn",""), "filing_deadline": "T+1 business day", "status": "pending_filing" if reportable else "below_threshold"}
-
-def generate_str(indicators, transaction):
-    risk_indicators = {"structuring": 40, "unusual_pattern": 30, "no_economic_justification": 35, "pep_involvement": 25, "high_risk_jurisdiction": 30, "rapid_movement": 20}
-    score = sum(risk_indicators.get(i, 10) for i in indicators)
-    return {"report_type": "STR", "suspicion_score": min(100, score), "indicators": indicators, "amount": transaction.get("amount", 0), "narrative_required": score >= 30, "filing_deadline": "immediately" if score >= 60 else "within 24 hours", "escalate_to_cbn": score >= 80}
-
-
-
-# --- HTTP Handler ---
-
-class CircuitBreaker:
-    def __init__(self, threshold=5, reset_timeout=30):
-        self.failures = 0
-        self.threshold = threshold
-        self.reset_timeout = reset_timeout
-        self.last_failure = 0
-        self.state = "closed"
-    def allow(self):
-        if self.state == "open":
-            if time.time() - self.last_failure > self.reset_timeout:
-                self.state = "half-open"
-                return True
-            return False
-        return True
-    def record_success(self):
-        self.failures = 0
-        self.state = "closed"
-    def record_failure(self):
-        self.failures += 1
-        self.last_failure = time.time()
-        if self.failures >= self.threshold:
-            self.state = "open"
-
-_circuit_breaker = CircuitBreaker()
-
-def call_service(method, url, body=None, retries=3, timeout=15):
-    """Call another microservice with retries and circuit breaker."""
-    if not _circuit_breaker.allow():
-        raise Exception(f"Circuit breaker open for {url}")
-    
-    last_err = None
-    for attempt in range(retries):
-        try:
-            if attempt > 0:
-                time.sleep(0.1 * (2 ** attempt))
-            
-            data = json.dumps(body).encode() if body else None
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("Content-Type", "application/json")
-            
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                result = json.loads(resp.read().decode())
-                _circuit_breaker.record_success()
-                return result
-        except Exception as e:
-            last_err = e
-            _circuit_breaker.record_failure()
-    
-    raise last_err
-
-
-# --- gRPC Client with Retry + Circuit Breaker ---
-class _CircuitBreaker:
-    def __init__(self, threshold=5, reset_after=30):
-        self.failures = 0
-        self.last_failure = 0
-        self.threshold = threshold
-        self.reset_after = reset_after
-        self._lock = threading.Lock()
-
-    def allow(self):
-        with self._lock:
-            if self.failures >= self.threshold:
-                if time.time() - self.last_failure > self.reset_after:
-                    self.failures = self.threshold // 2
-                    return True
-                return False
-            return True
-
-    def record_success(self):
-        with self._lock:
-            if self.failures > 0: self.failures -= 1
-
-    def record_failure(self):
-        with self._lock:
-            self.failures += 1
-            self.last_failure = time.time()
-
-_grpc_cb = _CircuitBreaker()
-
-def grpc_call(target, method, payload, retries=3):
-    """Make a gRPC call with retry + circuit breaker."""
-    if not _grpc_cb.allow():
-        logger.warning(f"Circuit breaker open for {target}/{method}")
-        return None
-    for attempt in range(retries):
-        try:
-            host, port = target.rsplit(":", 1)
-            sock = _grpc_socket.socket(_grpc_socket.AF_INET, _grpc_socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((host, int(port)))
-            data = json.dumps({"method": method, "payload": payload}).encode()
-            sock.sendall(_grpc_struct.pack(">I", len(data)) + data)
-            length_bytes = sock.recv(4)
-            if len(length_bytes) == 4:
-                length = _grpc_struct.unpack(">I", length_bytes)[0]
-                response = sock.recv(length)
-                _grpc_cb.record_success()
-                return json.loads(response)
-            _grpc_cb.record_failure()
-        except Exception as e:
-            _grpc_cb.record_failure()
-            if attempt < retries - 1:
-                time.sleep((2 ** attempt) * 0.2)
-            logger.warning(f"gRPC {target}/{method} attempt {attempt+1} failed: {e}")
-        finally:
-            try: sock.close()
-            except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-    return None
-
-def call_service(method, url, body=None, retries=3, timeout=15):
-    """HTTP inter-service call with retry + circuit breaker."""
-    if not _grpc_cb.allow():
-        return None
-    import urllib.request, urllib.error
-    for attempt in range(retries):
-        try:
-            data = json.dumps(body).encode() if body else None
-            req = urllib.request.Request(url, data=data, method=method,
-                                         headers={"Content-Type": "application/json"})
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            _grpc_cb.record_success()
-            return json.loads(resp.read())
-        except Exception as e:
-            _grpc_cb.record_failure()
-            if attempt < retries - 1:
-                time.sleep((2 ** attempt) * 0.2)
-            logger.warning(f"HTTP {method} {url} attempt {attempt+1} failed: {e}")
-    return None
-
-# gRPC service registry
-GRPC_REGISTRY = {
-    "core-banking": 9090, "payments-hub": 9091, "gl-engine": 9092,
-    "trade-finance": 9093, "cheque-clearing": 9094, "nibss-nip": 9095,
-    "credit-scoring": 9096, "fraud-detection": 9097, "aml-screening": 9098,
-    "kyc-engine": 9099,
-}
-
-def call_service_grpc(target, method, payload=None):
-    """Convenience: try gRPC first, fall back to HTTP."""
-    service_name_key = target.split("/")[0] if "/" in target else target
-    if service_name_key in GRPC_REGISTRY:
-        result = grpc_call(f"localhost:{GRPC_REGISTRY[service_name_key]}", method, payload or {})
-        if result: return result
-    return call_service("POST", f"http://{target}/v1/{method}", payload)
-
-
-# --- Alerting ---
-_ALERT_RULES = [
-    {"name": "high_error_rate", "metric": "error_rate", "threshold": 0.05, "severity": "critical"},
-    {"name": "high_latency", "metric": "p99_latency_ms", "threshold": 5000, "severity": "warning"},
-    {"name": "db_failures", "metric": "db_failures", "threshold": 3, "severity": "critical"},
-]
-
-def check_alerts():
-    fired = []
-    err_rate = error_count / max(request_count, 1)
-    if err_rate > 0.05:
-        fired.append({"rule": "high_error_rate", "value": err_rate, "severity": "critical"})
-    return fired
-
-
-# --- Graceful Degradation ---
-class _DegradationState:
-    def __init__(self):
-        self.db_available = True
-        self.cache_available = True
-        self.upstreams = {}
-        self._lock = threading.Lock()
-
-    def set_db(self, ok):
-        with self._lock: self.db_available = ok
-
-    def is_db_ok(self):
-        with self._lock: return self.db_available
-
-    def set_upstream(self, name, ok):
-        with self._lock: self.upstreams[name] = ok
-
-    def status(self):
-        with self._lock:
-            return {
-                "db_available": self.db_available,
-                "cache_available": self.cache_available,
-                "upstreams": dict(self.upstreams),
-                "mode": "normal" if self.db_available else "degraded",
-            }
-
-_degrade = _DegradationState()
-
-
-# --- Rate Limiter (Token Bucket) ---
-import threading as _threading
-import time as _time
-
-class _RateLimiter:
-    def __init__(self, rate=100, burst=200):
-        self._rate = rate
-        self._burst = burst
-        self._tokens = {}
-        self._lock = _threading.Lock()
-
-    def allow(self, key="global"):
-        with self._lock:
-            now = _time.monotonic()
-            if key not in self._tokens:
-                self._tokens[key] = (self._burst, now)
-                return True
-            tokens, last = self._tokens[key]
-            elapsed = now - last
-            tokens = min(self._burst, tokens + elapsed * self._rate)
-            if tokens >= 1:
-                self._tokens[key] = (tokens - 1, now)
-                return True
-            return False
-
-_rate_limiter = _RateLimiter()
-
-
-# --- Retry with Exponential Backoff ---
-import time as _retry_time
-
-def retry_with_backoff(fn, max_retries=3, base_delay=0.1):
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception:
-            if attempt == max_retries - 1:
-                raise
-            delay = min(base_delay * (2 ** attempt), 5.0)
-            _retry_time.sleep(delay)
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
-
-    def respond(self, code, data):
-        if code >= 400:
-            inc_errors()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
-        add_security_headers(self)
-        self.end_headers()
-        self.wfile.write(json.dumps(data, default=str).encode())
-
-    def do_GET(self):
-        _cache_key = f"nfiu_ctr_str_filing_{self.path}"
-        _cached = cache_get(_cache_key)
-        if _cached and self.path not in ("/healthz", "/readyz", "/livez", "/metrics", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-Cache", "HIT")
-            add_security_headers(self)
-            self.end_headers()
-            self.wfile.write(_cached.encode() if isinstance(_cached, str) else _cached)
-            return
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[nfiu-ctr-str-filing-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-
-        if path == "/v1/cache-metrics":
-            self._respond(200, cache_metrics())
-            return
-        elif path == "/healthz":
-            db = get_db()
-            db_status = "not_configured"
-            redis_status = "not_configured"
-            overall = "healthy"
-            if db:
-                try:
-                    cur = db.cursor()
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-                    db_status = "connected"
-                except Exception as _hce:
-                    db_status = f"unhealthy: {_hce}"
-                    overall = "degraded"
-            if _cache_pool:
-                try:
-                    cache_set("__healthcheck__", "1", 10)
-                    if cache_get("__healthcheck__"):
-                        redis_status = "connected"
-                    else:
-                        redis_status = "unreachable"
-                        overall = "degraded"
-                except Exception:
-                    redis_status = "unreachable"
-                    overall = "degraded"
-            self.respond(200, {
-                "status": overall,
-                "service": "nfiu-ctr-str-filing-py",
-                "version": "2.0.0",
-                "checks": {
-                    "database": db_status,
-                    "cache": redis_status,
-                },
-                "uptime_secs": round(time.time() - START_TIME),
-            })
-        elif path == "/readyz":
-            self.respond(200, {"ready": True})
-        elif path == "/livez":
-            self.respond(200, {"alive": True})
-        elif path == "/v1/degradation":
-            self._json(200, {"service": "nfiu-ctr-str-filing-py", **_degrade.status()})
-        elif path == "/v1/alerts":
-            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-        elif path == "/metrics":
-            body = (
-                f'# HELP requests_total Total requests\n'
-                f'# TYPE requests_total counter\n'
-                f'requests_total{{service=\"nfiu-ctr-str-filing-py\"}} {request_count}\n'
-                f'# HELP errors_total Total errors\n'
-                f'# TYPE errors_total counter\n'
-                f'errors_total{{service=\"nfiu-ctr-str-filing-py\"}} {error_count}\n'
-            )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body.encode())
-        elif path in ("/v1/records", "/v1/list"):
-            claims, err = validate_jwt(dict(self.headers))
-            if err:
-                self.respond(401, {"error": "unauthorized", "detail": err})
-                return
-            items, total = db_query("nfiu_ctr_str_filing_py")
-            self.respond(200, {"items": items, "total": total, "source": "database" if get_db() else "no_db"})
-        elif path == "/v1/stats":
-            self.respond(200, {
-                "service": "nfiu-ctr-str-filing-py",
-                "requests": request_count,
-                "errors": error_count,
-                "db_connected": get_db() is not None,
-                "uptime_secs": round(time.time() - START_TIME),
-            })
-        else:
-            self.respond(404, {"error": "not_found", "path": path})
-
-    def do_POST(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[nfiu-ctr-str-filing-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(length).decode() if isinstance(self.rfile.read(length), bytes) else str(self.rfile.read(length)))) if length > 0 else {}
-
-        # JWT auth check (monitoring mode: warn but allow)
-        claims, err = validate_jwt(dict(self.headers))
-        if err:
-            self.respond(401, {"error": "unauthorized", "detail": err})
-            # Inter-service call
-            try:
-                _upstream = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-                call_service("POST", f"{_upstream}/v1/screen", {"service": SERVICE_NAME, "action": "notify"})
-            except Exception as _e:
-                log_event("WARN", f"inter-service call failed: {_e}")
-            return
-
-        if path == "/v1/create":
-            try:
-                result = db_insert("nfiu_ctr_str_filing_py", body)
-                cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-                self.respond(201, {"created": True, "data": result})
-            except ConnectionError as ce:
-                self.respond(503, {"error": "database_unavailable", "detail": str(ce)})
-                return
-            except Exception as de:
-                logger.error(f"[{SERVICE_NAME}] Write failed: {de}")
-                self.respond(500, {"error": "write_failed", "detail": str(de)})
-                return
-        elif path == "/v1/nfiu-ctr-str-filing/update":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid:
-                    if "status" in body:
-                        rec["status"] = body["status"]
-                    rec["data"].update({k: v for k, v in body.items() if k != "id"})
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    audit_log.append({"id": gen_id(), "action": "update", "record_id": rid,
-                                     "actor": body.get("updated_by", "system"), "timestamp": now_iso()})
-                    self.respond(200, {"updated": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found: {rid}"})
-
-        elif path == "/v1/nfiu-ctr-str-filing/process":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid and rec["status"] in ("pending", "active"):
-                    rec["status"] = "completed"
-                    rec["data"]["processed_at"] = now_iso()
-                    rec["data"]["processing_result"] = "success"
-                    rec["data"]["score"] = round(0.85 + random.random() * 0.14, 3)
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    domain_stats["processed_today"] += 1
-                    audit_log.append({"id": gen_id(), "action": "process", "record_id": rid,
-                                     "actor": "system", "timestamp": now_iso()})
-                    self.respond(200, {"processed": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found or not processable: {rid}"})
-        elif path == "/v1/nfiu-ctr-str-filing/ctr":
-            result = generate_ctr(body.get("transaction",{}), body.get("customer",{}))
-            self.respond(200, result)
-        elif path == "/v1/nfiu-ctr-str-filing/str":
-            result = generate_str(body.get("indicators",[]), body.get("transaction",{}))
-            self.respond(200, result)
-
-
-
-        else:
-            self.respond(404, {"error": "Not found"})
-
-
-
-# --- Graceful Shutdown ---
-server = None
-shutdown_event = threading.Event()
-
-def shutdown_handler(signum, frame):
-    logger.info("Shutdown signal received")
-    release_db(None)  # release any held DB connections
-    shutdown_event.set()
-    if server:
-        threading.Thread(target=server.shutdown).start()
-
-signal.signal(signal.SIGTERM, shutdown_handler)
-
-# --- Security Headers ---
-SECURITY_HEADERS = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "X-XSS-Protection": "1; mode=block",
-    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-    "Content-Security-Policy": "default-src 'self'",
-}
-CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
-
-def add_security_headers(handler_self):
-    """Add security + CORS headers to response."""
-    for k, v in SECURITY_HEADERS.items():
-        handler_self.send_header(k, v)
-    origin = handler_self.headers.get("Origin", "")
-    if origin in [o.strip() for o in CORS_ALLOWED_ORIGINS]:
-        handler_self.send_header("Access-Control-Allow-Origin", origin)
-    handler_self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-    handler_self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
-
-def sanitize_input(s):
-    """Sanitize user input to prevent XSS/injection."""
-    if not isinstance(s, str):
-        return s
-    s = s.replace("<", "&lt;").replace(">", "&gt;")
-    s = s.replace("'", "&#39;").replace('"', "&quot;")
-    s = s.replace("\\", "")
-    return s[:10000] if len(s) > 10000 else s
-
-# --- OpenTelemetry Export ---
-OTEL_ENDPOINT = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "")
-
-def init_tracing(service_name):
-    """Initialize OpenTelemetry tracing with OTLP export if configured."""
-    if not OTEL_ENDPOINT:
-        return
-    try:
-        from opentelemetry import trace
-        from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
-        from opentelemetry.sdk.resources import Resource
-        resource = Resource.create({"service.name": service_name, "deployment.environment": os.environ.get("ENV", "development")})
-        provider = TracerProvider(resource=resource)
-        try:
-            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-            exporter = OTLPSpanExporter(endpoint=OTEL_ENDPOINT, insecure=True)
-        except ImportError:
-            exporter = ConsoleSpanExporter()
-        provider.add_span_processor(BatchSpanProcessor(exporter))
-        trace.set_tracer_provider(provider)
-        logger.info(f"OpenTelemetry tracing initialized: {OTEL_ENDPOINT}")
-    except ImportError:
-        logger.debug("OpenTelemetry SDK not installed, tracing disabled")
-    except Exception as e:
-        logger.warning(f"Failed to init tracing: {e}")
-signal.signal(signal.SIGINT, shutdown_handler)
-
-
-
-# ─── Idempotency Enforcement ────────────────────────────────────────────────
-import hashlib as _idem_hashlib
-_idempotency_cache = {}  # key -> (status_code, response_body, timestamp)
-
-def check_idempotency(key: str) -> tuple:
-    """Check if idempotency key has been seen. Returns (is_duplicate, cached_response)."""
-    if key and key in _idempotency_cache:
-        entry = _idempotency_cache[key]
-        return True, entry
-    return False, None
-
-def store_idempotency(key: str, status_code: int, response: dict):
-    """Store idempotency response for deduplication (24h TTL)."""
-    import time
-    if key:
-        _idempotency_cache[key] = (status_code, response, time.time())
-        # Cleanup entries older than 24h
-        cutoff = time.time() - 86400
-        for k in list(_idempotency_cache.keys()):
-            if _idempotency_cache[k][2] < cutoff:
-                del _idempotency_cache[k]
-
-
-# ─── Maker-Checker (Dual Authorization) ─────────────────────────────────────
-_maker_checker_requests = []
-_MAKER_CHECKER_THRESHOLDS = {
-    "transfer": 100_000_000,       # ₦1M
-    "loan_disburse": 100_000_000,  # ₦1M
-    "gl_posting": 50_000_000,      # ₦500K
-    "account_close": 0,            # Always
-}
-
-def requires_maker_checker(operation: str, amount_kobo: int) -> bool:
-    """Check if operation needs dual authorization per CBN guidelines."""
-    threshold = _MAKER_CHECKER_THRESHOLDS.get(operation, 100_000_000)
-    return amount_kobo >= threshold
-
-def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload: dict) -> dict:
-    """Submit operation for maker-checker approval."""
-    import time
-    req = {
-        "request_id": f"MCR-{int(time.time()*1000000)}",
-        "operation": operation, "maker_id": maker_id, "amount_kobo": amount_kobo,
-        "status": "pending_approval", "payload": payload,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    _maker_checker_requests.append(req)
-    return req
-
-
-# ─── Immutable Audit Trail ───────────────────────────────────────────────────
-import hashlib as _audit_hashlib
-
-# --- Monetary Safety (kobo precision) ---
-def round_naira(amount):
-    """Round to 2 decimal places (kobo precision) to prevent float drift."""
-    return round(float(amount), 2)
-
-def naira_to_kobo(naira):
-    """Convert naira (float) to kobo (int) for precise storage."""
-    return int(round(float(naira) * 100))
-
-def kobo_to_naira(kobo):
-    """Convert kobo (int) back to naira (float) for display."""
-    return round(int(kobo) / 100.0, 2)
-
-def validate_amount(amount):
-    """Validate monetary amount: non-negative, within CBN limits."""
-    amount = float(amount)
-    if amount < 0:
-        raise ValueError(f"Amount must be non-negative, got {amount:.2f}")
-    if amount > 999_999_999_999.99:
-        raise ValueError(f"Amount exceeds maximum (NGN 999,999,999,999.99)")
-    return round_naira(amount)
-
-_audit_log = []  # Append-only. No deletion permitted.
-
-def append_audit_entry(service: str, operation: str, actor_id: str, entity_id: str,
-                       entity_type: str, old_state: str = "", new_state: str = "", ip: str = ""):
-    """Append immutable audit entry with tamper-detection checksum."""
-    import time
-    entry_id = f"AUD-{int(time.time()*1000000)}"
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    raw = f"{entry_id}|{timestamp}|{service}|{operation}|{actor_id}|{entity_id}|{old_state}|{new_state}|{ip}"
-    checksum = _audit_hashlib.sha256(raw.encode()).hexdigest()
-    entry = {
-        "id": entry_id, "timestamp": timestamp, "service": service,
-        "operation": operation, "actor_id": actor_id, "entity_id": entity_id,
-        "entity_type": entity_type, "old_state": old_state, "new_state": new_state,
-        "ip_address": ip, "checksum": checksum, "immutable": True,
-    }
-    _audit_log.append(entry)
-    # Persist to DB if available
-    if _db_conn:
-        try:
-            _db_conn.cursor().execute(
-                "INSERT INTO audit_trail (id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip_address, checksum) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (entry_id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip, checksum))
-            _db_conn.commit()
-        except Exception:
-            pass
-    return entry
-
-
-# ─── Transaction Atomicity ───────────────────────────────────────────────────
-def db_exec_atomic(queries_params: list) -> bool:
-    """Execute multiple DB operations in a single atomic transaction.
-    queries_params: [(sql, params_tuple), ...]
-    Returns True on success, False on rollback.
+            _pool = await init_db(DATABASE_URL)
+            logger.info("Database pool initialised")
+        except Exception as exc:
+            logger.error("DB init failed: %s", exc)
+    else:
+        logger.warning("DATABASE_URL not set — reports will not be persisted")
+    yield
+    if _pool:
+        await _pool.close()
+    if _http:
+        await _http.aclose()
+
+
+app = FastAPI(
+    title="54Link NFIU CTR/STR Filing",
+    description="goAML-compliant Currency and Suspicious Transaction Report generation and submission",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+# ── goAML XML generation ───────────────────────────────────────────────────────
+
+def _xml_text(parent: Element, tag: str, text: str) -> Element:
+    el = SubElement(parent, tag)
+    el.text = text
+    return el
+
+
+def _pretty_xml(el: Element) -> str:
+    raw = tostring(el, encoding="unicode", xml_declaration=False)
+    dom = parseString(f'<?xml version="1.0" encoding="UTF-8"?>{raw}')
+    return dom.toprettyxml(indent="  ", encoding=None)
+
+
+def generate_ctr_xml(ctr: dict) -> str:
     """
-    if not _db_conn:
-        return False
-    cur = _db_conn.cursor()
+    Generate FATF goAML v3.1 XML for a Currency Transaction Report.
+    Schema follows the NFIU Nigeria goAML Filing Guide.
+    """
+    root = Element("goAML")
+    root.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
+
+    report = SubElement(root, "report")
+    _xml_text(report, "rentity_id", GOAML_BANK_CODE)
+    _xml_text(report, "rentity_branch", ctr.get("branch_code", "HQ"))
+    _xml_text(report, "submission_code", "E")  # E = electronic
+    _xml_text(report, "report_indicator", "A")
+    _xml_text(report, "submission_date", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
+    _xml_text(report, "currency_code_local", "NGN")
+    _xml_text(report, "report_code", "CTR")
+    _xml_text(report, "fiu_ref_no", ctr["fiu_ref_no"])
+    _xml_text(report, "report_date_period",
+              datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
+    # Reporting institution
+    rep_inst = SubElement(report, "reporting_institution")
+    _xml_text(rep_inst, "institution_name", GOAML_REPORTER_NAME)
+    _xml_text(rep_inst, "institution_code", GOAML_BANK_CODE)
+
+    # Involved parties
+    parties = SubElement(report, "involved_parties")
+    party = SubElement(parties, "party")
+    _xml_text(party, "party_type", "T")  # T = transaction subject
+
+    if ctr["customer_type"] == "individual":
+        person = SubElement(party, "person")
+        names = ctr["customer_name"].split(" ", 2)
+        _xml_text(person, "first_name", names[0])
+        _xml_text(person, "last_name", names[-1])
+        if ctr.get("customer_bvn"):
+            ids = SubElement(person, "identification")
+            _xml_text(ids, "id_type", "BVN")
+            _xml_text(ids, "id_number", ctr["customer_bvn"])
+        if ctr.get("customer_nin"):
+            ids2 = SubElement(person, "identification")
+            _xml_text(ids2, "id_type", "NIN")
+            _xml_text(ids2, "id_number", ctr["customer_nin"])
+    else:
+        entity = SubElement(party, "entity")
+        _xml_text(entity, "name", ctr["customer_name"])
+        _xml_text(entity, "entity_type", "COMPANY")
+
+    # Account
+    account = SubElement(party, "account")
+    _xml_text(account, "institution_name", GOAML_REPORTER_NAME)
+    _xml_text(account, "account_number", ctr.get("customer_id", "N/A"))
+    _xml_text(account, "currency_code", "NGN")
+
+    # Transaction
+    txn = SubElement(report, "transaction")
+    _xml_text(txn, "transaction_number", ctr["transaction_id"])
+    _xml_text(txn, "date_transaction",
+              ctr.get("transaction_date", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")))
+    _xml_text(txn, "transaction_type", ctr["transaction_type"].upper())
+
+    if ctr.get("teller_name"):
+        _xml_text(txn, "teller", ctr["teller_name"])
+
+    amount_naira = str(Decimal(ctr["amount_kobo"]) / 100)
+    _xml_text(txn, "transaction_location", ctr.get("branch_name", GOAML_REPORTER_NAME))
+
+    currency_amount = SubElement(txn, "currency_amount")
+    _xml_text(currency_amount, "transaction_amount", amount_naira)
+    _xml_text(currency_amount, "currency_code", "NGN")
+
+    return _pretty_xml(root)
+
+
+def generate_str_xml(str_report: dict) -> str:
+    """
+    Generate FATF goAML v3.1 XML for a Suspicious Transaction Report.
+    """
+    root = Element("goAML")
+    root.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
+
+    report = SubElement(root, "report")
+    _xml_text(report, "rentity_id", GOAML_BANK_CODE)
+    _xml_text(report, "submission_code", "E")
+    _xml_text(report, "report_indicator", "A")
+    _xml_text(report, "submission_date",
+              datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"))
+    _xml_text(report, "currency_code_local", "NGN")
+    _xml_text(report, "report_code", "STR")
+    _xml_text(report, "fiu_ref_no", str_report["fiu_ref_no"])
+    _xml_text(report, "report_date_period",
+              str(str_report["period_end"]))
+
+    rep_inst = SubElement(report, "reporting_institution")
+    _xml_text(rep_inst, "institution_name", GOAML_REPORTER_NAME)
+    _xml_text(rep_inst, "institution_code", GOAML_BANK_CODE)
+
+    # Suspicious activity description
+    activity = SubElement(report, "suspicious_activity")
+    _xml_text(activity, "activity_type", str_report["category"].upper())
+    _xml_text(activity, "description", str_report["reason"])
+    _xml_text(activity, "risk_level", str_report["risk_level"].upper())
+    _xml_text(activity, "risk_score", str(str_report["risk_score"]))
+
+    # Involved party
+    parties = SubElement(report, "involved_parties")
+    party = SubElement(parties, "party")
+    _xml_text(party, "party_type", "S")  # S = subject
+
+    if str_report["customer_type"] == "individual":
+        person = SubElement(party, "person")
+        names = str_report["customer_name"].split(" ", 2)
+        _xml_text(person, "first_name", names[0])
+        _xml_text(person, "last_name", names[-1])
+        if str_report.get("customer_bvn"):
+            ids = SubElement(person, "identification")
+            _xml_text(ids, "id_type", "BVN")
+            _xml_text(ids, "id_number", str_report["customer_bvn"])
+    else:
+        entity = SubElement(party, "entity")
+        _xml_text(entity, "name", str_report["customer_name"])
+        _xml_text(entity, "entity_type", "COMPANY")
+
+    # Aggregate transaction block
+    total_naira = str(Decimal(str_report["total_amount_kobo"]) / 100)
+    agg_txn = SubElement(report, "transaction")
+    _xml_text(agg_txn, "transaction_type", "AGGREGATE")
+    _xml_text(agg_txn, "transaction_count", str(str_report["transaction_count"]))
+    currency_amount = SubElement(agg_txn, "currency_amount")
+    _xml_text(currency_amount, "transaction_amount", total_naira)
+    _xml_text(currency_amount, "currency_code", "NGN")
+
+    # Individual transaction references
+    for txn_id in str_report.get("transaction_ids", []):
+        txn_ref = SubElement(report, "linked_transaction")
+        _xml_text(txn_ref, "transaction_number", txn_id)
+
+    return _pretty_xml(root)
+
+
+# ── goAML submission to NFIU ───────────────────────────────────────────────────
+
+async def submit_to_nfiu(xml_content: str, report_type: str, fiu_ref: str) -> dict:
+    """
+    POST the goAML XML to the NFIU portal.
+    Returns the NFIU acknowledgement response.
+    """
+    if not GOAML_API_URL or not GOAML_API_KEY:
+        raise ValueError(
+            "GOAML_API_URL and GOAML_API_KEY must be configured for live NFIU submission"
+        )
+
+    url = f"{GOAML_API_URL}/api/reports/submit"
+    headers = {
+        "Authorization": f"Bearer {GOAML_API_KEY}",
+        "Content-Type": "application/xml",
+        "X-Report-Type": report_type,
+        "X-FIU-Ref": fiu_ref,
+    }
+    resp = await get_http().post(url, content=xml_content.encode("utf-8"), headers=headers)
+    if resp.status_code not in (200, 201, 202):
+        raise ValueError(
+            f"NFIU goAML submission failed HTTP {resp.status_code}: {resp.text[:500]}"
+        )
+    return resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {"raw": resp.text}
+
+
+# ── Dapr publishing ────────────────────────────────────────────────────────────
+
+async def publish_event(topic: str, payload: dict) -> None:
+    url = f"{DAPR_URL}/v1.0/publish/{DAPR_PUBSUB}/{topic}"
     try:
-        for sql, params in queries_params:
-            cur.execute(sql, params)
-        _db_conn.commit()
-        return True
-    except Exception as e:
-        _db_conn.rollback()
-        import logging
-        logging.error(f"Atomic transaction failed, rolled back: {e}")
-        return False
+        resp = await get_http().post(url, json=payload)
+        if resp.status_code >= 300:
+            logger.warning("Dapr publish non-2xx topic=%s status=%d", topic, resp.status_code)
+    except Exception as exc:
+        logger.warning("Dapr publish failed topic=%s: %s", topic, exc)
 
 
-# --- Event Bus (Kafka-compatible event emission) ---
+# ── SLA helper ─────────────────────────────────────────────────────────────────
+
+def ctr_deadline() -> datetime:
+    """CTR must be filed by 23:59 of the same business day."""
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=23, minute=59, second=59, microsecond=0)
 
 
-# --- Process Health Watchdog ---
-# Monitors event loop liveness; if stalled >60s, liveness probe fails
-# and K8s/KEDA restarts the pod.
-
-_watchdog_last_ping = time.time()
-_watchdog_lock = threading.Lock()
+def str_deadline() -> datetime:
+    """STR must be filed within 72 hours of detection."""
+    return datetime.now(timezone.utc) + timedelta(hours=STR_SLA_HOURS)
 
 
-def watchdog_ping():
-    global _watchdog_last_ping
-    with _watchdog_lock:
-        _watchdog_last_ping = time.time()
+def next_ref(prefix: str) -> str:
+    now = datetime.now(timezone.utc)
+    return f"{GOAML_REPORTER_NAME}/{prefix}/{now.year}/{now.month:02d}/{uuid.uuid4().hex[:6].upper()}"
 
 
-def watchdog_healthy() -> bool:
-    with _watchdog_lock:
-        return (time.time() - _watchdog_last_ping) < 60
+# ── Tenant header ──────────────────────────────────────────────────────────────
+
+def require_tenant(x_tenant_id: str = Header(..., alias="x-tenant-id")) -> str:
+    if not x_tenant_id.strip():
+        raise HTTPException(status_code=400, detail="x-tenant-id header required")
+    return x_tenant_id.strip()
 
 
-def _watchdog_loop():
-    while True:
-        time.sleep(10)
-        if not watchdog_healthy():
-            logger.warning("[WATCHDOG] Event loop stalled — marking unhealthy")
-        watchdog_ping()
+# ── Request schemas ────────────────────────────────────────────────────────────
+
+class CTRRequest(BaseModel):
+    customer_id: str
+    customer_name: str
+    customer_type: str  # "individual" | "corporate"
+    customer_bvn: Optional[str] = None
+    customer_nin: Optional[str] = None
+    transaction_id: str
+    transaction_type: str
+    amount_kobo: int
+    currency: str = "NGN"
+    channel: Optional[str] = None
+    branch_code: Optional[str] = None
+    branch_name: Optional[str] = None
+    teller_id: Optional[str] = None
+    teller_name: Optional[str] = None
+    counterparty_name: Optional[str] = None
+
+    @field_validator("customer_type")
+    @classmethod
+    def validate_customer_type(cls, v: str) -> str:
+        if v not in ("individual", "corporate"):
+            raise ValueError("customer_type must be 'individual' or 'corporate'")
+        return v
+
+    @field_validator("amount_kobo")
+    @classmethod
+    def validate_amount(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("amount_kobo must be positive")
+        return v
 
 
-threading.Thread(target=_watchdog_loop, daemon=True).start()
-
-class EventBus:
-    """Publishes domain events to Kafka topics for downstream consumption."""
-
-    def __init__(self, topic: str, service: str):
-        self._broker = os.environ.get("KAFKA_BROKERS", "localhost:9092")
-        self._topic = topic
-        self._service = service
-        self._buffer: list = []
-        self._lock = threading.Lock()
-
-    def emit(self, event_type: str, payload: dict) -> None:
-        """Emit a domain event. In production: kafka-python producer."""
-        event = {{
-            "id": f"{{self._service}}_{{int(time.time() * 1000)}}",
-            "type": event_type,
-            "source": self._service,
-            "topic": self._topic,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "data": payload,
-        }}
-        with self._lock:
-            self._buffer.append(event)
-        logger.info(f"[EventBus] {{self._service}} -> {{self._topic}}: {{event_type}}")
-
-    def flush(self) -> list:
-        with self._lock:
-            events = self._buffer[:]
-            self._buffer.clear()
-        return events
-
-    def pending_count(self) -> int:
-        return len(self._buffer)
+class STRRequest(BaseModel):
+    customer_id: str
+    customer_name: str
+    customer_type: str
+    customer_bvn: Optional[str] = None
+    reason: str
+    category: str
+    total_amount_kobo: int
+    transaction_count: int
+    period_start: date
+    period_end: date
+    detection_method: str
+    rule_id: Optional[str] = None
+    risk_score: int = 0
+    risk_level: str = "high"
+    transaction_ids: List[str] = []
 
 
-class EventConsumer:
-    """Subscribes to Kafka topics for incoming events."""
+# ── Background filing task ─────────────────────────────────────────────────────
 
-    def __init__(self, topics: list, group_id: str):
-        self._topics = topics
-        self._group_id = group_id
-        self._handlers: dict = {{}}
+async def _file_ctr_background(ctr_id: str, tenant_id: str) -> None:
+    """Generate XML, submit to NFIU, update record status."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM nfiu_ctrs WHERE id=$1 AND tenant_id=$2", ctr_id, tenant_id
+    )
+    if not row:
+        logger.error("CTR %s not found for background filing", ctr_id)
+        return
 
-    def on(self, event_type: str, handler):
-        self._handlers[event_type] = handler
+    fiu_ref = row["fiu_ref_no"]
+    ctr_dict = dict(row)
+    ctr_dict["fiu_ref_no"] = fiu_ref
 
-    def start(self):
-        logger.info(f"[EventConsumer] Subscribing to {{self._topics}} as {{self._group_id}}")
-        # In production: kafka-python KafkaConsumer with group_id
-
-
-def notify_downstream(service_url: str, path: str, payload: dict) -> bool:
-    """Notify a downstream service via HTTP with retry."""
     try:
-        resp = call_service("POST", f"{{service_url}}{{path}}", payload)
-        return resp is not None
-    except Exception as e:
-        logger.warning(f"[Downstream] {{service_url}}{{path}} failed: {{e}}")
-        return False
+        xml_content = generate_ctr_xml(ctr_dict)
+        await pool.execute(
+            "UPDATE nfiu_ctrs SET goaml_xml=$1, status='generated' WHERE id=$2",
+            xml_content, ctr_id,
+        )
+
+        if GOAML_API_URL and GOAML_API_KEY:
+            result = await submit_to_nfiu(xml_content, "CTR", fiu_ref)
+            goaml_ref = result.get("reference", result.get("raw", ""))
+            await pool.execute(
+                """UPDATE nfiu_ctrs
+                   SET status='filed', filed_at=now(), filed_by='system',
+                       goaml_ref=$1
+                   WHERE id=$2""",
+                str(goaml_ref), ctr_id,
+            )
+            await publish_event("nfiu.ctr-filed", {
+                "tenantId": tenant_id, "ctrId": ctr_id,
+                "fiuRef": fiu_ref, "goamlRef": str(goaml_ref),
+            })
+            logger.info("CTR %s filed to NFIU goaml_ref=%s", ctr_id, goaml_ref)
+        else:
+            logger.warning("CTR %s XML generated but GOAML_API_URL not configured — not submitted to NFIU", ctr_id)
+            await pool.execute(
+                "UPDATE nfiu_ctrs SET status='generated' WHERE id=$1", ctr_id
+            )
+    except Exception as exc:
+        logger.error("CTR %s filing failed: %s", ctr_id, exc)
+        await pool.execute(
+            "UPDATE nfiu_ctrs SET status='failed' WHERE id=$1", ctr_id
+        )
+        await publish_event("nfiu.filing-failed", {
+            "tenantId": tenant_id, "reportType": "CTR",
+            "reportId": ctr_id, "error": str(exc),
+        })
 
 
-_event_bus = EventBus("platform.events", "nfiu-ctr-str-filing")
+async def _file_str_background(str_id: str, tenant_id: str) -> None:
+    """Generate XML for STR (after compliance review approval)."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT * FROM nfiu_strs WHERE id=$1 AND tenant_id=$2", str_id, tenant_id
+    )
+    if not row or row["status"] not in ("approved", "pending"):
+        logger.error("STR %s not found or not approvable", str_id)
+        return
+
+    fiu_ref = row["fiu_ref_no"]
+    str_dict = dict(row)
+
+    try:
+        xml_content = generate_str_xml(str_dict)
+        await pool.execute(
+            "UPDATE nfiu_strs SET goaml_xml=$1, status='submitted' WHERE id=$2",
+            xml_content, str_id,
+        )
+
+        if GOAML_API_URL and GOAML_API_KEY:
+            result = await submit_to_nfiu(xml_content, "STR", fiu_ref)
+            goaml_ref = result.get("reference", result.get("raw", ""))
+            await pool.execute(
+                """UPDATE nfiu_strs
+                   SET status='filed', filed_at=now(), goaml_ref=$1
+                   WHERE id=$2""",
+                str(goaml_ref), str_id,
+            )
+            await publish_event("nfiu.str-filed", {
+                "tenantId": tenant_id, "strId": str_id,
+                "fiuRef": fiu_ref, "goamlRef": str(goaml_ref),
+            })
+            logger.info("STR %s filed to NFIU goaml_ref=%s", str_id, goaml_ref)
+    except Exception as exc:
+        logger.error("STR %s filing failed: %s", str_id, exc)
+        await pool.execute(
+            "UPDATE nfiu_strs SET status='failed' WHERE id=$1", str_id
+        )
 
 
-# --- Data Flow Emit Point ---
-def emit_processing_event(action: str, data: dict) -> None:
-    """Called by handlers after successful processing."""
-    _event_bus.emit("nfiu-ctr-str-filing." + action, data)
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@app.get("/healthz")
+async def healthz():
+    checks: dict = {}
+    db_ok = False
+    if _pool:
+        try:
+            await _pool.fetchval("SELECT 1")
+            checks["postgres"] = "connected"
+            db_ok = True
+        except Exception as exc:
+            checks["postgres"] = f"unreachable: {exc}"
+    else:
+        checks["postgres"] = "not configured"
+
+    checks["goaml_configured"] = bool(GOAML_API_URL and GOAML_API_KEY)
+    checks["bank_code"] = GOAML_BANK_CODE
+    checks["reporter"] = GOAML_REPORTER_NAME
+
+    return {
+        "service": "nfiu-ctr-str-filing-py",
+        "status": "healthy" if db_ok else "degraded",
+        "checks": checks,
+    }
+
+
+@app.post("/api/ctrs", status_code=201)
+async def create_ctr(
+    body: CTRRequest,
+    background_tasks: BackgroundTasks,
+    tenant_id: str = Depends(require_tenant),
+    x_user_id: str = Header(default="system", alias="x-keycloak-id"),
+):
+    """
+    Create a Currency Transaction Report.
+
+    The threshold check is performed here. If the amount is below the CBN
+    threshold for the customer type, a 422 is returned. The caller (AML engine
+    or transaction monitor) is responsible for calling this only on qualifying
+    transactions.
+
+    After creation, XML generation and NFIU submission run in the background.
+    """
+    threshold = (
+        CTR_INDIVIDUAL_THRESHOLD_KOBO
+        if body.customer_type == "individual"
+        else CTR_CORPORATE_THRESHOLD_KOBO
+    )
+    if body.amount_kobo < threshold:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Amount ₦{body.amount_kobo/100:,.2f} is below the CTR threshold "
+                f"of ₦{threshold/100:,.2f} for {body.customer_type} customers"
+            ),
+        )
+
+    pool = await get_pool()
+    fiu_ref = next_ref("CTR")
+    ctr_id = uuid.uuid4()
+    deadline = ctr_deadline()
+
+    await pool.execute(
+        """
+        INSERT INTO nfiu_ctrs
+          (id, tenant_id, customer_id, customer_name, customer_type,
+           customer_bvn, customer_nin, transaction_id, transaction_type,
+           amount_kobo, currency, channel, branch_code, branch_name,
+           teller_id, teller_name, counterparty_name, threshold_kobo,
+           fiu_ref_no, filing_deadline, filed_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+        """,
+        ctr_id, tenant_id, body.customer_id, body.customer_name, body.customer_type,
+        body.customer_bvn, body.customer_nin, body.transaction_id, body.transaction_type,
+        body.amount_kobo, body.currency, body.channel, body.branch_code, body.branch_name,
+        body.teller_id, body.teller_name, body.counterparty_name, threshold,
+        fiu_ref, deadline, x_user_id,
+    )
+
+    await pool.execute(
+        """INSERT INTO nfiu_audit_log (tenant_id, report_type, report_id, action, performed_by)
+           VALUES ($1,'CTR',$2,'created',$3)""",
+        tenant_id, ctr_id, x_user_id,
+    )
+
+    background_tasks.add_task(_file_ctr_background, str(ctr_id), tenant_id)
+
+    await publish_event("nfiu.ctr-generated", {
+        "tenantId": tenant_id, "ctrId": str(ctr_id),
+        "customerId": body.customer_id, "amountKobo": body.amount_kobo,
+        "fiuRef": fiu_ref,
+    })
+
+    return {
+        "ctrId": str(ctr_id),
+        "fiuRef": fiu_ref,
+        "status": "pending",
+        "filingDeadline": deadline.isoformat(),
+        "message": "CTR created — XML generation and NFIU submission initiated",
+    }
+
+
+@app.post("/api/strs", status_code=201)
+async def create_str(
+    body: STRRequest,
+    tenant_id: str = Depends(require_tenant),
+    x_user_id: str = Header(default="system", alias="x-keycloak-id"),
+):
+    """
+    File a Suspicious Transaction Report.
+
+    STRs require compliance officer review before submission to NFIU.
+    Status starts at 'pending' → 'under_review' → 'approved' → 'filed'.
+    Use POST /api/strs/{id}/approve to advance the status.
+
+    Tipping-off restriction is enforced: the customer must not be informed.
+    """
+    pool = await get_pool()
+    fiu_ref = next_ref("STR")
+    str_id = uuid.uuid4()
+    deadline = str_deadline()
+
+    await pool.execute(
+        """
+        INSERT INTO nfiu_strs
+          (id, tenant_id, customer_id, customer_name, customer_type,
+           customer_bvn, reason, category, total_amount_kobo, transaction_count,
+           period_start, period_end, detection_method, rule_id,
+           risk_score, risk_level, transaction_ids, fiu_ref_no, filing_deadline)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+        """,
+        str_id, tenant_id, body.customer_id, body.customer_name, body.customer_type,
+        body.customer_bvn, body.reason, body.category, body.total_amount_kobo,
+        body.transaction_count, body.period_start, body.period_end,
+        body.detection_method, body.rule_id, body.risk_score, body.risk_level,
+        body.transaction_ids, fiu_ref, deadline,
+    )
+
+    await pool.execute(
+        """INSERT INTO nfiu_audit_log (tenant_id, report_type, report_id, action, performed_by)
+           VALUES ($1,'STR',$2,'created',$3)""",
+        tenant_id, str_id, x_user_id,
+    )
+
+    await publish_event("nfiu.str-generated", {
+        "tenantId": tenant_id, "strId": str(str_id),
+        "customerId": body.customer_id, "riskScore": body.risk_score,
+        "category": body.category, "filingDeadline": deadline.isoformat(),
+        "fiuRef": fiu_ref,
+    })
+
+    return {
+        "strId": str(str_id),
+        "fiuRef": fiu_ref,
+        "status": "pending",
+        "filingDeadline": deadline.isoformat(),
+        "tippingOffRestriction": True,
+        "message": "STR created — requires compliance review before NFIU submission",
+    }
+
+
+@app.post("/api/strs/{str_id}/approve")
+async def approve_str(
+    str_id: str,
+    background_tasks: BackgroundTasks,
+    tenant_id: str = Depends(require_tenant),
+    x_user_id: str = Header(default="officer", alias="x-keycloak-id"),
+):
+    """Compliance officer approves an STR for submission to NFIU."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT status, sla_breached, filing_deadline FROM nfiu_strs WHERE id=$1 AND tenant_id=$2",
+        str_id, tenant_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="STR not found")
+    if row["status"] not in ("pending", "under_review"):
+        raise HTTPException(status_code=409, detail=f"STR is already in status '{row['status']}'")
+
+    # Check SLA
+    sla_ok = datetime.now(timezone.utc) <= row["filing_deadline"]
+    if not sla_ok:
+        await pool.execute(
+            "UPDATE nfiu_strs SET sla_breached=true WHERE id=$1", str_id
+        )
+        await publish_event("nfiu.sla-breach", {
+            "tenantId": tenant_id, "reportType": "STR", "reportId": str_id,
+            "deadline": row["filing_deadline"].isoformat(),
+        })
+        logger.error("STR %s SLA BREACHED — filing after 72-hour deadline", str_id)
+
+    await pool.execute(
+        "UPDATE nfiu_strs SET status='approved', approved_by=$1, reviewed_by=$2 WHERE id=$3",
+        x_user_id, x_user_id, str_id,
+    )
+    await pool.execute(
+        """INSERT INTO nfiu_audit_log (tenant_id, report_type, report_id, action, detail, performed_by)
+           VALUES ($1,'STR',$2,'approved',$3,$4)""",
+        tenant_id, str_id, {"sla_ok": sla_ok}, x_user_id,
+    )
+
+    background_tasks.add_task(_file_str_background, str_id, tenant_id)
+
+    return {"strId": str_id, "status": "approved", "slaOk": sla_ok}
+
+
+@app.get("/api/ctrs")
+async def list_ctrs(
+    tenant_id: str = Depends(require_tenant),
+    page: int = 1,
+    limit: int = 50,
+):
+    pool = await get_pool()
+    limit = min(limit, 200)
+    offset = (page - 1) * limit
+    rows = await pool.fetch(
+        """SELECT id, customer_id, customer_name, customer_type, transaction_id,
+                  amount_kobo, status, fiu_ref_no, goaml_ref, filing_deadline,
+                  filed_at, sla_breached, created_at
+           FROM nfiu_ctrs WHERE tenant_id=$1
+           ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
+        tenant_id, limit, offset,
+    )
+    total = await pool.fetchval("SELECT COUNT(*) FROM nfiu_ctrs WHERE tenant_id=$1", tenant_id)
+    return {"items": [dict(r) for r in rows], "total": total}
+
+
+@app.get("/api/strs")
+async def list_strs(
+    tenant_id: str = Depends(require_tenant),
+    page: int = 1,
+    limit: int = 50,
+):
+    pool = await get_pool()
+    limit = min(limit, 200)
+    offset = (page - 1) * limit
+    rows = await pool.fetch(
+        """SELECT id, customer_id, customer_name, customer_type, category,
+                  total_amount_kobo, risk_score, risk_level, status,
+                  fiu_ref_no, goaml_ref, filing_deadline, filed_at,
+                  sla_breached, tipping_off_restricted, created_at
+           FROM nfiu_strs WHERE tenant_id=$1
+           ORDER BY created_at DESC LIMIT $2 OFFSET $3""",
+        tenant_id, limit, offset,
+    )
+    total = await pool.fetchval("SELECT COUNT(*) FROM nfiu_strs WHERE tenant_id=$1", tenant_id)
+    return {"items": [dict(r) for r in rows], "total": total}
+
+
+@app.get("/api/ctrs/{ctr_id}/xml")
+async def get_ctr_xml(
+    ctr_id: str,
+    tenant_id: str = Depends(require_tenant),
+):
+    """Return the generated goAML XML for a CTR (for audit/download)."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT goaml_xml FROM nfiu_ctrs WHERE id=$1 AND tenant_id=$2", ctr_id, tenant_id
+    )
+    if not row or not row["goaml_xml"]:
+        raise HTTPException(status_code=404, detail="CTR XML not yet generated")
+    return Response(content=row["goaml_xml"], media_type="application/xml")
+
+
+@app.get("/api/strs/{str_id}/xml")
+async def get_str_xml(
+    str_id: str,
+    tenant_id: str = Depends(require_tenant),
+):
+    """Return the generated goAML XML for an STR."""
+    pool = await get_pool()
+    row = await pool.fetchrow(
+        "SELECT goaml_xml FROM nfiu_strs WHERE id=$1 AND tenant_id=$2", str_id, tenant_id
+    )
+    if not row or not row["goaml_xml"]:
+        raise HTTPException(status_code=404, detail="STR XML not yet generated")
+    return Response(content=row["goaml_xml"], media_type="application/xml")
+
+
+@app.get("/api/dashboard")
+async def dashboard(tenant_id: str = Depends(require_tenant)):
+    pool = await get_pool()
+    ctr_stats = await pool.fetchrow(
+        """SELECT COUNT(*) AS total,
+                  COUNT(*) FILTER (WHERE status='filed') AS filed,
+                  COUNT(*) FILTER (WHERE status IN ('pending','generating','generated')) AS pending,
+                  COUNT(*) FILTER (WHERE sla_breached) AS sla_breaches
+           FROM nfiu_ctrs WHERE tenant_id=$1""",
+        tenant_id,
+    )
+    str_stats = await pool.fetchrow(
+        """SELECT COUNT(*) AS total,
+                  COUNT(*) FILTER (WHERE status='filed') AS filed,
+                  COUNT(*) FILTER (WHERE status='under_review') AS under_review,
+                  COUNT(*) FILTER (WHERE status='approved') AS approved,
+                  COUNT(*) FILTER (WHERE sla_breached) AS sla_breaches
+           FROM nfiu_strs WHERE tenant_id=$1""",
+        tenant_id,
+    )
+    return {
+        "ctrs": dict(ctr_stats),
+        "strs": dict(str_stats),
+        "thresholds": {
+            "individualCtrNgn": CTR_INDIVIDUAL_THRESHOLD_KOBO / 100,
+            "corporateCtrNgn": CTR_CORPORATE_THRESHOLD_KOBO / 100,
+            "strDeadlineHours": STR_SLA_HOURS,
+        },
+        "goamlConfigured": bool(GOAML_API_URL and GOAML_API_KEY),
+    }
+
 
 if __name__ == "__main__":
-    get_db()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": "nfiu-ctr-str-filing-py", "port": PORT, "message": "starting"}))
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        if db_conn:
-            db_conn.close()
-        logger.info("Server stopped gracefully")
+    import uvicorn
+    port = int(os.getenv("PORT", "8283"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info")

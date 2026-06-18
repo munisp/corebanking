@@ -1,0 +1,49 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Compliance Service DB Architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- REGULATORY REPORTS -->
+        <mxCell id="reg_reports" value="regulatory_reports&#xa;----------------------&#xa;id (PK, serial)&#xa;report_id (varchar, unique)&#xa;tenant_id (varchar, indexed)&#xa;report_type (varchar, indexed)&#xa;period_start (timestamptz)&#xa;period_end (timestamptz)&#xa;parameters (JSONB)&#xa;report_data (JSONB)&#xa;file_url (varchar)&#xa;status (varchar: pending/generated/submitted)&#xa;generated_at (timestamptz)&#xa;submitted_at (timestamptz)&#xa;submission_reference (varchar)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="280" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- COMPLIANCE ALERTS -->
+        <mxCell id="compliance_alerts" value="compliance_alerts&#xa;----------------------&#xa;id (PK, serial)&#xa;alert_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;alert_type (varchar)&#xa;severity (varchar: low/medium/high/critical)&#xa;entity_type (varchar)&#xa;entity_id (varchar)&#xa;description (text)&#xa;metadata (JSONB)&#xa;status (varchar: open/in_review/resolved)&#xa;assigned_to (varchar)&#xa;resolved_at (timestamptz)&#xa;resolution_notes (text)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="380" y="40" width="280" height="320" as="geometry"/>
+        </mxCell>
+
+        <!-- SAR FILINGS -->
+        <mxCell id="sar_filings" value="sar_filings&#xa;----------------------&#xa;id (PK, serial)&#xa;sar_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;subject_name (varchar)&#xa;subject_type (varchar)&#xa;subject_id (varchar)&#xa;suspicious_activity_type (varchar)&#xa;activity_description (text)&#xa;transaction_ids (JSONB)&#xa;total_amount (decimal)&#xa;currency (varchar, default NGN)&#xa;filing_reason (text)&#xa;supporting_documents (JSONB)&#xa;status (varchar: draft/filed/accepted)&#xa;filed_at / filing_reference&#xa;created_by / reviewed_by&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="720" y="40" width="280" height="380" as="geometry"/>
+        </mxCell>
+
+        <!-- TRANSACTION MONITORING RULES -->
+        <mxCell id="monitoring_rules" value="transaction_monitoring_rules&#xa;----------------------&#xa;id (PK, serial)&#xa;rule_id (varchar, unique)&#xa;tenant_id (varchar, indexed)&#xa;rule_name (varchar)&#xa;rule_type (varchar)&#xa;conditions (JSONB)&#xa;alert_severity (varchar)&#xa;is_active (bool, indexed)&#xa;triggered_count (int)&#xa;last_triggered_at (timestamptz)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="400" width="280" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- SANCTIONS SCREENING -->
+        <mxCell id="sanctions" value="sanctions_screening&#xa;----------------------&#xa;id (PK, serial)&#xa;screening_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;entity_type (varchar)&#xa;entity_id (varchar, indexed)&#xa;entity_name (varchar)&#xa;screening_result (varchar: clear/match/review)&#xa;match_score (decimal)&#xa;matched_lists (JSONB)&#xa;screening_provider (varchar)&#xa;screened_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="380" y="420" width="280" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- AML RISK ASSESSMENTS -->
+        <mxCell id="aml_risk" value="aml_risk_assessments&#xa;----------------------&#xa;id (PK, serial)&#xa;assessment_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;entity_type (varchar)&#xa;entity_id (varchar, indexed)&#xa;risk_level (varchar: low/medium/high)&#xa;risk_score (int)&#xa;risk_factors (JSONB)&#xa;assessment_date" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="720" y="480" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="monitoring_rules" target="compliance_alerts" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="sanctions" target="aml_risk" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

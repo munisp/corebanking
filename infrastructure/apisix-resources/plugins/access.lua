@@ -1,0 +1,303 @@
+--- 54link APISIX Access Plugin
+
+local core = require("apisix.core")
+local http = require("resty.http")
+local jwt = require("resty.jwt")
+local redis_connector = require("resty.redis")
+local ngx = ngx
+
+local plugin_name = "54link-access-plugin"
+
+local schema = {
+    type = "object",
+    properties = {
+        authorizer_url = {
+            type = "string",
+            minLength = 1,
+            description = "The url used to validate jwt",
+        },
+        mint_account_url = {
+            type = "string",
+            minLength = 1,
+            description = "The url used to retreive mint account information",
+        },
+        keycloak_public_key_url = {
+            type = "string",
+            minLength = 1,
+            description = "The url used to retreive tenant keycloak public key",
+        },
+        billing_url = {
+            type = "string",
+            description = "Billing service URL for tenant suspension check (optional)",
+        },
+        redis_host = {
+            type = "string",
+            description = "Redis host for billing status cache",
+        },
+        redis_port = {
+            type = "integer",
+            default = 6379,
+            description = "Redis port",
+        },
+        redis_cache_ttl = {
+            type = "integer",
+            default = 60,
+            description = "Billing status cache TTL in seconds",
+        },
+    },
+    required = {"authorizer_url", "keycloak_public_key_url"},
+}
+
+local _M = {
+    version = 0.1,
+    priority = 2509,
+    name = plugin_name,
+    schema = schema,
+}
+
+local function fetch_data_from_authorizer(authorizer_url, token, tenant_id, keycloak_realm, keycloak_public_key)
+    local httpc = http.new()
+    local res, err = httpc:request_uri(authorizer_url .. "/" .. "validate/" .. token, {
+        method = "GET",
+        headers = {
+            ["x-tenant-id"] = tenant_id, -- Add the x-tenant-id header
+            ["x-keycloak-realm"] = keycloak_realm, -- Add the x-keycloak-realm header
+            ["x-keycloak-pub-key"] = keycloak_public_key, -- Add the x-tenant-id header
+        },
+    })
+
+    if not res then
+        return nil, nil, "failed to verify token: " .. err
+    end
+
+    if res.status ~= 200 then
+        return nil, nil, "failed to verify token, status: " .. res.status
+    end
+
+    local result = core.json.decode(res.body)
+    if not result or not result.keycloak_id then
+        return nil, nil, "failed to verify token"
+    end
+
+    return result.keycloak_id
+end
+
+local function fetch_mint_account_data(mint_account_url, tenant_id, ledger_id, keycloak_id)
+    local httpc = http.new()
+    local res, err = httpc:request_uri(mint_account_url, {
+        method = "GET",
+        headers = {
+            ["x-tenant-id"] = tenant_id, -- Add the x-tenant-id header
+            ["x-ledger-id"] = ledger_id, -- Add the x-ledger-id header
+            ["x-keycloak-id"] = keycloak_id, -- Add the x-keycloak-id header
+        },
+    })
+
+    if not res then
+        return nil, nil, "failed to get mint account: " .. err
+    end
+
+    if res.status ~= 200 then
+        return nil, nil, "failed to get mint account, status: " .. res.status
+    end
+
+    local result = core.json.decode(res.body)
+    if not result or not result.id then
+        return nil, nil, "failed to get mint account"
+    end
+
+    return result.id
+end
+
+-- Fetch billing status from Redis cache; on miss, call billing service and populate cache.
+-- Returns "active" | "suspended" | "inactive", or nil+err on hard failure.
+local function get_billing_status(conf, tenant_id)
+    local cache_key = "billing:status:" .. tenant_id
+
+    -- Try Redis first
+    if conf.redis_host then
+        local red = redis_connector:new()
+        red:set_timeout(500) -- 500 ms max
+        local ok, err = red:connect(conf.redis_host, conf.redis_port or 6379)
+        if ok then
+            local cached, _ = red:get(cache_key)
+            red:set_keepalive(10000, 10)
+            if cached and cached ~= ngx.null then
+                return cached
+            end
+        else
+            core.log.warn("Redis connect failed (billing cache miss): " .. (err or "unknown"))
+        end
+    end
+
+    -- Cache miss — call billing service
+    local httpc = http.new()
+    local res, err = httpc:request_uri(conf.billing_url .. "/billing/status", {
+        method = "GET",
+        headers = { ["x-tenant-id"] = tenant_id },
+        ssl_verify = false,
+    })
+    if not res then
+        return nil, "billing service unreachable: " .. (err or "unknown")
+    end
+    if res.status ~= 200 then
+        return nil, "billing service returned " .. res.status
+    end
+
+    local body = core.json.decode(res.body)
+    if not body or not body.status then
+        return nil, "invalid billing response"
+    end
+
+    local status = body.status
+
+    -- Populate Redis cache
+    if conf.redis_host then
+        local red = redis_connector:new()
+        red:set_timeout(500)
+        local ok, _ = red:connect(conf.redis_host, conf.redis_port or 6379)
+        if ok then
+            red:setex(cache_key, conf.redis_cache_ttl or 60, status)
+            red:set_keepalive(10000, 10)
+        end
+    end
+
+    return status
+end
+
+local function fetch_tenant_keycloak_public_key(keycloak_public_key_url, tenant_id)
+    local httpc = http.new()
+    local res, err = httpc:request_uri(keycloak_public_key_url .. "/" .. tenant_id, {
+        method = "GET",
+        headers = {
+            ["x-tenant-id"] = tenant_id, -- Add the x-tenant-id header
+        },
+    })
+
+    if not res then
+        return nil, nil, "failed to get tenant public key: " .. err
+    end
+
+    if res.status ~= 200 then
+        return nil, nil, "failed to get tenant public key, status: " .. res.status
+    end
+
+    local result = core.json.decode(res.body)
+    if not result or not result.public_rsa_key then
+        return nil, nil, "failed to get tenant public key"
+    end
+    
+    return result.public_rsa_key
+end
+
+-- Helper function to extract a cookie by name
+local function get_cookie(ctx, cookie_name)
+    local cookie_header = ctx.var.http_cookie
+    if not cookie_header then
+        return nil
+    end
+
+    for cookie in string.gmatch(cookie_header, "[^;]+") do
+        local key, value = string.match(cookie, "%s*(.-)%s*=%s*(.*)")
+        if key == cookie_name then
+            return value
+        end
+    end
+
+    return nil
+end
+
+-- Helper function to retrieve token from the request context
+local function get_token(ctx)
+    -- Try to get the token from query parameter
+    local token = core.request.get_uri_args(ctx).token
+
+    -- Fallback to cookies if token is not in query parameter
+    if not token then
+        token = get_cookie(ctx, "access_token")
+
+        if token then 
+            core.log.warn("Token from cookie: " .. token)
+        else
+            core.log.warn("Token from cookie: null")
+        end
+    end
+
+     -- Fallback to Authorization header if token is still not found
+    if not token then
+        local auth_header = core.request.header(ctx, "Authorization")
+        if auth_header and auth_header:match("^Bearer%s+(%S+)$") then
+            token = auth_header:match("^Bearer%s+(%S+)$")
+            core.log.warn("Token from Authorization header: " .. token)
+        else
+            core.log.warn("Token from Authorization header: null")
+        end
+    end
+
+    return token
+end
+
+function _M.access(conf, ctx)
+    -- Ignore OPTIONS preflight before any header access to avoid nil concatenation errors
+    if ctx.var.request_method == "OPTIONS" then
+        core.log.info("Skipping OPTIONS request")
+        return
+    end
+
+    local tenant_id = core.request.header(ctx, "x-tenant-id")
+    local keycloak_realm = "54link_" .. tenant_id
+    local ledger_id = "1"
+
+    if not tenant_id then
+        core.log.warn("Tenant ID not found")
+        return 400, {message = "Missing tenant identifier"}
+    end
+    
+    -- Billing gate — checked before auth to return 402 at the edge (fail-open on service error)
+    if conf.billing_url then
+        local billing_status, billing_err = get_billing_status(conf, tenant_id)
+        if billing_err then
+            core.log.error("Billing check failed for tenant=" .. tenant_id .. ": " .. billing_err)
+            -- Fail-open: log the error but allow the request through
+        elseif billing_status == "suspended" or billing_status == "inactive" then
+            core.log.warn("Blocked suspended tenant=" .. tenant_id .. " status=" .. billing_status)
+            return 402, {message = "Tenant account suspended. Contact support to restore access."}
+        end
+    end
+
+    local token = get_token(ctx)
+    if not token then
+        core.log.warn("JWT token not found")
+        return 401, {message = "Missing JWT token"}
+    end
+
+    local keycloak_public_key, err = fetch_tenant_keycloak_public_key(conf.keycloak_public_key_url, tenant_id)
+    if not keycloak_public_key then
+        return 401, {message = err}
+    end
+
+    local keycloak_id, err = fetch_data_from_authorizer(conf.authorizer_url, token, tenant_id, keycloak_realm, keycloak_public_key)
+    if not keycloak_id then
+        return 401, {message = err}
+    end
+
+    core.request.set_header(ctx, "x-tenant-id", tenant_id)
+    core.request.set_header(ctx, "x-keycloak-id", keycloak_id)
+    core.request.set_header(ctx, "x-keycloak-realm", "54link_" .. tenant_id)
+    core.request.set_header(ctx, "x-keycloak-pub-key", keycloak_public_key)
+    core.request.set_header(ctx, "x-ledger-id", ledger_id)
+
+    if conf.mint_account_url then
+        local mint_account_id, err = fetch_mint_account_data(conf.mint_account_url, tenant_id, ledger_id, keycloak_id)
+        if not mint_account_id then
+            return 401, {message = err}
+        end
+        core.request.set_header(ctx, "x-mint-account-id", mint_account_id)
+    end
+end
+
+function _M.check_schema(conf, schema_type)
+    return core.schema.check(schema, conf)
+end
+
+return _M

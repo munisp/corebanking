@@ -1,0 +1,33 @@
+# kyc-event-consumer-py
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: 54link-dev-kyc-event-consumer-py-route
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-1
+      priority: 10
+      match:
+        hosts:
+          - 54link-dev.upi.dev
+        paths:
+          - /kyc-event-consumer/*
+      backends:
+        - serviceName: compliance-kyc-aml
+          servicePort: 9228
+      plugins:
+        - name: proxy-rewrite
+          enable: true
+          config:
+            regex_uri:
+              - "^/kyc-event-consumer/(.*)"
+              - "/$1"
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"

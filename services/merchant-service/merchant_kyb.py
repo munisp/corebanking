@@ -1,0 +1,430 @@
+"""
+Merchant KYB (Know Your Business) Verification Module
+Handles business verification, document validation, and compliance checks
+"""
+
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+from datetime import datetime
+from enum import Enum
+import asyncpg
+import json
+
+router = APIRouter(prefix="/api/v1/merchants", tags=["KYB Verification"])
+
+class DocumentType(str, Enum):
+    BUSINESS_REGISTRATION = "business_registration"
+    TAX_CERTIFICATE = "tax_certificate"
+    BANK_STATEMENT = "bank_statement"
+    UTILITY_BILL = "utility_bill"
+    DIRECTORS_ID = "directors_id"
+    MEMORANDUM = "memorandum_of_association"
+    ARTICLES = "articles_of_association"
+
+class VerificationStatus(str, Enum):
+    PENDING = "pending"
+    IN_REVIEW = "in_review"
+    VERIFIED = "verified"
+    REJECTED = "rejected"
+    ADDITIONAL_INFO_REQUIRED = "additional_info_required"
+
+class DocumentSubmission(BaseModel):
+    document_type: DocumentType
+    document_url: str
+    document_number: Optional[str] = None
+    issue_date: Optional[datetime] = None
+    expiry_date: Optional[datetime] = None
+
+class KYBSubmission(BaseModel):
+    merchant_id: str
+    documents: List[DocumentSubmission]
+    business_owners: List[Dict]
+    directors: List[Dict]
+    beneficial_owners: List[Dict]
+    additional_info: Optional[Dict] = None
+
+class KYBVerificationDecision(BaseModel):
+    merchant_id: str
+    decision: VerificationStatus
+    verified_by: str
+    verification_notes: Optional[str] = None
+    rejection_reason: Optional[str] = None
+    required_documents: Optional[List[str]] = None
+
+class RiskAssessment(BaseModel):
+    merchant_id: str
+    risk_level: str  # low, medium, high
+    risk_factors: List[str]
+    compliance_score: int  # 0-100
+    aml_check: bool
+    sanctions_check: bool
+    pep_check: bool
+
+@router.post("/{merchant_id}/kyb/submit")
+async def submit_kyb_documents(
+    merchant_id: str,
+    submission: KYBSubmission,
+    db: asyncpg.Pool = Depends()
+):
+    """Submit KYB documents for verification"""
+    async with db.acquire() as conn:
+        # Check if merchant exists
+        merchant = await conn.fetchrow(
+            "SELECT * FROM merchants WHERE merchant_id = $1",
+            merchant_id
+        )
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        # Check if KYB already submitted
+        existing = await conn.fetchrow(
+            "SELECT * FROM merchant_kyb_verification WHERE merchant_id = $1",
+            merchant_id
+        )
+        
+        documents_json = json.dumps([doc.dict() for doc in submission.documents])
+        business_owners_json = json.dumps(submission.business_owners)
+        directors_json = json.dumps(submission.directors)
+        beneficial_owners_json = json.dumps(submission.beneficial_owners)
+        additional_info_json = json.dumps(submission.additional_info) if submission.additional_info else None
+        
+        if existing:
+            # Update existing submission
+            await conn.execute("""
+                UPDATE merchant_kyb_verification
+                SET documents = $1, business_owners = $2, directors = $3,
+                    beneficial_owners = $4, additional_info = $5,
+                    verification_status = 'in_review', updated_at = CURRENT_TIMESTAMP
+                WHERE merchant_id = $6
+            """, documents_json, business_owners_json, directors_json,
+                beneficial_owners_json, additional_info_json, merchant_id)
+        else:
+            # Create new submission
+            await conn.execute("""
+                INSERT INTO merchant_kyb_verification (
+                    merchant_id, documents, business_owners, directors,
+                    beneficial_owners, additional_info, verification_status
+                ) VALUES ($1, $2, $3, $4, $5, $6, 'in_review')
+            """, merchant_id, documents_json, business_owners_json, directors_json,
+                beneficial_owners_json, additional_info_json)
+        
+        # Update merchant KYB status
+        await conn.execute("""
+            UPDATE merchants
+            SET kyb_status = 'in_progress', updated_at = CURRENT_TIMESTAMP
+            WHERE merchant_id = $1
+        """, merchant_id)
+        
+        return {
+            "status": "submitted",
+            "merchant_id": merchant_id,
+            "verification_status": "in_review",
+            "submitted_at": datetime.now()
+        }
+
+@router.get("/{merchant_id}/kyb/status")
+async def get_kyb_status(merchant_id: str, db: asyncpg.Pool = Depends()):
+    """Get KYB verification status"""
+    async with db.acquire() as conn:
+        kyb = await conn.fetchrow("""
+            SELECT * FROM merchant_kyb_verification
+            WHERE merchant_id = $1
+        """, merchant_id)
+        
+        if not kyb:
+            return {
+                "merchant_id": merchant_id,
+                "verification_status": "not_started",
+                "message": "KYB verification not yet initiated"
+            }
+        
+        return {
+            "merchant_id": merchant_id,
+            "verification_status": kyb['verification_status'],
+            "documents": json.loads(kyb['documents']) if kyb['documents'] else [],
+            "verification_notes": kyb['verification_notes'],
+            "verified_by": kyb['verified_by'],
+            "verified_at": kyb['verified_at'],
+            "rejection_reason": kyb['rejection_reason'],
+            "created_at": kyb['created_at'],
+            "updated_at": kyb['updated_at']
+        }
+
+@router.post("/{merchant_id}/kyb/verify")
+async def verify_kyb(
+    merchant_id: str,
+    decision: KYBVerificationDecision,
+    db: asyncpg.Pool = Depends()
+):
+    """Make KYB verification decision (admin only)"""
+    async with db.acquire() as conn:
+        # Check if KYB submission exists
+        kyb = await conn.fetchrow(
+            "SELECT * FROM merchant_kyb_verification WHERE merchant_id = $1",
+            merchant_id
+        )
+        if not kyb:
+            raise HTTPException(status_code=404, detail="KYB submission not found")
+        
+        # Update verification status
+        await conn.execute("""
+            UPDATE merchant_kyb_verification
+            SET verification_status = $1, verified_by = $2, verification_notes = $3,
+                rejection_reason = $4, verified_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE merchant_id = $5
+        """, decision.decision.value, decision.verified_by, decision.verification_notes,
+            decision.rejection_reason, merchant_id)
+        
+        # Update merchant status based on decision
+        if decision.decision == VerificationStatus.VERIFIED:
+            new_status = "active"
+            kyb_status = "verified"
+        elif decision.decision == VerificationStatus.REJECTED:
+            new_status = "suspended"
+            kyb_status = "rejected"
+        else:
+            new_status = "pending"
+            kyb_status = "in_progress"
+        
+        await conn.execute("""
+            UPDATE merchants
+            SET status = $1, kyb_status = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE merchant_id = $3
+        """, new_status, kyb_status, merchant_id)
+        
+        return {
+            "status": "decision_recorded",
+            "merchant_id": merchant_id,
+            "decision": decision.decision.value,
+            "merchant_status": new_status,
+            "verified_by": decision.verified_by,
+            "verified_at": datetime.now()
+        }
+
+@router.post("/{merchant_id}/kyb/risk-assessment")
+async def perform_risk_assessment(
+    merchant_id: str,
+    db: asyncpg.Pool = Depends()
+):
+    """Perform automated risk assessment on merchant"""
+    async with db.acquire() as conn:
+        # Get merchant and KYB data
+        merchant = await conn.fetchrow(
+            "SELECT * FROM merchants WHERE merchant_id = $1",
+            merchant_id
+        )
+        if not merchant:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        
+        kyb = await conn.fetchrow(
+            "SELECT * FROM merchant_kyb_verification WHERE merchant_id = $1",
+            merchant_id
+        )
+        
+        # Calculate risk score
+        risk_factors = []
+        risk_score = 0
+        
+        # Industry risk
+        high_risk_industries = ['gambling', 'crypto', 'forex', 'adult_content']
+        if merchant['industry'].lower() in high_risk_industries:
+            risk_factors.append("High-risk industry")
+            risk_score += 30
+        
+        # Document completeness
+        if kyb:
+            documents = json.loads(kyb['documents']) if kyb['documents'] else []
+            required_docs = ['business_registration', 'tax_certificate', 'bank_statement']
+            submitted_doc_types = [doc['document_type'] for doc in documents]
+            missing_docs = [doc for doc in required_docs if doc not in submitted_doc_types]
+            
+            if missing_docs:
+                risk_factors.append(f"Missing documents: {', '.join(missing_docs)}")
+                risk_score += 20
+        else:
+            risk_factors.append("KYB not submitted")
+            risk_score += 40
+        
+        # Business age (simulated - would check registration date)
+        # New businesses are higher risk
+        risk_factors.append("New business (< 1 year)")
+        risk_score += 15
+        
+        # Determine risk level
+        if risk_score >= 60:
+            risk_level = "high"
+        elif risk_score >= 30:
+            risk_level = "medium"
+        else:
+            risk_level = "low"
+        
+        # Compliance score (inverse of risk score)
+        compliance_score = max(0, 100 - risk_score)
+        
+        # Perform checks (simulated)
+        aml_check = risk_score < 70
+        sanctions_check = True  # Would integrate with sanctions list API
+        pep_check = True  # Would integrate with PEP screening API
+        
+        assessment = {
+            "merchant_id": merchant_id,
+            "risk_level": risk_level,
+            "risk_score": risk_score,
+            "risk_factors": risk_factors,
+            "compliance_score": compliance_score,
+            "aml_check": aml_check,
+            "sanctions_check": sanctions_check,
+            "pep_check": pep_check,
+            "assessed_at": datetime.now()
+        }
+        
+        # Store assessment
+        await conn.execute("""
+            INSERT INTO merchant_risk_assessments (
+                merchant_id, risk_level, risk_score, risk_factors,
+                compliance_score, aml_check, sanctions_check, pep_check
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        """, merchant_id, risk_level, risk_score, json.dumps(risk_factors),
+            compliance_score, aml_check, sanctions_check, pep_check)
+        
+        return assessment
+
+@router.get("/{merchant_id}/kyb/documents")
+async def get_kyb_documents(merchant_id: str, db: asyncpg.Pool = Depends()):
+    """Get list of submitted KYB documents"""
+    async with db.acquire() as conn:
+        kyb = await conn.fetchrow(
+            "SELECT documents FROM merchant_kyb_verification WHERE merchant_id = $1",
+            merchant_id
+        )
+        
+        if not kyb or not kyb['documents']:
+            return {
+                "merchant_id": merchant_id,
+                "documents": [],
+                "total": 0
+            }
+        
+        documents = json.loads(kyb['documents'])
+        return {
+            "merchant_id": merchant_id,
+            "documents": documents,
+            "total": len(documents)
+        }
+
+@router.post("/{merchant_id}/kyb/request-additional-info")
+async def request_additional_info(
+    merchant_id: str,
+    required_documents: List[str],
+    notes: str,
+    requested_by: str,
+    db: asyncpg.Pool = Depends()
+):
+    """Request additional information from merchant"""
+    async with db.acquire() as conn:
+        await conn.execute("""
+            UPDATE merchant_kyb_verification
+            SET verification_status = 'additional_info_required',
+                verification_notes = $1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE merchant_id = $2
+        """, notes, merchant_id)
+        
+        # Log the request
+        await conn.execute("""
+            INSERT INTO merchant_kyb_requests (
+                merchant_id, request_type, required_documents,
+                notes, requested_by
+            ) VALUES ($1, 'additional_info', $2, $3, $4)
+        """, merchant_id, json.dumps(required_documents), notes, requested_by)
+        
+        return {
+            "status": "additional_info_requested",
+            "merchant_id": merchant_id,
+            "required_documents": required_documents,
+            "notes": notes,
+            "requested_by": requested_by,
+            "requested_at": datetime.now()
+        }
+
+@router.get("/kyb/pending")
+async def get_pending_kyb_verifications(
+    skip: int = 0,
+    limit: int = 20,
+    db: asyncpg.Pool = Depends()
+):
+    """Get list of pending KYB verifications for admin review"""
+    async with db.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT 
+                k.merchant_id,
+                m.business_name,
+                m.business_email,
+                k.verification_status,
+                k.created_at,
+                k.updated_at
+            FROM merchant_kyb_verification k
+            JOIN merchants m ON k.merchant_id = m.merchant_id
+            WHERE k.verification_status IN ('pending', 'in_review', 'additional_info_required')
+            ORDER BY k.created_at ASC
+            LIMIT $1 OFFSET $2
+        """, limit, skip)
+        
+        return {
+            "pending_verifications": [dict(row) for row in rows],
+            "total": len(rows),
+            "skip": skip,
+            "limit": limit
+        }
+
+# Database schema additions needed
+async def create_kyb_tables(conn: asyncpg.Connection):
+    """Create KYB-related tables"""
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS merchant_kyb_verification (
+            id SERIAL PRIMARY KEY,
+            merchant_id VARCHAR(50) REFERENCES merchants(merchant_id) ON DELETE CASCADE UNIQUE,
+            verification_status VARCHAR(50) DEFAULT 'pending',
+            documents JSONB,
+            business_owners JSONB,
+            directors JSONB,
+            beneficial_owners JSONB,
+            additional_info JSONB,
+            verification_notes TEXT,
+            verified_by VARCHAR(255),
+            verified_at TIMESTAMP,
+            rejection_reason TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE TABLE IF NOT EXISTS merchant_risk_assessments (
+            id SERIAL PRIMARY KEY,
+            merchant_id VARCHAR(50) REFERENCES merchants(merchant_id) ON DELETE CASCADE,
+            risk_level VARCHAR(20) NOT NULL,
+            risk_score INT NOT NULL,
+            risk_factors JSONB,
+            compliance_score INT NOT NULL,
+            aml_check BOOLEAN DEFAULT false,
+            sanctions_check BOOLEAN DEFAULT false,
+            pep_check BOOLEAN DEFAULT false,
+            assessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_risk_assessments_merchant ON merchant_risk_assessments(merchant_id);
+        
+        CREATE TABLE IF NOT EXISTS merchant_kyb_requests (
+            id SERIAL PRIMARY KEY,
+            merchant_id VARCHAR(50) REFERENCES merchants(merchant_id) ON DELETE CASCADE,
+            request_type VARCHAR(50) NOT NULL,
+            required_documents JSONB,
+            notes TEXT,
+            requested_by VARCHAR(255),
+            responded_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_kyb_requests_merchant ON merchant_kyb_requests(merchant_id);
+    """)

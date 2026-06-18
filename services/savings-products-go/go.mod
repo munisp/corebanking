@@ -1,4 +1,4 @@
-module github.com/54bank/savings-products
+module github.com/54link-dev/savings-products
 
 go 1.22
 

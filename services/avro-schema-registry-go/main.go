@@ -11,12 +11,10 @@ import (
 "syscall"
 "sync/atomic"
 
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
-	"crypto/rand"
-	"encoding/binary"
+	"math/rand"
 	"net/http"
 	"os"
 	"sync"
@@ -27,25 +25,9 @@ import (
 
 	"net"
 
-	"regexp"
 )
 
-// secureRandUint32 generates a cryptographically secure random uint32
-func secureRandUint32() uint32 {
-	var b [4]byte
-	rand.Read(b[:])
-	return binary.BigEndian.Uint32(b[:])
-}
-
-
-// Concurrency limiter prevents goroutine explosion
-var semaphore = make(chan struct{}, 100)
-
-func acquireSem() { semaphore <- struct{}{} }
-func releaseSem() { <-semaphore }
 var serviceName = "avro-schema-registry-go"
-
-var eventBus = newEventBus("platform.events", "avro-schema-registry")
 
 var startTime = time.Now()
 
@@ -133,7 +115,7 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(cached))
 		return
 	}
-	// DB-first query with WARNING: DB unavailable — degraded mode active
+	// DB-first query with in-memory fallback
 	if db != nil {
 		rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT 100", "avro_schema_registry_go")
 		if err == nil {
@@ -149,29 +131,25 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 			respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
 			return
 		}
-		log.Printf("avro-schema-registry-go: DB query failed, DB query failed — returning cached/empty result: %v", err)
+		log.Printf("avro-schema-registry-go: DB query failed, falling back to in-memory: %v", err)
 	}
 	// In-memory fallback
 	mu.Lock()
 	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "database_fallback", "degraded": true, "warning": "DB unavailable — serving cached data. Set STRICT_DB=true to return 503 instead"})
+	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "in-memory"})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
-	cacheInvalidate("avro_schema_registry_list")
+	cacheSet("avro_schema_registry_list", "", 1) // invalidate list cache on write
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&body)
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("AVR-%08X", secureRandUint32()),
+		ID:        fmt.Sprintf("AVR-%08X", rand.Uint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -193,11 +171,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
-
 
 	// Inter-service call
 	_upURL := os.Getenv("CORE_BANKING_URL")
@@ -209,18 +186,13 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[%s] inter-service call ok: %v", serviceName, _csResult)
 	}
 
-		eventBus.Emit("avro-schema-registry.processed", map[string]interface{}{"status": "success"})
 	respondJSON(w, 201, map[string]interface{}{"created": true, "record": rec})
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&body)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -235,7 +207,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", secureRandUint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -249,11 +221,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 func handleProcess(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&body)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -267,8 +235,7 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			// Simulate domain processing
 			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
 			records[i].Data["processingResult"] = "success"
-			// Score computed from record data hash — deterministic, not random
-			recordHash := uint64(0); for _, b := range []byte(fmt.Sprintf("%v", records[i].Data)) { recordHash = recordHash*31 + uint64(b) }; records[i].Data["score"] = float64(recordHash % 100) / 100.0
+			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
 			records[i].Status = "completed"
 			domainStats.ProcessedToday++
 			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
@@ -321,11 +288,7 @@ func avro_schema_registryThroughputHandler(w http.ResponseWriter, r *http.Reques
         BatchSize  int `json:"batch_size"`
         IntervalMs int `json:"interval_ms"`
     }
-    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
-    	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-    	return
-    }
+    json.NewDecoder(r.Body).Decode(&req)
     tps := estimateThroughput(req.BatchSize, req.IntervalMs)
     respondJSON(w, 200, map[string]interface{}{"throughput_per_sec": tps, "batch_size": req.BatchSize})
 }
@@ -335,11 +298,7 @@ func avro_schema_registryPartitionHandler(w http.ResponseWriter, r *http.Request
         CustomerID    string `json:"customer_id"`
         NumPartitions int    `json:"num_partitions"`
     }
-    if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-    	log.Printf("[%s] JSON decode error: %v", serviceName, err)
-    	respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-    	return
-    }
+    json.NewDecoder(r.Body).Decode(&req)
     if req.NumPartitions <= 0 { req.NumPartitions = 12 }
     partition := partitionKey(req.CustomerID, req.NumPartitions)
     respondJSON(w, 200, map[string]interface{}{"partition": partition, "customer_id": req.CustomerID, "total_partitions": req.NumPartitions})
@@ -347,8 +306,8 @@ func avro_schema_registryPartitionHandler(w http.ResponseWriter, r *http.Request
 
 // --- Production Hardening ---
 var (
-    requestCount  uint64
-    errorCount  uint64
+    _reqCount  uint64
+    _errCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -365,8 +324,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&requestCount)
-    errs := atomic.LoadUint64(&errorCount)
+    reqs := atomic.LoadUint64(&_reqCount)
+    errs := atomic.LoadUint64(&_errCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"avro-schema-registry-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"avro-schema-registry-go\"} %d\n", errs)
@@ -377,11 +336,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&requestCount, 1)
+        atomic.AddUint64(&_reqCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&errorCount, 1)
+            atomic.AddUint64(&_errCount, 1)
         }
     })
 }
@@ -403,13 +362,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
 		db = nil
 		return
 	}
@@ -417,7 +376,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
 		db = nil
 		return
 	}
@@ -526,166 +485,39 @@ func traceMiddleware(next http.Handler) http.Handler {
 }
 
 // --- Redis Caching Layer ---
-// --- Production Cache (connection-pooled, multi-level, with metrics) ---
-var _cachePool *cachePool
-var _l1Cache sync.Map // L1 in-process cache
-var _cacheHits atomic.Uint64
-var _cacheMisses atomic.Uint64
-var _cacheStampedes atomic.Uint64
+var redisAddr string
 
-type cachePool struct {
-	pool     chan net.Conn
-	host     string
-	port     string
-	password string
-	db       string
-}
-
-type l1CacheEntry struct {
-	Value  string
-	Expiry time.Time
-}
-
-func initCachePool() {
-	url := os.Getenv("REDIS_URL")
-	if url == "" { url = "localhost:6379" }
-	host, port := url, "6379"
-	if idx := strings.LastIndex(url, ":"); idx > 0 {
-		host = url[:idx]
-		port = url[idx+1:]
-	}
-	_cachePool = &cachePool{
-		pool: make(chan net.Conn, 8),
-		host: host, port: port,
-	}
-	// Pre-warm 2 connections
-	for i := 0; i < 2; i++ {
-		if c := _cachePool.dial(); c != nil {
-			_cachePool.pool <- c
-		}
-	}
-}
-
-func (p *cachePool) dial() net.Conn {
-	addr := net.JoinHostPort(p.host, p.port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil { return nil }
-	conn.SetDeadline(time.Now().Add(3 * time.Second))
-	fmt.Fprintf(conn, "*1\r\n$4\r\nPING\r\n")
-	buf := make([]byte, 64)
-	n, _ := conn.Read(buf)
-	if n > 0 && buf[0] == '+' { return conn }
-	conn.Close()
-	return nil
-}
-
-func (p *cachePool) get() net.Conn {
-	select {
-	case c := <-p.pool:
-		c.SetDeadline(time.Now().Add(2 * time.Second))
-		fmt.Fprintf(c, "*1\r\n$4\r\nPING\r\n")
-		buf := make([]byte, 64)
-		n, err := c.Read(buf)
-		if err == nil && n > 0 && buf[0] == '+' { return c }
-		c.Close()
-		return p.dial()
-	default:
-		return p.dial()
-	}
-}
-
-func (p *cachePool) put(c net.Conn) {
-	if c == nil { return }
-	select {
-	case p.pool <- c:
-	default:
-		c.Close()
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
 	}
 }
 
 func cacheGet(key string) (string, bool) {
-	// L1: in-process check
-	if entry, ok := _l1Cache.Load(key); ok {
-		e := entry.(l1CacheEntry)
-		if time.Now().Before(e.Expiry) {
-			_cacheHits.Add(1)
-			return e.Value, true
-		}
-		_l1Cache.Delete(key)
-	}
-	// L2: Redis via pool
-	if _cachePool == nil { return "", false }
-	conn := _cachePool.get()
-	if conn == nil { _cacheMisses.Add(1); return "", false }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return "", false }
+	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 8192)
+	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { _cacheMisses.Add(1); return "", false }
+	if err != nil || n < 3 { return "", false }
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
+		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 {
-			_cacheHits.Add(1)
-			// Promote to L1 (10s TTL)
-			_l1Cache.Store(key, l1CacheEntry{Value: parts[1], Expiry: time.Now().Add(10 * time.Second)})
-			return parts[1], true
-		}
+		if len(parts) >= 3 { return parts[1], true }
 	}
-	_cacheMisses.Add(1)
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
-	// L1 store
-	_l1Cache.Store(key, l1CacheEntry{Value: value, Expiry: time.Now().Add(time.Duration(ttlSeconds) * time.Second)})
-	// L2: Redis via pool
-	if _cachePool == nil { return }
-	conn := _cachePool.get()
-	if conn == nil { return }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	ttlStr := fmt.Sprintf("%d", ttlSeconds)
-	fmt.Fprintf(conn, "*6\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%s\r\n$2\r\nNX\r\n",
-		len(key), key, len(value), value, len(ttlStr), ttlStr)
-	buf := make([]byte, 256)
-	conn.Read(buf)
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return }
+	defer conn.Close()
+	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
+		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
 }
-
-func cacheInvalidate(key string) {
-	_l1Cache.Delete(key)
-	if _cachePool == nil { return }
-	conn := _cachePool.get()
-	if conn == nil { return }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	fmt.Fprintf(conn, "*2\r\n$3\r\nDEL\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 64)
-	conn.Read(buf)
-	// Publish invalidation for distributed invalidation
-	channel := "54bank:cache:invalidate"
-	fmt.Fprintf(conn, "*3\r\n$7\r\nPUBLISH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-		len(channel), channel, len(key), key)
-	conn.Read(buf)
-}
-
-func cacheMetricsHandler(w http.ResponseWriter, r *http.Request) {
-	hits := _cacheHits.Load()
-	misses := _cacheMisses.Load()
-	total := hits + misses
-	hitRate := 0.0
-	if total > 0 { hitRate = float64(hits) / float64(total) * 100 }
-	l1Size := 0
-	_l1Cache.Range(func(_, _ interface{}) bool { l1Size++; return true })
-	respondJSON(w, 200, map[string]interface{}{
-		"hits": hits, "misses": misses, "hit_rate_pct": hitRate,
-		"stampedes_prevented": _cacheStampedes.Load(),
-		"l1_size": l1Size,
-		"pool_connected": _cachePool != nil,
-	})
-}
-
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
@@ -878,7 +710,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
+    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -888,7 +720,7 @@ func (am *alertManager) check() []map[string]interface{} {
 func max64(a, b uint64) uint64 { if a > b { return a }; return b }
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    respondJSON(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Graceful Degradation ---
@@ -926,7 +758,7 @@ func (d *degradationState) setUpstream(name string, ok bool) {
 func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     _degrade.mu.RLock()
     defer _degrade.mu.RUnlock()
-    respondJSON(w, 200, map[string]interface{}{
+    jsonResp(w, 200, map[string]interface{}{
         "service":        serviceName,
         "db_available":   _degrade.dbAvailable,
         "cache_available": _degrade.cacheAvailable,
@@ -935,681 +767,7 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
     })
 }
 
-
-// ── Deep Domain Logic: Compliance ───────────────────────────────────────────
-
-type AmountKobo int64
-func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
-func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
-
-// CTR (Currency Transaction Report) — NFIU requirement
-type CTRReport struct {
-	ReportID       string     `json:"report_id"`
-	CustomerID     string     `json:"customer_id"`
-	TransactionID  string     `json:"transaction_id"`
-	AmountKobo     AmountKobo `json:"amount_kobo"`
-	Type           string     `json:"type"` // cash_deposit, cash_withdrawal, transfer
-	Threshold      string     `json:"threshold"`
-	FiledAt        string     `json:"filed_at"`
-	Status         string     `json:"status"` // pending, filed, acknowledged
-}
-
-func generateCTR(customerID, txnID string, amountKobo AmountKobo, txnType string) *CTRReport {
-	threshold := ""
-	if txnType == "cash_deposit" || txnType == "cash_withdrawal" {
-		if amountKobo >= nairaToKobo(5000000) { threshold = "NFIU_CASH_5M" }
-	} else {
-		if amountKobo >= nairaToKobo(10000000) { threshold = "NFIU_TRANSFER_10M" }
-	}
-	if threshold == "" { return nil }
-	return &CTRReport{
-		ReportID: fmt.Sprintf("CTR-%d", time.Now().UnixMilli()),
-		CustomerID: customerID, TransactionID: txnID,
-		AmountKobo: amountKobo, Type: txnType,
-		Threshold: threshold, FiledAt: time.Now().Format(time.RFC3339),
-		Status: "pending",
-	}
-}
-
-// STR (Suspicious Transaction Report) generation
-type STRReport struct {
-	ReportID    string `json:"report_id"`
-	CustomerID  string `json:"customer_id"`
-	Reason      string `json:"reason"`
-	RiskScore   float64 `json:"risk_score"`
-	Indicators  []string `json:"indicators"`
-	Narrative   string `json:"narrative"`
-	FiledAt     string `json:"filed_at"`
-}
-
-func generateSTR(customerID string, riskScore float64, indicators []string) *STRReport {
-	if riskScore < 70 { return nil } // Only file if high risk
-	return &STRReport{
-		ReportID:   fmt.Sprintf("STR-%d", time.Now().UnixMilli()),
-		CustomerID: customerID,
-		Reason:     "automated_detection",
-		RiskScore:  riskScore,
-		Indicators: indicators,
-		Narrative:  fmt.Sprintf("Automated STR: %d risk indicators detected, score %.1f", len(indicators), riskScore),
-		FiledAt:    time.Now().Format(time.RFC3339),
-	}
-}
-
-// AML Risk Scoring — multi-factor
-func computeAMLRiskScoreDeep(
-	txnAmountKobo AmountKobo, isPEP bool, isHighRiskCountry bool,
-	cashIntensive bool, isStructuring bool, hasAdverseMedia bool,
-	customerAge int, accountAgeMonths int,
-) (float64, []string) {
-	score := 0.0
-	var indicators []string
-
-	if isPEP { score += 30; indicators = append(indicators, "PEP_STATUS") }
-	if isHighRiskCountry { score += 25; indicators = append(indicators, "HIGH_RISK_JURISDICTION") }
-	if cashIntensive { score += 15; indicators = append(indicators, "CASH_INTENSIVE") }
-	if isStructuring { score += 35; indicators = append(indicators, "STRUCTURING_DETECTED") }
-	if hasAdverseMedia { score += 20; indicators = append(indicators, "ADVERSE_MEDIA") }
-	if txnAmountKobo > nairaToKobo(10000000) { score += 10; indicators = append(indicators, "HIGH_VALUE_TXN") }
-	if accountAgeMonths < 3 { score += 10; indicators = append(indicators, "NEW_ACCOUNT") }
-	if customerAge < 25 && txnAmountKobo > nairaToKobo(5000000) { score += 15; indicators = append(indicators, "YOUNG_HIGH_VALUE") }
-
-	if score > 100 { score = 100 }
-	return score, indicators
-}
-
-// Sanctions screening
-var sanctionedCountries = map[string]bool{
-	"KP": true, "IR": true, "SY": true, "CU": true, "VE": true,
-	"MM": true, "BY": true, "ZW": true, "SD": true,
-}
-
-func checkSanctions(countryCode string) (bool, string) {
-	if sanctionedCountries[countryCode] {
-		return true, fmt.Sprintf("country %s is on sanctions list — transaction blocked", countryCode)
-	}
-	return false, ""
-}
-
-// PEP (Politically Exposed Person) enhanced due diligence
-func computePEPRiskLevel(pepCategory string, relationshipType string) string {
-	switch pepCategory {
-	case "head_of_state", "minister", "governor":
-		return "very_high"
-	case "senator", "representative", "judge":
-		return "high"
-	case "director_general", "commissioner":
-		return "medium"
-	case "family_member", "close_associate":
-		if relationshipType == "immediate_family" { return "high" }
-		return "medium"
-	default:
-		return "standard"
-	}
-}
-
-// Transaction monitoring — pattern detection
-func detectStructuring(transactions []map[string]interface{}, windowHours int) bool {
-	// Check for multiple transactions just below ₦5M threshold
-	count := 0
-	for _, txn := range transactions {
-		if amt, ok := txn["amount_kobo"].(int64); ok {
-			if AmountKobo(amt) >= nairaToKobo(4000000) && AmountKobo(amt) < nairaToKobo(5000000) {
-				count++
-			}
-		}
-	}
-	return count >= 3 // 3+ just-below-threshold = structuring
-}
-
-// OFAC/UN Sanctions name matching (fuzzy)
-func nameSimilarity(name1, name2 string) float64 {
-	n1 := strings.ToLower(strings.TrimSpace(name1))
-	n2 := strings.ToLower(strings.TrimSpace(name2))
-	if n1 == n2 { return 100.0 }
-	// Simple Jaccard similarity on character bigrams
-	bigrams1 := make(map[string]bool)
-	bigrams2 := make(map[string]bool)
-	for i := 0; i < len(n1)-1; i++ { bigrams1[n1[i:i+2]] = true }
-	for i := 0; i < len(n2)-1; i++ { bigrams2[n2[i:i+2]] = true }
-	intersection := 0
-	for bg := range bigrams1 { if bigrams2[bg] { intersection++ } }
-	union := len(bigrams1) + len(bigrams2) - intersection
-	if union == 0 { return 0 }
-	return float64(intersection) / float64(union) * 100.0
-}
-
-
-// ── State Machine, Reversal & Enhanced Validation ───────────────────────────
-
-// Processing state machine
-type ProcessingState string
-const (
-	ProcPending    ProcessingState = "pending"
-	ProcIngesting  ProcessingState = "ingesting"
-	ProcProcessing ProcessingState = "processing"
-	ProcCompleted  ProcessingState = "completed"
-	ProcFailed     ProcessingState = "failed"
-	ProcRetrying   ProcessingState = "retrying"
-	ProcCancelled  ProcessingState = "cancelled"
-)
-
-var validProcTransitions = map[ProcessingState][]ProcessingState{
-	ProcPending:    {ProcIngesting, ProcCancelled},
-	ProcIngesting:  {ProcProcessing, ProcFailed},
-	ProcProcessing: {ProcCompleted, ProcFailed},
-	ProcFailed:     {ProcRetrying, ProcCancelled},
-	ProcRetrying:   {ProcIngesting, ProcFailed, ProcCancelled},
-}
-
-func canTransitionProc(from, to ProcessingState) bool {
-	allowed := validProcTransitions[from]
-	for _, s := range allowed { if s == to { return true } }
-	return false
-}
-
-func transitionProcessing(entityID string, from, to ProcessingState) error {
-	if !canTransitionProc(from, to) {
-		return fmt.Errorf("invalid transition: %s → %s for %s", from, to, entityID)
-	}
-	log.Printf("[state-machine] %s: %s → %s", entityID, from, to)
-	return nil
-}
-
-// Reversal / compensation for processed records
-func computeProcessingReversal(batchID string, recordCount int, reason string) map[string]interface{} {
-	return map[string]interface{}{
-		"reversal_id":   fmt.Sprintf("PREV-%s-%d", batchID, time.Now().UnixMilli()),
-		"batch_id":      batchID,
-		"record_count":  recordCount,
-		"reason":        reason,
-		"status":        "reversed",
-		"reversed_at":   time.Now().Format(time.RFC3339),
-	}
-}
-
-// Comprehensive validation with error accumulation
-func validateProcessingInput(batchID, source string, recordCount int, schema string) (bool, []string) {
-	var errors []string
-	if batchID == "" { errors = append(errors, "batch ID required") }
-	if source == "" { errors = append(errors, "data source required") }
-	if recordCount <= 0 { errors = append(errors, "record count must be positive") }
-	if recordCount > 1000000 { errors = append(errors, "record count exceeds 1M batch limit") }
-	if schema == "" { errors = append(errors, "schema identifier required") }
-	// Validate batch ID format
-	if len(batchID) > 64 { errors = append(errors, "batch ID exceeds 64 character limit") }
-	return len(errors) == 0, errors
-}
-
-func validateSchemaInput(schemaName, version, format string, fields int) (bool, []string) {
-	var errors []string
-	if schemaName == "" { errors = append(errors, "schema name required") }
-	if version == "" { errors = append(errors, "schema version required") }
-	if format != "avro" && format != "json" && format != "protobuf" {
-		errors = append(errors, "schema format must be avro, json, or protobuf")
-	}
-	if fields <= 0 { errors = append(errors, "schema must have at least one field") }
-	if fields > 500 { errors = append(errors, "schema exceeds 500 field limit") }
-	return len(errors) == 0, errors
-}
-
-// Nigerian banking context for data processing
-func validateNIBSSBatchHeader(bankCode, sessionDate string, recordCount int) (bool, []string) {
-	var errors []string
-	if len(bankCode) != 3 { errors = append(errors, "NIBSS bank code must be 3 digits") }
-	if len(sessionDate) != 8 { errors = append(errors, "session date must be YYYYMMDD format") }
-	if recordCount <= 0 { errors = append(errors, "batch must contain at least 1 record") }
-	// Validate bank code is numeric
-	for _, c := range bankCode {
-		if c < '0' || c > '9' { errors = append(errors, "bank code must be numeric"); break }
-	}
-	return len(errors) == 0, errors
-}
-
-// NFIU compliance for batch processing
-func checkNFIUBatch(totalAmountKobo int64, txnType string) (bool, string) {
-	naira := float64(totalAmountKobo) / 100.0
-	if txnType == "cash" && naira >= 5000000 {
-		return true, "NFIU: Batch cash total ≥₦5M requires CTR"
-	}
-	if txnType == "transfer" && naira >= 10000000 {
-		return true, "NFIU: Batch transfer total ≥₦10M requires CTR"
-	}
-	return false, ""
-}
-
-
-func ensureDB() {
-	if db == nil {
-		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
-	}
-}
-
-
-// --- PII Masking (NDPR Compliance) ---
-func maskPII(value, fieldType string) string {
-	if len(value) == 0 { return "***" }
-	switch fieldType {
-	case "bvn", "nin":
-		if len(value) >= 4 { return "***" + value[len(value)-4:] }
-		return "***"
-	case "phone":
-		if len(value) >= 4 { return "+234***" + value[len(value)-4:] }
-		return "+234***"
-	case "email":
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return string(parts[0][0]) + "***@" + parts[1] }
-		return "***@***"
-	case "account":
-		if len(value) >= 4 { return "****" + value[len(value)-4:] }
-		return "****"
-	default:
-		if len(value) > 4 { return value[:1] + "***" + value[len(value)-1:] }
-		return "***"
-	}
-}
-
-func sanitizeLogEntry(msg string) string {
-	// Mask BVN patterns (11 digits)
-	re1 := regexp.MustCompile(`\b[0-9]{11}\b`)
-	msg = re1.ReplaceAllStringFunc(msg, func(s string) string { return "***" + s[len(s)-4:] })
-	// Mask account numbers (10 digits)
-	re2 := regexp.MustCompile(`\b[0-9]{10}\b`)
-	msg = re2.ReplaceAllStringFunc(msg, func(s string) string { return "****" + s[len(s)-4:] })
-	// Mask email
-	re3 := regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
-	msg = re3.ReplaceAllString(msg, "***@***")
-	return msg
-}
-
-
-// --- Dead Letter Queue Handler ---
-type DLQMessage struct {
-	OriginalTopic string                 `json:"original_topic"`
-	ConsumerGroup string                 `json:"consumer_group"`
-	MessageKey    string                 `json:"message_key"`
-	MessageValue  map[string]interface{} `json:"message_value"`
-	ErrorMessage  string                 `json:"error_message"`
-	RetryCount    int                    `json:"retry_count"`
-	MaxRetries    int                    `json:"max_retries"`
-	CreatedAt     string                 `json:"created_at"`
-}
-
-var dlqMessages []DLQMessage
-var dlqMu sync.Mutex
-
-func publishToDLQ(topic, consumerGroup, key string, value map[string]interface{}, err error, retryCount int) {
-	dlqMu.Lock()
-	defer dlqMu.Unlock()
-	msg := DLQMessage{
-		OriginalTopic: topic,
-		ConsumerGroup: consumerGroup,
-		MessageKey:    key,
-		MessageValue:  value,
-		ErrorMessage:  err.Error(),
-		RetryCount:    retryCount,
-		MaxRetries:    3,
-		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
-	}
-	dlqMessages = append(dlqMessages, msg)
-	log.Printf("[DLQ] Message sent to DLQ: topic=%s key=%s error=%s retries=%d", topic, key, err.Error(), retryCount)
-}
-
-func handleDLQList(w http.ResponseWriter, r *http.Request) {
-	dlqMu.Lock()
-	defer dlqMu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{
-		"dlq_messages": dlqMessages,
-		"count":        len(dlqMessages),
-	})
-}
-
-func handleDLQReplay(w http.ResponseWriter, r *http.Request) {
-	dlqMu.Lock()
-	defer dlqMu.Unlock()
-	if len(dlqMessages) == 0 {
-		respondJSON(w, 200, map[string]interface{}{"status": "empty", "replayed": 0})
-		return
-	}
-	replayed := 0
-	var remaining []DLQMessage
-	for _, msg := range dlqMessages {
-		if msg.RetryCount < msg.MaxRetries {
-			log.Printf("[DLQ] Replaying: topic=%s key=%s attempt=%d", msg.OriginalTopic, msg.MessageKey, msg.RetryCount+1)
-			replayed++
-		} else {
-			remaining = append(remaining, msg)
-		}
-	}
-	dlqMessages = remaining
-	respondJSON(w, 200, map[string]interface{}{"status": "replayed", "replayed": replayed, "remaining": len(remaining)})
-}
-
-
-// ─── Idempotency Middleware ─────────────────────────────────────────────────
-var idempotencyCache = struct {
-	sync.RWMutex
-	entries map[string]idempotencyEntry
-}{entries: make(map[string]idempotencyEntry)}
-
-type idempotencyEntry struct {
-	response   []byte
-	statusCode int
-	createdAt  time.Time
-}
-
-func idempotencyMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" && r.Method != "PUT" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		key := r.Header.Get("Idempotency-Key")
-		if key == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		idempotencyCache.RLock()
-		if entry, ok := idempotencyCache.entries[key]; ok {
-			idempotencyCache.RUnlock()
-			w.Header().Set("X-Idempotency-Replayed", "true")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(entry.statusCode)
-			w.Write(entry.response)
-			return
-		}
-		idempotencyCache.RUnlock()
-		rec := &idempotencyRecorder{ResponseWriter: w, statusCode: 200}
-		next.ServeHTTP(rec, r)
-		idempotencyCache.Lock()
-		idempotencyCache.entries[key] = idempotencyEntry{response: rec.body, statusCode: rec.statusCode, createdAt: time.Now()}
-		idempotencyCache.Unlock()
-		// Cleanup old entries (>24h) in background
-		go func() {
-			idempotencyCache.Lock()
-			defer idempotencyCache.Unlock()
-			for k, v := range idempotencyCache.entries {
-				if time.Since(v.createdAt) > 24*time.Hour { delete(idempotencyCache.entries, k) }
-			}
-		}()
-	})
-}
-
-type idempotencyRecorder struct {
-	http.ResponseWriter
-	statusCode int
-	body       []byte
-}
-
-func (r *idempotencyRecorder) WriteHeader(code int) { r.statusCode = code; r.ResponseWriter.WriteHeader(code) }
-func (r *idempotencyRecorder) Write(b []byte) (int, error) { r.body = append(r.body, b...); return r.ResponseWriter.Write(b) }
-
-
-// ─── Transaction Atomicity ──────────────────────────────────────────────────
-// All multi-step write operations wrapped in DB transactions.
-func dbExecAtomic(queries []string, params [][]interface{}) error {
-	if db == nil { return fmt.Errorf("DB not available") }
-	tx, err := db.Begin()
-	if err != nil { return fmt.Errorf("BEGIN failed: %v", err) }
-	for i, q := range queries {
-		var args []interface{}
-		if i < len(params) { args = params[i] }
-		if _, err := tx.Exec(q, args...); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("step %d failed: %v", i+1, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("COMMIT failed: %v", err)
-	}
-	return nil
-}
-
-
-// --- Observability (OpenTelemetry) ---
-var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-func initTracing() {
-	if otelEndpoint == "" { return }
-	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
-}
-
-// --- Retry with Exponential Backoff ---
-func retryWithBackoff(maxRetries int, fn func() error) error {
-	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
-		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
-		time.Sleep(backoff)
-	}
-	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
-}
-
-func requestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rid := r.Header.Get("X-Request-Id")
-		if rid == "" {
-			rid = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		w.Header().Set("X-Request-Id", rid)
-		next.ServeHTTP(w, r)
-	})
-}
-
-func validateOrigin(origin string) bool {
-	if origin == "" || origin == "*" {
-		return false // reject wildcards
-	}
-	// Only allow HTTPS origins in production
-	if strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://localhost") {
-		return true
-	}
-	return false
-}
-
-func validateJWTExpiry(tokenStr string) bool {
-	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	// Decode payload (base64url)
-	payload := parts[1]
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	decoded, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		return false
-	}
-	var claims map[string]interface{}
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return false
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return false
-	}
-	return time.Now().Unix() < int64(exp)
-}
-
-// Handler context with timeout prevents hung requests
-func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(r.Context(), 30*time.Second)
-}
-
-// Secure HTTP server configuration
-func newSecureServer(addr string, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadTimeout:       15 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
-	}
-}
-
-// Sanitize errors before sending to clients (prevent info leakage)
-func sanitizeError(err error) string {
-	errStr := err.Error()
-	// Strip file paths, stack traces, internal IPs
-	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") {
-		return "internal error"
-	}
-	if len(errStr) > 200 {
-		return "internal error"
-	}
-	return errStr
-}
-
-// IP-based sliding window rate limiter
-type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rateBucket
-	rate     int
-	window   time.Duration
-}
-
-type rateBucket struct {
-	count    int
-	lastSeen time.Time
-}
-
-func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
-	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
-	go rl.cleanup()
-	return rl
-}
-
-func (rl *ipRateLimiter) allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	b, exists := rl.visitors[ip]
-	if !exists || time.Since(b.lastSeen) > rl.window {
-		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
-		return true
-	}
-	if b.count >= rl.rate {
-		return false
-	}
-	b.count++
-	b.lastSeen = time.Now()
-	return true
-}
-
-func (rl *ipRateLimiter) cleanup() {
-	for {
-		time.Sleep(rl.window)
-		rl.mu.Lock()
-		for ip, b := range rl.visitors {
-			if time.Since(b.lastSeen) > rl.window {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
-}
-
-var globalIPLimiter = newIPRateLimiter(100, time.Minute)
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
-
-// Prevent HTTP header injection (strip CR/LF)
-func sanitizeHeader(value string) string {
-	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
-}
-
-func validateBVN(bvn string) bool {
-	if len(bvn) != 11 { return false }
-	for _, c := range bvn { if c < '0' || c > '9' { return false } }
-	return true
-}
-
-func validateAccountNumber(acctNo string) bool {
-	if len(acctNo) != 10 { return false }
-	for _, c := range acctNo { if c < '0' || c > '9' { return false } }
-	return true
-}
-
-func validateNigerianPhone(phone string) bool {
-	clean := strings.ReplaceAll(strings.ReplaceAll(phone, " ", ""), "-", "")
-	if strings.HasPrefix(clean, "+234") && len(clean) == 14 { return true }
-	if strings.HasPrefix(clean, "0") && len(clean) == 11 { return true }
-	return false
-}
-
-func validateAmountKobo(amount int64) bool {
-	return amount > 0 && amount <= 500000000000
-}
-
-
-// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
-func panicRecoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":"internal server error"}`))
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Process Health Watchdog ---
-// Monitors event loop liveness; if the main goroutine stalls for >60s,
-// the liveness probe fails and K8s/KEDA restarts the pod automatically.
-
-var watchdogLastPing atomic.Int64
-
-func init() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
-}
-
-func watchdogPing() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
-}
-
-func startWatchdog(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			lastPing := watchdogLastPing.Load()
-			elapsed := time.Now().UnixMilli() - lastPing
-			if elapsed > 60000 {
-				log.Printf("[WATCHDOG] Event loop stalled for %dms — marking unhealthy", elapsed)
-			}
-		}
-	}()
-}
-
-func watchdogHealthy() bool {
-	lastPing := watchdogLastPing.Load()
-	elapsed := time.Now().UnixMilli() - lastPing
-	return elapsed < 60000
-}
-
 func main() {
-	initTracing()
-	startWatchdog(10 * time.Second)
-	watchdogPing()
 	port := os.Getenv("PORT")
 	if port == "" { port = "9318" }
 	initDB()
@@ -1622,8 +780,6 @@ mux := http.NewServeMux()
 
 	mux.HandleFunc("/v1/alerts", alertsHandler)
 	mux.HandleFunc("/v1/degradation", degradationStatusHandler)
-	mux.HandleFunc("/dlq", handleDLQList)
-	mux.HandleFunc("/dlq/replay", handleDLQReplay)
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/v1/avro-schema-registry/list", handleList)
 	mux.HandleFunc("/v1/avro-schema-registry/create", handleCreate)
@@ -1640,7 +796,7 @@ mux := http.NewServeMux()
 	_ = tlsEnabled
 	server := &http.Server{
         Addr:    ":" + port,
-        Handler: panicRecoveryMiddleware(rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux)))))),
+        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
         ReadTimeout:  15 * time.Second,
         WriteTimeout: 30 * time.Second,
         IdleTimeout:  60 * time.Second,
@@ -1660,69 +816,4 @@ mux := http.NewServeMux()
     log.Println("[avro-schema-registry-go] Server stopped gracefully")
 }
 
-// --- Event Bus (Kafka-compatible event emission) ---
-
-type EventBus struct {
-	brokerURL   string
-	topic       string
-	serviceName string
-	mu          sync.Mutex
-	buffer      []map[string]interface{}
-}
-
-func newEventBus(topic, service string) *EventBus {
-	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" {
-		broker = "localhost:9092"
-	}
-	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
-}
-
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
-	event := map[string]interface{}{
-		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
-		"type":      eventType,
-		"source":    eb.serviceName,
-		"topic":     eb.topic,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"data":      payload,
-	}
-	eb.mu.Lock()
-	eb.buffer = append(eb.buffer, event)
-	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
-	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
-}
-
-func (eb *EventBus) Flush() []map[string]interface{} {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	events := eb.buffer
-	eb.buffer = nil
-	return events
-}
-
-// --- Downstream Notifier ---
-
-func notifyDownstream(serviceURL, path string, payload interface{}) error {
-	body, _ := json.Marshal(payload)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Source-Service", serviceName)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("[Downstream] %s%s failed: %v", serviceURL, path, err)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("downstream %s returned %d", path, resp.StatusCode)
-	}
-	return nil
-}
-
+func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

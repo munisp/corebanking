@@ -1,0 +1,195 @@
+# ============================================================
+# 1. Secret — Postgres credentials
+# ============================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: permify-postgres-secret
+  namespace: permify
+type: Opaque
+stringData:
+  POSTGRES_USER: permify
+  POSTGRES_PASSWORD: permify_secret   # ← change this before applying
+  POSTGRES_DB: permify
+  DATABASE_URI: "postgres://permify:permify_secret@permify-postgres.permify.svc.cluster.local:5432/permify?sslmode=disable"
+
+---
+# ============================================================
+# 2. PersistentVolumeClaim — Postgres data volume
+# ============================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: permify-postgres-pvc
+  namespace: permify
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+  # storageClassName: standard   # ← uncomment and set if your cluster needs a specific StorageClass
+
+---
+# ============================================================
+# 3. StatefulSet — Postgres
+# ============================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: permify-postgres
+  namespace: permify
+  labels:
+    app: permify-postgres
+spec:
+  serviceName: permify-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: permify-postgres
+  template:
+    metadata:
+      labels:
+        app: permify-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: permify-postgres-secret
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: permify-postgres-secret
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: permify-postgres-secret
+                  key: POSTGRES_DB
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: postgres-data
+              mountPath: /var/lib/postgresql/data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "permify", "-d", "permify"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "permify", "-d", "permify"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+      volumes:
+        - name: postgres-data
+          persistentVolumeClaim:
+            claimName: permify-postgres-pvc
+
+---
+# ============================================================
+# 4. Service — Postgres (ClusterIP, internal only)
+# ============================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: permify-postgres
+  namespace: permify
+  labels:
+    app: permify-postgres
+spec:
+  type: ClusterIP
+  selector:
+    app: permify-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+
+---
+# ============================================================
+# 5. Permify Deployment — updated to use Postgres
+#    (patch your existing deployment with these env vars)
+# ============================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: permify
+  namespace: permify
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: permify
+  template:
+    metadata:
+      labels:
+        app: permify
+    spec:
+      containers:
+        - name: permify
+          # Keep your existing image here
+          image: ghcr.io/permify/permify:latest
+          env:
+            # ---- existing env vars (keep as-is) ----
+            - name: PERMIFY_RATE_LIMIT
+              value: "100000"
+            - name: PERMIFY_GRPC_PORT
+              value: "3478"
+            - name: PERMIFY_HTTP_ENABLED
+              value: "true"
+            - name: PERMIFY_HTTP_PORT
+              value: "3476"
+            - name: PERMIFY_PROFILER_ENABLED
+              value: "true"
+            - name: PERMIFY_PROFILER_PORT
+              value: "6060"
+            - name: PERMIFY_LOG_LEVEL
+              value: "info"
+            - name: PERMIFY_SERVICE_SCHEMA_CACHE_NUMBER_OF_COUNTERS
+              value: "1000"
+            - name: PERMIFY_SERVICE_SCHEMA_CACHE_MAX_COST
+              value: "8MiB"
+            - name: PERMIFY_SERVICE_PERMISSION_CONCURRENCY_LIMIT
+              value: "100"
+            - name: PERMIFY_SERVICE_PERMISSION_CACHE_NUMBER_OF_COUNTERS
+              value: "10000"
+            - name: PERMIFY_SERVICE_PERMISSION_CACHE_MAX_COST
+              value: "16MiB"
+            - name: PERMIFY_DISTRIBUTED_ADDRESS
+              value: "demo:///grpc.demo.consistent_hash_balancer"
+            - name: PERMIFY_DISTRIBUTED_PORT
+              value: "5053"
+
+            # ---- NEW: database config (replaces memory engine) ----
+            - name: PERMIFY_DATABASE_ENGINE
+              value: "postgres"
+            - name: PERMIFY_DATABASE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: permify-postgres-secret
+                  key: DATABASE_URI
+            - name: PERMIFY_DATABASE_AUTO_MIGRATE
+              value: "true"
+            - name: PERMIFY_DATABASE_MAX_OPEN_CONNECTIONS
+              value: "20"
+            - name: PERMIFY_DATABASE_MAX_IDLE_CONNECTIONS
+              value: "5"
+            - name: PERMIFY_DATABASE_MAX_CONNECTION_LIFETIME
+              value: "300s"
+            - name: PERMIFY_DATABASE_MAX_CONNECTION_IDLE_TIME
+              value: "60s"

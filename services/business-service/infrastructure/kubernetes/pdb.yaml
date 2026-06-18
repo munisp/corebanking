@@ -1,0 +1,10 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: business-service-pdb
+  namespace: banking-platform
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: business-service

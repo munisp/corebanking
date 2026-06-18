@@ -1,0 +1,80 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-communication-hub
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: "communication-hub"
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  port: 8124
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    ephemeral-storage: 1Gi
+    cpu: 300m
+    memory: 512Mi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: communication-hub
+  appPort: 8124
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 50m
+  cpu-limit: 150m
+  memory-request: 128Mi
+  memory-limit: 512Mi
+secrets:
+  DATABASE_URL: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking"
+  DB_HOST: db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com
+  DB_PORT: "25060"
+  DB_NAME: link_core_banking
+  DB_USER: doadmin
+  DB_PASSWORD: AVNS_MSy6CW3EGXnA8wJgkLv
+  REDIS_URL: redis-master.redis.svc.cluster.local:6379
+  REDIS_HOST: redis-master.redis.svc.cluster.local
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: 3phHSv7qbAuZLb2pi9FWED2X
+  KAFKA_BROKERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
+  KAFKA_BOOTSTRAP_SERVERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc:9092
+  KAFKA_SECURITY_PROTOCOL: PLAINTEXT
+  FLUVIO_URL: fluvio:9003
+  FLUVIO_ENDPOINT: fluvio:9003
+  DAPR_HTTP_PORT: "3500"
+  DAPR_URL: "http://localhost:3500"
+  TEMPORAL_HOST: temporal-frontend.temporal.svc:7233
+  TEMPORAL_ADDRESS: temporal-frontend.temporal.svc:7233
+  TEMPORAL_NAMESPACE: "54link-dev"
+  KEYCLOAK_URL: https://keycloak.servers.upi.dev
+  PERMIFY_URL: http://permify.permify.svc.cluster.local:3476
+  WHATSAPP_SERVICE_URL: "http://whatsapp-service.54link-dev.svc.cluster.local:8102"
+  USSD_SERVICE_URL: "http://ussd-service.54link-dev.svc.cluster.local:8103"
+  SMS_SERVICE_URL: "http://sms-service.54link-dev.svc.cluster.local:8104"
+  TELEGRAM_SERVICE_URL: "http://telegram-service.54link-dev.svc.cluster.local:8123"
+  LAKEHOUSE_URL: http://data-intelligence.54link.svc.cluster.local:8000
+  AUTH_ENFORCER_URL: "http://auth-enforcer-rs.54link-dev.svc.cluster.local:8314"
+  ALLOWED_ORIGINS: "*"
+  PORT: "8124"
+  APP_HOST: "0.0.0.0"
+  APP_PORT: "8124"
+  LOG_LEVEL: info

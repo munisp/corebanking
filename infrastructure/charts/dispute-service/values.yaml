@@ -1,0 +1,80 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-dispute-service
+  pullPolicy: IfNotPresent
+  tag: "0.0.5"
+nameOverride: ""
+fullnameOverride: "dispute-service"
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  port: 8019
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    ephemeral-storage: 1Gi
+    cpu: 300m
+    memory: 512Mi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: dispute-service
+  appPort: 8019
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 50m
+  cpu-limit: 150m
+  memory-request: 128Mi
+  memory-limit: 512Mi
+secrets:
+  DATABASE_URL: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking"
+  DB_HOST: db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com
+  DB_PORT: "25060"
+  DB_NAME: link_core_banking
+  DB_USER: doadmin
+  DB_PASSWORD: AVNS_MSy6CW3EGXnA8wJgkLv
+  REDIS_URL: redis-master.redis.svc.cluster.local:6379
+  REDIS_HOST: redis-master.redis.svc.cluster.local
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: 3phHSv7qbAuZLb2pi9FWED2X
+  KAFKA_BROKERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
+  KAFKA_BOOTSTRAP_SERVERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc:9092
+  KAFKA_SECURITY_PROTOCOL: PLAINTEXT
+  KAFKA_SASL_MECHANISM: ""
+  KAFKA_SASL_USERNAME: ""
+  KAFKA_SASL_PASSWORD: ""
+  DAPR_HTTP_PORT: "3500"
+  DAPR_URL: "http://localhost:3500"
+  DAPR_PUBSUB: pubsub
+  DAPR_PUBSUB_NAME: pubsub
+  TEMPORAL_ADDRESS: temporal-frontend.temporal.svc:7233
+  TEMPORAL_NAMESPACE: "54link-dev"
+  KEYCLOAK_URL: https://keycloak.servers.upi.dev
+  KEYCLOAK_BASE_URL: https://keycloak.servers.upi.dev
+  AUTH_ENFORCER_URL: "http://auth-enforcer-rs.54link-dev.svc.cluster.local:8314"
+  TIGERBEETLE_ADDRESS: "10.233.107.191:3000,10.233.108.26:3000,10.233.108.25:3000"
+  TIGERBEETLE_ADDRESSES: "10.233.107.191:3000,10.233.108.26:3000,10.233.108.25:3000"
+  TRANSACTION_LEDGER_URL: "http://transaction-ledger.54link-dev.svc.cluster.local"
+  ALLOWED_ORIGINS: "*"
+  PORT: "8019"
+  APP_HOST: "0.0.0.0"
+  APP_PORT: "8019"
+  LOG_LEVEL: info

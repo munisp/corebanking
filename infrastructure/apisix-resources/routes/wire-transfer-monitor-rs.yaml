@@ -1,0 +1,64 @@
+# wire-transfer-monitor-rs
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: 54link-dev-wire-transfer-monitor-rs-route
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-stats
+      priority: 20
+      match:
+        hosts:
+          - 54link-dev.upi.dev
+        paths:
+          - /wire-transfer-monitor/v1/wire-transfers/stats
+      backends:
+        - serviceName: infra-observability
+          servicePort: 9462
+      plugins:
+        - name: proxy-rewrite
+          enable: true
+          config:
+            uri: "/v1/wire-transfer-monitor/stats"
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"
+    - name: rule-1
+      priority: 10
+      match:
+        hosts:
+          - 54link-dev.upi.dev
+        paths:
+          - /wire-transfer-monitor/*
+      backends:
+        - serviceName: infra-observability
+          servicePort: 9462
+      plugins:
+        - name: proxy-rewrite
+          enable: true
+          config:
+            regex_uri:
+              - "^/wire-transfer-monitor/v1/wire-transfers(.*)"
+              - "/v1/wire-transfer-monitor/list"
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"
+        # - name: 54link-access-plugin
+        #   enable: true
+        #   config:
+        #     authorizer_url: "http://auth-service/token"
+        #     keycloak_public_key_url: "http://tenant-management/tenant/keycloak-public-key/"
+        # - name: ucard-jwt-payload-decoder
+        #   enable: true
+        #   config:
+        #     authorizer_url: "http://auth-service.54link-dev.svc.cluster.local/token/validate"

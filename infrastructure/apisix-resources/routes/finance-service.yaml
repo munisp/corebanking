@@ -1,0 +1,42 @@
+# finance-service
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: 54link-dev-finance-service-route
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-1
+      priority: 10
+      match:
+        hosts:
+          - 54link-dev.upi.dev
+        paths:
+          - /finance/*
+      backends:
+        - serviceName: ledger-gl
+          servicePort: 9467
+      plugins:
+        - name: proxy-rewrite
+          enable: true
+          config:
+            regex_uri:
+              - "^/finance(?:/system)?/(.*)"
+              - "/$1"
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"
+        # - name: 54link-access-plugin
+        #   enable: true
+        #   config:
+        #     authorizer_url: "http://auth-service/token"
+        #     keycloak_public_key_url: "http://tenant-management/tenant/keycloak-public-key/"
+        # - name: ucard-jwt-payload-decoder
+        #   enable: true
+        #   config:
+        #     authorizer_url: "http://auth-service.54link-dev.svc.cluster.local/token/validate"

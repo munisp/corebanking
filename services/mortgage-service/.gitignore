@@ -1,0 +1,83 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+mortgage-service
+mortgage-service.exe
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.txt
+coverage.html
+
+# Dependency directories
+vendor/
+
+# Go workspace file
+go.work
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+logs/
+mortgage-service.log
+
+# TigerBeetle data files
+*.tigerbeetle
+tigerbeetle-data/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Build artifacts
+bin/
+build/
+dist/
+
+# Air live reload
+tmp/
+
+# Delve debugger
+__debug_bin
+
+# OS files
+Thumbs.db
+.Trash-*
+
+# Database dumps
+*.sql
+*.db
+*.sqlite
+*.sqlite3
+
+# Redis dumps
+dump.rdb
+
+# Certificates and keys
+*.pem
+*.key
+*.crt
+*.cert
+
+# Configuration overrides
+config.local.yaml
+config.override.yaml

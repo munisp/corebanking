@@ -1,5 +1,5 @@
 """
-54Bank GL Regulatory Pipeline — Python
+54link-dev GL Regulatory Pipeline — Python
 Regulatory report builder: eFASS, NDIC, Basel III, Prudential, CTR/STR
 Integrates with Temporal (workflow orchestration), Lakehouse/Sedona (analytics),
 OpenSearch (audit indexing), Keycloak (auth), and all 14 middleware.
@@ -22,14 +22,14 @@ MIDDLEWARE_CONFIG = {
     "fluvio": {"endpoint": "fluvio:9003", "topic": "regulatory-events-stream", "status": "connected"},
     "temporal": {"endpoint": "temporal:7233", "namespace": "regulatory-workflows", "workflows": ["PeriodCloseWorkflow", "EFASSGenerationWorkflow", "CBNSubmissionWorkflow", "NDICPremiumWorkflow"], "status": "connected"},
     "postgres": {"endpoint": os.getenv("DATABASE_URL", "postgres://localhost:5432/ndsep_db"), "tables": ["glAccounts", "journalEntries", "trialBalances", "efassMapping", "regulatoryReports"], "status": "connected"},
-    "keycloak": {"endpoint": "http://keycloak:8080/realms/54bank", "roles": ["compliance_officer", "head_of_reporting", "cfo", "auditor"], "status": "connected"},
+    "keycloak": {"endpoint": "http://keycloak:8080/realms/54link-dev", "roles": ["compliance_officer", "head_of_reporting", "cfo", "auditor"], "status": "connected"},
     "permify": {"endpoint": "permify:3476", "schema": "regulatory_reports", "permissions": ["generate", "submit", "approve", "view_audit_trail"], "status": "connected"},
     "redis": {"endpoint": "redis:6379", "cache_prefix": "regulatory:", "ttl_seconds": 3600, "status": "connected"},
     "mojaloop": {"endpoint": "http://mojaloop-switch:4003", "use_case": "Cross-border transaction volumes for FCE report", "status": "connected"},
     "opensearch": {"endpoint": "http://opensearch:9200", "indices": ["regulatory-reports-*", "filing-audit-*", "cbn-submissions-*"], "status": "connected"},
     "openappsec": {"endpoint": "http://openappsec:8090", "policy": "regulatory-api-protection", "status": "connected"},
     "apisix": {"endpoint": "http://apisix:9180", "routes": ["/v1/regulatory/*", "/v1/period-close/*", "/v1/cbn-returns/*"], "status": "connected"},
-    "tigerbeetle": {"endpoint": "tigerbeetle:3001", "account_id": "54bank_regulatory_ledger", "use_case": "Double-entry verification before report generation", "status": "connected"},
+    "tigerbeetle": {"endpoint": "tigerbeetle:3001", "account_id": "54link-dev_regulatory_ledger", "use_case": "Double-entry verification before report generation", "status": "connected"},
     "lakehouse": {"endpoint": "lakehouse:8181", "catalog": "kpi_catalog", "tables": ["regulatory.efass_returns_iceberg", "regulatory.trial_balance_iceberg", "regulatory.filing_history_iceberg"], "sedona_enabled": True, "status": "connected"},
 }
 
@@ -226,8 +226,7 @@ class GLReportEngine:
                 amount=amount,
                 cbn_code=mapping.cbn_code,
                 gl_codes_used=f"{mapping.gl_code_start}-{mapping.gl_code_end}",
-                computation_sql=f"SELECT SUM(closing_balance) FROM trial_balances WHERE gl_account_code BETWEEN $1 AND $2 AND period_end = $3",
-                computation_params=(mapping.gl_code_start, mapping.gl_code_end, f"{period}-30"),
+                computation_sql=f"SELECT SUM(closing_balance) FROM trial_balances WHERE gl_account_code BETWEEN '{mapping.gl_code_start}' AND '{mapping.gl_code_end}' AND period_end = '{period}-30'",
             ))
 
         totals = self._compute_totals(form_lines)

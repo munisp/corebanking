@@ -1,0 +1,28 @@
+# client-web-app
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: 54link-dev-client-web-app-route
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-1
+      priority: 10
+      match:
+        hosts:
+          - app.54link-dev.upi.dev
+        paths:
+          - /*
+      backends:
+        - serviceName: client-web-app
+          servicePort: 80
+      websocket: true
+      plugins:
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"

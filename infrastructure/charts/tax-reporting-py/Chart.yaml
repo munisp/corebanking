@@ -1,0 +1,6 @@
+apiVersion: v2
+name: tax-reporting-py
+description: 54link Tax Reporting Service Helm Chart
+type: application
+version: 0.0.1
+appVersion: "1.0.0"

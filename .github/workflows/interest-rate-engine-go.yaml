@@ -1,0 +1,75 @@
+name: Build and Deploy Interest Rate Engine Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/interest-rate-engine-go/**'
+      - 'infrastructure/charts/interest-rate-engine-go/**'
+      - 'infrastructure/apisix-resources/routes/interest-rate-engine-go.yaml'
+      - '.github/workflows/interest-rate-engine-go.yaml'
+
+env:
+  IMAGE: registry.digitalocean.com/talentgraph-auth/54link-dev-interest-rate-engine-go
+  TAG: "0.0.1"
+  CHART: infrastructure/charts/interest-rate-engine-go
+  RELEASE: interest-rate-engine-go
+  NAMESPACE: 54link-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/interest-rate-engine-go
+          file: ./services/interest-rate-engine-go/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Save kubeconfig
+        run: doctl kubernetes cluster kubeconfig save ${{ secrets.DO_CLUSTER_NAME }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+
+      - name: Deploy via Helm
+        run: |
+          helm upgrade --install ${{ env.RELEASE }} ./${{ env.CHART }} \
+            --namespace ${{ env.NAMESPACE }} \
+            --set image.tag=${{ env.TAG }} \
+            --wait \
+            --timeout 5m
+
+      - name: Apply APISIX route
+        run: |
+          kubectl apply -f infrastructure/apisix-resources/routes/interest-rate-engine-go.yaml \
+            -n ${{ env.NAMESPACE }}

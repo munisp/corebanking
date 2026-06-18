@@ -1,5 +1,5 @@
 """
-54Bank Banking Operations Pipeline — Python
+54link-dev Banking Operations Pipeline — Python
 Closes 5 architectural gaps by connecting isolated modules to GL:
 
 Gap 3: EOD Batch → Reconciliation → Exception Resolution → GL
@@ -27,7 +27,7 @@ MIDDLEWARE_CONFIG = {
     "fluvio": {"endpoint": "fluvio:9003", "stream": "banking-operations-events", "status": "connected"},
     "temporal": {"endpoint": "temporal:7233", "workflows": ["EODWorkflow", "ReconciliationWorkflow", "SettlementWorkflow", "EscheatmentWorkflow"], "status": "connected"},
     "postgres": {"endpoint": os.getenv("DATABASE_URL", "postgres://localhost:5432/ndsep_db"), "status": "connected"},
-    "keycloak": {"endpoint": "http://keycloak:8080/realms/54bank", "status": "connected"},
+    "keycloak": {"endpoint": "http://keycloak:8080/realms/54link-dev", "status": "connected"},
     "permify": {"endpoint": "permify:3476", "status": "connected"},
     "redis": {"endpoint": "redis:6379", "status": "connected"},
     "mojaloop": {"endpoint": "http://mojaloop-switch:4003", "status": "connected"},

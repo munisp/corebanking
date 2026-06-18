@@ -1,0 +1,55 @@
+name: Build Ledger GL Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/accounting-rules-rs/**'
+      - 'services/chart-of-accounts-service/**'
+      - 'services/finance-service/**'
+      - 'services/gl-engine-go/**'
+      - 'services/gl-engine-rs/**'
+      - 'services/operations-control-gl-rs/**'
+      - 'services/salary-processing-go/**'
+      - 'services/tigerbeetle-adapter-rs/**'
+      - 'services/tigerbeetle-batch-engine-rs/**'
+      - 'services/tigerbeetle-multicurrency-rs/**'
+      - 'services/tigerbeetle-postgres-sync/**'
+      - 'services/tigerbeetle-protocol-rs/**'
+      - 'services/tigerbeetle-sync-go/**'
+      - 'services/transaction-ledger/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/ledger-gl.yaml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=accounting-rules-rs,chart-of-accounts-service,finance-service,gl-engine-go,gl-engine-rs,operations-control-gl-rs,salary-processing-go,tigerbeetle-adapter-rs,tigerbeetle-batch-engine-rs,tigerbeetle-multicurrency-rs,tigerbeetle-postgres-sync,tigerbeetle-protocol-rs,tigerbeetle-sync-go,transaction-ledger
+            PRIMARY_LANG=rust
+            PORT_BASE=9465
+          tags: registry.digitalocean.com/talentgraph-auth/54link-ledger-gl:0.0.1

@@ -1,11 +1,16 @@
-FROM golang:1.21-alpine AS builder
+FROM golang:1.22-alpine AS builder
+RUN apk add --no-cache ca-certificates
 WORKDIR /app
 COPY go.mod ./
-COPY main.go ./
-RUN go build -o fee-management .
+RUN go mod download 2>/dev/null || true
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /service .
 FROM alpine:3.19
-COPY --from=builder /app/fee-management /usr/local/bin/
-RUN adduser -D -u 1001 appuser
+RUN apk add --no-cache ca-certificates && adduser -D appuser
 USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:9359/healthz || exit 1
-CMD ["fee-management"]
+WORKDIR /app
+COPY --from=builder /service /service
+ENV PORT=8080
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:${PORT}/healthz || exit 1
+CMD ["/service"]

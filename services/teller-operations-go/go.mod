@@ -1,4 +1,4 @@
-module github.com/54bank/teller-operations-go
+module github.com/54link-dev/teller-operations-go
 
 go 1.22
 

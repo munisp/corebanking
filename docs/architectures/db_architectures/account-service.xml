@@ -1,0 +1,26 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Account Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- BANK TABLE -->
+        <mxCell id="bank" value="Bank&#xa;----------------------&#xa;code (PK, int)&#xa;name (varchar)&#xa;tenant_id (varchar, unique)&#xa;ledger_id (varchar)&#xa;status (enum: active/inactive)&#xa;logo (varchar, nullable)&#xa;created_at&#xa;updated_at&#xa;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- ACCOUNT TABLE -->
+        <mxCell id="account" value="Account&#xa;----------------------&#xa;id (PK, int, TigerBeetle ID)&#xa;name (varchar)&#xa;keycloak_id (varchar)&#xa;tenant_id (varchar)&#xa;ledger_id (varchar)&#xa;account_number (varchar, unique)&#xa;balance (varchar)&#xa;pin (varchar, nullable)&#xa;status (enum: active/inactive/frozen)&#xa;account_type (enum: primary/savings/...)&#xa;account_currency (enum: NGN/USD/...)&#xa;created_at&#xa;updated_at&#xa;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- RELATIONSHIP: Bank -> Account (tenant_id logical) -->
+        <mxCell id="e1" edge="1" parent="1" source="bank" target="account" style="endArrow=block;dashed=1;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: dormancy-management-rs
+description: 54link Dormancy Management Service Helm Chart
+type: application
+version: 0.0.1
+appVersion: "1.0.0"

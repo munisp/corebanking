@@ -1,4 +1,4 @@
-module github.com/54bank/identity-verification-go
+module github.com/54link-dev/identity-verification-go
 
 go 1.22
 

@@ -128,7 +128,7 @@ pub async fn ussd_handler(
     let lang = body.language.clone().unwrap_or("en".to_string());
 
     let response = match input.as_str() {
-        "0" | "" => "Welcome to 54Bank AgriBank\n1. Check Balance\n2. Loan Status\n3. Weather\n4. Market Prices\n5. Warehouse Receipts",
+        "0" | "" => "Welcome to 54link-dev AgriBank\n1. Check Balance\n2. Loan Status\n3. Weather\n4. Market Prices\n5. Warehouse Receipts",
         "1" => "Your balance: NGN 125,000.00\nAvailable: NGN 120,000.00",
         "2" => "Active Loans: 1\nLoan AGR-001: NGN 500,000\nStatus: Current\nNext payment: NGN 48,500 on 2026-06-01",
         "3" => "Weather for your area:\nTemp: 32°C\nRainfall: 45mm expected\nAdvisory: Good planting conditions",

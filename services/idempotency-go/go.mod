@@ -1,4 +1,4 @@
-module github.com/54bank/idempotency-go
+module github.com/54link-dev/idempotency-go
 
 go 1.22
 

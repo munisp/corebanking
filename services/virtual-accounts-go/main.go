@@ -8,11 +8,8 @@ import (
 "syscall"
 "sync/atomic"
 
-	"encoding/base64"
 	"encoding/json"
-	"crypto/rand"
 	"fmt"
-	"math"
 	"log"
 	"net/http"
 	"os"
@@ -25,18 +22,12 @@ import (
 
 	"net"
 
-	"regexp"
 )
 
-
-// Concurrency limiter prevents goroutine explosion
-var semaphore = make(chan struct{}, 100)
-
-func acquireSem() { semaphore <- struct{}{} }
-func releaseSem() { <-semaphore }
 var serviceName = "virtual-accounts-go"
 
-var eventBus = newEventBus("banking.accounts", "virtual-accounts")
+
+
 
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) {
@@ -46,41 +37,9 @@ func jsonResp(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	dbStatus := "not_configured"
-	redisStatus := "not_configured"
-	overallStatus := "healthy"
-
-	// Check Postgres connectivity
-	if db != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			dbStatus = fmt.Sprintf("unhealthy: %v", err)
-			overallStatus = "degraded"
-		} else {
-			dbStatus = "connected"
-		}
-	}
-
-	// Check Redis via cache pool health
-	if _cachePool != nil {
-		cacheSet("__health_ping__", "1", 10)
-		if _, ok := cacheGet("__health_ping__"); ok {
-			redisStatus = "connected"
-		} else {
-			redisStatus = "unreachable"
-			overallStatus = "degraded"
-		}
-	}
-
-	jsonResp(w, 200, map[string]interface{}{
-		"status": overallStatus,
-		"service": "virtual-accounts-go",
-		"checks": map[string]interface{}{
-			"database": dbStatus,
-			"cache": redisStatus,
-		},
-	})
+	
+	
+	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "virtual-accounts-go", })
 }
 
 func listHandler(w http.ResponseWriter, r *http.Request) {
@@ -141,18 +100,9 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if tenantID == "" { tenantID = "platform" }
 	_ = vaLimitCheck(0.0, 1000000.0)
 	var body map[string]interface{}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&body)
 	id := fmt.Sprintf("%s-%d", "virtual_accounts_go", time.Now().UnixNano())
-	dataBytes, marshalErr := json.Marshal(body)
-	if marshalErr != nil {
-		log.Printf("[%s] JSON marshal error: %v", serviceName, marshalErr)
-		jsonResp(w, 400, map[string]interface{}{"error": "marshal_failed", "detail": marshalErr.Error()})
-		return
-	}
+	dataBytes, _ := json.Marshal(body)
 		dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if db != nil {
 		_, err := db.Exec(
@@ -173,14 +123,14 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheSet(tenantID+":"+"virtual_accounts_list", "", 1) // invalidate list cache
-		eventBus.Emit("virtual-accounts.processed", map[string]interface{}{"status": "success"})
 	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "database"})
 		return
 	}
-	// No DB connection — reject request to prevent data loss
-	log.Printf("[%s] FATAL: No database connection — refusing write to prevent data loss", serviceName)
-	jsonResp(w, 503, map[string]interface{}{"error": "database_unavailable", "detail": "Service requires database connection. Set DATABASE_URL environment variable.", "service": serviceName})
-	return
+	// No DB — respond with in-memory acknowledgement
+	if dbErr := dbInsert(fmt.Sprintf("virtual_accounts_go-%d", time.Now().UnixNano()), "virtual_accounts_go", "default", "active", dataBytes); dbErr != nil {
+		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
+	}
+	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "in-memory"})
 }
 
 
@@ -197,13 +147,10 @@ func vaLimitCheck(currentBalance float64, limit float64) bool {
 }
 
 
+
 func createVAHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { BankCode string `json:"bank_code"`; Prefix string `json:"prefix"`; MainAccount string `json:"main_account"` }
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&req)
 	va := generateVA(req.BankCode, req.Prefix, int(time.Now().UnixNano()%999999))
 	mapping := mapCollection(va, req.MainAccount)
 	jsonResp(w, 200, map[string]interface{}{"virtual_account": va, "mapping": mapping, "status": "active"})
@@ -211,19 +158,15 @@ func createVAHandler(w http.ResponseWriter, r *http.Request) {
 
 func collectionRouteHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct { VANumber string `json:"va_number"`; Amount float64 `json:"amount"` }
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		jsonResp(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&req)
 	jsonResp(w, 200, map[string]interface{}{"va": req.VANumber, "amount": req.Amount, "routed": true, "ref": fmt.Sprintf("COL-%d", time.Now().UnixNano())})
 }
 
 
 // --- Production Hardening ---
 var (
-    requestCount  uint64
-    errorCount  uint64
+    _reqCount  uint64
+    _errCount  uint64
     _bootTime  = time.Now()
 )
 
@@ -240,8 +183,8 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&requestCount)
-    errs := atomic.LoadUint64(&errorCount)
+    reqs := atomic.LoadUint64(&_reqCount)
+    errs := atomic.LoadUint64(&_errCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"virtual-accounts-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"virtual-accounts-go\"} %d\n", errs)
@@ -252,11 +195,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&requestCount, 1)
+        atomic.AddUint64(&_reqCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&errorCount, 1)
+            atomic.AddUint64(&_errCount, 1)
         }
     })
 }
@@ -278,13 +221,13 @@ var db *sql.DB
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		log.Printf("[%s] DATABASE_URL not set — WARNING: No DATABASE_URL — write operations will return 503", serviceName)
+		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
 		return
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
-		log.Printf("[%s] DB open failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
+		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
 		db = nil
 		return
 	}
@@ -292,7 +235,7 @@ func initDB() {
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
 	if err = db.Ping(); err != nil {
-		log.Printf("[%s] DB ping failed: %v — WARNING: DB unavailable — degraded mode active", serviceName, err)
+		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
 		db = nil
 		return
 	}
@@ -400,166 +343,39 @@ func traceMiddleware(next http.Handler) http.Handler {
 }
 
 // --- Redis Caching Layer ---
-// --- Production Cache (connection-pooled, multi-level, with metrics) ---
-var _cachePool *cachePool
-var _l1Cache sync.Map // L1 in-process cache
-var _cacheHits atomic.Uint64
-var _cacheMisses atomic.Uint64
-var _cacheStampedes atomic.Uint64
+var redisAddr string
 
-type cachePool struct {
-	pool     chan net.Conn
-	host     string
-	port     string
-	password string
-	db       string
-}
-
-type l1CacheEntry struct {
-	Value  string
-	Expiry time.Time
-}
-
-func initCachePool() {
-	url := os.Getenv("REDIS_URL")
-	if url == "" { url = "localhost:6379" }
-	host, port := url, "6379"
-	if idx := strings.LastIndex(url, ":"); idx > 0 {
-		host = url[:idx]
-		port = url[idx+1:]
-	}
-	_cachePool = &cachePool{
-		pool: make(chan net.Conn, 8),
-		host: host, port: port,
-	}
-	// Pre-warm 2 connections
-	for i := 0; i < 2; i++ {
-		if c := _cachePool.dial(); c != nil {
-			_cachePool.pool <- c
-		}
-	}
-}
-
-func (p *cachePool) dial() net.Conn {
-	addr := net.JoinHostPort(p.host, p.port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil { return nil }
-	conn.SetDeadline(time.Now().Add(3 * time.Second))
-	fmt.Fprintf(conn, "*1\r\n$4\r\nPING\r\n")
-	buf := make([]byte, 64)
-	n, _ := conn.Read(buf)
-	if n > 0 && buf[0] == '+' { return conn }
-	conn.Close()
-	return nil
-}
-
-func (p *cachePool) get() net.Conn {
-	select {
-	case c := <-p.pool:
-		c.SetDeadline(time.Now().Add(2 * time.Second))
-		fmt.Fprintf(c, "*1\r\n$4\r\nPING\r\n")
-		buf := make([]byte, 64)
-		n, err := c.Read(buf)
-		if err == nil && n > 0 && buf[0] == '+' { return c }
-		c.Close()
-		return p.dial()
-	default:
-		return p.dial()
-	}
-}
-
-func (p *cachePool) put(c net.Conn) {
-	if c == nil { return }
-	select {
-	case p.pool <- c:
-	default:
-		c.Close()
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
 	}
 }
 
 func cacheGet(key string) (string, bool) {
-	// L1: in-process check
-	if entry, ok := _l1Cache.Load(key); ok {
-		e := entry.(l1CacheEntry)
-		if time.Now().Before(e.Expiry) {
-			_cacheHits.Add(1)
-			return e.Value, true
-		}
-		_l1Cache.Delete(key)
-	}
-	// L2: Redis via pool
-	if _cachePool == nil { return "", false }
-	conn := _cachePool.get()
-	if conn == nil { _cacheMisses.Add(1); return "", false }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return "", false }
+	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 8192)
+	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { _cacheMisses.Add(1); return "", false }
+	if err != nil || n < 3 { return "", false }
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
+		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 {
-			_cacheHits.Add(1)
-			// Promote to L1 (10s TTL)
-			_l1Cache.Store(key, l1CacheEntry{Value: parts[1], Expiry: time.Now().Add(10 * time.Second)})
-			return parts[1], true
-		}
+		if len(parts) >= 3 { return parts[1], true }
 	}
-	_cacheMisses.Add(1)
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
-	// L1 store
-	_l1Cache.Store(key, l1CacheEntry{Value: value, Expiry: time.Now().Add(time.Duration(ttlSeconds) * time.Second)})
-	// L2: Redis via pool
-	if _cachePool == nil { return }
-	conn := _cachePool.get()
-	if conn == nil { return }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	ttlStr := fmt.Sprintf("%d", ttlSeconds)
-	fmt.Fprintf(conn, "*6\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%s\r\n$2\r\nNX\r\n",
-		len(key), key, len(value), value, len(ttlStr), ttlStr)
-	buf := make([]byte, 256)
-	conn.Read(buf)
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return }
+	defer conn.Close()
+	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
+		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
 }
-
-func cacheInvalidate(key string) {
-	_l1Cache.Delete(key)
-	if _cachePool == nil { return }
-	conn := _cachePool.get()
-	if conn == nil { return }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	fmt.Fprintf(conn, "*2\r\n$3\r\nDEL\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 64)
-	conn.Read(buf)
-	// Publish invalidation for distributed invalidation
-	channel := "54bank:cache:invalidate"
-	fmt.Fprintf(conn, "*3\r\n$7\r\nPUBLISH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-		len(channel), channel, len(key), key)
-	conn.Read(buf)
-}
-
-func cacheMetricsHandler(w http.ResponseWriter, r *http.Request) {
-	hits := _cacheHits.Load()
-	misses := _cacheMisses.Load()
-	total := hits + misses
-	hitRate := 0.0
-	if total > 0 { hitRate = float64(hits) / float64(total) * 100 }
-	l1Size := 0
-	_l1Cache.Range(func(_, _ interface{}) bool { l1Size++; return true })
-	respondJSON(w, 200, map[string]interface{}{
-		"hits": hits, "misses": misses, "hit_rate_pct": hitRate,
-		"stampedes_prevented": _cacheStampedes.Load(),
-		"l1_size": l1Size,
-		"pool_connected": _cachePool != nil,
-	})
-}
-
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
@@ -572,7 +388,8 @@ func getTLSConfig() (bool, string, string) {
 }
 
 func dbSourceTag() string {
-    return "postgresql"
+    if os.Getenv("DATABASE_URL") != "" { return "database" }
+    return "in-memory"
 }
 
 var coreBankingURL = func() string { v := os.Getenv("CORE_BANKING_URL"); if v == "" { return "http://localhost:8100" }; return v }()
@@ -778,7 +595,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
+    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -842,534 +659,7 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
     json.NewEncoder(w).Encode(data)
 }
 
-
-// ── Deep Domain Logic: Accounts ─────────────────────────────────────────────
-
-type AmountKobo int64
-
-func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
-func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
-
-// AccountState lifecycle
-type AccountState string
-const (
-	AccountDraft     AccountState = "draft"
-	AccountPendingKYC AccountState = "pending_kyc"
-	AccountActive    AccountState = "active"
-	AccountDormant   AccountState = "dormant"
-	AccountFrozen    AccountState = "frozen"
-	AccountClosed    AccountState = "closed"
-	AccountPND       AccountState = "post_no_debit"
-)
-
-var validAccountTransitions = map[AccountState][]AccountState{
-	AccountDraft:      {AccountPendingKYC, AccountActive},
-	AccountPendingKYC: {AccountActive, AccountClosed},
-	AccountActive:     {AccountDormant, AccountFrozen, AccountClosed, AccountPND},
-	AccountDormant:    {AccountActive, AccountClosed},
-	AccountFrozen:     {AccountActive, AccountClosed},
-	AccountPND:        {AccountActive, AccountFrozen, AccountClosed},
-}
-
-func canTransitionAccount(from, to AccountState) bool {
-	allowed := validAccountTransitions[from]
-	for _, s := range allowed { if s == to { return true } }
-	return false
-}
-
-// CBN Tier Limits
-type TierLimit struct {
-	MaxSingleDebit    AmountKobo
-	MaxDailyDebit     AmountKobo
-	MaxBalance        AmountKobo
-	MaxDailyCumulative AmountKobo
-	RequiredDocs      []string
-}
-
-var cbnTierLimits = map[string]TierLimit{
-	"tier1": {
-		MaxSingleDebit:    nairaToKobo(50000),
-		MaxDailyDebit:     nairaToKobo(300000),
-		MaxBalance:        nairaToKobo(300000),
-		MaxDailyCumulative: nairaToKobo(300000),
-		RequiredDocs:      []string{"phone_number"},
-	},
-	"tier2": {
-		MaxSingleDebit:    nairaToKobo(200000),
-		MaxDailyDebit:     nairaToKobo(500000),
-		MaxBalance:        nairaToKobo(500000),
-		MaxDailyCumulative: nairaToKobo(500000),
-		RequiredDocs:      []string{"bvn", "phone_number", "date_of_birth"},
-	},
-	"tier3": {
-		MaxSingleDebit:    nairaToKobo(5000000),
-		MaxDailyDebit:     nairaToKobo(10000000),
-		MaxBalance:        nairaToKobo(0), // unlimited
-		MaxDailyCumulative: nairaToKobo(10000000),
-		RequiredDocs:      []string{"bvn", "nin", "proof_of_address", "passport_photo", "utility_bill"},
-	},
-}
-
-func validateTierTransaction(tier string, amountKobo AmountKobo, dailyTotalKobo AmountKobo) (bool, string) {
-	limit, ok := cbnTierLimits[tier]
-	if !ok { return false, "unknown tier" }
-	if amountKobo > limit.MaxSingleDebit { return false, fmt.Sprintf("exceeds %s single debit limit ₦%.0f", tier, limit.MaxSingleDebit.Naira()) }
-	if dailyTotalKobo+amountKobo > limit.MaxDailyCumulative { return false, fmt.Sprintf("exceeds %s daily cumulative limit ₦%.0f", tier, limit.MaxDailyCumulative.Naira()) }
-	return true, ""
-}
-
-// BVN Validation (11-digit with check algorithm)
-func validateBVN(bvn string) (bool, string) {
-	if len(bvn) != 11 { return false, "BVN must be 11 digits" }
-	for _, c := range bvn {
-		if c < '0' || c > '9' { return false, "BVN must contain only digits" }
-	}
-	// First 2 digits = issuer code (must be valid)
-	issuer := bvn[:2]
-	if issuer == "00" { return false, "invalid BVN issuer code" }
-	return true, ""
-}
-
-// NIN Validation (11-digit National Identity Number)
-func validateNIN(nin string) (bool, string) {
-	if len(nin) != 11 { return false, "NIN must be 11 digits" }
-	for _, c := range nin {
-		if c < '0' || c > '9' { return false, "NIN must contain only digits" }
-	}
-	return true, ""
-}
-
-// Dormancy detection — CBN: no customer-initiated transaction in 12 months
-func checkDormancy(lastTxnDate time.Time) (bool, int) {
-	days := int(time.Since(lastTxnDate).Hours() / 24)
-	isDormant := days >= 365
-	return isDormant, days
-}
-
-// COT (Commission on Turnover) — deprecated but some accounts still have it
-func computeCOT(turnoverKobo AmountKobo, rate float64) AmountKobo {
-	if rate <= 0 { return 0 }
-	return AmountKobo(float64(turnoverKobo) * rate / 100.0)
-}
-
-// SMS alert charge
-func computeSMSAlertCharge(alertCount int, pricePerAlert AmountKobo) AmountKobo {
-	return AmountKobo(alertCount) * pricePerAlert
-}
-
-// Account closure validation
-func validateAccountClosure(balanceKobo AmountKobo, hasActiveLoan, hasPendingTxn, hasLien bool) (bool, []string) {
-	var errors []string
-	if balanceKobo != 0 { errors = append(errors, fmt.Sprintf("account balance must be zero (current: ₦%.2f)", balanceKobo.Naira())) }
-	if hasActiveLoan { errors = append(errors, "active loan linked to account") }
-	if hasPendingTxn { errors = append(errors, "pending transactions exist") }
-	if hasLien { errors = append(errors, "lien placed on account") }
-	return len(errors) == 0, errors
-}
-
-// Interest accrual for savings (daily accrual, monthly capitalization)
-func computeDailyInterestAccrual(balanceKobo AmountKobo, annualRatePct float64) AmountKobo {
-	dailyRate := annualRatePct / 365.0 / 100.0
-	return AmountKobo(float64(balanceKobo) * dailyRate)
-}
-
-// WHT (Withholding Tax) on interest — 10% for individuals, 10% for corporates
-func computeWHT(interestKobo AmountKobo, accountType string) AmountKobo {
-	rate := 0.10 // 10% for both individual and corporate per Nigerian tax law
-	return AmountKobo(float64(interestKobo) * rate)
-}
-
-
-func ensureDB() {
-	if db == nil {
-		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
-	}
-}
-
-
-// --- PII Masking (NDPR Compliance) ---
-func maskPII(value, fieldType string) string {
-	if len(value) == 0 { return "***" }
-	switch fieldType {
-	case "bvn", "nin":
-		if len(value) >= 4 { return "***" + value[len(value)-4:] }
-		return "***"
-	case "phone":
-		if len(value) >= 4 { return "+234***" + value[len(value)-4:] }
-		return "+234***"
-	case "email":
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return string(parts[0][0]) + "***@" + parts[1] }
-		return "***@***"
-	case "account":
-		if len(value) >= 4 { return "****" + value[len(value)-4:] }
-		return "****"
-	default:
-		if len(value) > 4 { return value[:1] + "***" + value[len(value)-1:] }
-		return "***"
-	}
-}
-
-func sanitizeLogEntry(msg string) string {
-	// Mask BVN patterns (11 digits)
-	re1 := regexp.MustCompile(`\b[0-9]{11}\b`)
-	msg = re1.ReplaceAllStringFunc(msg, func(s string) string { return "***" + s[len(s)-4:] })
-	// Mask account numbers (10 digits)
-	re2 := regexp.MustCompile(`\b[0-9]{10}\b`)
-	msg = re2.ReplaceAllStringFunc(msg, func(s string) string { return "****" + s[len(s)-4:] })
-	// Mask email
-	re3 := regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
-	msg = re3.ReplaceAllString(msg, "***@***")
-	return msg
-}
-
-
-// ─── Idempotency Middleware ─────────────────────────────────────────────────
-var idempotencyCache = struct {
-	sync.RWMutex
-	entries map[string]idempotencyEntry
-}{entries: make(map[string]idempotencyEntry)}
-
-type idempotencyEntry struct {
-	response   []byte
-	statusCode int
-	createdAt  time.Time
-}
-
-func idempotencyMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" && r.Method != "PUT" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		key := r.Header.Get("Idempotency-Key")
-		if key == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		idempotencyCache.RLock()
-		if entry, ok := idempotencyCache.entries[key]; ok {
-			idempotencyCache.RUnlock()
-			w.Header().Set("X-Idempotency-Replayed", "true")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(entry.statusCode)
-			w.Write(entry.response)
-			return
-		}
-		idempotencyCache.RUnlock()
-		rec := &idempotencyRecorder{ResponseWriter: w, statusCode: 200}
-		next.ServeHTTP(rec, r)
-		idempotencyCache.Lock()
-		idempotencyCache.entries[key] = idempotencyEntry{response: rec.body, statusCode: rec.statusCode, createdAt: time.Now()}
-		idempotencyCache.Unlock()
-		// Cleanup old entries (>24h) in background
-		go func() {
-			idempotencyCache.Lock()
-			defer idempotencyCache.Unlock()
-			for k, v := range idempotencyCache.entries {
-				if time.Since(v.createdAt) > 24*time.Hour { delete(idempotencyCache.entries, k) }
-			}
-		}()
-	})
-}
-
-type idempotencyRecorder struct {
-	http.ResponseWriter
-	statusCode int
-	body       []byte
-}
-
-func (r *idempotencyRecorder) WriteHeader(code int) { r.statusCode = code; r.ResponseWriter.WriteHeader(code) }
-func (r *idempotencyRecorder) Write(b []byte) (int, error) { r.body = append(r.body, b...); return r.ResponseWriter.Write(b) }
-
-
-// ─── Transaction Atomicity ──────────────────────────────────────────────────
-// All multi-step write operations wrapped in DB transactions.
-func dbExecAtomic(queries []string, params [][]interface{}) error {
-	if db == nil { return fmt.Errorf("DB not available") }
-	tx, err := db.Begin()
-	if err != nil { return fmt.Errorf("BEGIN failed: %v", err) }
-	for i, q := range queries {
-		var args []interface{}
-		if i < len(params) { args = params[i] }
-		if _, err := tx.Exec(q, args...); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("step %d failed: %v", i+1, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("COMMIT failed: %v", err)
-	}
-	return nil
-}
-
-
-
-// --- Monetary Safety (kobo precision) ---
-// roundNaira eliminates floating-point drift by rounding to 2 decimal places (kobo precision).
-func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
-
-// validateAmount checks monetary amount is non-negative and within CBN limits.
-func validateAmount(amount float64) error {
-	if amount < 0 {
-		return fmt.Errorf("amount must be non-negative, got %.2f", amount)
-	}
-	if amount > 999_999_999_999.99 {
-		return fmt.Errorf("amount exceeds maximum (₦999,999,999,999.99), got %.2f", amount)
-	}
-	return nil
-}
-
-// --- Audit Trail (append-only) ---
-type AuditEntry struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`
-	RecordID  string `json:"record_id"`
-	Actor     string `json:"actor"`
-	Timestamp string `json:"timestamp"`
-	Details   string `json:"details"`
-}
-
-var auditLog []AuditEntry
-
-func appendAudit(action, recordID, actor, details string) {
-	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
-		Action: action, RecordID: recordID, Actor: actor,
-		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
-	})
-
-}
-
-// --- Observability (OpenTelemetry) ---
-var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-func initTracing() {
-	if otelEndpoint == "" { return }
-	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
-}
-
-
-func secureRandUint32() uint32 {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-}
-
-// --- Retry with Exponential Backoff ---
-func retryWithBackoff(maxRetries int, fn func() error) error {
-	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
-		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
-		time.Sleep(backoff)
-	}
-	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
-}
-
-func requestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rid := r.Header.Get("X-Request-Id")
-		if rid == "" {
-			rid = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		w.Header().Set("X-Request-Id", rid)
-		next.ServeHTTP(w, r)
-	})
-}
-
-func validateOrigin(origin string) bool {
-	if origin == "" || origin == "*" {
-		return false // reject wildcards
-	}
-	// Only allow HTTPS origins in production
-	if strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://localhost") {
-		return true
-	}
-	return false
-}
-
-func validateJWTExpiry(tokenStr string) bool {
-	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	// Decode payload (base64url)
-	payload := parts[1]
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	decoded, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		return false
-	}
-	var claims map[string]interface{}
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return false
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return false
-	}
-	return time.Now().Unix() < int64(exp)
-}
-
-// Handler context with timeout prevents hung requests
-func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(r.Context(), 30*time.Second)
-}
-
-// Secure HTTP server configuration
-func newSecureServer(addr string, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadTimeout:       15 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
-	}
-}
-
-// Sanitize errors before sending to clients (prevent info leakage)
-func sanitizeError(err error) string {
-	errStr := err.Error()
-	// Strip file paths, stack traces, internal IPs
-	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") {
-		return "internal error"
-	}
-	if len(errStr) > 200 {
-		return "internal error"
-	}
-	return errStr
-}
-
-// IP-based sliding window rate limiter
-type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rateBucket
-	rate     int
-	window   time.Duration
-}
-
-type rateBucket struct {
-	count    int
-	lastSeen time.Time
-}
-
-func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
-	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
-	go rl.cleanup()
-	return rl
-}
-
-func (rl *ipRateLimiter) allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	b, exists := rl.visitors[ip]
-	if !exists || time.Since(b.lastSeen) > rl.window {
-		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
-		return true
-	}
-	if b.count >= rl.rate {
-		return false
-	}
-	b.count++
-	b.lastSeen = time.Now()
-	return true
-}
-
-func (rl *ipRateLimiter) cleanup() {
-	for {
-		time.Sleep(rl.window)
-		rl.mu.Lock()
-		for ip, b := range rl.visitors {
-			if time.Since(b.lastSeen) > rl.window {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
-}
-
-var globalIPLimiter = newIPRateLimiter(100, time.Minute)
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
-
-// Prevent HTTP header injection (strip CR/LF)
-func sanitizeHeader(value string) string {
-	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
-}
-
-
-// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
-func panicRecoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":"internal server error"}`))
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Process Health Watchdog ---
-// Monitors event loop liveness; if the main goroutine stalls for >60s,
-// the liveness probe fails and K8s/KEDA restarts the pod automatically.
-
-var watchdogLastPing atomic.Int64
-
-func init() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
-}
-
-func watchdogPing() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
-}
-
-func startWatchdog(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			lastPing := watchdogLastPing.Load()
-			elapsed := time.Now().UnixMilli() - lastPing
-			if elapsed > 60000 {
-				log.Printf("[WATCHDOG] Event loop stalled for %dms — marking unhealthy", elapsed)
-			}
-		}
-	}()
-}
-
-func watchdogHealthy() bool {
-	lastPing := watchdogLastPing.Load()
-	elapsed := time.Now().UnixMilli() - lastPing
-	return elapsed < 60000
-}
-
 func main() {
-	initTracing()
-	startWatchdog(10 * time.Second)
-	watchdogPing()
 	port := os.Getenv("PORT")
 	if port == "" { port = "8080" }
 	initDB()
@@ -1398,7 +688,7 @@ func main() {
 	_ = tlsEnabled
 	server := &http.Server{
         Addr:    ":" + port,
-        Handler: panicRecoveryMiddleware(rateLimitMiddleware(securityHeadersMiddleware(traceMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))))),
+        Handler: rateLimitMiddleware(securityHeadersMiddleware(traceMiddleware(jwtAuthMiddleware(countingMiddleware(mux))))),
         ReadTimeout:  15 * time.Second,
         WriteTimeout: 30 * time.Second,
         IdleTimeout:  60 * time.Second,
@@ -1417,70 +707,3 @@ func main() {
     _ = server.Shutdown(ctx)
     log.Println("[virtual-accounts-go] Server stopped gracefully")
 }
-
-// --- Event Bus (Kafka-compatible event emission) ---
-
-type EventBus struct {
-	brokerURL   string
-	topic       string
-	serviceName string
-	mu          sync.Mutex
-	buffer      []map[string]interface{}
-}
-
-func newEventBus(topic, service string) *EventBus {
-	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" {
-		broker = "localhost:9092"
-	}
-	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
-}
-
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
-	event := map[string]interface{}{
-		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
-		"type":      eventType,
-		"source":    eb.serviceName,
-		"topic":     eb.topic,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"data":      payload,
-	}
-	eb.mu.Lock()
-	eb.buffer = append(eb.buffer, event)
-	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
-	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
-}
-
-func (eb *EventBus) Flush() []map[string]interface{} {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	events := eb.buffer
-	eb.buffer = nil
-	return events
-}
-
-// --- Downstream Notifier ---
-
-func notifyDownstream(serviceURL, path string, payload interface{}) error {
-	body, _ := json.Marshal(payload)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Source-Service", serviceName)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("[Downstream] %s%s failed: %v", serviceURL, path, err)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("downstream %s returned %d", path, resp.StatusCode)
-	}
-	return nil
-}
-

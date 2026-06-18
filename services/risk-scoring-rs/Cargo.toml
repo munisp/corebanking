@@ -2,12 +2,9 @@
 name = "risk-scoring-engine"
 version = "0.1.0"
 edition = "2021"
-description = "54Bank Risk Scoring Engine — credit risk, market risk, operational risk, Basel III RWA"
+description = "54link-dev Risk Scoring Engine — credit risk, market risk, operational risk, Basel III RWA"
 
 [dependencies]
-actix-cors = "0.7"
-sha2 = "0.10"
-lazy_static = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }

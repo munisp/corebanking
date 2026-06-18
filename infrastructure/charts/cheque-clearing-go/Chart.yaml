@@ -1,0 +1,6 @@
+apiVersion: v2
+name: cheque-clearing-go
+description: 54link Cheque Clearing Service Helm Chart
+type: application
+version: 0.0.1
+appVersion: "1.0.0"

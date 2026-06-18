@@ -1,0 +1,34 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="FX Service DB Architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- FX RATES -->
+        <mxCell id="fx_rates" value="fx_rates&#xa;----------------------&#xa;id (PK, serial)&#xa;tenant_id (varchar)&#xa;from_currency (varchar(3))&#xa;to_currency (varchar(3))&#xa;rate (decimal(15,6))&#xa;source (varchar: CBN/Reuters/Bloomberg)&#xa;strategy (varchar: best/average/weighted)&#xa;provider_rates (JSONB)&#xa;created_at (timestamp)&#xa;INDEX: (tenant_id, from_currency, to_currency, created_at DESC)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- FX TRANSACTIONS -->
+        <mxCell id="fx_transactions" value="fx_transactions&#xa;----------------------&#xa;id (PK, serial)&#xa;transaction_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;customer_id (varchar)&#xa;from_currency (varchar(3))&#xa;to_currency (varchar(3))&#xa;from_amount (decimal(15,2))&#xa;to_amount (decimal(15,2))&#xa;exchange_rate (decimal(15,6))&#xa;base_rate (decimal(15,6))&#xa;rate_source (varchar)&#xa;strategy (varchar)&#xa;purpose (varchar)&#xa;margin_applied (decimal)&#xa;initiated_by (varchar)&#xa;status (varchar: completed/failed/reversed)&#xa;idempotency_key (varchar, unique per tenant)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="300" height="400" as="geometry"/>
+        </mxCell>
+
+        <!-- FX WORKFLOW EVENTS -->
+        <mxCell id="fx_workflow_events" value="fx_workflow_events&#xa;----------------------&#xa;id (PK, serial)&#xa;transaction_id (FK -> fx_transactions)&#xa;tenant_id (varchar, indexed)&#xa;event_type (varchar: initiated/approved/executed/settled)&#xa;actor (varchar)&#xa;details (JSONB)&#xa;created_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="360" width="300" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="fx_rates" target="fx_transactions" style="endArrow=block;dashed=1;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="fx_transactions" target="fx_workflow_events" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

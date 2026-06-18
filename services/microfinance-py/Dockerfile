@@ -6,4 +6,4 @@ RUN pip install --no-cache-dir -r requirements.txt 2>/dev/null || true
 COPY . .
 USER appuser
 HEALTHCHECK --interval=30s --timeout=5s CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${PORT:-8080}/healthz')" || exit 1
-ENTRYPOINT ["python", "service.py"]
+ENTRYPOINT ["python", "main.py"]

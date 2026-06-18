@@ -1,0 +1,111 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: 54link-dev-backend-cert
+  namespace: 54link-dev
+spec:
+  secretName: 54link-dev-backend-cert
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: 54link-dev.upi.dev
+  dnsNames:
+    - 54link-dev.upi.dev
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: 54link-dev-verification-ui-cert
+  namespace: 54link-dev
+spec:
+  secretName: 54link-dev-verification-ui-cert
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: kyc.54link-dev.upi.dev
+  dnsNames:
+    - kyc.54link-dev.upi.dev
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: 54link-dev-client-web-app-cert
+  namespace: 54link-dev
+spec:
+  secretName: 54link-dev-client-web-app-cert
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: app.54link-dev.upi.dev
+  dnsNames:
+    - app.54link-dev.upi.dev
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: 54link-dev-tenant-web-app-cert
+  namespace: 54link-dev
+spec:
+  secretName: 54link-dev-tenant-web-app-cert
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: tenant.54link-dev.upi.dev
+  dnsNames:
+    - tenant.54link-dev.upi.dev
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: 54link-dev-admin-web-app-cert
+  namespace: 54link-dev
+spec:
+  secretName: 54link-dev-admin-web-app-cert
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: admin.54link-dev.upi.dev
+  dnsNames:
+    - admin.54link-dev.upi.dev
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: 54link-dev-compliance-ui-cert
+  namespace: 54link-dev
+spec:
+  secretName: 54link-dev-compliance-ui-cert
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: compliance.54link-dev.upi.dev
+  dnsNames:
+    - compliance.54link-dev.upi.dev
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: 54link-dev-pup-web-app-cert
+  namespace: 54link-dev
+spec:
+  secretName: 54link-dev-pup-web-app-cert
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: pup.54link-dev.upi.dev
+  dnsNames:
+    - pup.54link-dev.upi.dev
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: temporal-server-cert
+  namespace: temporal
+spec:
+  secretName: temporal-server-cert
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: temporal-web.54link-dev.upi.dev
+  dnsNames:
+    - temporal-web.54link-dev.upi.dev

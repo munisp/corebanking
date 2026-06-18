@@ -5,7 +5,7 @@ syntax = "proto3";
 
 package kyc.v1;
 
-option go_package = "github.com/54bank/proto/kyc/v1;kycv1";
+option go_package = "github.com/54link-dev/proto/kyc/v1;kycv1";
 
 // ── KYC Verification Service ──
 

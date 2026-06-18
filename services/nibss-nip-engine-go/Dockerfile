@@ -7,7 +7,4 @@ FROM alpine:3.19
 WORKDIR /app
 COPY --from=builder /app/nibss-nip-engine .
 EXPOSE 8111
-RUN adduser -D -u 1001 appuser
-USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8111/healthz || exit 1
 CMD ["./nibss-nip-engine"]

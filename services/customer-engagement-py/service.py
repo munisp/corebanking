@@ -11,52 +11,7 @@ from datetime import datetime, date
 from typing import Optional, List
 import uvicorn, os, uuid, random
 
-
-SERVICE_NAME = "customer-engagement-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
-
-
-app = FastAPI(title="54Bank Customer Engagement", version="1.0.0")
+app = FastAPI(title="54link-dev Customer Engagement", version="1.0.0")
 
 # --- Models ---
 
@@ -123,7 +78,7 @@ class Referral(BaseModel):
 
 # --- Storage ---
 messages: list[InAppMessage] = [
-    InAppMessage(id="MSG-001", customer_id="CUST-001", title="Welcome to 54Bank!", body="Your account is set up and ready. Explore our savings products.", channel="in_app", priority="high", status="read", created_at="2026-01-15T09:00:00Z"),
+    InAppMessage(id="MSG-001", customer_id="CUST-001", title="Welcome to 54link-dev!", body="Your account is set up and ready. Explore our savings products.", channel="in_app", priority="high", status="read", created_at="2026-01-15T09:00:00Z"),
     InAppMessage(id="MSG-002", customer_id="CUST-002", title="Trade Finance Alert", body="Your LC for ₦25M has been confirmed by the advising bank.", channel="push", priority="high", status="delivered", created_at="2026-04-01T14:00:00Z"),
     InAppMessage(id="MSG-003", customer_id="CUST-001", title="Loan Payment Reminder", body="Your personal loan payment of ₦145,000 is due on Jan 25.", channel="sms", priority="medium", status="sent", created_at="2026-01-20T08:00:00Z"),
 ]
@@ -148,14 +103,14 @@ def healthz():
                 "fluvio": {"status": "connected", "topic": "customer_engagement-stream"},
                 "temporal": {"status": "connected", "namespace": "customer_engagement"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "customer_engagement"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "customer_engagement_authz"},
                 "redis": {"status": "connected", "prefix": "customer_engagement:"},
                 "mojaloop": {"status": "connected", "participant": "customer_engagement"},
                 "opensearch": {"status": "connected", "index": "customer_engagement-*"},
                 "openappsec": {"status": "connected", "policy": "customer_engagement-protection"},
                 "apisix": {"status": "connected", "upstream": "customer_engagement"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "customer_engagement_iceberg"}
             },
     }
@@ -172,7 +127,6 @@ def send_message(req: InAppMessage):
     req.id = f"MSG-{uuid.uuid4().hex[:8]}"
     req.sent_at = datetime.utcnow().isoformat()
     messages.append(req)
-    db_persist("messages", req.to_dict() if hasattr(req, "to_dict") else req if isinstance(req, dict) else {"value": str(req)})
     return req
 
 @app.post("/v1/engagement/messages/bulk", status_code=201)
@@ -191,9 +145,7 @@ def bulk_message(body: dict):
             segment=segment, sent_at=datetime.utcnow().isoformat(),
         )
         messages.append(msg)
-        db_persist("messages", msg.to_dict() if hasattr(msg, "to_dict") else msg if isinstance(msg, dict) else {"value": str(msg)})
         created.append(msg)
-        db_persist("created", msg.to_dict() if hasattr(msg, "to_dict") else msg if isinstance(msg, dict) else {"value": str(msg)})
     return {"sent": len(created), "messages": created}
 
 # --- Product Recommendations ---
@@ -222,9 +174,7 @@ def get_recommendations(customer_id: str):
             created_at=datetime.utcnow().isoformat(),
         )
         recs.append(rec)
-        db_persist("recs", rec.to_dict() if hasattr(rec, "to_dict") else rec if isinstance(rec, dict) else {"value": str(rec)})
         recommendations.append(rec)
-        db_persist("recommendations", rec.to_dict() if hasattr(rec, "to_dict") else rec if isinstance(rec, dict) else {"value": str(rec)})
 
     return sorted(recs, key=lambda r: r.score, reverse=True)
 
@@ -267,7 +217,6 @@ def submit_survey(req: SurveyResponse):
     req.id = f"SRV-{uuid.uuid4().hex[:8]}"
     req.created_at = datetime.utcnow().isoformat()
     surveys.append(req)
-    db_persist("surveys", req.to_dict() if hasattr(req, "to_dict") else req if isinstance(req, dict) else {"value": str(req)})
     return req
 
 @app.get("/v1/engagement/surveys/analytics")
@@ -305,7 +254,6 @@ def create_referral(req: Referral):
     req.reward_amount = 2000  # ₦2,000 referral bonus
     req.created_at = datetime.utcnow().isoformat()
     referrals.append(req)
-    db_persist("referrals", req.to_dict() if hasattr(req, "to_dict") else req if isinstance(req, dict) else {"value": str(req)})
     return req
 
 @app.post("/v1/engagement/referrals/{referral_id}/convert")
@@ -319,6 +267,5 @@ def convert_referral(referral_id: str, body: dict):
     raise HTTPException(404, "Referral not found")
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", 8111))
     uvicorn.run(app, host="0.0.0.0", port=port)

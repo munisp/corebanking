@@ -1,4 +1,4 @@
-module github.com/54bank/acgsf-guarantee-go
+module github.com/54link-dev/acgsf-guarantee-go
 
 go 1.21
 

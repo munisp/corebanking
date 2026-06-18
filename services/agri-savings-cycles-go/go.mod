@@ -1,4 +1,4 @@
-module github.com/54bank/agri-savings-cycles-go
+module github.com/54link-dev/agri-savings-cycles-go
 
 go 1.21
 

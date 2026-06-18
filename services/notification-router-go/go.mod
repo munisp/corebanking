@@ -1,4 +1,4 @@
-module github.com/54bank/notification-router-go
+module github.com/54link-dev/notification-router-go
 
 go 1.22
 

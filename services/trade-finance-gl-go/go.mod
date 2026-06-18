@@ -1,4 +1,4 @@
-module github.com/54bank/trade-finance-gl-go
+module github.com/54link-dev/trade-finance-gl-go
 
 go 1.21
 

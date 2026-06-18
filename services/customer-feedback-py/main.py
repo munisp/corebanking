@@ -1,30 +1,6 @@
-import sys; sys.path.insert(0, '/home/ubuntu/repos/corebanking/libs/banking-rules-py')
-
-# --- PII Masking (NDPR Compliance) ---
-import re as _pii_re
-
-def mask_pii(value: str, field_type: str = "generic") -> str:
-    if not value: return "***"
-    if field_type in ("bvn", "nin"):
-        return f"***{value[-4:]}" if len(value) >= 4 else "***"
-    elif field_type == "phone":
-        return f"+234***{value[-4:]}" if len(value) >= 4 else "+234***"
-    elif field_type == "email" and "@" in value:
-        local, domain = value.split("@", 1)
-        return f"{local[0]}***@{domain}"
-    elif field_type == "account":
-        return f"****{value[-4:]}" if len(value) >= 4 else "****"
-    return f"{value[0]}***{value[-1]}" if len(value) > 2 else "***"
-
-def sanitize_log(msg: str) -> str:
-    msg = _pii_re.sub(r"\b\d{11}\b", lambda m: f"***{m.group()[-4:]}", msg)
-    msg = _pii_re.sub(r"\b\d{10}\b", lambda m: f"****{m.group()[-4:]}", msg)
-    msg = _pii_re.sub(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "***@***", msg)
-    return msg
-
 #!/usr/bin/env python3
 """
-customer-feedback-py — 54Bank Microservice
+customer-feedback-py — 54link-dev Microservice
 Production-hardened: JWT, rate limiting, security headers, DB persistence,
 graceful shutdown, health probes, Prometheus metrics, distributed tracing,
 inter-service wiring, connection pooling, input sanitization.
@@ -38,10 +14,9 @@ SERVICE_NAME = "customer-feedback-py"
 
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
-TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54bank/certs/service.crt")
-TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
-TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
-MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
+TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54link-dev/certs/service.crt")
+TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54link-dev/certs/service.key")
+TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54link-dev/certs/ca.crt")
 PORT = int(os.environ.get("PORT", 9508))
 
 # --- Observability ---
@@ -204,8 +179,8 @@ def init_tracing():
         provider = TracerProvider()
         provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
         trace.set_tracer_provider(provider)
-    except Exception as _exc:
-        logger.debug(f"Suppressed error: {_exc}")
+    except Exception:
+        pass
 
 
 def analyze_sentiment(text):
@@ -214,9 +189,8 @@ def analyze_sentiment(text):
     words = text.lower().split()
     pos = sum(1 for w in words if w in positive)
     neg = sum(1 for w in words if w in negative)
-    total = max(pos + neg + 1, 1)
-    if pos > neg: return {"sentiment": "positive", "score": round(pos / total, 4)}
-    if neg > pos: return {"sentiment": "negative", "score": round(1.0 - neg / total, 4)}
+    if pos > neg: return {"sentiment": "positive", "score": 0.8}
+    if neg > pos: return {"sentiment": "negative", "score": 0.2}
     return {"sentiment": "neutral", "score": 0.5}
 
 
@@ -233,353 +207,6 @@ def respond(handler, code, body):
 import socket as _grpc_socket
 import struct as _grpc_struct
 import threading as _grpc_threading
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Deep Domain Logic — Production-Ready Business Rules
-# ══════════════════════════════════════════════════════════════════════════════
-
-class AmountKobo:
-    """Monetary amounts in kobo (smallest unit) to avoid float precision errors."""
-    __slots__ = ('_value',)
-
-    def __init__(self, kobo: int):
-        self._value = int(kobo)
-
-    @classmethod
-    def from_naira(cls, naira: float) -> 'AmountKobo':
-        return cls(int(round(naira * 100)))
-
-    @property
-    def kobo(self) -> int:
-        return self._value
-
-    @property
-    def naira(self) -> float:
-        return self._value / 100.0
-
-    def __repr__(self):
-        return f"₦{self._value // 100}.{abs(self._value % 100):02d}"
-
-    def __add__(self, other): return AmountKobo(self._value + other._value)
-    def __sub__(self, other): return AmountKobo(self._value - other._value)
-    def __gt__(self, other): return self._value > other._value
-    def __ge__(self, other): return self._value >= other._value
-    def __lt__(self, other): return self._value < other._value
-    def __eq__(self, other): return self._value == other._value
-
-
-# ── State Machine ────────────────────────────────────────────────────────────
-
-class StateMachine:
-    """Formal state machine with transition guards."""
-
-    TRANSITIONS = {
-        "draft": ["submitted", "cancelled"],
-        "submitted": ["under_review", "rejected", "cancelled"],
-        "under_review": ["approved", "rejected"],
-        "approved": ["processing", "cancelled"],
-        "processing": ["completed", "failed"],
-        "completed": ["reversed"],
-        "failed": ["submitted"],  # retry
-    }
-
-    @classmethod
-    def can_transition(cls, from_state: str, to_state: str) -> bool:
-        allowed = cls.TRANSITIONS.get(from_state, [])
-        return to_state in allowed
-
-    @classmethod
-    def transition(cls, entity_id: str, from_state: str, to_state: str) -> dict:
-        if not cls.can_transition(from_state, to_state):
-            return {"error": f"Invalid transition: {from_state} → {to_state}", "entity_id": entity_id}
-        return {"entity_id": entity_id, "from": from_state, "to": to_state, "transitioned_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ")}
-
-
-# ── Nigerian Regulatory Rules ────────────────────────────────────────────────
-
-CBN_TIER_LIMITS = {
-    "tier1": {"max_single_debit_kobo": 5_000_000, "max_daily_kobo": 30_000_000, "max_balance_kobo": 30_000_000, "required_docs": ["phone"]},
-    "tier2": {"max_single_debit_kobo": 20_000_000, "max_daily_kobo": 50_000_000, "max_balance_kobo": 50_000_000, "required_docs": ["bvn", "phone", "dob"]},
-    "tier3": {"max_single_debit_kobo": 500_000_000, "max_daily_kobo": 1_000_000_000, "max_balance_kobo": 0, "required_docs": ["bvn", "nin", "address_proof", "passport_photo", "utility_bill"]},
-}
-
-def validate_tier_transaction(tier: str, amount_kobo: int, daily_total_kobo: int) -> tuple:
-    """Validate transaction against CBN tier limits."""
-    limits = CBN_TIER_LIMITS.get(tier)
-    if not limits:
-        return False, "Unknown KYC tier"
-    if amount_kobo > limits["max_single_debit_kobo"]:
-        return False, f"Exceeds {tier} single debit limit ₦{limits['max_single_debit_kobo'] // 100:,}"
-    if daily_total_kobo + amount_kobo > limits["max_daily_kobo"]:
-        return False, f"Exceeds {tier} daily cumulative limit ₦{limits['max_daily_kobo'] // 100:,}"
-    return True, ""
-
-
-def validate_bvn(bvn: str) -> tuple:
-    """Validate Bank Verification Number (11 digits)."""
-    if len(bvn) != 11:
-        return False, "BVN must be 11 digits"
-    if not bvn.isdigit():
-        return False, "BVN must contain only digits"
-    if bvn[:2] == "00":
-        return False, "Invalid BVN issuer code"
-    return True, ""
-
-
-def validate_nin(nin: str) -> tuple:
-    """Validate National Identification Number (11 digits)."""
-    if len(nin) != 11:
-        return False, "NIN must be 11 digits"
-    if not nin.isdigit():
-        return False, "NIN must contain only digits"
-    return True, ""
-
-
-def validate_nuban(bank_code: str, account_number: str) -> tuple:
-    """Validate NUBAN (Nigerian Uniform Bank Account Number) with check digit."""
-    if len(account_number) != 10:
-        return False, "NUBAN must be 10 digits"
-    if len(bank_code) != 3:
-        return False, "Bank code must be 3 digits"
-    serial = bank_code + account_number[:9]
-    weights = [3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3]
-    total = sum(int(serial[i]) * weights[i] for i in range(min(len(serial), len(weights))))
-    check_digit = (10 - (total % 10)) % 10
-    if check_digit != int(account_number[9]):
-        return False, f"NUBAN check digit mismatch: expected {check_digit}"
-    return True, ""
-
-
-# ── NFIU Threshold Reporting ─────────────────────────────────────────────────
-
-def check_nfiu_threshold(amount_kobo: int, txn_type: str) -> tuple:
-    """Check if transaction triggers NFIU Currency Transaction Report."""
-    if txn_type in ("cash_deposit", "cash_withdrawal"):
-        if amount_kobo >= 500_000_000:  # ₦5M
-            return True, "NFIU: Cash transaction ≥₦5M requires CTR filing"
-    elif txn_type in ("transfer", "wire"):
-        if amount_kobo >= 1_000_000_000:  # ₦10M
-            return True, "NFIU: Transfer ≥₦10M requires CTR filing"
-    return False, ""
-
-
-def generate_ctr(customer_id: str, txn_id: str, amount_kobo: int, txn_type: str) -> dict:
-    """Generate Currency Transaction Report for NFIU."""
-    import time
-    threshold_hit, reason = check_nfiu_threshold(amount_kobo, txn_type)
-    if not threshold_hit:
-        return None
-    return {
-        "report_id": f"CTR-{int(time.time()*1000)}",
-        "customer_id": customer_id,
-        "transaction_id": txn_id,
-        "amount_kobo": amount_kobo,
-        "type": txn_type,
-        "reason": reason,
-        "filed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "status": "pending",
-    }
-
-
-# ── AML Risk Scoring ─────────────────────────────────────────────────────────
-
-SANCTIONED_COUNTRIES = {"KP", "IR", "SY", "CU", "VE", "MM", "BY", "ZW", "SD"}
-
-def compute_aml_risk_score(
-    txn_amount_kobo: int, is_pep: bool = False, is_high_risk_country: bool = False,
-    cash_intensive: bool = False, is_structuring: bool = False,
-    has_adverse_media: bool = False, account_age_months: int = 12
-) -> tuple:
-    """Multi-factor AML risk scoring."""
-    score = 0.0
-    indicators = []
-    if is_pep: score += 30; indicators.append("PEP_STATUS")
-    if is_high_risk_country: score += 25; indicators.append("HIGH_RISK_JURISDICTION")
-    if cash_intensive: score += 15; indicators.append("CASH_INTENSIVE")
-    if is_structuring: score += 35; indicators.append("STRUCTURING_DETECTED")
-    if has_adverse_media: score += 20; indicators.append("ADVERSE_MEDIA")
-    if txn_amount_kobo > 1_000_000_000: score += 10; indicators.append("HIGH_VALUE_TXN")
-    if account_age_months < 3: score += 10; indicators.append("NEW_ACCOUNT")
-    return min(score, 100.0), indicators
-
-
-def detect_structuring(transactions: list, threshold_kobo: int = 500_000_000) -> bool:
-    """Detect structuring: multiple just-below-threshold transactions."""
-    count = sum(1 for t in transactions if t.get("amount_kobo", 0) >= threshold_kobo * 0.8 and t.get("amount_kobo", 0) < threshold_kobo)
-    return count >= 3
-
-
-# ── Financial Calculations ───────────────────────────────────────────────────
-
-def compute_emi(principal_kobo: int, annual_rate_pct: float, tenor_months: int) -> int:
-    """Compute Equated Monthly Installment in kobo."""
-    if tenor_months <= 0: return 0
-    if annual_rate_pct == 0: return principal_kobo // tenor_months
-    monthly_rate = annual_rate_pct / 12.0 / 100.0
-    power = (1 + monthly_rate) ** tenor_months
-    emi = principal_kobo * monthly_rate * power / (power - 1)
-    return int(round(emi))
-
-
-def generate_amortization_schedule(principal_kobo: int, annual_rate_pct: float, tenor_months: int) -> list:
-    """Generate full amortization schedule."""
-    if tenor_months <= 0: return []
-    monthly_rate = annual_rate_pct / 12.0 / 100.0
-    emi = compute_emi(principal_kobo, annual_rate_pct, tenor_months)
-    schedule = []
-    balance = principal_kobo
-    cumulative_interest = 0
-    for period in range(1, tenor_months + 1):
-        interest = int(balance * monthly_rate)
-        principal_part = emi - interest
-        if period == tenor_months: principal_part = balance  # settle rounding
-        balance -= principal_part
-        cumulative_interest += interest
-        schedule.append({
-            "period": period, "emi_kobo": emi, "principal_kobo": principal_part,
-            "interest_kobo": interest, "balance_kobo": max(balance, 0),
-            "cumulative_interest_kobo": cumulative_interest,
-        })
-    return schedule
-
-
-def compute_dti(monthly_income_kobo: int, existing_debt_kobo: int, proposed_emi_kobo: int) -> float:
-    """Compute Debt-to-Income ratio as percentage."""
-    if monthly_income_kobo <= 0: return 100.0
-    return (existing_debt_kobo + proposed_emi_kobo) / monthly_income_kobo * 100.0
-
-
-def compute_provisioning_rate(days_past_due: int) -> float:
-    """CBN Prudential Guidelines provisioning rates."""
-    if days_past_due <= 90: return 1.0      # Performing
-    if days_past_due <= 180: return 10.0    # Watchlist
-    if days_past_due <= 360: return 50.0    # Substandard
-    if days_past_due <= 720: return 75.0    # Doubtful
-    return 100.0                              # Lost
-
-
-def compute_interest_daily_accrual(balance_kobo: int, annual_rate_pct: float) -> int:
-    """Daily interest accrual for savings accounts."""
-    daily_rate = annual_rate_pct / 365.0 / 100.0
-    return int(balance_kobo * daily_rate)
-
-
-def compute_wht(interest_kobo: int) -> int:
-    """Withholding Tax on interest — 10% per Nigerian tax law."""
-    return int(interest_kobo * 0.10)
-
-
-# ── Validation with Error Accumulation ───────────────────────────────────────
-
-def validate_loan_application(
-    customer_id: str, amount_kobo: int, tenor_months: int, annual_rate: float,
-    monthly_income_kobo: int, existing_debt_kobo: int, kyc_level: str,
-    employment_years: float = 0, age: int = 30,
-) -> tuple:
-    """Comprehensive loan validation with error accumulation."""
-    errors = []
-    if amount_kobo < 1_000_000: errors.append("Amount below CBN minimum ₦10,000")
-    if amount_kobo > 5_000_000_000: errors.append("Amount exceeds ₦50M max single obligor limit")
-    if tenor_months < 1: errors.append("Tenor must be at least 1 month")
-    if tenor_months > 360: errors.append("Tenor exceeds 30-year maximum")
-    if annual_rate <= 0: errors.append("Interest rate must be positive")
-    if annual_rate > 30: errors.append("Rate exceeds CBN maximum lending rate")
-
-    # DTI check
-    emi = compute_emi(amount_kobo, annual_rate, tenor_months)
-    dti = compute_dti(monthly_income_kobo, existing_debt_kobo, emi)
-    if dti > 60: errors.append(f"DTI ratio {dti:.1f}% exceeds 60% maximum")
-
-    # KYC tier limits
-    tier_limits = {"tier1": 30_000_000, "tier2": 500_000_000, "tier3": 0}
-    if kyc_level in tier_limits and tier_limits[kyc_level] > 0:
-        if amount_kobo > tier_limits[kyc_level]:
-            errors.append(f"{kyc_level} KYC max loan ₦{tier_limits[kyc_level] // 100:,}")
-
-    # Age check
-    if age < 18: errors.append("Applicant must be 18+")
-    if age + tenor_months // 12 > 65: errors.append(f"Applicant will be {age + tenor_months // 12} at maturity (max 65)")
-
-    # Employment
-    if employment_years < 0.5: errors.append("Minimum 6 months employment required")
-
-    return len(errors) == 0, errors
-
-
-# ── Payment Reversal & Reconciliation ────────────────────────────────────────
-
-def reverse_transaction(txn_id: str, amount_kobo: int, sender: str, receiver: str, reason: str) -> dict:
-    """Generate reversal with GL entries."""
-    import time
-    return {
-        "reversal_id": f"REV-{txn_id}-{int(time.time()*1000)}",
-        "original_txn_id": txn_id,
-        "amount_kobo": amount_kobo,
-        "reason": reason,
-        "status": "reversed",
-        "reversed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "gl_entries": [
-            {"debit": receiver, "credit": sender, "amount_kobo": amount_kobo, "narration": f"Reversal: {reason}"},
-        ],
-    }
-
-
-def reconcile_transactions(internal: list, external: list) -> dict:
-    """Match internal records vs external (NIBSS/processor) records."""
-    ext_map = {t.get("session_id", ""): t for t in external if t.get("session_id")}
-    matched, unmatched, amount_mismatches = 0, 0, 0
-    for txn in internal:
-        sid = txn.get("session_id", "")
-        if sid in ext_map:
-            if txn.get("amount_kobo") == ext_map[sid].get("amount_kobo"):
-                matched += 1
-            else:
-                amount_mismatches += 1
-        else:
-            unmatched += 1
-    return {
-        "matched": matched, "unmatched": unmatched,
-        "amount_mismatches": amount_mismatches,
-        "total_internal": len(internal), "total_external": len(external),
-        "exceptions": len(external) - matched,
-    }
-
-
-# ── Velocity & Fraud Detection ───────────────────────────────────────────────
-
-VELOCITY_RULES = [
-    {"max_amount_kobo": 490_000_000, "max_count": 3, "window_hours": 24, "description": "3x near-threshold in 24h"},
-    {"max_amount_kobo": 100_000_000, "max_count": 10, "window_hours": 1, "description": "10 transfers in 1h"},
-    {"max_amount_kobo": 50_000_000, "max_count": 20, "window_hours": 24, "description": "20 transfers in 24h"},
-]
-
-def check_velocity(recent_transactions: list, new_amount_kobo: int) -> tuple:
-    """Check velocity limits to detect potential fraud/structuring."""
-    for rule in VELOCITY_RULES:
-        count = sum(1 for t in recent_transactions if t.get("amount_kobo", 0) >= rule["max_amount_kobo"])
-        if count >= rule["max_count"]:
-            return False, f"Velocity breach: {rule['description']}"
-    return True, ""
-
-
-def compute_fraud_score(
-    amount_kobo: int, is_international: bool = False, is_new_beneficiary: bool = False,
-    unusual_time: bool = False, device_changed: bool = False, failed_attempts: int = 0,
-) -> tuple:
-    """Multi-factor transaction fraud scoring."""
-    score = 0.0
-    if is_international: score += 20
-    if is_new_beneficiary: score += 15
-    if unusual_time: score += 10
-    if device_changed: score += 25
-    if failed_attempts >= 3: score += 30
-    if amount_kobo > 500_000_000: score += 15
-    risk = "low" if score < 40 else ("medium" if score < 70 else "high")
-    return min(score, 100.0), risk
-
-
-
 
 class GrpcServicer:
     """gRPC handler for inter-service calls."""
@@ -601,8 +228,8 @@ def start_grpc_server(service_name, port):
             result = servicer.Process(data)
             response = json.dumps(result).encode()
             conn.sendall(_grpc_struct.pack(">I", len(response)) + response)
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
+        except Exception:
+            pass
         finally:
             conn.close()
 
@@ -681,8 +308,7 @@ def grpc_call(target, method, payload, retries=3):
             logger.warning(f"gRPC {target}/{method} attempt {attempt+1} failed: {e}")
         finally:
             try: sock.close()
-            except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
+            except: pass
     return None
 
 def call_service(method, url, body=None, retries=3, timeout=15):
@@ -765,20 +391,6 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
-
-# --- Retry with Exponential Backoff ---
-import time as _retry_time
-
-def retry_with_backoff(fn, max_retries=3, base_delay=0.1):
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception:
-            if attempt == max_retries - 1:
-                raise
-            delay = min(base_delay * (2 ** attempt), 5.0)
-            _retry_time.sleep(delay)
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         trace_id = self.headers.get(_trace_header, "-")
@@ -820,7 +432,7 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/v1/list":
             records = db_query()
-            source = "database" if records is not None else "postgresql_pending"
+            source = "database" if records is not None else "in-memory"
             respond(self, 200, {"records": records or [], "source": source, "service": SERVICE_NAME})
             return
 
@@ -858,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
             record_id = f"{SERVICE_NAME}-{int(time.time()*1e6)}"
             persisted = db_insert(record_id, body)
             _analyze_sentiment_result = analyze_sentiment(body.get("data", {}))
-            source = "database" if persisted else "postgresql_pending"
+            source = "database" if persisted else "in-memory"
 
             _upstream = os.environ.get("UPSTREAM_URL", "")
             if _upstream:
@@ -886,286 +498,6 @@ def sanitize_input(s):
     s = s.replace("'", "&#39;").replace('"', "&quot;")
     s = s.replace("\\", "")
     return s[:10000] if len(s) > 10000 else s
-
-
-
-# ─── Idempotency Enforcement ────────────────────────────────────────────────
-import hashlib as _idem_hashlib
-_idempotency_cache = {}  # key -> (status_code, response_body, timestamp)
-
-def check_idempotency(key: str) -> tuple:
-    """Check if idempotency key has been seen. Returns (is_duplicate, cached_response)."""
-    if key and key in _idempotency_cache:
-        entry = _idempotency_cache[key]
-        return True, entry
-    return False, None
-
-def store_idempotency(key: str, status_code: int, response: dict):
-    """Store idempotency response for deduplication (24h TTL)."""
-    import time
-    if key:
-        _idempotency_cache[key] = (status_code, response, time.time())
-        # Cleanup entries older than 24h
-        cutoff = time.time() - 86400
-        for k in list(_idempotency_cache.keys()):
-            if _idempotency_cache[k][2] < cutoff:
-                del _idempotency_cache[k]
-
-
-# ─── Maker-Checker (Dual Authorization) ─────────────────────────────────────
-_maker_checker_requests = []
-_MAKER_CHECKER_THRESHOLDS = {
-    "transfer": 100_000_000,       # ₦1M
-    "loan_disburse": 100_000_000,  # ₦1M
-    "gl_posting": 50_000_000,      # ₦500K
-    "account_close": 0,            # Always
-}
-
-def requires_maker_checker(operation: str, amount_kobo: int) -> bool:
-    """Check if operation needs dual authorization per CBN guidelines."""
-    threshold = _MAKER_CHECKER_THRESHOLDS.get(operation, 100_000_000)
-    return amount_kobo >= threshold
-
-def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload: dict) -> dict:
-    """Submit operation for maker-checker approval."""
-    import time
-    req = {
-        "request_id": f"MCR-{int(time.time()*1000000)}",
-        "operation": operation, "maker_id": maker_id, "amount_kobo": amount_kobo,
-        "status": "pending_approval", "payload": payload,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    _maker_checker_requests.append(req)
-    return req
-
-
-# ─── Immutable Audit Trail ───────────────────────────────────────────────────
-import hashlib as _audit_hashlib
-
-# --- Rate Limiting ---
-import time as _time
-import threading as _threading
-
-# --- Monetary Safety (kobo precision) ---
-def round_naira(amount):
-    """Round to 2 decimal places (kobo precision) to prevent float drift."""
-    return round(float(amount), 2)
-
-def naira_to_kobo(naira):
-    """Convert naira (float) to kobo (int) for precise storage."""
-    return int(round(float(naira) * 100))
-
-def kobo_to_naira(kobo):
-    """Convert kobo (int) back to naira (float) for display."""
-    return round(int(kobo) / 100.0, 2)
-
-def validate_amount(amount):
-    """Validate monetary amount: non-negative, within CBN limits."""
-    amount = float(amount)
-    if amount < 0:
-        raise ValueError(f"Amount must be non-negative, got {amount:.2f}")
-    if amount > 999_999_999_999.99:
-        raise ValueError(f"Amount exceeds maximum (NGN 999,999,999,999.99)")
-    return round_naira(amount)
-
-
-class _RateLimiter:
-    """Token bucket rate limiter (100 req/s per IP)."""
-    def __init__(self, rate=100, burst=200):
-        self._rate = rate
-        self._burst = burst
-        self._tokens = {}
-        self._lock = _threading.Lock()
-
-    def allow(self, key="global"):
-        with self._lock:
-            now = _time.monotonic()
-            if key not in self._tokens:
-                self._tokens[key] = (self._burst, now)
-                return True
-            tokens, last = self._tokens[key]
-            elapsed = now - last
-            tokens = min(self._burst, tokens + elapsed * self._rate)
-            if tokens >= 1:
-                self._tokens[key] = (tokens - 1, now)
-                return True
-            return False
-
-_rate_limiter = _RateLimiter()
-
-
-# --- CORS & Security Headers ---
-CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
-SECURITY_HEADERS = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "X-XSS-Protection": "1; mode=block",
-    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-    "Referrer-Policy": "strict-origin-when-cross-origin",
-}
-
-def add_cors_headers(handler_self):
-    """Add CORS + security headers to HTTP response."""
-    for k, v in SECURITY_HEADERS.items():
-        handler_self.send_header(k, v)
-    origin = handler_self.headers.get("Origin", "") if hasattr(handler_self, 'headers') else ""
-    if origin in [o.strip() for o in CORS_ALLOWED_ORIGINS]:
-        handler_self.send_header("Access-Control-Allow-Origin", origin)
-    else:
-        handler_self.send_header("Access-Control-Allow-Origin", "https://dashboard.54bank.ng")
-    handler_self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-    handler_self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
-    handler_self.send_header("Access-Control-Max-Age", "86400")
-
-_audit_log = []  # Append-only. No deletion permitted.
-
-def append_audit_entry(service: str, operation: str, actor_id: str, entity_id: str,
-                       entity_type: str, old_state: str = "", new_state: str = "", ip: str = ""):
-    """Append immutable audit entry with tamper-detection checksum."""
-    import time
-    entry_id = f"AUD-{int(time.time()*1000000)}"
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    raw = f"{entry_id}|{timestamp}|{service}|{operation}|{actor_id}|{entity_id}|{old_state}|{new_state}|{ip}"
-    checksum = _audit_hashlib.sha256(raw.encode()).hexdigest()
-    entry = {
-        "id": entry_id, "timestamp": timestamp, "service": service,
-        "operation": operation, "actor_id": actor_id, "entity_id": entity_id,
-        "entity_type": entity_type, "old_state": old_state, "new_state": new_state,
-        "ip_address": ip, "checksum": checksum, "immutable": True,
-    }
-    _audit_log.append(entry)
-    # Persist to DB if available
-    if _db_conn:
-        try:
-            _db_conn.cursor().execute(
-                "INSERT INTO audit_trail (id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip_address, checksum) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (entry_id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip, checksum))
-            _db_conn.commit()
-        except Exception:
-            pass
-    return entry
-
-
-# ─── Transaction Atomicity ───────────────────────────────────────────────────
-def db_exec_atomic(queries_params: list) -> bool:
-    """Execute multiple DB operations in a single atomic transaction.
-    queries_params: [(sql, params_tuple), ...]
-    Returns True on success, False on rollback.
-    """
-    if not _db_conn:
-        return False
-    cur = _db_conn.cursor()
-    try:
-        for sql, params in queries_params:
-            cur.execute(sql, params)
-        _db_conn.commit()
-        return True
-    except Exception as e:
-        _db_conn.rollback()
-        import logging
-        logging.error(f"Atomic transaction failed, rolled back: {e}")
-        return False
-
-
-# --- Event Bus (Kafka-compatible event emission) ---
-
-
-# --- Process Health Watchdog ---
-# Monitors event loop liveness; if stalled >60s, liveness probe fails
-# and K8s/KEDA restarts the pod.
-
-_watchdog_last_ping = time.time()
-_watchdog_lock = threading.Lock()
-
-
-def watchdog_ping():
-    global _watchdog_last_ping
-    with _watchdog_lock:
-        _watchdog_last_ping = time.time()
-
-
-def watchdog_healthy() -> bool:
-    with _watchdog_lock:
-        return (time.time() - _watchdog_last_ping) < 60
-
-
-def _watchdog_loop():
-    while True:
-        time.sleep(10)
-        if not watchdog_healthy():
-            logger.warning("[WATCHDOG] Event loop stalled — marking unhealthy")
-        watchdog_ping()
-
-
-threading.Thread(target=_watchdog_loop, daemon=True).start()
-
-class EventBus:
-    """Publishes domain events to Kafka topics for downstream consumption."""
-
-    def __init__(self, topic: str, service: str):
-        self._broker = os.environ.get("KAFKA_BROKERS", "localhost:9092")
-        self._topic = topic
-        self._service = service
-        self._buffer: list = []
-        self._lock = threading.Lock()
-
-    def emit(self, event_type: str, payload: dict) -> None:
-        """Emit a domain event. In production: kafka-python producer."""
-        event = {{
-            "id": f"{{self._service}}_{{int(time.time() * 1000)}}",
-            "type": event_type,
-            "source": self._service,
-            "topic": self._topic,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "data": payload,
-        }}
-        with self._lock:
-            self._buffer.append(event)
-        logger.info(f"[EventBus] {{self._service}} -> {{self._topic}}: {{event_type}}")
-
-    def flush(self) -> list:
-        with self._lock:
-            events = self._buffer[:]
-            self._buffer.clear()
-        return events
-
-    def pending_count(self) -> int:
-        return len(self._buffer)
-
-
-class EventConsumer:
-    """Subscribes to Kafka topics for incoming events."""
-
-    def __init__(self, topics: list, group_id: str):
-        self._topics = topics
-        self._group_id = group_id
-        self._handlers: dict = {{}}
-
-    def on(self, event_type: str, handler):
-        self._handlers[event_type] = handler
-
-    def start(self):
-        logger.info(f"[EventConsumer] Subscribing to {{self._topics}} as {{self._group_id}}")
-        # In production: kafka-python KafkaConsumer with group_id
-
-
-def notify_downstream(service_url: str, path: str, payload: dict) -> bool:
-    """Notify a downstream service via HTTP with retry."""
-    try:
-        resp = call_service("POST", f"{{service_url}}{{path}}", payload)
-        return resp is not None
-    except Exception as e:
-        logger.warning(f"[Downstream] {{service_url}}{{path}} failed: {{e}}")
-        return False
-
-
-_event_bus = EventBus("platform.events", "customer-feedback")
-
-
-# --- Data Flow Emit Point ---
-def emit_processing_event(action: str, data: dict) -> None:
-    """Called by handlers after successful processing."""
-    _event_bus.emit("customer-feedback." + action, data)
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, shutdown_handler)

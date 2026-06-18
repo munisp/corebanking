@@ -1,10 +1,11 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
-COPY go.mod main.go ./
+COPY go.mod go.sum ./
+RUN go mod download
+COPY main.go ./
 RUN go build -o service .
+
 FROM alpine:3.19
+RUN apk add --no-cache ca-certificates
 COPY --from=builder /app/service /usr/local/bin/
-RUN adduser -D -u 1001 appuser
-USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:9327/healthz || exit 1
 CMD ["service"]

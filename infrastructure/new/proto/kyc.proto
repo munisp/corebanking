@@ -1,0 +1,156 @@
+// gRPC proto definitions for KYC/AML hot path
+// Replaces HTTP REST for orchestration → verification service calls
+
+syntax = "proto3";
+
+package kyc.v1;
+
+option go_package = "github.com/54bank/proto/kyc/v1;kycv1";
+
+// ── KYC Verification Service ──
+
+service KYCVerificationService {
+  rpc VerifyIdentity(VerifyIdentityRequest) returns (VerifyIdentityResponse);
+  rpc VerifyDocument(VerifyDocumentRequest) returns (VerifyDocumentResponse);
+  rpc LivenessCheck(LivenessCheckRequest) returns (LivenessCheckResponse);
+  rpc SanctionsScreening(SanctionsRequest) returns (SanctionsResponse);
+  rpc GetKYCStatus(GetKYCStatusRequest) returns (KYCStatusResponse);
+}
+
+message VerifyIdentityRequest {
+  string customer_id = 1;
+  string bvn = 2;
+  string nin = 3;
+  string first_name = 4;
+  string last_name = 5;
+  string date_of_birth = 6;
+}
+
+message VerifyIdentityResponse {
+  bool verified = 1;
+  double confidence = 2;
+  string match_status = 3; // exact, partial, mismatch
+  repeated string discrepancies = 4;
+  string verified_at = 5;
+}
+
+message VerifyDocumentRequest {
+  string customer_id = 1;
+  string document_type = 2; // passport, national_id, drivers_license, voters_card
+  bytes document_image = 3;
+  string document_number = 4;
+}
+
+message VerifyDocumentResponse {
+  bool authentic = 1;
+  double confidence = 2;
+  string document_type = 3;
+  string expiry_date = 4;
+  map<string, string> extracted_fields = 5;
+  repeated string issues = 6;
+}
+
+message LivenessCheckRequest {
+  string customer_id = 1;
+  bytes selfie_image = 2;
+  bytes reference_image = 3;
+  string challenge_type = 4; // blink, head_turn, smile
+}
+
+message LivenessCheckResponse {
+  bool is_live = 1;
+  double liveness_score = 2;
+  double face_match_score = 3;
+  bool face_matched = 4;
+  string challenge_result = 5;
+}
+
+message SanctionsRequest {
+  string full_name = 1;
+  string date_of_birth = 2;
+  string nationality = 3;
+  string bvn = 4;
+}
+
+message SanctionsResponse {
+  bool clear = 1;
+  int32 match_count = 2;
+  repeated SanctionsMatch matches = 3;
+  string screened_at = 4;
+}
+
+message SanctionsMatch {
+  string list_name = 1;
+  string matched_name = 2;
+  double score = 3;
+  string category = 4; // pep, sanctions, adverse_media
+}
+
+message GetKYCStatusRequest {
+  string customer_id = 1;
+}
+
+message KYCStatusResponse {
+  string customer_id = 1;
+  string overall_status = 2; // pending, verified, rejected, expired
+  string kyc_tier = 3; // tier1, tier2, tier3
+  bool identity_verified = 4;
+  bool document_verified = 5;
+  bool liveness_verified = 6;
+  bool sanctions_clear = 7;
+  string last_verified_at = 8;
+  string expiry_date = 9;
+}
+
+// ── AML Screening Service ──
+
+service AMLScreeningService {
+  rpc ScreenTransaction(ScreenTransactionRequest) returns (ScreenTransactionResponse);
+  rpc GetRiskProfile(GetRiskProfileRequest) returns (RiskProfileResponse);
+  rpc ReportSAR(SARRequest) returns (SARResponse);
+}
+
+message ScreenTransactionRequest {
+  string transaction_id = 1;
+  string account_number = 2;
+  double amount = 3;
+  string currency = 4;
+  string counterparty = 5;
+  string channel = 6;
+  string transaction_type = 7;
+}
+
+message ScreenTransactionResponse {
+  string decision = 1; // allow, flag, block
+  double risk_score = 2;
+  repeated string triggered_rules = 3;
+  string alert_id = 4;
+  bool requires_review = 5;
+}
+
+message GetRiskProfileRequest {
+  string customer_id = 1;
+}
+
+message RiskProfileResponse {
+  string customer_id = 1;
+  string risk_rating = 2; // low, medium, high, critical
+  double risk_score = 3;
+  int32 flagged_transactions = 4;
+  int32 total_transactions = 5;
+  string last_reviewed = 6;
+}
+
+message SARRequest {
+  string customer_id = 1;
+  string account_number = 2;
+  string narrative = 3;
+  repeated string transaction_ids = 4;
+  double total_amount = 5;
+}
+
+message SARResponse {
+  string sar_id = 1;
+  string status = 2;
+  string filed_at = 3;
+}

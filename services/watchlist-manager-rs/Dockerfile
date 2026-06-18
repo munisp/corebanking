@@ -1,11 +1,11 @@
-FROM rust:1.75-slim AS builder
+FROM rust:1.88-slim AS builder
 WORKDIR /app
 COPY Cargo.toml ./
 RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release && rm -rf src
 COPY src/ src/
 RUN touch src/main.rs && cargo build --release
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 RUN useradd -m -u 1001 appuser
 COPY --from=builder /app/target/release/watchlist-manager-rs /usr/local/bin/service
 USER appuser

@@ -1,0 +1,27 @@
+# compliance-ui
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: 54link-dev-compliance-ui-route
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-1
+      priority: 10
+      match:
+        hosts:
+          - compliance.54link-dev.upi.dev
+        paths:
+          - /*
+      backends:
+        - serviceName: compliance-ui
+          servicePort: 80
+      plugins:
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"

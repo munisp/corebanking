@@ -1,0 +1,63 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Internal Auditor Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- NOTE -->
+        <mxCell id="note_storage" value="Storage model: In-memory (formal audit lifecycle).&#xa;This is the internal audit engagement system&#xa;(separate from the audit-service HTTP event log).&#xa;State persisted to Lakehouse/Kafka." style="text;html=1;strokeColor=#d6b656;fillColor=#fff2cc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="320" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- AUDIT PLAN -->
+        <mxCell id="audit_plan" value="AuditPlan&#xa;----------------------&#xa;plan_id (varchar)&#xa;tenant_id (varchar)&#xa;plan_year (int)&#xa;plan_name (varchar)&#xa;objectives ([]string)&#xa;scope (varchar)&#xa;risk_based (bool)&#xa;status (varchar: draft/approved/active/closed)&#xa;prepared_by / approved_by (varchar)&#xa;approval_date (timestamp)&#xa;engagements ([]AuditEngagement)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="200" width="300" height="320" as="geometry"/>
+        </mxCell>
+
+        <!-- AUDIT ENGAGEMENT -->
+        <mxCell id="audit_engagement" value="AuditEngagement&#xa;----------------------&#xa;engagement_id (varchar)&#xa;plan_id (FK -> AuditPlan)&#xa;tenant_id (varchar)&#xa;title / scope (varchar)&#xa;audit_type (varchar: financial/operational/compliance/IT)&#xa;status (varchar: planning/fieldwork/reporting/closed)&#xa;lead_auditor_id / auditor_ids ([]varchar)&#xa;auditee_department (varchar)&#xa;planned_start / planned_end (date)&#xa;actual_start / actual_end (date)&#xa;risk_rating (varchar: low/medium/high/critical)&#xa;objectives / methodology (text)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="200" width="300" height="360" as="geometry"/>
+        </mxCell>
+
+        <!-- AUDIT FINDINGS -->
+        <mxCell id="audit_findings" value="AuditFinding&#xa;----------------------&#xa;finding_id (varchar)&#xa;engagement_id (FK -> AuditEngagement)&#xa;tenant_id (varchar)&#xa;title / description (text)&#xa;finding_type (varchar: control_deficiency/fraud/policy_violation)&#xa;risk_rating (varchar: low/medium/high/critical)&#xa;root_cause / impact (text)&#xa;recommendation (text)&#xa;management_response (text)&#xa;action_plan / action_owner (varchar)&#xa;due_date (date)&#xa;status (varchar: open/in_progress/closed/overdue)&#xa;closed_at / created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="760" y="200" width="300" height="380" as="geometry"/>
+        </mxCell>
+
+        <!-- CONTROL TESTS -->
+        <mxCell id="control_tests" value="ControlTest&#xa;----------------------&#xa;test_id (varchar)&#xa;engagement_id (FK -> AuditEngagement)&#xa;tenant_id (varchar)&#xa;control_name / control_objective (varchar)&#xa;control_type (varchar: preventive/detective/corrective)&#xa;test_procedure (text)&#xa;sample_size (int)&#xa;status (varchar: not_started/in_progress/completed)&#xa;result (varchar: effective/ineffective/partially_effective)&#xa;exceptions_found (int)&#xa;tested_by / tested_at&#xa;evidence_refs ([]varchar)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="560" width="300" height="320" as="geometry"/>
+        </mxCell>
+
+        <!-- AUDIT REPORTS -->
+        <mxCell id="audit_reports" value="AuditReport&#xa;----------------------&#xa;report_id (varchar)&#xa;engagement_id (FK -> AuditEngagement)&#xa;tenant_id (varchar)&#xa;report_type (varchar: interim/final/follow_up)&#xa;executive_summary (text)&#xa;overall_rating (varchar)&#xa;total_findings (int)&#xa;critical/high/medium/low_findings (int)&#xa;status (varchar: draft/issued/acknowledged)&#xa;issued_by / issued_at&#xa;acknowledged_by / acknowledged_at&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="400" y="600" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- FOLLOW UPS -->
+        <mxCell id="followups" value="FollowUp&#xa;----------------------&#xa;followup_id (varchar)&#xa;finding_id (FK -> AuditFinding)&#xa;tenant_id (varchar)&#xa;followup_date (date)&#xa;status (varchar: open/closed/overdue)&#xa;comments (text)&#xa;evidence_refs ([]varchar)&#xa;reviewed_by / reviewed_at&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="760" y="620" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="audit_plan" target="audit_engagement" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="audit_engagement" target="audit_findings" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="audit_engagement" target="control_tests" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="audit_engagement" target="audit_reports" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="audit_findings" target="followups" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

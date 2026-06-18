@@ -1,4 +1,4 @@
-module github.com/54bank/fisheries-aquaculture-go
+module github.com/54link-dev/fisheries-aquaculture-go
 
 go 1.21
 

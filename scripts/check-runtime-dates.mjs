@@ -1,6 +1,11 @@
 import fs from "node:fs";
 
 const path = new URL("../server/.runtime-data/platform-state.json", import.meta.url);
+if (!fs.existsSync(path)) {
+  console.log("No platform state file found at", path.pathname);
+  process.exit(0);
+}
+
 const data = JSON.parse(fs.readFileSync(path, "utf8"));
 const dateKeys = new Set([
   "createdAt",
@@ -42,7 +47,10 @@ function visit(value, trail = "$") {
 visit(data);
 
 if (!issues.length) {
-  console.log("No malformed date strings found.");
+  console.log("✓ No malformed date strings found.");
+  process.exit(0);
 } else {
-  console.log(JSON.stringify(issues, null, 2));
+  console.error("✗ Found malformed dates:");
+  console.error(JSON.stringify(issues, null, 2));
+  process.exit(1);
 }

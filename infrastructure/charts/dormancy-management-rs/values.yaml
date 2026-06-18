@@ -1,0 +1,79 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-dormancy-management-rs
+  pullPolicy: IfNotPresent
+  tag: "1.0.1"
+nameOverride: ""
+fullnameOverride: "dormancy-management-rs"
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  port: 8335
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    ephemeral-storage: 512Mi
+    cpu: 200m
+    memory: 256Mi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: dormancy-management-rs
+  appPort: 8335
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 50m
+  cpu-limit: 150m
+  memory-request: 64Mi
+  memory-limit: 256Mi
+secrets:
+  PORT: "8335"
+  DATABASE_URL: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking"
+  DATABASE_URI: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking"
+  DB_HOST: db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com
+  DB_PORT: "25060"
+  DB_NAME: link_core_banking
+  DB_USER: doadmin
+  DB_PASSWORD: AVNS_MSy6CW3EGXnA8wJgkLv
+  REDIS_URL: redis-master.redis.svc.cluster.local:6379
+  REDIS_HOST: redis-master.redis.svc.cluster.local
+  REDIS_PORT: "6379"
+  REDIS_PASSWORD: 3phHSv7qbAuZLb2pi9FWED2X
+  KAFKA_BROKERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
+  KAFKA_BOOTSTRAP_SERVERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc:9092
+  KAFKA_SECURITY_PROTOCOL: PLAINTEXT
+  FLUVIO_ENDPOINT: fluvio:9003
+  DAPR_URL: "http://localhost:3500"
+  DAPR_HTTP_PORT: "3500"
+  DAPR_PUBSUB: pubsub
+  TEMPORAL_ADDRESS: temporal-frontend.temporal.svc:7233
+  TEMPORAL_NAMESPACE: "54link-dev"
+  KEYCLOAK_URL: https://keycloak.servers.upi.dev
+  AUTH_ENFORCER_URL: "http://auth-enforcer-rs.54link-dev.svc.cluster.local:8314"
+  PERMIFY_URL: http://permify.permify.svc.cluster.local:3476
+  TIGERBEETLE_ADDRESS: "10.233.107.191:3000,10.233.108.26:3000,10.233.108.25:3000"
+  TB_ADDRESS: "10.233.107.191:3000,10.233.108.26:3000,10.233.108.25:3000"
+  OPENSEARCH_URL: https://shared-cluster-master.opensearch.svc.cluster.local:9200
+  OPENSEARCH_USERNAME: admin
+  OPENSEARCH_PASSWORD: "newwave@opensearch"
+  OPENSEARCH_VERIFY_CERTS: "false"
+  ALLOWED_ORIGINS: "*"
+  LOG_LEVEL: info

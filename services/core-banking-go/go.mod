@@ -1,4 +1,4 @@
-module github.com/54bank/core-banking-go
+module github.com/54link-dev/core-banking-go
 
 go 1.21
 

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: trade-supply-chain
+description: 54link Trade Supply Chain Consolidated Helm Chart
+type: application
+version: 0.0.1
+appVersion: "1.0.0"

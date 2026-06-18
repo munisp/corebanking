@@ -1,2 +1,1 @@
-psycopg2-binary>=2.9
-requests>=2.28
+# no external deps

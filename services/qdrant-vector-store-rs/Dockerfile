@@ -1,15 +1,16 @@
-FROM rust:1.74-slim AS builder
+FROM rust:1.88-slim AS builder
 WORKDIR /app
-COPY Cargo.toml .
-COPY src/ src/
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release 2>/dev/null; rm -rf src
+COPY . .
 RUN cargo build --release
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+FROM rust:1.88-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget && rm -rf /var/lib/apt/lists/*
+RUN useradd -m appuser
 WORKDIR /app
-COPY --from=builder /app/target/release/qdrant_vector_store .
-EXPOSE 8080
-RUN adduser -D -u 1001 appuser
+COPY --from=builder /app/target/release/qdrant-vector-store-rs /app/service
 USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8080/healthz || exit 1
-CMD ["./qdrant_vector_store"]
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:${PORT:-8295}/healthz || exit 1
+EXPOSE 8295
+ENTRYPOINT ["./service"]

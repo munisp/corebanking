@@ -1,0 +1,85 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Teller Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- TELLERS -->
+        <mxCell id="tellers" value="tellers&#xa;----------------------&#xa;teller_id (PK, varchar)&#xa;tenant_id / branch_id (varchar)&#xa;employee_id / employee_number (varchar)&#xa;first_name / last_name / email / phone&#xa;status (varchar: active/inactive/on_break/suspended)&#xa;till_id (varchar, nullable)&#xa;window_number (int)&#xa;single_txn_limit / daily_txn_limit / cash_handling_limit (bigint)&#xa;can_process_checks / can_process_fx / can_override_holds (bool)&#xa;login_pin_hash (varchar)&#xa;session_start / session_end (timestamp)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="340" as="geometry"/>
+        </mxCell>
+
+        <!-- TILLS -->
+        <mxCell id="tills" value="tills&#xa;----------------------&#xa;till_id (PK, varchar)&#xa;tenant_id / branch_id (varchar)&#xa;till_number (varchar)&#xa;assigned_teller_id (FK -> tellers)&#xa;status (varchar: open/closed/balancing)&#xa;opening_balance / closing_balance (bigint)&#xa;current_balance (bigint)&#xa;currency (varchar, default NGN)&#xa;opened_at / closed_at (timestamp)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- TILL BALANCES -->
+        <mxCell id="till_balances" value="till_balances&#xa;----------------------&#xa;id (PK, serial)&#xa;till_id (FK -> tills)&#xa;currency (varchar)&#xa;denomination (bigint)&#xa;count (int)&#xa;amount (bigint)&#xa;recorded_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="740" y="40" width="260" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- VAULTS -->
+        <mxCell id="vaults" value="vaults&#xa;----------------------&#xa;vault_id (PK, varchar)&#xa;tenant_id / branch_id (varchar)&#xa;vault_name (varchar)&#xa;status (varchar: open/closed/audit)&#xa;current_balance / max_capacity (bigint)&#xa;currency (varchar)&#xa;dual_control_required (bool)&#xa;primary_custodian_id / secondary_custodian_id (varchar)&#xa;last_audit_at (timestamp)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="420" width="300" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- VAULT BALANCES -->
+        <mxCell id="vault_balances" value="vault_balances&#xa;----------------------&#xa;id (PK, serial)&#xa;vault_id (FK -> vaults)&#xa;currency / denomination (varchar/bigint)&#xa;count (int)&#xa;amount (bigint)&#xa;recorded_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="400" y="360" width="260" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- TELLER TRANSACTIONS -->
+        <mxCell id="teller_txn" value="teller_transactions&#xa;----------------------&#xa;transaction_id (PK, varchar)&#xa;tenant_id / branch_id (varchar)&#xa;teller_id (FK -> tellers)&#xa;till_id (FK -> tills)&#xa;transaction_type (varchar)&#xa;amount (bigint) / currency (varchar)&#xa;customer_account / customer_name&#xa;reference_number (varchar, unique)&#xa;narration (text)&#xa;check_number / check_bank / check_date (nullable)&#xa;hold_id (varchar, nullable)&#xa;status (varchar: pending/completed/reversed/failed)&#xa;reversed_by / reversal_reason&#xa;supervisor_override_by&#xa;created_at / completed_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="740" y="280" width="280" height="400" as="geometry"/>
+        </mxCell>
+
+        <!-- TILL TRANSFERS -->
+        <mxCell id="till_transfers" value="till_transfers&#xa;----------------------&#xa;transfer_id (PK, varchar)&#xa;tenant_id / branch_id (varchar)&#xa;from_till_id / to_till_id (FK -> tills)&#xa;from_vault_id / to_vault_id (FK -> vaults)&#xa;transfer_type (varchar)&#xa;amount (bigint) / currency (varchar)&#xa;authorized_by (varchar)&#xa;status (varchar)&#xa;created_at / completed_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="40" y="740" width="300" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- CTR REPORTS -->
+        <mxCell id="ctr_reports" value="ctr_reports&#xa;----------------------&#xa;report_id (PK, varchar)&#xa;tenant_id / branch_id (varchar)&#xa;teller_id (FK)&#xa;customer_id / customer_name / customer_id_type&#xa;transaction_ids (JSONB)&#xa;total_amount (bigint)&#xa;currency / transaction_date&#xa;report_type (varchar: ctr/str)&#xa;status / submitted_at / submission_ref&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="400" y="580" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- QUEUE TICKETS -->
+        <mxCell id="queue_tickets" value="queue_tickets&#xa;----------------------&#xa;ticket_id (PK, varchar)&#xa;tenant_id / branch_id (varchar)&#xa;customer_name / customer_phone&#xa;service_type (varchar)&#xa;priority (varchar)&#xa;status (varchar: waiting/serving/completed)&#xa;assigned_teller_id (FK)&#xa;issued_at / called_at / served_at / completed_at&#xa;wait_time_seconds / service_time_seconds (int)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="1060" width="300" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="tellers" target="tills" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="tills" target="till_balances" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="vaults" target="vault_balances" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="tellers" target="teller_txn" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="tills" target="teller_txn" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="tills" target="till_transfers" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="vaults" target="till_transfers" style="endArrow=block;dashed=1;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="teller_txn" target="ctr_reports" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e9" edge="1" parent="1" source="queue_tickets" target="tellers" style="endArrow=block;dashed=1;strokeColor=#666666;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

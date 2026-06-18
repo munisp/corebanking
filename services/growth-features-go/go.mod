@@ -1,4 +1,4 @@
-module github.com/54bank/growth-features-go
+module github.com/54link-dev/growth-features-go
 
 go 1.21
 

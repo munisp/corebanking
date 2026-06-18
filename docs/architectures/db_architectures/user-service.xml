@@ -1,0 +1,26 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="User Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- USER TABLE -->
+        <mxCell id="user" value="user&#xa;----------------------&#xa;id (PK, UUID)&#xa;first_name (varchar, nullable)&#xa;last_name (varchar, nullable)&#xa;name (varchar)&#xa;uin (varchar, nullable)&#xa;email (varchar, unique)&#xa;phone_number (varchar, unique, nullable)&#xa;keycloak_id (varchar)&#xa;tenant_id (varchar)&#xa;user_role (enum: user/admin)&#xa;status (enum: active/inactive/suspended)&#xa;kyc_verification_status (enum: not_verified/pending/verified)&#xa;kyc_verification_url (varchar, nullable)&#xa;created_at / updated_at / deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="340" as="geometry"/>
+        </mxCell>
+
+        <!-- FEEDBACK TABLE -->
+        <mxCell id="feedback" value="feedback&#xa;----------------------&#xa;id (PK, UUID)&#xa;user_id (FK -> user.id)&#xa;tenant_id (varchar)&#xa;category (enum: general/feature/bug/complaint/compliment)&#xa;subject (varchar)&#xa;message (text)&#xa;rating (int, nullable 1-5)&#xa;status (enum: open/in_review/resolved/closed)&#xa;response (text, nullable)&#xa;responded_by (varchar, nullable)&#xa;responded_at (timestamp, nullable)&#xa;created_at / updated_at / deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="300" height="320" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationship -->
+        <mxCell id="e1" edge="1" parent="1" source="user" target="feedback" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

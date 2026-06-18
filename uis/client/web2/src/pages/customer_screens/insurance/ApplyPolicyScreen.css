@@ -1,0 +1,252 @@
+.apply-policy-screen {
+  min-height: 100vh;
+  background-color: #f5f5f5;
+  padding-bottom: 20px;
+}
+
+.apply-policy-header {
+  background: linear-gradient(135deg, #1976d2 0%, #1565c0 100%);
+  color: white;
+  padding: 20px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.back-btn {
+  background: rgba(255,255,255,0.2);
+  border: none;
+  color: white;
+  padding: 8px 16px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.back-btn:hover {
+  background: rgba(255,255,255,0.3);
+}
+
+.apply-policy-header h1 {
+  margin: 0;
+  font-size: 24px;
+}
+
+.apply-policy-form {
+  max-width: 800px;
+  margin: 20px auto;
+  background: white;
+  padding: 24px;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+.info-box {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px;
+  background-color: #e3f2fd;
+  border-radius: 8px;
+  border: 1px solid #90caf9;
+  margin-bottom: 24px;
+  font-size: 13px;
+  color: #0d47a1;
+}
+
+.info-icon {
+  font-size: 20px;
+}
+
+.apply-policy-form h2 {
+  font-size: 18px;
+  font-weight: bold;
+  margin-bottom: 12px;
+  color: #333;
+}
+
+.policy-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.policy-type-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border: 2px solid #1976d2;
+  background-color: #fff;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.3s;
+  font-size: 14px;
+  font-weight: 500;
+  color: #1976d2;
+}
+
+.policy-type-chip:hover:not(.disabled) {
+  background-color: #e3f2fd;
+}
+
+.policy-type-chip.selected {
+  background-color: #1976d2;
+  color: white;
+}
+
+.policy-type-chip.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  background-color: #f5f5f5;
+  border-color: #ccc;
+  color: #999;
+}
+
+.policy-description {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 12px;
+  background-color: #f0f7ff;
+  border-radius: 8px;
+  border: 1px solid #bbdefb;
+  margin-bottom: 24px;
+  font-size: 13px;
+  color: #1565c0;
+}
+
+.desc-icon {
+  font-size: 18px;
+  margin-top: 2px;
+}
+
+.form-group {
+  margin-bottom: 16px;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 500;
+  color: #333;
+  font-size: 14px;
+}
+
+.form-group input,
+.form-group select {
+  width: 100%;
+  padding: 12px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+  transition: border-color 0.3s;
+}
+
+.form-group input:focus,
+.form-group select:focus {
+  outline: none;
+  border-color: #1976d2;
+  box-shadow: 0 0 0 2px rgba(25, 118, 210, 0.1);
+}
+
+.beneficiaries-section {
+  margin: 24px 0;
+}
+
+.beneficiaries-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.beneficiaries-header h3 {
+  font-size: 16px;
+  font-weight: bold;
+  margin: 0;
+  color: #333;
+}
+
+.add-beneficiary-btn {
+  background-color: #1976d2;
+  color: white;
+  border: none;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.add-beneficiary-btn:hover {
+  background-color: #1565c0;
+}
+
+.beneficiary-input-group {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.beneficiary-input-group input {
+  flex: 1;
+  padding: 12px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+.remove-beneficiary-btn {
+  background-color: #f44336;
+  color: white;
+  border: none;
+  padding: 8px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+.remove-beneficiary-btn:hover {
+  background-color: #d32f2f;
+}
+
+.submit-btn {
+  width: 100%;
+  padding: 14px;
+  background-color: #1976d2;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  font-size: 16px;
+  font-weight: bold;
+  cursor: pointer;
+  transition: background-color 0.3s;
+  margin-top: 24px;
+}
+
+.submit-btn:hover:not(:disabled) {
+  background-color: #1565c0;
+}
+
+.submit-btn:disabled {
+  background-color: #ccc;
+  cursor: not-allowed;
+}
+
+@media (max-width: 768px) {
+  .apply-policy-form {
+    margin: 10px;
+    padding: 16px;
+  }
+
+  .policy-types {
+    flex-direction: column;
+  }
+
+  .policy-type-chip {
+    justify-content: center;
+  }
+}

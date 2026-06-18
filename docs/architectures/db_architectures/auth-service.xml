@@ -1,0 +1,26 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Auth Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- AUTH TABLE -->
+        <mxCell id="auth" value="Auth&#xa;----------------------&#xa;id (PK, int)&#xa;email (varchar, unique)&#xa;user_role (enum: user/admin)&#xa;keycloak_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;api_key (varchar, unique)&#xa;api_secret (varchar, unique)&#xa;created_at&#xa;updated_at&#xa;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="60" y="60" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- TRUSTED DEVICES TABLE -->
+        <mxCell id="trusted_devices" value="TrustedDevice&#xa;----------------------&#xa;id (PK, int)&#xa;device_id (varchar, indexed)&#xa;device_ip (varchar)&#xa;user_agent (varchar)&#xa;tenant_id (varchar)&#xa;user_email (varchar)&#xa;keycloak_id (varchar, indexed)&#xa;created_at&#xa;updated_at&#xa;deleted_at&#xa;&#xa;UNIQUE(device_id, keycloak_id, tenant_id)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="420" y="60" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- Auth -> TrustedDevice (logical via keycloak_id) -->
+        <mxCell id="e1" edge="1" parent="1" source="auth" target="trusted_devices" style="endArrow=block;dashed=1;strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

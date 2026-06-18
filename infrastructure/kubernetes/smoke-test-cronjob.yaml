@@ -1,0 +1,44 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: smoke-test-runner
+  namespace: 54link-dev
+  labels:
+    app: smoke-test-runner
+    component: testing
+spec:
+  # Runs every day at midnight UTC
+  schedule: "0 0 * * *"
+  concurrencyPolicy: Forbid       # don't overlap runs
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      # Kill the job if it runs longer than 30 minutes
+      activeDeadlineSeconds: 1800
+      template:
+        metadata:
+          labels:
+            app: smoke-test-runner
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: credential
+          containers:
+            - name: smoke-test-runner
+              image: registry.digitalocean.com/talentgraph-auth/smoke-test-runner:0.0.2
+              imagePullPolicy: Always
+              env:
+                - name: CLUSTER_BASE_URL
+                  value: "https://54link-dev.upi.dev"
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+                - name: DATABASE_URL
+                  value: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking?sslmode=require"
+              resources:
+                requests:
+                  cpu: "250m"
+                  memory: "256Mi"
+                limits:
+                  cpu: "500m"
+                  memory: "512Mi"

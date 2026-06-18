@@ -10,51 +10,6 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 import os
 
-
-SERVICE_NAME = "batch-processing-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
-
-
 @dataclass
 class BatchJob:
     id: str = ""
@@ -176,7 +131,6 @@ def handle_batch_jobs(method: str, body: dict) -> tuple[int, dict]:
         job.completed_at = datetime.now(timezone.utc).isoformat()
         job.duration_seconds = 0.5
         batch_jobs.append(job)
-        db_persist("batch_jobs", job.to_dict() if hasattr(job, "to_dict") else job if isinstance(job, dict) else {"value": str(job)})
         return 201, job.to_dict()
     return 405, {"error": "method not allowed"}
 
@@ -202,7 +156,6 @@ def _run_interest_accrual(params: dict):
             method="daily",
         )
         accruals.append(acc)
-        db_persist("accruals", acc.to_dict() if hasattr(acc, "to_dict") else acc if isinstance(acc, dict) else {"value": str(acc)})
 
 
 def _run_statement_generation(params: dict):
@@ -231,7 +184,6 @@ def _run_statement_generation(params: dict):
             generated_at=now.isoformat(),
         )
         statements.append(stmt)
-        db_persist("statements", stmt.to_dict() if hasattr(stmt, "to_dict") else stmt if isinstance(stmt, dict) else {"value": str(stmt)})
 
 
 def _run_dormancy_check(params: dict):
@@ -264,7 +216,6 @@ def _run_dormancy_check(params: dict):
             check_date=now.strftime("%Y-%m-%d"),
         )
         dormancy_checks.append(check)
-        db_persist("dormancy_checks", check.to_dict() if hasattr(check, "to_dict") else check if isinstance(check, dict) else {"value": str(check)})
 
 
 def handle_accruals(method: str, body: dict) -> tuple[int, dict]:
@@ -332,14 +283,14 @@ class Handler(BaseHTTPRequestHandler):
                 "fluvio": {"status": "connected", "topic": "batch_processing-stream"},
                 "temporal": {"status": "connected", "namespace": "batch_processing"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "batch_processing"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "batch_processing_authz"},
                 "redis": {"status": "connected", "prefix": "batch_processing:"},
                 "mojaloop": {"status": "connected", "participant": "batch_processing"},
                 "opensearch": {"status": "connected", "index": "batch_processing-*"},
                 "openappsec": {"status": "connected", "policy": "batch_processing-protection"},
                 "apisix": {"status": "connected", "upstream": "batch_processing"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "batch_processing_iceberg"}
             },
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -372,7 +323,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8117"))
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"Batch Processing Engine starting on :{port}")

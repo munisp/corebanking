@@ -1,0 +1,68 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Chart of Accounts Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- COA ACCOUNTS (core) -->
+        <mxCell id="coa_accounts" value="coa_accounts&#xa;----------------------&#xa;id (PK, UUID)&#xa;tenant_id (varchar, indexed)&#xa;code (varchar, indexed)&#xa;name (varchar)&#xa;account_type (varchar: asset/liability/equity/revenue/expense)&#xa;category (varchar)&#xa;sub_category (varchar)&#xa;parent_id (FK -> coa_accounts.id, self-ref)&#xa;normal_balance (varchar: debit/credit)&#xa;level (int)&#xa;is_active (bool)&#xa;is_system_account (bool)&#xa;currency (varchar)&#xa;description (text)&#xa;tb_account_id (varchar, nullable - TigerBeetle)&#xa;created_at / updated_at&#xa;UNIQUE(tenant_id, code)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="360" y="40" width="300" height="380" as="geometry"/>
+        </mxCell>
+
+        <!-- JOURNAL ENTRIES -->
+        <mxCell id="journal_entries" value="journal_entries&#xa;----------------------&#xa;id (PK, UUID)&#xa;tenant_id (varchar, indexed)&#xa;date (date, indexed)&#xa;description (varchar)&#xa;reference (varchar)&#xa;entry_type (varchar: manual/system/adjustment)&#xa;period_id (FK -> accounting_periods)&#xa;posted_by (varchar)&#xa;status (varchar: draft/posted/reversed)&#xa;reversal_of_id (FK -> journal_entries, nullable)&#xa;total_debit / total_credit (bigint)&#xa;metadata (JSONB)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="280" height="340" as="geometry"/>
+        </mxCell>
+
+        <!-- JOURNAL ENTRY LINES -->
+        <mxCell id="journal_entry_lines" value="journal_entry_lines&#xa;----------------------&#xa;id (PK, UUID)&#xa;entry_id (FK -> journal_entries.id)&#xa;account_id (FK -> coa_accounts.id)&#xa;description (varchar)&#xa;debit_amount (bigint)&#xa;credit_amount (bigint)&#xa;currency (varchar)&#xa;line_number (int)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="420" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- ACCOUNTING PERIODS -->
+        <mxCell id="accounting_periods" value="accounting_periods&#xa;----------------------&#xa;id (PK, UUID)&#xa;tenant_id (varchar, indexed)&#xa;name (varchar)&#xa;period_type (varchar: monthly/quarterly/annual)&#xa;start_date / end_date (date)&#xa;status (varchar: open/closed/locked)&#xa;closed_by / closed_at&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="720" y="40" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- APPROVAL WORKFLOWS -->
+        <mxCell id="approval_workflows" value="approval_workflows&#xa;----------------------&#xa;id (PK, UUID)&#xa;tenant_id (varchar)&#xa;workflow_name (varchar)&#xa;entity_type (varchar: journal_entry/account)&#xa;approval_type (varchar: sequential/parallel)&#xa;is_active (bool)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="720" y="320" width="280" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- APPROVAL REQUESTS -->
+        <mxCell id="approval_requests" value="approval_requests&#xa;----------------------&#xa;id (PK, UUID)&#xa;workflow_id (FK -> approval_workflows)&#xa;tenant_id (varchar)&#xa;entity_id (varchar)&#xa;entity_type (varchar)&#xa;requested_by (varchar)&#xa;status (varchar: pending/approved/rejected)&#xa;current_step (int)&#xa;metadata (JSONB)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="360" y="460" width="280" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- ACCOUNT TEMPLATES -->
+        <mxCell id="account_templates" value="account_templates&#xa;----------------------&#xa;id (PK, UUID)&#xa;template_name (varchar)&#xa;description (text)&#xa;industry (varchar: banking/microfinance/...)&#xa;accounts (JSONB array)&#xa;is_system (bool)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="720" y="540" width="280" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- AUDIT LOG -->
+        <mxCell id="audit_log" value="audit_log&#xa;----------------------&#xa;id (PK, UUID)&#xa;tenant_id (varchar, indexed)&#xa;entity_type / entity_id (varchar)&#xa;action (varchar)&#xa;performed_by (varchar)&#xa;changes (JSONB)&#xa;ip_address (varchar)&#xa;performed_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="40" y="680" width="280" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="coa_accounts" target="coa_accounts" style="endArrow=block;dashed=1;strokeColor=#6c8ebf;exitX=1;exitY=0.5;entryX=1;entryY=0.25;">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="720" y="130"/><mxPoint x="720" y="190"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="journal_entries" target="journal_entry_lines" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="journal_entry_lines" target="coa_accounts" style="endArrow=block;strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="accounting_periods" target="journal_entries" style="endArrow=block;dashed=1;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="approval_workflows" target="approval_requests" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

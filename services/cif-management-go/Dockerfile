@@ -1,12 +1,14 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
-COPY main.go .
-RUN CGO_ENABLED=0 go build -o /service main.go
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o service .
 
 FROM alpine:3.19
-COPY --from=builder /service /service
-EXPOSE 8200
-RUN adduser -D -u 1001 appuser
+RUN adduser -D appuser
+WORKDIR /app
+COPY --from=builder /app/service .
 USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8200/healthz || exit 1
-CMD ["/service"]
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:${PORT:-8222}/healthz || exit 1
+ENTRYPOINT ["./service"]

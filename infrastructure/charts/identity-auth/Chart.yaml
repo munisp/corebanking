@@ -1,0 +1,6 @@
+apiVersion: v2
+name: identity-auth
+description: 54link Identity Auth Consolidated Helm Chart
+type: application
+version: 0.0.13
+appVersion: "1.0.0"

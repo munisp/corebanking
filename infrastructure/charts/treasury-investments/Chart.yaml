@@ -1,0 +1,6 @@
+apiVersion: v2
+name: treasury-investments
+description: 54link Treasury Investments Consolidated Helm Chart
+type: application
+version: 0.0.3
+appVersion: "1.0.1"

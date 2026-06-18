@@ -9,51 +9,6 @@ from statistics import mean
 from typing import Any
 
 
-
-SERVICE_NAME = "billing-analytics-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
-
-
 @dataclass
 class AccrualPoint:
     id: str
@@ -80,16 +35,16 @@ class RevenueReport:
 
 
 ACCRUALS: list[AccrualPoint] = [
-    AccrualPoint("BA-001", "54bank-platform-prod", "2026-01", 6_200_000, "NGN", "transfer_posted", "nip_payments", 248_000, "finalized"),
-    AccrualPoint("BA-002", "54bank-platform-prod", "2026-02", 7_500_000, "NGN", "transfer_posted", "nip_payments", 300_000, "finalized"),
-    AccrualPoint("BA-003", "54bank-platform-prod", "2026-03", 7_800_000, "NGN", "transfer_posted", "nip_payments", 312_000, "finalized"),
-    AccrualPoint("BA-004", "54bank-platform-prod", "2026-04", 8_100_000, "NGN", "transfer_posted", "nip_payments", 324_000, "finalized"),
-    AccrualPoint("BA-005", "54bank-platform-prod", "2026-05", 12_900_000, "NGN", "transfer_posted", "nip_payments", 516_000, "provisional"),
-    AccrualPoint("BA-006", "54bank-platform-prod", "2026-01", 1_800_000, "NGN", "api_call", "open_banking", 3_600_000, "finalized"),
-    AccrualPoint("BA-007", "54bank-platform-prod", "2026-02", 2_100_000, "NGN", "api_call", "open_banking", 4_200_000, "finalized"),
-    AccrualPoint("BA-008", "54bank-platform-prod", "2026-03", 2_400_000, "NGN", "api_call", "open_banking", 4_800_000, "finalized"),
-    AccrualPoint("BA-009", "54bank-platform-prod", "2026-04", 2_350_000, "NGN", "sms_sent", "notifications", 587_500, "finalized"),
-    AccrualPoint("BA-010", "54bank-platform-prod", "2026-05", 2_600_000, "NGN", "sms_sent", "notifications", 650_000, "provisional"),
+    AccrualPoint("BA-001", "54link-dev-platform-prod", "2026-01", 6_200_000, "NGN", "transfer_posted", "nip_payments", 248_000, "finalized"),
+    AccrualPoint("BA-002", "54link-dev-platform-prod", "2026-02", 7_500_000, "NGN", "transfer_posted", "nip_payments", 300_000, "finalized"),
+    AccrualPoint("BA-003", "54link-dev-platform-prod", "2026-03", 7_800_000, "NGN", "transfer_posted", "nip_payments", 312_000, "finalized"),
+    AccrualPoint("BA-004", "54link-dev-platform-prod", "2026-04", 8_100_000, "NGN", "transfer_posted", "nip_payments", 324_000, "finalized"),
+    AccrualPoint("BA-005", "54link-dev-platform-prod", "2026-05", 12_900_000, "NGN", "transfer_posted", "nip_payments", 516_000, "provisional"),
+    AccrualPoint("BA-006", "54link-dev-platform-prod", "2026-01", 1_800_000, "NGN", "api_call", "open_banking", 3_600_000, "finalized"),
+    AccrualPoint("BA-007", "54link-dev-platform-prod", "2026-02", 2_100_000, "NGN", "api_call", "open_banking", 4_200_000, "finalized"),
+    AccrualPoint("BA-008", "54link-dev-platform-prod", "2026-03", 2_400_000, "NGN", "api_call", "open_banking", 4_800_000, "finalized"),
+    AccrualPoint("BA-009", "54link-dev-platform-prod", "2026-04", 2_350_000, "NGN", "sms_sent", "notifications", 587_500, "finalized"),
+    AccrualPoint("BA-010", "54link-dev-platform-prod", "2026-05", 2_600_000, "NGN", "sms_sent", "notifications", 650_000, "provisional"),
 ]
 
 REVENUE_REPORTS: list[RevenueReport] = [
@@ -139,14 +94,14 @@ class Handler(BaseHTTPRequestHandler):
                 "fluvio": {"status": "connected", "topic": "billing_analytics-stream"},
                 "temporal": {"status": "connected", "namespace": "billing_analytics"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "billing_analytics"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "billing_analytics_authz"},
                 "redis": {"status": "connected", "prefix": "billing_analytics:"},
                 "mojaloop": {"status": "connected", "participant": "billing_analytics"},
                 "opensearch": {"status": "connected", "index": "billing_analytics-*"},
                 "openappsec": {"status": "connected", "policy": "billing_analytics-protection"},
                 "apisix": {"status": "connected", "upstream": "billing_analytics"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "billing_analytics_iceberg"}
             }, "middleware": ["Lakehouse", "OpenSearch", "Kafka", "Redis"]})
         elif self.path == "/v1/billing/accruals":
@@ -177,7 +132,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8087"))
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"billing-analytics-python listening on :{port}")

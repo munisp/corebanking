@@ -1159,7 +1159,6 @@ func (p *PostgresClient) Health() string {
 type Bundle struct {
 	Kafka       *KafkaClient
 	Redis       *RedisClient
-	Cache       *CacheManager
 	Temporal    *TemporalClient
 	Keycloak    *KeycloakClient
 	Permify     *PermifyClient
@@ -1174,7 +1173,6 @@ func NewBundle() *Bundle {
 	return &Bundle{
 		Kafka:       NewKafkaClient(),
 		Redis:       NewRedisClient(),
-		Cache:       NewCacheManager(),
 		Temporal:    NewTemporalClient(),
 		Keycloak:    NewKeycloakClient(),
 		Permify:     NewPermifyClient(),

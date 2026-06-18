@@ -2,12 +2,9 @@
 name = "data-export-engine"
 version = "0.1.0"
 edition = "2021"
-description = "54Bank Data Export/ETL Engine — CSV/JSON/PDF generation, scheduled exports, data warehouse feeds"
+description = "54link-dev Data Export/ETL Engine — CSV/JSON/PDF generation, scheduled exports, data warehouse feeds"
 
 [dependencies]
-actix-cors = "0.7"
-sha2 = "0.10"
-lazy_static = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["full"] }

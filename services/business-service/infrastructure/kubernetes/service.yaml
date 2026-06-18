@@ -1,0 +1,50 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: business-service
+  namespace: banking-platform
+  labels:
+    app: business-service
+spec:
+  type: ClusterIP
+  selector:
+    app: business-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+    protocol: TCP
+  sessionAffinity: None
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: business-service
+  namespace: banking-platform
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: business-service
+  namespace: banking-platform
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: business-service
+  namespace: banking-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: business-service
+subjects:
+- kind: ServiceAccount
+  name: business-service
+  namespace: banking-platform

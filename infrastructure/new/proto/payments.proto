@@ -1,0 +1,228 @@
+// gRPC proto definitions for payments hot path
+// Replaces HTTP REST for payments-hub → core-banking → GL engine calls
+
+syntax = "proto3";
+
+package payments.v1;
+
+option go_package = "github.com/54bank/proto/payments/v1;paymentsv1";
+
+// ── Payment Processing Service ──
+
+service PaymentService {
+  rpc ProcessPayment(PaymentRequest) returns (PaymentResponse);
+  rpc SettleBatch(SettleBatchRequest) returns (SettleBatchResponse);
+  rpc GetPaymentStatus(GetPaymentStatusRequest) returns (PaymentResponse);
+  rpc ReversePayment(ReversePaymentRequest) returns (PaymentResponse);
+  rpc ValidatePayment(ValidatePaymentRequest) returns (ValidationResponse);
+}
+
+message PaymentRequest {
+  string reference = 1;
+  string source_account = 2;
+  string destination_account = 3;
+  double amount = 4;
+  string currency = 5;
+  string channel = 6;       // nip, neft, rtgs, internal, ussd, pos
+  string narration = 7;
+  string initiated_by = 8;
+  map<string, string> metadata = 9;
+}
+
+message PaymentResponse {
+  string id = 1;
+  string reference = 2;
+  string status = 3;         // pending, processing, completed, failed, reversed
+  double amount = 4;
+  string currency = 5;
+  double fee = 6;
+  double vat = 7;
+  string source_account = 8;
+  string destination_account = 9;
+  string completed_at = 10;
+  string failure_reason = 11;
+  string session_id = 12;    // NIP session ID
+}
+
+message GetPaymentStatusRequest {
+  string reference = 1;
+}
+
+message ReversePaymentRequest {
+  string reference = 1;
+  string reason = 2;
+  string reversed_by = 3;
+}
+
+message ValidatePaymentRequest {
+  string source_account = 1;
+  string destination_account = 2;
+  double amount = 3;
+  string currency = 4;
+  string channel = 5;
+}
+
+message ValidationResponse {
+  bool valid = 1;
+  repeated string errors = 2;
+  double available_balance = 3;
+  double fee = 4;
+  double vat = 5;
+  double total_debit = 6;
+}
+
+message SettleBatchRequest {
+  string batch_id = 1;
+  string settlement_date = 2;
+  repeated PaymentRequest payments = 3;
+}
+
+message SettleBatchResponse {
+  string batch_id = 1;
+  int32 total = 2;
+  int32 successful = 3;
+  int32 failed = 4;
+  double total_amount = 5;
+  string settled_at = 6;
+  repeated SettlementItem items = 7;
+}
+
+message SettlementItem {
+  string reference = 1;
+  string status = 2;
+  double amount = 3;
+  string failure_reason = 4;
+}
+
+// ── GL Posting Service (high-frequency from every transaction) ──
+
+service GLPostingService {
+  rpc PostJournalEntry(JournalEntryRequest) returns (JournalEntryResponse);
+  rpc PostBatch(BatchJournalRequest) returns (BatchJournalResponse);
+  rpc GetTrialBalance(TrialBalanceRequest) returns (TrialBalanceResponse);
+  rpc GetGLBalance(GLBalanceRequest) returns (GLBalanceResponse);
+}
+
+message JournalEntryRequest {
+  string transaction_id = 1;
+  string narration = 2;
+  string value_date = 3;
+  repeated GLLeg legs = 4;
+}
+
+message GLLeg {
+  string gl_code = 1;
+  double debit = 2;
+  double credit = 3;
+  string currency = 4;
+  string branch = 5;
+}
+
+message JournalEntryResponse {
+  string journal_id = 1;
+  string status = 2;
+  bool balanced = 3;
+  string posted_at = 4;
+}
+
+message BatchJournalRequest {
+  repeated JournalEntryRequest entries = 1;
+}
+
+message BatchJournalResponse {
+  int32 total = 1;
+  int32 posted = 2;
+  int32 failed = 3;
+  repeated JournalEntryResponse results = 4;
+}
+
+message TrialBalanceRequest {
+  string as_of_date = 1;
+  string branch = 2;
+  string currency = 3;
+}
+
+message TrialBalanceResponse {
+  repeated TrialBalanceEntry entries = 1;
+  double total_debits = 2;
+  double total_credits = 3;
+  bool balanced = 4;
+}
+
+message TrialBalanceEntry {
+  string gl_code = 1;
+  string gl_name = 2;
+  double debit_balance = 3;
+  double credit_balance = 4;
+}
+
+message GLBalanceRequest {
+  string gl_code = 1;
+  string as_of_date = 2;
+}
+
+message GLBalanceResponse {
+  string gl_code = 1;
+  string gl_name = 2;
+  double balance = 3;
+  string currency = 4;
+  string as_of = 5;
+}
+
+// ── Transaction Monitoring (streaming for real-time) ──
+
+service TransactionMonitoringService {
+  rpc ScreenTransaction(TxnScreenRequest) returns (TxnScreenResponse);
+  rpc StreamAlerts(AlertStreamRequest) returns (stream Alert);
+  rpc DetectTypology(TypologyRequest) returns (TypologyResponse);
+}
+
+message TxnScreenRequest {
+  string transaction_id = 1;
+  string account_number = 2;
+  double amount = 3;
+  string currency = 4;
+  string counterparty_account = 5;
+  string channel = 6;
+  string transaction_type = 7;
+  int64 timestamp = 8;
+}
+
+message TxnScreenResponse {
+  string decision = 1;      // allow, flag, block, escalate
+  double risk_score = 2;
+  repeated string matched_rules = 3;
+  string alert_id = 4;
+  int32 velocity_count = 5;  // transactions in window
+  double velocity_amount = 6;
+}
+
+message AlertStreamRequest {
+  string severity = 1;      // critical, high, medium, all
+  repeated string rule_ids = 2;
+}
+
+message Alert {
+  string alert_id = 1;
+  string severity = 2;
+  string rule_id = 3;
+  string rule_name = 4;
+  string account_number = 5;
+  double amount = 6;
+  string description = 7;
+  int64 timestamp = 8;
+}
+
+message TypologyRequest {
+  string customer_id = 1;
+  repeated string transaction_ids = 2;
+  int32 lookback_days = 3;
+}
+
+message TypologyResponse {
+  string typology = 1;       // structuring, layering, round_tripping, smurfing
+  double confidence = 2;
+  int32 pattern_matches = 3;
+  repeated string evidence = 4;
+  string risk_level = 5;
+}

@@ -1,0 +1,55 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Relationship Manager Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- NOTE -->
+        <mxCell id="note_storage" value="Storage model: In-memory (sync.RWMutex maps).&#xa;Events published to Kafka / Lakehouse.&#xa;Customer profiles synced from user-service." style="text;html=1;strokeColor=#d6b656;fillColor=#fff2cc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="80" as="geometry"/>
+        </mxCell>
+
+        <!-- CUSTOMER -->
+        <mxCell id="customer" value="Customer&#xa;----------------------&#xa;customer_id (varchar)&#xa;tenant_id (varchar)&#xa;rm_id (FK -> RelationshipManager)&#xa;first_name / last_name (varchar)&#xa;email / phone (varchar)&#xa;customer_type (varchar: retail/sme/corporate)&#xa;segment (varchar: mass/premium/private)&#xa;kyc_status / kyc_tier (varchar)&#xa;account_ids ([]varchar)&#xa;total_aum (int64)&#xa;credit_score (int)&#xa;onboarded_at / last_review_at (timestamp)&#xa;status (varchar: active/dormant/exited)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="180" width="300" height="360" as="geometry"/>
+        </mxCell>
+
+        <!-- PORTFOLIO -->
+        <mxCell id="portfolio" value="Portfolio&#xa;----------------------&#xa;portfolio_id (varchar)&#xa;rm_id (FK -> RelationshipManager)&#xa;tenant_id (varchar)&#xa;customer_ids ([]varchar)&#xa;total_customers (int)&#xa;total_aum (int64)&#xa;total_deposits / total_loans (int64)&#xa;npl_ratio (float)&#xa;revenue_ytd (int64)&#xa;target_aum / target_revenue (int64)&#xa;performance_score (float)&#xa;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="180" width="280" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- OPPORTUNITIES -->
+        <mxCell id="opportunities" value="Opportunity&#xa;----------------------&#xa;opportunity_id (varchar)&#xa;customer_id (FK -> Customer)&#xa;rm_id (varchar)&#xa;tenant_id (varchar)&#xa;opportunity_type (varchar: loan/investment/insurance/fx)&#xa;title / description (varchar)&#xa;estimated_value (int64)&#xa;probability (float)&#xa;stage (varchar: prospect/qualified/proposal/negotiation/closed_won/closed_lost)&#xa;expected_close_date (date)&#xa;product_id / product_name (varchar)&#xa;notes (text)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="580" width="300" height="340" as="geometry"/>
+        </mxCell>
+
+        <!-- ACTIVITIES -->
+        <mxCell id="activities" value="Activity&#xa;----------------------&#xa;activity_id (varchar)&#xa;customer_id (FK -> Customer)&#xa;rm_id / tenant_id (varchar)&#xa;activity_type (varchar: call/meeting/email/visit/review)&#xa;subject / notes (text)&#xa;outcome (varchar)&#xa;next_action (varchar)&#xa;next_action_date (date)&#xa;duration_minutes (int)&#xa;scheduled_at / completed_at (timestamp)&#xa;status (varchar: planned/completed/cancelled)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="400" y="520" width="280" height="320" as="geometry"/>
+        </mxCell>
+
+        <!-- CAMPAIGNS -->
+        <mxCell id="campaigns" value="Campaign&#xa;----------------------&#xa;campaign_id (varchar)&#xa;tenant_id (varchar)&#xa;name / description (varchar)&#xa;campaign_type (varchar: product/retention/acquisition)&#xa;target_segment (varchar)&#xa;target_product (varchar)&#xa;start_date / end_date (date)&#xa;target_customers (int)&#xa;reached_customers (int)&#xa;converted_customers (int)&#xa;status (varchar: draft/active/paused/completed)&#xa;created_by / created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="740" y="180" width="280" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="customer" target="opportunities" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="customer" target="activities" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="portfolio" target="customer" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="campaigns" target="customer" style="endArrow=block;dashed=1;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

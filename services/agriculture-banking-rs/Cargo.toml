@@ -2,12 +2,9 @@
 name = "agriculture-banking"
 version = "0.1.0"
 edition = "2021"
-description = "54Bank Agriculture Banking Service — farmer records, agri-loans, crop insurance, value chain"
+description = "54link-dev Agriculture Banking Service — farmer records, agri-loans, crop insurance, value chain"
 
 [dependencies]
-actix-cors = "0.7"
-sha2 = "0.10"
-lazy_static = "1"
 tokio-postgres = { version = "0.7", features = ["default"] }
 actix-web = "4"
 actix-rt = "2"
