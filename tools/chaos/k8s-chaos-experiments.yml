@@ -1,0 +1,212 @@
+# 54Bank Chaos Engineering — Kubernetes Experiments (Litmus Chaos)
+# Install: kubectl apply -f https://litmuschaos.github.io/litmus/litmus-operator-v3.0.0.yaml
+
+---
+# Pod Kill Experiment — Kill random pods to test self-healing
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: 54bank-pod-kill
+  namespace: 54bank
+spec:
+  appinfo:
+    appns: 54bank
+    applabel: 'app.kubernetes.io/part-of=54bank'
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: pod-delete
+      spec:
+        components:
+          env:
+            - name: TOTAL_CHAOS_DURATION
+              value: '60'
+            - name: CHAOS_INTERVAL
+              value: '15'
+            - name: FORCE
+              value: 'false'
+            - name: PODS_AFFECTED_PERC
+              value: '30'
+        probe:
+          - name: healthcheck
+            type: httpProbe
+            httpProbe/inputs:
+              url: http://api-gateway:8080/healthz
+              insecureSkipVerify: true
+              method:
+                get:
+                  criteria: ==
+                  responseCode: '200'
+            mode: Continuous
+            runProperties:
+              probeTimeout: 5
+              interval: 10
+              retry: 3
+
+---
+# Network Latency — Inject 500ms latency to test circuit breakers
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: 54bank-network-latency
+  namespace: 54bank
+spec:
+  appinfo:
+    appns: 54bank
+    applabel: 'app=core-payments'
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: pod-network-latency
+      spec:
+        components:
+          env:
+            - name: TOTAL_CHAOS_DURATION
+              value: '120'
+            - name: NETWORK_LATENCY
+              value: '500'
+            - name: JITTER
+              value: '100'
+            - name: CONTAINER_RUNTIME
+              value: 'containerd'
+        probe:
+          - name: circuit-breaker-check
+            type: httpProbe
+            httpProbe/inputs:
+              url: http://core-payments:9128/v1/degradation
+              method:
+                get:
+                  criteria: ==
+                  responseCode: '200'
+            mode: EOT
+            runProperties:
+              probeTimeout: 10
+              retry: 3
+
+---
+# CPU Stress — Test autoscaling triggers
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: 54bank-cpu-stress
+  namespace: 54bank
+spec:
+  appinfo:
+    appns: 54bank
+    applabel: 'app=compliance-kyc-aml'
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: pod-cpu-hog
+      spec:
+        components:
+          env:
+            - name: TOTAL_CHAOS_DURATION
+              value: '60'
+            - name: CPU_CORES
+              value: '2'
+            - name: CPU_LOAD
+              value: '80'
+
+---
+# Memory Stress — Test OOM handling
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: 54bank-memory-stress
+  namespace: 54bank
+spec:
+  appinfo:
+    appns: 54bank
+    applabel: 'app=ai-inference'
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: pod-memory-hog
+      spec:
+        components:
+          env:
+            - name: TOTAL_CHAOS_DURATION
+              value: '60'
+            - name: MEMORY_CONSUMPTION
+              value: '500'
+            - name: NUMBER_OF_WORKERS
+              value: '1'
+
+---
+# Disk Fill — Test write failure handling
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: 54bank-disk-fill
+  namespace: 54bank
+spec:
+  appinfo:
+    appns: 54bank
+    applabel: 'app=lakehouse'
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: disk-fill
+      spec:
+        components:
+          env:
+            - name: TOTAL_CHAOS_DURATION
+              value: '60'
+            - name: FILL_PERCENTAGE
+              value: '80'
+            - name: CONTAINER_PATH
+              value: '/tmp'
+
+---
+# DNS Error — Test service discovery resilience
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosEngine
+metadata:
+  name: 54bank-dns-error
+  namespace: 54bank
+spec:
+  appinfo:
+    appns: 54bank
+    applabel: 'app=core-accounts'
+    appkind: deployment
+  chaosServiceAccount: litmus-admin
+  experiments:
+    - name: pod-dns-error
+      spec:
+        components:
+          env:
+            - name: TOTAL_CHAOS_DURATION
+              value: '60'
+            - name: TARGET_HOSTNAMES
+              value: 'redis-master,postgres,kafka'
+
+---
+# Schedule — Run experiments on a cron
+apiVersion: litmuschaos.io/v1alpha1
+kind: ChaosSchedule
+metadata:
+  name: 54bank-weekly-chaos
+  namespace: 54bank
+spec:
+  schedule:
+    repeat:
+      properties:
+        minChaosInterval: 168h  # Weekly
+      workDays:
+        includedDays: 'Sun'
+  engineTemplateSpec:
+    appinfo:
+      appns: 54bank
+      applabel: 'app.kubernetes.io/part-of=54bank'
+      appkind: deployment
+    chaosServiceAccount: litmus-admin
+    experiments:
+      - name: pod-delete
+        spec:
+          components:
+            env:
+              - name: TOTAL_CHAOS_DURATION
+                value: '30'
+              - name: PODS_AFFECTED_PERC
+                value: '10'

@@ -1,0 +1,304 @@
+{
+  "model_name": "credit_scorer",
+  "timestamp": "2026-06-07T15:10:43.142014+00:00",
+  "reference_window": "50000 samples",
+  "current_window": "50000 samples",
+  "total_features_checked": 16,
+  "features_drifted": 0,
+  "overall_drift_detected": false,
+  "should_retrain": false,
+  "results": [
+    {
+      "feature_name": "age",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "age",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "monthly_income",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "monthly_income",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "total_debt",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "total_debt",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "dti_ratio",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "dti_ratio",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "employment_years",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "employment_years",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "num_prior_loans",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "num_prior_loans",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "num_defaults",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "num_defaults",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "loan_amount_requested",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "loan_amount_requested",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "loan_tenure_months",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "loan_tenure_months",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "collateral_value",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "collateral_value",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "account_age_months",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "account_age_months",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "avg_monthly_balance",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "avg_monthly_balance",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "num_dependents",
+      "drift_type": "feature",
+      "metric": "ks_statistic",
+      "value": 0.0,
+      "threshold": 0.1,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "num_dependents",
+      "drift_type": "feature",
+      "metric": "psi",
+      "value": 0.0,
+      "threshold": 0.2,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    },
+    {
+      "feature_name": "sector",
+      "drift_type": "feature",
+      "metric": "chi2",
+      "value": 0.0,
+      "threshold": 0.01,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "state",
+      "drift_type": "feature",
+      "metric": "chi2",
+      "value": 0.0,
+      "threshold": 0.01,
+      "drifted": "False",
+      "p_value": 1.0,
+      "severity": "none"
+    },
+    {
+      "feature_name": "will_default",
+      "drift_type": "label",
+      "metric": "rate_shift",
+      "value": 0.0,
+      "threshold": 0.03,
+      "drifted": "False",
+      "p_value": null,
+      "severity": "none"
+    }
+  ],
+  "prediction_drift": null,
+  "concept_drift": null
+}

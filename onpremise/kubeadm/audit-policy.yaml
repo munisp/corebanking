@@ -1,0 +1,46 @@
+# Kubernetes API Audit Policy for 54Bank
+# CBN requires full audit trail for financial systems
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  # Log all requests to secrets at Metadata level
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["secrets", "configmaps"]
+    omitStages:
+      - RequestReceived
+
+  # Log all changes to deployments, services, pods
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["pods", "services", "endpoints"]
+      - group: "apps"
+        resources: ["deployments", "statefulsets", "daemonsets"]
+    verbs: ["create", "update", "patch", "delete"]
+
+  # Log all RBAC changes
+  - level: RequestResponse
+    resources:
+      - group: "rbac.authorization.k8s.io"
+        resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
+
+  # Log all namespace operations
+  - level: Metadata
+    resources:
+      - group: ""
+        resources: ["namespaces"]
+
+  # Log authentication failures
+  - level: Metadata
+    nonResourceURLs:
+      - "/api*"
+      - "/version"
+    omitStages:
+      - RequestReceived
+
+  # Default: log metadata for everything else
+  - level: Metadata
+    omitStages:
+      - RequestReceived

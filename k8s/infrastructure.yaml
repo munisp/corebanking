@@ -1,0 +1,613 @@
+# A6: Infrastructure components — All 12 systems
+# Production: Replace with managed services (RDS, ElastiCache, MSK, etc.)
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: 54bank-config
+  namespace: 54bank
+data:
+  kafka-brokers: "kafka:9092"
+  opensearch-url: "http://opensearch:9200"
+  apisix-admin-url: "http://apisix-admin:9180"
+  keycloak-url: "http://keycloak:8080"
+  permify-url: "http://permify:3476"
+  tigerbeetle-address: "tigerbeetle:3001"
+  dapr-sidecar-port: "3500"
+  fluvio-endpoint: "fluvio:9003"
+  mojaloop-hub-url: "http://mojaloop-hub:4000"
+  openappsec-url: "http://openappsec:8080"
+  environment: "production"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: 54bank-secrets
+  namespace: 54bank
+type: Opaque
+stringData:
+  database-url: "postgresql://banking:CHANGE_ME@postgres:5432/banking54"
+  redis-url: "redis://redis:6379"
+  jwt-secret: "CHANGE_ME_IN_PRODUCTION"
+  encryption-key: "CHANGE_ME_IN_PRODUCTION"
+  keycloak-admin-password: "CHANGE_ME_IN_PRODUCTION"
+  apisix-admin-key: "CHANGE_ME_IN_PRODUCTION"
+---
+# PostgreSQL StatefulSet
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: 54bank
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: "banking54"
+            - name: POSTGRES_USER
+              value: "banking"
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-secrets
+                  key: database-url
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          readinessProbe:
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "banking", "-d", "banking54"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 3
+            exec:
+              command: ["pg_isready", "-U", "banking", "-d", "banking54"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "2Gi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: 54bank
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+  clusterIP: None
+---
+# Redis Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: 54bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          ports:
+            - containerPort: 6379
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          command: ["redis-server", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: 54bank
+spec:
+  selector:
+    app: redis
+  ports:
+    - port: 6379
+---
+# Kafka (KRaft mode — no Zookeeper)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: 54bank
+spec:
+  serviceName: kafka
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+    spec:
+      containers:
+        - name: kafka
+          image: confluentinc/cp-kafka:7.6.0
+          ports:
+            - containerPort: 9092
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          env:
+            - { name: KAFKA_NODE_ID, value: "1" }
+            - { name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP, value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT" }
+            - { name: KAFKA_ADVERTISED_LISTENERS, value: "PLAINTEXT://kafka:9092" }
+            - { name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR, value: "1" }
+            - { name: KAFKA_PROCESS_ROLES, value: "broker,controller" }
+            - { name: KAFKA_CONTROLLER_QUORUM_VOTERS, value: "1@kafka:9093" }
+            - { name: KAFKA_LISTENERS, value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093" }
+            - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: "CONTROLLER" }
+            - { name: CLUSTER_ID, value: "54bank-kafka-cluster" }
+          readinessProbe:
+            exec:
+              command: ["kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "1Gi" }
+            limits: { cpu: "1", memory: "2Gi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: kafka-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: 54bank
+spec:
+  selector:
+    app: kafka
+  ports:
+    - port: 9092
+  clusterIP: None
+---
+# OpenSearch
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: opensearch
+  namespace: 54bank
+spec:
+  serviceName: opensearch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opensearch
+  template:
+    metadata:
+      labels:
+        app: opensearch
+    spec:
+      containers:
+        - name: opensearch
+          image: opensearchproject/opensearch:2.12.0
+          ports:
+            - containerPort: 9200
+          livenessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          env:
+            - { name: discovery.type, value: "single-node" }
+            - { name: OPENSEARCH_JAVA_OPTS, value: "-Xms512m -Xmx512m" }
+            - { name: DISABLE_SECURITY_PLUGIN, value: "true" }
+          readinessProbe:
+            httpGet:
+              path: /_cluster/health
+              port: 9200
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "1Gi" }
+            limits: { cpu: "1", memory: "2Gi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: osdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opensearch
+  namespace: 54bank
+spec:
+  selector:
+    app: opensearch
+  ports:
+    - port: 9200
+---
+# TigerBeetle — Financial ledger
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tigerbeetle
+  namespace: 54bank
+spec:
+  serviceName: tigerbeetle
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tigerbeetle
+  template:
+    metadata:
+      labels:
+        app: tigerbeetle
+    spec:
+      containers:
+        - name: tigerbeetle
+          image: ghcr.io/tigerbeetle/tigerbeetle:0.16.11
+          command: ["start", "--addresses=0.0.0.0:3001", "--cluster-id=0"]
+          ports:
+            - containerPort: 3001
+          readinessProbe:
+            tcpSocket:
+              port: 3001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "2Gi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: tbdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tigerbeetle
+  namespace: 54bank
+spec:
+  selector:
+    app: tigerbeetle
+  ports:
+    - port: 3001
+  clusterIP: None
+---
+# Keycloak — Identity & Access Management
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: 54bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:24.0
+          args: ["start", "--optimized"]
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          env:
+            - { name: KC_HEALTH_ENABLED, value: "true" }
+            - { name: KC_DB, value: "postgres" }
+            - name: KC_DB_URL
+              value: "jdbc:postgresql://postgres:5432/banking54"
+            - { name: KC_DB_USERNAME, value: "banking" }
+            - name: KC_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-secrets
+                  key: keycloak-admin-password
+            - { name: KC_HOSTNAME_STRICT, value: "false" }
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: 54bank
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - port: 8080
+---
+# Permify — Zanzibar-style Authorization
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: permify
+  namespace: 54bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: permify
+  template:
+    metadata:
+      labels:
+        app: permify
+    spec:
+      containers:
+        - name: permify
+          image: ghcr.io/permify/permify:v1.1.4
+          command: ["serve"]
+          ports:
+            - containerPort: 3476
+            - containerPort: 3478
+          env:
+            - { name: PERMIFY_DATABASE_ENGINE, value: "postgres" }
+            - name: PERMIFY_DATABASE_URI
+              value: "postgres://banking:CHANGE_ME@postgres:5432/banking54"
+          readinessProbe:
+            tcpSocket:
+              port: 3476
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: permify
+  namespace: 54bank
+spec:
+  selector:
+    app: permify
+  ports:
+    - name: http
+      port: 3476
+    - name: grpc
+      port: 3478
+---
+# APISIX — API Gateway
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apisix
+  namespace: 54bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: apisix
+  template:
+    metadata:
+      labels:
+        app: apisix
+    spec:
+      containers:
+        - name: apisix
+          image: apache/apisix:3.9.1-debian
+          ports:
+            - containerPort: 9080
+            - containerPort: 9443
+            - containerPort: 9180
+          volumeMounts:
+            - name: apisix-config
+              mountPath: /usr/local/apisix/conf/apisix.yaml
+              subPath: apisix.yaml
+          readinessProbe:
+            httpGet:
+              path: /apisix/status
+              port: 9080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+      volumes:
+        - name: apisix-config
+          configMap:
+            name: apisix-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apisix
+  namespace: 54bank
+spec:
+  selector:
+    app: apisix
+  ports:
+    - name: http
+      port: 9080
+    - name: https
+      port: 9443
+    - name: admin
+      port: 9180
+---
+# Dapr — Distributed Application Runtime (placement service)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dapr-placement
+  namespace: 54bank
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: dapr-placement
+  template:
+    metadata:
+      labels:
+        app: dapr-placement
+    spec:
+      containers:
+        - name: dapr-placement
+          image: daprio/dapr:1.13.4
+          command: ["./placement", "-port", "50005"]
+          ports:
+            - containerPort: 50005
+          readinessProbe:
+            tcpSocket:
+              port: 50005
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "250m", memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dapr-placement
+  namespace: 54bank
+spec:
+  selector:
+    app: dapr-placement
+  ports:
+    - port: 50005
+---
+# Fluvio — Streaming platform
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: fluvio
+  namespace: 54bank
+spec:
+  serviceName: fluvio
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fluvio
+  template:
+    metadata:
+      labels:
+        app: fluvio
+    spec:
+      containers:
+        - name: fluvio
+          image: infinyon/fluvio:0.11.9
+          ports:
+            - containerPort: 9003
+          readinessProbe:
+            tcpSocket:
+              port: 9003
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+  volumeClaimTemplates:
+    - metadata:
+        name: fluvio-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fluvio
+  namespace: 54bank
+spec:
+  selector:
+    app: fluvio
+  ports:
+    - port: 9003
+  clusterIP: None

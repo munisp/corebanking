@@ -1,0 +1,8 @@
+# A6: Kubernetes namespace for 54Bank platform
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: 54bank
+  labels:
+    app.kubernetes.io/part-of: 54bank-platform
+    environment: production

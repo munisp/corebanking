@@ -1,0 +1,36 @@
+# 54Bank Promtail — Log Shipping to Loki
+server:
+  http_listen_port: 9080
+positions:
+  filename: /tmp/positions.yaml
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+scrape_configs:
+  - job_name: containers
+    static_configs:
+      - targets: [localhost]
+        labels:
+          job: 54bank-services
+          __path__: /var/log/containers/*.log
+    pipeline_stages:
+      - json:
+          expressions:
+            level: level
+            service: service
+            message: msg
+            trace_id: trace_id
+      - labels:
+          level: ""
+          service: ""
+      - output:
+          source: message
+      # PII masking in logs
+      - replace:
+          expression: '\b[0-9]{11}\b'
+          replace: '***MASKED_BVN***'
+      - replace:
+          expression: '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+          replace: '***MASKED_EMAIL***'
+      - replace:
+          expression: '\b[0-9]{10}\b'
+          replace: '***MASKED_ACCT***'

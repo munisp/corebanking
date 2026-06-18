@@ -1,0 +1,187 @@
+# ─────────────────────────────────────────────────────────────
+# 54Bank Helm Values — On-Premise (OpenStack / MicroCloud / Bare Metal)
+# Override: helm install 54bank ./helm/54bank -f helm/54bank/values-onpremise.yaml
+# ─────────────────────────────────────────────────────────────
+
+environment: production
+replicaCount: 3
+
+image:
+  repository: 54bank/platform
+  tag: latest
+  pullPolicy: IfNotPresent
+  # For air-gapped: use local registry
+  # registry: localhost:5000
+
+# Database (external — managed by Ansible/Heat)
+database:
+  host: 10.54.10.10
+  port: 5432
+  name: ndsep_db
+  user: ndsep_user
+  # Password from K8s secret (54bank-db)
+  existingSecret: 54bank-db
+  existingSecretKey: DATABASE_URL
+  # PgBouncer (recommended for production)
+  pgbouncer:
+    enabled: true
+    port: 6432
+
+# Redis (external — managed by Ansible/Heat)
+redis:
+  host: 10.54.10.10
+  port: 6379
+  existingSecret: 54bank-db
+  existingSecretKey: REDIS_URL
+
+# Kafka (if deployed)
+kafka:
+  enabled: false
+  brokers: ""
+
+# Application settings
+app:
+  port: 3000
+  nodeEnv: production
+  enableAuth: true
+  enforceAuth: true
+  corsOrigins: "https://54bank.local,https://www.54bank.local"
+  sessionSecret: ""  # Set via K8s secret
+  jwtSecret: ""      # Set via K8s secret
+
+# Resource limits (tuned for on-premise)
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+
+# Horizontal Pod Autoscaler
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilization: 70
+  targetMemoryUtilization: 80
+
+# Ingress (NGINX)
+ingress:
+  enabled: true
+  className: nginx
+  host: 54bank.local
+  tls:
+    enabled: true
+    secretName: 54bank-tls
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    nginx.ingress.kubernetes.io/rate-limit: "100"
+    nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+
+# Health checks
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 3000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  timeoutSeconds: 5
+
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: 3000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  timeoutSeconds: 3
+
+# Pod disruption budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Service account
+serviceAccount:
+  create: true
+  name: 54bank-api
+
+# Node affinity (prefer dedicated nodes)
+nodeSelector: {}
+  # role: banking-platform
+
+tolerations: []
+
+# Anti-affinity: spread pods across nodes
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: [54bank-api]
+          topologyKey: kubernetes.io/hostname
+
+# Monitoring (Prometheus + Grafana)
+monitoring:
+  enabled: true
+  prometheus:
+    scrape: true
+    port: 3000
+    path: /metrics
+  grafana:
+    enabled: true
+    dashboards:
+      - name: 54bank-overview
+        json: |
+          {}
+
+# Network policies
+networkPolicy:
+  enabled: true
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - port: 3000
+  egress:
+    - to: []
+      ports:
+        - port: 5432  # PostgreSQL
+        - port: 6432  # PgBouncer
+        - port: 6379  # Redis
+        - port: 9092  # Kafka
+        - port: 443   # External HTTPS
+        - port: 53    # DNS
+          protocol: UDP
+
+# Init containers (run migrations on deploy)
+initContainers:
+  - name: migrate
+    command: ["pnpm", "db:migrate"]
+    env:
+      - name: DATABASE_URL
+        valueFrom:
+          secretKeyRef:
+            name: 54bank-db
+            key: DATABASE_URL
+
+# Backup CronJob
+backup:
+  enabled: true
+  schedule: "0 2 * * *"  # Daily at 2 AM
+  retention: 30           # Keep 30 days
+  s3:
+    enabled: false        # No S3 in air-gapped
+  local:
+    enabled: true
+    path: /backups/54bank
+    volumeSize: 100Gi

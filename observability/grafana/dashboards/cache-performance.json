@@ -1,0 +1,96 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "54bank-cache-performance",
+    "title": "54Bank Cache Performance",
+    "description": "Multi-level cache monitoring: L1 in-process, L2 Redis, stampede, invalidation",
+    "tags": ["54bank", "cache", "redis", "performance"],
+    "timezone": "utc",
+    "refresh": "15s",
+    "time": { "from": "now-3h", "to": "now" },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Overall Cache Hit Rate",
+        "type": "gauge",
+        "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+        "targets": [{ "expr": "avg(cache_hit_rate)", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "thresholds": { "steps": [{ "color": "red", "value": 0 }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] } } }
+      },
+      {
+        "id": 2,
+        "title": "L1 Hit Rate",
+        "type": "gauge",
+        "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+        "targets": [{ "expr": "avg(cache_l1_hits_total / clamp_min(cache_l1_hits_total + cache_l2_hits_total + cache_misses_total, 1))", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1 } }
+      },
+      {
+        "id": 3,
+        "title": "Stampedes Prevented",
+        "type": "stat",
+        "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+        "targets": [{ "expr": "sum(rate(cache_stampedes_total[5m])) * 300", "legendFormat": "" }]
+      },
+      {
+        "id": 4,
+        "title": "Redis Memory",
+        "type": "stat",
+        "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+        "targets": [{ "expr": "redis_memory_used_bytes / 1024 / 1024", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "decmbytes" } }
+      },
+      {
+        "id": 5,
+        "title": "Hit/Miss Rate Over Time",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+        "targets": [
+          { "expr": "sum(rate(cache_l1_hits_total[5m]))", "legendFormat": "L1 Hits" },
+          { "expr": "sum(rate(cache_l2_hits_total[5m]))", "legendFormat": "L2 Hits" },
+          { "expr": "sum(rate(cache_misses_total[5m]))", "legendFormat": "Misses" }
+        ]
+      },
+      {
+        "id": 6,
+        "title": "Cache Hit Rate by Service",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+        "targets": [{ "expr": "topk(10, cache_hit_rate)", "legendFormat": "{{ service }}" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit" } }
+      },
+      {
+        "id": 7,
+        "title": "Redis Operations/sec",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+        "targets": [{ "expr": "rate(redis_commands_processed_total[5m])", "legendFormat": "ops/s" }]
+      },
+      {
+        "id": 8,
+        "title": "Evictions & Expirations",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+        "targets": [
+          { "expr": "rate(redis_evicted_keys_total[5m])", "legendFormat": "Evictions" },
+          { "expr": "rate(redis_expired_keys_total[5m])", "legendFormat": "Expirations" }
+        ]
+      },
+      {
+        "id": 9,
+        "title": "Connection Pool Utilization",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+        "targets": [{ "expr": "cache_pool_active / cache_pool_size", "legendFormat": "{{ service }}" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit" } }
+      },
+      {
+        "id": 10,
+        "title": "Invalidation Events",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+        "targets": [{ "expr": "rate(cache_invalidations_total[5m])", "legendFormat": "{{ service }}" }]
+      }
+    ]
+  }
+}

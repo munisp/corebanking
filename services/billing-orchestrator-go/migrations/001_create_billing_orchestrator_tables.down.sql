@@ -1,0 +1,10 @@
+-- Rollback: 001_create_billing_orchestrator_tables
+BEGIN;
+DROP TRIGGER IF EXISTS trg_billing_orchestrator_updated ON billing_orchestrator_records;
+DROP FUNCTION IF EXISTS update_billing_orchestrator_timestamp();
+DROP FUNCTION IF EXISTS cleanup_billing_orchestrator_idempotency();
+DROP POLICY IF EXISTS billing_orchestrator_tenant_isolation ON billing_orchestrator_records;
+DROP TABLE IF EXISTS billing_orchestrator_idempotency;
+DROP TABLE IF EXISTS billing_orchestrator_audit;
+DROP TABLE IF EXISTS billing_orchestrator_records;
+COMMIT;

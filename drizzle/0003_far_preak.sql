@@ -1,0 +1,43 @@
+CREATE TABLE `partnerApprovalRecords` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`approvalId` varchar(64) NOT NULL,
+	`partnerId` varchar(64) NOT NULL,
+	`stage` enum('compliance_review','commercial_review','operations_review','launch_signoff') NOT NULL,
+	`title` varchar(191) NOT NULL,
+	`detail` text NOT NULL,
+	`state` enum('pending','approved','rejected') NOT NULL,
+	`requiredRole` enum('branch','operations','treasury','compliance') NOT NULL,
+	`requestedAt` timestamp NOT NULL DEFAULT (now()),
+	`requestedById` varchar(96) NOT NULL,
+	`resolvedAt` timestamp,
+	`resolutionNote` text,
+	CONSTRAINT `partnerApprovalRecords_id` PRIMARY KEY(`id`),
+	CONSTRAINT `partnerApprovalRecords_approvalId_unique` UNIQUE(`approvalId`)
+);
+--> statement-breakpoint
+CREATE TABLE `partnerOnboardingRecords` (
+	`id` int AUTO_INCREMENT NOT NULL,
+	`partnerId` varchar(64) NOT NULL,
+	`tenantId` varchar(64) NOT NULL,
+	`partnerName` varchar(191) NOT NULL,
+	`legalEntity` varchar(191) NOT NULL,
+	`partnerType` enum('mfb','fintech','cooperative','agency','enterprise') NOT NULL,
+	`region` varchar(96) NOT NULL,
+	`stage` enum('draft','submitted','compliance_review','commercial_review','operations_review','approved','provisioning','launch_ready','launched') NOT NULL,
+	`requestedModules` json NOT NULL,
+	`primaryContact` json NOT NULL,
+	`operationsContact` json NOT NULL,
+	`commercial` json NOT NULL,
+	`compliance` json NOT NULL,
+	`branding` json NOT NULL,
+	`checklist` json NOT NULL,
+	`blockers` json NOT NULL,
+	`readinessScore` int NOT NULL DEFAULT 0,
+	`createdAt` timestamp NOT NULL DEFAULT (now()),
+	`updatedAt` timestamp NOT NULL DEFAULT (now()) ON UPDATE CURRENT_TIMESTAMP,
+	`submittedAt` timestamp,
+	`launchedAt` timestamp,
+	`lastSubmittedBy` varchar(96),
+	CONSTRAINT `partnerOnboardingRecords_id` PRIMARY KEY(`id`),
+	CONSTRAINT `partnerOnboardingRecords_partnerId_unique` UNIQUE(`partnerId`)
+);

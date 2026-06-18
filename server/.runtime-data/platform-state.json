@@ -1,0 +1,2342 @@
+{
+  "customers": [
+    {
+      "id": "CUS-001",
+      "name": "Amina Yusuf Farms",
+      "segment": "Agriculture",
+      "tier": "Tier 1",
+      "location": "Kaduna",
+      "relationshipManager": "M. Danjuma",
+      "risk": "Medium",
+      "status": "Active",
+      "bvn": "22188439014",
+      "phone": "08030000001",
+      "balance": 12450000,
+      "lastTouchpoint": "10 minutes ago"
+    },
+    {
+      "id": "CUS-002",
+      "name": "Sadiq Trade Exporters",
+      "segment": "Trade",
+      "tier": "Tier 2",
+      "location": "Kano",
+      "relationshipManager": "K. Ibrahim",
+      "risk": "High",
+      "status": "Review",
+      "bvn": "22188439015",
+      "phone": "08030000002",
+      "balance": 28650000,
+      "lastTouchpoint": "35 minutes ago"
+    },
+    {
+      "id": "CUS-003",
+      "name": "Grace Community Cooperative",
+      "segment": "Retail",
+      "tier": "Tier 1",
+      "location": "Jos",
+      "relationshipManager": "A. Effiong",
+      "risk": "Low",
+      "status": "Pending",
+      "bvn": "22188439016",
+      "phone": "08030000003",
+      "balance": 3750000,
+      "lastTouchpoint": "1 hour ago"
+    },
+    {
+      "id": "CUS-004",
+      "name": "Haruna Agent Network",
+      "segment": "Retail",
+      "tier": "Tier 2",
+      "location": "Abuja",
+      "relationshipManager": "L. Hassan",
+      "risk": "Medium",
+      "status": "Active",
+      "bvn": "22188439017",
+      "phone": "08030000004",
+      "balance": 9450000,
+      "lastTouchpoint": "22 minutes ago"
+    },
+    {
+      "id": "CUS-005",
+      "name": "Kaduna Milling Consortium",
+      "segment": "Agriculture",
+      "tier": "Tier 2",
+      "location": "Kaduna",
+      "relationshipManager": "B. Okorie",
+      "risk": "Medium",
+      "status": "Review",
+      "bvn": "22188439018",
+      "phone": "08030000005",
+      "balance": 41200000,
+      "lastTouchpoint": "12 minutes ago"
+    },
+    {
+      "id": "CUS-006",
+      "name": "Lagos Merchant Acquiring Pool",
+      "segment": "Trade",
+      "tier": "Tier 1",
+      "location": "Lagos",
+      "relationshipManager": "T. Bello",
+      "risk": "Low",
+      "status": "Active",
+      "bvn": "22188439019",
+      "phone": "08030000006",
+      "balance": 22850000,
+      "lastTouchpoint": "6 minutes ago"
+    }
+  ],
+  "customerCards": [
+    {
+      "id": "CARD-001",
+      "customerId": "CUS-001",
+      "type": "physical",
+      "brand": "visa",
+      "lastFour": "4401",
+      "expiryDate": "09/29",
+      "cardHolder": "Amina Yusuf Farms",
+      "balance": 1245000,
+      "isLocked": false,
+      "controls": {
+        "atm": true,
+        "international": false,
+        "online": true
+      },
+      "spendingLimits": {
+        "atm": 120000,
+        "daily": 350000,
+        "online": 180000
+      },
+      "colorTone": "blue",
+      "updatedAt": "2026-05-09T12:19:17.000Z"
+    },
+    {
+      "id": "CARD-003",
+      "customerId": "CUS-002",
+      "type": "physical",
+      "brand": "visa",
+      "lastFour": "5520",
+      "expiryDate": "01/30",
+      "cardHolder": "Sadiq Trade Exporters",
+      "balance": 2150000,
+      "isLocked": false,
+      "controls": {
+        "atm": true,
+        "international": true,
+        "online": true
+      },
+      "spendingLimits": {
+        "atm": 150000,
+        "daily": 500000,
+        "online": 250000
+      },
+      "colorTone": "blue",
+      "updatedAt": "2026-05-09T12:07:17.000Z"
+    },
+    {
+      "id": "CARD-002",
+      "customerId": "CUS-001",
+      "type": "virtual",
+      "brand": "mastercard",
+      "lastFour": "9088",
+      "expiryDate": "04/28",
+      "cardHolder": "Amina Yusuf Farms",
+      "balance": 420000,
+      "isLocked": true,
+      "controls": {
+        "atm": false,
+        "international": false,
+        "online": true
+      },
+      "spendingLimits": {
+        "atm": 0,
+        "daily": 150000,
+        "online": 90000
+      },
+      "colorTone": "graphite",
+      "updatedAt": "2026-05-09T11:55:17.000Z"
+    }
+  ],
+  "customerCardEvents": [
+    {
+      "id": "CEVT-001",
+      "cardId": "CARD-001",
+      "customerId": "CUS-001",
+      "title": "ATM limit adjusted",
+      "detail": "Daily ATM limit raised after servicing review.",
+      "severity": "success",
+      "createdAt": "2026-04-21T12:29:00.000Z"
+    },
+    {
+      "id": "CEVT-003",
+      "cardId": "CARD-003",
+      "customerId": "CUS-002",
+      "title": "Cross-border control confirmed",
+      "detail": "International spend control retained for trade settlement journeys.",
+      "severity": "info",
+      "createdAt": "2026-04-21T12:14:00.000Z"
+    },
+    {
+      "id": "CEVT-002",
+      "cardId": "CARD-002",
+      "customerId": "CUS-001",
+      "title": "Virtual card locked",
+      "detail": "International usage remained blocked pending operator confirmation.",
+      "severity": "warning",
+      "createdAt": "2026-04-21T11:49:00.000Z"
+    }
+  ],
+  "customerSavedBillers": [
+    {
+      "id": "BILLER-001",
+      "customerId": "CUS-001",
+      "category": "electricity",
+      "provider": "Kaduna Electric",
+      "billerId": "KEDCO-4401",
+      "customerReference": "METER-554401",
+      "nickname": "Farm power",
+      "lastAmount": 48500,
+      "verifiedName": "Amina Yusuf Farms Yard",
+      "lastPaidAt": "2026-05-01T12:37:17.000Z",
+      "createdAt": "2026-04-05T12:37:17.000Z"
+    },
+    {
+      "id": "BILLER-002",
+      "customerId": "CUS-001",
+      "category": "internet",
+      "provider": "Swift Fibre",
+      "billerId": "SWIFT-2209",
+      "customerReference": "ACC-220998",
+      "nickname": "Office data",
+      "lastAmount": 32000,
+      "verifiedName": "Amina Yusuf Farms HQ",
+      "lastPaidAt": "2026-04-27T12:37:17.000Z",
+      "createdAt": "2026-03-26T12:37:17.000Z"
+    },
+    {
+      "id": "BILLER-003",
+      "customerId": "CUS-002",
+      "category": "school",
+      "provider": "Northern Business School",
+      "billerId": "NBS-1180",
+      "customerReference": "STUDENT-1180",
+      "nickname": "Executive tuition",
+      "lastAmount": 210000,
+      "verifiedName": "Sadiq Trade Exporters Training Desk",
+      "lastPaidAt": "2026-04-20T12:37:17.000Z",
+      "createdAt": "2026-03-07T12:37:17.000Z"
+    }
+  ],
+  "customerBillPayments": [
+    {
+      "id": "CBILL-005",
+      "customerId": "CUS-001",
+      "category": "electricity",
+      "provider": "Ikeja Electric",
+      "amount": 45000,
+      "status": "paid",
+      "paidAt": "2026-05-09T12:37:19.160Z",
+      "reference": "54B-1778330239157",
+      "customerName": "Amina Yusuf Farms",
+      "scheduledFor": "2026-05-10T12:37:19.156Z",
+      "evidenceStatus": "verified",
+      "channel": "self-service"
+    },
+    {
+      "id": "CBILL-004",
+      "customerId": "CUS-001",
+      "category": "electricity",
+      "provider": "Abuja Electricity Distribution",
+      "amount": 32000,
+      "status": "scheduled",
+      "paidAt": "2026-05-10T00:37:19.148Z",
+      "reference": "54B-1778330239150",
+      "customerName": "Amina Yusuf Farms",
+      "scheduledFor": "2026-05-10T00:37:19.148Z",
+      "evidenceStatus": "scheduled",
+      "channel": "self-service"
+    },
+    {
+      "id": "CBILL-002",
+      "customerId": "CUS-001",
+      "category": "internet",
+      "provider": "Swift Fibre",
+      "amount": 32000,
+      "status": "scheduled",
+      "paidAt": "2026-05-11T12:37:17.000Z",
+      "reference": "54B-DATA-2209",
+      "billerId": "BILLER-002",
+      "customerReference": "ACC-220998",
+      "customerName": "Amina Yusuf Farms HQ",
+      "scheduledFor": "2026-05-11T12:37:17.000Z",
+      "evidenceStatus": "scheduled",
+      "channel": "saved-biller"
+    },
+    {
+      "id": "CBILL-001",
+      "customerId": "CUS-001",
+      "category": "electricity",
+      "provider": "Kaduna Electric",
+      "amount": 48500,
+      "status": "paid",
+      "paidAt": "2026-05-01T12:37:17.000Z",
+      "reference": "54B-UTIL-4401",
+      "billerId": "BILLER-001",
+      "customerReference": "METER-554401",
+      "customerName": "Amina Yusuf Farms Yard",
+      "evidenceStatus": "verified",
+      "channel": "saved-biller"
+    },
+    {
+      "id": "CBILL-003",
+      "customerId": "CUS-002",
+      "category": "school",
+      "provider": "Northern Business School",
+      "amount": 210000,
+      "status": "paid",
+      "paidAt": "2026-04-20T12:37:17.000Z",
+      "reference": "54B-SCHOOL-1180",
+      "billerId": "BILLER-003",
+      "customerReference": "STUDENT-1180",
+      "customerName": "Sadiq Trade Exporters Training Desk",
+      "evidenceStatus": "ready",
+      "channel": "operator-assisted"
+    }
+  ],
+  "customerTransfers": [
+    {
+      "id": "CTR-003",
+      "customerId": "CUS-001",
+      "beneficiaryName": "Runtime Test Beneficiary",
+      "amount": 120000,
+      "narration": "Runtime transfer lifecycle test",
+      "transferType": "bank",
+      "status": "completed",
+      "createdAt": "2026-05-09T12:37:19.139Z",
+      "bankName": "54Bank Test Rail",
+      "accountNumber": "1234567890",
+      "accountName": "Runtime Test Beneficiary",
+      "approvalState": "not_required",
+      "otpReference": "OTP-1778330239142",
+      "otpIssuedAt": "2026-05-09T12:37:19.142Z",
+      "confirmedAt": "2026-05-09T12:37:19.146Z"
+    },
+    {
+      "id": "CTR-002",
+      "customerId": "CUS-001",
+      "beneficiaryName": "Workflow desk release",
+      "amount": 950000,
+      "narration": "Collateral top-up for workflow case",
+      "transferType": "workflow",
+      "status": "submitted",
+      "createdAt": "2026-05-09T11:07:17.000Z",
+      "workflowId": "WF-1182",
+      "confirmedAt": "2026-05-09T11:09:17.000Z",
+      "approvalState": "approved"
+    },
+    {
+      "id": "CTR-001",
+      "customerId": "CUS-001",
+      "beneficiaryName": "Amina Input Suppliers",
+      "amount": 185000,
+      "narration": "Input restock settlement",
+      "transferType": "bank",
+      "status": "completed",
+      "createdAt": "2026-05-09T06:37:17.000Z",
+      "bankCode": "058",
+      "bankName": "GTBank",
+      "accountNumber": "0123456789",
+      "accountName": "Amina Input Suppliers",
+      "confirmedAt": "2026-05-09T06:39:17.000Z",
+      "approvalState": "not_required"
+    }
+  ],
+  "customerApprovals": [
+    {
+      "id": "CAP-005",
+      "customerId": "CUS-001",
+      "entityType": "statement_export",
+      "entityId": "EXP-213",
+      "title": "Approve statement export for CUS-001",
+      "detail": "Statement exports require operator sign-off before the package becomes downloadable.",
+      "route": "/customer/statements",
+      "state": "approved",
+      "requestedAt": "2026-05-09T12:37:19.163Z",
+      "requestedByRole": "operations",
+      "requestedById": "operations.default",
+      "approvalRole": "branch",
+      "resolvedAt": "2026-05-09T12:37:19.166Z",
+      "resolutionNote": "Export approval test"
+    },
+    {
+      "id": "CAP-004",
+      "customerId": "CUS-001",
+      "entityType": "scheduled_bill",
+      "entityId": "CBILL-005",
+      "title": "Approve scheduled payment for Ikeja Electric",
+      "detail": "Scheduled customer payments require branch approval before execution in the servicing ledger.",
+      "route": "/customer/bills",
+      "state": "approved",
+      "requestedAt": "2026-05-09T12:37:19.157Z",
+      "requestedByRole": "operations",
+      "requestedById": "operations.default",
+      "approvalRole": "branch",
+      "resolvedAt": "2026-05-09T12:37:19.160Z",
+      "resolutionNote": "Approved from runtime integration test"
+    },
+    {
+      "id": "CAP-003",
+      "customerId": "CUS-001",
+      "entityType": "scheduled_bill",
+      "entityId": "CBILL-004",
+      "title": "Approve scheduled payment for Abuja Electricity Distribution",
+      "detail": "Scheduled customer payments require branch approval before execution in the servicing ledger.",
+      "route": "/customer/bills",
+      "state": "pending",
+      "requestedAt": "2026-05-09T12:37:19.150Z",
+      "requestedByRole": "operations",
+      "requestedById": "operations.default",
+      "approvalRole": "branch"
+    },
+    {
+      "id": "CAP-002",
+      "customerId": "CUS-001",
+      "entityType": "scheduled_bill",
+      "entityId": "CBILL-002",
+      "title": "Approve scheduled data payment",
+      "detail": "Scheduled Swift Fibre payment is awaiting branch confirmation before release.",
+      "route": "/customer/bills",
+      "state": "pending",
+      "requestedAt": "2026-05-09T12:13:17.000Z",
+      "requestedByRole": "customer",
+      "requestedById": "CUS-001",
+      "approvalRole": "branch"
+    },
+    {
+      "id": "CAP-001",
+      "customerId": "CUS-001",
+      "entityType": "card_control",
+      "entityId": "CARD-002",
+      "title": "Approve virtual card unlock",
+      "detail": "International usage unlock requires branch review before customer self-service can resume.",
+      "route": "/customer/cards",
+      "state": "pending",
+      "requestedAt": "2026-05-09T11:55:17.000Z",
+      "requestedByRole": "customer",
+      "requestedById": "CUS-001",
+      "approvalRole": "branch"
+    }
+  ],
+  "workflowCases": [
+    {
+      "id": "WF-1182",
+      "customer": "Amina Yusuf Farms",
+      "product": "Trade finance",
+      "stage": "Approval",
+      "status": "In Progress",
+      "channel": "Branch plus ops desk",
+      "amount": 18500000,
+      "nextAction": "Confirm collateral perfection and release import settlement memo.",
+      "slaHours": 6
+    },
+    {
+      "id": "WF-1183",
+      "customer": "Sadiq Trade Exporters",
+      "product": "Dispute management",
+      "stage": "KYC",
+      "status": "Ready",
+      "channel": "PWA operations",
+      "amount": 3200000,
+      "nextAction": "Collect merchant evidence pack and validate customer narrative.",
+      "slaHours": 8
+    },
+    {
+      "id": "WF-1184",
+      "customer": "Grace Community Cooperative",
+      "product": "Agricultural insurance",
+      "stage": "Origination",
+      "status": "Blocked",
+      "channel": "Field onboarding",
+      "amount": 4500000,
+      "nextAction": "Resolve missing farm-plot coordinates before underwriting handoff.",
+      "slaHours": 12
+    },
+    {
+      "id": "WF-1185",
+      "customer": "Haruna Agent Network",
+      "product": "Agent settlement service",
+      "stage": "Fulfilment",
+      "status": "In Progress",
+      "channel": "Agent banking hub",
+      "amount": 2750000,
+      "nextAction": "Approve float top-up and release assisted settlement batch.",
+      "slaHours": 26
+    },
+    {
+      "id": "WF-1186",
+      "customer": "Kaduna Milling Consortium",
+      "product": "Seasonal crop loan service review",
+      "stage": "Monitoring",
+      "status": "Blocked",
+      "channel": "Agriculture desk",
+      "amount": 22500000,
+      "nextAction": "Repair warehouse receipt mismatch and resume disbursement service track.",
+      "slaHours": 30
+    },
+    {
+      "id": "WF-1187",
+      "customer": "Lagos Merchant Acquiring Pool",
+      "product": "Merchant settlement analytics",
+      "stage": "Approval",
+      "status": "Ready",
+      "channel": "Merchant service console",
+      "amount": 8200000,
+      "nextAction": "Approve export-ready merchant fee package for downstream reconciliation.",
+      "slaHours": 18
+    },
+    {
+      "id": "WF-1188",
+      "customer": "Grace Community Cooperative",
+      "product": "Customer onboarding service",
+      "stage": "KYC",
+      "status": "In Progress",
+      "channel": "Customer mobile onboarding",
+      "amount": 850000,
+      "nextAction": "Complete document review and customer risk grading before account activation.",
+      "slaHours": 10
+    },
+    {
+      "id": "WF-1189",
+      "customer": "Sadiq Trade Exporters",
+      "product": "Dispute repair workflow",
+      "stage": "Monitoring",
+      "status": "Blocked",
+      "channel": "Operations queue",
+      "amount": 1600000,
+      "nextAction": "Escalate exception backlog and confirm reversal funding path.",
+      "slaHours": 34
+    },
+    {
+      "id": "WF-1190",
+      "customer": "Adebisi Family Housing Cooperative",
+      "product": "Mortgage servicing",
+      "stage": "Approval",
+      "status": "In Progress",
+      "channel": "Mortgage desk",
+      "amount": 68500000,
+      "nextAction": "Confirm property valuation variance and refresh debt-service coverage sign-off before offer issuance.",
+      "slaHours": 20
+    },
+    {
+      "id": "WF-1191",
+      "customer": "Sunrise Estate Subscribers",
+      "product": "Mortgage servicing",
+      "stage": "Fulfilment",
+      "status": "Blocked",
+      "channel": "Branch plus legal desk",
+      "amount": 41200000,
+      "nextAction": "Resolve title-document exception and requeue legal perfection before disbursement release.",
+      "slaHours": 36
+    }
+  ],
+  "operatorActions": [
+    {
+      "id": "ACTN-301",
+      "domainKey": "trade-finance",
+      "title": "Review letter-of-credit discrepancy pack",
+      "detail": "Confirm amendment approval and partner-bank response before settlement release.",
+      "owner": "Trade desk",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/trade-finance",
+      "status": "Pending",
+      "roles": [
+        "operations",
+        "treasury"
+      ]
+    },
+    {
+      "id": "ACTN-302",
+      "domainKey": "dispute-management",
+      "title": "Complete card dispute evidence sweep",
+      "detail": "Collect merchant receipt and customer narrative before reversal posture is finalized.",
+      "owner": "Dispute operations",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/disputes",
+      "status": "In progress",
+      "roles": [
+        "operations",
+        "compliance"
+      ]
+    },
+    {
+      "id": "ACTN-303",
+      "domainKey": "agricultural-insurance",
+      "title": "Validate weather-trigger claim cohort",
+      "detail": "Compare rainfall trigger feed with enrolled crop-cover policy group before payout sign-off.",
+      "owner": "Insurance desk",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/agricultural-insurance",
+      "status": "Pending",
+      "roles": [
+        "compliance",
+        "operations"
+      ]
+    },
+    {
+      "id": "ACTN-304",
+      "domainKey": "ledger-reconciliation",
+      "title": "Acknowledge unrepaired ledger variance",
+      "detail": "Review TigerBeetle to PostgreSQL delta and assign the next repair owner.",
+      "owner": "Ledger control",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/ledger-sync",
+      "status": "Pending",
+      "roles": [
+        "treasury"
+      ]
+    },
+    {
+      "id": "ACTN-305",
+      "domainKey": "analytics",
+      "title": "Approve billing evidence package",
+      "detail": "Validate signed settlement exports and release the commercial pack for finance review.",
+      "owner": "Commercial analytics",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/billing",
+      "status": "In progress",
+      "roles": [
+        "operations",
+        "treasury"
+      ]
+    },
+    {
+      "id": "ACTN-306",
+      "domainKey": "analytics",
+      "title": "Review adoption drift for assisted channels",
+      "detail": "Compare customer onboarding throughput with branch and mobile conversion posture before publishing analytics notes.",
+      "owner": "Adoption desk",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/usage-analytics",
+      "status": "Pending",
+      "roles": [
+        "operations",
+        "compliance"
+      ]
+    },
+    {
+      "id": "ACTN-307",
+      "domainKey": "operations",
+      "title": "Escalate alert backlog across payment and identity rails",
+      "detail": "Route unresolved warning events into operations and security owners with signed audit continuity.",
+      "owner": "Alert desk",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/alerts",
+      "status": "Pending",
+      "roles": [
+        "operations",
+        "compliance"
+      ]
+    },
+    {
+      "id": "ACTN-308",
+      "domainKey": "operations",
+      "title": "Confirm customer card-control exceptions",
+      "detail": "Review lock-state overrides and international control changes before the next servicing window.",
+      "owner": "Customer servicing",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/customer/cards",
+      "status": "In progress",
+      "roles": [
+        "operations",
+        "branch"
+      ]
+    },
+    {
+      "id": "ACTN-309",
+      "domainKey": "mortgage-servicing",
+      "title": "Approve collateral perfection exception pack",
+      "detail": "Validate title remediation evidence, refreshed valuation notes, and affordability override before offer issuance proceeds.",
+      "owner": "Mortgage desk",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/mortgage",
+      "status": "Pending",
+      "roles": [
+        "branch",
+        "operations"
+      ]
+    },
+    {
+      "id": "ACTN-310",
+      "domainKey": "mortgage-servicing",
+      "title": "Review arrears early-warning outreach",
+      "detail": "Confirm branch contact attempts and repayment restructuring posture for the flagged mortgage cohort.",
+      "owner": "Collections support",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/mortgage",
+      "status": "In progress",
+      "roles": [
+        "operations"
+      ]
+    },
+    {
+      "id": "ACTN-311",
+      "domainKey": "education-loans",
+      "title": "Approve guarantor and admission exception pack",
+      "detail": "Validate guarantor evidence, admission-letter refresh, and school-fee disbursement guardrails before release proceeds.",
+      "owner": "Education finance desk",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/education-loans",
+      "status": "Pending",
+      "roles": [
+        "branch",
+        "operations"
+      ]
+    },
+    {
+      "id": "ACTN-312",
+      "domainKey": "education-loans",
+      "title": "Review delinquency outreach and rollover posture",
+      "detail": "Confirm guardian contact attempts, rescheduling posture, and fee-cycle continuity for the flagged student-finance cohort.",
+      "owner": "Collections support",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/education-loans",
+      "status": "In progress",
+      "roles": [
+        "operations"
+      ]
+    },
+    {
+      "id": "ACTN-313",
+      "domainKey": "esusu-groups",
+      "title": "Approve contribution-cycle exception and payout hold",
+      "detail": "Validate missed-contribution remediation, payout readiness, and agent follow-through before the next group rotation closes.",
+      "owner": "Esusu operations desk",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/esusu",
+      "status": "Pending",
+      "roles": [
+        "branch",
+        "operations"
+      ]
+    },
+    {
+      "id": "ACTN-314",
+      "domainKey": "esusu-groups",
+      "title": "Review reminder cadence and group-health outreach",
+      "detail": "Confirm reminder-channel timing, defaulter outreach posture, and collection continuity for the flagged savings circles.",
+      "owner": "Community collections",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/esusu",
+      "status": "In progress",
+      "roles": [
+        "operations"
+      ]
+    },
+    {
+      "id": "ACTN-315",
+      "domainKey": "virtual-accounts",
+      "title": "Approve dedicated VAN suspension and settlement hold",
+      "detail": "Validate account suspension, inbound settlement posture, and downstream collection routing for the flagged virtual account cohort.",
+      "owner": "Collections switch desk",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/virtual-accounts",
+      "status": "Pending",
+      "roles": [
+        "branch",
+        "operations"
+      ]
+    },
+    {
+      "id": "ACTN-316",
+      "domainKey": "virtual-accounts",
+      "title": "Review dynamic VAN issuance and payment exceptions",
+      "detail": "Confirm one-time account issuance, failed inbound payment retries, and merchant allocation posture for the active VAN batch.",
+      "owner": "Payments operations",
+      "due": "2026-05-09T12:37:18.000Z",
+      "route": "/virtual-accounts",
+      "status": "In progress",
+      "roles": [
+        "operations"
+      ]
+    }
+  ],
+  "auditTrail": [
+    {
+      "id": "AUD-955",
+      "timestamp": "2026-05-09T12:37:20.348Z",
+      "actorRole": "compliance",
+      "actorId": "aml.engine",
+      "entityType": "aml_screening",
+      "entityId": "SCR-4891",
+      "action": "escalated",
+      "outcome": "High-risk PEP match flagged for enhanced due diligence \u2014 Alhaji Musa Danjuma, Kano State.",
+      "severity": "warning",
+      "route": "/aml-enhancement/sanctions-screening",
+      "middleware": [
+        "OpenSearch",
+        "Kafka",
+        "Postgres",
+        "Redis"
+      ],
+      "detail": "Automated sanctions screening matched a politically exposed person against the CBN watchlist. Case escalated to the AML compliance desk for manual review and SAR determination."
+    },
+    {
+      "id": "AUD-954",
+      "timestamp": "2026-05-09T12:35:41.914Z",
+      "actorRole": "treasury",
+      "actorId": "treasury.lead",
+      "entityType": "fx_settlement",
+      "entityId": "FX-TXN-7823",
+      "action": "completed",
+      "outcome": "NGN/USD spot settlement completed \u2014 \u20a61.2B @ \u20a61,580/$ for Dangote Industries.",
+      "severity": "info",
+      "route": "/treasury/fx-deals",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres",
+        "Mojaloop"
+      ],
+      "detail": "Foreign exchange spot deal settled through the interbank market. TigerBeetle double-entry posted and Mojaloop corridor confirmation received from CBN."
+    },
+    {
+      "id": "AUD-953",
+      "timestamp": "2026-05-09T12:33:12.803Z",
+      "actorRole": "operations",
+      "actorId": "ops.supervisor",
+      "entityType": "loan_disbursement",
+      "entityId": "LOAN-DIS-3345",
+      "action": "approved",
+      "outcome": "Agricultural anchor borrower loan disbursed \u2014 \u20a645M to Oyo Cooperative Farmers Union.",
+      "severity": "info",
+      "route": "/agriculture-banking/agri-loans",
+      "middleware": [
+        "Temporal",
+        "Postgres",
+        "Kafka",
+        "TigerBeetle"
+      ],
+      "detail": "CBN Anchor Borrowers Programme loan approved and disbursed via NIRSAL credit guarantee (75% CRG). Funds released to 120 cooperative members across 3 LGAs."
+    },
+    {
+      "id": "AUD-952",
+      "timestamp": "2026-05-09T12:30:55.685Z",
+      "actorRole": "security",
+      "actorId": "soc.analyst",
+      "entityType": "fraud_alert",
+      "entityId": "FRD-ALT-892",
+      "action": "blocked",
+      "outcome": "Suspicious card-not-present transaction blocked \u2014 \u20a68.5M attempted from flagged IP (Lagos).",
+      "severity": "critical",
+      "route": "/risk-compliance/fraud-detection",
+      "middleware": [
+        "Redis",
+        "OpenAppSec",
+        "APISIX",
+        "Kafka"
+      ],
+      "detail": "Real-time fraud detection engine identified velocity anomaly \u2014 12 transactions in 3 minutes from same card across different merchants. Card frozen and customer notification sent via SMS."
+    },
+    {
+      "id": "AUD-951",
+      "timestamp": "2026-05-09T12:28:33.401Z",
+      "actorRole": "operations",
+      "actorId": "kyc.processor",
+      "entityType": "kyc_verification",
+      "entityId": "KYC-VER-5567",
+      "action": "completed",
+      "outcome": "Tier 3 KYC upgrade completed for Sterling Microfinance Bank \u2014 BVN, NIN, CAC verified.",
+      "severity": "info",
+      "route": "/kyc-kyb/verification-queue",
+      "middleware": [
+        "Keycloak",
+        "Postgres",
+        "Kafka",
+        "OpenSearch"
+      ],
+      "detail": "Corporate KYB verification completed with BVN validation, NIN cross-check, CAC registration confirmed. UBO chain verified to 3 levels. Risk score: Low (12/100)."
+    },
+    {
+      "id": "AUD-950",
+      "timestamp": "2026-05-09T12:25:10.288Z",
+      "actorRole": "operations",
+      "actorId": "channel.monitor",
+      "entityType": "ussd_gateway",
+      "entityId": "USSD-SES-44120",
+      "action": "threshold_breach",
+      "outcome": "USSD gateway latency spike detected \u2014 P99 response time 4.2s (threshold: 3s) on Airtel corridor.",
+      "severity": "warning",
+      "route": "/channel-banking/ussd-banking-gateway",
+      "middleware": [
+        "APISIX",
+        "Redis",
+        "Kafka",
+        "Fluvio"
+      ],
+      "detail": "USSD banking gateway Airtel corridor experiencing elevated latency during peak hours. Auto-scaling triggered \u2014 2 additional pods spun up. 45,000 sessions affected in last 15 minutes."
+    },
+    {
+      "id": "AUD-949",
+      "timestamp": "2026-05-09T12:37:19.172Z",
+      "actorRole": "treasury",
+      "actorId": "treasury.default",
+      "entityType": "export",
+      "entityId": "EXP-214",
+      "action": "generated",
+      "outcome": "Export Runtime ledger evidence pack prepared as csv.",
+      "severity": "info",
+      "route": "/ledger-sync",
+      "middleware": [
+        "Postgres",
+        "Lakehouse",
+        "Permify"
+      ],
+      "detail": "A role-scoped export package was generated from the operational workbench."
+    },
+    {
+      "id": "AUD-948",
+      "timestamp": "2026-05-09T12:37:19.167Z",
+      "actorRole": "branch",
+      "actorId": "branch.default",
+      "entityType": "customer_approval",
+      "entityId": "CAP-005",
+      "action": "approved",
+      "outcome": "Approve statement export for CUS-001 was approved by branch.",
+      "severity": "info",
+      "route": "/customer/statements",
+      "middleware": [
+        "Permify",
+        "Kafka",
+        "Postgres"
+      ],
+      "detail": "An operator approval resolved a customer-servicing lifecycle gate in the active environment."
+    },
+    {
+      "id": "AUD-947",
+      "timestamp": "2026-05-09T12:37:19.163Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "statement_export",
+      "entityId": "EXP-213",
+      "action": "requested",
+      "outcome": "Statement export EXP-213 was requested for CUS-001.",
+      "severity": "info",
+      "route": "/customer/statements",
+      "middleware": [
+        "Lakehouse",
+        "Permify",
+        "Postgres"
+      ],
+      "detail": "The statement servicing endpoint created an export package and routed it into the approval chain."
+    },
+    {
+      "id": "AUD-946",
+      "timestamp": "2026-05-09T12:37:19.160Z",
+      "actorRole": "branch",
+      "actorId": "branch.default",
+      "entityType": "customer_approval",
+      "entityId": "CAP-004",
+      "action": "approved",
+      "outcome": "Approve scheduled payment for Ikeja Electric was approved by branch.",
+      "severity": "info",
+      "route": "/customer/bills",
+      "middleware": [
+        "Permify",
+        "Kafka",
+        "Postgres"
+      ],
+      "detail": "An operator approval resolved a customer-servicing lifecycle gate in the active environment."
+    },
+    {
+      "id": "AUD-945",
+      "timestamp": "2026-05-09T12:37:19.157Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "bill_payment",
+      "entityId": "CBILL-005",
+      "action": "scheduled",
+      "outcome": "Customer bill payment for Ikeja Electric was scheduled.",
+      "severity": "warning",
+      "route": "/customer/bills",
+      "middleware": [
+        "Postgres",
+        "Kafka",
+        "Permify"
+      ],
+      "detail": "The customer billing endpoint recorded a servicing payment event through the active adapter server."
+    },
+    {
+      "id": "AUD-944",
+      "timestamp": "2026-05-09T12:37:19.150Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "bill_payment",
+      "entityId": "CBILL-004",
+      "action": "scheduled",
+      "outcome": "Customer bill payment for Abuja Electricity Distribution was scheduled.",
+      "severity": "warning",
+      "route": "/customer/bills",
+      "middleware": [
+        "Postgres",
+        "Kafka",
+        "Permify"
+      ],
+      "detail": "The customer billing endpoint recorded a servicing payment event through the active adapter server."
+    },
+    {
+      "id": "AUD-943",
+      "timestamp": "2026-05-09T12:37:19.146Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_transfer",
+      "entityId": "CTR-003",
+      "action": "completed",
+      "outcome": "Transfer CTR-003 was completed after customer confirmation.",
+      "severity": "info",
+      "route": "/customer/transfers",
+      "middleware": [
+        "Postgres",
+        "Kafka",
+        "Permify"
+      ],
+      "detail": "The transfer servicing endpoint moved the transfer into the post-confirmation lifecycle and refreshed the statements evidence layer."
+    },
+    {
+      "id": "AUD-942",
+      "timestamp": "2026-05-09T12:37:19.142Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_transfer",
+      "entityId": "CTR-003",
+      "action": "otp_requested",
+      "outcome": "OTP challenge issued for transfer CTR-003.",
+      "severity": "info",
+      "route": "/customer/transfers",
+      "middleware": [
+        "Redis",
+        "APISIX"
+      ],
+      "detail": "The transfer servicing endpoint issued an OTP challenge for customer confirmation."
+    },
+    {
+      "id": "AUD-941",
+      "timestamp": "2026-05-09T12:37:19.139Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_transfer",
+      "entityId": "CTR-003",
+      "action": "created",
+      "outcome": "Transfer draft CTR-003 was created for Runtime Test Beneficiary.",
+      "severity": "info",
+      "route": "/customer/transfers",
+      "middleware": [
+        "Postgres",
+        "Redis",
+        "Kafka"
+      ],
+      "detail": "The customer transfer servicing endpoint created a draft transfer and recorded the next lifecycle step."
+    },
+    {
+      "id": "AUD-940",
+      "timestamp": "2026-05-09T12:37:19.132Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239132",
+      "action": "created",
+      "outcome": "Rate limit warmup 19",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-939",
+      "timestamp": "2026-05-09T12:37:19.131Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239131",
+      "action": "created",
+      "outcome": "Rate limit warmup 18",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-938",
+      "timestamp": "2026-05-09T12:37:19.129Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239129",
+      "action": "created",
+      "outcome": "Rate limit warmup 17",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-937",
+      "timestamp": "2026-05-09T12:37:19.127Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239127",
+      "action": "created",
+      "outcome": "Rate limit warmup 16",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-936",
+      "timestamp": "2026-05-09T12:37:19.125Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239125",
+      "action": "created",
+      "outcome": "Rate limit warmup 15",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-935",
+      "timestamp": "2026-05-09T12:37:19.124Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239124",
+      "action": "created",
+      "outcome": "Rate limit warmup 14",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-934",
+      "timestamp": "2026-05-09T12:37:19.122Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239122",
+      "action": "created",
+      "outcome": "Rate limit warmup 13",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-933",
+      "timestamp": "2026-05-09T12:37:19.121Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239121",
+      "action": "created",
+      "outcome": "Rate limit warmup 12",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-932",
+      "timestamp": "2026-05-09T12:37:19.119Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239119",
+      "action": "created",
+      "outcome": "Rate limit warmup 11",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-931",
+      "timestamp": "2026-05-09T12:37:19.117Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239117",
+      "action": "created",
+      "outcome": "Rate limit warmup 10",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-930",
+      "timestamp": "2026-05-09T12:37:19.116Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239116",
+      "action": "created",
+      "outcome": "Rate limit warmup 9",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-929",
+      "timestamp": "2026-05-09T12:37:19.114Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239114",
+      "action": "created",
+      "outcome": "Rate limit warmup 8",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-928",
+      "timestamp": "2026-05-09T12:37:19.112Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239112",
+      "action": "created",
+      "outcome": "Rate limit warmup 7",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-927",
+      "timestamp": "2026-05-09T12:37:19.110Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239110",
+      "action": "created",
+      "outcome": "Rate limit warmup 6",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-926",
+      "timestamp": "2026-05-09T12:37:19.109Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239109",
+      "action": "created",
+      "outcome": "Rate limit warmup 5",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-925",
+      "timestamp": "2026-05-09T12:37:19.107Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239107",
+      "action": "created",
+      "outcome": "Rate limit warmup 4",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-924",
+      "timestamp": "2026-05-09T12:37:19.104Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239104",
+      "action": "created",
+      "outcome": "Rate limit warmup 3",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-923",
+      "timestamp": "2026-05-09T12:37:19.103Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239103",
+      "action": "created",
+      "outcome": "Rate limit warmup 2",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-922",
+      "timestamp": "2026-05-09T12:37:19.101Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239101",
+      "action": "created",
+      "outcome": "Rate limit warmup 1",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-921",
+      "timestamp": "2026-05-09T12:37:19.100Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239100",
+      "action": "created",
+      "outcome": "Rate limit warmup 0",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Exercise the API write rate limiter."
+    },
+    {
+      "id": "AUD-920",
+      "timestamp": "2026-05-09T12:37:19.095Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "customer_notification",
+      "entityId": "notification-1778330239095",
+      "action": "created",
+      "outcome": "Persistence migration test",
+      "severity": "info",
+      "route": "/customer/dashboard",
+      "middleware": [
+        "Postgres",
+        "Notification rail"
+      ],
+      "detail": "Server-backed customer notifications should survive the UI migration path."
+    },
+    {
+      "id": "AUD-919",
+      "timestamp": "2026-05-09T12:37:18.557Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "ledger_posting_preview",
+      "entityId": "LPOST-1778330238557",
+      "action": "preview_created",
+      "outcome": "agricultural-insurance posting preview queued for claim_settlement_release.",
+      "severity": "info",
+      "route": "/agricultural-insurance",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres",
+        "Redis",
+        "Lakehouse",
+        "Fluvio"
+      ],
+      "detail": "Agricultural-insurance settlement events are the safest next adjacent ledger seam: only approved claim and premium movements should emit TigerBeetle outcomes through the Go contract path."
+    },
+    {
+      "id": "AUD-918",
+      "timestamp": "2026-05-09T12:37:18.553Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "ledger_posting_preview",
+      "entityId": "LPOST-1778330238553",
+      "action": "preview_created",
+      "outcome": "islamic-banking posting preview queued for murabaha_disbursement_authorization.",
+      "severity": "info",
+      "route": "/islamic-banking",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres",
+        "Redis",
+        "Lakehouse",
+        "Permify"
+      ],
+      "detail": "Islamic-finance commitments should use a Go posting adapter so approved contracts emit explicit TigerBeetle and downstream middleware outcomes instead of generic fallback notes."
+    },
+    {
+      "id": "AUD-917",
+      "timestamp": "2026-05-09T12:37:18.548Z",
+      "actorRole": "operations",
+      "actorId": "operations.default",
+      "entityType": "ledger_posting_preview",
+      "entityId": "LPOST-1778330238548",
+      "action": "preview_created",
+      "outcome": "teller posting preview queued for counter_transaction_confirmation.",
+      "severity": "info",
+      "route": "/teller",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres",
+        "Redis",
+        "Lakehouse"
+      ],
+      "detail": "Teller cash events should post directly through a Go ledger adapter before reconciliation and downstream reporting continue."
+    },
+    {
+      "id": "AUD-912",
+      "timestamp": "2026-05-09T12:32:17.000Z",
+      "actorRole": "branch",
+      "actorId": "branch.education.officer",
+      "entityType": "education_loan_case",
+      "entityId": "WF-1193",
+      "action": "fee_disbursement_hold_flagged",
+      "outcome": "School-fee disbursement hold escalated pending guarantor remediation.",
+      "severity": "critical",
+      "route": "/education-loans",
+      "middleware": [
+        "Temporal",
+        "Kafka",
+        "Postgres",
+        "Permify"
+      ],
+      "detail": "The routed education-loan workflow now records guarantor and admission blockers as explicit audit evidence instead of hiding them in overview posture."
+    },
+    {
+      "id": "AUD-916",
+      "timestamp": "2026-05-09T12:31:17.000Z",
+      "actorRole": "branch",
+      "actorId": "branch.collections.officer",
+      "entityType": "virtual_account",
+      "entityId": "VAN-9824",
+      "action": "dynamic_van_payment_exception_flagged",
+      "outcome": "Dynamic VAN payment exception escalated after failed inbound allocation and retry mismatch.",
+      "severity": "critical",
+      "route": "/virtual-accounts",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres",
+        "Redis"
+      ],
+      "detail": "The routed virtual-account workflow now records issuance and payment-allocation blockers as explicit audit evidence instead of leaving them inside middleware summaries."
+    },
+    {
+      "id": "AUD-908",
+      "timestamp": "2026-05-09T12:31:17.000Z",
+      "actorRole": "operations",
+      "actorId": "customer.servicing.lead",
+      "entityType": "customer_card",
+      "entityId": "CRD-1001",
+      "action": "card_controls_reviewed",
+      "outcome": "Card control overrides verified for retained servicing evidence.",
+      "severity": "info",
+      "route": "/customer/cards",
+      "middleware": [
+        "Redis",
+        "Postgres",
+        "Permify"
+      ],
+      "detail": "The servicing desk reviewed international and online card controls and retained the result for later customer evidence."
+    },
+    {
+      "id": "AUD-914",
+      "timestamp": "2026-05-09T12:30:17.000Z",
+      "actorRole": "branch",
+      "actorId": "agent.esusu.fieldlead",
+      "entityType": "esusu_group",
+      "entityId": "ESU-4402",
+      "action": "payout_hold_flagged",
+      "outcome": "Payout hold escalated after missed-contribution and identity verification exceptions.",
+      "severity": "critical",
+      "route": "/esusu",
+      "middleware": [
+        "Temporal",
+        "Kafka",
+        "Postgres",
+        "Redis",
+        "APISIX"
+      ],
+      "detail": "The routed esusu workflow now records contribution and payout blockers as explicit audit evidence instead of leaving them implied inside service notes."
+    },
+    {
+      "id": "AUD-905",
+      "timestamp": "2026-05-09T12:29:17.000Z",
+      "actorRole": "operations",
+      "actorId": "analytics.operator",
+      "entityType": "usage_analytics",
+      "entityId": "ANA-220",
+      "action": "export_refreshed",
+      "outcome": "Usage analytics evidence pack refreshed with customer and merchant adoption posture.",
+      "severity": "warning",
+      "route": "/usage-analytics",
+      "middleware": [
+        "Lakehouse",
+        "Kafka",
+        "Postgres"
+      ],
+      "detail": "Adoption analytics was refreshed after a branch-channel lag triggered review of onboarding throughput."
+    },
+    {
+      "id": "AUD-910",
+      "timestamp": "2026-05-09T12:28:17.000Z",
+      "actorRole": "branch",
+      "actorId": "branch.mortgage.officer",
+      "entityType": "mortgage_case",
+      "entityId": "WF-1191",
+      "action": "collateral_exception_flagged",
+      "outcome": "Title-perfection exception escalated before disbursement release.",
+      "severity": "critical",
+      "route": "/mortgage",
+      "middleware": [
+        "Temporal",
+        "Kafka",
+        "Postgres",
+        "Permify"
+      ],
+      "detail": "The routed mortgage workflow now records legal-perfection blockers as explicit audit evidence instead of burying them in overview posture."
+    },
+    {
+      "id": "AUD-904",
+      "timestamp": "2026-05-09T12:27:17.000Z",
+      "actorRole": "compliance",
+      "actorId": "alert.supervisor",
+      "entityType": "alert_queue",
+      "entityId": "ALT-RECON-18",
+      "action": "escalation_opened",
+      "outcome": "Alert backlog escalated for payment and identity review.",
+      "severity": "critical",
+      "route": "/alerts",
+      "middleware": [
+        "Kafka",
+        "Redis",
+        "APISIX"
+      ],
+      "detail": "A warning cluster spanning payment retries and identity review has been escalated into the shared alert desk."
+    },
+    {
+      "id": "AUD-903",
+      "timestamp": "2026-05-09T12:25:17.000Z",
+      "actorRole": "operations",
+      "actorId": "billing.controller",
+      "entityType": "billing_export",
+      "entityId": "BILL-READY-402",
+      "action": "approval_signed",
+      "outcome": "Billing export package signed for finance review.",
+      "severity": "info",
+      "route": "/billing",
+      "middleware": [
+        "Postgres",
+        "Lakehouse",
+        "Kafka"
+      ],
+      "detail": "The commercial desk signed the latest settlement evidence package and queued it for finance distribution."
+    },
+    {
+      "id": "AUD-902",
+      "timestamp": "2026-05-09T12:22:17.000Z",
+      "actorRole": "operations",
+      "actorId": "ops.supervisor",
+      "entityType": "erpnext_sync",
+      "entityId": "ERP-771",
+      "action": "retry_queued",
+      "outcome": "Retry scheduled with dependency-aware posture.",
+      "severity": "info",
+      "route": "/erpnext-sync",
+      "middleware": [
+        "Kafka",
+        "Postgres",
+        "Lakehouse"
+      ],
+      "detail": "The accounting integration queue now retains retry evidence and exposes the action through the workbench."
+    },
+    {
+      "id": "AUD-911",
+      "timestamp": "2026-05-09T12:21:17.000Z",
+      "actorRole": "operations",
+      "actorId": "education.finance.supervisor",
+      "entityType": "education_loan_case",
+      "entityId": "WF-1192",
+      "action": "guarantor_review_started",
+      "outcome": "Education-loan guarantor and admission review opened.",
+      "severity": "warning",
+      "route": "/education-loans",
+      "middleware": [
+        "Temporal",
+        "Kafka",
+        "Postgres"
+      ],
+      "detail": "The education-loan desk opened a routed guarantor and admission review so school-fee disbursement blockers stay visible in the shared shell."
+    },
+    {
+      "id": "AUD-915",
+      "timestamp": "2026-05-09T12:21:17.000Z",
+      "actorRole": "operations",
+      "actorId": "payments.van.supervisor",
+      "entityType": "virtual_account",
+      "entityId": "VAN-9801",
+      "action": "dedicated_van_suspension_review_started",
+      "outcome": "Dedicated VAN suspension and settlement review opened for a flagged collections account.",
+      "severity": "warning",
+      "route": "/virtual-accounts",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres"
+      ],
+      "detail": "The routed VAN desk opened a suspension review so inbound settlement posture and collection continuity stay visible in the shared shell."
+    },
+    {
+      "id": "AUD-913",
+      "timestamp": "2026-05-09T12:18:17.000Z",
+      "actorRole": "operations",
+      "actorId": "esusu.supervisor",
+      "entityType": "esusu_group",
+      "entityId": "ESU-4401",
+      "action": "collection_cycle_review_started",
+      "outcome": "Contribution-cycle and payout review opened for flagged esusu groups.",
+      "severity": "warning",
+      "route": "/esusu",
+      "middleware": [
+        "Temporal",
+        "Kafka",
+        "Postgres",
+        "Redis"
+      ],
+      "detail": "The routed esusu desk opened a collection-cycle review so reminder cadence and payout readiness stay visible in the shared shell."
+    },
+    {
+      "id": "AUD-909",
+      "timestamp": "2026-05-09T12:15:17.000Z",
+      "actorRole": "operations",
+      "actorId": "mortgage.supervisor",
+      "entityType": "mortgage_case",
+      "entityId": "WF-1190",
+      "action": "underwriting_review_started",
+      "outcome": "Mortgage affordability and valuation exception review opened.",
+      "severity": "warning",
+      "route": "/mortgage",
+      "middleware": [
+        "Temporal",
+        "Kafka",
+        "Postgres"
+      ],
+      "detail": "The mortgage desk opened a routed underwriting review so collateral and affordability evidence stay visible in the shared shell."
+    },
+    {
+      "id": "AUD-901",
+      "timestamp": "2026-05-09T11:57:17.000Z",
+      "actorRole": "treasury",
+      "actorId": "treasury.lead",
+      "entityType": "ledger_discrepancy",
+      "entityId": "REC-4401",
+      "action": "review_started",
+      "outcome": "Variance triage opened for TigerBeetle/PostgreSQL parity drift.",
+      "severity": "warning",
+      "route": "/ledger-sync",
+      "middleware": [
+        "TigerBeetle",
+        "Postgres",
+        "Kafka",
+        "Lakehouse"
+      ],
+      "detail": "The reconciliation desk reviewed the latest discrepancy snapshot and queued a manual repair decision."
+    }
+  ],
+  "exportJobs": [
+    {
+      "id": "EXP-214",
+      "domainKey": "ledger-reconciliation",
+      "title": "Runtime ledger evidence pack",
+      "format": "csv",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:37:19.172Z",
+      "requestedByRole": "treasury",
+      "route": "/ledger-sync",
+      "rowCount": 4,
+      "approvalState": "Signed",
+      "approvalSignature": "TREASURY-AUTO-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-214/download",
+      "retainedUntil": "2026-08-07T12:37:19.172Z",
+      "reportVersion": "v14",
+      "approvalChain": [
+        "Treasury and ledger control"
+      ],
+      "signedBy": [
+        "TREASURY-AUTO-SIGNOFF"
+      ]
+    },
+    {
+      "id": "EXP-213",
+      "domainKey": "customer-statements",
+      "title": "Runtime export approval test",
+      "format": "CSV",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:37:19.163Z",
+      "requestedByRole": "operations",
+      "route": "/customer/statements",
+      "rowCount": 12,
+      "approvalState": "Signed",
+      "approvalSignature": "CUSTOMER-CUS-001",
+      "downloadUrl": "/api/platform/exports/EXP-213/download",
+      "retainedUntil": "2026-06-08T12:37:19.163Z",
+      "reportVersion": "v13",
+      "approvalChain": [
+        "Customer servicing",
+        "Branch operations"
+      ],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-212",
+      "domainKey": "ledger-reconciliation",
+      "title": "Runtime ledger evidence pack",
+      "format": "csv",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:36:45.000Z",
+      "requestedByRole": "treasury",
+      "route": "/ledger-sync",
+      "rowCount": 4,
+      "approvalState": "Signed",
+      "approvalSignature": "TREASURY-AUTO-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-212/download",
+      "retainedUntil": "2026-08-07T12:36:45.000Z",
+      "reportVersion": "v12",
+      "approvalChain": [
+        "Treasury and ledger control"
+      ],
+      "signedBy": [
+        "TREASURY-AUTO-SIGNOFF"
+      ]
+    },
+    {
+      "id": "EXP-211",
+      "domainKey": "customer-statements",
+      "title": "Runtime export approval test",
+      "format": "csv",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:36:45.000Z",
+      "requestedByRole": "operations",
+      "route": "/customer/statements",
+      "rowCount": 12,
+      "approvalState": "Signed",
+      "approvalSignature": "CUSTOMER-CUS-001",
+      "downloadUrl": "/api/platform/exports/EXP-211/download",
+      "retainedUntil": "2026-06-08T12:36:45.000Z",
+      "reportVersion": "v11",
+      "approvalChain": [
+        "Customer servicing",
+        "Branch operations"
+      ],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-206",
+      "domainKey": "customer-operations",
+      "title": "Customer card-control audit pack",
+      "format": "csv",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:26:00.000Z",
+      "requestedByRole": "operations",
+      "route": "/customer/cards",
+      "rowCount": 16,
+      "approvalState": "Signed",
+      "approvalSignature": "CUSTOMER-SERVICING-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-206/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-205",
+      "domainKey": "operations",
+      "title": "Alert desk escalation package",
+      "format": "json",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:24:00.000Z",
+      "requestedByRole": "compliance",
+      "route": "/alerts",
+      "rowCount": 13,
+      "approvalState": "Signed",
+      "approvalSignature": "ALERT-COMPLIANCE-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-205/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-210",
+      "domainKey": "virtual-accounts",
+      "title": "VAN suspension and settlement evidence pack",
+      "format": "json",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:23:00.000Z",
+      "requestedByRole": "operations",
+      "route": "/virtual-accounts",
+      "rowCount": 24,
+      "approvalState": "Signed",
+      "approvalSignature": "VAN-OPS-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-210/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-204",
+      "domainKey": "analytics",
+      "title": "Usage analytics adoption snapshot",
+      "format": "csv",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:22:00.000Z",
+      "requestedByRole": "operations",
+      "route": "/usage-analytics",
+      "rowCount": 54,
+      "approvalState": "Pending review",
+      "approvalSignature": "ANALYTICS-OPS-REVIEW",
+      "downloadUrl": "/api/platform/exports/EXP-204/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-209",
+      "domainKey": "esusu-groups",
+      "title": "Esusu payout and defaulter review pack",
+      "format": "json",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:21:00.000Z",
+      "requestedByRole": "operations",
+      "route": "/esusu",
+      "rowCount": 17,
+      "approvalState": "Signed",
+      "approvalSignature": "ESUSU-OPS-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-209/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-208",
+      "domainKey": "education-loans",
+      "title": "Education-loan disbursement exception pack",
+      "format": "json",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:19:00.000Z",
+      "requestedByRole": "operations",
+      "route": "/education-loans",
+      "rowCount": 11,
+      "approvalState": "Signed",
+      "approvalSignature": "EDU-FINANCE-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-208/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-203",
+      "domainKey": "analytics",
+      "title": "Billing settlement readiness pack",
+      "format": "xlsx",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:15:00.000Z",
+      "requestedByRole": "operations",
+      "route": "/billing",
+      "rowCount": 27,
+      "approvalState": "Signed",
+      "approvalSignature": "BILLING-FINANCE-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-203/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-207",
+      "domainKey": "mortgage-servicing",
+      "title": "Mortgage underwriting exception pack",
+      "format": "json",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:15:00.000Z",
+      "requestedByRole": "operations",
+      "route": "/mortgage",
+      "rowCount": 14,
+      "approvalState": "Signed",
+      "approvalSignature": "MORTGAGE-OPS-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-207/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-202",
+      "domainKey": "dispute-management",
+      "title": "Dispute case review pack",
+      "format": "json",
+      "status": "Ready",
+      "createdAt": "2026-05-09T12:08:00.000Z",
+      "requestedByRole": "compliance",
+      "route": "/disputes",
+      "rowCount": 18,
+      "approvalState": "Signed",
+      "approvalSignature": "COMPLIANCE-LEGAL-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-202/download",
+      "approvalChain": [],
+      "signedBy": []
+    },
+    {
+      "id": "EXP-201",
+      "domainKey": "ledger-reconciliation",
+      "title": "Ledger variance summary",
+      "format": "csv",
+      "status": "Ready",
+      "createdAt": "2026-05-09T11:23:00.000Z",
+      "requestedByRole": "treasury",
+      "route": "/ledger-sync",
+      "rowCount": 42,
+      "approvalState": "Signed",
+      "approvalSignature": "TREASURY-OPS-SIGNOFF",
+      "downloadUrl": "/api/platform/exports/EXP-201/download",
+      "approvalChain": [],
+      "signedBy": []
+    }
+  ],
+  "partnerOnboardingRecords": [
+    {
+      "id": "PARTNER-003",
+      "tenantId": "tenant-runtime-partner-bank-1778330239178",
+      "partnerName": "Runtime Partner Bank 1778330239178",
+      "legalEntity": "Runtime Partner Bank 1778330239178 Ltd",
+      "partnerType": "fintech",
+      "region": "Ibadan",
+      "stage": "launch_ready",
+      "requestedModules": [
+        "digital_onboarding",
+        "cards",
+        "notifications"
+      ],
+      "primaryContact": {
+        "name": "Ada Runtime",
+        "role": "Programme manager",
+        "email": "ada@runtime.54bank.app",
+        "phone": "+234800019900"
+      },
+      "operationsContact": {
+        "name": "Bola Runtime",
+        "role": "Operations lead",
+        "email": "ops@runtime.54bank.app",
+        "phone": "+234800019901"
+      },
+      "commercial": {
+        "plan": "starter",
+        "billingModel": "Platform fee",
+        "revenueSharePct": 10,
+        "settlementBank": "54Bank Settlement",
+        "settlementAccountName": "Runtime Settlement",
+        "settlementAccountNumber": "2223334445",
+        "settlementFrequency": "weekly"
+      },
+      "compliance": {
+        "kybStatus": "approved",
+        "requiredDocumentCount": 6,
+        "submittedDocumentCount": 6,
+        "riskRating": "medium",
+        "notes": "",
+        "lastReviewedAt": "2026-05-09T12:37:19.685Z"
+      },
+      "branding": {
+        "displayName": "Runtime Partner Bank 1778330239178",
+        "supportEmail": "partners@54bank.app",
+        "primaryColor": "#0f766e",
+        "accentColor": "#f59e0b",
+        "logoUrl": "https://assets.54bank.app/logos/54bank-partner-program.png",
+        "loginHeadline": "Runtime Partner Bank 1778330239178 onboarding workspace is ready for configuration and review.",
+        "customDomain": ""
+      },
+      "checklist": [
+        {
+          "key": "company_profile",
+          "label": "Company profile completed",
+          "owner": "partner",
+          "completed": true
+        },
+        {
+          "key": "commercial_terms",
+          "label": "Commercial package confirmed",
+          "owner": "partner",
+          "completed": true
+        },
+        {
+          "key": "kyb_documents",
+          "label": "KYB and compliance documents uploaded",
+          "owner": "partner",
+          "completed": true
+        },
+        {
+          "key": "branding_pack",
+          "label": "Branding pack finalized",
+          "owner": "partner",
+          "completed": true
+        },
+        {
+          "key": "ops_runbook",
+          "label": "Operations runbook reviewed",
+          "owner": "operations",
+          "completed": true
+        },
+        {
+          "key": "launch_readiness",
+          "label": "Launch readiness review completed",
+          "owner": "operations",
+          "completed": true
+        }
+      ],
+      "blockers": [],
+      "readinessScore": 100,
+      "createdAt": "2026-05-09T12:37:19.287Z",
+      "updatedAt": "2026-05-09T12:37:20.348Z",
+      "submittedAt": "2026-05-09T12:37:19.400Z",
+      "lastSubmittedBy": "partner.portal"
+    },
+    {
+      "id": "PARTNER-001",
+      "tenantId": "tenant-sunrise-mfb",
+      "partnerName": "Sunrise Microfinance Bank",
+      "legalEntity": "Sunrise MFB Limited",
+      "partnerType": "mfb",
+      "region": "Lagos",
+      "stage": "commercial_review",
+      "requestedModules": [
+        "digital_onboarding",
+        "cards",
+        "transfers",
+        "savings",
+        "notifications"
+      ],
+      "primaryContact": {
+        "email": "ifeoma@sunrisemfb.bank",
+        "name": "Ifeoma Okonkwo",
+        "phone": "+234800010001",
+        "role": "Program lead"
+      },
+      "operationsContact": {
+        "email": "ops@sunrisemfb.bank",
+        "name": "Tunde Adebayo",
+        "phone": "+234800010002",
+        "role": "Operations manager"
+      },
+      "commercial": {
+        "billingModel": "Revenue share + platform fee",
+        "goLiveTarget": "2026-05-30T12:37:17.117Z",
+        "plan": "growth",
+        "revenueSharePct": 12,
+        "settlementAccountName": "Sunrise Settlement Collection",
+        "settlementAccountNumber": "1234567890",
+        "settlementBank": "54Bank Settlement",
+        "settlementFrequency": "daily"
+      },
+      "compliance": {
+        "kybStatus": "in_review",
+        "lastReviewedAt": "2026-05-08T18:37:17.117Z",
+        "notes": "Corporate documents received; awaiting commercial sign-off before provisioning.",
+        "requiredDocumentCount": 8,
+        "riskRating": "medium",
+        "submittedDocumentCount": 8
+      },
+      "branding": {
+        "accentColor": "#1d4ed8",
+        "customDomain": "bank.sunrisemfb.bank",
+        "displayName": "Sunrise Bank",
+        "loginHeadline": "Digital banking tailored for Sunrise branch and field teams.",
+        "logoUrl": "https://assets.54bank.app/logos/sunrise-mfb.png",
+        "primaryColor": "#ea580c",
+        "supportEmail": "support@sunrisemfb.bank"
+      },
+      "checklist": [
+        {
+          "completed": true,
+          "key": "company_profile",
+          "label": "Company profile completed",
+          "owner": "partner"
+        },
+        {
+          "completed": true,
+          "key": "commercial_terms",
+          "label": "Commercial package confirmed",
+          "owner": "partner"
+        },
+        {
+          "completed": true,
+          "key": "kyb_documents",
+          "label": "KYB and compliance documents uploaded",
+          "owner": "partner"
+        },
+        {
+          "completed": true,
+          "key": "branding_pack",
+          "label": "Branding pack finalized",
+          "owner": "partner"
+        },
+        {
+          "completed": false,
+          "key": "ops_runbook",
+          "label": "Operations runbook reviewed",
+          "owner": "operations"
+        },
+        {
+          "completed": false,
+          "key": "launch_readiness",
+          "label": "Launch readiness review completed",
+          "owner": "operations"
+        }
+      ],
+      "blockers": [
+        "Commercial package approval is still pending.",
+        "Launch checklist still has incomplete items."
+      ],
+      "readinessScore": 90,
+      "createdAt": "2026-04-27T12:37:17.000Z",
+      "updatedAt": "2026-05-09T12:37:20.348Z",
+      "submittedAt": "2026-05-02T12:37:17.000Z",
+      "lastSubmittedBy": "ifeoma@sunrisemfb.bank"
+    },
+    {
+      "id": "PARTNER-002",
+      "tenantId": "tenant-greenfield-fintech",
+      "partnerName": "Greenfield Lending",
+      "legalEntity": "Greenfield Lending Technologies Ltd",
+      "partnerType": "fintech",
+      "region": "Abuja",
+      "stage": "draft",
+      "requestedModules": [
+        "digital_onboarding",
+        "loans",
+        "notifications"
+      ],
+      "primaryContact": {
+        "email": "mary@greenfieldlending.app",
+        "name": "Mary Danjuma",
+        "phone": "+234800010101",
+        "role": "Founder"
+      },
+      "operationsContact": {
+        "email": "",
+        "name": "",
+        "phone": "",
+        "role": ""
+      },
+      "commercial": {
+        "billingModel": "Platform fee",
+        "goLiveTarget": "2026-06-23T12:37:17.117Z",
+        "plan": "starter",
+        "revenueSharePct": 8,
+        "settlementAccountName": "",
+        "settlementAccountNumber": "",
+        "settlementBank": "",
+        "settlementFrequency": "weekly"
+      },
+      "compliance": {
+        "kybStatus": "not_started",
+        "notes": "Draft partner intake still missing KYB packet and settlement details.",
+        "requiredDocumentCount": 8,
+        "riskRating": "medium",
+        "submittedDocumentCount": 3
+      },
+      "branding": {
+        "accentColor": "#f59e0b",
+        "customDomain": "",
+        "displayName": "Greenfield",
+        "loginHeadline": "Launch greenfield credit journeys with a branded onboarding experience.",
+        "logoUrl": "https://assets.54bank.app/logos/greenfields-finance.png",
+        "primaryColor": "#166534",
+        "supportEmail": "hello@greenfieldlending.app"
+      },
+      "checklist": [
+        {
+          "completed": false,
+          "key": "company_profile",
+          "label": "Company profile completed",
+          "owner": "partner"
+        },
+        {
+          "completed": false,
+          "key": "commercial_terms",
+          "label": "Commercial package confirmed",
+          "owner": "partner"
+        },
+        {
+          "completed": false,
+          "key": "kyb_documents",
+          "label": "KYB and compliance documents uploaded",
+          "owner": "partner"
+        },
+        {
+          "completed": false,
+          "key": "branding_pack",
+          "label": "Branding pack finalized",
+          "owner": "partner"
+        },
+        {
+          "completed": false,
+          "key": "ops_runbook",
+          "label": "Operations runbook reviewed",
+          "owner": "operations"
+        },
+        {
+          "completed": false,
+          "key": "launch_readiness",
+          "label": "Launch readiness review completed",
+          "owner": "operations"
+        }
+      ],
+      "blockers": [
+        "Operations contact details are incomplete.",
+        "Settlement configuration is incomplete.",
+        "Compliance documents are incomplete.",
+        "Launch checklist still has incomplete items."
+      ],
+      "readinessScore": 42,
+      "createdAt": "2026-05-05T12:37:17.000Z",
+      "updatedAt": "2026-05-09T12:37:20.348Z"
+    }
+  ],
+  "partnerApprovalRecords": [
+    {
+      "id": "PARTNER-APR-002",
+      "partnerId": "PARTNER-001",
+      "stage": "commercial_review",
+      "title": "Commercial package approval",
+      "detail": "Confirm pricing, settlement expectations, and requested module scope before provisioning begins.",
+      "state": "pending",
+      "requiredRole": "treasury",
+      "requestedAt": "2026-05-07T12:37:17.000Z",
+      "requestedById": "ops@sunrisemfb.bank"
+    },
+    {
+      "id": "PARTNER-APR-001",
+      "partnerId": "PARTNER-001",
+      "stage": "compliance_review",
+      "title": "Compliance readiness review",
+      "detail": "Validate KYB documents, shareholder structure, and risk posture before commercial packaging is finalized.",
+      "state": "approved",
+      "requiredRole": "compliance",
+      "requestedAt": "2026-05-02T12:37:17.000Z",
+      "requestedById": "ifeoma@sunrisemfb.bank",
+      "resolvedAt": "2026-05-04T12:37:17.000Z",
+      "resolutionNote": "KYB packet complete. No critical blockers remain at compliance stage."
+    },
+    {
+      "id": "PARTNER-APR-003",
+      "partnerId": "PARTNER-003",
+      "stage": "compliance_review",
+      "title": "Compliance readiness review",
+      "detail": "Validate KYB package and risk posture for Runtime Partner Bank 1778330239178.",
+      "state": "approved",
+      "requiredRole": "compliance",
+      "requestedAt": "2026-05-09T12:37:19.400Z",
+      "requestedById": "partner.portal",
+      "resolvedAt": "2026-05-09T12:37:19.685Z",
+      "resolutionNote": "Compliance packet validated"
+    },
+    {
+      "id": "PARTNER-APR-004",
+      "partnerId": "PARTNER-003",
+      "stage": "commercial_review",
+      "title": "Commercial package approval",
+      "detail": "Approve pricing, settlement model, and requested modules for Runtime Partner Bank 1778330239178.",
+      "state": "approved",
+      "requiredRole": "treasury",
+      "requestedAt": "2026-05-09T12:37:19.400Z",
+      "requestedById": "partner.portal",
+      "resolvedAt": "2026-05-09T12:37:19.802Z",
+      "resolutionNote": "Commercial structure approved"
+    },
+    {
+      "id": "PARTNER-APR-005",
+      "partnerId": "PARTNER-003",
+      "stage": "operations_review",
+      "title": "Operations readiness approval",
+      "detail": "Confirm onboarding checklist, support readiness, and provisioning dependencies for Runtime Partner Bank 1778330239178.",
+      "state": "approved",
+      "requiredRole": "operations",
+      "requestedAt": "2026-05-09T12:37:19.400Z",
+      "requestedById": "partner.portal",
+      "resolvedAt": "2026-05-09T12:37:19.914Z",
+      "resolutionNote": "Operations readiness approved"
+    },
+    {
+      "id": "PARTNER-APR-006",
+      "partnerId": "PARTNER-003",
+      "stage": "launch_signoff",
+      "title": "Final launch sign-off",
+      "detail": "Approve launch readiness and white-label rollout for Runtime Partner Bank 1778330239178.",
+      "state": "approved",
+      "requiredRole": "operations",
+      "requestedAt": "2026-05-09T12:37:19.400Z",
+      "requestedById": "partner.portal",
+      "resolvedAt": "2026-05-09T12:37:20.347Z",
+      "resolutionNote": "Launch sign-off granted"
+    }
+  ]
+}

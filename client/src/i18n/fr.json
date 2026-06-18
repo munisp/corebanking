@@ -1,0 +1,18 @@
+{
+  "app_name": "54Bank",
+  "dashboard": "Tableau de bord",
+  "accounts": "Comptes",
+  "transfers": "Transferts",
+  "payments": "Paiements",
+  "cards": "Cartes",
+  "loans": "Prêts",
+  "settings": "Paramètres",
+  "logout": "Déconnexion",
+  "welcome": "Bienvenue",
+  "balance": "Solde du compte",
+  "recent_transactions": "Transactions récentes",
+  "quick_transfer": "Transfert rapide",
+  "pay_bills": "Payer les factures",
+  "currency": "XOF",
+  "language": "Français"
+}

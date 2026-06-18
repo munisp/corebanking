@@ -1,0 +1,18 @@
+[package]
+name = "swift-iso20022-rs"
+version = "2.0.0"
+edition = "2021"
+[[bin]]
+name = "swift-iso20022-rs"
+path = "src/main.rs"
+[dependencies]
+actix-cors = "0.7"
+tokio-postgres = "0.7"
+sha2 = "0.10"
+lazy_static = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+actix-web = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

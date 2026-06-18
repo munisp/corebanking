@@ -1,0 +1,18 @@
+{
+  "app_name": "٥٤بنك",
+  "dashboard": "لوحة القيادة",
+  "accounts": "الحسابات",
+  "transfers": "التحويلات",
+  "payments": "المدفوعات",
+  "cards": "البطاقات",
+  "loans": "القروض",
+  "settings": "الإعدادات",
+  "logout": "تسجيل الخروج",
+  "welcome": "مرحبًا بعودتك",
+  "balance": "رصيد الحساب",
+  "recent_transactions": "المعاملات الأخيرة",
+  "quick_transfer": "تحويل سريع",
+  "pay_bills": "دفع الفواتير",
+  "currency": "NGN",
+  "language": "العربية"
+}

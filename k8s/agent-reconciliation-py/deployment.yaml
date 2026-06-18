@@ -1,0 +1,156 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-reconciliation-py
+  labels:
+    app: agent-reconciliation-py
+    tier: ai-agents
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: agent-reconciliation-py
+  template:
+    metadata:
+      labels:
+        app: agent-reconciliation-py
+        tier: ai-agents
+    spec:
+      serviceAccountName: agent-reconciliation-py
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: agent-reconciliation-py
+          image: 54bank/agent-reconciliation-py:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: PORT
+              value: "8080"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: REDIS_URL
+              value: redis-cluster:6379
+            - name: KPI_ENGINE_URL
+              value: http://kpi-engine-go:8500
+            - name: NEO4J_COA_URL
+              value: http://neo4j-coa-graph-py:8080
+            - name: GL_ENGINE_URL
+              value: http://gl-engine-go:8080
+            - name: AGENT_NL_URL
+              value: http://agent-nl-reporting-py:8080
+            - name: AGENT_CASH_URL
+              value: http://agent-cash-management-py:8080
+            - name: AGENT_FRAUD_URL
+              value: http://agent-fraud-detection-py:8080
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            failureThreshold: 30
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-reconciliation-py
+spec:
+  selector:
+    app: agent-reconciliation-py
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agent-reconciliation-py
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent-reconciliation-py
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agent-reconciliation-py
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: agent-reconciliation-py
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: agent-reconciliation-py
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-reconciliation-py
+spec:
+  podSelector:
+    matchLabels:
+      app: agent-reconciliation-py
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              tier: ai-agents
+        - podSelector:
+            matchLabels:
+              app: api-gateway
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - to:
+        - podSelector: {}
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 5432
+          protocol: TCP
+        - port: 6379
+          protocol: TCP

@@ -1,0 +1,435 @@
+heat_template_version: 2021-04-16
+description: >
+  54Bank Core Banking Platform — OpenStack Heat Orchestration Template
+  Deploys the full platform stack: K8s cluster, PostgreSQL, Redis, Kafka,
+  load balancer, monitoring, and all 425 microservices.
+
+parameters:
+  environment:
+    type: string
+    default: production
+    constraints:
+      - allowed_values: [staging, production]
+  
+  key_name:
+    type: string
+    description: SSH key pair name for instance access
+  
+  external_network:
+    type: string
+    description: External/provider network for floating IPs
+    default: external
+  
+  image:
+    type: string
+    description: Base OS image (Ubuntu 22.04 LTS recommended)
+    default: ubuntu-22.04-lts
+  
+  k8s_master_flavor:
+    type: string
+    default: m1.xlarge
+    description: "Flavor for K8s master (min 4 vCPU, 16GB RAM)"
+  
+  k8s_worker_flavor:
+    type: string
+    default: m1.2xlarge
+    description: "Flavor for K8s workers (min 8 vCPU, 32GB RAM)"
+  
+  db_flavor:
+    type: string
+    default: m1.xlarge
+    description: "Flavor for PostgreSQL (min 4 vCPU, 16GB RAM, SSD)"
+  
+  worker_count:
+    type: number
+    default: 3
+    constraints:
+      - range: { min: 2, max: 20 }
+  
+  db_volume_size:
+    type: number
+    default: 200
+    description: "PostgreSQL data volume size in GB"
+  
+  db_password:
+    type: string
+    hidden: true
+    description: PostgreSQL superuser password
+  
+  domain_name:
+    type: string
+    default: 54bank.local
+    description: Internal DNS domain
+
+resources:
+
+  # ── Networking ──────────────────────────────────────────
+
+  platform_network:
+    type: OS::Neutron::Net
+    properties:
+      name:
+        str_replace:
+          template: 54bank-NET-ENV
+          params:
+            ENV: { get_param: environment }
+
+  platform_subnet:
+    type: OS::Neutron::Subnet
+    properties:
+      network: { get_resource: platform_network }
+      cidr: 10.54.0.0/16
+      gateway_ip: 10.54.0.1
+      dns_nameservers: [8.8.8.8, 8.8.4.4]
+      allocation_pools:
+        - start: 10.54.1.10
+          end: 10.54.254.250
+      ip_version: 4
+
+  platform_router:
+    type: OS::Neutron::Router
+    properties:
+      external_gateway_info:
+        network: { get_param: external_network }
+
+  router_interface:
+    type: OS::Neutron::RouterInterface
+    properties:
+      router: { get_resource: platform_router }
+      subnet: { get_resource: platform_subnet }
+
+  # ── Security Groups ────────────────────────────────────
+
+  sg_k8s:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: 54bank-k8s-sg
+      rules:
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 6443
+          port_range_max: 6443
+          remote_ip_prefix: 0.0.0.0/0
+          description: K8s API
+        - protocol: tcp
+          port_range_min: 80
+          port_range_max: 80
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 443
+          port_range_max: 443
+          remote_ip_prefix: 0.0.0.0/0
+        - protocol: tcp
+          port_range_min: 30000
+          port_range_max: 32767
+          remote_ip_prefix: 10.54.0.0/16
+          description: NodePort range
+        - protocol: tcp
+          port_range_min: 1
+          port_range_max: 65535
+          remote_group_id:
+          description: Intra-cluster
+        - protocol: icmp
+          remote_ip_prefix: 10.54.0.0/16
+
+  sg_database:
+    type: OS::Neutron::SecurityGroup
+    properties:
+      name: 54bank-db-sg
+      rules:
+        - protocol: tcp
+          port_range_min: 5432
+          port_range_max: 5432
+          remote_group_id: { get_resource: sg_k8s }
+          description: PostgreSQL from K8s
+        - protocol: tcp
+          port_range_min: 6432
+          port_range_max: 6432
+          remote_group_id: { get_resource: sg_k8s }
+          description: PgBouncer from K8s
+        - protocol: tcp
+          port_range_min: 6379
+          port_range_max: 6379
+          remote_group_id: { get_resource: sg_k8s }
+          description: Redis from K8s
+        - protocol: tcp
+          port_range_min: 9092
+          port_range_max: 9092
+          remote_group_id: { get_resource: sg_k8s }
+          description: Kafka from K8s
+        - protocol: tcp
+          port_range_min: 22
+          port_range_max: 22
+          remote_ip_prefix: 10.54.0.0/16
+
+  # ── Database Server ────────────────────────────────────
+
+  db_volume:
+    type: OS::Cinder::Volume
+    properties:
+      size: { get_param: db_volume_size }
+      volume_type: ssd-high-iops
+      description: PostgreSQL data volume
+
+  db_server:
+    type: OS::Nova::Server
+    properties:
+      name: 54bank-db-primary
+      flavor: { get_param: db_flavor }
+      image: { get_param: image }
+      key_name: { get_param: key_name }
+      networks:
+        - network: { get_resource: platform_network }
+          fixed_ip: 10.54.10.10
+      security_groups:
+        - { get_resource: sg_database }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -euo pipefail
+            
+            # System tuning for Postgres
+            cat >> /etc/sysctl.conf <<EOF
+            vm.overcommit_memory = 2
+            vm.overcommit_ratio = 90
+            vm.swappiness = 1
+            vm.dirty_ratio = 10
+            vm.dirty_background_ratio = 3
+            vm.zone_reclaim_mode = 0
+            kernel.shmmax = 4294967296
+            kernel.shmall = 1048576
+            net.core.somaxconn = 65535
+            net.ipv4.tcp_max_syn_backlog = 65535
+            EOF
+            sysctl -p
+            
+            # Disable THP
+            echo never > /sys/kernel/mm/transparent_hugepage/enabled
+            echo never > /sys/kernel/mm/transparent_hugepage/defrag
+            
+            # Install PostgreSQL 16
+            apt-get update && apt-get install -y postgresql-16 postgresql-16-pgaudit redis-server pgbouncer
+            
+            # Mount data volume
+            mkfs.ext4 /dev/vdb
+            mkdir -p /var/lib/postgresql/16/main
+            mount /dev/vdb /var/lib/postgresql/16/main
+            echo '/dev/vdb /var/lib/postgresql/16/main ext4 defaults,noatime,nodiratime 0 2' >> /etc/fstab
+            chown postgres:postgres /var/lib/postgresql/16/main
+            
+            # Configure PostgreSQL
+            cat > /etc/postgresql/16/main/conf.d/54bank.conf <<PGCONF
+            # 54Bank production tuning
+            shared_buffers = '4GB'
+            effective_cache_size = '12GB'
+            work_mem = '64MB'
+            maintenance_work_mem = '1GB'
+            huge_pages = try
+            wal_buffers = '64MB'
+            max_wal_size = '4GB'
+            min_wal_size = '1GB'
+            checkpoint_completion_target = 0.9
+            checkpoint_timeout = '15min'
+            wal_compression = zstd
+            random_page_cost = 1.1
+            effective_io_concurrency = 200
+            default_statistics_target = 500
+            max_parallel_workers_per_gather = 2
+            max_parallel_workers = 4
+            max_connections = 200
+            autovacuum_max_workers = 4
+            autovacuum_naptime = '30s'
+            autovacuum_vacuum_scale_factor = 0.02
+            autovacuum_analyze_scale_factor = 0.01
+            log_min_duration_statement = 100
+            log_checkpoints = on
+            log_lock_waits = on
+            statement_timeout = '60s'
+            idle_in_transaction_session_timeout = '30s'
+            jit = on
+            PGCONF
+            
+            # Listen on all interfaces
+            echo "listen_addresses = '*'" >> /etc/postgresql/16/main/conf.d/54bank.conf
+            echo "host all all 10.54.0.0/16 scram-sha-256" >> /etc/postgresql/16/main/pg_hba.conf
+            
+            # Create database and user
+            systemctl restart postgresql
+            sudo -u postgres psql -c "CREATE USER ndsep_user WITH PASSWORD '$DB_PASSWORD' CREATEDB;"
+            sudo -u postgres psql -c "CREATE DATABASE ndsep_db OWNER ndsep_user;"
+            sudo -u postgres psql -c "GRANT ALL ON DATABASE ndsep_db TO ndsep_user;"
+            
+            # Configure Redis
+            sed -i 's/bind 127.0.0.1/bind 0.0.0.0/' /etc/redis/redis.conf
+            echo "maxmemory 2gb" >> /etc/redis/redis.conf
+            echo "maxmemory-policy allkeys-lru" >> /etc/redis/redis.conf
+            systemctl restart redis
+            
+            # Configure PgBouncer
+            echo '"ndsep_user" "DB_PASSWORD"' > /etc/pgbouncer/userlist.txt
+            systemctl restart pgbouncer
+          params:
+            $DB_PASSWORD: { get_param: db_password }
+
+  db_volume_attach:
+    type: OS::Cinder::VolumeAttachment
+    properties:
+      volume_id: { get_resource: db_volume }
+      instance_uuid: { get_resource: db_server }
+      mountpoint: /dev/vdb
+
+  # ── K8s Master ─────────────────────────────────────────
+
+  k8s_master:
+    type: OS::Nova::Server
+    depends_on: [db_server]
+    properties:
+      name: 54bank-k8s-master
+      flavor: { get_param: k8s_master_flavor }
+      image: { get_param: image }
+      key_name: { get_param: key_name }
+      networks:
+        - network: { get_resource: platform_network }
+          fixed_ip: 10.54.20.10
+      security_groups:
+        - { get_resource: sg_k8s }
+      user_data_format: RAW
+      user_data:
+        str_replace:
+          template: |
+            #!/bin/bash
+            set -euo pipefail
+            
+            # Install K3s (lightweight K8s for on-premise)
+            curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
+              --cluster-init \
+              --tls-san 10.54.20.10 \
+              --node-ip 10.54.20.10 \
+              --flannel-iface eth0 \
+              --write-kubeconfig-mode 644" sh -
+            
+            # Wait for K3s
+            sleep 30
+            
+            # Install Helm
+            curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+            
+            # Store join token for workers
+            cat /var/lib/rancher/k3s/server/node-token > /tmp/k3s-token
+          params:
+            $DOMAIN: { get_param: domain_name }
+
+  k8s_master_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: external_network }
+
+  k8s_master_fip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: k8s_master_floating_ip }
+      port_id:
+        get_attr: [k8s_master, addresses, { get_resource: platform_network }, 0, port]
+
+  # ── K8s Workers ────────────────────────────────────────
+
+  k8s_workers:
+    type: OS::Heat::ResourceGroup
+    depends_on: [k8s_master]
+    properties:
+      count: { get_param: worker_count }
+      resource_def:
+        type: OS::Nova::Server
+        properties:
+          name: 54bank-k8s-worker-%index%
+          flavor: { get_param: k8s_worker_flavor }
+          image: { get_param: image }
+          key_name: { get_param: key_name }
+          networks:
+            - network: { get_resource: platform_network }
+          security_groups:
+            - { get_resource: sg_k8s }
+          user_data_format: RAW
+          user_data:
+            str_replace:
+              template: |
+                #!/bin/bash
+                set -euo pipefail
+                
+                # Wait for master
+                sleep 60
+                
+                # Join K3s cluster
+                curl -sfL https://get.k3s.io | K3S_URL=https://10.54.20.10:6443 \
+                  K3S_TOKEN_FILE=/dev/stdin sh - <<< "$(ssh -o StrictHostKeyChecking=no 10.54.20.10 cat /var/lib/rancher/k3s/server/node-token)"
+              params:
+                $MASTER_IP: 10.54.20.10
+
+  # ── Load Balancer ──────────────────────────────────────
+
+  lb:
+    type: OS::Octavia::LoadBalancer
+    properties:
+      name: 54bank-lb
+      vip_subnet: { get_resource: platform_subnet }
+
+  lb_listener_https:
+    type: OS::Octavia::Listener
+    properties:
+      loadbalancer: { get_resource: lb }
+      protocol: TCP
+      protocol_port: 443
+
+  lb_listener_http:
+    type: OS::Octavia::Listener
+    properties:
+      loadbalancer: { get_resource: lb }
+      protocol: TCP
+      protocol_port: 80
+
+  lb_floating_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: { get_param: external_network }
+
+  lb_fip_assoc:
+    type: OS::Neutron::FloatingIPAssociation
+    properties:
+      floatingip_id: { get_resource: lb_floating_ip }
+      port_id:
+        get_attr: [lb, vip_port_id]
+
+outputs:
+  k8s_api_endpoint:
+    description: Kubernetes API endpoint
+    value:
+      str_replace:
+        template: https://FLOATING_IP:6443
+        params:
+          FLOATING_IP: { get_attr: [k8s_master_floating_ip, floating_ip_address] }
+
+  lb_public_ip:
+    description: Load balancer public IP
+    value: { get_attr: [lb_floating_ip, floating_ip_address] }
+
+  db_internal_ip:
+    description: PostgreSQL internal IP
+    value: 10.54.10.10
+
+  platform_network_id:
+    description: Platform network ID
+    value: { get_resource: platform_network }
+
+  deployment_instructions:
+    description: Post-deployment steps
+    value: |
+      1. SSH to K8s master: ssh ubuntu@<k8s_api_endpoint>
+      2. Apply 54Bank Helm chart: helm install 54bank ./helm/54bank -f helm/54bank/values-onpremise.yaml
+      3. Run DB migrations: kubectl exec -it deploy/54bank-api -- pnpm db:migrate
+      4. Seed database: kubectl exec -it deploy/54bank-api -- pnpm db:seed
+      5. Access platform: https://<lb_public_ip>

@@ -1,0 +1,116 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grid-token-card-go
+  namespace: 54bank
+  labels:
+    app: grid-token-card-go
+    tier: tier3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grid-token-card-go
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: grid-token-card-go
+    spec:
+      serviceAccountName: grid-token-card-go
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: grid-token-card-go
+          image: 54bank/grid-token-card-go:latest
+          ports:
+            - containerPort: 8488
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8488"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-secret
+                  key: secret
+            - name: TLS_ENABLED
+              value: "true"
+            - name: TLS_CERT_PATH
+              value: "/etc/54bank/certs/service.crt"
+            - name: TLS_KEY_PATH
+              value: "/etc/54bank/certs/service.key"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8488
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8488
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/54bank/certs
+              readOnly: true
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: grid-token-card-go-tls
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grid-token-card-go
+  namespace: 54bank
+spec:
+  selector:
+    app: grid-token-card-go
+  ports:
+    - port: 8488
+      targetPort: 8488
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: grid-token-card-go
+  namespace: 54bank
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: grid-token-card-go

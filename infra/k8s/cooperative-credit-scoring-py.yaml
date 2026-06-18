@@ -1,0 +1,116 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cooperative-credit-scoring-py
+  namespace: 54bank
+  labels:
+    app: cooperative-credit-scoring-py
+    tier: tier3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cooperative-credit-scoring-py
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: cooperative-credit-scoring-py
+    spec:
+      serviceAccountName: cooperative-credit-scoring-py
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: cooperative-credit-scoring-py
+          image: 54bank/cooperative-credit-scoring-py:latest
+          ports:
+            - containerPort: 8601
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8601"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-secret
+                  key: secret
+            - name: TLS_ENABLED
+              value: "true"
+            - name: TLS_CERT_PATH
+              value: "/etc/54bank/certs/service.crt"
+            - name: TLS_KEY_PATH
+              value: "/etc/54bank/certs/service.key"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8601
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8601
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/54bank/certs
+              readOnly: true
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: cooperative-credit-scoring-py-tls
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cooperative-credit-scoring-py
+  namespace: 54bank
+spec:
+  selector:
+    app: cooperative-credit-scoring-py
+  ports:
+    - port: 8601
+      targetPort: 8601
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cooperative-credit-scoring-py
+  namespace: 54bank
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: cooperative-credit-scoring-py

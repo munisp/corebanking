@@ -1,0 +1,244 @@
+# Rook-Ceph Storage Cluster for 54Bank On-Premise
+# Provides: Block (RBD), File (CephFS), Object (RGW) storage
+# Replaces: AWS EBS, EFS, S3 in on-premise deployment
+---
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: 54bank-ceph
+  namespace: rook-ceph
+spec:
+  cephVersion:
+    image: quay.io/ceph/ceph:v18.2
+    allowUnsupported: false
+
+  dataDirHostPath: /var/lib/rook
+  skipUpgradeChecks: false
+  continueUpgradeAfterChecksEvenIfNotHealthy: false
+  removeOSDsIfOutAndSafeToRemove: true
+
+  mon:
+    count: 3
+    allowMultiplePerNode: false
+
+  mgr:
+    count: 2
+    allowMultiplePerNode: false
+    modules:
+      - name: pg_autoscaler
+        enabled: true
+      - name: rook
+        enabled: true
+      - name: prometheus
+        enabled: true
+      - name: dashboard
+        enabled: true
+
+  dashboard:
+    enabled: true
+    ssl: true
+
+  monitoring:
+    enabled: true
+    metricsDisabled: false
+
+  network:
+    provider: host
+    connections:
+      encryption:
+        enabled: true
+      compression:
+        enabled: true
+
+  crashCollector:
+    disable: false
+
+  logCollector:
+    enabled: true
+    periodicity: daily
+    maxLogSize: 500M
+
+  # Storage nodes — 3 dedicated storage servers
+  storage:
+    useAllNodes: false
+    useAllDevices: false
+    nodes:
+      - name: storage-node-1
+        devices:
+          - name: /dev/nvme0n1   # 2TB NVMe for OSD
+          - name: /dev/nvme1n1   # 2TB NVMe for OSD
+        config:
+          osdsPerDevice: "1"
+          encryptedDevice: "true"
+      - name: storage-node-2
+        devices:
+          - name: /dev/nvme0n1
+          - name: /dev/nvme1n1
+        config:
+          osdsPerDevice: "1"
+          encryptedDevice: "true"
+      - name: storage-node-3
+        devices:
+          - name: /dev/nvme0n1
+          - name: /dev/nvme1n1
+        config:
+          osdsPerDevice: "1"
+          encryptedDevice: "true"
+
+  placement:
+    mon:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node-role.kubernetes.io/storage
+                  operator: Exists
+    osd:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: node-role.kubernetes.io/storage
+                  operator: Exists
+
+  resources:
+    mon:
+      limits:
+        cpu: "2"
+        memory: 4Gi
+      requests:
+        cpu: "1"
+        memory: 2Gi
+    osd:
+      limits:
+        cpu: "4"
+        memory: 8Gi
+      requests:
+        cpu: "2"
+        memory: 4Gi
+    mgr:
+      limits:
+        cpu: "2"
+        memory: 2Gi
+      requests:
+        cpu: "1"
+        memory: 1Gi
+
+  # Encryption at rest — CBN requirement
+  security:
+    kms:
+      connectionDetails:
+        KMS_PROVIDER: vault
+        VAULT_ADDR: https://vault.54bank.local:8200
+        VAULT_BACKEND_PATH: secret/data/rook
+      tokenSecretName: rook-vault-token
+
+---
+# Block storage class for PostgreSQL, Kafka, etc.
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: 54bank-block-replicated
+  namespace: rook-ceph
+spec:
+  failureDomain: host
+  replicated:
+    size: 3
+    requireSafeReplicaSize: true
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-block
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: rook-ceph.rbd.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  pool: 54bank-block-replicated
+  imageFormat: "2"
+  imageFeatures: layering,exclusive-lock,object-map,fast-diff
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-rbd-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-rbd-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+  csi.storage.k8s.io/fstype: ext4
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+mountOptions:
+  - discard
+
+---
+# Shared filesystem for logs, ML models, reports
+apiVersion: ceph.rook.io/v1
+kind: CephFilesystem
+metadata:
+  name: 54bank-shared
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    replicated:
+      size: 3
+  dataPools:
+    - name: data0
+      replicated:
+        size: 3
+  metadataServer:
+    activeCount: 2
+    activeStandby: true
+    resources:
+      limits:
+        cpu: "2"
+        memory: 4Gi
+      requests:
+        cpu: "1"
+        memory: 2Gi
+
+---
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ceph-filesystem
+provisioner: rook-ceph.cephfs.csi.ceph.com
+parameters:
+  clusterID: rook-ceph
+  fsName: 54bank-shared
+  pool: 54bank-shared-data0
+  csi.storage.k8s.io/provisioner-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/provisioner-secret-namespace: rook-ceph
+  csi.storage.k8s.io/controller-expand-secret-name: rook-csi-cephfs-provisioner
+  csi.storage.k8s.io/controller-expand-secret-namespace: rook-ceph
+  csi.storage.k8s.io/node-stage-secret-name: rook-csi-cephfs-node
+  csi.storage.k8s.io/node-stage-secret-namespace: rook-ceph
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+
+---
+# Object storage (S3-compatible) for documents, backups
+apiVersion: ceph.rook.io/v1
+kind: CephObjectStore
+metadata:
+  name: 54bank-s3
+  namespace: rook-ceph
+spec:
+  metadataPool:
+    replicated:
+      size: 3
+  dataPool:
+    replicated:
+      size: 3
+  gateway:
+    port: 8080
+    securePort: 8443
+    sslCertificateRef: rook-ceph-rgw-cert
+    instances: 2
+    resources:
+      limits:
+        cpu: "2"
+        memory: 4Gi
+      requests:
+        cpu: "1"
+        memory: 2Gi

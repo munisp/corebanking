@@ -1,0 +1,34 @@
+{
+  "credit_scorer": {
+    "model_name": "credit_scorer",
+    "run_id": "20260608_121514",
+    "timestamp": "2026-06-08T12:15:14.375986+00:00",
+    "drift": {
+      "detected": false,
+      "should_retrain": false,
+      "features_drifted": 0
+    },
+    "retrained": true,
+    "retrain_metrics": {
+      "val_auc_roc": 0.863321,
+      "epochs_trained": 19,
+      "parameters": 80761,
+      "training_time_seconds": 44.4
+    },
+    "evaluation": {
+      "success": true,
+      "model_name": "credit_scorer",
+      "champion_auc": 0.8657,
+      "challenger_auc": 0.863321,
+      "improvement": -0.002379,
+      "recommendation": "keep_champion",
+      "reason": "No AUC improvement (-0.0024)"
+    },
+    "promotion": {
+      "success": true,
+      "action": "no_promotion",
+      "reason": "No AUC improvement (-0.0024)",
+      "recommendation": "keep_champion"
+    }
+  }
+}

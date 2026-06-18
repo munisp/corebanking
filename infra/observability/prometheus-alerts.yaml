@@ -1,0 +1,103 @@
+# Prometheus alerting rules for 54Bank
+groups:
+  - name: 54bank-service-health
+    rules:
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Service {{ $labels.job }} is down"
+          description: "{{ $labels.job }} has been unreachable for more than 1 minute."
+
+      - alert: HighErrorRate
+        expr: rate(errors_total[5m]) / rate(requests_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High error rate on {{ $labels.service }}"
+          description: "Error rate is {{ $value | humanizePercentage }} (>5%) for 5 minutes."
+
+      - alert: HighLatencyP99
+        expr: histogram_quantile(0.99, rate(request_duration_seconds_bucket[5m])) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High P99 latency on {{ $labels.service }}"
+          description: "P99 latency is {{ $value }}s (>2s threshold)."
+
+      - alert: DatabaseConnectionFailure
+        expr: increase(db_connection_errors_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection failures on {{ $labels.service }}"
+          description: "{{ $value }} DB connection errors in the last 5 minutes."
+
+      - alert: RateLimitTriggered
+        expr: rate(rate_limit_rejected_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Rate limiting active on {{ $labels.service }}"
+          description: "{{ $value }} requests/sec being rate-limited."
+
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Circuit breaker OPEN on {{ $labels.service }} → {{ $labels.upstream }}"
+          description: "Circuit breaker opened — upstream service unreachable."
+
+      - alert: KYCServiceDegraded
+        expr: rate(kyc_verification_failures_total[5m]) > 1
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "KYC verification failures"
+          description: "KYC service is failing verifications — may be blocking account openings."
+
+      - alert: HighMemoryUsage
+        expr: container_memory_usage_bytes / container_spec_memory_limit_bytes > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage on {{ $labels.pod }}"
+          description: "Memory usage is at {{ $value | humanizePercentage }} of limit."
+
+      - alert: PodRestartLoop
+        expr: increase(kube_pod_container_status_restarts_total[1h]) > 3
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pod {{ $labels.pod }} is crash-looping"
+          description: "{{ $value }} restarts in the last hour."
+
+  - name: 54bank-business
+    rules:
+      - alert: TransactionProcessingDelay
+        expr: rate(transaction_processed_total[5m]) == 0 and rate(transaction_received_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Transactions stuck — receiving but not processing"
+
+      - alert: AMLScreeningBacklog
+        expr: aml_screening_queue_length > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AML screening backlog growing"
+          description: "{{ $value }} items in AML screening queue."

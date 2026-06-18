@@ -1,0 +1,236 @@
+# Auto-generated K8s manifest for neo4j-coa-graph-rs
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: 54bank
+  labels:
+    istio-injection: enabled
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: neo4j-coa-graph-rs
+  namespace: 54bank
+  labels:
+    app: neo4j-coa-graph-rs
+    language: rust
+    tier: microservice
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: neo4j-coa-graph-rs
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: neo4j-coa-graph-rs
+        language: rust
+        tier: microservice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8501"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: neo4j-coa-graph-rs
+      terminationGracePeriodSeconds: 30
+      restartPolicy: Always
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z kafka-broker.54bank.svc.cluster.local 9092; do echo "Waiting for Kafka..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgresql.54bank.svc.cluster.local 5432; do echo "Waiting for PostgreSQL..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+        - name: wait-for-redis
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redis-cache.54bank.svc.cluster.local 6379; do echo "Waiting for Redis..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: neo4j-coa-graph-rs
+          image: ghcr.io/54bank/neo4j-coa-graph-rs:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8501
+              name: http
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8501"
+            - name: SERVICE_NAME
+              value: "neo4j-coa-graph-rs"
+            - name: ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-config
+                  key: ENV
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-db
+                  key: url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-redis
+                  key: url
+            - name: NEO4J_BOLT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-neo4j
+                  key: bolt_url
+                  optional: true
+            - name: FALKORDB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-falkordb
+                  key: url
+                  optional: true
+            - name: QDRANT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-qdrant
+                  key: url
+                  optional: true
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-openai
+                  key: api_key
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8501
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8501
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8501
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: neo4j-coa-graph-rs-svc
+  namespace: 54bank
+  labels:
+    app: neo4j-coa-graph-rs
+spec:
+  selector:
+    app: neo4j-coa-graph-rs
+  ports:
+    - port: 8501
+      targetPort: 8501
+      protocol: TCP
+      name: http
+  type: ClusterIP
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: neo4j-coa-graph-rs
+  namespace: 54bank
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: neo4j-coa-graph-rs-hpa
+  namespace: 54bank
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: neo4j-coa-graph-rs
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: neo4j-coa-graph-rs-pdb
+  namespace: 54bank
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: neo4j-coa-graph-rs
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: neo4j-coa-graph-rs-netpol
+  namespace: 54bank
+spec:
+  podSelector:
+    matchLabels:
+      app: neo4j-coa-graph-rs
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: 54bank
+      ports:
+        - protocol: TCP
+          port: 8501
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: 54bank

@@ -1,0 +1,78 @@
+{
+  "domains": [
+    {
+      "domain": "agricultural-insurance",
+      "postingMode": "adjacent_go_adapter",
+      "tigerBeetlePosting": "conditional_on_claim_settlement",
+      "kafkaPublication": "after_claim_readiness_gate",
+      "postgresPersistence": "policy_and_claim_metadata",
+      "redisInvalidation": "claims_and_weather_risk_cache_refresh",
+      "lakehousePublication": "claims_settlement_snapshot",
+      "workflowProgression": "awaiting_settlement_approval",
+      "authContext": "keycloak_and_permify_guarded",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres",
+        "Redis",
+        "Lakehouse",
+        "Fluvio"
+      ],
+      "recommendedPostingSeams": [
+        "claim_settlement_release",
+        "premium_reversal_authorization",
+        "weather_trigger_payout_confirmation"
+      ],
+      "detail": "Agricultural-insurance settlement events are the safest next adjacent ledger seam: only approved claim and premium movements should emit TigerBeetle outcomes through the Go contract path."
+    },
+    {
+      "domain": "islamic-banking",
+      "postingMode": "direct_go_adapter",
+      "tigerBeetlePosting": "queued_for_contract_approval",
+      "kafkaPublication": "after_ledger_commit",
+      "postgresPersistence": "contract_and_schedule_metadata",
+      "redisInvalidation": "exposure_and_pricing_cache_refresh",
+      "lakehousePublication": "portfolio_and_sharia_audit_snapshot",
+      "workflowProgression": "awaiting_contract_authorization",
+      "authContext": "keycloak_and_permify_guarded",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres",
+        "Redis",
+        "Lakehouse",
+        "Permify"
+      ],
+      "recommendedPostingSeams": [
+        "murabaha_disbursement_authorization",
+        "ijara_rental_schedule_confirmation",
+        "mudarabah_profit_distribution_approval"
+      ],
+      "detail": "Islamic-finance commitments should use a Go posting adapter so approved contracts emit explicit TigerBeetle and downstream middleware outcomes instead of generic fallback notes."
+    },
+    {
+      "domain": "teller",
+      "postingMode": "direct_go_adapter",
+      "tigerBeetlePosting": "queued_for_cash_confirmation",
+      "kafkaPublication": "after_ledger_commit",
+      "postgresPersistence": "session_and_transaction_metadata",
+      "redisInvalidation": "till_and_session_cache_refresh",
+      "lakehousePublication": "cash_activity_snapshot",
+      "workflowProgression": "awaiting_balance_confirmation",
+      "authContext": "keycloak_and_permify_guarded",
+      "middleware": [
+        "TigerBeetle",
+        "Kafka",
+        "Postgres",
+        "Redis",
+        "Lakehouse"
+      ],
+      "recommendedPostingSeams": [
+        "counter_transaction_confirmation",
+        "vault_funding_release",
+        "session_balance_lock"
+      ],
+      "detail": "Teller cash events should post directly through a Go ledger adapter before reconciliation and downstream reporting continue."
+    }
+  ]
+}

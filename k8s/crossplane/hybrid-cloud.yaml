@@ -1,0 +1,285 @@
+# Crossplane Hybrid Cloud Orchestration for 54Bank
+# Manages resources across AWS, OpenStack, and On-Premise from a single K8s cluster
+# Enables consistent infrastructure provisioning regardless of deployment target
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crossplane-system
+  labels:
+    app.kubernetes.io/part-of: 54bank-infra
+
+---
+# AWS Provider Configuration
+apiVersion: aws.upbound.io/v1beta1
+kind: ProviderConfig
+metadata:
+  name: aws-production
+spec:
+  credentials:
+    source: Secret
+    secretRef:
+      namespace: crossplane-system
+      name: aws-credentials
+      key: credentials
+
+---
+# Kubernetes Provider (for on-prem and OpenStack Magnum clusters)
+apiVersion: kubernetes.crossplane.io/v1alpha1
+kind: ProviderConfig
+metadata:
+  name: onprem-cluster
+spec:
+  credentials:
+    source: Secret
+    secretRef:
+      namespace: crossplane-system
+      name: onprem-kubeconfig
+      key: kubeconfig
+
+---
+# Composite Resource Definition: 54Bank Database
+# Abstracts AWS RDS / OpenStack Trove / On-Prem Patroni
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xdatabases.54bank.ng
+spec:
+  group: 54bank.ng
+  names:
+    kind: XDatabase
+    plural: xdatabases
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                provider:
+                  type: string
+                  enum: [aws, openstack, onprem]
+                  description: "Target infrastructure provider"
+                engine:
+                  type: string
+                  default: postgresql
+                  enum: [postgresql, redis]
+                version:
+                  type: string
+                  default: "15"
+                size:
+                  type: string
+                  enum: [small, medium, large, xlarge]
+                  default: medium
+                highAvailability:
+                  type: boolean
+                  default: true
+                encrypted:
+                  type: boolean
+                  default: true
+                backupRetentionDays:
+                  type: integer
+                  default: 35
+              required: [provider]
+
+---
+# Composition: AWS RDS Aurora
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: xdatabase-aws
+  labels:
+    provider: aws
+spec:
+  compositeTypeRef:
+    apiVersion: 54bank.ng/v1alpha1
+    kind: XDatabase
+  resources:
+    - name: rds-cluster
+      base:
+        apiVersion: rds.aws.upbound.io/v1beta1
+        kind: Cluster
+        spec:
+          forProvider:
+            engine: aurora-postgresql
+            engineVersion: "15.4"
+            masterUsername: corebanking_admin
+            storageEncrypted: true
+            backupRetentionPeriod: 35
+            deletionProtection: true
+            region: af-south-1
+          providerConfigRef:
+            name: aws-production
+
+    - name: rds-instance-writer
+      base:
+        apiVersion: rds.aws.upbound.io/v1beta1
+        kind: ClusterInstance
+        spec:
+          forProvider:
+            engine: aurora-postgresql
+            instanceClass: db.r6g.xlarge
+            region: af-south-1
+          providerConfigRef:
+            name: aws-production
+
+---
+# Composition: On-Prem Patroni PostgreSQL
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: xdatabase-onprem
+  labels:
+    provider: onprem
+spec:
+  compositeTypeRef:
+    apiVersion: 54bank.ng/v1alpha1
+    kind: XDatabase
+  resources:
+    - name: patroni-statefulset
+      base:
+        apiVersion: kubernetes.crossplane.io/v1alpha2
+        kind: Object
+        spec:
+          forProvider:
+            manifest:
+              apiVersion: apps/v1
+              kind: StatefulSet
+              metadata:
+                name: patroni
+                namespace: database
+              spec:
+                serviceName: patroni
+                replicas: 3
+                selector:
+                  matchLabels:
+                    app: patroni
+                template:
+                  metadata:
+                    labels:
+                      app: patroni
+                  spec:
+                    containers:
+                      - name: patroni
+                        image: patroni/patroni:3.2
+                        ports:
+                          - containerPort: 5432
+                          - containerPort: 8008
+                        resources:
+                          requests:
+                            cpu: "2"
+                            memory: 8Gi
+                          limits:
+                            cpu: "4"
+                            memory: 16Gi
+          providerConfigRef:
+            name: onprem-cluster
+
+---
+# Composite Resource Definition: 54Bank Cache (Redis)
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xcaches.54bank.ng
+spec:
+  group: 54bank.ng
+  names:
+    kind: XCache
+    plural: xcaches
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                provider:
+                  type: string
+                  enum: [aws, openstack, onprem]
+                clusterMode:
+                  type: boolean
+                  default: true
+                encrypted:
+                  type: boolean
+                  default: true
+              required: [provider]
+
+---
+# Composite Resource Definition: 54Bank Message Queue (Kafka)
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xmessagequeues.54bank.ng
+spec:
+  group: 54bank.ng
+  names:
+    kind: XMessageQueue
+    plural: xmessagequeues
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                provider:
+                  type: string
+                  enum: [aws, openstack, onprem]
+                brokerCount:
+                  type: integer
+                  default: 6
+                replicationFactor:
+                  type: integer
+                  default: 3
+                encrypted:
+                  type: boolean
+                  default: true
+              required: [provider]
+
+---
+# Example: Provision production infrastructure
+apiVersion: 54bank.ng/v1alpha1
+kind: XDatabase
+metadata:
+  name: production-database
+spec:
+  provider: aws  # Change to "onprem" or "openstack" for different targets
+  engine: postgresql
+  version: "15"
+  size: xlarge
+  highAvailability: true
+  encrypted: true
+  backupRetentionDays: 35
+
+---
+apiVersion: 54bank.ng/v1alpha1
+kind: XCache
+metadata:
+  name: production-cache
+spec:
+  provider: aws
+  clusterMode: true
+  encrypted: true
+
+---
+apiVersion: 54bank.ng/v1alpha1
+kind: XMessageQueue
+metadata:
+  name: production-kafka
+spec:
+  provider: aws
+  brokerCount: 6
+  replicationFactor: 3
+  encrypted: true

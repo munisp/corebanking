@@ -1,0 +1,579 @@
+# KEDA ScaledJobs for Batch Processing Services
+# Auto-generated for 54Bank platform
+# Total: 8 ScaledJobs
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: sj-efass-report-generation
+  namespace: 54bank
+  labels:
+    app: efass-generator-rs
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: efass-generator-rs
+          job-type: batch
+      spec:
+        containers:
+        - name: efass-generator-rs
+          image: ghcr.io/54bank/efass-generator-rs:latest
+          command:
+          - /app/efass-generator-rs
+          - --batch-mode
+          env:
+          - name: KAFKA_BROKERS
+            valueFrom:
+              configMapKeyRef:
+                name: 54bank-config
+                key: kafka-brokers
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: efass-generator-rs-secrets
+                key: database-url
+                optional: true
+          - name: BATCH_MODE
+            value: 'true'
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        restartPolicy: OnFailure
+        serviceAccountName: efass-generator-rs
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+    parallelism: 3
+    completions: 1
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 3600
+  pollingInterval: 30
+  maxReplicaCount: 6
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  rolloutStrategy: gradual
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: efass-report-generation-batch
+      topic: accounting.ledger
+      lagThreshold: '1000'
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: sj-data-export-batch
+  namespace: 54bank
+  labels:
+    app: data-export-rs
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: data-export-rs
+          job-type: batch
+      spec:
+        containers:
+        - name: data-export-rs
+          image: ghcr.io/54bank/data-export-rs:latest
+          command:
+          - /app/data-export-rs
+          - --batch-mode
+          env:
+          - name: KAFKA_BROKERS
+            valueFrom:
+              configMapKeyRef:
+                name: 54bank-config
+                key: kafka-brokers
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: data-export-rs-secrets
+                key: database-url
+                optional: true
+          - name: BATCH_MODE
+            value: 'true'
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        restartPolicy: OnFailure
+        serviceAccountName: data-export-rs
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+    parallelism: 5
+    completions: 1
+    backoffLimit: 5
+    ttlSecondsAfterFinished: 7200
+  pollingInterval: 30
+  maxReplicaCount: 10
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  rolloutStrategy: gradual
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: data-export-batch-batch
+      topic: data.pipeline
+      lagThreshold: '1000'
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: sj-reconciliation-batch
+  namespace: 54bank
+  labels:
+    app: reconciliation-engine-go
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: reconciliation-engine-go
+          job-type: batch
+      spec:
+        containers:
+        - name: reconciliation-engine-go
+          image: ghcr.io/54bank/reconciliation-engine-go:latest
+          command:
+          - /app/reconciliation-engine-go
+          - --batch-mode
+          env:
+          - name: KAFKA_BROKERS
+            valueFrom:
+              configMapKeyRef:
+                name: 54bank-config
+                key: kafka-brokers
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: reconciliation-engine-go-secrets
+                key: database-url
+                optional: true
+          - name: BATCH_MODE
+            value: 'true'
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        restartPolicy: OnFailure
+        serviceAccountName: reconciliation-engine-go
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+    parallelism: 4
+    completions: 1
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 3600
+  pollingInterval: 30
+  maxReplicaCount: 8
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  rolloutStrategy: gradual
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: reconciliation-batch-batch
+      topic: banking.payments
+      lagThreshold: '1000'
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: sj-ifrs9-computation-batch
+  namespace: 54bank
+  labels:
+    app: ifrs9-ecl-engine-rs
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: ifrs9-ecl-engine-rs
+          job-type: batch
+      spec:
+        containers:
+        - name: ifrs9-ecl-engine-rs
+          image: ghcr.io/54bank/ifrs9-ecl-engine-rs:latest
+          command:
+          - /app/ifrs9-ecl-engine-rs
+          - --batch-mode
+          env:
+          - name: KAFKA_BROKERS
+            valueFrom:
+              configMapKeyRef:
+                name: 54bank-config
+                key: kafka-brokers
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: ifrs9-ecl-engine-rs-secrets
+                key: database-url
+                optional: true
+          - name: BATCH_MODE
+            value: 'true'
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        restartPolicy: OnFailure
+        serviceAccountName: ifrs9-ecl-engine-rs
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+    parallelism: 2
+    completions: 1
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 7200
+  pollingInterval: 30
+  maxReplicaCount: 4
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  rolloutStrategy: gradual
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: ifrs9-computation-batch-batch
+      topic: accounting.ledger
+      lagThreshold: '1000'
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: sj-analytics-etl-batch
+  namespace: 54bank
+  labels:
+    app: analytics-pipeline-py
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: analytics-pipeline-py
+          job-type: batch
+      spec:
+        containers:
+        - name: analytics-pipeline-py
+          image: ghcr.io/54bank/analytics-pipeline-py:latest
+          command:
+          - /app/analytics-pipeline-py
+          - --batch-mode
+          env:
+          - name: KAFKA_BROKERS
+            valueFrom:
+              configMapKeyRef:
+                name: 54bank-config
+                key: kafka-brokers
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: analytics-pipeline-py-secrets
+                key: database-url
+                optional: true
+          - name: BATCH_MODE
+            value: 'true'
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        restartPolicy: OnFailure
+        serviceAccountName: analytics-pipeline-py
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+    parallelism: 3
+    completions: 1
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 3600
+  pollingInterval: 30
+  maxReplicaCount: 6
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  rolloutStrategy: gradual
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: analytics-etl-batch-batch
+      topic: data.pipeline
+      lagThreshold: '1000'
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: sj-compliance-report-batch
+  namespace: 54bank
+  labels:
+    app: compliance-dashboard-py
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: compliance-dashboard-py
+          job-type: batch
+      spec:
+        containers:
+        - name: compliance-dashboard-py
+          image: ghcr.io/54bank/compliance-dashboard-py:latest
+          command:
+          - /app/compliance-dashboard-py
+          - --batch-mode
+          env:
+          - name: KAFKA_BROKERS
+            valueFrom:
+              configMapKeyRef:
+                name: 54bank-config
+                key: kafka-brokers
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: compliance-dashboard-py-secrets
+                key: database-url
+                optional: true
+          - name: BATCH_MODE
+            value: 'true'
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        restartPolicy: OnFailure
+        serviceAccountName: compliance-dashboard-py
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+    parallelism: 2
+    completions: 1
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 3600
+  pollingInterval: 30
+  maxReplicaCount: 4
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  rolloutStrategy: gradual
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: compliance-report-batch-batch
+      topic: compliance.screening
+      lagThreshold: '1000'
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: sj-event-dedup-batch
+  namespace: 54bank
+  labels:
+    app: event-dedup-engine-rs
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: event-dedup-engine-rs
+          job-type: batch
+      spec:
+        containers:
+        - name: event-dedup-engine-rs
+          image: ghcr.io/54bank/event-dedup-engine-rs:latest
+          command:
+          - /app/event-dedup-engine-rs
+          - --batch-mode
+          env:
+          - name: KAFKA_BROKERS
+            valueFrom:
+              configMapKeyRef:
+                name: 54bank-config
+                key: kafka-brokers
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: event-dedup-engine-rs-secrets
+                key: database-url
+                optional: true
+          - name: BATCH_MODE
+            value: 'true'
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        restartPolicy: OnFailure
+        serviceAccountName: event-dedup-engine-rs
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+    parallelism: 4
+    completions: 1
+    backoffLimit: 5
+    ttlSecondsAfterFinished: 1800
+  pollingInterval: 30
+  maxReplicaCount: 8
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  rolloutStrategy: gradual
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: event-dedup-batch-batch
+      topic: platform.events
+      lagThreshold: '1000'
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth
+---
+apiVersion: keda.sh/v1alpha1
+kind: ScaledJob
+metadata:
+  name: sj-lakehouse-ingest-batch
+  namespace: 54bank
+  labels:
+    app: lakehouse-rs
+    tier: batch-processing
+    app.kubernetes.io/managed-by: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  jobTargetRef:
+    template:
+      metadata:
+        labels:
+          app: lakehouse-rs
+          job-type: batch
+      spec:
+        containers:
+        - name: lakehouse-rs
+          image: ghcr.io/54bank/lakehouse-rs:latest
+          command:
+          - /app/lakehouse-rs
+          - --batch-mode
+          env:
+          - name: KAFKA_BROKERS
+            valueFrom:
+              configMapKeyRef:
+                name: 54bank-config
+                key: kafka-brokers
+          - name: DATABASE_URL
+            valueFrom:
+              secretKeyRef:
+                name: lakehouse-rs-secrets
+                key: database-url
+                optional: true
+          - name: BATCH_MODE
+            value: 'true'
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+        restartPolicy: OnFailure
+        serviceAccountName: lakehouse-rs
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+    parallelism: 6
+    completions: 1
+    backoffLimit: 3
+    ttlSecondsAfterFinished: 3600
+  pollingInterval: 30
+  maxReplicaCount: 12
+  successfulJobsHistoryLimit: 5
+  failedJobsHistoryLimit: 3
+  rolloutStrategy: gradual
+  scalingStrategy:
+    strategy: accurate
+  triggers:
+  - type: kafka
+    metadata:
+      bootstrapServers: kafka-broker.54bank.svc.cluster.local:9092
+      consumerGroup: lakehouse-ingest-batch-batch
+      topic: platform.events
+      lagThreshold: '1000'
+      offsetResetPolicy: earliest
+    authenticationRef:
+      name: keda-kafka-auth

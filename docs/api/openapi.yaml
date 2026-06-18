@@ -1,0 +1,163 @@
+openapi: 3.1.0
+info:
+  title: 54Bank Core Banking API
+  description: Africa-First Core Banking Platform — RESTful APIs
+  version: 2.0.0
+  contact:
+    name: 54Bank API Support
+    email: api@54bank.ng
+  license:
+    name: Proprietary
+servers:
+  - url: https://api.54bank.ng/v1
+    description: Production
+  - url: https://sandbox.54bank.ng/v1
+    description: Sandbox
+security:
+  - BearerAuth: []
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Account:
+      type: object
+      properties:
+        id: { type: string }
+        account_number: { type: string, pattern: "^[0-9]{10}$" }
+        account_name: { type: string }
+        balance: { type: integer, description: "Balance in kobo" }
+        currency: { type: string, enum: [NGN, USD, GBP, EUR] }
+        status: { type: string, enum: [active, dormant, frozen, closed] }
+        tier: { type: string, enum: [tier1, tier2, tier3] }
+        created_at: { type: string, format: date-time }
+    Transaction:
+      type: object
+      properties:
+        id: { type: string }
+        type: { type: string, enum: [credit, debit] }
+        amount: { type: integer, description: "Amount in kobo" }
+        narration: { type: string }
+        reference: { type: string }
+        status: { type: string, enum: [pending, completed, failed, reversed] }
+        created_at: { type: string, format: date-time }
+    Error:
+      type: object
+      properties:
+        error: { type: string }
+        code: { type: string }
+        details: { type: array, items: { type: string } }
+paths:
+  /accounts:
+    get:
+      summary: List accounts
+      tags: [Accounts]
+      parameters:
+        - name: status
+          in: query
+          schema: { type: string, enum: [active, dormant, frozen, closed] }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20, maximum: 100 }
+      responses:
+        '200':
+          description: List of accounts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accounts: { type: array, items: { $ref: '#/components/schemas/Account' } }
+                  total: { type: integer }
+    post:
+      summary: Create account
+      tags: [Accounts]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [customer_id, product_type]
+              properties:
+                customer_id: { type: string }
+                product_type: { type: string, enum: [savings, current, fixed_deposit] }
+                currency: { type: string, default: NGN }
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+  /transfers:
+    post:
+      summary: Initiate transfer
+      tags: [Transfers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source_account, destination_account, amount]
+              properties:
+                source_account: { type: string }
+                destination_account: { type: string }
+                amount: { type: integer, minimum: 100, description: "Amount in kobo" }
+                narration: { type: string, maxLength: 100 }
+                channel: { type: string, enum: [web, mobile, ussd, api] }
+      responses:
+        '200':
+          description: Transfer initiated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transaction' }
+  /kyc/verify:
+    post:
+      summary: KYC verification
+      tags: [KYC]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [bvn, customer_id]
+              properties:
+                bvn: { type: string, pattern: "^[0-9]{11}$" }
+                nin: { type: string, pattern: "^[0-9]{11}$" }
+                customer_id: { type: string }
+      responses:
+        '200':
+          description: Verification result
+  /ndpr/privacy-policy:
+    get:
+      summary: Get NDPR privacy policy
+      tags: [Compliance]
+      security: []
+      responses:
+        '200':
+          description: Privacy policy
+  /ndpr/consents:
+    post:
+      summary: Grant data processing consent
+      tags: [Compliance]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_id, purpose, legal_basis]
+              properties:
+                user_id: { type: string }
+                purpose: { type: string, enum: [account_management, transaction_processing, kyc_verification, marketing, analytics] }
+                legal_basis: { type: string, enum: [consent, contract, legal_obligation, legitimate_interest] }
+      responses:
+        '200':
+          description: Consent recorded

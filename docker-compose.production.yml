@@ -1,0 +1,121 @@
+version: "3.8"
+# 54Bank Platform — Production Middleware Stack
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.production.yml up -d
+
+services:
+  # PostgreSQL (Primary database)
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: bank54_db
+      POSTGRES_USER: bank54_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-bank54_secure_2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./drizzle/seed.sql:/docker-entrypoint-initdb.d/seed.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bank54_user -d bank54_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis (Cache, sessions, rate limiting)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Kafka (Event streaming)
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      CLUSTER_ID: "54bank-kafka-cluster"
+    ports:
+      - "9092:9092"
+
+  # Keycloak (Identity & SSO)
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0
+    command: start-dev
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/bank54_db
+      KC_DB_USERNAME: bank54_user
+      KC_DB_PASSWORD: ${DB_PASSWORD:-bank54_secure_2026}
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # OpenSearch (Search & analytics)
+  opensearch:
+    image: opensearchproject/opensearch:2.11.1
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+    ports:
+      - "9200:9200"
+
+  # Temporal (Workflow orchestration)
+  temporal:
+    image: temporalio/auto-setup:1.22
+    environment:
+      DB: postgresql
+      DB_PORT: 5432
+      POSTGRES_USER: bank54_user
+      POSTGRES_PWD: ${DB_PASSWORD:-bank54_secure_2026}
+      POSTGRES_SEEDS: postgres
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # APISIX (API Gateway)
+  apisix:
+    image: apache/apisix:3.7.0-debian
+    ports:
+      - "9080:9080"
+      - "9443:9443"
+    volumes:
+      - ./apisix/config.yaml:/usr/local/apisix/conf/config.yaml
+
+  # 54Bank Platform (Node.js server)
+  platform:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://bank54_user:${DB_PASSWORD:-bank54_secure_2026}@postgres:5432/bank54_db
+      JWT_SECRET: ${JWT_SECRET:-54bank-jwt-secret-change-in-production}
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKERS: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OPENSEARCH_URL: http://opensearch:9200
+      TEMPORAL_ADDRESS: temporal:7233
+      NODE_ENV: production
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:

@@ -1,0 +1,11 @@
+parameters:
+  environment: production
+  key_name: 54bank-prod-key
+  external_network: external
+  image: ubuntu-22.04-lts
+  k8s_master_flavor: m1.xlarge       # 4 vCPU, 16GB RAM
+  k8s_worker_flavor: m1.2xlarge      # 8 vCPU, 32GB RAM
+  db_flavor: m1.xlarge               # 4 vCPU, 16GB RAM, SSD
+  worker_count: 3
+  db_volume_size: 500
+  domain_name: 54bank.local

@@ -1,0 +1,211 @@
+# KEDA Monitoring — Prometheus ServiceMonitor + Grafana Dashboard
+# Monitors KEDA operator metrics, ScaledObject status, and scaling events
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: keda-operator-metrics
+  namespace: keda
+  labels:
+    app.kubernetes.io/name: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-operator
+  endpoints:
+    - port: metrics
+      interval: 15s
+      path: /metrics
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: keda-metrics-apiserver
+  namespace: keda
+  labels:
+    app.kubernetes.io/name: keda-metrics-apiserver
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-metrics-apiserver
+  endpoints:
+    - port: http
+      interval: 15s
+      path: /metrics
+---
+# PrometheusRule for KEDA alerts
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: keda-alerts
+  namespace: keda
+  labels:
+    app.kubernetes.io/name: keda
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  groups:
+    - name: keda.rules
+      interval: 30s
+      rules:
+        - alert: KEDAScaledObjectError
+          expr: keda_scaledobject_errors > 0
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "KEDA ScaledObject {{ $labels.scaledObject }} has errors"
+            description: "ScaledObject {{ $labels.scaledObject }} in namespace {{ $labels.namespace }} has had {{ $value }} errors in the last 5 minutes."
+
+        - alert: KEDAScalerMetricsFailing
+          expr: keda_scaler_errors_total > 10
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "KEDA scaler metrics failing for {{ $labels.scaler }}"
+            description: "Scaler {{ $labels.scaler }} for ScaledObject {{ $labels.scaledObject }} has failed {{ $value }} times. Services may not auto-scale."
+
+        - alert: KafkaConsumerLagHigh
+          expr: keda_scaler_metrics_value{scaler="kafka"} > 10000
+          for: 10m
+          labels:
+            severity: critical
+            team: banking-ops
+          annotations:
+            summary: "Kafka consumer lag exceeds 10K for {{ $labels.scaledObject }}"
+            description: "Consumer lag for {{ $labels.scaledObject }} is {{ $value }}. Events are not being processed fast enough."
+
+        - alert: KEDAOperatorDown
+          expr: up{job="keda-operator"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "KEDA operator is down"
+            description: "KEDA operator has been unreachable for 2 minutes. Auto-scaling is disabled."
+
+        - alert: ProcessWatchdogStalled
+          expr: probe_success{job="54bank-liveness"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Service {{ $labels.instance }} watchdog reports stalled event loop"
+            description: "Liveness probe has been failing for 2 minutes — indicates stalled event loop. K8s will restart the pod."
+
+        - alert: KEDAFallbackActive
+          expr: keda_scaledobject_fallback_active == 1
+          for: 5m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "KEDA fallback active for {{ $labels.scaledObject }}"
+            description: "ScaledObject {{ $labels.scaledObject }} is using fallback replicas because primary metrics are unavailable."
+
+        - alert: ScaledJobFailing
+          expr: kube_job_status_failed{namespace="54bank",label_job_type="batch"} > 3
+          for: 15m
+          labels:
+            severity: warning
+            team: data-engineering
+          annotations:
+            summary: "Batch ScaledJob {{ $labels.job_name }} failing repeatedly"
+            description: "{{ $value }} failures in the last 15 minutes for batch job {{ $labels.job_name }}."
+---
+# Grafana Dashboard ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keda-grafana-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/part-of: 54bank-platform
+data:
+  keda-dashboard.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": true,
+      "title": "54Bank KEDA Auto-Scaling Dashboard",
+      "uid": "54bank-keda",
+      "version": 1,
+      "panels": [
+        {
+          "title": "Active ScaledObjects",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+          "targets": [{ "expr": "count(keda_scaledobject_status{namespace=\"54bank\"})", "legendFormat": "Active" }]
+        },
+        {
+          "title": "ScaledObject Errors (5m)",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+          "targets": [{ "expr": "sum(rate(keda_scaledobject_errors{namespace=\"54bank\"}[5m]))", "legendFormat": "Errors/s" }],
+          "fieldConfig": { "defaults": { "thresholds": { "steps": [{"value": 0, "color": "green"}, {"value": 1, "color": "red"}] } } }
+        },
+        {
+          "title": "Fallback Active",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "targets": [{ "expr": "sum(keda_scaledobject_fallback_active{namespace=\"54bank\"})", "legendFormat": "Fallback" }],
+          "fieldConfig": { "defaults": { "thresholds": { "steps": [{"value": 0, "color": "green"}, {"value": 1, "color": "orange"}] } } }
+        },
+        {
+          "title": "Active ScaledJobs",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "targets": [{ "expr": "count(keda_scaledjob_status{namespace=\"54bank\"})", "legendFormat": "Active Jobs" }]
+        },
+        {
+          "title": "Kafka Consumer Lag by Service",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+          "targets": [{ "expr": "keda_scaler_metrics_value{namespace=\"54bank\",scaler=\"kafka\"}", "legendFormat": "{{ scaledObject }}" }],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "title": "Replica Count by Service",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+          "targets": [{ "expr": "kube_deployment_spec_replicas{namespace=\"54bank\"}", "legendFormat": "{{ deployment }}" }],
+          "fieldConfig": { "defaults": { "unit": "short" } }
+        },
+        {
+          "title": "Scaling Events (rate)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+          "targets": [
+            { "expr": "rate(keda_scaler_activity{namespace=\"54bank\"}[5m])", "legendFormat": "{{ scaledObject }} scale events" }
+          ]
+        },
+        {
+          "title": "Watchdog Health (Liveness Probes)",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+          "targets": [
+            { "expr": "probe_success{namespace=\"54bank\"}", "legendFormat": "{{ instance }}" }
+          ]
+        },
+        {
+          "title": "Batch Job Success/Failure Rate",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+          "targets": [
+            { "expr": "rate(kube_job_status_succeeded{namespace=\"54bank\",label_job_type=\"batch\"}[15m])", "legendFormat": "{{ job_name }} success" },
+            { "expr": "rate(kube_job_status_failed{namespace=\"54bank\",label_job_type=\"batch\"}[15m])", "legendFormat": "{{ job_name }} failure" }
+          ]
+        }
+      ],
+      "time": { "from": "now-1h", "to": "now" },
+      "refresh": "30s"
+    }

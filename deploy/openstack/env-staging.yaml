@@ -1,0 +1,11 @@
+parameters:
+  environment: staging
+  key_name: 54bank-staging-key
+  external_network: external
+  image: ubuntu-22.04-lts
+  k8s_master_flavor: m1.large        # 2 vCPU, 8GB RAM
+  k8s_worker_flavor: m1.xlarge       # 4 vCPU, 16GB RAM
+  db_flavor: m1.large                # 2 vCPU, 8GB RAM
+  worker_count: 2
+  db_volume_size: 100
+  domain_name: staging.54bank.local

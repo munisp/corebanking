@@ -1,0 +1,17 @@
+# Kubernetes Secrets Encryption at Rest
+# Required for CBN IT Standards compliance
+# The encryption key must be rotated every 90 days
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+      - configmaps
+    providers:
+      - aescbc:
+          keys:
+            # IMPORTANT: Replace with actual 32-byte base64-encoded key
+            # Generate with: head -c 32 /dev/urandom | base64
+            - name: key1
+              secret: REPLACE_WITH_ACTUAL_ENCRYPTION_KEY
+      - identity: {}  # Fallback for reading unencrypted secrets

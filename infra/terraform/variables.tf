@@ -1,0 +1,17 @@
+variable "environment" { default = "staging" }
+variable "aws_region" { default = "af-south-1" }
+variable "vpc_cidr" { default = "10.0.0.0/16" }
+variable "availability_zones" { default = ["af-south-1a", "af-south-1b", "af-south-1c"] }
+variable "private_subnets" { default = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"] }
+variable "public_subnets" { default = ["10.0.101.0/24", "10.0.102.0/24", "10.0.103.0/24"] }
+variable "database_subnets" { default = ["10.0.201.0/24", "10.0.202.0/24", "10.0.203.0/24"] }
+variable "node_instance_types" { default = ["m6g.xlarge"] }
+variable "min_nodes" { default = 2 }
+variable "max_nodes" { default = 20 }
+variable "desired_nodes" { default = 3 }
+variable "db_instance_class" { default = "db.r6g.xlarge" }
+variable "db_storage_gb" { default = 100 }
+variable "db_max_storage_gb" { default = 500 }
+variable "redis_node_type" { default = "cache.r6g.large" }
+variable "kafka_instance_type" { default = "kafka.m5.large" }
+variable "kafka_storage_gb" { default = 100 }

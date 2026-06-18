@@ -1,0 +1,18 @@
+{
+  "app_name": "54Bank",
+  "dashboard": "Dashboard",
+  "accounts": "Accounts",
+  "transfers": "Transfers",
+  "payments": "Payments",
+  "cards": "Cards",
+  "loans": "Loans",
+  "settings": "Settings",
+  "logout": "Logout",
+  "welcome": "Welcome back",
+  "balance": "Account Balance",
+  "recent_transactions": "Recent Transactions",
+  "quick_transfer": "Quick Transfer",
+  "pay_bills": "Pay Bills",
+  "currency": "NGN",
+  "language": "English"
+}

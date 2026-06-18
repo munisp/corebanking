@@ -1,0 +1,347 @@
+# APISIX Declarative Gateway Configuration for 54Bank Platform
+# This config replaces the Express proxy routes with declarative YAML routing
+# Deploy alongside APISIX for production-grade API gateway features
+
+apisix:
+  node_listen: 9080
+  admin_key:
+    - name: "admin"
+      key: "${APISIX_ADMIN_KEY:-54bank-admin-key}"
+      role: admin
+
+# Global plugins
+global_rules:
+  - id: 1
+    plugins:
+      cors:
+        allow_origins: "*"
+        allow_methods: "GET, POST, PUT, DELETE, OPTIONS"
+        allow_headers: "Content-Type, Authorization, X-Correlation-ID, X-API-Version"
+      prometheus:
+        prefer_name: true
+      request-id:
+        header_name: "X-Correlation-ID"
+        include_in_response: true
+      ip-restriction:
+        blacklist: []
+
+# Rate limiting
+plugin_configs:
+  - id: 1
+    desc: "Standard rate limit"
+    plugins:
+      limit-req:
+        rate: 100
+        burst: 50
+        key_type: "var"
+        key: "remote_addr"
+        rejected_code: 429
+  - id: 2
+    desc: "Strict rate limit (auth endpoints)"
+    plugins:
+      limit-req:
+        rate: 10
+        burst: 5
+        key_type: "var"
+        key: "remote_addr"
+        rejected_code: 429
+
+# Upstream service definitions
+upstreams:
+  - id: agriculture
+    type: roundrobin
+    nodes:
+      "localhost:8090": 1
+    timeout:
+      connect: 5
+      send: 10
+      read: 10
+    checks:
+      active:
+        http_path: "/healthz"
+        healthy:
+          interval: 5
+          successes: 2
+        unhealthy:
+          interval: 5
+          http_failures: 3
+
+  - id: teller
+    type: roundrobin
+    nodes:
+      "localhost:8091": 1
+    checks:
+      active:
+        http_path: "/healthz"
+
+  - id: islamic-banking
+    type: roundrobin
+    nodes:
+      "localhost:8092": 1
+
+  - id: trade-finance
+    type: roundrobin
+    nodes:
+      "localhost:8093": 1
+
+  - id: mortgage
+    type: roundrobin
+    nodes:
+      "localhost:8094": 1
+
+  - id: esusu
+    type: roundrobin
+    nodes:
+      "localhost:8095": 1
+
+  - id: virtual-accounts
+    type: roundrobin
+    nodes:
+      "localhost:8096": 1
+
+  - id: agent-banking
+    type: roundrobin
+    nodes:
+      "localhost:8097": 1
+
+  - id: group-lending
+    type: roundrobin
+    nodes:
+      "localhost:8098": 1
+
+  - id: education-loans
+    type: roundrobin
+    nodes:
+      "localhost:8099": 1
+
+  - id: ledger-recon
+    type: roundrobin
+    nodes:
+      "localhost:8100": 1
+
+  - id: identity-channels
+    type: roundrobin
+    nodes:
+      "localhost:8101": 1
+
+  - id: disputes
+    type: roundrobin
+    nodes:
+      "localhost:8102": 1
+
+  - id: erpnext-sync
+    type: roundrobin
+    nodes:
+      "localhost:8103": 1
+
+  - id: regulatory
+    type: roundrobin
+    nodes:
+      "localhost:8104": 1
+
+  - id: security-gateway
+    type: roundrobin
+    nodes:
+      "localhost:8105": 1
+
+  - id: resilience
+    type: roundrobin
+    nodes:
+      "localhost:8106": 1
+
+  - id: payments-hub
+    type: roundrobin
+    nodes:
+      "localhost:8107": 1
+
+  - id: savings-products
+    type: roundrobin
+    nodes:
+      "localhost:8108": 1
+
+  - id: card-management
+    type: roundrobin
+    nodes:
+      "localhost:8109": 1
+
+  - id: treasury-liquidity
+    type: roundrobin
+    nodes:
+      "localhost:8110": 1
+
+  - id: customer-engagement
+    type: roundrobin
+    nodes:
+      "localhost:8111": 1
+
+  - id: fraud-detection
+    type: roundrobin
+    nodes:
+      "localhost:8112": 1
+
+  - id: notification
+    type: roundrobin
+    nodes:
+      "localhost:8113": 1
+
+  - id: account-opening
+    type: roundrobin
+    nodes:
+      "localhost:8114": 1
+
+  - id: standing-orders
+    type: roundrobin
+    nodes:
+      "localhost:8115": 1
+
+  - id: beneficiary-mgmt
+    type: roundrobin
+    nodes:
+      "localhost:8116": 1
+
+  - id: batch-processing
+    type: roundrobin
+    nodes:
+      "localhost:8117": 1
+
+  - id: fx-rates
+    type: roundrobin
+    nodes:
+      "localhost:8118": 1
+
+  - id: loan-calculator
+    type: roundrobin
+    nodes:
+      "localhost:8119": 1
+
+  - id: branch-operations
+    type: roundrobin
+    nodes:
+      "localhost:8120": 1
+
+  - id: tigerbeetle-ledger
+    type: roundrobin
+    nodes:
+      "localhost:8121": 1
+
+  - id: event-bus
+    type: roundrobin
+    nodes:
+      "localhost:8122": 1
+
+  - id: workflow-engine
+    type: roundrobin
+    nodes:
+      "localhost:8123": 1
+
+  - id: mojaloop-connector
+    type: roundrobin
+    nodes:
+      "localhost:8124": 1
+
+# Route definitions (maps /api/platform/* to upstream services)
+routes:
+  - uri: /api/platform/agriculture/*
+    upstream_id: agriculture
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/agriculture/(.*)", "/v1/agriculture/$1"]
+
+  - uri: /api/platform/teller/*
+    upstream_id: teller
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/teller/(.*)", "/v1/teller/$1"]
+
+  - uri: /api/platform/islamic-banking/*
+    upstream_id: islamic-banking
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/islamic-banking/(.*)", "/v1/islamic-banking/$1"]
+
+  - uri: /api/platform/trade-finance/*
+    upstream_id: trade-finance
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/trade-finance/(.*)", "/v1/trade-finance/$1"]
+
+  - uri: /api/platform/mortgage/*
+    upstream_id: mortgage
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/mortgage/(.*)", "/v1/mortgage/$1"]
+
+  - uri: /api/platform/ledger/*
+    upstream_id: tigerbeetle-ledger
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/ledger/(.*)", "/v1/ledger/$1"]
+
+  - uri: /api/platform/events/*
+    upstream_id: event-bus
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/events/(.*)", "/v1/events/$1"]
+
+  - uri: /api/platform/workflows/*
+    upstream_id: workflow-engine
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/workflows/(.*)", "/v1/workflows/$1"]
+
+  - uri: /api/platform/mojaloop/*
+    upstream_id: mojaloop-connector
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/mojaloop/(.*)", "/v1/mojaloop/$1"]
+
+  - uri: /api/platform/security/*
+    upstream_id: security-gateway
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/security/(.*)", "/v1/security/$1"]
+
+  - uri: /api/platform/payments/*
+    upstream_id: payments-hub
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/payments/(.*)", "/v1/payments/$1"]
+
+  - uri: /api/platform/fraud/*
+    upstream_id: fraud-detection
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/fraud/(.*)", "/v1/fraud/$1"]
+
+  - uri: /api/platform/notifications/*
+    upstream_id: notification
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/notifications/(.*)", "/v1/notifications/$1"]
+
+  - uri: /api/platform/branches/*
+    upstream_id: branch-operations
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/branches/(.*)", "/v1/branches/$1"]
+
+  - uri: /api/platform/loan-calculator/*
+    upstream_id: loan-calculator
+    plugin_config_id: 1
+    plugins:
+      proxy-rewrite:
+        regex_uri: ["^/api/platform/loan-calculator/(.*)", "/v1/loan-calculator/$1"]

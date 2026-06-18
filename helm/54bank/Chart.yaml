@@ -1,0 +1,14 @@
+apiVersion: v2
+name: 54bank
+description: 54Bank Africa-First Core Banking Platform
+type: application
+version: 2.0.0
+appVersion: "2.0.0"
+keywords:
+  - banking
+  - fintech
+  - africa
+  - nigeria
+maintainers:
+  - name: 54Bank Engineering
+    email: engineering@54bank.ng

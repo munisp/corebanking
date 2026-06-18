@@ -1,0 +1,286 @@
+# Auto-generated K8s manifest for telegram-bot-gateway-go
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: 54bank
+  labels:
+    istio-injection: enabled
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telegram-bot-gateway-go
+  namespace: 54bank
+  labels:
+    app: telegram-bot-gateway-go
+    language: go
+    tier: microservice
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: telegram-bot-gateway-go
+  strategy:
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: telegram-bot-gateway-go
+        language: go
+        tier: microservice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: telegram-bot-gateway-go
+      terminationGracePeriodSeconds: 30
+      restartPolicy: Always
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      initContainers:
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z kafka-broker.54bank.svc.cluster.local 9092; do echo "Waiting for Kafka..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgresql.54bank.svc.cluster.local 5432; do echo "Waiting for PostgreSQL..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+        - name: wait-for-redis
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redis-cache.54bank.svc.cluster.local 6379; do echo "Waiting for Redis..."; sleep 2; done']
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi
+      containers:
+        - name: telegram-bot-gateway-go
+          image: ghcr.io/54bank/telegram-bot-gateway-go:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8080"
+            - name: SERVICE_NAME
+              value: "telegram-bot-gateway-go"
+            - name: ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-config
+                  key: environment
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: telegram-bot-gateway-go-secrets
+                  key: database-url
+                  optional: true
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-secrets
+                  key: redis-url
+                  optional: true
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-config
+                  key: kafka-brokers
+                  optional: true
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-config
+                  key: otel-endpoint
+                  optional: true
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-secrets
+                  key: jwt-secret
+                  optional: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 5
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 12
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: telegram-bot-gateway-go
+  namespace: 54bank
+  labels:
+    app: telegram-bot-gateway-go
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: telegram-bot-gateway-go
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: telegram-bot-gateway-go
+  namespace: 54bank
+  labels:
+    app: telegram-bot-gateway-go
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: telegram-bot-gateway-go
+  namespace: 54bank
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: telegram-bot-gateway-go
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: telegram-bot-gateway-go
+  namespace: 54bank
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: telegram-bot-gateway-go
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 30
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: telegram-bot-gateway-go
+  namespace: 54bank
+spec:
+  podSelector:
+    matchLabels:
+      app: telegram-bot-gateway-go
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: 54bank
+        - podSelector:
+            matchLabels:
+              tier: microservice
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              name: 54bank
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 9092
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 53
+        - protocol: UDP
+          port: 53

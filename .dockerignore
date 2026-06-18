@@ -1,0 +1,14 @@
+node_modules
+.git
+.github
+*.md
+*.log
+.env
+.env.*
+dist
+coverage
+.vscode
+.idea
+tmp
+*.tar.gz
+flutter

@@ -1,0 +1,180 @@
+# APISIX Configuration — TLS Termination, API Gateway, Rate Limiting
+# Deploy in front of Express gateway for production-grade traffic management.
+#
+# Usage: apisix start -c config/apisix.yml
+# Docker: docker run -v $(pwd)/config/apisix.yml:/usr/local/apisix/conf/apisix.yaml apache/apisix
+
+apisix:
+  node_listen:
+    - port: 443
+      enable_http2: true
+      ssl:
+        cert: /etc/ssl/certs/54bank.crt
+        cert_key: /etc/ssl/private/54bank.key
+    - port: 80
+
+  ssl:
+    enable: true
+    listen:
+      - port: 443
+        enable_http2: true
+    ssl_protocols: TLSv1.2 TLSv1.3
+    ssl_ciphers: ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384
+
+  enable_admin: true
+  admin_key:
+    - name: admin
+      key: "${APISIX_ADMIN_KEY:-change-me-in-production}"
+      role: admin
+
+deployment:
+  role: traditional
+  role_traditional:
+    config_provider: yaml
+
+#routes:
+upstreams:
+  - id: express-gateway
+    type: roundrobin
+    nodes:
+      "127.0.0.1:3000": 1
+    timeout:
+      connect: 5
+      send: 30
+      read: 30
+    checks:
+      active:
+        type: http
+        http_path: /healthz
+        healthy:
+          interval: 10
+          successes: 2
+        unhealthy:
+          interval: 5
+          http_failures: 3
+
+  - id: security-gateway
+    type: roundrobin
+    nodes:
+      "127.0.0.1:8105": 1
+
+  - id: resilience-service
+    type: roundrobin
+    nodes:
+      "127.0.0.1:8106": 1
+
+  - id: payments-hub
+    type: roundrobin
+    nodes:
+      "127.0.0.1:8107": 1
+
+  - id: savings-products
+    type: roundrobin
+    nodes:
+      "127.0.0.1:8108": 1
+
+  - id: card-management
+    type: roundrobin
+    nodes:
+      "127.0.0.1:8109": 1
+
+  - id: treasury-liquidity
+    type: roundrobin
+    nodes:
+      "127.0.0.1:8110": 1
+
+  - id: customer-engagement
+    type: roundrobin
+    nodes:
+      "127.0.0.1:8111": 1
+
+  - id: fraud-detection
+    type: roundrobin
+    nodes:
+      "127.0.0.1:8112": 1
+
+routes:
+  # HTTP → HTTPS redirect
+  - id: http-redirect
+    uri: "/*"
+    plugins:
+      redirect:
+        http_to_https: true
+    priority: 1
+    listeners:
+      - port: 80
+
+  # Main application
+  - id: main-app
+    uri: "/*"
+    upstream_id: express-gateway
+    plugins:
+      # TLS termination handled by APISIX listener
+      cors:
+        allow_origins: "${CORS_ORIGINS:-https://54bank.com}"
+        allow_methods: "GET,POST,PUT,DELETE,OPTIONS,PATCH"
+        allow_headers: "Authorization,Content-Type,X-Api-Key,X-Correlation-Id,X-Tenant-Id"
+        expose_headers: "X-Request-Id,X-RateLimit-Limit,X-RateLimit-Remaining"
+        max_age: 86400
+        allow_credential: true
+
+      limit-req:
+        rate: 500
+        burst: 100
+        key_type: var
+        key: remote_addr
+        rejected_code: 429
+        rejected_msg: '{"error":"Rate limit exceeded"}'
+
+      limit-count:
+        count: 10000
+        time_window: 3600
+        key_type: var
+        key: remote_addr
+        rejected_code: 429
+
+      ip-restriction:
+        # Block known malicious IPs (update via admin API)
+        blacklist: []
+
+      request-id:
+        header_name: X-Request-Id
+        include_in_response: true
+
+      prometheus:
+        prefer_name: true
+
+      opentelemetry:
+        sampler:
+          name: trace_id_ratio
+          options:
+            fraction: 0.1
+
+  # Direct security gateway access (internal)
+  - id: security-direct
+    uri: /internal/security/*
+    upstream_id: security-gateway
+    plugins:
+      ip-restriction:
+        whitelist:
+          - "127.0.0.1"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+
+  # Direct resilience service access (internal)
+  - id: resilience-direct
+    uri: /internal/resilience/*
+    upstream_id: resilience-service
+    plugins:
+      ip-restriction:
+        whitelist:
+          - "127.0.0.1"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+
+plugin_attr:
+  prometheus:
+    export_uri: /apisix/prometheus/metrics
+    export_addr:
+      ip: "0.0.0.0"
+      port: 9091

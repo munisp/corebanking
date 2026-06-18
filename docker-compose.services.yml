@@ -1,0 +1,5342 @@
+# 54Bank — All 186 Microservices
+# Auto-generated. Usage: docker compose -f docker-compose.yml -f docker-compose.services.yml up
+
+version: "3.9"
+
+services:
+  ab_testing:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: ab-testing-py } }
+    environment:
+      PORT: "8300"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: ab-testing-py
+    ports: ["8300:8300"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  account_opening:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: account-opening-go } }
+    environment:
+      PORT: "8301"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: account-opening-go
+    ports: ["8301:8301"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  account_statement:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: account-statement-go } }
+    environment:
+      PORT: "8302"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: account-statement-go
+    ports: ["8302:8302"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  accounting_rules:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: accounting-rules-rs } }
+    environment:
+      PORT: "8303"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: accounting-rules-rs
+    ports: ["8303:8303"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  agent_banking:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: agent-banking-go } }
+    environment:
+      PORT: "8304"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent-banking-go
+    ports: ["8304:8304"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  agriculture_banking:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: agriculture-banking-rs } }
+    environment:
+      PORT: "8305"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agriculture-banking-rs
+    ports: ["8305:8305"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  api_marketplace:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: api-marketplace-go } }
+    environment:
+      PORT: "8306"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: api-marketplace-go
+    ports: ["8306:8306"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  apisix_gateway:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: apisix-gateway-go } }
+    environment:
+      PORT: "8307"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: apisix-gateway-go
+    ports: ["8307:8307"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  approval_workflow:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: approval-workflow-go } }
+    environment:
+      PORT: "8308"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: approval-workflow-go
+    ports: ["8308:8308"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  atm_management:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: atm-management-go } }
+    environment:
+      PORT: "8309"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: atm-management-go
+    ports: ["8309:8309"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  bank_guarantees:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: bank-guarantees-go } }
+    environment:
+      PORT: "8310"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: bank-guarantees-go
+    ports: ["8310:8310"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  basel_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: basel-engine-rs } }
+    environment:
+      PORT: "8311"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: basel-engine-rs
+    ports: ["8311:8311"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  batch_processing:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: batch-processing-py } }
+    environment:
+      PORT: "8312"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: batch-processing-py
+    ports: ["8312:8312"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  beneficiary_management:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: beneficiary-management-go } }
+    environment:
+      PORT: "8313"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: beneficiary-management-go
+    ports: ["8313:8313"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  billing_analytics:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: billing-analytics-py } }
+    environment:
+      PORT: "8314"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: billing-analytics-py
+    ports: ["8314:8314"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  billing_event_processor:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: billing-event-processor-py } }
+    environment:
+      PORT: "8315"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: billing-event-processor-py
+    ports: ["8315:8315"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  billing_ingestor:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: billing-ingestor-go } }
+    environment:
+      PORT: "8316"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: billing-ingestor-go
+    ports: ["8316:8316"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  billing_orchestrator:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: billing-orchestrator-go } }
+    environment:
+      PORT: "8317"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: billing-orchestrator-go
+    ports: ["8317:8317"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  billing_rating:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: billing-rating-rs } }
+    environment:
+      PORT: "8318"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: billing-rating-rs
+    ports: ["8318:8318"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  billing_rbac:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: billing-rbac-rs } }
+    environment:
+      PORT: "8319"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: billing-rbac-rs
+    ports: ["8319:8319"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  biometric_auth:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: biometric-auth-rs } }
+    environment:
+      PORT: "8320"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: biometric-auth-rs
+    ports: ["8320:8320"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  branch_operations:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: branch-operations-go } }
+    environment:
+      PORT: "8321"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: branch-operations-go
+    ports: ["8321:8321"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  branded_comms:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: branded-comms-py } }
+    environment:
+      PORT: "8322"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: branded-comms-py
+    ports: ["8322:8322"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  bulk_payments:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: bulk-payments-rs } }
+    environment:
+      PORT: "8323"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: bulk-payments-rs
+    ports: ["8323:8323"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  card_management:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: card-management-go } }
+    environment:
+      PORT: "8324"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: card-management-go
+    ports: ["8324:8324"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cash_pooling:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: cash-pooling-go } }
+    environment:
+      PORT: "8325"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cash-pooling-go
+    ports: ["8325:8325"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cbn_returns:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: cbn-returns-py } }
+    environment:
+      PORT: "8326"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cbn-returns-py
+    ports: ["8326:8326"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  chatbot:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: chatbot-py } }
+    environment:
+      PORT: "8327"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: chatbot-py
+    ports: ["8327:8327"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cheque_clearing:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: cheque-clearing-go } }
+    environment:
+      PORT: "8328"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cheque-clearing-go
+    ports: ["8328:8328"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cif_management:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: cif-management-go } }
+    environment:
+      PORT: "8329"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cif-management-go
+    ports: ["8329:8329"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  circuit_breaker:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: circuit-breaker-rs } }
+    environment:
+      PORT: "8330"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: circuit-breaker-rs
+    ports: ["8330:8330"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  collateral_valuation:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: collateral-valuation-rs } }
+    environment:
+      PORT: "8331"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: collateral-valuation-rs
+    ports: ["8331:8331"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  contingent_liabilities:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: contingent-liabilities-rs } }
+    environment:
+      PORT: "8332"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: contingent-liabilities-rs
+    ports: ["8332:8332"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  credit_bureau:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: credit-bureau-rs } }
+    environment:
+      PORT: "8333"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: credit-bureau-rs
+    ports: ["8333:8333"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  credit_facility:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: credit-facility-go } }
+    environment:
+      PORT: "8334"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: credit-facility-go
+    ports: ["8334:8334"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  custody_service:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: custody-service-go } }
+    environment:
+      PORT: "8335"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: custody-service-go
+    ports: ["8335:8335"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  custom_domain:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: custom-domain-go } }
+    environment:
+      PORT: "8336"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: custom-domain-go
+    ports: ["8336:8336"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  customer_360:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: customer-360-py } }
+    environment:
+      PORT: "8337"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: customer-360-py
+    ports: ["8337:8337"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  customer_engagement:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: customer-engagement-py } }
+    environment:
+      PORT: "8338"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: customer-engagement-py
+    ports: ["8338:8338"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  customer_feedback:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: customer-feedback-py } }
+    environment:
+      PORT: "8339"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: customer-feedback-py
+    ports: ["8339:8339"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  customer_insights:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: customer-insights-py } }
+    environment:
+      PORT: "8340"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: customer-insights-py
+    ports: ["8340:8340"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  dapr_sidecar:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: dapr-sidecar-go } }
+    environment:
+      PORT: "8341"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: dapr-sidecar-go
+    ports: ["8341:8341"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  data_export:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: data-export-rs } }
+    environment:
+      PORT: "8342"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: data-export-rs
+    ports: ["8342:8342"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ddos_protection:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: ddos-protection-go } }
+    environment:
+      PORT: "8343"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: ddos-protection-go
+    ports: ["8343:8343"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  diaspora_banking:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: diaspora-banking-py } }
+    environment:
+      PORT: "8344"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: diaspora-banking-py
+    ports: ["8344:8344"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  dispute_management:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: dispute-management-py } }
+    environment:
+      PORT: "8345"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: dispute-management-py
+    ports: ["8345:8345"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  document_management:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: document-management-py } }
+    environment:
+      PORT: "8346"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: document-management-py
+    ports: ["8346:8346"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  education_loans:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: education-loans-py } }
+    environment:
+      PORT: "8347"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: education-loans-py
+    ports: ["8347:8347"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  eod_processor:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: eod-processor-go } }
+    environment:
+      PORT: "8348"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: eod-processor-go
+    ports: ["8348:8348"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  erpnext_sync:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: erpnext-sync-py } }
+    environment:
+      PORT: "8349"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: erpnext-sync-py
+    ports: ["8349:8349"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  error_telemetry:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: error-telemetry-py } }
+    environment:
+      PORT: "8350"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: error-telemetry-py
+    ports: ["8350:8350"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  escrow:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: escrow-go } }
+    environment:
+      PORT: "8351"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: escrow-go
+    ports: ["8351:8351"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  esusu_groups:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: esusu-groups-go } }
+    environment:
+      PORT: "8352"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: esusu-groups-go
+    ports: ["8352:8352"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  etd_trading:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: etd-trading-rs } }
+    environment:
+      PORT: "8353"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: etd-trading-rs
+    ports: ["8353:8353"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  event_bus:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: event-bus-go } }
+    environment:
+      PORT: "8354"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: event-bus-go
+    ports: ["8354:8354"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  event_streaming:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: event-streaming-go } }
+    environment:
+      PORT: "8355"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: event-streaming-go
+    ports: ["8355:8355"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  exam_management:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: exam-management-py } }
+    environment:
+      PORT: "8356"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: exam-management-py
+    ports: ["8356:8356"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  expense_mgmt:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: expense-mgmt-go } }
+    environment:
+      PORT: "8357"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: expense-mgmt-go
+    ports: ["8357:8357"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  face_match:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: face-match-rs } }
+    environment:
+      PORT: "8358"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: face-match-rs
+    ports: ["8358:8358"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  factoring:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: factoring-go } }
+    environment:
+      PORT: "8359"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: factoring-go
+    ports: ["8359:8359"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fatca_crs:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: fatca-crs-rs } }
+    environment:
+      PORT: "8360"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fatca-crs-rs
+    ports: ["8360:8360"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  feature_flag_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: feature-flag-engine-rs } }
+    environment:
+      PORT: "8361"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: feature-flag-engine-rs
+    ports: ["8361:8361"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fixed_assets:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: fixed-assets-go } }
+    environment:
+      PORT: "8362"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fixed-assets-go
+    ports: ["8362:8362"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  flag_audit:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: flag-audit-rs } }
+    environment:
+      PORT: "8363"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: flag-audit-rs
+    ports: ["8363:8363"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fluvio_streams:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: fluvio-streams-rs } }
+    environment:
+      PORT: "8364"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fluvio-streams-rs
+    ports: ["8364:8364"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fraud_detection:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: fraud-detection-rs } }
+    environment:
+      PORT: "8365"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fraud-detection-rs
+    ports: ["8365:8365"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fx_rates_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: fx-rates-engine-rs } }
+    environment:
+      PORT: "8366"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fx-rates-engine-rs
+    ports: ["8366:8366"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  gl_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: gl-engine-rs } }
+    environment:
+      PORT: "8367"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: gl-engine-rs
+    ports: ["8367:8367"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  graduated_rollout:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: graduated-rollout-rs } }
+    environment:
+      PORT: "8368"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: graduated-rollout-rs
+    ports: ["8368:8368"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  group_lending:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: group-lending-go } }
+    environment:
+      PORT: "8369"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: group-lending-go
+    ports: ["8369:8369"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  idempotency:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: idempotency-go } }
+    environment:
+      PORT: "8370"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: idempotency-go
+    ports: ["8370:8370"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  identity_channels:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: identity-channels-go } }
+    environment:
+      PORT: "8371"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: identity-channels-go
+    ports: ["8371:8371"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ifrs9_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: ifrs9-engine-rs } }
+    environment:
+      PORT: "8372"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: ifrs9-engine-rs
+    ports: ["8372:8372"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  insurance:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: insurance-py } }
+    environment:
+      PORT: "8373"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: insurance-py
+    ports: ["8373:8373"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  interbank_lending:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: interbank-lending-rs } }
+    environment:
+      PORT: "8374"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: interbank-lending-rs
+    ports: ["8374:8374"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  interest_rate_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: interest-rate-engine-go } }
+    environment:
+      PORT: "8375"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: interest-rate-engine-go
+    ports: ["8375:8375"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  inventory:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: inventory-py } }
+    environment:
+      PORT: "8376"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: inventory-py
+    ports: ["8376:8376"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  islamic_banking:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: islamic-banking-py } }
+    environment:
+      PORT: "8377"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: islamic-banking-py
+    ports: ["8377:8377"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  iso20022_hub:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: iso20022-hub-rs } }
+    environment:
+      PORT: "8378"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: iso20022-hub-rs
+    ports: ["8378:8378"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kafka_broker:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: kafka-broker-go } }
+    environment:
+      PORT: "8379"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kafka-broker-go
+    ports: ["8379:8379"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kafka_streaming:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: kafka-streaming-go } }
+    environment:
+      PORT: "8380"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kafka-streaming-go
+    ports: ["8380:8380"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  keycloak_enforcer:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: keycloak-enforcer-go } }
+    environment:
+      PORT: "8381"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: keycloak-enforcer-go
+    ports: ["8381:8381"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  keycloak_identity:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: keycloak-identity-py } }
+    environment:
+      PORT: "8382"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: keycloak-identity-py
+    ports: ["8382:8382"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kyb_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: kyb-engine-go } }
+    environment:
+      PORT: "8383"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kyb-engine-go
+    ports: ["8383:8383"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kyb_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: kyb-engine-py } }
+    environment:
+      PORT: "8384"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kyb-engine-py
+    ports: ["8384:8384"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kyc_aml_screening:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: kyc-aml-screening-py } }
+    environment:
+      PORT: "8385"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kyc-aml-screening-py
+    ports: ["8385:8385"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kyc_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: kyc-engine-py } }
+    environment:
+      PORT: "8386"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kyc-engine-py
+    ports: ["8386:8386"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  lakehouse_etl:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: lakehouse-etl-py } }
+    environment:
+      PORT: "8387"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: lakehouse-etl-py
+    ports: ["8387:8387"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  lakehouse:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: lakehouse-rs } }
+    environment:
+      PORT: "8388"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: lakehouse-rs
+    ports: ["8388:8388"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  lcr_nsfr:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: lcr-nsfr-rs } }
+    environment:
+      PORT: "8389"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: lcr-nsfr-rs
+    ports: ["8389:8389"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  leasing:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: leasing-go } }
+    environment:
+      PORT: "8390"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: leasing-go
+    ports: ["8390:8390"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ledger_reconciliation:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: ledger-reconciliation-rs } }
+    environment:
+      PORT: "8391"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: ledger-reconciliation-rs
+    ports: ["8391:8391"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  liveness_detection:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: liveness-detection-rs } }
+    environment:
+      PORT: "8392"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: liveness-detection-rs
+    ports: ["8392:8392"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  loan_calculator:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: loan-calculator-go } }
+    environment:
+      PORT: "8393"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: loan-calculator-go
+    ports: ["8393:8393"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  loan_origination:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: loan-origination-go } }
+    environment:
+      PORT: "8394"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: loan-origination-go
+    ports: ["8394:8394"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  locker:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: locker-go } }
+    environment:
+      PORT: "8395"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: locker-go
+    ports: ["8395:8395"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  maker_checker:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: maker-checker-go } }
+    environment:
+      PORT: "8396"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: maker-checker-go
+    ports: ["8396:8396"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mandate_management:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: mandate-management-go } }
+    environment:
+      PORT: "8397"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mandate-management-go
+    ports: ["8397:8397"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  microfinance_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: microfinance-engine-go } }
+    environment:
+      PORT: "8398"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: microfinance-engine-go
+    ports: ["8398:8398"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  microfinance:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: microfinance-py } }
+    environment:
+      PORT: "8399"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: microfinance-py
+    ports: ["8399:8399"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  middleware:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: middleware-go } }
+    environment:
+      PORT: "8400"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: middleware-go
+    ports: ["8400:8400"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  middleware:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: middleware-py } }
+    environment:
+      PORT: "8401"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: middleware-py
+    ports: ["8401:8401"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  middleware:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: middleware-rs } }
+    environment:
+      PORT: "8402"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: middleware-rs
+    ports: ["8402:8402"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mojaloop_admin:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: mojaloop-admin-go } }
+    environment:
+      PORT: "8403"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mojaloop-admin-go
+    ports: ["8403:8403"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mojaloop_connector:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: mojaloop-connector-go } }
+    environment:
+      PORT: "8404"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mojaloop-connector-go
+    ports: ["8404:8404"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mojaloop_crossborder:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: mojaloop-crossborder-py } }
+    environment:
+      PORT: "8405"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mojaloop-crossborder-py
+    ports: ["8405:8405"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mojaloop_fspiop_callbacks:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: mojaloop-fspiop-callbacks-rs } }
+    environment:
+      PORT: "8406"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mojaloop-fspiop-callbacks-rs
+    ports: ["8406:8406"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mojaloop_settlement_mgr:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: mojaloop-settlement-mgr-go } }
+    environment:
+      PORT: "8407"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mojaloop-settlement-mgr-go
+    ports: ["8407:8407"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mojaloop_tb_bridge:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: mojaloop-tb-bridge-rs } }
+    environment:
+      PORT: "8408"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mojaloop-tb-bridge-rs
+    ports: ["8408:8408"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  money_market:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: money-market-rs } }
+    environment:
+      PORT: "8409"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: money-market-rs
+    ports: ["8409:8409"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mortgage_servicing:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: mortgage-servicing-rs } }
+    environment:
+      PORT: "8410"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mortgage-servicing-rs
+    ports: ["8410:8410"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  multi_entity:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: multi-entity-go } }
+    environment:
+      PORT: "8411"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: multi-entity-go
+    ports: ["8411:8411"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  multicurrency_revaluation:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: multicurrency-revaluation-rs } }
+    environment:
+      PORT: "8412"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: multicurrency-revaluation-rs
+    ports: ["8412:8412"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  nibss_direct_debit:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: nibss-direct-debit-go } }
+    environment:
+      PORT: "8413"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: nibss-direct-debit-go
+    ports: ["8413:8413"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  notification_service:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: notification-service-go } }
+    environment:
+      PORT: "8414"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: notification-service-go
+    ports: ["8414:8414"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  offline_resilience:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: offline-resilience-rs } }
+    environment:
+      PORT: "8415"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: offline-resilience-rs
+    ports: ["8415:8415"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  open_banking:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: open-banking-go } }
+    environment:
+      PORT: "8416"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: open-banking-go
+    ports: ["8416:8416"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  openappsec_waf:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: openappsec-waf-rs } }
+    environment:
+      PORT: "8417"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: openappsec-waf-rs
+    ports: ["8417:8417"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  opensearch_analytics:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: opensearch-analytics-py } }
+    environment:
+      PORT: "8418"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: opensearch-analytics-py
+    ports: ["8418:8418"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  opensearch_indexer:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: opensearch-indexer-py } }
+    environment:
+      PORT: "8419"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: opensearch-indexer-py
+    ports: ["8419:8419"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  otc_derivatives:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: otc-derivatives-rs } }
+    environment:
+      PORT: "8420"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: otc-derivatives-rs
+    ports: ["8420:8420"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  payment_investigation:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: payment-investigation-go } }
+    environment:
+      PORT: "8421"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: payment-investigation-go
+    ports: ["8421:8421"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  payments_hub:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: payments-hub-go } }
+    environment:
+      PORT: "8422"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: payments-hub-go
+    ports: ["8422:8422"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pbac_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: pbac-engine-rs } }
+    environment:
+      PORT: "8423"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: pbac-engine-rs
+    ports: ["8423:8423"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pension:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: pension-py } }
+    environment:
+      PORT: "8424"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: pension-py
+    ports: ["8424:8424"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  permify_authz:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: permify-authz-go } }
+    environment:
+      PORT: "8425"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: permify-authz-go
+    ports: ["8425:8425"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  plugin_marketplace:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: plugin-marketplace-py } }
+    environment:
+      PORT: "8426"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: plugin-marketplace-py
+    ports: ["8426:8426"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  portfolio_mgmt:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: portfolio-mgmt-rs } }
+    environment:
+      PORT: "8427"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: portfolio-mgmt-rs
+    ports: ["8427:8427"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pos_terminal:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: pos-terminal-go } }
+    environment:
+      PORT: "8428"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: pos-terminal-go
+    ports: ["8428:8428"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  postgres_adapter:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: postgres-adapter-go } }
+    environment:
+      PORT: "8429"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: postgres-adapter-go
+    ports: ["8429:8429"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  postgres_persistence:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: postgres-persistence-rs } }
+    environment:
+      PORT: "8430"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: postgres-persistence-rs
+    ports: ["8430:8430"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  postgres_query_cache:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: postgres-query-cache-rs } }
+    environment:
+      PORT: "8431"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: postgres-query-cache-rs
+    ports: ["8431:8431"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  postgres_query_optimizer:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: postgres-query-optimizer-go } }
+    environment:
+      PORT: "8432"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: postgres-query-optimizer-go
+    ports: ["8432:8432"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  postgres_vacuum:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: postgres-vacuum-py } }
+    environment:
+      PORT: "8433"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: postgres-vacuum-py
+    ports: ["8433:8433"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  product_factory:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: product-factory-rs } }
+    environment:
+      PORT: "8434"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: product-factory-rs
+    ports: ["8434:8434"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  project_finance:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: project-finance-go } }
+    environment:
+      PORT: "8435"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: project-finance-go
+    ports: ["8435:8435"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  qr_payments:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: qr-payments-go } }
+    environment:
+      PORT: "8436"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: qr-payments-go
+    ports: ["8436:8436"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  rate_cascade:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: rate-cascade-rs } }
+    environment:
+      PORT: "8437"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: rate-cascade-rs
+    ports: ["8437:8437"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  reconciliation_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: reconciliation-engine-rs } }
+    environment:
+      PORT: "8438"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: reconciliation-engine-rs
+    ports: ["8438:8438"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  redis_cache:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: redis-cache-rs } }
+    environment:
+      PORT: "8439"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: redis-cache-rs
+    ports: ["8439:8439"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  regulatory_automation:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: regulatory-automation-py } }
+    environment:
+      PORT: "8440"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: regulatory-automation-py
+    ports: ["8440:8440"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  regulatory_reporting:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: regulatory-reporting-py } }
+    environment:
+      PORT: "8441"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: regulatory-reporting-py
+    ports: ["8441:8441"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  relationship_pricing:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: relationship-pricing-rs } }
+    environment:
+      PORT: "8442"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: relationship-pricing-rs
+    ports: ["8442:8442"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  remittance:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: remittance-go } }
+    environment:
+      PORT: "8443"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: remittance-go
+    ports: ["8443:8443"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  resilience_service:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: resilience-service-rs } }
+    environment:
+      PORT: "8444"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: resilience-service-rs
+    ports: ["8444:8444"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  risk_scoring:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: risk-scoring-rs } }
+    environment:
+      PORT: "8445"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: risk-scoring-rs
+    ports: ["8445:8445"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  safe_deposit:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: safe-deposit-go } }
+    environment:
+      PORT: "8446"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: safe-deposit-go
+    ports: ["8446:8446"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  saga_coordinator:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: saga-coordinator-py } }
+    environment:
+      PORT: "8447"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: saga-coordinator-py
+    ports: ["8447:8447"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  salary_processing:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: salary-processing-go } }
+    environment:
+      PORT: "8448"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: salary-processing-go
+    ports: ["8448:8448"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  savings_products:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: savings-products-go } }
+    environment:
+      PORT: "8449"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: savings-products-go
+    ports: ["8449:8449"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  savings_products:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: savings-products-py } }
+    environment:
+      PORT: "8450"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: savings-products-py
+    ports: ["8450:8450"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  securities_trading:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: securities-trading-rs } }
+    environment:
+      PORT: "8451"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: securities-trading-rs
+    ports: ["8451:8451"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  security_gateway:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: security-gateway-go } }
+    environment:
+      PORT: "8452"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: security-gateway-go
+    ports: ["8452:8452"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  security_hardening:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: security-hardening-go } }
+    environment:
+      PORT: "8453"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: security-hardening-go
+    ports: ["8453:8453"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  signature_verification:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: signature-verification-rs } }
+    environment:
+      PORT: "8454"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: signature-verification-rs
+    ports: ["8454:8454"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  sms_email_gateway:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: sms-email-gateway-go } }
+    environment:
+      PORT: "8455"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: sms-email-gateway-go
+    ports: ["8455:8455"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  standing_charges:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: standing-charges-go } }
+    environment:
+      PORT: "8456"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: standing-charges-go
+    ports: ["8456:8456"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  standing_orders:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: standing-orders-go } }
+    environment:
+      PORT: "8457"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: standing-orders-go
+    ports: ["8457:8457"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  statement_generator:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: statement-generator-py } }
+    environment:
+      PORT: "8458"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: statement-generator-py
+    ports: ["8458:8458"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  stress_testing:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: stress-testing-rs } }
+    environment:
+      PORT: "8459"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: stress-testing-rs
+    ports: ["8459:8459"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  supply_chain_finance:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: supply-chain-finance-go } }
+    environment:
+      PORT: "8460"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: supply-chain-finance-go
+    ports: ["8460:8460"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  swift_messaging:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: swift-messaging-go } }
+    environment:
+      PORT: "8461"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: swift-messaging-go
+    ports: ["8461:8461"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  syndicated_loans:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: syndicated-loans-go } }
+    environment:
+      PORT: "8462"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: syndicated-loans-go
+    ports: ["8462:8462"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  teller_operations:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: teller-operations-go } }
+    environment:
+      PORT: "8463"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: teller-operations-go
+    ports: ["8463:8463"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  temporal_sagas:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: temporal-sagas-go } }
+    environment:
+      PORT: "8464"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: temporal-sagas-go
+    ports: ["8464:8464"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  temporal_worker:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: temporal-worker-go } }
+    environment:
+      PORT: "8465"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: temporal-worker-go
+    ports: ["8465:8465"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tenant_billing:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: tenant-billing-go } }
+    environment:
+      PORT: "8466"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tenant-billing-go
+    ports: ["8466:8466"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tenant_export:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: tenant-export-go } }
+    environment:
+      PORT: "8467"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tenant-export-go
+    ports: ["8467:8467"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tenant_isolation:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: tenant-isolation-go } }
+    environment:
+      PORT: "8468"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tenant-isolation-go
+    ports: ["8468:8468"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tenant_metering:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: tenant-metering-go } }
+    environment:
+      PORT: "8469"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tenant-metering-go
+    ports: ["8469:8469"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tenant_provisioning:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: tenant-provisioning-go } }
+    environment:
+      PORT: "8470"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tenant-provisioning-go
+    ports: ["8470:8470"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tenant_ratelimit:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: tenant-ratelimit-rs } }
+    environment:
+      PORT: "8471"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tenant-ratelimit-rs
+    ports: ["8471:8471"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tigerbeetle_adapter:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: tigerbeetle-adapter-rs } }
+    environment:
+      PORT: "8472"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tigerbeetle-adapter-rs
+    ports: ["8472:8472"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tigerbeetle_ledger:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: tigerbeetle-ledger-rs } }
+    environment:
+      PORT: "8473"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tigerbeetle-ledger-rs
+    ports: ["8473:8473"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tigerbeetle_sync:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: tigerbeetle-sync-go } }
+    environment:
+      PORT: "8474"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tigerbeetle-sync-go
+    ports: ["8474:8474"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  trade_finance:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: trade-finance-go } }
+    environment:
+      PORT: "8475"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: trade-finance-go
+    ports: ["8475:8475"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  treasury_liquidity:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: treasury-liquidity-py } }
+    environment:
+      PORT: "8476"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: treasury-liquidity-py
+    ports: ["8476:8476"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  treasury_liquidity:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: treasury-liquidity-rs } }
+    environment:
+      PORT: "8477"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: treasury-liquidity-rs
+    ports: ["8477:8477"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  trust_estate:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: trust-estate-rs } }
+    environment:
+      PORT: "8478"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: trust-estate-rs
+    ports: ["8478:8478"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  utility_payments:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: utility-payments-go } }
+    environment:
+      PORT: "8479"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: utility-payments-go
+    ports: ["8479:8479"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  virtual_accounts:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: virtual-accounts-go } }
+    environment:
+      PORT: "8480"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: virtual-accounts-go
+    ports: ["8480:8480"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  wealth_mgmt:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: wealth-mgmt-py } }
+    environment:
+      PORT: "8481"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: wealth-mgmt-py
+    ports: ["8481:8481"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  webhook_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: webhook-engine-go } }
+    environment:
+      PORT: "8482"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: webhook-engine-go
+    ports: ["8482:8482"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  white_label_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: white-label-engine-go } }
+    environment:
+      PORT: "8483"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: white-label-engine-go
+    ports: ["8483:8483"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  workflow_engine:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: workflow-engine-py } }
+    environment:
+      PORT: "8484"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: workflow-engine-py
+    ports: ["8484:8484"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  # ========================================================================
+  # KYC/KYB Enhanced Suite — 22 polyglot services (5 phases)
+  # ========================================================================
+
+  cbn_tiered_kyc:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: cbn-tiered-kyc-rs } }
+    environment:
+      PORT: "8280"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cbn-tiered-kyc-rs
+    ports: ["8280:8280"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  bvn_nin_verification:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: bvn-nin-verification-go } }
+    environment:
+      PORT: "8281"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: bvn-nin-verification-go
+    ports: ["8281:8281"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  nfiu_ctr_str_filing:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: nfiu-ctr-str-filing-py } }
+    environment:
+      PORT: "8282"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: nfiu-ctr-str-filing-py
+    ports: ["8282:8282"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  sanctions_screening:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: sanctions-screening-rs } }
+    environment:
+      PORT: "8283"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: sanctions-screening-rs
+    ports: ["8283:8283"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cac_realtime_api:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: cac-realtime-api-go } }
+    environment:
+      PORT: "8284"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cac-realtime-api-go
+    ports: ["8284:8284"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  txn_monitoring_rules:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: txn-monitoring-rules-rs } }
+    environment:
+      PORT: "8285"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: txn-monitoring-rules-rs
+    ports: ["8285:8285"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  risk_based_approach:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: risk-based-approach-py } }
+    environment:
+      PORT: "8286"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: risk-based-approach-py
+    ports: ["8286:8286"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pep_enhanced_dd:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: pep-enhanced-dd-py } }
+    environment:
+      PORT: "8287"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: pep-enhanced-dd-py
+    ports: ["8287:8287"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ubo_ownership_graph:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: ubo-ownership-graph-rs } }
+    environment:
+      PORT: "8288"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: ubo-ownership-graph-rs
+    ports: ["8288:8288"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  multi_bureau_verification:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: multi-bureau-verification-go } }
+    environment:
+      PORT: "8289"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: multi-bureau-verification-go
+    ports: ["8289:8289"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  corporate_doc_verification:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: corporate-doc-verification-py } }
+    environment:
+      PORT: "8290"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: corporate-doc-verification-py
+    ports: ["8290:8290"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kyc_analytics_dashboard:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: kyc-analytics-dashboard-py } }
+    environment:
+      PORT: "8291"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kyc-analytics-dashboard-py
+    ports: ["8291:8291"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  video_kyc:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: video-kyc-py } }
+    environment:
+      PORT: "8292"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: video-kyc-py
+    ports: ["8292:8292"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  continuous_liveness:
+    build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: continuous-liveness-rs } }
+    environment:
+      PORT: "8293"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: continuous-liveness-rs
+    ports: ["8293:8293"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  adverse_media_screening:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: adverse-media-screening-py } }
+    environment:
+      PORT: "8294"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: adverse-media-screening-py
+    ports: ["8294:8294"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  agent_kyc_capture:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: agent-kyc-capture-go } }
+    environment:
+      PORT: "8295"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: agent-kyc-capture-go
+    ports: ["8295:8295"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kyc_data_quality:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: kyc-data-quality-py } }
+    environment:
+      PORT: "8296"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kyc-data-quality-py
+    ports: ["8296:8296"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  efass_kyc_returns:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: efass-kyc-returns-py } }
+    environment:
+      PORT: "8297"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: efass-kyc-returns-py
+    ports: ["8297:8297"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kyc_self_service:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: kyc-self-service-py } }
+    environment:
+      PORT: "8298"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kyc-self-service-py
+    ports: ["8298:8298"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kyc_workflow_orchestration:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: kyc-workflow-orchestration-py } }
+    environment:
+      PORT: "8299"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kyc-workflow-orchestration-py
+    ports: ["8299:8299"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  corporate_monitoring:
+    build: { context: ., dockerfile: docker/Dockerfile.go, args: { SERVICE: corporate-monitoring-go } }
+    environment:
+      PORT: "8300"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: corporate-monitoring-go
+    ports: ["8300:8300"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  address_verification:
+    build: { context: ., dockerfile: docker/Dockerfile.python, args: { SERVICE: address-verification-py } }
+    environment:
+      PORT: "8301"
+      DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: address-verification-py
+    ports: ["8301:8301"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  # ======== AI/ML/DL/GNN/CV Services ========
+  gnn-fraud-detection-py:
+    build: ./services/gnn-fraud-detection-py
+    environment:
+      PORT: "8302"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: gnn-fraud-detection-py
+    ports: ["8302:8302"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fraudfusion-ensemble-rs:
+    build: ./services/fraudfusion-ensemble-rs
+    environment:
+      PORT: "8303"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fraudfusion-ensemble-rs
+    ports: ["8303:8303"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mcmc-bayesian-risk-py:
+    build: ./services/mcmc-bayesian-risk-py
+    environment:
+      PORT: "8304"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mcmc-bayesian-risk-py
+    ports: ["8304:8304"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cocoindex-pipeline-py:
+    build: ./services/cocoindex-pipeline-py
+    environment:
+      PORT: "8305"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cocoindex-pipeline-py
+    ports: ["8305:8305"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  epr-kgqa-engine-py:
+    build: ./services/epr-kgqa-engine-py
+    environment:
+      PORT: "8306"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: epr-kgqa-engine-py
+    ports: ["8306:8306"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  falkordb-graph-rs:
+    build: ./services/falkordb-graph-rs
+    environment:
+      PORT: "8307"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: falkordb-graph-rs
+    ports: ["8307:8307"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ollama-inference-go:
+    build: ./services/ollama-inference-go
+    environment:
+      PORT: "8308"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: ollama-inference-go
+    ports: ["8308:8308"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  art-adversarial-robustness-py:
+    build: ./services/art-adversarial-robustness-py
+    environment:
+      PORT: "8309"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: art-adversarial-robustness-py
+    ports: ["8309:8309"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mojaloop-pisp-go:
+    build: ./services/mojaloop-pisp-go
+    environment:
+      PORT: "8310"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mojaloop-pisp-go
+    ports: ["8310:8310"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tigerbeetle-multicurrency-rs:
+    build: ./services/tigerbeetle-multicurrency-rs
+    environment:
+      PORT: "8311"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tigerbeetle-multicurrency-rs
+    ports: ["8311:8311"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kafka-schema-registry-go:
+    build: ./services/kafka-schema-registry-go
+    environment:
+      PORT: "8312"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kafka-schema-registry-go
+    ports: ["8312:8312"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+# ======== Production Hardening Services (30) ========
+
+  cors-gateway-go:
+    build: ./services/cors-gateway-go
+    environment:
+      PORT: "8313"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cors-gateway-go
+    ports: ["8313:8313"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  auth-enforcer-rs:
+    build: ./services/auth-enforcer-rs
+    environment:
+      PORT: "8314"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: auth-enforcer-rs
+    ports: ["8314:8314"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  request-validator-py:
+    build: ./services/request-validator-py
+    environment:
+      PORT: "8315"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: request-validator-py
+    ports: ["8315:8315"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  api-versioning-go:
+    build: ./services/api-versioning-go
+    environment:
+      PORT: "8316"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: api-versioning-go
+    ports: ["8316:8316"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  apm-sentry-py:
+    build: ./services/apm-sentry-py
+    environment:
+      PORT: "8317"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: apm-sentry-py
+    ports: ["8317:8317"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  secrets-rotation-rs:
+    build: ./services/secrets-rotation-rs
+    environment:
+      PORT: "8318"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: secrets-rotation-rs
+    ports: ["8318:8318"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  db-migration-manager-go:
+    build: ./services/db-migration-manager-go
+    environment:
+      PORT: "8319"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: db-migration-manager-go
+    ports: ["8319:8319"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  connection-pooler-rs:
+    build: ./services/connection-pooler-rs
+    environment:
+      PORT: "8320"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: connection-pooler-rs
+    ports: ["8320:8320"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  backup-manager-py:
+    build: ./services/backup-manager-py
+    environment:
+      PORT: "8321"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: backup-manager-py
+    ports: ["8321:8321"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  unit-test-runner-py:
+    build: ./services/unit-test-runner-py
+    environment:
+      PORT: "8322"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: unit-test-runner-py
+    ports: ["8322:8322"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  e2e-orchestrator-go:
+    build: ./services/e2e-orchestrator-go
+    environment:
+      PORT: "8323"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: e2e-orchestrator-go
+    ports: ["8323:8323"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  contract-test-rs:
+    build: ./services/contract-test-rs
+    environment:
+      PORT: "8324"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: contract-test-rs
+    ports: ["8324:8324"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  load-test-runner-py:
+    build: ./services/load-test-runner-py
+    environment:
+      PORT: "8325"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: load-test-runner-py
+    ports: ["8325:8325"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  otel-collector-go:
+    build: ./services/otel-collector-go
+    environment:
+      PORT: "8326"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: otel-collector-go
+    ports: ["8326:8326"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  changelog-generator-py:
+    build: ./services/changelog-generator-py
+    environment:
+      PORT: "8327"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: changelog-generator-py
+    ports: ["8327:8327"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  helm-validator-go:
+    build: ./services/helm-validator-go
+    environment:
+      PORT: "8328"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: helm-validator-go
+    ports: ["8328:8328"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  accessibility-auditor-py:
+    build: ./services/accessibility-auditor-py
+    environment:
+      PORT: "8329"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: accessibility-auditor-py
+    ports: ["8329:8329"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  i18n-service-go:
+    build: ./services/i18n-service-go
+    environment:
+      PORT: "8330"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: i18n-service-go
+    ports: ["8330:8330"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  skeleton-loading-rs:
+    build: ./services/skeleton-loading-rs
+    environment:
+      PORT: "8331"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: skeleton-loading-rs
+    ports: ["8331:8331"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  credit-scoring-py:
+    build: ./services/credit-scoring-py
+    environment:
+      PORT: "8332"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: credit-scoring-py
+    ports: ["8332:8332"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  debt-collection-go:
+    build: ./services/debt-collection-go
+    environment:
+      PORT: "8333"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: debt-collection-go
+    ports: ["8333:8333"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  account-closure-go:
+    build: ./services/account-closure-go
+    environment:
+      PORT: "8334"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: account-closure-go
+    ports: ["8334:8334"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  dormancy-management-rs:
+    build: ./services/dormancy-management-rs
+    environment:
+      PORT: "8335"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: dormancy-management-rs
+    ports: ["8335:8335"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  interest-computation-rs:
+    build: ./services/interest-computation-rs
+    environment:
+      PORT: "8336"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: interest-computation-rs
+    ports: ["8336:8336"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fee-management-go:
+    build: ./services/fee-management-go
+    environment:
+      PORT: "8337"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fee-management-go
+    ports: ["8337:8337"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tax-reporting-py:
+    build: ./services/tax-reporting-py
+    environment:
+      PORT: "8338"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tax-reporting-py
+    ports: ["8338:8338"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  regulatory-sandbox-go:
+    build: ./services/regulatory-sandbox-go
+    environment:
+      PORT: "8339"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: regulatory-sandbox-go
+    ports: ["8339:8339"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  api-analytics-py:
+    build: ./services/api-analytics-py
+    environment:
+      PORT: "8340"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: api-analytics-py
+    ports: ["8340:8340"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  developer-portal-go:
+    build: ./services/developer-portal-go
+    environment:
+      PORT: "8341"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: developer-portal-go
+    ports: ["8341:8341"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  customer-360-dashboard-py:
+    build: ./services/customer-360-dashboard-py
+    environment:
+      PORT: "8342"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: customer-360-dashboard-py
+    ports: ["8342:8342"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  realtime-pricing-rs:
+    build: ./services/realtime-pricing-rs
+    environment:
+      PORT: "8343"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: realtime-pricing-rs
+    ports: ["8343:8343"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  grpc-gateway-rs:
+    build: ./services/grpc-gateway-rs
+    environment:
+      PORT: "8344"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: grpc-gateway-rs
+    ports: ["8344:8344"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  event-sourcing-go:
+    build: ./services/event-sourcing-go
+    environment:
+      PORT: "8345"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: event-sourcing-go
+    ports: ["8345:8345"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  express-rate-limiter-rs:
+    build: ./services/express-rate-limiter-rs
+    environment:
+      PORT: "8346"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: express-rate-limiter-rs
+    ports: ["8346:8346"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  graphql-gateway-go:
+    build: ./services/graphql-gateway-go
+    environment:
+      PORT: "8347"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: graphql-gateway-go
+    ports: ["8347:8347"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  # ─── Security Enhancement Suite (12 services) ─────────────────────────────
+
+  scratch-card-pin-go:
+    build: ./services/scratch-card-pin-go
+    environment:
+      PORT: "8485"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: scratch-card-pin-go
+    ports: ["8485:8485"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  hsm-key-manager-rs:
+    build: ./services/hsm-key-manager-rs
+    environment:
+      PORT: "8486"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: hsm-key-manager-rs
+    ports: ["8486:8486"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pin-block-engine-rs:
+    build: ./services/pin-block-engine-rs
+    environment:
+      PORT: "8487"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: pin-block-engine-rs
+    ports: ["8487:8487"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  grid-token-card-go:
+    build: ./services/grid-token-card-go
+    environment:
+      PORT: "8488"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: grid-token-card-go
+    ports: ["8488:8488"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mfa-orchestrator-go:
+    build: ./services/mfa-orchestrator-go
+    environment:
+      PORT: "8489"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: mfa-orchestrator-go
+    ports: ["8489:8489"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  otp-hardening-rs:
+    build: ./services/otp-hardening-rs
+    environment:
+      PORT: "8490"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: otp-hardening-rs
+    ports: ["8490:8490"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  session-security-rs:
+    build: ./services/session-security-rs
+    environment:
+      PORT: "8491"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: session-security-rs
+    ports: ["8491:8491"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  api-key-vault-go:
+    build: ./services/api-key-vault-go
+    environment:
+      PORT: "8492"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: api-key-vault-go
+    ports: ["8492:8492"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  adaptive-rate-limiter-rs:
+    build: ./services/adaptive-rate-limiter-rs
+    environment:
+      PORT: "8493"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: adaptive-rate-limiter-rs
+    ports: ["8493:8493"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  field-level-encryption-rs:
+    build: ./services/field-level-encryption-rs
+    environment:
+      PORT: "8494"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: field-level-encryption-rs
+    ports: ["8494:8494"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  certificate-manager-py:
+    build: ./services/certificate-manager-py
+    environment:
+      PORT: "8495"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: certificate-manager-py
+    ports: ["8495:8495"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  security-audit-logger-py:
+    build: ./services/security-audit-logger-py
+    environment:
+      PORT: "8496"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: security-audit-logger-py
+    ports: ["8496:8496"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  # ─── Platform Security Hardening (37 services) ───────────────────────
+  jwt-validator-rs:
+    build: ./services/jwt-validator-rs
+    environment:
+      PORT: "8497"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: jwt-validator-rs
+    ports: ["8497:8497"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  route-schema-enforcer-go:
+    build: ./services/route-schema-enforcer-go
+    environment:
+      PORT: "8498"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: route-schema-enforcer-go
+    ports: ["8498:8498"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  sql-parameterizer-rs:
+    build: ./services/sql-parameterizer-rs
+    environment:
+      PORT: "8499"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: sql-parameterizer-rs
+    ports: ["8499:8499"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  secrets-vault-go:
+    build: ./services/secrets-vault-go
+    environment:
+      PORT: "8500"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: secrets-vault-go
+    ports: ["8500:8500"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pin-hasher-rs:
+    build: ./services/pin-hasher-rs
+    environment:
+      PORT: "8501"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: pin-hasher-rs
+    ports: ["8501:8501"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  docker-hardener-py:
+    build: ./services/docker-hardener-py
+    environment:
+      PORT: "8502"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: docker-hardener-py
+    ports: ["8502:8502"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pkce-auth-flow-go:
+    build: ./services/pkce-auth-flow-go
+    environment:
+      PORT: "8503"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      OTEL_SERVICE_NAME: pkce-auth-flow-go
+    ports: ["8503:8503"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  token-rotation-rs:
+    build: ./services/token-rotation-rs
+    environment:
+      PORT: "8504"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: token-rotation-rs
+    ports: ["8504:8504"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  mtls-mesh-rs:
+    build: ./services/mtls-mesh-rs
+    environment:
+      PORT: "8505"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: mtls-mesh-rs
+    ports: ["8505:8505"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  body-limit-enforcer-go:
+    build: ./services/body-limit-enforcer-go
+    environment:
+      PORT: "8506"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: body-limit-enforcer-go
+    ports: ["8506:8506"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cloud-kms-bridge-rs:
+    build: ./services/cloud-kms-bridge-rs
+    environment:
+      PORT: "8507"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: cloud-kms-bridge-rs
+    ports: ["8507:8507"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tls-terminator-go:
+    build: ./services/tls-terminator-go
+    environment:
+      PORT: "8508"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: tls-terminator-go
+    ports: ["8508:8508"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  event-correlator-py:
+    build: ./services/event-correlator-py
+    environment:
+      PORT: "8509"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: event-correlator-py
+    ports: ["8509:8509"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pci-scanner-rs:
+    build: ./services/pci-scanner-rs
+    environment:
+      PORT: "8510"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: pci-scanner-rs
+    ports: ["8510:8510"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  api-key-enforcer-go:
+    build: ./services/api-key-enforcer-go
+    environment:
+      PORT: "8511"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: api-key-enforcer-go
+    ports: ["8511:8511"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  path-validator-rs:
+    build: ./services/path-validator-rs
+    environment:
+      PORT: "8512"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: path-validator-rs
+    ports: ["8512:8512"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  key-rotation-engine-go:
+    build: ./services/key-rotation-engine-go
+    environment:
+      PORT: "8513"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: key-rotation-engine-go
+    ports: ["8513:8513"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  network-policy-manager-py:
+    build: ./services/network-policy-manager-py
+    environment:
+      PORT: "8514"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: network-policy-manager-py
+    ports: ["8514:8514"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  vault-integration-rs:
+    build: ./services/vault-integration-rs
+    environment:
+      PORT: "8515"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: vault-integration-rs
+    ports: ["8515:8515"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  anomaly-detector-py:
+    build: ./services/anomaly-detector-py
+    environment:
+      PORT: "8516"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: anomaly-detector-py
+    ports: ["8516:8516"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ndpr-compliance-py:
+    build: ./services/ndpr-compliance-py
+    environment:
+      PORT: "8517"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: ndpr-compliance-py
+    ports: ["8517:8517"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  output-encoder-rs:
+    build: ./services/output-encoder-rs
+    environment:
+      PORT: "8518"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: output-encoder-rs
+    ports: ["8518:8518"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  image-scanner-go:
+    build: ./services/image-scanner-go
+    environment:
+      PORT: "8519"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: image-scanner-go
+    ports: ["8519:8519"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  waf-rules-engine-rs:
+    build: ./services/waf-rules-engine-rs
+    environment:
+      PORT: "8520"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: waf-rules-engine-rs
+    ports: ["8520:8520"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ddos-shield-go:
+    build: ./services/ddos-shield-go
+    environment:
+      PORT: "8521"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: ddos-shield-go
+    ports: ["8521:8521"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ip-allowlist-rs:
+    build: ./services/ip-allowlist-rs
+    environment:
+      PORT: "8522"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: ip-allowlist-rs
+    ports: ["8522:8522"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  siem-exporter-py:
+    build: ./services/siem-exporter-py
+    environment:
+      PORT: "8523"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: siem-exporter-py
+    ports: ["8523:8523"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cbn-compliance-checker-py:
+    build: ./services/cbn-compliance-checker-py
+    environment:
+      PORT: "8524"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: cbn-compliance-checker-py
+    ports: ["8524:8524"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  egress-controller-rs:
+    build: ./services/egress-controller-rs
+    environment:
+      PORT: "8525"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: egress-controller-rs
+    ports: ["8525:8525"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  incident-responder-go:
+    build: ./services/incident-responder-go
+    environment:
+      PORT: "8526"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: incident-responder-go
+    ports: ["8526:8526"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  immutable-audit-rs:
+    build: ./services/immutable-audit-rs
+    environment:
+      PORT: "8527"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: immutable-audit-rs
+    ports: ["8527:8527"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  soc2-evidence-collector-py:
+    build: ./services/soc2-evidence-collector-py
+    environment:
+      PORT: "8528"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: soc2-evidence-collector-py
+    ports: ["8528:8528"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pentest-orchestrator-go:
+    build: ./services/pentest-orchestrator-go
+    environment:
+      PORT: "8529"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: pentest-orchestrator-go
+    ports: ["8529:8529"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  sri-validator-rs:
+    build: ./services/sri-validator-rs
+    environment:
+      PORT: "8530"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: sri-validator-rs
+    ports: ["8530:8530"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  csp-nonce-engine-go:
+    build: ./services/csp-nonce-engine-go
+    environment:
+      PORT: "8531"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: csp-nonce-engine-go
+    ports: ["8531:8531"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  clickjack-defender-rs:
+    build: ./services/clickjack-defender-rs
+    environment:
+      PORT: "8532"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: clickjack-defender-rs
+    ports: ["8532:8532"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  browser-fingerprint-go:
+    build: ./services/browser-fingerprint-go
+    environment:
+      PORT: "8533"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_SERVICE_NAME: browser-fingerprint-go
+    ports: ["8533:8533"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  # ─── Performance Optimization (40 services) ───────────────────────
+
+  redis-cache-middleware-rs:
+    build: ./services/redis-cache-middleware-rs
+    environment:
+      PORT: "8534"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: redis-cache-middleware-rs
+    ports: ["8534:8534"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  redis-session-store-go:
+    build: ./services/redis-session-store-go
+    environment:
+      PORT: "8535"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: redis-session-store-go
+    ports: ["8535:8535"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cache-invalidation-rs:
+    build: ./services/cache-invalidation-rs
+    environment:
+      PORT: "8536"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cache-invalidation-rs
+    ports: ["8536:8536"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  bloom-filter-cache-rs:
+    build: ./services/bloom-filter-cache-rs
+    environment:
+      PORT: "8537"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: bloom-filter-cache-rs
+    ports: ["8537:8537"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  sorted-set-ranking-go:
+    build: ./services/sorted-set-ranking-go
+    environment:
+      PORT: "8538"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: sorted-set-ranking-go
+    ports: ["8538:8538"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  pgbouncer-manager-go:
+    build: ./services/pgbouncer-manager-go
+    environment:
+      PORT: "8539"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: pgbouncer-manager-go
+    ports: ["8539:8539"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  query-cache-engine-rs:
+    build: ./services/query-cache-engine-rs
+    environment:
+      PORT: "8540"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: query-cache-engine-rs
+    ports: ["8540:8540"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  prepared-stmt-cache-go:
+    build: ./services/prepared-stmt-cache-go
+    environment:
+      PORT: "8541"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: prepared-stmt-cache-go
+    ports: ["8541:8541"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  table-partitioner-rs:
+    build: ./services/table-partitioner-rs
+    environment:
+      PORT: "8542"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: table-partitioner-rs
+    ports: ["8542:8542"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  materialized-view-engine-go:
+    build: ./services/materialized-view-engine-go
+    environment:
+      PORT: "8543"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: materialized-view-engine-go
+    ports: ["8543:8543"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  hot-data-cache-rs:
+    build: ./services/hot-data-cache-rs
+    environment:
+      PORT: "8544"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: hot-data-cache-rs
+    ports: ["8544:8544"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  batch-aggregator-go:
+    build: ./services/batch-aggregator-go
+    environment:
+      PORT: "8545"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: batch-aggregator-go
+    ports: ["8545:8545"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  keepalive-tuner-rs:
+    build: ./services/keepalive-tuner-rs
+    environment:
+      PORT: "8546"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: keepalive-tuner-rs
+    ports: ["8546:8546"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  response-compressor-rs:
+    build: ./services/response-compressor-rs
+    environment:
+      PORT: "8547"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: response-compressor-rs
+    ports: ["8547:8547"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  grpc-hot-path-go:
+    build: ./services/grpc-hot-path-go
+    environment:
+      PORT: "8548"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: grpc-hot-path-go
+    ports: ["8548:8548"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  route-trie-optimizer-rs:
+    build: ./services/route-trie-optimizer-rs
+    environment:
+      PORT: "8549"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: route-trie-optimizer-rs
+    ports: ["8549:8549"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  stream-response-go:
+    build: ./services/stream-response-go
+    environment:
+      PORT: "8550"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: stream-response-go
+    ports: ["8550:8550"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  http2-multiplexer-rs:
+    build: ./services/http2-multiplexer-rs
+    environment:
+      PORT: "8551"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: http2-multiplexer-rs
+    ports: ["8551:8551"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  request-coalescer-go:
+    build: ./services/request-coalescer-go
+    environment:
+      PORT: "8552"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: request-coalescer-go
+    ports: ["8552:8552"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fast-json-serializer-rs:
+    build: ./services/fast-json-serializer-rs
+    environment:
+      PORT: "8553"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fast-json-serializer-rs
+    ports: ["8553:8553"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  sw-api-cache-go:
+    build: ./services/sw-api-cache-go
+    environment:
+      PORT: "8554"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: sw-api-cache-go
+    ports: ["8554:8554"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  virtual-scroll-engine-rs:
+    build: ./services/virtual-scroll-engine-rs
+    environment:
+      PORT: "8555"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: virtual-scroll-engine-rs
+    ports: ["8555:8555"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  component-memoizer-py:
+    build: ./services/component-memoizer-py
+    environment:
+      PORT: "8556"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: component-memoizer-py
+    ports: ["8556:8556"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  bundle-splitter-py:
+    build: ./services/bundle-splitter-py
+    environment:
+      PORT: "8557"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: bundle-splitter-py
+    ports: ["8557:8557"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  optimistic-ui-engine-go:
+    build: ./services/optimistic-ui-engine-go
+    environment:
+      PORT: "8558"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: optimistic-ui-engine-go
+    ports: ["8558:8558"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kafka-consumer-optimizer-go:
+    build: ./services/kafka-consumer-optimizer-go
+    environment:
+      PORT: "8559"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kafka-consumer-optimizer-go
+    ports: ["8559:8559"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  kafka-batch-producer-rs:
+    build: ./services/kafka-batch-producer-rs
+    environment:
+      PORT: "8560"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: kafka-batch-producer-rs
+    ports: ["8560:8560"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  avro-schema-registry-go:
+    build: ./services/avro-schema-registry-go
+    environment:
+      PORT: "8561"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: avro-schema-registry-go
+    ports: ["8561:8561"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  fluvio-wasm-transform-rs:
+    build: ./services/fluvio-wasm-transform-rs
+    environment:
+      PORT: "8562"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: fluvio-wasm-transform-rs
+    ports: ["8562:8562"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  event-dedup-engine-rs:
+    build: ./services/event-dedup-engine-rs
+    environment:
+      PORT: "8563"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: event-dedup-engine-rs
+    ports: ["8563:8563"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  distroless-builder-py:
+    build: ./services/distroless-builder-py
+    environment:
+      PORT: "8564"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: distroless-builder-py
+    ports: ["8564:8564"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  tigerbeetle-batch-engine-rs:
+    build: ./services/tigerbeetle-batch-engine-rs
+    environment:
+      PORT: "8565"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: tigerbeetle-batch-engine-rs
+    ports: ["8565:8565"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  hpa-autoscaler-go:
+    build: ./services/hpa-autoscaler-go
+    environment:
+      PORT: "8566"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: hpa-autoscaler-go
+    ports: ["8566:8566"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  cdn-edge-cache-go:
+    build: ./services/cdn-edge-cache-go
+    environment:
+      PORT: "8567"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: cdn-edge-cache-go
+    ports: ["8567:8567"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  read-replica-router-rs:
+    build: ./services/read-replica-router-rs
+    environment:
+      PORT: "8568"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: read-replica-router-rs
+    ports: ["8568:8568"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  keda-scaler-go:
+    build: ./services/keda-scaler-go
+    environment:
+      PORT: "8569"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: keda-scaler-go
+    ports: ["8569:8569"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  prometheus-dashboard-py:
+    build: ./services/prometheus-dashboard-py
+    environment:
+      PORT: "8570"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: prometheus-dashboard-py
+    ports: ["8570:8570"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  opensearch-optimizer-py:
+    build: ./services/opensearch-optimizer-py
+    environment:
+      PORT: "8571"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: opensearch-optimizer-py
+    ports: ["8571:8571"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  temporal-memoizer-go:
+    build: ./services/temporal-memoizer-go
+    environment:
+      PORT: "8572"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: temporal-memoizer-go
+    ports: ["8572:8572"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  apisix-plugin-optimizer-go:
+    build: ./services/apisix-plugin-optimizer-go
+    environment:
+      PORT: "8573"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: apisix-plugin-optimizer-go
+    ports: ["8573:8573"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  # ─── AML Enhancement (15 services) ───────────────────────
+
+  aml-risk-scoring-rs:
+    build: ./services/aml-risk-scoring-rs
+    environment:
+      PORT: "8574"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: aml-risk-scoring-rs
+    ports: ["8574:8574"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  sar-filing-engine-go:
+    build: ./services/sar-filing-engine-go
+    environment:
+      PORT: "8575"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: sar-filing-engine-go
+    ports: ["8575:8575"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  ctr-auto-filer-go:
+    build: ./services/ctr-auto-filer-go
+    environment:
+      PORT: "8576"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: ctr-auto-filer-go
+    ports: ["8576:8576"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  aml-case-manager-go:
+    build: ./services/aml-case-manager-go
+    environment:
+      PORT: "8577"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: aml-case-manager-go
+    ports: ["8577:8577"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  watchlist-manager-rs:
+    build: ./services/watchlist-manager-rs
+    environment:
+      PORT: "8578"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: watchlist-manager-rs
+    ports: ["8578:8578"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  adverse-media-scanner-py:
+    build: ./services/adverse-media-scanner-py
+    environment:
+      PORT: "8579"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: adverse-media-scanner-py
+    ports: ["8579:8579"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  beneficial-ownership-go:
+    build: ./services/beneficial-ownership-go
+    environment:
+      PORT: "8580"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: beneficial-ownership-go
+    ports: ["8580:8580"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  txn-pattern-analyzer-py:
+    build: ./services/txn-pattern-analyzer-py
+    environment:
+      PORT: "8581"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: txn-pattern-analyzer-py
+    ports: ["8581:8581"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  goaml-integration-go:
+    build: ./services/goaml-integration-go
+    environment:
+      PORT: "8582"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: goaml-integration-go
+    ports: ["8582:8582"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  aml-compliance-dashboard-py:
+    build: ./services/aml-compliance-dashboard-py
+    environment:
+      PORT: "8583"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: aml-compliance-dashboard-py
+    ports: ["8583:8583"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  sanctions-batch-rescreener-rs:
+    build: ./services/sanctions-batch-rescreener-rs
+    environment:
+      PORT: "8584"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: sanctions-batch-rescreener-rs
+    ports: ["8584:8584"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  aml-training-tracker-go:
+    build: ./services/aml-training-tracker-go
+    environment:
+      PORT: "8585"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: aml-training-tracker-go
+    ports: ["8585:8585"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  wire-transfer-monitor-rs:
+    build: ./services/wire-transfer-monitor-rs
+    environment:
+      PORT: "8586"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: wire-transfer-monitor-rs
+    ports: ["8586:8586"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  regulatory-reporting-go:
+    build: ./services/regulatory-reporting-go
+    environment:
+      PORT: "8587"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: regulatory-reporting-go
+    ports: ["8587:8587"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+  typology-detector-rs:
+    build: ./services/typology-detector-rs
+    environment:
+      PORT: "8588"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/bank54
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKER: kafka:9092
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: typology-detector-rs
+    ports: ["8588:8588"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+
+
+
+  # === Agriculture Enhancement Services (40 services, ports 8589-8628) ===
+  cooperative-management-go:
+    build: ./services/cooperative-management-go
+    ports:
+      - "8589:8589"
+    environment:
+      - PORT=8589
+    restart: unless-stopped
+  livestock-management-rs:
+    build: ./services/livestock-management-rs
+    ports:
+      - "8590:8590"
+    environment:
+      - PORT=8590
+    restart: unless-stopped
+  agri-input-marketplace-go:
+    build: ./services/agri-input-marketplace-go
+    ports:
+      - "8591:8591"
+    environment:
+      - PORT=8591
+    restart: unless-stopped
+  nirsal-credit-guarantee-go:
+    build: ./services/nirsal-credit-guarantee-go
+    ports:
+      - "8592:8592"
+    environment:
+      - PORT=8592
+    restart: unless-stopped
+  cbn-anchor-borrowers-go:
+    build: ./services/cbn-anchor-borrowers-go
+    ports:
+      - "8593:8593"
+    environment:
+      - PORT=8593
+    restart: unless-stopped
+  interactive-ussd-agri-py:
+    build: ./services/interactive-ussd-agri-py
+    ports:
+      - "8594:8594"
+    environment:
+      - PORT=8594
+    restart: unless-stopped
+  agri-savings-cycles-go:
+    build: ./services/agri-savings-cycles-go
+    ports:
+      - "8595:8595"
+    environment:
+      - PORT=8595
+    restart: unless-stopped
+  livestock-finance-rs:
+    build: ./services/livestock-finance-rs
+    ports:
+      - "8596:8596"
+    environment:
+      - PORT=8596
+    restart: unless-stopped
+  commodity-exchange-rs:
+    build: ./services/commodity-exchange-rs
+    ports:
+      - "8597:8597"
+    environment:
+      - PORT=8597
+    restart: unless-stopped
+  agri-evoucher-go:
+    build: ./services/agri-evoucher-go
+    ports:
+      - "8598:8598"
+    environment:
+      - PORT=8598
+    restart: unless-stopped
+  commodity-price-intelligence-py:
+    build: ./services/commodity-price-intelligence-py
+    ports:
+      - "8599:8599"
+    environment:
+      - PORT=8599
+    restart: unless-stopped
+  satellite-crop-monitor-rs:
+    build: ./services/satellite-crop-monitor-rs
+    ports:
+      - "8600:8600"
+    environment:
+      - PORT=8600
+    restart: unless-stopped
+  cooperative-credit-scoring-py:
+    build: ./services/cooperative-credit-scoring-py
+    ports:
+      - "8601:8601"
+    environment:
+      - PORT=8601
+    restart: unless-stopped
+  fisheries-aquaculture-go:
+    build: ./services/fisheries-aquaculture-go
+    ports:
+      - "8602:8602"
+    environment:
+      - PORT=8602
+    restart: unless-stopped
+  farm-boundary-mapping-rs:
+    build: ./services/farm-boundary-mapping-rs
+    ports:
+      - "8603:8603"
+    environment:
+      - PORT=8603
+    restart: unless-stopped
+  area-yield-index-insurance-py:
+    build: ./services/area-yield-index-insurance-py
+    ports:
+      - "8604:8604"
+    environment:
+      - PORT=8604
+    restart: unless-stopped
+  warehouse-management-go:
+    build: ./services/warehouse-management-go
+    ports:
+      - "8605:8605"
+    environment:
+      - PORT=8605
+    restart: unless-stopped
+  agent-farmer-onboarding-go:
+    build: ./services/agent-farmer-onboarding-go
+    ports:
+      - "8606:8606"
+    environment:
+      - PORT=8606
+    restart: unless-stopped
+  livestock-insurance-rs:
+    build: ./services/livestock-insurance-rs
+    ports:
+      - "8607:8607"
+    environment:
+      - PORT=8607
+    restart: unless-stopped
+  equipment-leasing-go:
+    build: ./services/equipment-leasing-go
+    ports:
+      - "8608:8608"
+    environment:
+      - PORT=8608
+    restart: unless-stopped
+  crop-yield-prediction-py:
+    build: ./services/crop-yield-prediction-py
+    ports:
+      - "8609:8609"
+    environment:
+      - PORT=8609
+    restart: unless-stopped
+  multi-peril-crop-insurance-rs:
+    build: ./services/multi-peril-crop-insurance-rs
+    ports:
+      - "8610:8610"
+    environment:
+      - PORT=8610
+    restart: unless-stopped
+  agri-logistics-go:
+    build: ./services/agri-logistics-go
+    ports:
+      - "8611:8611"
+    environment:
+      - PORT=8611
+    restart: unless-stopped
+  cbn-agri-returns-py:
+    build: ./services/cbn-agri-returns-py
+    ports:
+      - "8612:8612"
+    environment:
+      - PORT=8612
+    restart: unless-stopped
+  animal-id-traceability-rs:
+    build: ./services/animal-id-traceability-rs
+    ports:
+      - "8613:8613"
+    environment:
+      - PORT=8613
+    restart: unless-stopped
+  nirsal-agro-geocoop-go:
+    build: ./services/nirsal-agro-geocoop-go
+    ports:
+      - "8614:8614"
+    environment:
+      - PORT=8614
+    restart: unless-stopped
+  agri-iot-sensor-rs:
+    build: ./services/agri-iot-sensor-rs
+    ports:
+      - "8615:8615"
+    environment:
+      - PORT=8615
+    restart: unless-stopped
+  agri-reinsurance-go:
+    build: ./services/agri-reinsurance-go
+    ports:
+      - "8616:8616"
+    environment:
+      - PORT=8616
+    restart: unless-stopped
+  quality-certification-go:
+    build: ./services/quality-certification-go
+    ports:
+      - "8617:8617"
+    environment:
+      - PORT=8617
+    restart: unless-stopped
+  agri-esg-impact-py:
+    build: ./services/agri-esg-impact-py
+    ports:
+      - "8618:8618"
+    environment:
+      - PORT=8618
+    restart: unless-stopped
+  crossborder-agri-trade-rs:
+    build: ./services/crossborder-agri-trade-rs
+    ports:
+      - "8619:8619"
+    environment:
+      - PORT=8619
+    restart: unless-stopped
+  cooperative-meetings-go:
+    build: ./services/cooperative-meetings-go
+    ports:
+      - "8620:8620"
+    environment:
+      - PORT=8620
+    restart: unless-stopped
+  cooperative-financials-py:
+    build: ./services/cooperative-financials-py
+    ports:
+      - "8621:8621"
+    environment:
+      - PORT=8621
+    restart: unless-stopped
+  soil-analysis-py:
+    build: ./services/soil-analysis-py
+    ports:
+      - "8622:8622"
+    environment:
+      - PORT=8622
+    restart: unless-stopped
+  insurance-portfolio-analytics-py:
+    build: ./services/insurance-portfolio-analytics-py
+    ports:
+      - "8623:8623"
+    environment:
+      - PORT=8623
+    restart: unless-stopped
+  parametric-insurance-iot-rs:
+    build: ./services/parametric-insurance-iot-rs
+    ports:
+      - "8624:8624"
+    environment:
+      - PORT=8624
+    restart: unless-stopped
+  post-harvest-loss-tracker-go:
+    build: ./services/post-harvest-loss-tracker-go
+    ports:
+      - "8625:8625"
+    environment:
+      - PORT=8625
+    restart: unless-stopped
+  aggregation-center-go:
+    build: ./services/aggregation-center-go
+    ports:
+      - "8626:8626"
+    environment:
+      - PORT=8626
+    restart: unless-stopped
+  cbn-agsmeis-go:
+    build: ./services/cbn-agsmeis-go
+    ports:
+      - "8627:8627"
+    environment:
+      - PORT=8627
+    restart: unless-stopped
+  acgsf-guarantee-go:
+    build: ./services/acgsf-guarantee-go
+    ports:
+      - "8628:8628"
+    environment:
+      - PORT=8628
+    restart: unless-stopped
+  # === Channel Banking Services (25 services, ports 8629-8653) ===
+  voice-banking-gateway-go:
+    build: ./services/voice-banking-gateway-go
+    ports:
+      - "8629:8629"
+    environment:
+      - PORT=8629
+    restart: unless-stopped
+  voice-tts-nigerian-ru:
+    build: ./services/voice-tts-nigerian-ru
+    ports:
+      - "8630:8630"
+    environment:
+      - PORT=8630
+    restart: unless-stopped
+  voice-asr-nigerian-py:
+    build: ./services/voice-asr-nigerian-py
+    ports:
+      - "8631:8631"
+    environment:
+      - PORT=8631
+    restart: unless-stopped
+  voice-nlu-banking-py:
+    build: ./services/voice-nlu-banking-py
+    ports:
+      - "8632:8632"
+    environment:
+      - PORT=8632
+    restart: unless-stopped
+  voice-biometric-auth-ru:
+    build: ./services/voice-biometric-auth-ru
+    ports:
+      - "8633:8633"
+    environment:
+      - PORT=8633
+    restart: unless-stopped
+  voice-ivr-menu-go:
+    build: ./services/voice-ivr-menu-go
+    ports:
+      - "8634:8634"
+    environment:
+      - PORT=8634
+    restart: unless-stopped
+  voice-call-analytics-py:
+    build: ./services/voice-call-analytics-py
+    ports:
+      - "8635:8635"
+    environment:
+      - PORT=8635
+    restart: unless-stopped
+  voice-agent-escalation-go:
+    build: ./services/voice-agent-escalation-go
+    ports:
+      - "8636:8636"
+    environment:
+      - PORT=8636
+    restart: unless-stopped
+  telegram-bot-gateway-go:
+    build: ./services/telegram-bot-gateway-go
+    ports:
+      - "8637:8637"
+    environment:
+      - PORT=8637
+    restart: unless-stopped
+  telegram-banking-commands-ru:
+    build: ./services/telegram-banking-commands-ru
+    ports:
+      - "8638:8638"
+    environment:
+      - PORT=8638
+    restart: unless-stopped
+  telegram-notification-py:
+    build: ./services/telegram-notification-py
+    ports:
+      - "8639:8639"
+    environment:
+      - PORT=8639
+    restart: unless-stopped
+  telegram-mini-app-go:
+    build: ./services/telegram-mini-app-go
+    ports:
+      - "8640:8640"
+    environment:
+      - PORT=8640
+    restart: unless-stopped
+  telegram-kyc-bot-ru:
+    build: ./services/telegram-kyc-bot-ru
+    ports:
+      - "8641:8641"
+    environment:
+      - PORT=8641
+    restart: unless-stopped
+  whatsapp-business-gateway-go:
+    build: ./services/whatsapp-business-gateway-go
+    ports:
+      - "8642:8642"
+    environment:
+      - PORT=8642
+    restart: unless-stopped
+  whatsapp-banking-flows-ru:
+    build: ./services/whatsapp-banking-flows-ru
+    ports:
+      - "8643:8643"
+    environment:
+      - PORT=8643
+    restart: unless-stopped
+  whatsapp-payment-integration-go:
+    build: ./services/whatsapp-payment-integration-go
+    ports:
+      - "8644:8644"
+    environment:
+      - PORT=8644
+    restart: unless-stopped
+  whatsapp-notification-py:
+    build: ./services/whatsapp-notification-py
+    ports:
+      - "8645:8645"
+    environment:
+      - PORT=8645
+    restart: unless-stopped
+  whatsapp-document-service-ru:
+    build: ./services/whatsapp-document-service-ru
+    ports:
+      - "8646:8646"
+    environment:
+      - PORT=8646
+    restart: unless-stopped
+  ussd-banking-gateway-go:
+    build: ./services/ussd-banking-gateway-go
+    ports:
+      - "8647:8647"
+    environment:
+      - PORT=8647
+    restart: unless-stopped
+  ussd-transaction-engine-ru:
+    build: ./services/ussd-transaction-engine-ru
+    ports:
+      - "8648:8648"
+    environment:
+      - PORT=8648
+    restart: unless-stopped
+  ussd-multilingual-py:
+    build: ./services/ussd-multilingual-py
+    ports:
+      - "8649:8649"
+    environment:
+      - PORT=8649
+    restart: unless-stopped
+  ussd-sim-toolkit-go:
+    build: ./services/ussd-sim-toolkit-go
+    ports:
+      - "8650:8650"
+    environment:
+      - PORT=8650
+    restart: unless-stopped
+  sms-banking-gateway-go:
+    build: ./services/sms-banking-gateway-go
+    ports:
+      - "8651:8651"
+    environment:
+      - PORT=8651
+    restart: unless-stopped
+  sms-otp-service-ru:
+    build: ./services/sms-otp-service-ru
+    ports:
+      - "8652:8652"
+    environment:
+      - PORT=8652
+    restart: unless-stopped
+  sms-alert-notification-py:
+    build: ./services/sms-alert-notification-py
+    ports:
+      - "8653:8653"
+    environment:
+      - PORT=8653
+    restart: unless-stopped

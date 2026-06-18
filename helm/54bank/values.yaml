@@ -1,0 +1,68 @@
+replicaCount: 2
+image:
+  repository: 54bank/platform
+  pullPolicy: IfNotPresent
+  tag: "2.0.0"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: true
+  name: ""
+podAnnotations: {}
+service:
+  type: ClusterIP
+  port: 3000
+ingress:
+  enabled: true
+  className: nginx
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: app.54bank.ng
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: 54bank-tls
+      hosts:
+        - app.54bank.ng
+resources:
+  limits:
+    cpu: 2000m
+    memory: 2Gi
+  requests:
+    cpu: 500m
+    memory: 512Mi
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+postgresql:
+  host: postgres
+  port: 5432
+  database: bank54_db
+  existingSecret: 54bank-db-credentials
+redis:
+  host: redis
+  port: 6379
+  existingSecret: 54bank-redis-credentials
+kafka:
+  brokers: kafka:9092
+keycloak:
+  url: http://keycloak:8080
+  realm: 54bank
+  clientId: 54bank-platform
+monitoring:
+  prometheus:
+    enabled: true
+    serviceMonitor: true
+  grafana:
+    enabled: true
+env:
+  NODE_ENV: production
+  ENABLE_AUTH: "true"
+  LOG_LEVEL: info
+  RATE_LIMIT_READS: "300"
+  RATE_LIMIT_WRITES: "60"

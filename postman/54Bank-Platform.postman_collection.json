@@ -1,0 +1,186 @@
+{
+  "info": {
+    "name": "54Bank Core Banking Platform",
+    "description": "Complete API collection for 54Bank — 59 microservices, 450+ endpoints",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000" },
+    { "key": "tellerUrl", "value": "http://localhost:8090" },
+    { "key": "paymentsUrl", "value": "http://localhost:8091" },
+    { "key": "islamicUrl", "value": "http://localhost:8092" }
+  ],
+  "item": [
+    {
+      "name": "Health & Monitoring",
+      "item": [
+        {
+          "name": "Gateway Health Check",
+          "request": { "method": "GET", "url": "{{baseUrl}}/healthz" }
+        },
+        {
+          "name": "Service Health Aggregation",
+          "request": { "method": "GET", "url": "{{baseUrl}}/healthz/services" }
+        },
+        {
+          "name": "Prometheus Metrics",
+          "request": { "method": "GET", "url": "{{baseUrl}}/metrics" }
+        },
+        {
+          "name": "OpenAPI Spec",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/docs/spec" }
+        }
+      ]
+    },
+    {
+      "name": "Teller Operations",
+      "item": [
+        {
+          "name": "List Transactions",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/teller/v1/transactions" }
+        },
+        {
+          "name": "Create Transaction",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/platform/teller/v1/transactions",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"accountNumber\":\"0123456789\",\"amount\":50000,\"type\":\"deposit\",\"currency\":\"NGN\",\"channel\":\"teller\",\"narration\":\"Cash deposit\"}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Islamic Banking",
+      "item": [
+        {
+          "name": "List Murabaha Contracts",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/islamic/v1/murabaha" }
+        },
+        {
+          "name": "Create Murabaha Contract",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/platform/islamic/v1/murabaha",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customerName\":\"Test Customer\",\"assetDescription\":\"Toyota Camry 2026\",\"costPrice\":25000000,\"profitMarginPct\":12.5,\"tenorMonths\":36}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Trade Finance",
+      "item": [
+        {
+          "name": "List Letters of Credit",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/trade-finance/v1/lcs" }
+        }
+      ]
+    },
+    {
+      "name": "Ledger & GL",
+      "item": [
+        {
+          "name": "Chart of Accounts",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/ledger/chart-of-accounts" }
+        },
+        {
+          "name": "Journal Entries",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/ledger/journal-entries" }
+        },
+        {
+          "name": "Trial Balance",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/ledger/trial-balance" }
+        },
+        {
+          "name": "Post Journal Entry",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/platform/ledger/journal-entries",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"date\":\"2026-05-09\",\"description\":\"Test entry\",\"reference\":\"TEST-001\",\"postedBy\":\"tester\",\"entries\":[{\"accountCode\":\"1210\",\"accountName\":\"Personal Loans\",\"debit\":1000000,\"credit\":0,\"currency\":\"NGN\",\"narration\":\"Loan\"},{\"accountCode\":\"2020\",\"accountName\":\"Current Account\",\"debit\":0,\"credit\":1000000,\"currency\":\"NGN\",\"narration\":\"Credit\"}]}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Security",
+      "item": [
+        {
+          "name": "PCI Compliance Check",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/compliance/pci" }
+        },
+        {
+          "name": "Generate OTP",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/platform/otp/generate",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\"userId\":\"CUST-001\",\"purpose\":\"transfer\"}" }
+          }
+        },
+        {
+          "name": "List Secrets (metadata)",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/secrets" }
+        }
+      ]
+    },
+    {
+      "name": "Reports",
+      "item": [
+        {
+          "name": "List Report Definitions",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/reports/definitions" }
+        },
+        {
+          "name": "List Generated Reports",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/reports/generated" }
+        }
+      ]
+    },
+    {
+      "name": "KYC/AML",
+      "item": [
+        {
+          "name": "Screen Customer",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/platform/kyc-aml/v1/screening",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\"customerId\":\"CUST-001\",\"customerName\":\"John Doe\",\"customerType\":\"individual\",\"bvn\":\"12345678901\"}"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Dashboard & Analytics",
+      "item": [
+        {
+          "name": "Dashboard KPIs",
+          "request": { "method": "GET", "url": "{{baseUrl}}/api/platform/dashboard/kpis" }
+        },
+        {
+          "name": "Regulatory CAR",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/api/platform/regulatory/car",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\"tier1Capital\":50000000000,\"tier2Capital\":10000000000,\"riskWeightedAssets\":380000000000}" }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,102 @@
+# A6: Template for deploying Go/Python/Rust microservices
+# Replace ${SERVICE_NAME}, ${PORT}, ${IMAGE} with actual values
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${SERVICE_NAME}
+  namespace: 54bank
+  labels:
+    app: ${SERVICE_NAME}
+    tier: microservice
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ${SERVICE_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${SERVICE_NAME}
+        tier: microservice
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "${PORT}"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: ${SERVICE_NAME}
+          image: ${IMAGE}
+          ports:
+            - containerPort: ${PORT}
+              name: http
+          env:
+            - name: PORT
+              value: "${PORT}"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-secrets
+                  key: database-url
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-secrets
+                  key: redis-url
+            - name: KAFKA_BROKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-config
+                  key: kafka-brokers
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: ${PORT}
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ${PORT}
+            initialDelaySeconds: 10
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${SERVICE_NAME}
+  namespace: 54bank
+spec:
+  selector:
+    app: ${SERVICE_NAME}
+  ports:
+    - port: ${PORT}
+      targetPort: ${PORT}
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ${SERVICE_NAME}-hpa
+  namespace: 54bank
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ${SERVICE_NAME}
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 75

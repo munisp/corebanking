@@ -1,0 +1,116 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sms-alert-notification-py
+  namespace: 54bank
+  labels:
+    app: sms-alert-notification-py
+    tier: tier3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sms-alert-notification-py
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: sms-alert-notification-py
+    spec:
+      serviceAccountName: sms-alert-notification-py
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: sms-alert-notification-py
+          image: 54bank/sms-alert-notification-py:latest
+          ports:
+            - containerPort: 8653
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8653"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-secret
+                  key: secret
+            - name: TLS_ENABLED
+              value: "true"
+            - name: TLS_CERT_PATH
+              value: "/etc/54bank/certs/service.crt"
+            - name: TLS_KEY_PATH
+              value: "/etc/54bank/certs/service.key"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8653
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8653
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/54bank/certs
+              readOnly: true
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: sms-alert-notification-py-tls
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sms-alert-notification-py
+  namespace: 54bank
+spec:
+  selector:
+    app: sms-alert-notification-py
+  ports:
+    - port: 8653
+      targetPort: 8653
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sms-alert-notification-py
+  namespace: 54bank
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sms-alert-notification-py

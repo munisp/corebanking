@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>54Bank — Offline</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+    .container { text-align: center; padding: 2rem; max-width: 480px; }
+    .icon { font-size: 4rem; margin-bottom: 1rem; }
+    h1 { font-size: 1.5rem; margin-bottom: 0.5rem; color: #f8fafc; }
+    p { color: #94a3b8; margin-bottom: 1.5rem; line-height: 1.6; }
+    .status { background: #1e293b; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; }
+    .status-item { display: flex; justify-content: space-between; padding: 0.5rem 0; border-bottom: 1px solid #334155; }
+    .status-item:last-child { border-bottom: none; }
+    .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+    .badge-queued { background: #fbbf24; color: #1e293b; }
+    .badge-cached { background: #34d399; color: #1e293b; }
+    button { background: #0f766e; color: white; border: none; padding: 12px 24px; border-radius: 8px; font-size: 1rem; cursor: pointer; }
+    button:hover { background: #0d9488; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">📡</div>
+    <h1>You're Currently Offline</h1>
+    <p>54Bank is designed to work in low-connectivity environments. Your pending operations are safely queued and will sync automatically when your connection is restored.</p>
+    <div class="status">
+      <div class="status-item">
+        <span>Connection</span>
+        <span class="badge badge-queued" id="conn-status">Offline</span>
+      </div>
+      <div class="status-item">
+        <span>Queued Operations</span>
+        <span id="queue-count">Checking...</span>
+      </div>
+      <div class="status-item">
+        <span>Cached Data</span>
+        <span class="badge badge-cached">Available</span>
+      </div>
+    </div>
+    <button onclick="location.reload()">Try Again</button>
+  </div>
+  <script>
+    window.addEventListener('online', () => location.reload());
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', (event) => {
+        if (event.data.type === '54bank-sync-complete') {
+          document.getElementById('queue-count').textContent = event.data.remaining + ' pending';
+        }
+      });
+    }
+  </script>
+</body>
+</html>

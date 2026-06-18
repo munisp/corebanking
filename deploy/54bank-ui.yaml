@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: 54bank-ui
+  labels:
+    app: 54bank-ui
+spec:
+  replicas: 2
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: 54bank-ui
+  template:
+    metadata:
+      labels:
+        app: 54bank-ui
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: 54bank-ui
+          image: 54bank-ui:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 3000
+          env:
+            - name: NODE_ENV
+              value: production
+            - name: PORT
+              value: "3000"
+            - name: PLATFORM_TENANT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-ui-config
+                  key: PLATFORM_TENANT_ID
+            - name: TENANT_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-ui-config
+                  key: TENANT_ID
+            - name: DEFAULT_OPERATOR_ROLE
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-ui-config
+                  key: DEFAULT_OPERATOR_ROLE
+            - name: DEFAULT_OPERATOR_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-ui-config
+                  key: DEFAULT_OPERATOR_ID
+            - name: PLATFORM_BASE_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-ui-config
+                  key: PLATFORM_BASE_URL
+            - name: VITE_PLATFORM_API_BASE
+              valueFrom:
+                configMapKeyRef:
+                  name: 54bank-ui-config
+                  key: VITE_PLATFORM_API_BASE
+            - name: REQUEST_TIMEOUT_MS
+              value: "15000"
+            - name: DB_POOL_MAX
+              value: "10"
+            - name: DB_POOL_IDLE_MAX
+              value: "10"
+            - name: DB_POOL_IDLE_TIMEOUT_MS
+              value: "60000"
+            - name: DB_POOL_QUEUE_LIMIT
+              value: "100"
+            - name: DB_POOL_KEEPALIVE_DELAY_MS
+              value: "10000"
+            - name: TENANT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-ui-secrets
+                  key: TENANT_SECRET
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-ui-secrets
+                  key: JWT_SECRET
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: 54bank-ui-secrets
+                  key: DATABASE_URL
+            - name: TELLER_SERVICE_URL
+              value: http://teller-service.default.svc.cluster.local:8096
+            - name: RECONCILIATION_SERVICE_URL
+              value: http://reconciliation-service.default.svc.cluster.local:8092
+            - name: ERPNEXT_SERVICE_URL
+              value: http://erpnext-integration-service.default.svc.cluster.local:8098
+            - name: ISLAMIC_BANKING_SERVICE_URL
+              value: http://islamic-banking-service.default.svc.cluster.local:8097
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: 54bank-ui
+spec:
+  selector:
+    app: 54bank-ui
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000

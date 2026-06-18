@@ -1,0 +1,1383 @@
+# 54Bank Core Banking Platform — Consolidated Docker Compose
+# Optimized: 496 services consolidated into 41 service containers + 12 infrastructure
+#
+# Total containers: 53 (down from 496+ individual containers)
+#
+# Usage:
+#   docker compose -f docker-compose.consolidated.yml up -d                    # Infrastructure only
+#   docker compose -f docker-compose.consolidated.yml --profile services up -d # All services
+#
+# Architecture:
+#   - 12 infrastructure containers (Postgres, Redis, Kafka, OpenSearch, TigerBeetle,
+#     Keycloak, Permify, APISIX, Dapr, Fluvio, Gateway, ML Inference)
+#   - 41 consolidated service containers (each runs multiple microservices via supervisor)
+#   - Each microservice within a container listens on its own unique port
+#   - Service discovery via config/service-registry.json
+
+version: "3.9"
+
+x-common-env: &common-env
+  DATABASE_URL: postgresql://banking:banking_dev_password@postgres:5432/banking54
+  REDIS_URL: redis://redis:6379
+  KAFKA_BROKER: kafka:9092
+  KEYCLOAK_URL: http://keycloak:8080
+  OPENSEARCH_URL: http://opensearch:9200
+  TIGERBEETLE_ADDRESS: tigerbeetle:3001
+  PERMIFY_URL: http://permify:3476
+  APISIX_ADMIN_URL: http://apisix:9180
+  DAPR_HTTP_PORT: "3500"
+  FLUVIO_ENDPOINT: fluvio:9003
+  MOJALOOP_HUB_URL: http://mojaloop-hub:4000
+  LAKEHOUSE_API_URL: http://lakehouse:8020
+
+services:
+  # ══════════════════════════════════════════════════════════════════════════════
+  # INFRASTRUCTURE (12 containers)
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: banking54
+      POSTGRES_USER: banking
+      POSTGRES_PASSWORD: banking_dev_password
+    ports: ["5432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U banking -d banking54"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    command: >
+      redis-server
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly yes
+      --appendfsync everysec
+      --tcp-backlog 511
+      --timeout 300
+      --tcp-keepalive 60
+      --maxclients 10000
+      --hz 10
+      --lazyfree-lazy-eviction yes
+      --lazyfree-lazy-expire yes
+      --latency-tracking yes
+      --activedefrag yes
+      --active-defrag-ignore-bytes 100mb
+      --active-defrag-threshold-lower 10
+      --notify-keyspace-events Ex
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+  redis-sentinel:
+    image: redis:7-alpine
+    ports: ["26379:26379"]
+    depends_on:
+      redis: { condition: service_healthy }
+    command: >
+      sh -c "echo 'sentinel monitor mymaster redis 6379 1' > /tmp/sentinel.conf &&
+      echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf &&
+      echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf &&
+      echo 'sentinel parallel-syncs mymaster 1' >> /tmp/sentinel.conf &&
+      redis-sentinel /tmp/sentinel.conf"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "26379", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      CLUSTER_ID: "54bank-kafka-dev-cluster"
+    ports: ["9092:9092"]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  opensearch:
+    image: opensearchproject/opensearch:2.12.0
+    environment:
+      - discovery.type=single-node
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - DISABLE_SECURITY_PLUGIN=true
+    ports: ["9200:9200"]
+    volumes: [osdata:/usr/share/opensearch/data]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.16.11
+    command: ["start", "--addresses=0.0.0.0:3001", "--cluster-id=0"]
+    ports: ["3001:3001"]
+    volumes: [tbdata:/var/lib/tigerbeetle]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 3001 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0
+    command: start-dev
+    environment:
+      KC_HEALTH_ENABLED: "true"
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin_dev_password
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/banking54
+      KC_DB_USERNAME: banking
+      KC_DB_PASSWORD: banking_dev_password
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8080 && echo -e 'GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n' >&3 && cat <&3 | grep -q UP || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  permify:
+    image: ghcr.io/permify/permify:v1.1.4
+    command: serve
+    environment:
+      PERMIFY_DATABASE_ENGINE: postgres
+      PERMIFY_DATABASE_URI: "postgres://banking:banking_dev_password@postgres:5432/banking54"
+    ports: ["3476:3476", "3478:3478"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 3476 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  apisix:
+    image: apache/apisix:3.9.1-debian
+    ports: ["9080:9080", "9443:9443", "9180:9180"]
+    volumes: [./config/apisix.yml:/usr/local/apisix/conf/apisix.yaml:ro]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9080/apisix/status || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  dapr-placement:
+    image: daprio/dapr:1.13.4
+    command: ["./placement", "-port", "50005"]
+    ports: ["50005:50005"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 50005 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  fluvio:
+    image: infinyon/fluvio:0.11.9
+    command: ["fluvio", "cluster", "start", "--local"]
+    ports: ["9003:9003"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9003 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    build: { context: ., dockerfile: Dockerfile }
+    ports: ["3000:3000"]
+    environment:
+      <<: *common-env
+      NODE_ENV: production
+      PORT: "3000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  ml-inference:
+    build: { context: ., dockerfile: docker/Dockerfile.ml }
+    ports: ["8500:8500", "8501:8501"]
+    environment:
+      <<: *common-env
+      PORT: "8500"
+      MONITORING_PORT: "8501"
+    depends_on:
+      postgres: { condition: service_healthy }
+    profiles: ["services"]
+
+  # ══════════════════════════════════════════════════════════════════════════════
+  # CONSOLIDATED SERVICE CONTAINERS (41 containers, 496 services)
+  # ══════════════════════════════════════════════════════════════════════════════
+
+  # Data pipeline — lakehouse, ETL, CDC, analytics, insights
+  # Services: 4 | Ports: 9100-9103 | Primary: python
+  ai-data-pipeline:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "document-intelligence-py,lakehouse-etl-py,lakehouse-rs,materialized-view-engine-go"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "ai-data-pipeline"
+      SERVICES: "document-intelligence-py,lakehouse-etl-py,lakehouse-rs,materialized-view-engine-go"
+      PORT_BASE: "9100"
+    ports: ["9100-9103:9100-9103"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    labels:
+      - "com.54bank.group=ai-data-pipeline"
+      - "com.54bank.services=4"
+      - "com.54bank.ports=9100-9103"
+      - "com.54bank.description=Data pipeline — lakehouse, ETL, CDC, analytics, insights"
+    profiles: ["services"]
+
+  # Graph & Search — Neo4j, FalkorDB, Qdrant, KGQA, LangChain
+  # Services: 23 | Ports: 9105-9127 | Primary: rust
+  ai-graph-search:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "cocoindex-pipeline-py,epr-kgqa-engine-py,epr-kgqa-go,epr-kgqa-py,epr-kgqa-rs,falkordb-coa-go,falkordb-coa-py,falkordb-coa-rs,falkordb-graph-engine-rs,falkordb-graph-rs,kgqa-reasoning-engine-py,langchain-agent-go,langchain-agent-py,langchain-agent-rs,neo4j-coa-graph-go,neo4j-coa-graph-py,neo4j-coa-graph-rs,neo4j-knowledge-graph-go,ollama-inference-go,qdrant-financial-search-go,qdrant-financial-search-py,qdrant-financial-search-rs,qdrant-vector-store-rs"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "ai-graph-search"
+      SERVICES: "cocoindex-pipeline-py,epr-kgqa-engine-py,epr-kgqa-go,epr-kgqa-py,epr-kgqa-rs,falkordb-coa-go,falkordb-coa-py,falkordb-coa-rs,falkordb-graph-engine-rs,falkordb-graph-rs,kgqa-reasoning-engine-py,langchain-agent-go,langchain-agent-py,langchain-agent-rs,neo4j-coa-graph-go,neo4j-coa-graph-py,neo4j-coa-graph-rs,neo4j-knowledge-graph-go,ollama-inference-go,qdrant-financial-search-go,qdrant-financial-search-py,qdrant-financial-search-rs,qdrant-vector-store-rs"
+      PORT_BASE: "9105"
+    ports: ["9105-9127:9105-9127"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1472M
+    labels:
+      - "com.54bank.group=ai-graph-search"
+      - "com.54bank.services=23"
+      - "com.54bank.ports=9105-9127"
+      - "com.54bank.description=Graph & Search — Neo4j, FalkorDB, Qdrant, KGQA, LangChain"
+    profiles: ["services"]
+
+  # ML inference — fraud, credit, AML, churn, anomaly, GNN models
+  # Services: 4 | Ports: 9129-9132 | Primary: python
+  ai-ml-inference:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "art-adversarial-robustness-py,crop-yield-prediction-py,customer-insights-py,soil-analysis-py"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "ai-ml-inference"
+      SERVICES: "art-adversarial-robustness-py,crop-yield-prediction-py,customer-insights-py,soil-analysis-py"
+      PORT_BASE: "9129"
+    ports: ["9129-9132:9129-9132"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    labels:
+      - "com.54bank.group=ai-ml-inference"
+      - "com.54bank.services=4"
+      - "com.54bank.ports=9129-9132"
+      - "com.54bank.description=ML inference — fraud, credit, AML, churn, anomaly, GNN models"
+    profiles: ["services"]
+
+  # AI Agents — conversational banking agents
+  # Services: 8 | Ports: 9134-9141 | Primary: python
+  channels-agents:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "agent-banking-go,agent-cash-management-py,agent-customer-360-py,agent-dormancy-prevention-py,agent-farmer-onboarding-go,agent-nl-reporting-py,agent-reconciliation-py,agent-transaction-investigation-py"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "channels-agents"
+      SERVICES: "agent-banking-go,agent-cash-management-py,agent-customer-360-py,agent-dormancy-prevention-py,agent-farmer-onboarding-go,agent-nl-reporting-py,agent-reconciliation-py,agent-transaction-investigation-py"
+      PORT_BASE: "9134"
+    ports: ["9134-9141:9134-9141"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    labels:
+      - "com.54bank.group=channels-agents"
+      - "com.54bank.services=8"
+      - "com.54bank.ports=9134-9141"
+      - "com.54bank.description=AI Agents — conversational banking agents"
+    profiles: ["services"]
+
+  # Messaging — WhatsApp, Telegram, SMS, push notifications, email
+  # Services: 16 | Ports: 9143-9158 | Primary: go
+  channels-messaging:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "branded-comms-py,notification-router-go,notification-service-go,sms-alert-notification-py,sms-banking-gateway-go,sms-email-gateway-go,sms-otp-service-rs,telegram-banking-commands-rs,telegram-bot-gateway-go,telegram-mini-app-go,telegram-notification-py,whatsapp-banking-flows-rs,whatsapp-business-gateway-go,whatsapp-cloud-api-go,whatsapp-document-service-rs,whatsapp-notification-py"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "channels-messaging"
+      SERVICES: "branded-comms-py,notification-router-go,notification-service-go,sms-alert-notification-py,sms-banking-gateway-go,sms-email-gateway-go,sms-otp-service-rs,telegram-banking-commands-rs,telegram-bot-gateway-go,telegram-mini-app-go,telegram-notification-py,whatsapp-banking-flows-rs,whatsapp-business-gateway-go,whatsapp-cloud-api-go,whatsapp-document-service-rs,whatsapp-notification-py"
+      PORT_BASE: "9143"
+    ports: ["9143-9158:9143-9158"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+    labels:
+      - "com.54bank.group=channels-messaging"
+      - "com.54bank.services=16"
+      - "com.54bank.ports=9143-9158"
+      - "com.54bank.description=Messaging — WhatsApp, Telegram, SMS, push notifications, email"
+    profiles: ["services"]
+
+  # Mobile/Web — open banking, BaaS, developer portal, webhooks
+  # Services: 4 | Ports: 9160-9163 | Primary: go
+  channels-mobile-web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "custom-domain-go,developer-portal-go,open-banking-baas-go,open-banking-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "channels-mobile-web"
+      SERVICES: "custom-domain-go,developer-portal-go,open-banking-baas-go,open-banking-go"
+      PORT_BASE: "9160"
+    ports: ["9160-9163:9160-9163"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    labels:
+      - "com.54bank.group=channels-mobile-web"
+      - "com.54bank.services=4"
+      - "com.54bank.ports=9160-9163"
+      - "com.54bank.description=Mobile/Web — open banking, BaaS, developer portal, webhooks"
+    profiles: ["services"]
+
+  # Voice — IVR, voice banking, USSD, chatbot
+  # Services: 14 | Ports: 9165-9178 | Primary: python
+  channels-voice:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "chatbot-py,interactive-ussd-agri-py,ussd-banking-gateway-go,ussd-multilingual-py,ussd-sim-toolkit-go,ussd-transaction-engine-rs,voice-agent-escalation-go,voice-asr-nigerian-py,voice-banking-gateway-go,voice-biometric-auth-rs,voice-call-analytics-py,voice-ivr-menu-go,voice-nlu-banking-py,voice-tts-nigerian-rs"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "channels-voice"
+      SERVICES: "chatbot-py,interactive-ussd-agri-py,ussd-banking-gateway-go,ussd-multilingual-py,ussd-sim-toolkit-go,ussd-transaction-engine-rs,voice-agent-escalation-go,voice-asr-nigerian-py,voice-banking-gateway-go,voice-biometric-auth-rs,voice-call-analytics-py,voice-ivr-menu-go,voice-nlu-banking-py,voice-tts-nigerian-rs"
+      PORT_BASE: "9165"
+    ports: ["9165-9178:9165-9178"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 896M
+    labels:
+      - "com.54bank.group=channels-voice"
+      - "com.54bank.services=14"
+      - "com.54bank.ports=9165-9178"
+      - "com.54bank.description=Voice — IVR, voice banking, USSD, chatbot"
+    profiles: ["services"]
+
+  # Fraud — detection, scoring, anomaly, GNN, fusion
+  # Services: 8 | Ports: 9180-9187 | Primary: python
+  compliance-fraud:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "agent-fraud-detection-py,ai-fraud-scoring-rs,anomaly-detector-py,fraud-detection-rs,fraudfusion-ensemble-rs,gnn-fraud-detection-py,mcmc-bayesian-risk-py,txn-pattern-analyzer-py"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "compliance-fraud"
+      SERVICES: "agent-fraud-detection-py,ai-fraud-scoring-rs,anomaly-detector-py,fraud-detection-rs,fraudfusion-ensemble-rs,gnn-fraud-detection-py,mcmc-bayesian-risk-py,txn-pattern-analyzer-py"
+      PORT_BASE: "9180"
+    ports: ["9180-9187:9180-9187"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    labels:
+      - "com.54bank.group=compliance-fraud"
+      - "com.54bank.services=8"
+      - "com.54bank.ports=9180-9187"
+      - "com.54bank.description=Fraud — detection, scoring, anomaly, GNN, fusion"
+    profiles: ["services"]
+
+  # KYC/AML — verification, screening, sanctions, PEP, adverse media
+  # Services: 33 | Ports: 9189-9221 | Primary: python
+  compliance-kyc-aml:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "address-verification-py,adverse-media-scanner-py,adverse-media-screening-py,agent-kyc-capture-go,aml-case-manager-go,aml-compliance-dashboard-py,aml-engine-rs,aml-risk-scoring-rs,aml-training-tracker-go,beneficial-ownership-go,bvn-nin-verification-go,cbn-tiered-kyc-rs,corporate-doc-verification-py,efass-kyc-returns-py,goaml-integration-go,kyb-engine-go,kyb-engine-py,kyc-aml-screening-py,kyc-analytics-dashboard-py,kyc-data-quality-py,kyc-engine-py,kyc-event-consumer-py,kyc-self-service-py,kyc-workflow-orchestration-py,multi-bureau-verification-go,pep-enhanced-dd-py,sanctions-batch-rescreener-rs,sanctions-engine-rs,sanctions-screening-rs,signature-verification-rs,telegram-kyc-bot-rs,video-kyc-py,watchlist-manager-rs"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "compliance-kyc-aml"
+      SERVICES: "address-verification-py,adverse-media-scanner-py,adverse-media-screening-py,agent-kyc-capture-go,aml-case-manager-go,aml-compliance-dashboard-py,aml-engine-rs,aml-risk-scoring-rs,aml-training-tracker-go,beneficial-ownership-go,bvn-nin-verification-go,cbn-tiered-kyc-rs,corporate-doc-verification-py,efass-kyc-returns-py,goaml-integration-go,kyb-engine-go,kyb-engine-py,kyc-aml-screening-py,kyc-analytics-dashboard-py,kyc-data-quality-py,kyc-engine-py,kyc-event-consumer-py,kyc-self-service-py,kyc-workflow-orchestration-py,multi-bureau-verification-go,pep-enhanced-dd-py,sanctions-batch-rescreener-rs,sanctions-engine-rs,sanctions-screening-rs,signature-verification-rs,telegram-kyc-bot-rs,video-kyc-py,watchlist-manager-rs"
+      PORT_BASE: "9189"
+    ports: ["9189-9221:9189-9221"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2112M
+    labels:
+      - "com.54bank.group=compliance-kyc-aml"
+      - "com.54bank.services=33"
+      - "com.54bank.ports=9189-9221"
+      - "com.54bank.description=KYC/AML — verification, screening, sanctions, PEP, adverse media"
+    profiles: ["services"]
+
+  # Regulatory — CBN returns, NFIU, NDIC, EFASS, Basel, IFRS9
+  # Services: 21 | Ports: 9223-9243 | Primary: python
+  compliance-regulatory:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "agent-regulatory-returns-py,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,ctr-auto-filer-go,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-reporting-py,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "compliance-regulatory"
+      SERVICES: "agent-regulatory-returns-py,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,ctr-auto-filer-go,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-reporting-py,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py"
+      PORT_BASE: "9223"
+    ports: ["9223-9243:9223-9243"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1344M
+    labels:
+      - "com.54bank.group=compliance-regulatory"
+      - "com.54bank.services=21"
+      - "com.54bank.ports=9223-9243"
+      - "com.54bank.description=Regulatory — CBN returns, NFIU, NDIC, EFASS, Basel, IFRS9"
+    profiles: ["services"]
+
+  # Risk — scoring, assessment, credit risk, operational risk
+  # Services: 5 | Ports: 9245-9249 | Primary: rust
+  compliance-risk:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "contingent-liabilities-rs,risk-based-approach-py,risk-scoring-rs,tenant-provisioning-go,tenant-provisioning-py"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "compliance-risk"
+      SERVICES: "contingent-liabilities-rs,risk-based-approach-py,risk-scoring-rs,tenant-provisioning-go,tenant-provisioning-py"
+      PORT_BASE: "9245"
+    ports: ["9245-9249:9245-9249"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    labels:
+      - "com.54bank.group=compliance-risk"
+      - "com.54bank.services=5"
+      - "com.54bank.ports=9245-9249"
+      - "com.54bank.description=Risk — scoring, assessment, credit risk, operational risk"
+    profiles: ["services"]
+
+  # Account lifecycle — opening, closure, statements, dormancy, reactivation
+  # Services: 7 | Ports: 9251-9257 | Primary: go
+  core-accounts:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "account-closure-go,account-opening-go,account-statement-go,agent-account-opening-py,cif-management-go,dormancy-management-rs,virtual-accounts-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "core-accounts"
+      SERVICES: "account-closure-go,account-opening-go,account-statement-go,agent-account-opening-py,cif-management-go,dormancy-management-rs,virtual-accounts-go"
+      PORT_BASE: "9251"
+    ports: ["9251-9257:9251-9257"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+    labels:
+      - "com.54bank.group=core-accounts"
+      - "com.54bank.services=7"
+      - "com.54bank.ports=9251-9257"
+      - "com.54bank.description=Account lifecycle — opening, closure, statements, dormancy, reactivation"
+    profiles: ["services"]
+
+  # Cards — issuance, PIN, POS, ATM, tokenization, contactless
+  # Services: 7 | Ports: 9259-9265 | Primary: go
+  core-cards:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "atm-management-go,card-management-go,grid-token-card-go,pin-block-engine-rs,pin-hasher-rs,pos-terminal-go,scratch-card-pin-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "core-cards"
+      SERVICES: "atm-management-go,card-management-go,grid-token-card-go,pin-block-engine-rs,pin-hasher-rs,pos-terminal-go,scratch-card-pin-go"
+      PORT_BASE: "9259"
+    ports: ["9259-9265:9259-9265"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+    labels:
+      - "com.54bank.group=core-cards"
+      - "com.54bank.services=7"
+      - "com.54bank.ports=9259-9265"
+      - "com.54bank.description=Cards — issuance, PIN, POS, ATM, tokenization, contactless"
+    profiles: ["services"]
+
+  # Deposits — savings, fixed deposits, current accounts, interest
+  # Services: 7 | Ports: 9267-9273 | Primary: go
+  core-deposits:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "agri-savings-cycles-go,interest-accrual-engine-go,interest-computation-rs,interest-rate-engine-go,safe-deposit-go,savings-products-go,savings-products-py"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "core-deposits"
+      SERVICES: "agri-savings-cycles-go,interest-accrual-engine-go,interest-computation-rs,interest-rate-engine-go,safe-deposit-go,savings-products-go,savings-products-py"
+      PORT_BASE: "9267"
+    ports: ["9267-9273:9267-9273"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+    labels:
+      - "com.54bank.group=core-deposits"
+      - "com.54bank.services=7"
+      - "com.54bank.ports=9267-9273"
+      - "com.54bank.description=Deposits — savings, fixed deposits, current accounts, interest"
+    profiles: ["services"]
+
+  # Lending — loans, credit, BNPL, mortgage, overdraft, microfinance
+  # Services: 14 | Ports: 9275-9288 | Primary: go
+  core-lending:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "agent-loan-origination-py,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,debt-collection-go,education-loans-py,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,microfinance-engine-go,microfinance-py,mortgage-servicing-rs,syndicated-loans-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "core-lending"
+      SERVICES: "agent-loan-origination-py,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,debt-collection-go,education-loans-py,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,microfinance-engine-go,microfinance-py,mortgage-servicing-rs,syndicated-loans-go"
+      PORT_BASE: "9275"
+    ports: ["9275-9288:9275-9288"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 896M
+    labels:
+      - "com.54bank.group=core-lending"
+      - "com.54bank.services=14"
+      - "com.54bank.ports=9275-9288"
+      - "com.54bank.description=Lending — loans, credit, BNPL, mortgage, overdraft, microfinance"
+    profiles: ["services"]
+
+  # Payments — transfers, bills, bulk, NIBSS, NIP, cheques, standing orders
+  # Services: 12 | Ports: 9290-9301 | Primary: go
+  core-payments:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "beneficiary-management-go,bulk-payments-rs,cheque-clearing-go,mandate-management-go,nibss-direct-debit-go,nibss-nip-engine-go,payment-investigation-go,payments-hub-go,qr-payments-go,standing-orders-go,utility-payments-go,whatsapp-payment-integration-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "core-payments"
+      SERVICES: "beneficiary-management-go,bulk-payments-rs,cheque-clearing-go,mandate-management-go,nibss-direct-debit-go,nibss-nip-engine-go,payment-investigation-go,payments-hub-go,qr-payments-go,standing-orders-go,utility-payments-go,whatsapp-payment-integration-go"
+      PORT_BASE: "9290"
+    ports: ["9290-9301:9290-9301"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    labels:
+      - "com.54bank.group=core-payments"
+      - "com.54bank.services=12"
+      - "com.54bank.ports=9290-9301"
+      - "com.54bank.description=Payments — transfers, bills, bulk, NIBSS, NIP, cheques, standing orders"
+    profiles: ["services"]
+
+  # Customer — CRM, 360 view, segmentation, lifecycle, engagement
+  # Services: 5 | Ports: 9303-9307 | Primary: python
+  customer-management:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "customer-360-py,customer-engagement-py,customer-feedback-py,expense-mgmt-go,i18n-service-go"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "customer-management"
+      SERVICES: "customer-360-py,customer-engagement-py,customer-feedback-py,expense-mgmt-go,i18n-service-go"
+      PORT_BASE: "9303"
+    ports: ["9303-9307:9303-9307"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    labels:
+      - "com.54bank.group=customer-management"
+      - "com.54bank.services=5"
+      - "com.54bank.ports=9303-9307"
+      - "com.54bank.description=Customer — CRM, 360 view, segmentation, lifecycle, engagement"
+    profiles: ["services"]
+
+  # Pricing — fees, charges, tariffs, interest rates, rate cascades
+  # Services: 6 | Ports: 9309-9314 | Primary: rust
+  customer-pricing:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "aggregation-center-go,fee-management-go,product-factory-rs,rate-cascade-rs,realtime-pricing-rs,relationship-pricing-rs"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "customer-pricing"
+      SERVICES: "aggregation-center-go,fee-management-go,product-factory-rs,rate-cascade-rs,realtime-pricing-rs,relationship-pricing-rs"
+      PORT_BASE: "9309"
+    ports: ["9309-9314:9309-9314"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    labels:
+      - "com.54bank.group=customer-pricing"
+      - "com.54bank.services=6"
+      - "com.54bank.ports=9309-9314"
+      - "com.54bank.description=Pricing — fees, charges, tariffs, interest rates, rate cascades"
+    profiles: ["services"]
+
+  # Identity — Keycloak, MFA, OTP, biometric, face match, liveness
+  # Services: 18 | Ports: 9316-9333 | Primary: go
+  identity-auth:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "auth-enforcer-rs,biometric-auth-rs,browser-fingerprint-go,continuous-liveness-rs,face-match-rs,identity-channels-go,identity-verification-go,jwt-validator-rs,keycloak-admin-go,keycloak-enforcer-go,keycloak-identity-py,liveness-detection-rs,liveness-inference-py,liveness-orchestrator-go,mfa-orchestrator-go,otp-hardening-rs,pkce-auth-flow-go,token-rotation-rs"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "identity-auth"
+      SERVICES: "auth-enforcer-rs,biometric-auth-rs,browser-fingerprint-go,continuous-liveness-rs,face-match-rs,identity-channels-go,identity-verification-go,jwt-validator-rs,keycloak-admin-go,keycloak-enforcer-go,keycloak-identity-py,liveness-detection-rs,liveness-inference-py,liveness-orchestrator-go,mfa-orchestrator-go,otp-hardening-rs,pkce-auth-flow-go,token-rotation-rs"
+      PORT_BASE: "9316"
+    ports: ["9316-9333:9316-9333"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1152M
+    labels:
+      - "com.54bank.group=identity-auth"
+      - "com.54bank.services=18"
+      - "com.54bank.ports=9316-9333"
+      - "com.54bank.description=Identity — Keycloak, MFA, OTP, biometric, face match, liveness"
+    profiles: ["services"]
+
+  # Caching — Redis, bloom filter, hot data, cache invalidation
+  # Services: 11 | Ports: 9335-9345 | Primary: rust
+  infra-caching:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "bloom-filter-cache-rs,cache-invalidation-rs,cdn-edge-cache-go,hot-data-cache-rs,postgres-query-cache-rs,prepared-stmt-cache-go,query-cache-engine-rs,redis-cache-middleware-rs,redis-cache-rs,redis-session-store-go,sw-api-cache-go"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "infra-caching"
+      SERVICES: "bloom-filter-cache-rs,cache-invalidation-rs,cdn-edge-cache-go,hot-data-cache-rs,postgres-query-cache-rs,prepared-stmt-cache-go,query-cache-engine-rs,redis-cache-middleware-rs,redis-cache-rs,redis-session-store-go,sw-api-cache-go"
+      PORT_BASE: "9335"
+    ports: ["9335-9345:9335-9345"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 704M
+    labels:
+      - "com.54bank.group=infra-caching"
+      - "com.54bank.services=11"
+      - "com.54bank.ports=9335-9345"
+      - "com.54bank.description=Caching — Redis, bloom filter, hot data, cache invalidation"
+    profiles: ["services"]
+
+  # Database infra — Postgres, pgbouncer, migrations, backups, read replicas
+  # Services: 13 | Ports: 9347-9359 | Primary: go
+  infra-database:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "avro-schema-registry-go,backup-manager-py,data-export-rs,db-migration-manager-go,db-migrations,pgbouncer-manager-go,postgres-adapter-go,postgres-persistence-rs,postgres-query-optimizer-go,postgres-vacuum-py,read-replica-router-rs,route-schema-enforcer-go,table-partitioner-rs"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "infra-database"
+      SERVICES: "avro-schema-registry-go,backup-manager-py,data-export-rs,db-migration-manager-go,db-migrations,pgbouncer-manager-go,postgres-adapter-go,postgres-persistence-rs,postgres-query-optimizer-go,postgres-vacuum-py,read-replica-router-rs,route-schema-enforcer-go,table-partitioner-rs"
+      PORT_BASE: "9347"
+    ports: ["9347-9359:9347-9359"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 832M
+    labels:
+      - "com.54bank.group=infra-database"
+      - "com.54bank.services=13"
+      - "com.54bank.ports=9347-9359"
+      - "com.54bank.description=Database infra — Postgres, pgbouncer, migrations, backups, read replicas"
+    profiles: ["services"]
+
+  # Messaging infra — Kafka, Fluvio, event sourcing, CDC, pub/sub
+  # Services: 14 | Ports: 9361-9374 | Primary: go
+  infra-messaging:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "billing-event-processor-py,event-bus-go,event-correlator-py,event-dedup-engine-rs,event-sourcing-go,event-streaming-go,fluvio-streams-rs,fluvio-wasm-transform-rs,kafka-batch-producer-rs,kafka-broker-go,kafka-consumer-optimizer-go,kafka-schema-registry-go,kafka-streaming-go,stream-response-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "infra-messaging"
+      SERVICES: "billing-event-processor-py,event-bus-go,event-correlator-py,event-dedup-engine-rs,event-sourcing-go,event-streaming-go,fluvio-streams-rs,fluvio-wasm-transform-rs,kafka-batch-producer-rs,kafka-broker-go,kafka-consumer-optimizer-go,kafka-schema-registry-go,kafka-streaming-go,stream-response-go"
+      PORT_BASE: "9361"
+    ports: ["9361-9374:9361-9374"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 896M
+    labels:
+      - "com.54bank.group=infra-messaging"
+      - "com.54bank.services=14"
+      - "com.54bank.ports=9361-9374"
+      - "com.54bank.description=Messaging infra — Kafka, Fluvio, event sourcing, CDC, pub/sub"
+    profiles: ["services"]
+
+  # Network — rate limiting, circuit breaker, gRPC, HTTP/2, TLS, load balancing
+  # Services: 15 | Ports: 9376-9390 | Primary: rust
+  infra-network:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "adaptive-rate-limiter-rs,circuit-breaker-rs,connection-pooler-rs,egress-controller-rs,express-rate-limiter-rs,grpc-gateway-rs,grpc-hot-path-go,http2-multiplexer-rs,keepalive-tuner-rs,mtls-mesh-rs,network-policy-manager-py,path-validator-rs,request-validator-py,route-trie-optimizer-rs,tls-terminator-go"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "infra-network"
+      SERVICES: "adaptive-rate-limiter-rs,circuit-breaker-rs,connection-pooler-rs,egress-controller-rs,express-rate-limiter-rs,grpc-gateway-rs,grpc-hot-path-go,http2-multiplexer-rs,keepalive-tuner-rs,mtls-mesh-rs,network-policy-manager-py,path-validator-rs,request-validator-py,route-trie-optimizer-rs,tls-terminator-go"
+      PORT_BASE: "9376"
+    ports: ["9376-9390:9376-9390"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 960M
+    labels:
+      - "com.54bank.group=infra-network"
+      - "com.54bank.services=15"
+      - "com.54bank.ports=9376-9390"
+      - "com.54bank.description=Network — rate limiting, circuit breaker, gRPC, HTTP/2, TLS, load balancing"
+    profiles: ["services"]
+
+  # Observability — monitoring, alerting, metrics, tracing, logging, APM
+  # Services: 10 | Ports: 9392-9401 | Primary: python
+  infra-observability:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "apm-sentry-py,changelog-generator-py,corporate-monitoring-go,error-telemetry-py,incident-responder-go,kpi-threshold-monitor-rs,otel-collector-go,siem-exporter-py,txn-monitoring-rules-rs,wire-transfer-monitor-rs"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "infra-observability"
+      SERVICES: "apm-sentry-py,changelog-generator-py,corporate-monitoring-go,error-telemetry-py,incident-responder-go,kpi-threshold-monitor-rs,otel-collector-go,siem-exporter-py,txn-monitoring-rules-rs,wire-transfer-monitor-rs"
+      PORT_BASE: "9392"
+    ports: ["9392-9401:9392-9401"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+    labels:
+      - "com.54bank.group=infra-observability"
+      - "com.54bank.services=10"
+      - "com.54bank.ports=9392-9401"
+      - "com.54bank.description=Observability — monitoring, alerting, metrics, tracing, logging, APM"
+    profiles: ["services"]
+
+  # General Ledger — GL, CoA, journal entries, trial balance, TigerBeetle
+  # Services: 10 | Ports: 9403-9412 | Primary: rust
+  ledger-gl:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "accounting-rules-rs,gl-engine-go,gl-engine-rs,operations-control-gl-rs,salary-processing-go,tigerbeetle-adapter-rs,tigerbeetle-batch-engine-rs,tigerbeetle-ledger-rs,tigerbeetle-protocol-rs,tigerbeetle-sync-go"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "ledger-gl"
+      SERVICES: "accounting-rules-rs,gl-engine-go,gl-engine-rs,operations-control-gl-rs,salary-processing-go,tigerbeetle-adapter-rs,tigerbeetle-batch-engine-rs,tigerbeetle-ledger-rs,tigerbeetle-protocol-rs,tigerbeetle-sync-go"
+      PORT_BASE: "9403"
+    ports: ["9403-9412:9403-9412"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 640M
+    labels:
+      - "com.54bank.group=ledger-gl"
+      - "com.54bank.services=10"
+      - "com.54bank.ports=9403-9412"
+      - "com.54bank.description=General Ledger — GL, CoA, journal entries, trial balance, TigerBeetle"
+    profiles: ["services"]
+
+  # Reconciliation — settlement, clearing, recon engine, suspense
+  # Services: 5 | Ports: 9414-9418 | Primary: rust
+  ledger-reconciliation:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "banking-clearing-ops-rs,ledger-reconciliation-rs,mojaloop-settlement-mgr-go,recon-engine-rs,reconciliation-engine-rs"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "ledger-reconciliation"
+      SERVICES: "banking-clearing-ops-rs,ledger-reconciliation-rs,mojaloop-settlement-mgr-go,recon-engine-rs,reconciliation-engine-rs"
+      PORT_BASE: "9414"
+    ports: ["9414-9418:9414-9418"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    labels:
+      - "com.54bank.group=ledger-reconciliation"
+      - "com.54bank.services=5"
+      - "com.54bank.ports=9414-9418"
+      - "com.54bank.description=Reconciliation — settlement, clearing, recon engine, suspense"
+    profiles: ["services"]
+
+  # Mojaloop — DFSP connector, PISP, FSPIOP, settlement, TB bridge
+  # Services: 7 | Ports: 9420-9426 | Primary: go
+  mojaloop-connector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "mojaloop-admin-go,mojaloop-connector-go,mojaloop-crossborder-py,mojaloop-fspiop-callbacks-rs,mojaloop-pisp-go,mojaloop-protocol-py,mojaloop-tb-bridge-rs"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "mojaloop-connector"
+      SERVICES: "mojaloop-admin-go,mojaloop-connector-go,mojaloop-crossborder-py,mojaloop-fspiop-callbacks-rs,mojaloop-pisp-go,mojaloop-protocol-py,mojaloop-tb-bridge-rs"
+      PORT_BASE: "9420"
+    ports: ["9420-9426:9420-9426"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 448M
+    labels:
+      - "com.54bank.group=mojaloop-connector"
+      - "com.54bank.services=7"
+      - "com.54bank.ports=9420-9426"
+      - "com.54bank.description=Mojaloop — DFSP connector, PISP, FSPIOP, settlement, TB bridge"
+    profiles: ["services"]
+
+  # API platform — gateway, marketplace, developer portal, sandbox, webhooks
+  # Services: 13 | Ports: 9428-9440 | Primary: go
+  platform-api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "api-key-enforcer-go,api-key-vault-go,api-marketplace-go,api-versioning-go,apisix-gateway-go,apisix-plugin-optimizer-go,bundle-splitter-py,cors-gateway-go,dapr-sidecar-go,graphql-gateway-go,plugin-marketplace-py,security-gateway-go,webhook-engine-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "platform-api"
+      SERVICES: "api-key-enforcer-go,api-key-vault-go,api-marketplace-go,api-versioning-go,apisix-gateway-go,apisix-plugin-optimizer-go,bundle-splitter-py,cors-gateway-go,dapr-sidecar-go,graphql-gateway-go,plugin-marketplace-py,security-gateway-go,webhook-engine-go"
+      PORT_BASE: "9428"
+    ports: ["9428-9440:9428-9440"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 832M
+    labels:
+      - "com.54bank.group=platform-api"
+      - "com.54bank.services=13"
+      - "com.54bank.ports=9428-9440"
+      - "com.54bank.description=API platform — gateway, marketplace, developer portal, sandbox, webhooks"
+    profiles: ["services"]
+
+  # DevOps — feature flags, canary, rollout, A/B testing, config
+  # Services: 8 | Ports: 9442-9449 | Primary: go
+  platform-devops:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "ab-testing-py,certificate-manager-py,feature-entitlement-go,feature-flag-engine-rs,flag-audit-rs,graduated-rollout-rs,hpa-autoscaler-go,keda-scaler-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "platform-devops"
+      SERVICES: "ab-testing-py,certificate-manager-py,feature-entitlement-go,feature-flag-engine-rs,flag-audit-rs,graduated-rollout-rs,hpa-autoscaler-go,keda-scaler-go"
+      PORT_BASE: "9442"
+    ports: ["9442-9449:9442-9449"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    labels:
+      - "com.54bank.group=platform-devops"
+      - "com.54bank.services=8"
+      - "com.54bank.ports=9442-9449"
+      - "com.54bank.description=DevOps — feature flags, canary, rollout, A/B testing, config"
+    profiles: ["services"]
+
+  # Multi-tenant — provisioning, billing, metering, isolation, white-label
+  # Services: 12 | Ports: 9451-9462 | Primary: go
+  platform-tenant:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "billing-enforcement-rs,billing-ingestor-go,billing-orchestrator-go,billing-rating-rs,multi-entity-go,tenant-billing-go,tenant-export-go,tenant-isolation-go,tenant-management-py,tenant-metering-go,tenant-ratelimit-rs,white-label-engine-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "platform-tenant"
+      SERVICES: "billing-enforcement-rs,billing-ingestor-go,billing-orchestrator-go,billing-rating-rs,multi-entity-go,tenant-billing-go,tenant-export-go,tenant-isolation-go,tenant-management-py,tenant-metering-go,tenant-ratelimit-rs,white-label-engine-go"
+      PORT_BASE: "9451"
+    ports: ["9451-9462:9451-9462"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+    labels:
+      - "com.54bank.group=platform-tenant"
+      - "com.54bank.services=12"
+      - "com.54bank.ports=9451-9462"
+      - "com.54bank.description=Multi-tenant — provisioning, billing, metering, isolation, white-label"
+    profiles: ["services"]
+
+  # Access control — Permify, RBAC, PBAC, maker-checker, approval
+  # Services: 5 | Ports: 9464-9468 | Primary: go
+  security-access:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "approval-workflow-go,billing-rbac-rs,maker-checker-go,pbac-engine-rs,permify-authz-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "security-access"
+      SERVICES: "approval-workflow-go,billing-rbac-rs,maker-checker-go,pbac-engine-rs,permify-authz-go"
+      PORT_BASE: "9464"
+    ports: ["9464-9468:9464-9468"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 320M
+    labels:
+      - "com.54bank.group=security-access"
+      - "com.54bank.services=5"
+      - "com.54bank.ports=9464-9468"
+      - "com.54bank.description=Access control — Permify, RBAC, PBAC, maker-checker, approval"
+    profiles: ["services"]
+
+  # Security — WAF, PCI, HSM, KMS, encryption, DDoS, CSRF
+  # Services: 19 | Ports: 9470-9488 | Primary: rust
+  security-waf:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "body-limit-enforcer-go,clickjack-defender-rs,cloud-kms-bridge-rs,csp-nonce-engine-go,ddos-protection-go,ddos-shield-go,distroless-builder-py,docker-hardener-py,field-level-encryption-rs,helm-validator-go,hsm-key-manager-rs,image-scanner-go,ip-allowlist-rs,key-rotation-engine-go,openappsec-waf-rs,output-encoder-rs,pci-scanner-rs,sri-validator-rs,waf-rules-engine-rs"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "security-waf"
+      SERVICES: "body-limit-enforcer-go,clickjack-defender-rs,cloud-kms-bridge-rs,csp-nonce-engine-go,ddos-protection-go,ddos-shield-go,distroless-builder-py,docker-hardener-py,field-level-encryption-rs,helm-validator-go,hsm-key-manager-rs,image-scanner-go,ip-allowlist-rs,key-rotation-engine-go,openappsec-waf-rs,output-encoder-rs,pci-scanner-rs,sri-validator-rs,waf-rules-engine-rs"
+      PORT_BASE: "9470"
+    ports: ["9470-9488:9470-9488"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1216M
+    labels:
+      - "com.54bank.group=security-waf"
+      - "com.54bank.services=19"
+      - "com.54bank.ports=9470-9488"
+      - "com.54bank.description=Security — WAF, PCI, HSM, KMS, encryption, DDoS, CSRF"
+    profiles: ["services"]
+
+  # Agriculture — crop, livestock, soil, harvest, warehouse, cooperatives
+  # Services: 25 | Ports: 9490-9514 | Primary: go
+  specialized-agri:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "acgsf-guarantee-go,agri-esg-impact-py,agri-evoucher-go,agri-input-marketplace-go,agri-iot-sensor-rs,agri-logistics-go,agri-reinsurance-go,agriculture-banking-rs,cooperative-financials-py,cooperative-management-go,cooperative-meetings-go,crossborder-agri-trade-rs,esusu-groups-go,farm-boundary-mapping-rs,fisheries-aquaculture-go,livestock-finance-rs,livestock-insurance-rs,livestock-management-rs,multi-peril-crop-insurance-rs,nirsal-agro-geocoop-go,nirsal-credit-guarantee-go,post-harvest-loss-tracker-go,quality-certification-go,satellite-crop-monitor-rs,warehouse-management-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "specialized-agri"
+      SERVICES: "acgsf-guarantee-go,agri-esg-impact-py,agri-evoucher-go,agri-input-marketplace-go,agri-iot-sensor-rs,agri-logistics-go,agri-reinsurance-go,agriculture-banking-rs,cooperative-financials-py,cooperative-management-go,cooperative-meetings-go,crossborder-agri-trade-rs,esusu-groups-go,farm-boundary-mapping-rs,fisheries-aquaculture-go,livestock-finance-rs,livestock-insurance-rs,livestock-management-rs,multi-peril-crop-insurance-rs,nirsal-agro-geocoop-go,nirsal-credit-guarantee-go,post-harvest-loss-tracker-go,quality-certification-go,satellite-crop-monitor-rs,warehouse-management-go"
+      PORT_BASE: "9490"
+    ports: ["9490-9514:9490-9514"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1600M
+    labels:
+      - "com.54bank.group=specialized-agri"
+      - "com.54bank.services=25"
+      - "com.54bank.ports=9490-9514"
+      - "com.54bank.description=Agriculture — crop, livestock, soil, harvest, warehouse, cooperatives"
+    profiles: ["services"]
+
+  # Engagement — gamification, loyalty, rewards, referrals, cashback
+  # Services: 6 | Ports: 9516-9521 | Primary: go
+  specialized-engagement:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "component-memoizer-py,growth-features-go,optimistic-ui-engine-go,skeleton-loading-rs,sorted-set-ranking-go,virtual-scroll-engine-rs"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "specialized-engagement"
+      SERVICES: "component-memoizer-py,growth-features-go,optimistic-ui-engine-go,skeleton-loading-rs,sorted-set-ranking-go,virtual-scroll-engine-rs"
+      PORT_BASE: "9516"
+    ports: ["9516-9521:9516-9521"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    labels:
+      - "com.54bank.group=specialized-engagement"
+      - "com.54bank.services=6"
+      - "com.54bank.ports=9516-9521"
+      - "com.54bank.description=Engagement — gamification, loyalty, rewards, referrals, cashback"
+    profiles: ["services"]
+
+  # Islamic & specialized — murabaha, sukuk, takaful, pension, insurance, diaspora
+  # Services: 6 | Ports: 9523-9528 | Primary: python
+  specialized-islamic:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "area-yield-index-insurance-py,exam-management-py,insurance-py,islamic-banking-py,parametric-insurance-iot-rs,pension-py"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "specialized-islamic"
+      SERVICES: "area-yield-index-insurance-py,exam-management-py,insurance-py,islamic-banking-py,parametric-insurance-iot-rs,pension-py"
+      PORT_BASE: "9523"
+    ports: ["9523-9528:9523-9528"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 384M
+    labels:
+      - "com.54bank.group=specialized-islamic"
+      - "com.54bank.services=6"
+      - "com.54bank.ports=9523-9528"
+      - "com.54bank.description=Islamic & specialized — murabaha, sukuk, takaful, pension, insurance, diaspora"
+    profiles: ["services"]
+
+  # Trade & FX — trade finance, forex, remittance, SWIFT, cross-border
+  # Services: 9 | Ports: 9530-9538 | Primary: go
+  trade-fx:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "diaspora-banking-py,enaira-cbdc-py,fx-rates-engine-rs,iso20022-hub-rs,remittance-go,swift-iso20022-rs,swift-messaging-go,trade-finance-gl-go,trade-finance-go"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "trade-fx"
+      SERVICES: "diaspora-banking-py,enaira-cbdc-py,fx-rates-engine-rs,iso20022-hub-rs,remittance-go,swift-iso20022-rs,swift-messaging-go,trade-finance-gl-go,trade-finance-go"
+      PORT_BASE: "9530"
+    ports: ["9530-9538:9530-9538"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 576M
+    labels:
+      - "com.54bank.group=trade-fx"
+      - "com.54bank.services=9"
+      - "com.54bank.ports=9530-9538"
+      - "com.54bank.description=Trade & FX — trade finance, forex, remittance, SWIFT, cross-border"
+    profiles: ["services"]
+
+  # Supply chain — factoring, leasing, escrow, project finance
+  # Services: 9 | Ports: 9540-9548 | Primary: go
+  trade-supply-chain:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "bank-guarantees-go,equipment-leasing-go,escrow-go,factoring-go,leasing-go,locker-go,project-finance-go,supply-chain-finance-go,trust-estate-rs"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "trade-supply-chain"
+      SERVICES: "bank-guarantees-go,equipment-leasing-go,escrow-go,factoring-go,leasing-go,locker-go,project-finance-go,supply-chain-finance-go,trust-estate-rs"
+      PORT_BASE: "9540"
+    ports: ["9540-9548:9540-9548"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 576M
+    labels:
+      - "com.54bank.group=trade-supply-chain"
+      - "com.54bank.services=9"
+      - "com.54bank.ports=9540-9548"
+      - "com.54bank.description=Supply chain — factoring, leasing, escrow, project finance"
+    profiles: ["services"]
+
+  # Treasury — liquidity, money market, bonds, securities, commodities
+  # Services: 15 | Ports: 9550-9564 | Primary: rust
+  treasury-investments:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "cash-pooling-go,commodity-exchange-rs,commodity-price-intelligence-py,custody-service-go,etd-trading-rs,insurance-portfolio-analytics-py,money-market-rs,multicurrency-revaluation-rs,otc-derivatives-rs,portfolio-mgmt-rs,securities-trading-rs,tigerbeetle-multicurrency-rs,treasury-liquidity-py,treasury-liquidity-rs,wealth-mgmt-py"
+        PRIMARY_LANG: "rust"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "treasury-investments"
+      SERVICES: "cash-pooling-go,commodity-exchange-rs,commodity-price-intelligence-py,custody-service-go,etd-trading-rs,insurance-portfolio-analytics-py,money-market-rs,multicurrency-revaluation-rs,otc-derivatives-rs,portfolio-mgmt-rs,securities-trading-rs,tigerbeetle-multicurrency-rs,treasury-liquidity-py,treasury-liquidity-rs,wealth-mgmt-py"
+      PORT_BASE: "9550"
+    ports: ["9550-9564:9550-9564"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 960M
+    labels:
+      - "com.54bank.group=treasury-investments"
+      - "com.54bank.services=15"
+      - "com.54bank.ports=9550-9564"
+      - "com.54bank.description=Treasury — liquidity, money market, bonds, securities, commodities"
+    profiles: ["services"]
+
+  # Workflow — batch processing, schedulers, Temporal, sagas, job queues
+  # Services: 9 | Ports: 9566-9574 | Primary: go
+  workflow-batch:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "batch-aggregator-go,batch-processing-py,e2e-orchestrator-go,saga-coordinator-py,temporal-memoizer-go,temporal-orchestrator-py,temporal-sagas-go,temporal-worker-go,workflow-engine-py"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "workflow-batch"
+      SERVICES: "batch-aggregator-go,batch-processing-py,e2e-orchestrator-go,saga-coordinator-py,temporal-memoizer-go,temporal-orchestrator-py,temporal-sagas-go,temporal-worker-go,workflow-engine-py"
+      PORT_BASE: "9566"
+    ports: ["9566-9574:9566-9574"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 576M
+    labels:
+      - "com.54bank.group=workflow-batch"
+      - "com.54bank.services=9"
+      - "com.54bank.ports=9566-9574"
+      - "com.54bank.description=Workflow — batch processing, schedulers, Temporal, sagas, job queues"
+    profiles: ["services"]
+
+  # Operations — teller, branch, maker-checker, document management
+  # Services: 48 | Ports: 9576-9623 | Primary: go
+  workflow-operations:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "accessibility-auditor-py,animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-operations-go,cac-realtime-api-go,contract-test-rs,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-management-py,eod-processor-go,erpnext-bridge-go,erpnext-sync-py,fast-json-serializer-rs,fixed-assets-go,idempotency-go,immutable-audit-rs,inventory-py,load-test-runner-py,middleware-go,middleware-py,middleware-rs,ndpr-compliance-py,offline-resilience-rs,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-operations-engine-py,platform-security-infra-go,request-coalescer-go,resilience-service-rs,response-compressor-rs,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,stress-testing-rs,tax-reporting-py,teller-operations-go,typology-detector-rs,ubo-ownership-graph-rs,unit-test-runner-py,vault-integration-rs"
+        PRIMARY_LANG: "go"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "workflow-operations"
+      SERVICES: "accessibility-auditor-py,animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-operations-go,cac-realtime-api-go,contract-test-rs,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-management-py,eod-processor-go,erpnext-bridge-go,erpnext-sync-py,fast-json-serializer-rs,fixed-assets-go,idempotency-go,immutable-audit-rs,inventory-py,load-test-runner-py,middleware-go,middleware-py,middleware-rs,ndpr-compliance-py,offline-resilience-rs,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-operations-engine-py,platform-security-infra-go,request-coalescer-go,resilience-service-rs,response-compressor-rs,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,stress-testing-rs,tax-reporting-py,teller-operations-go,typology-detector-rs,ubo-ownership-graph-rs,unit-test-runner-py,vault-integration-rs"
+      PORT_BASE: "9576"
+    ports: ["9576-9623:9576-9623"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 3072M
+    labels:
+      - "com.54bank.group=workflow-operations"
+      - "com.54bank.services=48"
+      - "com.54bank.ports=9576-9623"
+      - "com.54bank.description=Operations — teller, branch, maker-checker, document management"
+    profiles: ["services"]
+
+  # Reporting — dashboards, KPIs, analytics, business intelligence
+  # Services: 11 | Ports: 9625-9635 | Primary: python
+  workflow-reporting:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consolidated
+      args:
+        SERVICES: "analytics-engine-py,api-analytics-py,billing-analytics-py,customer-360-dashboard-py,document-management-py,kpi-analytics-py,kpi-engine-go,opensearch-analytics-py,prometheus-dashboard-py,stakeholder-kpi-dashboard-py,statement-generator-py"
+        PRIMARY_LANG: "python"
+    environment:
+      <<: *common-env
+      SERVICE_GROUP: "workflow-reporting"
+      SERVICES: "analytics-engine-py,api-analytics-py,billing-analytics-py,customer-360-dashboard-py,document-management-py,kpi-analytics-py,kpi-engine-go,opensearch-analytics-py,prometheus-dashboard-py,stakeholder-kpi-dashboard-py,statement-generator-py"
+      PORT_BASE: "9625"
+    ports: ["9625-9635:9625-9635"]
+    depends_on: [postgres, redis, kafka]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 704M
+    labels:
+      - "com.54bank.group=workflow-reporting"
+      - "com.54bank.services=11"
+      - "com.54bank.ports=9625-9635"
+      - "com.54bank.description=Reporting — dashboards, KPIs, analytics, business intelligence"
+    profiles: ["services"]
+
+volumes:
+  pgdata:
+  osdata:
+  tbdata:

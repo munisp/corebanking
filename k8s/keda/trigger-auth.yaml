@@ -1,0 +1,131 @@
+# KEDA TriggerAuthentication for 54Bank Platform
+# Provides Kafka SASL, PostgreSQL, Redis, and Prometheus credentials to KEDA triggers
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keda-kafka-credentials
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: 54bank-platform
+    app.kubernetes.io/managed-by: keda
+type: Opaque
+stringData:
+  sasl: "scram_sha512"
+  username: "keda-consumer"
+  password: "${KAFKA_KEDA_PASSWORD}"
+  tls: "enable"
+  ca: "/var/run/secrets/kafka-tls/ca.crt"
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-kafka-auth
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  secretTargetRef:
+    - parameter: sasl
+      name: keda-kafka-credentials
+      key: sasl
+    - parameter: username
+      name: keda-kafka-credentials
+      key: username
+    - parameter: password
+      name: keda-kafka-credentials
+      key: password
+    - parameter: tls
+      name: keda-kafka-credentials
+      key: tls
+    - parameter: ca
+      name: keda-kafka-credentials
+      key: ca
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keda-postgres-credentials
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: 54bank-platform
+type: Opaque
+stringData:
+  host: "postgresql.54bank.svc.cluster.local"
+  port: "5432"
+  username: "keda_readonly"
+  password: "${POSTGRES_KEDA_PASSWORD}"
+  dbName: "corebanking"
+  sslmode: "require"
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-postgres-auth
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  secretTargetRef:
+    - parameter: host
+      name: keda-postgres-credentials
+      key: host
+    - parameter: port
+      name: keda-postgres-credentials
+      key: port
+    - parameter: userName
+      name: keda-postgres-credentials
+      key: username
+    - parameter: password
+      name: keda-postgres-credentials
+      key: password
+    - parameter: dbName
+      name: keda-postgres-credentials
+      key: dbName
+    - parameter: sslmode
+      name: keda-postgres-credentials
+      key: sslmode
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keda-redis-credentials
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: 54bank-platform
+type: Opaque
+stringData:
+  address: "redis-cache.54bank.svc.cluster.local:6379"
+  password: "${REDIS_KEDA_PASSWORD}"
+  enableTLS: "true"
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-redis-auth
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  secretTargetRef:
+    - parameter: address
+      name: keda-redis-credentials
+      key: address
+    - parameter: password
+      name: keda-redis-credentials
+      key: password
+    - parameter: enableTLS
+      name: keda-redis-credentials
+      key: enableTLS
+---
+# Prometheus auth (for metrics-based scaling)
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-prometheus-auth
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  secretTargetRef: []
+  # Prometheus runs in-cluster without auth; add bearer token here if needed

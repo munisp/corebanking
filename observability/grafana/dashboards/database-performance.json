@@ -1,0 +1,97 @@
+{
+  "dashboard": {
+    "id": null,
+    "uid": "54bank-database-performance",
+    "title": "54Bank Database Performance",
+    "description": "PostgreSQL query performance, connection pools, slow queries, index usage",
+    "tags": ["54bank", "database", "postgres", "performance"],
+    "timezone": "utc",
+    "refresh": "30s",
+    "time": { "from": "now-6h", "to": "now" },
+    "panels": [
+      {
+        "id": 1,
+        "title": "Active Connections",
+        "type": "gauge",
+        "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+        "targets": [{ "expr": "pg_stat_activity_count", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "max": 200, "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 150 }] } } }
+      },
+      {
+        "id": 2,
+        "title": "Connection Pool Utilization",
+        "type": "gauge",
+        "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+        "targets": [{ "expr": "postgres:connection_utilization", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 0.7 }, { "color": "red", "value": 0.9 }] } } }
+      },
+      {
+        "id": 3,
+        "title": "Transactions/sec",
+        "type": "stat",
+        "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+        "targets": [{ "expr": "rate(pg_stat_database_xact_commit[5m]) + rate(pg_stat_database_xact_rollback[5m])", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "ops" } }
+      },
+      {
+        "id": 4,
+        "title": "Replication Lag",
+        "type": "stat",
+        "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+        "targets": [{ "expr": "pg_replication_lag_seconds", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "s", "thresholds": { "steps": [{ "color": "green", "value": 0 }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 30 }] } } }
+      },
+      {
+        "id": 10,
+        "title": "Top Slow Queries (mean exec time)",
+        "type": "table",
+        "gridPos": { "h": 10, "w": 24, "x": 0, "y": 5 },
+        "targets": [{
+          "expr": "topk(20, pg_stat_statements_mean_exec_time_ms)",
+          "format": "table",
+          "legendFormat": ""
+        }]
+      },
+      {
+        "id": 11,
+        "title": "Sequential Scans by Table",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+        "targets": [{ "expr": "topk(10, rate(pg_stat_user_tables_seq_scan[5m]))", "legendFormat": "{{ relname }}" }]
+      },
+      {
+        "id": 12,
+        "title": "Dead Tuples by Table",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+        "targets": [{ "expr": "topk(10, pg_stat_user_tables_n_dead_tup)", "legendFormat": "{{ relname }}" }]
+      },
+      {
+        "id": 13,
+        "title": "Index Hit Rate",
+        "type": "gauge",
+        "gridPos": { "h": 8, "w": 8, "x": 0, "y": 23 },
+        "targets": [{ "expr": "pg_stat_database_blks_hit / (pg_stat_database_blks_hit + pg_stat_database_blks_read)", "legendFormat": "" }],
+        "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "thresholds": { "steps": [{ "color": "red", "value": 0 }, { "color": "yellow", "value": 0.9 }, { "color": "green", "value": 0.99 }] } } }
+      },
+      {
+        "id": 14,
+        "title": "Commits vs Rollbacks",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 8, "y": 23 },
+        "targets": [
+          { "expr": "rate(pg_stat_database_xact_commit[5m])", "legendFormat": "Commits" },
+          { "expr": "rate(pg_stat_database_xact_rollback[5m])", "legendFormat": "Rollbacks" }
+        ]
+      },
+      {
+        "id": 15,
+        "title": "Database Size",
+        "type": "timeseries",
+        "gridPos": { "h": 8, "w": 8, "x": 16, "y": 23 },
+        "targets": [{ "expr": "pg_database_size_bytes / 1024 / 1024 / 1024", "legendFormat": "{{ datname }}" }],
+        "fieldConfig": { "defaults": { "unit": "decgbytes" } }
+      }
+    ]
+  }
+}

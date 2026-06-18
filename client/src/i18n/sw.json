@@ -1,0 +1,18 @@
+{
+  "app_name": "54Bank",
+  "dashboard": "Dashibodi",
+  "accounts": "Akaunti",
+  "transfers": "Uhamisho",
+  "payments": "Malipo",
+  "cards": "Kadi",
+  "loans": "Mikopo",
+  "settings": "Mipangilio",
+  "logout": "Ondoka",
+  "welcome": "Karibu tena",
+  "balance": "Salio la Akaunti",
+  "recent_transactions": "Miamala ya hivi karibuni",
+  "quick_transfer": "Uhamisho wa haraka",
+  "pay_bills": "Lipa bili",
+  "currency": "KES",
+  "language": "Kiswahili"
+}

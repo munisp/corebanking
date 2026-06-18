@@ -1,0 +1,51 @@
+/* 54Bank WCAG 2.1 AA Accessibility Styles */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+.sr-only.focus\:not-sr-only:focus {
+  position: static; width: auto; height: auto;
+  margin: 0; overflow: visible; clip: auto; white-space: normal;
+}
+
+/* High Contrast Mode */
+html.high-contrast { --contrast-bg: #000; --contrast-fg: #fff; --contrast-link: #ff0; --contrast-border: #fff; }
+html.high-contrast body { background: var(--contrast-bg) !important; color: var(--contrast-fg) !important; }
+html.high-contrast a { color: var(--contrast-link) !important; text-decoration: underline !important; }
+html.high-contrast button, html.high-contrast input, html.high-contrast select {
+  border: 2px solid var(--contrast-border) !important;
+  background: var(--contrast-bg) !important; color: var(--contrast-fg) !important;
+}
+
+/* Font Size Scaling */
+html[data-font-size="large"] { font-size: 120%; }
+html[data-font-size="xlarge"] { font-size: 140%; }
+
+/* Reduced Motion */
+html.reduced-motion *, html.reduced-motion *::before, html.reduced-motion *::after {
+  animation-duration: 0.01ms !important; animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important; scroll-behavior: auto !important;
+}
+
+/* Focus Indicators (WCAG 2.4.7) */
+:focus-visible {
+  outline: 3px solid #00d4aa !important;
+  outline-offset: 2px !important;
+  box-shadow: 0 0 0 4px rgba(0, 212, 170, 0.3) !important;
+}
+
+/* Minimum Touch Target (WCAG 2.5.5) */
+button, a, input[type="checkbox"], input[type="radio"], select {
+  min-width: 44px; min-height: 44px;
+}
+
+/* Color Contrast (WCAG 1.4.3 — 4.5:1 ratio for text) */
+.text-success { color: #0a8754; }
+.text-error { color: #c62828; }
+.text-warning { color: #8c6d00; }
+
+/* RTL Support for Arabic */
+html[dir="rtl"] { direction: rtl; }
+html[dir="rtl"] .sidebar { right: 0; left: auto; }
+html[dir="rtl"] .content { margin-right: 260px; margin-left: 0; }

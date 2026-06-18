@@ -1,0 +1,431 @@
+---
+# ─────────────────────────────────────────────────────────────
+# 54Bank On-Premise Deployment — Ansible Playbook
+# Deploys the full platform on bare-metal or VM infrastructure
+#
+# Usage:
+#   ansible-playbook -i inventory.ini playbook.yaml
+#   ansible-playbook -i inventory.ini playbook.yaml --tags database
+#   ansible-playbook -i inventory.ini playbook.yaml --tags k8s
+# ─────────────────────────────────────────────────────────────
+
+- name: System preparation (all nodes)
+  hosts: all
+  become: true
+  tags: [prepare]
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install common packages
+      apt:
+        name:
+          - curl
+          - jq
+          - htop
+          - iotop
+          - net-tools
+          - unzip
+          - gnupg
+          - lsb-release
+          - ca-certificates
+          - apt-transport-https
+        state: present
+
+    - name: Set kernel parameters
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        reload: yes
+      loop:
+        - { key: "vm.swappiness", value: "1" }
+        - { key: "vm.overcommit_memory", value: "2" }
+        - { key: "vm.overcommit_ratio", value: "90" }
+        - { key: "vm.dirty_ratio", value: "10" }
+        - { key: "vm.dirty_background_ratio", value: "3" }
+        - { key: "net.core.somaxconn", value: "65535" }
+        - { key: "net.ipv4.tcp_max_syn_backlog", value: "65535" }
+        - { key: "net.ipv4.ip_forward", value: "1" }
+
+    - name: Disable transparent huge pages
+      shell: |
+        echo never > /sys/kernel/mm/transparent_hugepage/enabled
+        echo never > /sys/kernel/mm/transparent_hugepage/defrag
+      changed_when: false
+
+    - name: Persist THP disable on boot
+      copy:
+        dest: /etc/systemd/system/disable-thp.service
+        content: |
+          [Unit]
+          Description=Disable Transparent Huge Pages
+          [Service]
+          Type=simple
+          ExecStart=/bin/sh -c "echo never > /sys/kernel/mm/transparent_hugepage/enabled && echo never > /sys/kernel/mm/transparent_hugepage/defrag"
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable THP disable service
+      systemd:
+        name: disable-thp
+        enabled: yes
+        state: started
+
+    - name: Set open file limits
+      pam_limits:
+        domain: "*"
+        limit_type: "{{ item.type }}"
+        limit_item: nofile
+        value: "65535"
+      loop:
+        - { type: soft }
+        - { type: hard }
+
+# ─────────────────────────────────────────────────────────────
+- name: PostgreSQL 16 Database Server
+  hosts: database
+  become: true
+  tags: [database]
+  vars:
+    db_name: ndsep_db
+    db_user: ndsep_user
+    db_password: "{{ lookup('env', 'DB_PASSWORD') | default('changeme_in_production', true) }}"
+  tasks:
+    - name: Add PostgreSQL APT repository
+      shell: |
+        echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+        wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+        apt-get update
+      args:
+        creates: /etc/apt/sources.list.d/pgdg.list
+
+    - name: Install PostgreSQL 16 and extensions
+      apt:
+        name:
+          - postgresql-16
+          - postgresql-16-pgaudit
+          - postgresql-16-pg-stat-kcache
+          - redis-server
+          - pgbouncer
+        state: present
+
+    - name: Create PostgreSQL data directory on fast storage
+      file:
+        path: /var/lib/postgresql/16/main
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700"
+
+    - name: Deploy 54Bank PostgreSQL configuration
+      copy:
+        dest: /etc/postgresql/16/main/conf.d/54bank.conf
+        owner: postgres
+        group: postgres
+        mode: "0644"
+        content: |
+          # 54Bank Production Tuning — PostgreSQL 16
+          shared_buffers = '4GB'
+          effective_cache_size = '12GB'
+          work_mem = '64MB'
+          maintenance_work_mem = '1GB'
+          huge_pages = try
+          wal_buffers = '64MB'
+          max_wal_size = '4GB'
+          min_wal_size = '1GB'
+          checkpoint_completion_target = 0.9
+          checkpoint_timeout = '15min'
+          wal_compression = zstd
+          synchronous_commit = on
+          random_page_cost = 1.1
+          effective_io_concurrency = 200
+          default_statistics_target = 500
+          jit = on
+          jit_above_cost = 100000
+          max_parallel_workers_per_gather = 2
+          max_parallel_workers = 4
+          max_connections = 200
+          autovacuum_max_workers = 4
+          autovacuum_naptime = '30s'
+          autovacuum_vacuum_scale_factor = 0.02
+          autovacuum_analyze_scale_factor = 0.01
+          autovacuum_vacuum_cost_delay = '2ms'
+          autovacuum_vacuum_cost_limit = 1000
+          log_min_duration_statement = 100
+          log_checkpoints = on
+          log_lock_waits = on
+          statement_timeout = '60s'
+          idle_in_transaction_session_timeout = '30s'
+          lock_timeout = '10s'
+          deadlock_timeout = '1s'
+          listen_addresses = '*'
+          max_wal_senders = 10
+          max_replication_slots = 10
+          hot_standby = on
+          enable_partition_pruning = on
+          enable_partitionwise_join = on
+          enable_partitionwise_aggregate = on
+      notify: Restart PostgreSQL
+
+    - name: Configure pg_hba.conf for network access
+      lineinfile:
+        path: /etc/postgresql/16/main/pg_hba.conf
+        line: "host all all 10.54.0.0/16 scram-sha-256"
+        insertafter: "^# IPv4 local connections"
+      notify: Restart PostgreSQL
+
+    - name: Enable and start PostgreSQL
+      systemd:
+        name: postgresql
+        enabled: yes
+        state: started
+
+    - name: Create database user
+      become_user: postgres
+      community.postgresql.postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        role_attr_flags: CREATEDB
+      ignore_errors: yes
+
+    - name: Create database
+      become_user: postgres
+      community.postgresql.postgresql_db:
+        name: "{{ db_name }}"
+        owner: "{{ db_user }}"
+      ignore_errors: yes
+
+    - name: Enable pg_stat_statements extension
+      become_user: postgres
+      community.postgresql.postgresql_ext:
+        name: pg_stat_statements
+        db: "{{ db_name }}"
+      ignore_errors: yes
+
+    - name: Enable pg_trgm extension
+      become_user: postgres
+      community.postgresql.postgresql_ext:
+        name: pg_trgm
+        db: "{{ db_name }}"
+      ignore_errors: yes
+
+    - name: Configure Redis for network access
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^bind"
+        line: "bind 0.0.0.0"
+      notify: Restart Redis
+
+    - name: Set Redis maxmemory
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^maxmemory "
+        line: "maxmemory 2gb"
+      notify: Restart Redis
+
+    - name: Set Redis eviction policy
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^maxmemory-policy"
+        line: "maxmemory-policy allkeys-lru"
+      notify: Restart Redis
+
+    - name: Enable and start Redis
+      systemd:
+        name: redis-server
+        enabled: yes
+        state: started
+
+    - name: Deploy PgBouncer configuration
+      copy:
+        src: ../../config/pgbouncer.ini
+        dest: /etc/pgbouncer/pgbouncer.ini
+        owner: postgres
+        group: postgres
+        mode: "0644"
+      notify: Restart PgBouncer
+
+    - name: Create PgBouncer userlist
+      copy:
+        dest: /etc/pgbouncer/userlist.txt
+        owner: postgres
+        group: postgres
+        mode: "0600"
+        content: |
+          "{{ db_user }}" "{{ db_password }}"
+      notify: Restart PgBouncer
+
+    - name: Enable and start PgBouncer
+      systemd:
+        name: pgbouncer
+        enabled: yes
+        state: started
+
+  handlers:
+    - name: Restart PostgreSQL
+      systemd:
+        name: postgresql
+        state: restarted
+
+    - name: Restart Redis
+      systemd:
+        name: redis-server
+        state: restarted
+
+    - name: Restart PgBouncer
+      systemd:
+        name: pgbouncer
+        state: restarted
+
+# ─────────────────────────────────────────────────────────────
+- name: K3s Master Node
+  hosts: k8s_master
+  become: true
+  tags: [k8s, k8s-master]
+  tasks:
+    - name: Install K3s server
+      shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}" \
+          INSTALL_K3S_EXEC="server \
+            --cluster-init \
+            --tls-san {{ ansible_host }} \
+            --node-ip {{ ansible_host }} \
+            --write-kubeconfig-mode 644 \
+            --disable traefik" sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: Wait for K3s to be ready
+      command: k3s kubectl get nodes
+      register: k3s_ready
+      retries: 30
+      delay: 10
+      until: k3s_ready.rc == 0
+
+    - name: Get K3s join token
+      slurp:
+        src: /var/lib/rancher/k3s/server/node-token
+      register: k3s_token
+
+    - name: Set token fact
+      set_fact:
+        k3s_join_token: "{{ k3s_token.content | b64decode | trim }}"
+
+    - name: Install Helm
+      shell: curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+
+    - name: Install NGINX Ingress Controller
+      shell: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo update
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx --create-namespace \
+          --set controller.service.type=NodePort \
+          --set controller.service.nodePorts.http=30080 \
+          --set controller.service.nodePorts.https=30443
+      args:
+        creates: /tmp/.nginx-ingress-installed
+      register: nginx_result
+      ignore_errors: yes
+
+    - name: Install cert-manager
+      shell: |
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager --create-namespace \
+          --set installCRDs=true
+      args:
+        creates: /tmp/.cert-manager-installed
+      register: certmanager_result
+      ignore_errors: yes
+
+# ─────────────────────────────────────────────────────────────
+- name: K3s Worker Nodes
+  hosts: k8s_workers
+  become: true
+  tags: [k8s, k8s-workers]
+  tasks:
+    - name: Get join token from master
+      set_fact:
+        k3s_join_token: "{{ hostvars[groups['k8s_master'][0]]['k3s_join_token'] }}"
+        k3s_master_ip: "{{ hostvars[groups['k8s_master'][0]]['ansible_host'] }}"
+
+    - name: Install K3s agent
+      shell: |
+        curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="{{ k3s_version }}" \
+          K3S_URL="https://{{ k3s_master_ip }}:6443" \
+          K3S_TOKEN="{{ k3s_join_token }}" sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+# ─────────────────────────────────────────────────────────────
+- name: Deploy 54Bank Platform
+  hosts: k8s_master
+  become: true
+  tags: [deploy]
+  vars:
+    db_host: "{{ hostvars[groups['database'][0]]['ansible_host'] }}"
+    db_password: "{{ lookup('env', 'DB_PASSWORD') | default('changeme_in_production', true) }}"
+  tasks:
+    - name: Create 54bank namespace
+      command: k3s kubectl create namespace 54bank
+      ignore_errors: yes
+
+    - name: Create database secret
+      shell: |
+        k3s kubectl create secret generic 54bank-db -n 54bank \
+          --from-literal=DATABASE_URL='postgresql://ndsep_user:{{ db_password }}@{{ db_host }}:5432/ndsep_db' \
+          --from-literal=REDIS_URL='redis://{{ db_host }}:6379' \
+          --dry-run=client -o yaml | k3s kubectl apply -f -
+
+    - name: Copy Helm chart to master
+      copy:
+        src: ../../helm/54bank/
+        dest: /tmp/54bank-helm/
+
+    - name: Deploy via Helm
+      shell: |
+        helm upgrade --install 54bank /tmp/54bank-helm \
+          --namespace 54bank \
+          --set environment={{ bank_environment }} \
+          --set database.host={{ db_host }} \
+          --set database.port=5432 \
+          --set redis.host={{ db_host }} \
+          --set redis.port=6379 \
+          --set ingress.enabled=true \
+          --set ingress.host={{ bank_domain }} \
+          --wait --timeout=10m
+
+    - name: Wait for platform to be ready
+      command: k3s kubectl get pods -n 54bank -o wide
+      register: pod_status
+      retries: 30
+      delay: 10
+      until: "'Running' in pod_status.stdout"
+
+    - name: Print deployment status
+      debug:
+        msg: |
+          ═══════════════════════════════════════════════
+            54Bank Deployment Complete
+          ═══════════════════════════════════════════════
+          
+            Environment:   {{ bank_environment }}
+            K8s API:       https://{{ ansible_host }}:6443
+            PostgreSQL:    {{ db_host }}:5432
+            Redis:         {{ db_host }}:6379
+            Platform:      https://{{ bank_domain }}
+          
+            Next steps:
+            1. Run migrations:
+               kubectl exec -it deploy/54bank-api -n 54bank -- pnpm db:migrate
+            2. Seed database:
+               kubectl exec -it deploy/54bank-api -n 54bank -- pnpm db:seed
+            3. Create indexes:
+               psql $DATABASE_URL -f drizzle/indexes.sql

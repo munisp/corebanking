@@ -1,0 +1,55 @@
+{
+  "version": "7",
+  "dialect": "mysql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "5",
+      "when": 1776629925120,
+      "tag": "0000_blue_white_queen",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "5",
+      "when": 1776647112441,
+      "tag": "0001_busy_human_robot",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "5",
+      "when": 1776649692868,
+      "tag": "0002_calm_lilandra",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "5",
+      "when": 1776774602701,
+      "tag": "0003_far_preak",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "5",
+      "when": 1776885090577,
+      "tag": "0004_freezing_captain_britain",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "5",
+      "when": 1778322938135,
+      "tag": "0005_youthful_mattie_franklin",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "5",
+      "when": 1778327587325,
+      "tag": "0006_conscious_marrow",
+      "breakpoints": true
+    }
+  ]
+}

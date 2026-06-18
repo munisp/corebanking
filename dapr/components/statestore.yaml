@@ -1,0 +1,15 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: statestore
+  namespace: 54bank
+spec:
+  type: state.postgresql
+  version: v1
+  metadata:
+    - name: connectionString
+      value: "host=localhost user=ndsep_user password=ndsep_secure_2026 port=5432 dbname=ndsep_db sslmode=disable"
+    - name: actorStateStore
+      value: "true"
+    - name: tableName
+      value: dapr_state

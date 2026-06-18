@@ -1,0 +1,66 @@
+# OpenStack Magnum Kubernetes Cluster Template
+# Use with: openstack coe cluster template create -f yaml < cluster-template.yaml
+---
+# Create the cluster template
+# openstack coe cluster template create 54bank-k8s-template \
+#   --image fedora-coreos-39 \
+#   --keypair 54bank-key \
+#   --external-network public-net \
+#   --dns-nameserver 8.8.8.8 \
+#   --master-flavor m1.xlarge \
+#   --flavor m1.2xlarge \
+#   --coe kubernetes \
+#   --network-driver calico \
+#   --volume-driver cinder \
+#   --docker-storage-driver overlay2 \
+#   --master-lb-enabled \
+#   --floating-ip-enabled \
+#   --labels kube_tag=v1.29.0,container_runtime=containerd,ingress_controller=nginx
+
+# Create the cluster
+# openstack coe cluster create 54bank-production \
+#   --cluster-template 54bank-k8s-template \
+#   --master-count 3 \
+#   --node-count 6 \
+#   --keypair 54bank-key
+
+# Get kubeconfig
+# openstack coe cluster config 54bank-production --dir ~/.kube/
+
+# Post-install steps
+post_install:
+  - name: Install MetalLB
+    command: kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.3/config/manifests/metallb-native.yaml
+
+  - name: Install Rook-Ceph operator
+    command: |
+      kubectl apply -f https://raw.githubusercontent.com/rook/rook/v1.13/deploy/examples/crds.yaml
+      kubectl apply -f https://raw.githubusercontent.com/rook/rook/v1.13/deploy/examples/common.yaml
+      kubectl apply -f https://raw.githubusercontent.com/rook/rook/v1.13/deploy/examples/operator.yaml
+
+  - name: Deploy Ceph cluster
+    command: kubectl apply -f ../rook-ceph/ceph-cluster.yaml
+
+  - name: Install External Secrets Operator
+    command: |
+      helm repo add external-secrets https://charts.external-secrets.io
+      helm install external-secrets external-secrets/external-secrets -n external-secrets --create-namespace
+
+  - name: Install APISIX
+    command: |
+      helm repo add apisix https://charts.apiseven.com
+      helm install apisix apisix/apisix -n apisix --create-namespace \
+        --set gateway.type=LoadBalancer \
+        --set ingress-controller.enabled=true
+
+  - name: Install Vault
+    command: |
+      helm repo add hashicorp https://helm.releases.hashicorp.com
+      helm install vault hashicorp/vault -n vault --create-namespace \
+        --set server.ha.enabled=true \
+        --set server.ha.replicas=3
+
+  - name: Install monitoring stack
+    command: |
+      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+      helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring --create-namespace

@@ -1,0 +1,144 @@
+# Dapr Service Discovery Registry for 54Bank Platform
+# Each service registers with Dapr sidecar for mTLS and discovery
+services:
+  # Go Services
+  - app_id: account-opening
+    app_port: 8088
+    language: go
+    category: operations
+  - app_id: billing-ingestor
+    app_port: 8089
+    language: go
+    category: billing
+  - app_id: teller-operations
+    app_port: 8091
+    language: go
+    category: operations
+  - app_id: trade-finance
+    app_port: 8093
+    language: go
+    category: trade
+  - app_id: escrow
+    app_port: 8186
+    language: go
+    category: trade
+  - app_id: qr-payments
+    app_port: 8187
+    language: go
+    category: payments
+  - app_id: interest-rate-engine
+    app_port: 8131
+    language: go
+    category: treasury
+  - app_id: cheque-clearing
+    app_port: 8132
+    language: go
+    category: operations
+  - app_id: nibss-direct-debit
+    app_port: 8134
+    language: go
+    category: payments
+  - app_id: sms-email-gateway
+    app_port: 8144
+    language: go
+    category: notifications
+  - app_id: atm-management
+    app_port: 8147
+    language: go
+    category: channels
+  - app_id: salary-processing
+    app_port: 8150
+    language: go
+    category: operations
+  - app_id: pos-terminal
+    app_port: 8153
+    language: go
+    category: channels
+  - app_id: supply-chain
+    app_port: 8158
+    language: go
+    category: trade
+  - app_id: card-management
+    app_port: 8140
+    language: go
+    category: cards
+  - app_id: agent-banking
+    app_port: 8143
+    language: go
+    category: channels
+
+  # Rust Services
+  - app_id: billing-rating
+    app_port: 8086
+    language: rust
+    category: billing
+  - app_id: agriculture-banking
+    app_port: 8090
+    language: rust
+    category: agriculture
+  - app_id: risk-scoring
+    app_port: 8145
+    language: rust
+    category: risk
+  - app_id: data-export
+    app_port: 8148
+    language: rust
+    category: analytics
+  - app_id: credit-bureau
+    app_port: 8151
+    language: rust
+    category: lending
+  - app_id: collateral-valuation
+    app_port: 8154
+    language: rust
+    category: lending
+  - app_id: money-market
+    app_port: 8156
+    language: rust
+    category: treasury
+  - app_id: securities-trading
+    app_port: 8157
+    language: rust
+    category: treasury
+  - app_id: interbank-lending
+    app_port: 8166
+    language: rust
+    category: treasury
+  - app_id: portfolio-mgmt
+    app_port: 8167
+    language: rust
+    category: wealth
+
+  # Python Services
+  - app_id: billing-analytics
+    app_port: 8087
+    language: python
+    category: billing
+  - app_id: islamic-banking
+    app_port: 8092
+    language: python
+    category: islamic
+  - app_id: chatbot
+    app_port: 8179
+    language: python
+    category: channels
+  - app_id: insurance
+    app_port: 8194
+    language: python
+    category: bancassurance
+  - app_id: regulatory-reporting
+    app_port: 8146
+    language: python
+    category: compliance
+  - app_id: customer-insights
+    app_port: 8149
+    language: python
+    category: analytics
+  - app_id: document-management
+    app_port: 8152
+    language: python
+    category: operations
+  - app_id: customer-feedback
+    app_port: 8155
+    language: python
+    category: crm

@@ -1,0 +1,305 @@
+# KEDA Operator Deployment for 54Bank Platform
+# Installs KEDA v2.14 with HA, metrics server, and admission webhooks
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keda
+  labels:
+    app.kubernetes.io/name: keda
+    app.kubernetes.io/part-of: 54bank-platform
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: keda-operator
+  namespace: keda
+  labels:
+    app.kubernetes.io/name: keda-operator
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: keda-operator
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "services", "endpoints", "events", "configmaps", "secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects", "scaledjobs", "triggerauthentications", "clustertriggerauthentications"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects/status", "scaledobjects/finalizers", "scaledjobs/status", "scaledjobs/finalizers"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: keda-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: keda-operator
+subjects:
+  - kind: ServiceAccount
+    name: keda-operator
+    namespace: keda
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keda-operator
+  namespace: keda
+  labels:
+    app.kubernetes.io/name: keda-operator
+    app.kubernetes.io/version: "2.14.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-operator
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keda-operator
+    spec:
+      serviceAccountName: keda-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: keda-operator
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: keda-operator
+          image: ghcr.io/kedacore/keda:2.14.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --leader-elect
+            - --zap-log-level=info
+            - --zap-encoder=json
+            - --zap-time-encoding=rfc3339nano
+          ports:
+            - containerPort: 8080
+              name: http
+              protocol: TCP
+            - containerPort: 9666
+              name: metrics
+              protocol: TCP
+          env:
+            - name: WATCH_NAMESPACE
+              value: ""
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: OPERATOR_NAME
+              value: "keda-operator"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: keda-operator
+---
+# KEDA Metrics Server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keda-metrics-apiserver
+  namespace: keda
+  labels:
+    app.kubernetes.io/name: keda-metrics-apiserver
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-metrics-apiserver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keda-metrics-apiserver
+    spec:
+      serviceAccountName: keda-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: keda-metrics-apiserver
+          image: ghcr.io/kedacore/keda-metrics-apiserver:2.14.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 6443
+              name: https
+            - containerPort: 8080
+              name: http
+          env:
+            - name: WATCH_NAMESPACE
+              value: ""
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keda-metrics-apiserver
+  namespace: keda
+spec:
+  type: ClusterIP
+  ports:
+    - port: 443
+      targetPort: 6443
+      name: https
+    - port: 8080
+      targetPort: 8080
+      name: http
+  selector:
+    app.kubernetes.io/name: keda-metrics-apiserver
+---
+# KEDA Admission Webhooks
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keda-admission-webhooks
+  namespace: keda
+  labels:
+    app.kubernetes.io/name: keda-admission-webhooks
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-admission-webhooks
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keda-admission-webhooks
+    spec:
+      serviceAccountName: keda-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: keda-admission-webhooks
+          image: ghcr.io/kedacore/keda-admission-webhooks:2.14.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 9443
+              name: https
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9443
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keda-operator-pdb
+  namespace: keda
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-operator
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: keda-metrics-pdb
+  namespace: keda
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keda-metrics-apiserver

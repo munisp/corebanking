@@ -1,0 +1,116 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: image-scanner-go
+  namespace: 54bank
+  labels:
+    app: image-scanner-go
+    tier: tier3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: image-scanner-go
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: image-scanner-go
+    spec:
+      serviceAccountName: image-scanner-go
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: image-scanner-go
+          image: 54bank/image-scanner-go:latest
+          ports:
+            - containerPort: 8519
+              protocol: TCP
+          env:
+            - name: PORT
+              value: "8519"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: REDIS_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: redis-config
+                  key: url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: jwt-secret
+                  key: secret
+            - name: TLS_ENABLED
+              value: "true"
+            - name: TLS_CERT_PATH
+              value: "/etc/54bank/certs/service.crt"
+            - name: TLS_KEY_PATH
+              value: "/etc/54bank/certs/service.key"
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "250m"
+              memory: "256Mi"
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 8519
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8519
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 2
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/54bank/certs
+              readOnly: true
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: image-scanner-go-tls
+      terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: image-scanner-go
+  namespace: 54bank
+spec:
+  selector:
+    app: image-scanner-go
+  ports:
+    - port: 8519
+      targetPort: 8519
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: image-scanner-go
+  namespace: 54bank
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: image-scanner-go

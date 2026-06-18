@@ -1,0 +1,83 @@
+# MetalLB Configuration for 54Bank On-Premise
+# Provides LoadBalancer service type on bare-metal K8s
+# Uses L2 mode (ARP) for simplicity in single-site deployments
+# Uses BGP mode for multi-rack/multi-site deployments
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: 54bank-api-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    # VIP range for external-facing services (API gateway, web UI)
+    - 10.0.1.200-10.0.1.220
+  autoAssign: true
+
+---
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: 54bank-internal-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    # VIP range for internal services (monitoring, admin)
+    - 10.0.1.230-10.0.1.250
+  autoAssign: false
+
+---
+# L2 Advertisement — for single-rack/single-site deployments
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: 54bank-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - 54bank-api-pool
+    - 54bank-internal-pool
+  interfaces:
+    - eth0  # Primary NIC
+
+---
+# BGP Advertisement — for multi-rack deployments with ToR switches
+apiVersion: metallb.io/v1beta1
+kind: BGPAdvertisement
+metadata:
+  name: 54bank-bgp
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - 54bank-api-pool
+  communities:
+    - 65000:100
+  localPref: 200
+
+---
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata:
+  name: tor-switch-1
+  namespace: metallb-system
+spec:
+  myASN: 65001
+  peerASN: 65000
+  peerAddress: 10.0.0.1
+  holdTime: 90s
+  keepaliveTime: 30s
+  routerID: 10.0.1.10
+
+---
+apiVersion: metallb.io/v1beta2
+kind: BGPPeer
+metadata:
+  name: tor-switch-2
+  namespace: metallb-system
+spec:
+  myASN: 65001
+  peerASN: 65000
+  peerAddress: 10.0.0.2
+  holdTime: 90s
+  keepaliveTime: 30s
+  routerID: 10.0.1.11
