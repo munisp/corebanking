@@ -17,7 +17,7 @@ import (
 	"time"
 )
 
-// --- Permission Cache (LRU with TTL) ---
+// --- Permission Cache (with TTL and size cap) ---
 
 type CacheEntry struct {
 	Allowed   bool
@@ -79,11 +79,34 @@ func (pc *PermissionCache) Get(entity, relation, subject string) (bool, bool) {
 func (pc *PermissionCache) Set(entity, relation, subject string, allowed bool) {
 	key := pc.cacheKey(entity, relation, subject)
 	pc.mu.Lock()
+	if len(pc.entries) >= pc.maxSize {
+		pc.evictLocked()
+	}
 	pc.entries[key] = CacheEntry{
 		Allowed:   allowed,
 		ExpiresAt: time.Now().UnixMilli() + pc.ttlMs,
 	}
 	pc.mu.Unlock()
+}
+
+func (pc *PermissionCache) evictLocked() {
+	now := time.Now().UnixMilli()
+	for k, v := range pc.entries {
+		if now > v.ExpiresAt {
+			delete(pc.entries, k)
+		}
+	}
+	if len(pc.entries) >= pc.maxSize {
+		count := 0
+		target := pc.maxSize / 10
+		for k := range pc.entries {
+			delete(pc.entries, k)
+			count++
+			if count >= target {
+				break
+			}
+		}
+	}
 }
 
 func (pc *PermissionCache) cleanup() {
@@ -218,13 +241,16 @@ func handleBatchCheck(bc *BatchChecker) http.HandlerFunc {
 
 func handleCacheStats(bc *BatchChecker) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		bc.cache.mu.RLock()
+		cacheSize := len(bc.cache.entries)
+		bc.cache.mu.RUnlock()
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"checked":    atomic.LoadInt64(&bc.checked),
 			"allowed":    atomic.LoadInt64(&bc.allowed),
 			"denied":     atomic.LoadInt64(&bc.denied),
 			"cacheHits":  atomic.LoadInt64(&bc.cache.hits),
 			"cacheMisses": atomic.LoadInt64(&bc.cache.misses),
-			"cacheSize":  len(bc.cache.entries),
+			"cacheSize":  cacheSize,
 		})
 	}
 }

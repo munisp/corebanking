@@ -80,7 +80,10 @@ func (cb *CircuitBreaker) Allow() bool {
 		}
 		return false
 	}
-	return true // half-open: allow one request
+	if atomic.CompareAndSwapInt32(&cb.state, 2, 1) {
+		return true // half-open: allow single probe request
+	}
+	return false
 }
 
 func (cb *CircuitBreaker) RecordSuccess() {
@@ -253,6 +256,7 @@ func handleTransfer(bp *BatchProcessor) http.HandlerFunc {
 		atomic.AddInt64(&metrics.transfersReceived, 1)
 		start := time.Now()
 		bp.Add(t)
+		watchdogPing()
 		elapsed := time.Since(start).Microseconds()
 		atomic.AddInt64(&metrics.latencySum, elapsed)
 		atomic.AddInt64(&metrics.latencyCount, 1)
@@ -320,8 +324,12 @@ func handleHealth(bp *BatchProcessor) http.HandlerFunc {
 
 var watchdogLast int64
 
-func startWatchdog() {
+func watchdogPing() {
 	atomic.StoreInt64(&watchdogLast, time.Now().UnixMilli())
+}
+
+func startWatchdog() {
+	watchdogPing()
 	go func() {
 		for {
 			time.Sleep(10 * time.Second)
@@ -329,7 +337,6 @@ func startWatchdog() {
 			if time.Now().UnixMilli()-last > 60000 {
 				log.Println("[WATCHDOG] Event loop stalled")
 			}
-			atomic.StoreInt64(&watchdogLast, time.Now().UnixMilli())
 		}
 	}()
 }
@@ -378,9 +385,9 @@ func main() {
 	<-quit
 
 	log.Println("[mojaloop-adapter] Shutting down...")
-	bp.FlushRemaining()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	server.Shutdown(ctx)
+	bp.FlushRemaining()
 	log.Println("[mojaloop-adapter] Stopped")
 }

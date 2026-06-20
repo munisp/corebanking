@@ -93,8 +93,11 @@ func (ba *BatchAggregator) Add(e Event) {
 
 	if !ok {
 		ba.mu.Lock()
-		batch = &TopicBatch{events: make([]Event, 0, ba.maxBatch)}
-		ba.batches[e.Topic] = batch
+		batch, ok = ba.batches[e.Topic]
+		if !ok {
+			batch = &TopicBatch{events: make([]Event, 0, ba.maxBatch)}
+			ba.batches[e.Topic] = batch
+		}
 		ba.mu.Unlock()
 	}
 
@@ -216,11 +219,14 @@ func handlePartitions(w http.ResponseWriter, r *http.Request) {
 
 func handleStats(ba *BatchAggregator) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ba.mu.RLock()
+		numTopics := len(ba.batches)
+		ba.mu.RUnlock()
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"produced": atomic.LoadInt64(&ba.produced),
 			"dropped":  atomic.LoadInt64(&ba.dropped),
-			"topics":   len(ba.batches),
+			"topics":   numTopics,
 		})
 	}
 }
@@ -267,9 +273,9 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	ba.FlushAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	server.Shutdown(ctx)
+	ba.FlushAll()
 	fmt.Println("[kafka-batch-producer] Stopped")
 }

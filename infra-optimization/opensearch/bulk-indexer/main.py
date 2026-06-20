@@ -150,7 +150,6 @@ def _watchdog_loop():
         time.sleep(10)
         if not watchdog_healthy():
             print("[WATCHDOG] Bulk indexer stalled", flush=True)
-        watchdog_ping()
 
 
 # --- HTTP Server (using stdlib for zero deps) ---
@@ -166,6 +165,7 @@ class Handler(BaseHTTPRequestHandler):
         pass  # Suppress access logs for throughput
 
     def do_GET(self):
+        watchdog_ping()
         if self.path == "/healthz":
             self._json_response(200, {"status": "ok", "service": "opensearch-bulk-indexer"})
         elif self.path == "/v1/opensearch/stats":
@@ -178,6 +178,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json_response(404, {"error": "not found"})
 
     def do_POST(self):
+        watchdog_ping()
         if self.path == "/v1/opensearch/index":
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length))
@@ -208,8 +209,23 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     watchdog_ping()
-    t = threading.Thread(target=_watchdog_loop, daemon=True)
-    t.start()
+    wd = threading.Thread(target=_watchdog_loop, daemon=True)
+    wd.start()
+
+    flush_stop = threading.Event()
+    def _periodic_flush():
+        while not flush_stop.is_set():
+            flush_stop.wait(timeout=0.1)
+            remaining = buffer.flush_all()
+            for idx, docs in remaining.items():
+                log_flush(idx, len(docs))
+                buffer.record_success(len(docs))
+
+    def log_flush(idx: str, count: int):
+        print(f"[bulk-indexer] Flushed {count} docs to {idx}", flush=True)
+
+    ft = threading.Thread(target=_periodic_flush, daemon=True)
+    ft.start()
 
     port = config.port
     server = HTTPServer(("0.0.0.0", port), Handler)
