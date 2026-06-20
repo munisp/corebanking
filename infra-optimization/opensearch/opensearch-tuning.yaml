@@ -1,0 +1,126 @@
+# 54Bank OpenSearch 2.x Tuning — Millions TPS Ingestion
+# Assumes 6-node cluster (3 data + 3 ingest), 64GB RAM each, NVMe SSD
+
+cluster:
+  name: "54bank-opensearch"
+  routing:
+    allocation:
+      disk.threshold_enabled: true
+      disk.watermark.low: "85%"
+      disk.watermark.high: "90%"
+      disk.watermark.flood_stage: "95%"
+      node_concurrent_recoveries: 4
+
+node:
+  name: "${HOSTNAME}"
+  data: true
+  ingest: true
+
+# --- JVM Heap (50% of RAM, max 31GB for compressed oops) ---
+# Set in jvm.options: -Xms31g -Xmx31g
+
+# --- Thread Pool ---
+thread_pool:
+  write:
+    size: 16           # Match CPU cores
+    queue_size: 10000  # Large queue for burst ingestion
+  search:
+    size: 25           # 1.5x CPU cores for search
+    queue_size: 5000
+  get:
+    size: 8
+    queue_size: 1000
+  bulk:
+    size: 16
+    queue_size: 10000
+
+# --- Index Defaults ---
+index:
+  number_of_shards: 6
+  number_of_replicas: 1
+  refresh_interval: "30s"           # Reduce refresh for write throughput
+  translog:
+    durability: "async"             # Async translog for speed
+    sync_interval: "5s"
+    flush_threshold_size: "1gb"
+  merge:
+    scheduler:
+      max_thread_count: 4           # Limit merge threads to not starve indexing
+    policy:
+      max_merged_segment: "5gb"
+  codec: "zstd_no_dict"            # ZSTD compression for storage efficiency
+
+# --- Bulk Indexing ---
+indices:
+  memory:
+    index_buffer_size: "20%"        # 20% of heap for indexing buffer
+  recovery:
+    max_bytes_per_sec: "500mb"
+  fielddata:
+    cache:
+      size: "20%"
+
+# --- Circuit Breakers ---
+indices.breaker:
+  total.limit: "70%"
+  request.limit: "40%"
+  fielddata.limit: "30%"
+
+# --- Network ---
+network:
+  host: "0.0.0.0"
+  tcp:
+    keep_alive: true
+    reuse_address: true
+  compression: "lz4"
+
+http:
+  max_content_length: "200mb"
+  max_header_size: "16kb"
+  max_initial_line_length: "8kb"
+  compression: true
+
+# --- ISM Policies (Index State Management) ---
+# Automated index lifecycle:
+# hot (7 days, SSD) -> warm (30 days, HDD) -> cold (90 days, S3) -> delete (365 days)
+
+# --- Index Templates ---
+index_templates:
+  - name: "54bank-transactions"
+    index_patterns: ["transactions-*"]
+    settings:
+      number_of_shards: 12        # High shard count for parallel search
+      number_of_replicas: 1
+      refresh_interval: "10s"
+      codec: "zstd_no_dict"
+    mappings:
+      properties:
+        timestamp: { type: "date" }
+        account_id: { type: "keyword" }
+        amount_kobo: { type: "long" }
+        currency: { type: "keyword" }
+        type: { type: "keyword" }
+        status: { type: "keyword" }
+        trace_id: { type: "keyword" }
+
+  - name: "54bank-audit"
+    index_patterns: ["audit-*"]
+    settings:
+      number_of_shards: 6
+      number_of_replicas: 2       # Extra replica for compliance
+      refresh_interval: "30s"
+    mappings:
+      properties:
+        timestamp: { type: "date" }
+        actor: { type: "keyword" }
+        action: { type: "keyword" }
+        resource: { type: "keyword" }
+        outcome: { type: "keyword" }
+        ip: { type: "ip" }
+
+  - name: "54bank-metrics"
+    index_patterns: ["metrics-*"]
+    settings:
+      number_of_shards: 24        # Highest volume
+      number_of_replicas: 0       # Metrics are ephemeral
+      refresh_interval: "60s"

@@ -1,0 +1,67 @@
+# 54Bank Mojaloop MySQL 8.0 Tuning — Millions TPS
+# Mojaloop requires MySQL (uses Knex.js with MySQL dialect internally).
+# Cannot switch to PostgreSQL without forking Mojaloop core.
+# This config tunes MySQL for high-throughput financial transaction processing.
+
+[mysqld]
+# --- InnoDB Engine (Core Performance) ---
+innodb_buffer_pool_size         = 32G           # 70-80% of available RAM
+innodb_buffer_pool_instances    = 16            # Reduce contention on buffer pool mutex
+innodb_log_file_size            = 4G            # Larger redo logs = fewer checkpoints
+innodb_log_buffer_size          = 256M          # Buffer writes before flushing to redo log
+innodb_flush_log_at_trx_commit  = 2             # 2 = flush every second (1 = every commit, slower)
+innodb_flush_method             = O_DIRECT      # Bypass OS cache — InnoDB has its own
+innodb_io_capacity              = 20000         # NVMe SSD IOPS baseline
+innodb_io_capacity_max          = 40000         # NVMe SSD IOPS burst
+innodb_read_io_threads          = 16            # Parallel read threads
+innodb_write_io_threads         = 16            # Parallel write threads
+innodb_adaptive_hash_index      = ON            # Speed up point lookups
+innodb_change_buffering         = all           # Buffer secondary index changes
+innodb_doublewrite              = OFF           # Disable for NVMe (has atomic writes)
+innodb_page_cleaners            = 16            # Match buffer pool instances
+
+# --- Connection Handling ---
+max_connections                 = 2048          # Mojaloop uses connection pools
+thread_cache_size               = 256           # Reuse threads instead of creating new ones
+back_log                        = 4096          # Connection queue during spikes
+wait_timeout                    = 300           # Close idle connections after 5 min
+interactive_timeout             = 300
+
+# --- Query Cache (MySQL 8 uses NO_QUERY_CACHE) ---
+# MySQL 8.0 removed query cache. Use ProxySQL for query caching instead.
+
+# --- Binary Log (Replication) ---
+log_bin                         = mysql-bin
+binlog_format                   = ROW           # Row-based for Mojaloop data integrity
+sync_binlog                     = 0             # Async binlog sync (fast, use SEMI_SYNC for safety)
+binlog_expire_logs_days         = 7
+gtid_mode                       = ON            # Global Transaction IDs for failover
+enforce_gtid_consistency        = ON
+
+# --- Replication (Read Replicas) ---
+replica_parallel_workers        = 16            # Parallel apply on replicas
+replica_parallel_type           = LOGICAL_CLOCK # Order by commit timestamp
+replica_preserve_commit_order   = ON
+
+# --- Table / Buffer Settings ---
+table_open_cache                = 8192          # Cache open table handles
+table_open_cache_instances      = 16
+sort_buffer_size                = 4M
+join_buffer_size                = 4M
+read_buffer_size                = 2M
+read_rnd_buffer_size            = 4M
+tmp_table_size                  = 256M
+max_heap_table_size             = 256M
+
+# --- Network ---
+max_allowed_packet              = 64M
+net_read_timeout                = 60
+net_write_timeout               = 120
+
+# --- Performance Schema (Monitoring) ---
+performance_schema              = ON
+performance_schema_max_table_instances = 500
+
+# --- Character Set ---
+character_set_server            = utf8mb4
+collation_server                = utf8mb4_0900_ai_ci

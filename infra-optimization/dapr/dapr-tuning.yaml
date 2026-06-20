@@ -1,0 +1,138 @@
+# 54Bank Dapr Sidecar Tuning — Millions TPS
+# Dapr 1.13+ production configuration
+
+apiVersion: dapr.io/v1alpha1
+kind: Configuration
+metadata:
+  name: 54bank-dapr-config
+spec:
+  # --- Tracing (reduce overhead for high TPS) ---
+  tracing:
+    samplingRate: "0.01"  # 1% sampling at millions TPS
+    otel:
+      endpointAddress: "otel-collector.observability:4317"
+      isSecure: false
+      protocol: grpc
+
+  # --- HTTP Pipeline ---
+  httpPipeline:
+    handlers:
+      - name: ratelimit
+        type: middleware.http.ratelimit
+      - name: oauth2
+        type: middleware.http.oauth2
+
+  # --- API Access Control ---
+  api:
+    allowed:
+      - name: state
+        version: v1.0
+        protocol: http
+      - name: pubsub
+        version: v1.0
+        protocol: http
+      - name: invoke
+        version: v1.0
+        protocol: http
+
+  # --- Metrics ---
+  metric:
+    enabled: true
+    http:
+      increasedCardinality: false  # Reduce metric cardinality for high TPS
+
+  # --- Access Control ---
+  accessControl:
+    defaultAction: deny
+    trustDomain: "54bank.local"
+
+---
+# --- State Store (Redis) ---
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: statestore
+spec:
+  type: state.redis
+  version: v1
+  metadata:
+    - name: redisHost
+      value: "redis-cluster:6379"
+    - name: redisPassword
+      secretKeyRef:
+        name: redis-secret
+        key: password
+    - name: enableTLS
+      value: "true"
+    - name: maxRetries
+      value: "3"
+    - name: maxRetryBackoff
+      value: "2s"
+    - name: actorStateStore
+      value: "true"
+    # Performance tuning
+    - name: dialTimeout
+      value: "5s"
+    - name: readTimeout
+      value: "3s"
+    - name: writeTimeout
+      value: "3s"
+    - name: poolSize
+      value: "200"
+    - name: minIdleConns
+      value: "50"
+    # Bulk operations
+    - name: queryIndexes
+      value: '[{"name":"orgIndex","indexes":[{"key":"org_id","order":"ASC"}]}]'
+
+---
+# --- Pub/Sub (Kafka) ---
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub-kafka
+spec:
+  type: pubsub.kafka
+  version: v1
+  metadata:
+    - name: brokers
+      value: "kafka-0:9092,kafka-1:9092,kafka-2:9092"
+    - name: consumerGroup
+      value: "54bank-dapr"
+    - name: authType
+      value: "none"
+    # Performance tuning
+    - name: maxMessageBytes
+      value: "10485760"
+    - name: consumeRetryInterval
+      value: "100ms"
+    - name: version
+      value: "3.7.0"
+    - name: initialOffset
+      value: "newest"
+    # Batch publishing
+    - name: producerRequiredAcks
+      value: "1"
+    - name: producerMaxMessageBytes
+      value: "10485760"
+    # Bulk subscribe
+    - name: maxBulkSubCount
+      value: "500"
+    - name: maxBulkSubAwaitDurationMs
+      value: "100"
+
+---
+# --- Bulk Pub/Sub Subscription ---
+apiVersion: dapr.io/v2alpha1
+kind: Subscription
+metadata:
+  name: bulk-payment-events
+spec:
+  topic: banking.payments
+  routes:
+    default: /v1/events/payments
+  pubsubname: pubsub-kafka
+  bulkSubscribe:
+    enabled: true
+    maxMessagesCount: 500
+    maxAwaitDurationMs: 100
