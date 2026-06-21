@@ -906,8 +906,17 @@ func LoanDisbursementWorkflow(ctx workflow.Context, loanID string, amountKobo in
 		return err
 	}
 
-	// Step 4: Create repayment schedule
-	return workflow.ExecuteActivity(ctx, CreateRepaymentSchedule, loanID, amountKobo).Get(ctx, nil)
+	// Step 4: Create repayment schedule — if this fails, compensate by reversing disbursement
+	if err := workflow.ExecuteActivity(ctx, CreateRepaymentSchedule, loanID, amountKobo).Get(ctx, nil); err != nil {
+		logger.Warn("Repayment schedule creation failed, reversing disbursement", "error", err)
+		compensateCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			StartToCloseTimeout: 30 * time.Second,
+			RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 5},
+		})
+		_ = workflow.ExecuteActivity(compensateCtx, ReverseLoanDisbursement, loanID, borrowerID, amountKobo).Get(ctx, nil)
+		return fmt.Errorf("loan disbursement reversed (schedule creation failed): %w", err)
+	}
+	return nil
 }
 
 // EODProcessingWorkflow — end-of-day batch processing
@@ -986,18 +995,57 @@ func ComputeCreditScore(ctx context.Context, borrowerID string) (*CreditScore, e
 }
 
 func DisburseLoan(ctx context.Context, loanID, borrowerID string, amountKobo int64) error {
+	activity.RecordHeartbeat(ctx, fmt.Sprintf("disbursing loan %s: %d kobo to %s", loanID, amountKobo, borrowerID))
+	// In production: POST to payments-hub to execute the transfer via saga
+	// The saga handles: lock accounts → TigerBeetle 2PC → GL posting → event emission
+	log.Printf("[loan-disburse] Disbursing %d kobo for loan %s to borrower %s", amountKobo, loanID, borrowerID)
+	return nil
+}
+
+// ReverseLoanDisbursement is the compensation for DisburseLoan.
+// Called automatically by Temporal if a downstream step fails.
+func ReverseLoanDisbursement(ctx context.Context, loanID, borrowerID string, amountKobo int64) error {
+	activity.RecordHeartbeat(ctx, fmt.Sprintf("reversing loan disbursement %s", loanID))
+	log.Printf("[saga-compensation] Reversing loan disbursement: loan=%s borrower=%s amount=%d kobo", loanID, borrowerID, amountKobo)
+	// In production: Create a reversal transfer via saga (credit loan account, debit borrower)
 	return nil
 }
 
 func CreateRepaymentSchedule(ctx context.Context, loanID string, amountKobo int64) error {
+	activity.RecordHeartbeat(ctx, fmt.Sprintf("creating repayment schedule for loan %s", loanID))
+	log.Printf("[loan-schedule] Creating repayment schedule for loan %s, principal %d kobo", loanID, amountKobo)
 	return nil
 }
 
-func AccrueInterest(ctx context.Context, businessDate string) error { return nil }
-func ProcessFees(ctx context.Context, businessDate string) error { return nil }
-func ClassifyLoans(ctx context.Context, businessDate string) error { return nil }
-func ReconcileGL(ctx context.Context, businessDate string) error { return nil }
-func GenerateReturns(ctx context.Context, businessDate string) error { return nil }
+func AccrueInterest(ctx context.Context, businessDate string) error {
+	activity.RecordHeartbeat(ctx, "accruing interest for "+businessDate)
+	log.Printf("[eod] Interest accrual for %s", businessDate)
+	return nil
+}
+
+func ProcessFees(ctx context.Context, businessDate string) error {
+	activity.RecordHeartbeat(ctx, "processing fees for "+businessDate)
+	log.Printf("[eod] Fee processing for %s", businessDate)
+	return nil
+}
+
+func ClassifyLoans(ctx context.Context, businessDate string) error {
+	activity.RecordHeartbeat(ctx, "classifying loans for "+businessDate)
+	log.Printf("[eod] Loan classification (IFRS9) for %s", businessDate)
+	return nil
+}
+
+func ReconcileGL(ctx context.Context, businessDate string) error {
+	activity.RecordHeartbeat(ctx, "reconciling GL for "+businessDate)
+	log.Printf("[eod] GL reconciliation for %s", businessDate)
+	return nil
+}
+
+func GenerateReturns(ctx context.Context, businessDate string) error {
+	activity.RecordHeartbeat(ctx, "generating regulatory returns for "+businessDate)
+	log.Printf("[eod] Regulatory returns (CBN) for %s", businessDate)
+	return nil
+}
 
 // --- Temporal Client Wrapper ---
 

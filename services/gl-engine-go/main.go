@@ -1833,12 +1833,16 @@ func appendAuditEntry(service, operation, actorID, entityID, entityType, oldStat
 	auditLogMu.Lock()
 	auditLog = append(auditLog, entry)
 	auditLogMu.Unlock()
-	// Persist to DB if available (append-only INSERT, never UPDATE/DELETE)
+	// Persist to DB synchronously — audit trail must not be lost on crash.
+	// Financial regulation (CBN) requires complete, tamper-proof audit trail.
 	if db != nil {
-		go func() {
-			db.Exec("INSERT INTO audit_trail (id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip_address, checksum) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
-				entry.ID, entry.Timestamp, entry.Service, entry.Operation, entry.ActorID, entry.EntityID, entry.EntityType, entry.OldState, entry.NewState, entry.IPAddress, entry.Checksum)
-		}()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := db.ExecContext(ctx, "INSERT INTO audit_trail (id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip_address, checksum) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+			entry.ID, entry.Timestamp, entry.Service, entry.Operation, entry.ActorID, entry.EntityID, entry.EntityType, entry.OldState, entry.NewState, entry.IPAddress, entry.Checksum)
+		if err != nil {
+			log.Printf("[AUDIT] CRITICAL: Failed to persist audit entry %s: %v (entry preserved in memory)", entry.ID, err)
+		}
 	}
 }
 

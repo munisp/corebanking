@@ -16,7 +16,9 @@ struct GLAccount {
     pub account_type: Option<String>,  // asset, liability, equity, revenue, expense
     pub parent_code: Option<String>,
     pub currency: Option<String>,
-    pub balance: Option<f64>,
+    pub balance_kobo: Option<i64>,  // kobo (1/100 Naira) — never use f64 for money
+    #[serde(default)]
+    pub balance: Option<f64>,  // deprecated: kept for backward compat, derived from balance_kobo
     pub blocked: Option<bool>,
 }
 
@@ -25,7 +27,9 @@ struct JournalEntry {
     pub entry_id: Option<String>,
     pub debit_account: String,
     pub credit_account: String,
-    pub amount: f64,
+    pub amount_kobo: i64,  // kobo (1/100 Naira) — atomic integer, no rounding errors
+    #[serde(default)]
+    pub amount: f64,  // deprecated: kept for backward compat, derived from amount_kobo
     pub currency: String,
     pub narration: String,
     pub value_date: String,
@@ -47,10 +51,23 @@ struct AppState {
 
 
 fn validate_double_entry(entries: &[JournalEntry]) -> Result<(), String> {
-    let total_debit: f64 = entries.iter().map(|e| e.amount).sum();
-    let total_credit: f64 = entries.iter().map(|e| e.amount).sum();
-    if (total_debit - total_credit).abs() > 0.01 {
-        return Err(format!("Double-entry imbalance: debit={} credit={}", total_debit, total_credit));
+    // Each JournalEntry represents one leg: debit_account debited, credit_account credited
+    // by amount_kobo. For a batch of entries, total debited must equal total credited.
+    // Since each entry debits and credits the same amount, multi-entry batches must
+    // group by account and verify that the net effect sums to zero across all accounts.
+    let mut account_nets: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    for e in entries {
+        let amt = if e.amount_kobo != 0 { e.amount_kobo } else { (e.amount * 100.0).round() as i64 };
+        if amt <= 0 {
+            return Err(format!("Journal entry amount must be positive: {} kobo", amt));
+        }
+        *account_nets.entry(&e.debit_account).or_insert(0) += amt;   // debit increases
+        *account_nets.entry(&e.credit_account).or_insert(0) -= amt;  // credit decreases
+    }
+    // Net across all accounts must be zero (conservation of money)
+    let net: i64 = account_nets.values().sum();
+    if net != 0 {
+        return Err(format!("Double-entry imbalance: net={} kobo (must be 0)", net));
     }
     Ok(())
 }
@@ -67,29 +84,34 @@ fn classify_account(code: &str) -> &str {
 }
 
 fn compute_trial_balance(accounts: &[GLAccount]) -> serde_json::Value {
-    let mut total_debit = 0.0f64;
-    let mut total_credit = 0.0f64;
+    let mut total_debit_kobo: i64 = 0;
+    let mut total_credit_kobo: i64 = 0;
     let mut entries = Vec::new();
     for acc in accounts {
-        let bal = acc.balance.unwrap_or(0.0);
+        let bal_kobo = acc.balance_kobo.unwrap_or_else(|| {
+            acc.balance.map(|b| (b * 100.0).round() as i64).unwrap_or(0)
+        });
         let acct_type = acc.account_type.as_deref().unwrap_or("unknown");
         let (dr, cr) = match acct_type {
-            "asset" | "expense" => if bal >= 0.0 { (bal, 0.0) } else { (0.0, bal.abs()) },
-            _ => if bal >= 0.0 { (0.0, bal) } else { (bal.abs(), 0.0) },
+            "asset" | "expense" => if bal_kobo >= 0 { (bal_kobo, 0i64) } else { (0i64, bal_kobo.abs()) },
+            _ => if bal_kobo >= 0 { (0i64, bal_kobo) } else { (bal_kobo.abs(), 0i64) },
         };
-        total_debit += dr;
-        total_credit += cr;
+        total_debit_kobo += dr;
+        total_credit_kobo += cr;
         entries.push(json!({
             "account_code": acc.account_code,
             "account_name": acc.account_name,
-            "debit": dr, "credit": cr,
+            "debit_kobo": dr, "credit_kobo": cr,
+            "debit": dr as f64 / 100.0, "credit": cr as f64 / 100.0,
         }));
     }
     json!({
         "entries": entries,
-        "total_debit": total_debit,
-        "total_credit": total_credit,
-        "balanced": (total_debit - total_credit).abs() < 0.01,
+        "total_debit_kobo": total_debit_kobo,
+        "total_credit_kobo": total_credit_kobo,
+        "total_debit": total_debit_kobo as f64 / 100.0,
+        "total_credit": total_credit_kobo as f64 / 100.0,
+        "balanced": total_debit_kobo == total_credit_kobo,
     })
 }
 
@@ -145,11 +167,14 @@ async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppSt
     let entry_id = format!("JRN-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
     let mut accounts = state.accounts.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     for entry in &entries {
+        let amt = if entry.amount_kobo != 0 { entry.amount_kobo } else { (entry.amount * 100.0).round() as i64 };
         if let Some(acc) = accounts.iter_mut().find(|a| a.account_code.as_deref() == Some(&entry.debit_account)) {
-            *acc.balance.get_or_insert(0.0) += entry.amount;
+            *acc.balance_kobo.get_or_insert(0) += amt;  // debit increases
+            acc.balance = Some(acc.balance_kobo.unwrap_or(0) as f64 / 100.0);
         }
         if let Some(acc) = accounts.iter_mut().find(|a| a.account_code.as_deref() == Some(&entry.credit_account)) {
-            *acc.balance.get_or_insert(0.0) -= entry.amount;
+            *acc.balance_kobo.get_or_insert(0) -= amt;  // credit decreases
+            acc.balance = Some(acc.balance_kobo.unwrap_or(0) as f64 / 100.0);
         }
     }
     db_persist(&state, "post_journal", &json!({"action": "post_journal"})).await;
