@@ -292,6 +292,7 @@ class App {
       case 'chat': return this.renderChat();
       case 'settings': return this.renderSettings();
       case 'login': return this.renderLogin();
+      case 'insider-threat': return this.renderInsiderThreatDashboard();
       default: return this.renderHome();
     }
   }
@@ -329,6 +330,11 @@ class App {
               <span class="action-icon">&#x1F578;</span>
               <span class="action-title">COA Graph</span>
               <span class="action-desc">Account relationship explorer</span>
+            </button>
+            <button class="action-card" data-action="navigate" data-target="insider-threat">
+              <span class="action-icon">&#x1F6E1;</span>
+              <span class="action-title">Insider Threat</span>
+              <span class="action-desc">PAM, UEBA, DLP, Canary Tokens</span>
             </button>
           </div>
         </div>
@@ -630,6 +636,221 @@ class App {
         </div>
       </div>
     `;
+  }
+
+  renderInsiderThreatDashboard() {
+    return `
+      <div class="page insider-threat-page">
+        <h1 class="page-title">Insider Threat Dashboard</h1>
+        <p class="page-subtitle">Security Operations Center — Real-time threat monitoring</p>
+
+        <div class="threat-summary">
+          <div class="widget-grid">
+            <div class="widget widget-danger" id="pam-widget">
+              <h3 id="pam-active-count">0</h3>
+              <p>Active PAM Sessions</p>
+              <small>Privileged Access</small>
+            </div>
+            <div class="widget widget-warning" id="ueba-widget">
+              <h3 id="ueba-alert-count">0</h3>
+              <p>UEBA Anomalies</p>
+              <small>Behavioral Analytics</small>
+            </div>
+            <div class="widget widget-danger" id="dlp-widget">
+              <h3 id="dlp-blocked-count">0</h3>
+              <p>DLP Blocks</p>
+              <small>Data Exfiltration</small>
+            </div>
+            <div class="widget widget-critical" id="canary-widget">
+              <h3 id="canary-trigger-count">0</h3>
+              <p>Canary Triggers</p>
+              <small>Honeypot Alerts</small>
+            </div>
+          </div>
+        </div>
+
+        <div class="threat-sections">
+          <!-- PAM Section -->
+          <div class="threat-section">
+            <h2>Privileged Access Management</h2>
+            <p>Just-in-time privilege elevation. No standing admin access.</p>
+            <div class="threat-actions">
+              <button class="btn btn-primary" onclick="app.pamRequestAccess()">Request Access</button>
+              <button class="btn btn-secondary" onclick="app.pamViewRequests()">View Requests</button>
+              <button class="btn btn-secondary" onclick="app.pamViewSessions()">Active Sessions</button>
+            </div>
+            <div id="pam-requests-list" class="threat-list"></div>
+          </div>
+
+          <!-- UEBA Section -->
+          <div class="threat-section">
+            <h2>User Behavior Analytics (UEBA)</h2>
+            <p>ML-powered behavioral profiling detects anomalous employee activity.</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.uebaViewProfiles()">Employee Profiles</button>
+              <button class="btn btn-secondary" onclick="app.uebaViewAlerts()">Anomaly Alerts</button>
+            </div>
+            <div id="ueba-alerts-list" class="threat-list"></div>
+          </div>
+
+          <!-- DLP Section -->
+          <div class="threat-section">
+            <h2>Data Loss Prevention</h2>
+            <p>Detects and blocks bulk data exfiltration and API scraping.</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.dlpViewEvents()">DLP Events</button>
+              <button class="btn btn-secondary" onclick="app.dlpViewRules()">DLP Rules</button>
+            </div>
+            <div id="dlp-events-list" class="threat-list"></div>
+          </div>
+
+          <!-- Canary Token Section -->
+          <div class="threat-section">
+            <h2>Canary Tokens (Honeypots)</h2>
+            <p>Decoy accounts and records that trigger alerts when accessed.</p>
+            <div class="threat-actions">
+              <button class="btn btn-primary" onclick="app.canaryCreate()">Deploy Canary</button>
+              <button class="btn btn-secondary" onclick="app.canaryViewTokens()">View Tokens</button>
+              <button class="btn btn-danger" onclick="app.canaryViewTriggers()">View Triggers</button>
+            </div>
+            <div id="canary-list" class="threat-list"></div>
+          </div>
+
+          <!-- Break Glass Section -->
+          <div class="threat-section">
+            <h2>Break-Glass Emergency Access</h2>
+            <p>Emergency access with automatic incident creation and mandatory review.</p>
+            <div class="threat-actions">
+              <button class="btn btn-danger" onclick="app.breakGlassActivate()">Activate Break-Glass</button>
+              <button class="btn btn-secondary" onclick="app.breakGlassViewEvents()">View Events</button>
+            </div>
+            <div id="break-glass-list" class="threat-list"></div>
+          </div>
+
+          <!-- Session Recording Section -->
+          <div class="threat-section">
+            <h2>Session Recording</h2>
+            <p>All privileged sessions are recorded with tamper-proof chain hashing.</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.sessionViewRecordings()">View Recordings</button>
+              <button class="btn btn-warning" onclick="app.sessionViewFlagged()">Flagged Sessions</button>
+            </div>
+            <div id="session-list" class="threat-list"></div>
+          </div>
+
+          <!-- Velocity Limits Section -->
+          <div class="threat-section">
+            <h2>Employee Velocity Limits</h2>
+            <p>Per-employee transaction velocity limits to detect structuring (smurfing).</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.velocityViewRules()">Velocity Rules</button>
+              <button class="btn btn-secondary" onclick="app.velocityViewBlocked()">Blocked Transactions</button>
+            </div>
+            <div id="velocity-list" class="threat-list"></div>
+          </div>
+
+          <!-- Self-Dealing Detection Section -->
+          <div class="threat-section">
+            <h2>Self-Dealing Detection</h2>
+            <p>Detects employees processing transactions to accounts they or family members control.</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.selfDealingViewAlerts()">View Alerts</button>
+              <button class="btn btn-secondary" onclick="app.selfDealingViewLinks()">Employee Links</button>
+            </div>
+            <div id="self-dealing-list" class="threat-list"></div>
+          </div>
+
+          <!-- GL Reconciliation Section -->
+          <div class="threat-section">
+            <h2>GL Reconciliation Alerts</h2>
+            <p>Real-time trial balance monitoring. Detects journal manipulation and phantom entries.</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.glReconViewAlerts()">GL Alerts</button>
+              <button class="btn btn-secondary" onclick="app.glReconViewJournals()">Suspicious Journals</button>
+            </div>
+            <div id="gl-recon-list" class="threat-list"></div>
+          </div>
+
+          <!-- Credential Rotation Section -->
+          <div class="threat-section">
+            <h2>Credential Rotation</h2>
+            <p>Automated credential lifecycle management. Detects stale service accounts and expired keys.</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.credViewStale()">Stale Credentials</button>
+              <button class="btn btn-secondary" onclick="app.credViewHistory()">Rotation History</button>
+            </div>
+            <div id="credential-list" class="threat-list"></div>
+          </div>
+
+          <!-- Code Signing Section -->
+          <div class="threat-section">
+            <h2>Code Signing & Verification</h2>
+            <p>Cryptographic signature verification prevents tampered deployments.</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.codeSignViewSigs()">Signatures</button>
+              <button class="btn btn-secondary" onclick="app.codeSignViewVerifications()">Verification Log</button>
+            </div>
+            <div id="code-signing-list" class="threat-list"></div>
+          </div>
+
+          <!-- Dormant Account Monitor Section -->
+          <div class="threat-section">
+            <h2>Dormant Account Monitor</h2>
+            <p>Monitors dormant accounts for suspicious reactivation by insiders.</p>
+            <div class="threat-actions">
+              <button class="btn btn-secondary" onclick="app.dormantViewAccounts()">Dormant Accounts</button>
+              <button class="btn btn-danger" onclick="app.dormantViewAlerts()">Reactivation Alerts</button>
+            </div>
+            <div id="dormant-list" class="threat-list"></div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  // Insider threat action stubs — call backend APIs
+  pamRequestAccess() { this.fetchAndDisplay('/api/v1/pam/requests?status=pending', 'pam-requests-list'); }
+  pamViewRequests() { this.fetchAndDisplay('/api/v1/pam/requests', 'pam-requests-list'); }
+  pamViewSessions() { this.fetchAndDisplay('/api/v1/pam/sessions', 'pam-requests-list'); }
+  uebaViewProfiles() { this.fetchAndDisplay('/api/v1/ueba/profiles', 'ueba-alerts-list'); }
+  uebaViewAlerts() { this.fetchAndDisplay('/api/v1/ueba/alerts', 'ueba-alerts-list'); }
+  dlpViewEvents() { this.fetchAndDisplay('/api/v1/dlp/events', 'dlp-events-list'); }
+  dlpViewRules() { this.fetchAndDisplay('/api/v1/dlp/rules', 'dlp-events-list'); }
+  canaryCreate() { alert('Deploy new canary token — use API: POST /api/v1/canary/create'); }
+  canaryViewTokens() { this.fetchAndDisplay('/api/v1/canary/tokens', 'canary-list'); }
+  canaryViewTriggers() { this.fetchAndDisplay('/api/v1/canary/triggers', 'canary-list'); }
+  breakGlassActivate() { if (confirm('EMERGENCY: Activate break-glass access?')) { alert('Break-glass activation requires POST /api/v1/break-glass/activate'); } }
+  breakGlassViewEvents() { this.fetchAndDisplay('/api/v1/break-glass/events', 'break-glass-list'); }
+  sessionViewRecordings() { this.fetchAndDisplay('/api/v1/sessions/list', 'session-list'); }
+  sessionViewFlagged() { this.fetchAndDisplay('/api/v1/sessions/list?status=flagged', 'session-list'); }
+  velocityViewRules() { this.fetchAndDisplay('/api/v1/velocity/rules', 'velocity-list'); }
+  velocityViewBlocked() { this.fetchAndDisplay('/api/v1/velocity/stats', 'velocity-list'); }
+  selfDealingViewAlerts() { this.fetchAndDisplay('/api/v1/self-dealing/alerts', 'self-dealing-list'); }
+  selfDealingViewLinks() { this.fetchAndDisplay('/api/v1/self-dealing/links', 'self-dealing-list'); }
+  glReconViewAlerts() { this.fetchAndDisplay('/api/v1/gl-recon/alerts', 'gl-recon-list'); }
+  glReconViewJournals() { this.fetchAndDisplay('/api/v1/gl-recon/journals', 'gl-recon-list'); }
+  credViewStale() { this.fetchAndDisplay('/api/v1/credentials/stale', 'credential-list'); }
+  credViewHistory() { this.fetchAndDisplay('/api/v1/credentials/history', 'credential-list'); }
+  codeSignViewSigs() { this.fetchAndDisplay('/api/v1/signing/signatures', 'code-signing-list'); }
+  codeSignViewVerifications() { this.fetchAndDisplay('/api/v1/signing/verifications', 'code-signing-list'); }
+  dormantViewAccounts() { this.fetchAndDisplay('/api/v1/dormant/accounts', 'dormant-list'); }
+  dormantViewAlerts() { this.fetchAndDisplay('/api/v1/dormant/alerts', 'dormant-list'); }
+
+  async fetchAndDisplay(endpoint, targetId) {
+    const el = document.getElementById(targetId);
+    if (!el) return;
+    el.innerHTML = '<p>Loading...</p>';
+    try {
+      const resp = await fetch(endpoint);
+      const data = await resp.json();
+      if (Array.isArray(data) && data.length === 0) {
+        el.innerHTML = '<p class="empty-state">No data found.</p>';
+      } else {
+        el.innerHTML = '<pre style="max-height:300px;overflow:auto;font-size:12px;background:#1a1a2e;color:#e0e0e0;padding:12px;border-radius:8px;">' + JSON.stringify(data, null, 2) + '</pre>';
+      }
+    } catch (err) {
+      el.innerHTML = '<p class="error-state">Service unavailable — ' + err.message + '</p>';
+    }
   }
 
   renderSettings() {
