@@ -2,21 +2,31 @@ package outbox
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
 
 type mockPublisher struct {
+	mu        sync.Mutex
 	published []string
 	failNext  bool
 }
 
 func (m *mockPublisher) Publish(topic, key string, payload []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.failNext {
 		return fmt.Errorf("publish failed")
 	}
 	m.published = append(m.published, topic+":"+key)
 	return nil
+}
+
+func (m *mockPublisher) count() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.published)
 }
 
 func TestAppendAndRelay(t *testing.T) {
@@ -118,7 +128,7 @@ func TestAutoRelay(t *testing.T) {
 	ob.Append("topic", "key", "payload", "IDEM-1")
 	time.Sleep(200 * time.Millisecond)
 
-	if len(pub.published) == 0 {
+	if pub.count() == 0 {
 		t.Error("auto-relay should have published the event")
 	}
 }
