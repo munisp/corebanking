@@ -174,36 +174,46 @@ func tracingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- Circuit Breaker ---
-type circuitBreakerState int
-const (
-	cbClosed circuitBreakerState = iota
-	cbOpen
-	cbHalfOpen
-)
-
+// --- Circuit Breaker (atomic CAS — no data races, no thundering herd) ---
+// States: 0=closed, 1=open, 2=half-open
 var (
-	cbState     circuitBreakerState
-	cbFailCount uint64
-	cbLastFail  int64
+	cbState     int32  // atomic: 0=closed, 1=open, 2=half-open
+	cbFailCount uint64 // atomic
+	cbLastFail  int64  // atomic: unix seconds
 	cbThreshold uint64 = 5
 	cbTimeout   int64  = 30 // seconds
 )
 
 func cbAllow() bool {
-	if cbState == cbClosed { return true }
-	if cbState == cbOpen && time.Now().Unix()-atomic.LoadInt64(&cbLastFail) > cbTimeout {
-		cbState = cbHalfOpen
-		return true
+	state := atomic.LoadInt32(&cbState)
+	if state == 0 { return true } // closed
+	if state == 1 { // open
+		last := atomic.LoadInt64(&cbLastFail)
+		if time.Now().Unix()-last > cbTimeout {
+			// Try to transition open→half-open (only one goroutine wins)
+			atomic.CompareAndSwapInt32(&cbState, 1, 2)
+			return true
+		}
+		return false
 	}
-	return cbState == cbHalfOpen
+	// half-open: only one probe request via CAS
+	if atomic.CompareAndSwapInt32(&cbState, 2, 1) {
+		return true // winner gets through; transitions back to open
+	}
+	return false // losers are rejected
 }
 
-func cbRecordSuccess() { atomic.StoreUint64(&cbFailCount, 0); cbState = cbClosed }
+func cbRecordSuccess() {
+	atomic.StoreUint64(&cbFailCount, 0)
+	atomic.StoreInt32(&cbState, 0) // closed
+}
+
 func cbRecordFailure() {
 	atomic.AddUint64(&cbFailCount, 1)
 	atomic.StoreInt64(&cbLastFail, time.Now().Unix())
-	if atomic.LoadUint64(&cbFailCount) >= cbThreshold { cbState = cbOpen }
+	if atomic.LoadUint64(&cbFailCount) >= cbThreshold {
+		atomic.StoreInt32(&cbState, 1) // open
+	}
 }
 
 // --- Observability (OpenTelemetry) ---
