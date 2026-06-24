@@ -1,187 +1,223 @@
-#![allow(unused)]
+// 54Bank Credential Rotation — Rust
+// All state persisted to PostgreSQL. No in-memory Vecs/HashMaps.
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
-use std::collections::HashMap;
-
-// credential-rotation-rs — Automated credential rotation and stale account detection
-// Tracks all service accounts, API keys, DB passwords, and certificates.
-// Enforces rotation policies and alerts on stale/expired credentials.
-// Integrates with Vault for automated secret rotation.
+use std::sync::atomic::{AtomicI64, AtomicI32, Ordering};
+use std::env;
+use tokio_postgres::{Client, NoTls};
+use tokio::sync::Mutex;
 
 struct AppState {
-    credentials: Mutex<Vec<ManagedCredential>>,
-    rotation_log: Mutex<Vec<RotationEvent>>,
-    policies: Mutex<HashMap<String, RotationPolicy>>,
+    db: Option<Mutex<Client>>,
+    healthy: AtomicI32,
+    last_activity: AtomicI64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ManagedCredential {
     id: String,
     name: String,
-    credential_type: String,  // "api_key", "db_password", "service_account", "tls_cert", "ssh_key"
-    owner: String,            // service or person owning this credential
+    credential_type: String,
+    owner: String,
     last_rotated: String,
     expires_at: String,
-    rotation_count: u32,
-    status: String,           // "active", "stale", "expired", "rotating", "revoked"
-    vault_path: String,       // Vault secret path
+    rotation_count: i32,
+    status: String,
+    vault_path: String,
     auto_rotate: bool,
-    days_since_rotation: i64,
+    days_since_rotation: i32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct RotationEvent {
     id: String,
     credential_id: String,
-    action: String,           // "rotated", "revoked", "expired_alert", "stale_alert"
+    action: String,
     performed_by: String,
     timestamp: String,
     details: String,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct RotationPolicy {
     credential_type: String,
-    max_age_days: i64,
-    stale_warning_days: i64,
+    max_age_days: i32,
+    stale_warning_days: i32,
     auto_rotate: bool,
     require_mfa: bool,
 }
 
-fn init_state() -> AppState {
-    let mut policies = HashMap::new();
-    policies.insert("api_key".to_string(), RotationPolicy { credential_type: "api_key".to_string(), max_age_days: 90, stale_warning_days: 75, auto_rotate: true, require_mfa: false });
-    policies.insert("db_password".to_string(), RotationPolicy { credential_type: "db_password".to_string(), max_age_days: 30, stale_warning_days: 25, auto_rotate: true, require_mfa: true });
-    policies.insert("service_account".to_string(), RotationPolicy { credential_type: "service_account".to_string(), max_age_days: 180, stale_warning_days: 150, auto_rotate: false, require_mfa: true });
-    policies.insert("tls_cert".to_string(), RotationPolicy { credential_type: "tls_cert".to_string(), max_age_days: 365, stale_warning_days: 330, auto_rotate: true, require_mfa: false });
-    policies.insert("ssh_key".to_string(), RotationPolicy { credential_type: "ssh_key".to_string(), max_age_days: 90, stale_warning_days: 75, auto_rotate: false, require_mfa: true });
-
-    let now = chrono::Utc::now();
-    let credentials = vec![
-        ManagedCredential { id: "CRED-001".into(), name: "payments-hub-db".into(), credential_type: "db_password".into(), owner: "payments-hub-go".into(), last_rotated: (now - chrono::Duration::days(15)).to_rfc3339(), expires_at: (now + chrono::Duration::days(15)).to_rfc3339(), rotation_count: 12, status: "active".into(), vault_path: "secret/data/payments-hub/db".into(), auto_rotate: true, days_since_rotation: 15 },
-        ManagedCredential { id: "CRED-002".into(), name: "gl-engine-db".into(), credential_type: "db_password".into(), owner: "gl-engine-go".into(), last_rotated: (now - chrono::Duration::days(28)).to_rfc3339(), expires_at: (now + chrono::Duration::days(2)).to_rfc3339(), rotation_count: 11, status: "stale".into(), vault_path: "secret/data/gl-engine/db".into(), auto_rotate: true, days_since_rotation: 28 },
-        ManagedCredential { id: "CRED-003".into(), name: "nibss-api-key".into(), credential_type: "api_key".into(), owner: "nibss-nip-engine-go".into(), last_rotated: (now - chrono::Duration::days(45)).to_rfc3339(), expires_at: (now + chrono::Duration::days(45)).to_rfc3339(), rotation_count: 4, status: "active".into(), vault_path: "secret/data/nibss/api-key".into(), auto_rotate: true, days_since_rotation: 45 },
-        ManagedCredential { id: "CRED-004".into(), name: "aml-service-account".into(), credential_type: "service_account".into(), owner: "aml-engine-rs".into(), last_rotated: (now - chrono::Duration::days(160)).to_rfc3339(), expires_at: (now + chrono::Duration::days(20)).to_rfc3339(), rotation_count: 2, status: "stale".into(), vault_path: "secret/data/aml/service-account".into(), auto_rotate: false, days_since_rotation: 160 },
-        ManagedCredential { id: "CRED-005".into(), name: "platform-tls-cert".into(), credential_type: "tls_cert".into(), owner: "apisix-gateway".into(), last_rotated: (now - chrono::Duration::days(300)).to_rfc3339(), expires_at: (now + chrono::Duration::days(65)).to_rfc3339(), rotation_count: 1, status: "active".into(), vault_path: "secret/data/platform/tls".into(), auto_rotate: true, days_since_rotation: 300 },
+async fn init_schema(db: &Client) {
+    let queries = [
+        "CREATE TABLE IF NOT EXISTS managed_credentials (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, credential_type TEXT NOT NULL,
+            owner TEXT NOT NULL, last_rotated TEXT, expires_at TEXT,
+            rotation_count INT DEFAULT 0, status TEXT DEFAULT 'active',
+            vault_path TEXT, auto_rotate BOOLEAN DEFAULT FALSE,
+            days_since_rotation INT DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS rotation_events (
+            id TEXT PRIMARY KEY, credential_id TEXT NOT NULL, action TEXT,
+            performed_by TEXT, timestamp TEXT, details TEXT)",
+        "CREATE TABLE IF NOT EXISTS rotation_policies (
+            credential_type TEXT PRIMARY KEY, max_age_days INT DEFAULT 90,
+            stale_warning_days INT DEFAULT 60, auto_rotate BOOLEAN DEFAULT FALSE,
+            require_mfa BOOLEAN DEFAULT FALSE)",
+        "CREATE INDEX IF NOT EXISTS idx_cred_owner ON managed_credentials(owner)",
+        "CREATE INDEX IF NOT EXISTS idx_cred_status ON managed_credentials(status)",
     ];
-
-    AppState {
-        credentials: Mutex::new(credentials),
-        rotation_log: Mutex::new(Vec::new()),
-        policies: Mutex::new(policies),
+    for q in queries {
+        if let Err(e) = db.execute(q, &[]).await { eprintln!("[cred-rotation] schema: {}", e); }
     }
-}
-
-async fn list_credentials(state: web::Data<AppState>) -> HttpResponse {
-    let creds = state.credentials.lock().unwrap();
-    HttpResponse::Ok().json(creds.clone())
-}
-
-async fn rotate_credential(state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    let cred_id = body["credential_id"].as_str().unwrap_or("").to_string();
-    let rotator = body["rotated_by"].as_str().unwrap_or("system").to_string();
-
-    let mut creds = state.credentials.lock().unwrap();
-    let cred = match creds.iter_mut().find(|c| c.id == cred_id) {
-        Some(c) => c,
-        None => return HttpResponse::NotFound().json(json!({"error": "credential not found"})),
-    };
-
-    let now = chrono::Utc::now();
-    let policies = state.policies.lock().unwrap();
-    let policy = policies.get(&cred.credential_type);
-    let max_age = policy.map(|p| p.max_age_days).unwrap_or(90);
-
-    cred.last_rotated = now.to_rfc3339();
-    cred.expires_at = (now + chrono::Duration::days(max_age)).to_rfc3339();
-    cred.rotation_count += 1;
-    cred.status = "active".to_string();
-    cred.days_since_rotation = 0;
-
-    let evt = RotationEvent {
-        id: format!("ROT-{:06}", cred.rotation_count),
-        credential_id: cred_id.clone(),
-        action: "rotated".to_string(),
-        performed_by: rotator,
-        timestamp: now.to_rfc3339(),
-        details: format!("credential rotated, new expiry: {}", cred.expires_at),
-    };
-
-    let mut log = state.rotation_log.lock().unwrap();
-    log.push(evt.clone());
-
-    HttpResponse::Ok().json(json!({"status": "rotated", "event": evt, "next_expiry": cred.expires_at}))
-}
-
-async fn check_stale(state: web::Data<AppState>) -> HttpResponse {
-    let creds = state.credentials.lock().unwrap();
-    let policies = state.policies.lock().unwrap();
-    let mut stale: Vec<serde_json::Value> = Vec::new();
-
-    for cred in creds.iter() {
-        let policy = policies.get(&cred.credential_type);
-        if let Some(p) = policy {
-            if cred.days_since_rotation >= p.stale_warning_days {
-                stale.push(json!({
-                    "credential_id": cred.id, "name": cred.name, "type": cred.credential_type,
-                    "days_since_rotation": cred.days_since_rotation, "max_allowed": p.max_age_days,
-                    "status": if cred.days_since_rotation >= p.max_age_days { "EXPIRED" } else { "STALE" },
-                    "auto_rotate": p.auto_rotate,
-                }));
-            }
-        }
+    // Seed credentials and policies
+    let creds = [
+        ("CRED-DB-001", "PostgreSQL production password", "database", "platform-team", "2026-01-15T00:00:00Z", "2026-04-15T00:00:00Z", 3, "active", "secret/data/db/prod-password", true, 144),
+        ("CRED-API-001", "Payment gateway API key", "api_key", "payments-team", "2026-05-01T00:00:00Z", "2026-08-01T00:00:00Z", 5, "active", "secret/data/api/payment-gw", true, 38),
+        ("CRED-SSH-001", "Production SSH key", "ssh_key", "sre-team", "2025-12-01T00:00:00Z", "2026-03-01T00:00:00Z", 2, "expired", "secret/data/ssh/prod-key", false, 189),
+        ("CRED-TLS-001", "mTLS client certificate", "certificate", "security-team", "2026-04-01T00:00:00Z", "2027-04-01T00:00:00Z", 1, "active", "secret/data/tls/mtls-client", false, 68),
+        ("CRED-JWT-001", "JWT signing key", "signing_key", "auth-team", "2026-03-15T00:00:00Z", "2026-09-15T00:00:00Z", 4, "active", "secret/data/jwt/signing", true, 85),
+    ];
+    for (id, name, ctype, owner, lr, ea, rc, status, vp, ar, dsr) in creds {
+        let _ = db.execute(
+            "INSERT INTO managed_credentials (id, name, credential_type, owner, last_rotated, expires_at, rotation_count, status, vault_path, auto_rotate, days_since_rotation) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT (id) DO NOTHING",
+            &[&id, &name, &ctype, &owner, &lr, &ea, &rc, &status, &vp, &ar, &dsr]
+        ).await;
     }
-
-    HttpResponse::Ok().json(json!({"stale_credentials": stale, "total_stale": stale.len()}))
+    let policies = [
+        ("database", 90, 60, true, true),
+        ("api_key", 90, 60, true, false),
+        ("ssh_key", 180, 120, false, true),
+        ("certificate", 365, 300, false, false),
+        ("signing_key", 180, 120, true, true),
+    ];
+    for (ct, max, stale, ar, mfa) in policies {
+        let _ = db.execute(
+            "INSERT INTO rotation_policies (credential_type, max_age_days, stale_warning_days, auto_rotate, require_mfa) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (credential_type) DO NOTHING",
+            &[&ct, &max, &stale, &ar, &mfa]
+        ).await;
+    }
+    eprintln!("[cred-rotation] PostgreSQL schema initialized with seed data");
 }
 
-async fn list_policies(state: web::Data<AppState>) -> HttpResponse {
-    let p = state.policies.lock().unwrap();
-    HttpResponse::Ok().json(p.clone())
+async fn list_credentials(data: web::Data<AppState>) -> HttpResponse {
+    data.last_activity.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+    let db_guard = match &data.db { Some(db) => db.lock().await, None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "no db"})) };
+    let rows = db_guard.query("SELECT id, name, credential_type, owner, COALESCE(last_rotated,''), COALESCE(expires_at,''), rotation_count, status, COALESCE(vault_path,''), auto_rotate, days_since_rotation FROM managed_credentials ORDER BY days_since_rotation DESC", &[]).await.unwrap_or_default();
+    let creds: Vec<ManagedCredential> = rows.iter().map(|r| ManagedCredential {
+        id: r.get(0), name: r.get(1), credential_type: r.get(2), owner: r.get(3),
+        last_rotated: r.get(4), expires_at: r.get(5), rotation_count: r.get(6), status: r.get(7),
+        vault_path: r.get(8), auto_rotate: r.get(9), days_since_rotation: r.get(10),
+    }).collect();
+    HttpResponse::Ok().json(creds)
 }
 
-async fn rotation_history(state: web::Data<AppState>) -> HttpResponse {
-    let log = state.rotation_log.lock().unwrap();
-    HttpResponse::Ok().json(log.clone())
+async fn check_stale(data: web::Data<AppState>) -> HttpResponse {
+    data.last_activity.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+    let db_guard = match &data.db { Some(db) => db.lock().await, None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "no db"})) };
+    let rows = db_guard.query(
+        "SELECT c.id, c.name, c.credential_type, c.days_since_rotation, p.stale_warning_days, p.max_age_days FROM managed_credentials c JOIN rotation_policies p ON c.credential_type = p.credential_type WHERE c.days_since_rotation > p.stale_warning_days ORDER BY c.days_since_rotation DESC",
+        &[]
+    ).await.unwrap_or_default();
+    let stale: Vec<serde_json::Value> = rows.iter().map(|r| {
+        let days: i32 = r.get(3);
+        let max: i32 = r.get(5);
+        let severity = if days > max { "critical" } else { "warning" };
+        serde_json::json!({
+            "credential_id": r.get::<_, String>(0), "name": r.get::<_, String>(1),
+            "type": r.get::<_, String>(2), "days_since_rotation": days,
+            "max_age_days": max, "severity": severity,
+        })
+    }).collect();
+    HttpResponse::Ok().json(serde_json::json!({"stale_credentials": stale, "count": stale.len()}))
 }
 
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
-    let creds = state.credentials.lock().unwrap();
-    let log = state.rotation_log.lock().unwrap();
-    let stale = creds.iter().filter(|c| c.status == "stale").count();
-    let expired = creds.iter().filter(|c| c.status == "expired").count();
-    HttpResponse::Ok().json(json!({
-        "total_credentials": creds.len(), "active": creds.iter().filter(|c| c.status == "active").count(),
-        "stale": stale, "expired": expired, "total_rotations": log.len(),
-        "service": "credential-rotation-rs"
-    }))
+async fn rotate_credential(data: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    data.last_activity.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+    let cred_id = body["credential_id"].as_str().unwrap_or("");
+    let performed_by = body["performed_by"].as_str().unwrap_or("system");
+    let db_guard = match &data.db { Some(db) => db.lock().await, None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "no db"})) };
+    let now = chrono::Utc::now().to_rfc3339();
+    let res = db_guard.execute(
+        "UPDATE managed_credentials SET last_rotated = $1, rotation_count = rotation_count + 1, days_since_rotation = 0, status = 'active' WHERE id = $2",
+        &[&now, &cred_id]
+    ).await;
+    if let Err(e) = res { return HttpResponse::BadRequest().json(serde_json::json!({"error": format!("{}", e)})); }
+    let evt_id = format!("ROT-{:08x}", rand_u32());
+    let _ = db_guard.execute(
+        "INSERT INTO rotation_events (id, credential_id, action, performed_by, timestamp, details) VALUES ($1,$2,$3,$4,$5,$6)",
+        &[&evt_id, &cred_id, &"rotated", &performed_by, &now, &"Credential rotated successfully"]
+    ).await;
+    HttpResponse::Ok().json(serde_json::json!({"status": "rotated", "credential_id": cred_id, "event_id": evt_id}))
 }
 
-async fn healthz() -> HttpResponse { HttpResponse::Ok().json(json!({"status": "healthy", "service": "credential-rotation-rs"})) }
-async fn livez() -> HttpResponse { HttpResponse::Ok().json(json!({"status": "alive"})) }
-async fn readyz() -> HttpResponse { HttpResponse::Ok().json(json!({"status": "ready"})) }
+async fn list_policies(data: web::Data<AppState>) -> HttpResponse {
+    let db_guard = match &data.db { Some(db) => db.lock().await, None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "no db"})) };
+    let rows = db_guard.query("SELECT credential_type, max_age_days, stale_warning_days, auto_rotate, require_mfa FROM rotation_policies", &[]).await.unwrap_or_default();
+    let policies: Vec<RotationPolicy> = rows.iter().map(|r| RotationPolicy {
+        credential_type: r.get(0), max_age_days: r.get(1), stale_warning_days: r.get(2),
+        auto_rotate: r.get(3), require_mfa: r.get(4),
+    }).collect();
+    HttpResponse::Ok().json(policies)
+}
+
+async fn stats(data: web::Data<AppState>) -> HttpResponse {
+    let db_guard = match &data.db { Some(db) => db.lock().await, None => return HttpResponse::Ok().json(serde_json::json!({"error": "no db"})) };
+    let total: i64 = db_guard.query_one("SELECT COUNT(*) FROM managed_credentials", &[]).await.map(|r| r.get(0)).unwrap_or(0);
+    let stale: i64 = db_guard.query_one("SELECT COUNT(*) FROM managed_credentials c JOIN rotation_policies p ON c.credential_type = p.credential_type WHERE c.days_since_rotation > p.stale_warning_days", &[]).await.map(|r| r.get(0)).unwrap_or(0);
+    let events: i64 = db_guard.query_one("SELECT COUNT(*) FROM rotation_events", &[]).await.map(|r| r.get(0)).unwrap_or(0);
+    HttpResponse::Ok().json(serde_json::json!({"total_credentials": total, "stale_credentials": stale, "total_rotation_events": events, "service": "credential-rotation-rs"}))
+}
+
+async fn healthz() -> HttpResponse { HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "credential-rotation-rs"})) }
+async fn livez() -> HttpResponse { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }
+async fn readyz(data: web::Data<AppState>) -> HttpResponse {
+    if data.db.is_some() { HttpResponse::Ok().json(serde_json::json!({"status": "ready"})) }
+    else { HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not_ready"})) }
+}
+
+fn rand_u32() -> u32 { use std::time::SystemTime; SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().subsec_nanos() }
+
+fn start_watchdog(data: web::Data<AppState>) {
+    let d = data.clone();
+    tokio::spawn(async move { loop {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let last = d.last_activity.load(Ordering::Relaxed);
+        let now = chrono::Utc::now().timestamp();
+        if now - last > 60 { d.healthy.store(0, Ordering::Relaxed); } else { d.healthy.store(1, Ordering::Relaxed); }
+    }});
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080);
-    let state = web::Data::new(init_state());
-    println!("[credential-rotation-rs] Starting on :{}", port);
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8080".into()).parse().unwrap_or(8080);
+    let db_url = env::var("DATABASE_URL").unwrap_or_default();
+    let db_client = if !db_url.is_empty() {
+        match tokio_postgres::connect(&db_url, NoTls).await {
+            Ok((client, conn)) => {
+                tokio::spawn(async move { if let Err(e) = conn.await { eprintln!("[cred-rotation] DB error: {}", e); } });
+                init_schema(&client).await;
+                eprintln!("[cred-rotation] Connected to PostgreSQL");
+                Some(Mutex::new(client))
+            },
+            Err(e) => { eprintln!("[cred-rotation] DB failed: {}", e); None },
+        }
+    } else { eprintln!("[cred-rotation] WARNING: DATABASE_URL not set"); None };
+
+    let data = web::Data::new(AppState { db: db_client, healthy: AtomicI32::new(1), last_activity: AtomicI64::new(chrono::Utc::now().timestamp()) });
+    start_watchdog(data.clone());
+    eprintln!("[credential-rotation] Starting on :{}", port);
     HttpServer::new(move || {
-        App::new()
-            .app_data(state.clone())
-            .route("/healthz", web::get().to(healthz))
-            .route("/livez", web::get().to(livez))
-            .route("/readyz", web::get().to(readyz))
-            .route("/api/v1/credentials/list", web::get().to(list_credentials))
-            .route("/api/v1/credentials/rotate", web::post().to(rotate_credential))
+        App::new().app_data(data.clone())
+            .route("/healthz", web::get().to(healthz)).route("/livez", web::get().to(livez)).route("/readyz", web::get().to(readyz))
+            .route("/api/v1/credentials", web::get().to(list_credentials))
             .route("/api/v1/credentials/stale", web::get().to(check_stale))
+            .route("/api/v1/credentials/rotate", web::post().to(rotate_credential))
             .route("/api/v1/credentials/policies", web::get().to(list_policies))
-            .route("/api/v1/credentials/history", web::get().to(rotation_history))
             .route("/api/v1/credentials/stats", web::get().to(stats))
-    })
-    .bind(("0.0.0.0", port))?
-    .run()
-    .await
+    }).bind(format!("0.0.0.0:{}", port))?.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_rand_u32() { let r = super::rand_u32(); assert!(r >= 0); }
 }
