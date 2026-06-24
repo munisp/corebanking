@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: settlement-clearing-go
+  labels:
+    app: settlement-clearing-go
+    tier: platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: settlement-clearing-go
+  template:
+    metadata:
+      labels:
+        app: settlement-clearing-go
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z postgres 5432; do sleep 2; done"]
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z kafka 9092; do sleep 2; done"]
+      containers:
+        - name: settlement-clearing-go
+          image: 54bank/settlement-clearing-go:latest
+          ports:
+            - containerPort: 9044
+          env:
+            - name: PORT
+              value: "9044"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9044
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9044
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: settlement-clearing-go
+spec:
+  selector:
+    app: settlement-clearing-go
+  ports:
+    - port: 9044
+      targetPort: 9044
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: settlement-clearing-go-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: settlement-clearing-go
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: settlement-clearing-go-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: settlement-clearing-go

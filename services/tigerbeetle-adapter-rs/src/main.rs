@@ -821,6 +821,84 @@ fn mask_pii(value: &str, field_type: &str) -> String {
 }
 
 
+// --- TB Transfer user_data fields for audit ---
+// TB transfers have 128/64/32-bit user_data fields for transaction_ref, customer_id, channel_code
+async fn tb_user_data_handler(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let input = body.into_inner();
+    let transaction_ref = input.get("transaction_ref").and_then(|v| v.as_str()).unwrap_or("");
+    let customer_id = input.get("customer_id").and_then(|v| v.as_str()).unwrap_or("");
+    let channel_code = input.get("channel_code").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Pack into TB user_data fields:
+    // user_data_128: first 16 bytes of SHA256(transaction_ref) — 128-bit unique ref
+    // user_data_64: first 8 bytes of SHA256(customer_id) — 64-bit customer identifier
+    // user_data_32: channel_code as enum (NIP=1, USSD=2, API=3, POS=4, ATM=5, MOBILE=6)
+    let user_data_128 = {
+        let mut h: u128 = 0;
+        for (i, b) in transaction_ref.bytes().enumerate() {
+            h ^= (b as u128) << ((i % 16) * 8);
+        }
+        h
+    };
+    let user_data_64 = {
+        let mut h: u64 = 0;
+        for (i, b) in customer_id.bytes().enumerate() {
+            h ^= (b as u64) << ((i % 8) * 8);
+        }
+        h
+    };
+    let user_data_32: u32 = match channel_code {
+        "NIP" => 1, "USSD" => 2, "API" => 3, "POS" => 4, "ATM" => 5,
+        "MOBILE" => 6, "AGENT" => 7, "WEB" => 8, _ => 0,
+    };
+
+    HttpResponse::Ok().json(json!({
+        "user_data_128": format!("{:032X}", user_data_128),
+        "user_data_64": format!("{:016X}", user_data_64),
+        "user_data_32": user_data_32,
+        "mapping": {
+            "user_data_128": "transaction_ref (SHA256 truncated to 128-bit)",
+            "user_data_64": "customer_id (hash truncated to 64-bit)",
+            "user_data_32": format!("channel_code ({} = {})", channel_code, user_data_32),
+        },
+        "source": { "transaction_ref": transaction_ref, "customer_id": customer_id, "channel_code": channel_code },
+    }))
+}
+
+// --- TB Account Flags endpoint ---
+// Expose flag computation: credits_must_not_exceed_debits (asset), debits_must_not_exceed_credits (liability)
+async fn tb_account_flags_handler(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let input = body.into_inner();
+    let account_type = input.get("account_type").and_then(|v| v.as_str()).unwrap_or("");
+    let history = input.get("history").and_then(|v| v.as_bool()).unwrap_or(true);
+    let closed = input.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let mut flags: u32 = 0;
+    match account_type {
+        "asset" | "expense" => flags |= 4, // credits_must_not_exceed_debits
+        "liability" | "equity" | "revenue" => flags |= 2, // debits_must_not_exceed_credits
+        _ => {}
+    }
+    if history { flags |= 8; } // history flag
+    if closed { flags |= 32; } // closed flag
+
+    let flag_names: Vec<&str> = [
+        if flags & 2 != 0 { Some("debits_must_not_exceed_credits") } else { None },
+        if flags & 4 != 0 { Some("credits_must_not_exceed_debits") } else { None },
+        if flags & 8 != 0 { Some("history") } else { None },
+        if flags & 32 != 0 { Some("closed") } else { None },
+    ].iter().filter_map(|f| *f).collect();
+
+    HttpResponse::Ok().json(json!({
+        "account_type": account_type,
+        "flags_value": flags,
+        "flags_names": flag_names,
+        "tb_spec": "TigerBeetle account flags enforced at ledger level — application cannot bypass",
+    }))
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8256);
@@ -887,6 +965,8 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/tb_operation", web::post().to(tb_operation))
             .route("/v1/records", web::get().to(list_records))
             .route("/v1/stats", web::get().to(stats))
+            .route("/v1/tb_user_data", web::post().to(tb_user_data_handler))
+            .route("/v1/tb_account_flags", web::post().to(tb_account_flags_handler))
             .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(livez))

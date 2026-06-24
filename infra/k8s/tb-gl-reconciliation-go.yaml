@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tb-gl-reconciliation-go
+  labels:
+    app: tb-gl-reconciliation-go
+    tier: platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tb-gl-reconciliation-go
+  template:
+    metadata:
+      labels:
+        app: tb-gl-reconciliation-go
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z postgres 5432; do sleep 2; done"]
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z kafka 9092; do sleep 2; done"]
+      containers:
+        - name: tb-gl-reconciliation-go
+          image: 54bank/tb-gl-reconciliation-go:latest
+          ports:
+            - containerPort: 9043
+          env:
+            - name: PORT
+              value: "9043"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9043
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9043
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tb-gl-reconciliation-go
+spec:
+  selector:
+    app: tb-gl-reconciliation-go
+  ports:
+    - port: 9043
+      targetPort: 9043
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: tb-gl-reconciliation-go-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: tb-gl-reconciliation-go
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: tb-gl-reconciliation-go-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: tb-gl-reconciliation-go
