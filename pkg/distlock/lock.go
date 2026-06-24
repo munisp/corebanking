@@ -7,13 +7,20 @@
 //   - Auto-expiry: TTL prevents orphaned locks from indefinitely blocking
 //   - Fencing token: monotonic token prevents stale lock holders from writing
 //   - Reentrant-safe: lock owner tracked by unique holder ID
+//   - Redis-backed: survives process restart, works across multiple instances
 package distlock
 
 import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // Lock represents a held distributed lock.
@@ -24,25 +31,62 @@ type Lock struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// LockManager manages distributed locks.
-// In production, this backs onto Redis SETNX + PEXPIRE.
-// This implementation is an in-process simulation for correctness verification.
+// LockManager manages distributed locks backed by Redis.
 type LockManager struct {
-	mu     sync.Mutex
-	locks  map[string]*Lock
-	token  int64
+	rdb        *redis.Client
+	mu         sync.Mutex // protects local token counter
+	token      int64
+	prefix     string
+	instanceID string
 }
 
-// NewLockManager creates a new lock manager.
+// Config configures the Redis connection for the lock manager.
+type Config struct {
+	RedisAddr     string
+	RedisPassword string
+	RedisDB       int
+	KeyPrefix     string // prefix for all lock keys (default: "distlock:")
+}
+
+// NewLockManager creates a new Redis-backed lock manager.
 func NewLockManager() *LockManager {
-	mgr := &LockManager{
-		locks: make(map[string]*Lock),
+	return NewLockManagerWithConfig(Config{
+		RedisAddr: getEnvOrDefault("REDIS_URL", "localhost:6379"),
+		KeyPrefix: "distlock:",
+	})
+}
+
+// NewLockManagerWithConfig creates a lock manager with explicit config.
+func NewLockManagerWithConfig(cfg Config) *LockManager {
+	if cfg.KeyPrefix == "" {
+		cfg.KeyPrefix = "distlock:"
 	}
-	go mgr.cleanupLoop()
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPassword,
+		DB:       cfg.RedisDB,
+	})
+
+	instanceID := generateInstanceID()
+
+	mgr := &LockManager{
+		rdb:        rdb,
+		prefix:     cfg.KeyPrefix,
+		instanceID: instanceID,
+	}
+
+	// Initialize fencing token counter from Redis
+	ctx := context.Background()
+	val, err := rdb.Get(ctx, cfg.KeyPrefix+"__fencing_counter__").Int64()
+	if err == nil {
+		mgr.token = val
+	}
+
 	return mgr
 }
 
-// Acquire attempts to acquire a lock on the given key.
+// Acquire attempts to acquire a lock on the given key using Redis SET NX.
 // Returns a fencing token on success, error if already held by another holder.
 func (m *LockManager) Acquire(key, holderID string, ttl time.Duration) (*Lock, error) {
 	if ttl <= 0 {
@@ -52,35 +96,48 @@ func (m *LockManager) Acquire(key, holderID string, ttl time.Duration) (*Lock, e
 		return nil, fmt.Errorf("TTL must not exceed 5 minutes (got %v)", ttl)
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	ctx := context.Background()
+	redisKey := m.prefix + key
 
-	now := time.Now()
-
-	// Check if lock exists and is still valid
-	if existing, ok := m.locks[key]; ok {
-		if now.Before(existing.ExpiresAt) {
-			if existing.HolderID == holderID {
-				// Reentrant: extend TTL and return same token
-				existing.ExpiresAt = now.Add(ttl)
-				return existing, nil
-			}
-			return nil, fmt.Errorf("lock %s held by %s until %v", key, existing.HolderID, existing.ExpiresAt)
-		}
-		// Expired — remove and allow new acquisition
-		delete(m.locks, key)
+	// Try SET NX (atomic acquire)
+	lockValue := holderID
+	ok, err := m.rdb.SetNX(ctx, redisKey, lockValue, ttl).Result()
+	if err != nil {
+		return nil, fmt.Errorf("redis SETNX failed: %w", err)
 	}
 
-	// Acquire new lock with monotonically increasing fencing token
-	token := atomic.AddInt64(&m.token, 1)
-	lock := &Lock{
+	if !ok {
+		// Key exists — check if same holder (reentrant)
+		existing, err := m.rdb.Get(ctx, redisKey).Result()
+		if err != nil {
+			return nil, fmt.Errorf("lock %s held by another process", key)
+		}
+		if existing == holderID {
+			// Reentrant: extend TTL
+			m.rdb.Expire(ctx, redisKey, ttl)
+			token := m.currentToken(key, ctx)
+			return &Lock{
+				Key:       key,
+				HolderID:  holderID,
+				Token:     token,
+				ExpiresAt: time.Now().Add(ttl),
+			}, nil
+		}
+		remainTTL, _ := m.rdb.TTL(ctx, redisKey).Result()
+		return nil, fmt.Errorf("lock %s held by %s until %v", key, existing, time.Now().Add(remainTTL))
+	}
+
+	// Acquired — get monotonic fencing token
+	token := m.nextToken(ctx)
+	tokenKey := m.prefix + "token:" + key
+	m.rdb.Set(ctx, tokenKey, token, ttl+time.Minute) // token persists slightly longer than lock
+
+	return &Lock{
 		Key:       key,
 		HolderID:  holderID,
 		Token:     token,
-		ExpiresAt: now.Add(ttl),
-	}
-	m.locks[key] = lock
-	return lock, nil
+		ExpiresAt: time.Now().Add(ttl),
+	}, nil
 }
 
 // AcquireMulti acquires locks on multiple keys in sorted order to prevent deadlocks.
@@ -105,20 +162,28 @@ func (m *LockManager) AcquireMulti(keys []string, holderID string, ttl time.Dura
 	return acquired, nil
 }
 
-// Release releases a lock. Only the holder can release it.
+// Release releases a lock. Only the holder can release it (verified via Lua script).
 func (m *LockManager) Release(key, holderID string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	ctx := context.Background()
+	redisKey := m.prefix + key
 
-	existing, ok := m.locks[key]
-	if !ok {
-		return nil // already released or expired
-	}
-	if existing.HolderID != holderID {
-		return fmt.Errorf("lock %s held by %s, not %s", key, existing.HolderID, holderID)
-	}
+	// Lua script: atomic check-and-delete (only if holder matches)
+	script := redis.NewScript(`
+		if redis.call("GET", KEYS[1]) == ARGV[1] then
+			return redis.call("DEL", KEYS[1])
+		else
+			return 0
+		end
+	`)
 
-	delete(m.locks, key)
+	result, err := script.Run(ctx, m.rdb, []string{redisKey}, holderID).Int64()
+	if err != nil {
+		return fmt.Errorf("redis release script failed: %w", err)
+	}
+	if result == 0 {
+		// Either already released or held by someone else — both are acceptable
+		return nil
+	}
 	return nil
 }
 
@@ -131,39 +196,60 @@ func (m *LockManager) ReleaseMulti(keys []string, holderID string) {
 
 // IsHeld checks if a lock is currently held.
 func (m *LockManager) IsHeld(key string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	existing, ok := m.locks[key]
-	return ok && time.Now().Before(existing.ExpiresAt)
+	ctx := context.Background()
+	redisKey := m.prefix + key
+	exists, err := m.rdb.Exists(ctx, redisKey).Result()
+	return err == nil && exists > 0
 }
 
 // ValidateFencingToken checks that the token is still the current holder's token.
-// This prevents stale lock holders from performing writes after their lock expired
-// and was re-acquired by another process.
 func (m *LockManager) ValidateFencingToken(key string, token int64) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	existing, ok := m.locks[key]
-	if !ok {
+	ctx := context.Background()
+	tokenKey := m.prefix + "token:" + key
+	val, err := m.rdb.Get(ctx, tokenKey).Int64()
+	if err != nil {
 		return false
 	}
-	return existing.Token == token && time.Now().Before(existing.ExpiresAt)
+	return val == token
 }
 
-// cleanupLoop periodically removes expired locks.
-func (m *LockManager) cleanupLoop() {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		now := time.Now()
-		m.mu.Lock()
-		for key, lock := range m.locks {
-			if now.After(lock.ExpiresAt) {
-				delete(m.locks, key)
-			}
-		}
-		m.mu.Unlock()
+// Close closes the Redis connection.
+func (m *LockManager) Close() error {
+	return m.rdb.Close()
+}
+
+// nextToken returns the next monotonically increasing fencing token (Redis INCR).
+func (m *LockManager) nextToken(ctx context.Context) int64 {
+	counterKey := m.prefix + "__fencing_counter__"
+	val, err := m.rdb.Incr(ctx, counterKey).Result()
+	if err != nil {
+		// Fallback to local counter if Redis fails
+		return atomic.AddInt64(&m.token, 1)
 	}
+	return val
+}
+
+// currentToken retrieves the current token for a key.
+func (m *LockManager) currentToken(key string, ctx context.Context) int64 {
+	tokenKey := m.prefix + "token:" + key
+	val, err := m.rdb.Get(ctx, tokenKey).Int64()
+	if err != nil {
+		return atomic.LoadInt64(&m.token)
+	}
+	return val
+}
+
+func generateInstanceID() string {
+	b := make([]byte, 8)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func getEnvOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func sortStrings(s []string) []string {

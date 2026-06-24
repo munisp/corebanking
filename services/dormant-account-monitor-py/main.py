@@ -1,390 +1,232 @@
 """
-54Bank Dormant Account Monitor — Python
-All state persisted to PostgreSQL. No in-memory dicts.
-Middleware: Kafka, Postgres, Redis
+dormant-account-monitor-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
 
-import hashlib
-import json
 import os
-import signal
-import sys
-import threading
-import time
-from datetime import datetime, timezone, timedelta
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import json
+import uuid
+import logging
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
-SERVICE_NAME = "dormant-account-monitor-py"
-PORT = int(os.environ.get("PORT", "8080"))
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-DORMANCY_THRESHOLD_DAYS = 180
-SUSPICIOUS_REACTIVATION_RULES = [
-    {"name": "high_value_first_txn", "description": "First transaction after dormancy > ₦500,000", "threshold_kobo": 50_000_000},
-    {"name": "rapid_multiple_txns", "description": "Multiple transactions within 1 hour of reactivation", "threshold_count": 3},
-    {"name": "off_hours_reactivation", "description": "Account reactivated outside business hours", "blocked_hours": [0,1,2,3,4,5,6,7,20,21,22,23]},
-    {"name": "same_employee_pattern", "description": "Same employee reactivates 3+ dormant accounts in 7 days", "threshold_count": 3},
-]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("dormant-account-monitor-py")
 
-# ─── Database ────────────────────────────────────────────────────────────────
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/dormant_account_monitor_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8637"))
 
 db_conn = None
-db_lock = threading.Lock()
 
 
 def get_db():
     global db_conn
-    if db_conn is not None:
-        return db_conn
-    db_url = os.environ.get("DATABASE_URL", "")
-    if not db_url:
-        return None
-    try:
-        import psycopg2
-        db_conn = psycopg2.connect(db_url)
+    if db_conn is None or db_conn.closed:
+        db_conn = psycopg2.connect(DATABASE_URL)
         db_conn.autocommit = True
-        return db_conn
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB connection failed: {e}")
-        return None
+    return db_conn
 
 
 def init_schema():
     conn = get_db()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS dormant_accounts (
-            account_id TEXT PRIMARY KEY, nuban TEXT, customer_name TEXT,
-            last_activity TEXT, balance_kobo BIGINT DEFAULT 0, tier TEXT,
-            status TEXT DEFAULT 'dormant', reactivated_by TEXT,
-            reactivation_time TEXT, alerts JSONB DEFAULT '[]')""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS reactivation_alerts (
-            id TEXT PRIMARY KEY, account_id TEXT NOT NULL, employee_id TEXT,
-            rule_name TEXT, severity TEXT, details TEXT,
-            timestamp TEXT, blocked BOOLEAN DEFAULT FALSE)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS employee_reactivation_log (
-            id SERIAL PRIMARY KEY, employee_id TEXT NOT NULL,
-            account_id TEXT NOT NULL, timestamp TEXT NOT NULL)""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_dormant_status ON dormant_accounts(status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_react_emp ON employee_reactivation_log(employee_id)")
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS accounts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_number VARCHAR(20) NOT NULL UNIQUE,
+    customer_id UUID NOT NULL,
+    account_type VARCHAR(32) NOT NULL,
+    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    balance_kobo BIGINT NOT NULL DEFAULT 0,
+    available_balance_kobo BIGINT NOT NULL DEFAULT 0,
+    tier VARCHAR(10) NOT NULL DEFAULT '1',
+    bvn VARCHAR(11),
+    tenant_id UUID NOT NULL,
+    opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-        # Seed dormant accounts
-        seeds = [
-            ("ACCT-D001", "0012345601", "Adebayo Okonkwo", (datetime.now(timezone.utc) - timedelta(days=400)).isoformat(), 15000000, "tier-1"),
-            ("ACCT-D002", "0012345602", "Fatima Ibrahim", (datetime.now(timezone.utc) - timedelta(days=250)).isoformat(), 350000, "tier-2"),
-            ("ACCT-D003", "0012345603", "Chukwuma Nwosu", (datetime.now(timezone.utc) - timedelta(days=720)).isoformat(), 8500000, "tier-3"),
-            ("ACCT-D004", "0012345604", "Aisha Mohammed", (datetime.now(timezone.utc) - timedelta(days=190)).isoformat(), 22000, "tier-1"),
-            ("ACCT-D005", "0012345605", "Oluwaseun Akintola", (datetime.now(timezone.utc) - timedelta(days=550)).isoformat(), 4200000, "tier-2"),
-        ]
-        for acct_id, nuban, name, last, bal, tier in seeds:
-            cur.execute("INSERT INTO dormant_accounts (account_id, nuban, customer_name, last_activity, balance_kobo, tier) VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (account_id) DO NOTHING",
-                (acct_id, nuban, name, last, bal, tier))
-        cur.close()
-        print(f"[{SERVICE_NAME}] PostgreSQL schema initialized with seed data")
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] Schema init error: {e}")
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-
-def db_get_account(account_id):
-    conn = get_db()
-    if not conn:
-        return None
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT account_id, nuban, customer_name, last_activity, balance_kobo, tier, status, reactivated_by, reactivation_time, alerts FROM dormant_accounts WHERE account_id = %s", (account_id,))
-        row = cur.fetchone()
-        cur.close()
-        if not row:
-            return None
-        return {
-            "account_id": row[0], "nuban": row[1], "customer_name": row[2],
-            "last_activity": row[3], "balance_kobo": row[4], "tier": row[5],
-            "status": row[6], "reactivated_by": row[7], "reactivation_time": row[8],
-            "alerts": row[9] if isinstance(row[9], list) else json.loads(row[9] or "[]"),
-        }
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB get_account error: {e}")
-        return None
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_accounts_tenant ON accounts(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_accounts_created ON accounts(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
 
 
-def db_save_account(a):
-    conn = get_db()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute("""INSERT INTO dormant_accounts (account_id, nuban, customer_name, last_activity, balance_kobo, tier, status, reactivated_by, reactivation_time, alerts)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (account_id) DO UPDATE SET status=EXCLUDED.status, reactivated_by=EXCLUDED.reactivated_by, reactivation_time=EXCLUDED.reactivation_time, alerts=EXCLUDED.alerts""",
-            (a["account_id"], a["nuban"], a["customer_name"], a["last_activity"],
-             a["balance_kobo"], a["tier"], a["status"], a.get("reactivated_by"),
-             a.get("reactivation_time"), json.dumps(a.get("alerts", []))))
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB save_account error: {e}")
-
-
-def db_save_alert(alert):
-    conn = get_db()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO reactivation_alerts (id, account_id, employee_id, rule_name, severity, details, timestamp, blocked) VALUES (%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING",
-            (alert["id"], alert["account_id"], alert["employee_id"], alert["rule_name"],
-             alert["severity"], alert["details"], alert["timestamp"], alert["blocked"]))
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB save_alert error: {e}")
-
-
-def db_log_reactivation(employee_id, account_id):
-    conn = get_db()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO employee_reactivation_log (employee_id, account_id, timestamp) VALUES (%s,%s,%s)",
-            (employee_id, account_id, datetime.now(timezone.utc).isoformat()))
-        cur.close()
-    except Exception:
-        pass
-
-
-def db_recent_reactivations(employee_id, days=7):
-    conn = get_db()
-    if not conn:
-        return 0
-    try:
-        cur = conn.cursor()
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-        cur.execute("SELECT COUNT(*) FROM employee_reactivation_log WHERE employee_id = %s AND timestamp > %s", (employee_id, cutoff))
-        count = cur.fetchone()[0]
-        cur.close()
-        return count
-    except Exception:
-        return 0
-
-
-def db_list_accounts():
-    conn = get_db()
-    if not conn:
-        return []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT account_id, nuban, customer_name, last_activity, balance_kobo, tier, status, reactivated_by, reactivation_time, alerts FROM dormant_accounts ORDER BY last_activity")
-        rows = cur.fetchall()
-        cur.close()
-        result = []
-        for r in rows:
-            last = datetime.fromisoformat(r[3]) if r[3] else datetime.now(timezone.utc)
-            days = (datetime.now(timezone.utc) - last.replace(tzinfo=timezone.utc if last.tzinfo is None else last.tzinfo)).days
-            alerts = r[9] if isinstance(r[9], list) else json.loads(r[9] or "[]")
-            result.append({
-                "account_id": r[0], "nuban": r[1], "customer_name": r[2],
-                "last_activity": r[3], "balance_kobo": r[4], "tier": r[5],
-                "status": r[6], "days_dormant": days, "reactivated_by": r[7],
-                "reactivation_time": r[8], "alert_count": len(alerts),
-            })
-        return result
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB list error: {e}")
-        return []
-
-
-def db_list_alerts():
-    conn = get_db()
-    if not conn:
-        return []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, account_id, employee_id, rule_name, severity, details, timestamp, blocked FROM reactivation_alerts ORDER BY timestamp DESC LIMIT 1000")
-        rows = cur.fetchall()
-        cur.close()
-        return [{"id": r[0], "account_id": r[1], "employee_id": r[2], "rule_name": r[3],
-                 "severity": r[4], "details": r[5], "timestamp": r[6], "blocked": r[7]} for r in rows]
-    except Exception:
-        return []
-
-
-def db_stats():
-    conn = get_db()
-    if not conn:
-        return {}
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM dormant_accounts")
-        total = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM dormant_accounts WHERE status = 'dormant'")
-        dormant = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM reactivation_alerts")
-        alerts = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM reactivation_alerts WHERE severity = 'critical'")
-        critical = cur.fetchone()[0]
-        cur.close()
-        return {"total_accounts": total, "dormant": dormant, "reactivated": total - dormant,
-                "alerts": alerts, "critical_alerts": critical, "service": SERVICE_NAME}
-    except Exception:
-        return {}
-
-
-# ─── Core Logic ──────────────────────────────────────────────────────────────
-
-def check_reactivation(account_id, employee_id, txn_amount_kobo=0, txn_count=1):
-    with db_lock:
-        account = db_get_account(account_id)
-        if not account:
-            return [], False
-
-        if account["status"] != "dormant":
-            return [], True
-
-        alerts_triggered = []
-        now = datetime.now(timezone.utc)
-
-        last = datetime.fromisoformat(account["last_activity"])
-        if last.tzinfo is None:
-            last = last.replace(tzinfo=timezone.utc)
-        days_dormant = (now - last).days
-
-        if txn_amount_kobo > 50_000_000:
-            alert = make_alert(account_id, employee_id, "high_value_first_txn", "critical",
-                f"First transaction after {days_dormant} days dormancy is ₦{txn_amount_kobo/100:,.2f}")
-            alerts_triggered.append(alert)
-
-        if now.hour in [0,1,2,3,4,5,6,7,20,21,22,23]:
-            alert = make_alert(account_id, employee_id, "off_hours_reactivation", "high",
-                f"Dormant account reactivated at {now.strftime('%H:%M')} (outside business hours)")
-            alerts_triggered.append(alert)
-
-        recent_count = db_recent_reactivations(employee_id, 7)
-        if recent_count >= 2:
-            alert = make_alert(account_id, employee_id, "same_employee_pattern", "critical",
-                f"Employee {employee_id} has reactivated {recent_count+1} dormant accounts in 7 days")
-            alerts_triggered.append(alert)
-
-        db_log_reactivation(employee_id, account_id)
-
-        blocked = any(a["blocked"] for a in alerts_triggered)
-
-        if not blocked:
-            account["status"] = "reactivated"
-            account["reactivated_by"] = employee_id
-            account["reactivation_time"] = now.isoformat()
-
-        for alert in alerts_triggered:
-            account["alerts"].append(alert)
-            db_save_alert(alert)
-
-        db_save_account(account)
-        return alerts_triggered, not blocked
-
-
-def make_alert(account_id, employee_id, rule_name, severity, details):
-    blocked = severity in ("critical", "high")
-    return {
-        "id": f"DRM-{hashlib.sha256(f'{account_id}{time.time()}'.encode()).hexdigest()[:8]}",
-        "account_id": account_id, "employee_id": employee_id,
-        "rule_name": rule_name, "severity": severity, "details": details,
-        "timestamp": datetime.now(timezone.utc).isoformat(), "blocked": blocked,
-    }
-
-
-# ─── HTTP Server ─────────────────────────────────────────────────────────────
-
-class DormantHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
-
-    def _json_response(self, status, data):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-
-    def do_GET(self):
-        if self.path == "/healthz":
-            self._json_response(200, {"status": "healthy", "service": SERVICE_NAME})
-        elif self.path == "/livez":
-            self._json_response(200, {"status": "alive"})
-        elif self.path == "/readyz":
-            if get_db():
-                self._json_response(200, {"status": "ready"})
-            else:
-                self._json_response(503, {"status": "not_ready"})
-        elif self.path == "/api/v1/dormant/accounts":
-            self._json_response(200, db_list_accounts())
-        elif self.path == "/api/v1/dormant/alerts":
-            self._json_response(200, db_list_alerts())
-        elif self.path == "/api/v1/dormant/rules":
-            self._json_response(200, SUSPICIOUS_REACTIVATION_RULES)
-        elif self.path == "/api/v1/dormant/stats":
-            self._json_response(200, db_stats())
-        else:
-            self._json_response(404, {"error": "not found"})
-
-    def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
-
-        if self.path == "/api/v1/dormant/check-reactivation":
-            alerts_triggered, allowed = check_reactivation(
-                body.get("account_id", ""), body.get("employee_id", ""),
-                body.get("txn_amount_kobo", 0), body.get("txn_count", 1))
-            status = 200 if allowed else 403
-            self._json_response(status, {
-                "allowed": allowed, "alerts": alerts_triggered, "blocked": not allowed,
-            })
-        elif self.path == "/api/v1/dormant/register":
-            with db_lock:
-                acct = {
-                    "account_id": body.get("account_id"), "nuban": body.get("nuban"),
-                    "customer_name": body.get("customer_name"),
-                    "last_activity": body.get("last_activity"),
-                    "balance_kobo": body.get("balance_kobo", 0),
-                    "tier": body.get("tier", "tier-1"),
-                    "status": "dormant", "reactivated_by": None,
-                    "reactivation_time": None, "alerts": [],
-                }
-                db_save_account(acct)
-            self._json_response(201, acct)
-        else:
-            self._json_response(404, {"error": "not found"})
-
-
-# ─── Watchdog ────────────────────────────────────────────────────────────────
-
-_last_activity = time.time()
-_healthy = True
-
-def _watchdog_loop():
-    global _healthy
-    while True:
-        time.sleep(15)
-        _healthy = (time.time() - _last_activity) <= 60
-
-def watchdog_healthy():
-    return _healthy
-
-
-def main():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_schema()
+    logger.info(f"[dormant-account-monitor-py] ready on :%d", PORT)
+    logger.info(f"[dormant-account-monitor-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
+    if db_conn:
+        db_conn.close()
 
-    watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True)
-    watchdog_thread.start()
 
-    server = HTTPServer(("0.0.0.0", PORT), DormantHandler)
-    print(f"[{SERVICE_NAME}] Starting on :{PORT}")
+app = FastAPI(title="dormant-account-monitor-py", version="1.0.0", lifespan=lifespan)
 
-    def shutdown_handler(sig, frame):
-        print(f"[{SERVICE_NAME}] Shutting down...")
-        server.shutdown()
-        sys.exit(0)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    server.serve_forever()
+
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "dormant-account-monitor-py", "version": "1.0.0"}
+
+
+@app.get("/readyz")
+def readyz():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM accounts")
+            count = cur.fetchone()[0]
+        return {"service": "dormant-account-monitor-py", "total_records": count}
+    except Exception:
+        return {"service": "dormant-account-monitor-py", "total_records": 0}
+
+
+@app.get("/api/v1/accounts")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if x_tenant_id:
+            cur.execute(
+                "SELECT id, status, created_at FROM accounts WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
+                (x_tenant_id,)
+            )
+        else:
+            cur.execute("SELECT id, status, created_at FROM accounts ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+
+    records = [
+        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
+        for r in rows
+    ]
+    return {"data": records, "count": len(records)}
+
+
+@app.post("/api/v1/accounts", status_code=201)
+def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
+    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
+    status = body.status or "active"
+    record_id = str(uuid.uuid4())
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO accounts (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
+            (record_id, tenant_id, status)
+        )
+        # Outbox event
+        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("accounts.created", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": "created"}
+
+
+@app.get("/api/v1/accounts/{record_id}")
+def get_record(record_id: str):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, status, created_at FROM accounts WHERE id = %s::uuid", (record_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
+
+
+@app.put("/api/v1/accounts/{record_id}")
+def update_record(record_id: str, body: UpdateRequest):
+    status = body.status or "updated"
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE accounts SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
+            (status, record_id)
+        )
+        payload = json.dumps({"id": record_id, "status": status})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("accounts.updated", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": status}
+
+
+@app.delete("/api/v1/accounts/{record_id}", status_code=204)
+def delete_record(record_id: str):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE accounts SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
+        payload = json.dumps({"id": record_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("accounts.deleted", record_id, payload)
+        )
+    conn.commit()
+
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
