@@ -52,18 +52,17 @@ var startTime = time.Now()
 
 // ─── Domain Types ───────────────────────────────────────────────────────────
 
-// AccessRequest represents a request for elevated privileges
 type AccessRequest struct {
 	ID            string    `json:"id"`
 	RequestorID   string    `json:"requestor_id"`
 	RequestorName string    `json:"requestor_name"`
-	Resource      string    `json:"resource"`       // e.g. "database:core_banking", "service:gl-engine", "admin:user-management"
-	AccessLevel   string    `json:"access_level"`   // "read", "write", "admin", "superadmin"
+	Resource      string    `json:"resource"`
+	AccessLevel   string    `json:"access_level"`
 	Justification string    `json:"justification"`
-	Duration      int       `json:"duration_minutes"` // max 480 (8 hours)
-	Status        string    `json:"status"`           // "pending", "approved", "denied", "active", "expired", "revoked"
+	Duration      int       `json:"duration_minutes"`
+	Status        string    `json:"status"`
 	ApprovedBy    string    `json:"approved_by,omitempty"`
-	ApprovalChain []string  `json:"approval_chain"` // for superadmin: requires 2+ approvers
+	ApprovalChain []string  `json:"approval_chain"`
 	SessionToken  string    `json:"session_token,omitempty"`
 	IPAddress     string    `json:"ip_address"`
 	DeviceID      string    `json:"device_id"`
@@ -73,7 +72,6 @@ type AccessRequest struct {
 	AuditTrail    []string  `json:"audit_trail"`
 }
 
-// ActiveSession represents a currently elevated session
 type ActiveSession struct {
 	RequestID    string    `json:"request_id"`
 	SessionToken string    `json:"session_token"`
@@ -91,22 +89,19 @@ type Action struct {
 	Result    string    `json:"result"`
 }
 
-// Policy defines access control rules
 type AccessPolicy struct {
 	Resource         string   `json:"resource"`
 	MaxDuration      int      `json:"max_duration_minutes"`
 	RequiredApprovers int     `json:"required_approvers"`
 	AllowedRoles     []string `json:"allowed_roles"`
 	RequiresMFA      bool     `json:"requires_mfa"`
-	RequiresTicket   bool     `json:"requires_ticket"` // must reference incident/change ticket
-	BlockedHours     []int    `json:"blocked_hours"`   // hours when access is denied (e.g. [0,1,2,3,4,5])
+	RequiresTicket   bool     `json:"requires_ticket"`
+	BlockedHours     []int    `json:"blocked_hours"`
 }
 
 var (
-	mu             sync.RWMutex
-	requests       = make(map[string]*AccessRequest)
-	activeSessions = make(map[string]*ActiveSession)
-	policies       = map[string]*AccessPolicy{
+	mu       sync.RWMutex
+	policies = map[string]*AccessPolicy{
 		"database:core_banking": {Resource: "database:core_banking", MaxDuration: 60, RequiredApprovers: 2, AllowedRoles: []string{"dba", "sre"}, RequiresMFA: true, RequiresTicket: true, BlockedHours: []int{0, 1, 2, 3, 4, 5}},
 		"database:audit_trail":  {Resource: "database:audit_trail", MaxDuration: 30, RequiredApprovers: 2, AllowedRoles: []string{"compliance_officer"}, RequiresMFA: true, RequiresTicket: true},
 		"service:gl-engine":     {Resource: "service:gl-engine", MaxDuration: 120, RequiredApprovers: 1, AllowedRoles: []string{"sre", "backend_eng"}, RequiresMFA: true},
@@ -115,10 +110,249 @@ var (
 		"vault:secrets":         {Resource: "vault:secrets", MaxDuration: 30, RequiredApprovers: 2, AllowedRoles: []string{"security_admin"}, RequiresMFA: true, RequiresTicket: true},
 		"k8s:production":        {Resource: "k8s:production", MaxDuration: 120, RequiredApprovers: 2, AllowedRoles: []string{"sre", "platform_eng"}, RequiresMFA: true, RequiresTicket: true},
 	}
-	auditLog  []map[string]interface{}
 	db        *sql.DB
 	requestID uint64
 )
+
+// ─── Database Schema ────────────────────────────────────────────────────────
+
+func initSchema() {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS pam_requests (
+			id TEXT PRIMARY KEY,
+			requestor_id TEXT NOT NULL,
+			requestor_name TEXT,
+			resource TEXT NOT NULL,
+			access_level TEXT NOT NULL,
+			justification TEXT,
+			duration_minutes INT,
+			status TEXT NOT NULL DEFAULT 'pending',
+			approved_by TEXT,
+			approval_chain JSONB DEFAULT '[]',
+			session_token TEXT,
+			ip_address TEXT,
+			device_id TEXT,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			expires_at TIMESTAMPTZ,
+			revoked_at TIMESTAMPTZ,
+			audit_trail JSONB DEFAULT '[]'
+		)`,
+		`CREATE TABLE IF NOT EXISTS pam_active_sessions (
+			session_token TEXT PRIMARY KEY,
+			request_id TEXT NOT NULL REFERENCES pam_requests(id),
+			resource TEXT NOT NULL,
+			access_level TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			expires_at TIMESTAMPTZ NOT NULL,
+			actions_log JSONB DEFAULT '[]'
+		)`,
+		`CREATE TABLE IF NOT EXISTS pam_audit_trail (
+			id TEXT PRIMARY KEY,
+			action TEXT NOT NULL,
+			actor TEXT NOT NULL,
+			entity_id TEXT,
+			timestamp TEXT NOT NULL,
+			details JSONB,
+			service TEXT DEFAULT 'privileged-access-go'
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pam_requests_status ON pam_requests(status)`,
+		`CREATE INDEX IF NOT EXISTS idx_pam_sessions_expires ON pam_active_sessions(expires_at)`,
+	}
+	for _, q := range queries {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			log.Printf("[PAM] Schema init warning: %v", err)
+		}
+	}
+	log.Println("[PAM] PostgreSQL schema initialized")
+}
+
+// ─── Postgres Helpers ───────────────────────────────────────────────────────
+
+func dbSaveRequest(req *AccessRequest) {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	chainJSON, _ := json.Marshal(req.ApprovalChain)
+	trailJSON, _ := json.Marshal(req.AuditTrail)
+	db.ExecContext(ctx, `INSERT INTO pam_requests (id, requestor_id, requestor_name, resource, access_level, justification, duration_minutes, status, approved_by, approval_chain, session_token, ip_address, device_id, created_at, expires_at, revoked_at, audit_trail)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+		ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, approved_by=EXCLUDED.approved_by, approval_chain=EXCLUDED.approval_chain, session_token=EXCLUDED.session_token, expires_at=EXCLUDED.expires_at, revoked_at=EXCLUDED.revoked_at, audit_trail=EXCLUDED.audit_trail`,
+		req.ID, req.RequestorID, req.RequestorName, req.Resource, req.AccessLevel, req.Justification, req.Duration,
+		req.Status, req.ApprovedBy, string(chainJSON), req.SessionToken, req.IPAddress, req.DeviceID,
+		req.CreatedAt, nullTime(req.ExpiresAt), nullTime(req.RevokedAt), string(trailJSON))
+}
+
+func dbSaveSession(s *ActiveSession) {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	actionsJSON, _ := json.Marshal(s.ActionsLog)
+	db.ExecContext(ctx, `INSERT INTO pam_active_sessions (session_token, request_id, resource, access_level, user_id, expires_at, actions_log)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT (session_token) DO UPDATE SET actions_log=EXCLUDED.actions_log`,
+		s.SessionToken, s.RequestID, s.Resource, s.AccessLevel, s.UserID, s.ExpiresAt, string(actionsJSON))
+}
+
+func dbDeleteSession(token string) {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	db.ExecContext(ctx, `DELETE FROM pam_active_sessions WHERE session_token=$1`, token)
+}
+
+func dbLoadRequest(id string) *AccessRequest {
+	if db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	row := db.QueryRowContext(ctx, `SELECT id, requestor_id, requestor_name, resource, access_level, justification, duration_minutes, status, COALESCE(approved_by,''), approval_chain, COALESCE(session_token,''), ip_address, device_id, created_at, expires_at, revoked_at, audit_trail FROM pam_requests WHERE id=$1`, id)
+	var req AccessRequest
+	var chainJSON, trailJSON string
+	var expiresAt, revokedAt sql.NullTime
+	err := row.Scan(&req.ID, &req.RequestorID, &req.RequestorName, &req.Resource, &req.AccessLevel, &req.Justification, &req.Duration, &req.Status, &req.ApprovedBy, &chainJSON, &req.SessionToken, &req.IPAddress, &req.DeviceID, &req.CreatedAt, &expiresAt, &revokedAt, &trailJSON)
+	if err != nil {
+		return nil
+	}
+	json.Unmarshal([]byte(chainJSON), &req.ApprovalChain)
+	json.Unmarshal([]byte(trailJSON), &req.AuditTrail)
+	if expiresAt.Valid {
+		req.ExpiresAt = expiresAt.Time
+	}
+	if revokedAt.Valid {
+		req.RevokedAt = revokedAt.Time
+	}
+	return &req
+}
+
+func dbLoadSession(token string) *ActiveSession {
+	if db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	row := db.QueryRowContext(ctx, `SELECT session_token, request_id, resource, access_level, user_id, expires_at, actions_log FROM pam_active_sessions WHERE session_token=$1`, token)
+	var s ActiveSession
+	var actionsJSON string
+	err := row.Scan(&s.SessionToken, &s.RequestID, &s.Resource, &s.AccessLevel, &s.UserID, &s.ExpiresAt, &actionsJSON)
+	if err != nil {
+		return nil
+	}
+	json.Unmarshal([]byte(actionsJSON), &s.ActionsLog)
+	return &s
+}
+
+func dbListRequests(status string) []*AccessRequest {
+	if db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var rows *sql.Rows
+	var err error
+	if status == "" {
+		rows, err = db.QueryContext(ctx, `SELECT id, requestor_id, requestor_name, resource, access_level, justification, duration_minutes, status, COALESCE(approved_by,''), approval_chain, COALESCE(session_token,''), ip_address, device_id, created_at, expires_at, revoked_at, audit_trail FROM pam_requests ORDER BY created_at DESC LIMIT 1000`)
+	} else {
+		rows, err = db.QueryContext(ctx, `SELECT id, requestor_id, requestor_name, resource, access_level, justification, duration_minutes, status, COALESCE(approved_by,''), approval_chain, COALESCE(session_token,''), ip_address, device_id, created_at, expires_at, revoked_at, audit_trail FROM pam_requests WHERE status=$1 ORDER BY created_at DESC LIMIT 1000`, status)
+	}
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var result []*AccessRequest
+	for rows.Next() {
+		var req AccessRequest
+		var chainJSON, trailJSON string
+		var expiresAt, revokedAt sql.NullTime
+		if err := rows.Scan(&req.ID, &req.RequestorID, &req.RequestorName, &req.Resource, &req.AccessLevel, &req.Justification, &req.Duration, &req.Status, &req.ApprovedBy, &chainJSON, &req.SessionToken, &req.IPAddress, &req.DeviceID, &req.CreatedAt, &expiresAt, &revokedAt, &trailJSON); err != nil {
+			continue
+		}
+		json.Unmarshal([]byte(chainJSON), &req.ApprovalChain)
+		json.Unmarshal([]byte(trailJSON), &req.AuditTrail)
+		if expiresAt.Valid {
+			req.ExpiresAt = expiresAt.Time
+		}
+		if revokedAt.Valid {
+			req.RevokedAt = revokedAt.Time
+		}
+		result = append(result, &req)
+	}
+	return result
+}
+
+func dbListActiveSessions() []*ActiveSession {
+	if db == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SELECT session_token, request_id, resource, access_level, user_id, expires_at, actions_log FROM pam_active_sessions ORDER BY expires_at`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var result []*ActiveSession
+	for rows.Next() {
+		var s ActiveSession
+		var actionsJSON string
+		if err := rows.Scan(&s.SessionToken, &s.RequestID, &s.Resource, &s.AccessLevel, &s.UserID, &s.ExpiresAt, &actionsJSON); err != nil {
+			continue
+		}
+		json.Unmarshal([]byte(actionsJSON), &s.ActionsLog)
+		result = append(result, &s)
+	}
+	return result
+}
+
+func dbCountByStatus() (total, pending, active, denied, expired int) {
+	if db == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SELECT status, COUNT(*) FROM pam_requests GROUP BY status`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s string
+		var c int
+		if rows.Scan(&s, &c) == nil {
+			total += c
+			switch s {
+			case "pending":
+				pending = c
+			case "active":
+				active = c
+			case "denied":
+				denied = c
+			case "expired":
+				expired = c
+			}
+		}
+	}
+	return
+}
+
+func nullTime(t time.Time) interface{} {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
 
 // ─── Core Logic ─────────────────────────────────────────────────────────────
 
@@ -132,7 +366,6 @@ func createAccessRequest(req *AccessRequest) error {
 	req.Status = "pending"
 	req.AuditTrail = []string{fmt.Sprintf("%s: request created by %s for %s (%s)", req.CreatedAt.Format(time.RFC3339), req.RequestorID, req.Resource, req.AccessLevel)}
 
-	// Validate against policy
 	policy, ok := policies[req.Resource]
 	if !ok {
 		return fmt.Errorf("no policy defined for resource %q", req.Resource)
@@ -144,7 +377,6 @@ func createAccessRequest(req *AccessRequest) error {
 		return fmt.Errorf("resource %s requires incident/change ticket reference in justification", req.Resource)
 	}
 
-	// Check blocked hours
 	currentHour := time.Now().Hour()
 	for _, blocked := range policy.BlockedHours {
 		if currentHour == blocked {
@@ -152,10 +384,9 @@ func createAccessRequest(req *AccessRequest) error {
 		}
 	}
 
-	// Self-approval prevention: requestor cannot approve their own request
 	req.ApprovalChain = make([]string, 0, policy.RequiredApprovers)
 
-	requests[req.ID] = req
+	dbSaveRequest(req)
 
 	appendAudit("pam_request_created", req.RequestorID, req.ID, map[string]interface{}{
 		"resource": req.Resource, "access_level": req.AccessLevel, "duration": req.Duration,
@@ -169,25 +400,23 @@ func createAccessRequest(req *AccessRequest) error {
 	return nil
 }
 
-func approveRequest(requestID, approverID string) error {
+func approveRequest(reqID, approverID string) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	req, ok := requests[requestID]
-	if !ok {
-		return fmt.Errorf("request %s not found", requestID)
+	req := dbLoadRequest(reqID)
+	if req == nil {
+		return fmt.Errorf("request %s not found", reqID)
 	}
 	if req.Status != "pending" {
-		return fmt.Errorf("request %s is %s, cannot approve", requestID, req.Status)
+		return fmt.Errorf("request %s is %s, cannot approve", reqID, req.Status)
 	}
 
-	// Self-approval prevention
 	if approverID == req.RequestorID {
-		appendAudit("pam_self_approval_blocked", approverID, requestID, nil)
+		appendAudit("pam_self_approval_blocked", approverID, reqID, nil)
 		return fmt.Errorf("self-approval is prohibited: %s cannot approve their own request", approverID)
 	}
 
-	// Duplicate approval prevention
 	for _, existing := range req.ApprovalChain {
 		if existing == approverID {
 			return fmt.Errorf("approver %s has already approved this request", approverID)
@@ -199,7 +428,6 @@ func approveRequest(requestID, approverID string) error {
 	req.AuditTrail = append(req.AuditTrail, fmt.Sprintf("%s: approved by %s (%d/%d)", time.Now().Format(time.RFC3339), approverID, len(req.ApprovalChain), policy.RequiredApprovers))
 
 	if len(req.ApprovalChain) >= policy.RequiredApprovers {
-		// Fully approved — activate session
 		req.Status = "active"
 		req.ApprovedBy = strings.Join(req.ApprovalChain, ",")
 		req.ExpiresAt = time.Now().Add(time.Duration(req.Duration) * time.Minute)
@@ -214,7 +442,7 @@ func approveRequest(requestID, approverID string) error {
 			ExpiresAt:    req.ExpiresAt,
 			ActionsLog:   make([]Action, 0),
 		}
-		activeSessions[req.SessionToken] = session
+		dbSaveSession(session)
 
 		eventBus.Emit("pam.session.activated", map[string]interface{}{
 			"request_id": req.ID, "user": req.RequestorID, "resource": req.Resource,
@@ -222,19 +450,27 @@ func approveRequest(requestID, approverID string) error {
 		})
 	}
 
-	appendAudit("pam_request_approved", approverID, requestID, map[string]interface{}{
+	dbSaveRequest(req)
+
+	appendAudit("pam_request_approved", approverID, reqID, map[string]interface{}{
 		"approval_count": len(req.ApprovalChain), "required": policy.RequiredApprovers,
 	})
 
 	return nil
 }
 
+func getRequest(reqID string) *AccessRequest {
+	mu.RLock()
+	defer mu.RUnlock()
+	return dbLoadRequest(reqID)
+}
+
 func validateSession(token string) (*ActiveSession, error) {
 	mu.RLock()
 	defer mu.RUnlock()
 
-	session, ok := activeSessions[token]
-	if !ok {
+	session := dbLoadSession(token)
+	if session == nil {
 		return nil, fmt.Errorf("session not found or expired")
 	}
 	if time.Now().After(session.ExpiresAt) {
@@ -247,18 +483,20 @@ func revokeSession(token, revokerID, reason string) error {
 	mu.Lock()
 	defer mu.Unlock()
 
-	session, ok := activeSessions[token]
-	if !ok {
+	session := dbLoadSession(token)
+	if session == nil {
 		return fmt.Errorf("session not found")
 	}
 
-	if req, exists := requests[session.RequestID]; exists {
+	req := dbLoadRequest(session.RequestID)
+	if req != nil {
 		req.Status = "revoked"
 		req.RevokedAt = time.Now()
 		req.AuditTrail = append(req.AuditTrail, fmt.Sprintf("%s: REVOKED by %s — %s", time.Now().Format(time.RFC3339), revokerID, reason))
+		dbSaveRequest(req)
 	}
 
-	delete(activeSessions, token)
+	dbDeleteSession(token)
 
 	appendAudit("pam_session_revoked", revokerID, session.RequestID, map[string]interface{}{
 		"user": session.UserID, "resource": session.Resource, "reason": reason,
@@ -271,20 +509,22 @@ func revokeSession(token, revokerID, reason string) error {
 	return nil
 }
 
-// expireLoop runs every 30 seconds, expiring sessions past their TTL
 func expireLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
 		mu.Lock()
 		now := time.Now()
-		for token, session := range activeSessions {
+		sessions := dbListActiveSessions()
+		for _, session := range sessions {
 			if now.After(session.ExpiresAt) {
-				if req, ok := requests[session.RequestID]; ok {
+				req := dbLoadRequest(session.RequestID)
+				if req != nil {
 					req.Status = "expired"
 					req.AuditTrail = append(req.AuditTrail, fmt.Sprintf("%s: session auto-expired", now.Format(time.RFC3339)))
+					dbSaveRequest(req)
 				}
-				delete(activeSessions, token)
+				dbDeleteSession(session.SessionToken)
 				appendAudit("pam_session_expired", "system", session.RequestID, map[string]interface{}{
 					"user": session.UserID, "resource": session.Resource,
 				})
@@ -307,7 +547,6 @@ func appendAudit(action, actor, entityID string, details map[string]interface{})
 		"service":   serviceName,
 		"details":   details,
 	}
-	auditLog = append(auditLog, entry)
 
 	if db != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -368,10 +607,7 @@ func handleApproveRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mu.RLock()
-	req := requests[body.RequestID]
-	mu.RUnlock()
-
+	req := getRequest(body.RequestID)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(req)
 }
@@ -417,17 +653,11 @@ func handleRevokeSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleListRequests(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-
 	status := r.URL.Query().Get("status")
-	result := make([]*AccessRequest, 0)
-	for _, req := range requests {
-		if status == "" || req.Status == status {
-			result = append(result, req)
-		}
+	result := dbListRequests(status)
+	if result == nil {
+		result = make([]*AccessRequest, 0)
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)
 }
@@ -440,41 +670,23 @@ func handleListPolicies(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleActiveSessions(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-
-	sessions := make([]*ActiveSession, 0, len(activeSessions))
-	for _, s := range activeSessions {
-		sessions = append(sessions, s)
+	sessions := dbListActiveSessions()
+	if sessions == nil {
+		sessions = make([]*ActiveSession, 0)
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(sessions)
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-
-	pending, active, denied, expired := 0, 0, 0, 0
-	for _, req := range requests {
-		switch req.Status {
-		case "pending":
-			pending++
-		case "active":
-			active++
-		case "denied":
-			denied++
-		case "expired":
-			expired++
-		}
-	}
+	total, pending, _, denied, expired := dbCountByStatus()
+	sessions := dbListActiveSessions()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total_requests":  len(requests),
+		"total_requests":  total,
 		"pending":         pending,
-		"active_sessions": len(activeSessions),
+		"active_sessions": len(sessions),
 		"denied":          denied,
 		"expired":         expired,
 		"policies":        len(policies),
@@ -506,6 +718,12 @@ func livezHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	ready := db != nil
+	if !ready {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not_ready", "reason": "database not connected"})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
@@ -589,14 +807,25 @@ func main() {
 		port = "8080"
 	}
 
-	// Database connection
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL != "" {
 		var err error
 		db, err = sql.Open("postgres", dbURL)
 		if err != nil {
-			log.Printf("[PAM] Database connection failed: %v (continuing in-memory)", err)
+			log.Printf("[PAM] Database connection failed: %v", err)
+		} else {
+			db.SetMaxOpenConns(25)
+			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(5 * time.Minute)
+			if err := db.Ping(); err != nil {
+				log.Printf("[PAM] Database ping failed: %v", err)
+			} else {
+				log.Println("[PAM] Connected to PostgreSQL")
+				initSchema()
+			}
 		}
+	} else {
+		log.Println("[PAM] WARNING: DATABASE_URL not set — service will not persist state")
 	}
 
 	startWatchdog()
@@ -604,12 +833,10 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	// Health endpoints
 	mux.HandleFunc("/healthz", healthzHandler)
 	mux.HandleFunc("/livez", livezHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 
-	// PAM endpoints
 	mux.HandleFunc("/api/v1/pam/request", handleRequestAccess)
 	mux.HandleFunc("/api/v1/pam/approve", handleApproveRequest)
 	mux.HandleFunc("/api/v1/pam/validate", handleValidateSession)
@@ -619,7 +846,6 @@ func main() {
 	mux.HandleFunc("/api/v1/pam/policies", handleListPolicies)
 	mux.HandleFunc("/api/v1/pam/stats", handleStats)
 
-	// Wrap with middleware
 	handler := panicRecoveryMiddleware(rateLimitMiddleware(loggingMiddleware(mux)))
 
 	srv := &http.Server{Addr: ":" + port, Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 120 * time.Second}

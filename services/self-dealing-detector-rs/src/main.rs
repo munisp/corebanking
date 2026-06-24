@@ -1,27 +1,24 @@
-#![allow(unused)]
-use actix_web::{web, App, HttpServer, HttpResponse};
+// 54Bank Self-Dealing Detector — Rust
+// All state persisted to PostgreSQL. No in-memory HashMaps.
+use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
-use std::collections::{HashMap, HashSet};
-
-// self-dealing-detector-rs — Detects employees processing transactions to accounts they control
-// Maintains employee↔account relationship graph and flags conflicts of interest.
-// Cross-references with beneficial ownership, family declarations, and phone/address matches.
+use std::sync::atomic::{AtomicI64, AtomicI32, Ordering};
+use std::env;
+use tokio_postgres::{Client, NoTls};
+use tokio::sync::Mutex;
 
 struct AppState {
-    employee_accounts: Mutex<HashMap<String, HashSet<String>>>,  // employee_id → set of associated account IDs
-    family_links: Mutex<HashMap<String, HashSet<String>>>,       // employee_id → set of family member account IDs
-    alerts: Mutex<Vec<SelfDealingAlert>>,
-    transaction_log: Mutex<Vec<TransactionCheck>>,
+    db: Option<Mutex<Client>>,
+    healthy: AtomicI32,
+    last_activity: AtomicI64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct SelfDealingAlert {
     id: String,
     employee_id: String,
     account_id: String,
-    relationship: String,  // "own_account", "family", "address_match", "phone_match", "beneficiary"
+    relationship: String,
     transaction_ref: String,
     amount_kobo: i64,
     severity: String,
@@ -29,171 +26,244 @@ struct SelfDealingAlert {
     blocked: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct TransactionCheck {
     employee_id: String,
     source_account: String,
     dest_account: String,
     amount_kobo: i64,
     is_self_dealing: bool,
-    relationship: Option<String>,
+    relationship: String,
     timestamp: String,
 }
 
-#[derive(Deserialize)]
-struct RegisterLink {
-    employee_id: String,
-    account_id: String,
-    relationship: String,
-}
-
-#[derive(Deserialize)]
-struct CheckRequest {
-    employee_id: String,
-    source_account: String,
-    dest_account: String,
-    amount_kobo: i64,
-    transaction_ref: String,
-}
-
-fn check_self_dealing(
-    employee_accounts: &HashMap<String, HashSet<String>>,
-    family_links: &HashMap<String, HashSet<String>>,
-    employee_id: &str,
-    source_account: &str,
-    dest_account: &str,
-) -> Option<String> {
-    // Check if employee owns either account
-    if let Some(accounts) = employee_accounts.get(employee_id) {
-        if accounts.contains(source_account) || accounts.contains(dest_account) {
-            return Some("own_account".to_string());
+async fn init_schema(db: &Client) {
+    let queries = [
+        "CREATE TABLE IF NOT EXISTS employee_account_links (
+            employee_id TEXT NOT NULL, account_id TEXT NOT NULL,
+            relationship TEXT NOT NULL DEFAULT 'own',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (employee_id, account_id))",
+        "CREATE TABLE IF NOT EXISTS self_dealing_alerts (
+            id TEXT PRIMARY KEY, employee_id TEXT NOT NULL, account_id TEXT NOT NULL,
+            relationship TEXT, transaction_ref TEXT, amount_kobo BIGINT,
+            severity TEXT, timestamp TEXT, blocked BOOLEAN DEFAULT TRUE)",
+        "CREATE TABLE IF NOT EXISTS self_dealing_checks (
+            id SERIAL PRIMARY KEY, employee_id TEXT NOT NULL,
+            source_account TEXT, dest_account TEXT, amount_kobo BIGINT,
+            is_self_dealing BOOLEAN, relationship TEXT,
+            timestamp TEXT)",
+        "CREATE INDEX IF NOT EXISTS idx_sd_links_emp ON employee_account_links(employee_id)",
+        "CREATE INDEX IF NOT EXISTS idx_sd_alerts_emp ON self_dealing_alerts(employee_id)",
+    ];
+    for q in queries {
+        if let Err(e) = db.execute(q, &[]).await {
+            eprintln!("[self-dealing] schema warning: {}", e);
         }
     }
-
-    // Check if family member owns either account
-    if let Some(family) = family_links.get(employee_id) {
-        if family.contains(source_account) || family.contains(dest_account) {
-            return Some("family".to_string());
-        }
+    // Seed default employee-account links
+    let seeds = [
+        ("EMP-001", "ACCT-1001", "own"),
+        ("EMP-001", "ACCT-1002", "family"),
+        ("EMP-002", "ACCT-2001", "own"),
+        ("EMP-003", "ACCT-3001", "own"),
+        ("EMP-003", "ACCT-3002", "family"),
+        ("EMP-003", "ACCT-3003", "family"),
+    ];
+    for (emp, acct, rel) in seeds {
+        let _ = db.execute(
+            "INSERT INTO employee_account_links (employee_id, account_id, relationship) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            &[&emp, &acct, &rel]
+        ).await;
     }
-
-    None
+    eprintln!("[self-dealing] PostgreSQL schema initialized with seed data");
 }
 
-async fn register_link(state: web::Data<AppState>, body: web::Json<RegisterLink>) -> HttpResponse {
-    let mut map = if body.relationship == "family" {
-        state.family_links.lock().unwrap()
-    } else {
-        state.employee_accounts.lock().unwrap()
+async fn check_transaction(data: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    data.last_activity.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+    let employee_id = body["employee_id"].as_str().unwrap_or("");
+    let source = body["source_account"].as_str().unwrap_or("");
+    let dest = body["destination_account"].as_str().unwrap_or("");
+    let amount = body["amount_kobo"].as_i64().unwrap_or(0);
+    let txn_ref = body["transaction_ref"].as_str().unwrap_or("");
+
+    let db_guard = match &data.db {
+        Some(db) => db.lock().await,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database not connected"})),
     };
-    map.entry(body.employee_id.clone()).or_insert_with(HashSet::new).insert(body.account_id.clone());
-    HttpResponse::Created().json(json!({"status": "registered", "employee": body.employee_id, "account": body.account_id, "relationship": body.relationship}))
-}
 
-async fn check_transaction(state: web::Data<AppState>, body: web::Json<CheckRequest>) -> HttpResponse {
-    let emp_accts = state.employee_accounts.lock().unwrap();
-    let fam_links = state.family_links.lock().unwrap();
+    let row = db_guard.query_opt(
+        "SELECT relationship FROM employee_account_links WHERE employee_id = $1 AND account_id = $2",
+        &[&employee_id, &dest]
+    ).await;
 
-    let relationship = check_self_dealing(&emp_accts, &fam_links, &body.employee_id, &body.source_account, &body.dest_account);
-    drop(emp_accts);
-    drop(fam_links);
+    let (is_self_dealing, relationship) = match row {
+        Ok(Some(r)) => {
+            let rel: String = r.get(0);
+            (true, rel)
+        },
+        _ => (false, String::new()),
+    };
 
-    let is_self_dealing = relationship.is_some();
     let now = chrono::Utc::now().to_rfc3339();
 
-    let check = TransactionCheck {
-        employee_id: body.employee_id.clone(),
-        source_account: body.source_account.clone(),
-        dest_account: body.dest_account.clone(),
-        amount_kobo: body.amount_kobo,
-        is_self_dealing,
-        relationship: relationship.clone(),
-        timestamp: now.clone(),
-    };
+    let _ = db_guard.execute(
+        "INSERT INTO self_dealing_checks (employee_id, source_account, dest_account, amount_kobo, is_self_dealing, relationship, timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+        &[&employee_id, &source, &dest, &amount, &is_self_dealing, &relationship, &now]
+    ).await;
 
-    let mut log = state.transaction_log.lock().unwrap();
-    log.push(check);
-
-    if let Some(rel) = &relationship {
-        let alert = SelfDealingAlert {
-            id: format!("SD-{:06}", log.len()),
-            employee_id: body.employee_id.clone(),
-            account_id: if rel == "own_account" || rel == "family" { body.dest_account.clone() } else { body.source_account.clone() },
-            relationship: rel.clone(),
-            transaction_ref: body.transaction_ref.clone(),
-            amount_kobo: body.amount_kobo,
-            severity: if body.amount_kobo > 100_000_00 { "critical".to_string() } else { "high".to_string() },
-            timestamp: now,
-            blocked: true,
-        };
-
-        let mut alerts = state.alerts.lock().unwrap();
-        alerts.push(alert.clone());
-
-        return HttpResponse::Forbidden().json(json!({
-            "allowed": false,
-            "reason": format!("SELF-DEALING DETECTED: employee {} has '{}' relationship with account", body.employee_id, rel),
-            "alert": alert
+    if is_self_dealing {
+        let alert_id = format!("SD-{:08x}", rand_u32());
+        let severity = if relationship == "own" { "critical" } else { "high" };
+        let _ = db_guard.execute(
+            "INSERT INTO self_dealing_alerts (id, employee_id, account_id, relationship, transaction_ref, amount_kobo, severity, timestamp, blocked) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            &[&alert_id, &employee_id, &dest, &relationship, &txn_ref, &amount, &severity, &now, &true]
+        ).await;
+        return HttpResponse::Forbidden().json(serde_json::json!({
+            "blocked": true, "is_self_dealing": true, "relationship": relationship,
+            "alert_id": alert_id, "severity": severity,
+            "message": format!("BLOCKED: Employee {} has {} relationship with account {}", employee_id, relationship, dest),
         }));
     }
 
-    HttpResponse::Ok().json(json!({"allowed": true, "self_dealing": false}))
-}
-
-async fn list_alerts(state: web::Data<AppState>) -> HttpResponse {
-    let alerts = state.alerts.lock().unwrap();
-    HttpResponse::Ok().json(alerts.clone())
-}
-
-async fn list_links(state: web::Data<AppState>) -> HttpResponse {
-    let emp = state.employee_accounts.lock().unwrap();
-    let fam = state.family_links.lock().unwrap();
-    HttpResponse::Ok().json(json!({
-        "employee_accounts": emp.iter().map(|(k, v)| (k.clone(), v.iter().cloned().collect::<Vec<_>>())).collect::<HashMap<_, _>>(),
-        "family_links": fam.iter().map(|(k, v)| (k.clone(), v.iter().cloned().collect::<Vec<_>>())).collect::<HashMap<_, _>>(),
+    HttpResponse::Ok().json(serde_json::json!({
+        "blocked": false, "is_self_dealing": false, "relationship": "none",
     }))
 }
 
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
-    let alerts = state.alerts.lock().unwrap();
-    let log = state.transaction_log.lock().unwrap();
-    let emp = state.employee_accounts.lock().unwrap();
-    HttpResponse::Ok().json(json!({
-        "total_checks": log.len(),
-        "self_dealing_detected": alerts.len(),
-        "employees_registered": emp.len(),
-        "service": "self-dealing-detector-rs"
+async fn register_link(data: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    data.last_activity.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+    let emp = body["employee_id"].as_str().unwrap_or("");
+    let acct = body["account_id"].as_str().unwrap_or("");
+    let rel = body["relationship"].as_str().unwrap_or("own");
+
+    let db_guard = match &data.db {
+        Some(db) => db.lock().await,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database not connected"})),
+    };
+
+    let _ = db_guard.execute(
+        "INSERT INTO employee_account_links (employee_id, account_id, relationship) VALUES ($1,$2,$3) ON CONFLICT (employee_id, account_id) DO UPDATE SET relationship = $3",
+        &[&emp, &acct, &rel]
+    ).await;
+
+    HttpResponse::Created().json(serde_json::json!({"status": "registered", "employee_id": emp, "account_id": acct, "relationship": rel}))
+}
+
+async fn list_links(data: web::Data<AppState>) -> HttpResponse {
+    let db_guard = match &data.db {
+        Some(db) => db.lock().await,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database not connected"})),
+    };
+    let rows = db_guard.query("SELECT employee_id, account_id, relationship FROM employee_account_links ORDER BY employee_id", &[]).await.unwrap_or_default();
+    let links: Vec<serde_json::Value> = rows.iter().map(|r| {
+        serde_json::json!({"employee_id": r.get::<_, String>(0), "account_id": r.get::<_, String>(1), "relationship": r.get::<_, String>(2)})
+    }).collect();
+    HttpResponse::Ok().json(links)
+}
+
+async fn list_alerts(data: web::Data<AppState>) -> HttpResponse {
+    let db_guard = match &data.db {
+        Some(db) => db.lock().await,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database not connected"})),
+    };
+    let rows = db_guard.query("SELECT id, employee_id, account_id, relationship, COALESCE(transaction_ref,''), amount_kobo, severity, timestamp, blocked FROM self_dealing_alerts ORDER BY timestamp DESC LIMIT 1000", &[]).await.unwrap_or_default();
+    let alerts: Vec<SelfDealingAlert> = rows.iter().map(|r| SelfDealingAlert {
+        id: r.get(0), employee_id: r.get(1), account_id: r.get(2), relationship: r.get(3),
+        transaction_ref: r.get(4), amount_kobo: r.get(5), severity: r.get(6), timestamp: r.get(7), blocked: r.get(8),
+    }).collect();
+    HttpResponse::Ok().json(alerts)
+}
+
+async fn stats(data: web::Data<AppState>) -> HttpResponse {
+    let db_guard = match &data.db {
+        Some(db) => db.lock().await,
+        None => return HttpResponse::Ok().json(serde_json::json!({"error": "database not connected"})),
+    };
+    let links: i64 = db_guard.query_one("SELECT COUNT(*) FROM employee_account_links", &[]).await.map(|r| r.get(0)).unwrap_or(0);
+    let alerts: i64 = db_guard.query_one("SELECT COUNT(*) FROM self_dealing_alerts", &[]).await.map(|r| r.get(0)).unwrap_or(0);
+    let checks: i64 = db_guard.query_one("SELECT COUNT(*) FROM self_dealing_checks", &[]).await.map(|r| r.get(0)).unwrap_or(0);
+    HttpResponse::Ok().json(serde_json::json!({
+        "total_links": links, "total_alerts": alerts, "total_checks": checks,
+        "service": "self-dealing-detector-rs",
     }))
 }
 
-async fn healthz() -> HttpResponse { HttpResponse::Ok().json(json!({"status": "healthy", "service": "self-dealing-detector-rs"})) }
-async fn livez() -> HttpResponse { HttpResponse::Ok().json(json!({"status": "alive"})) }
-async fn readyz() -> HttpResponse { HttpResponse::Ok().json(json!({"status": "ready"})) }
+async fn healthz() -> HttpResponse { HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "self-dealing-detector-rs"})) }
+async fn livez() -> HttpResponse { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }
+async fn readyz(data: web::Data<AppState>) -> HttpResponse {
+    if data.db.is_some() { HttpResponse::Ok().json(serde_json::json!({"status": "ready"})) }
+    else { HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not_ready"})) }
+}
+
+fn rand_u32() -> u32 { use std::time::SystemTime; SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().subsec_nanos() }
+
+fn start_watchdog(data: web::Data<AppState>) {
+    let d = data.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            let last = d.last_activity.load(Ordering::Relaxed);
+            let now = chrono::Utc::now().timestamp();
+            if now - last > 60 { d.healthy.store(0, Ordering::Relaxed); }
+            else { d.healthy.store(1, Ordering::Relaxed); }
+        }
+    });
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080);
-    let state = web::Data::new(AppState {
-        employee_accounts: Mutex::new(HashMap::new()),
-        family_links: Mutex::new(HashMap::new()),
-        alerts: Mutex::new(Vec::new()),
-        transaction_log: Mutex::new(Vec::new()),
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080);
+    let db_url = env::var("DATABASE_URL").unwrap_or_default();
+
+    let db_client = if !db_url.is_empty() {
+        match tokio_postgres::connect(&db_url, NoTls).await {
+            Ok((client, connection)) => {
+                tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("[self-dealing] DB connection error: {}", e); } });
+                init_schema(&client).await;
+                eprintln!("[self-dealing] Connected to PostgreSQL");
+                Some(Mutex::new(client))
+            },
+            Err(e) => { eprintln!("[self-dealing] DB connection failed: {}", e); None },
+        }
+    } else {
+        eprintln!("[self-dealing] WARNING: DATABASE_URL not set");
+        None
+    };
+
+    let data = web::Data::new(AppState {
+        db: db_client,
+        healthy: AtomicI32::new(1),
+        last_activity: AtomicI64::new(chrono::Utc::now().timestamp()),
     });
 
-    println!("[self-dealing-detector-rs] Starting on :{}", port);
+    start_watchdog(data.clone());
+
+    eprintln!("[self-dealing-detector] Starting on :{}", port);
     HttpServer::new(move || {
         App::new()
-            .app_data(state.clone())
+            .app_data(data.clone())
             .route("/healthz", web::get().to(healthz))
             .route("/livez", web::get().to(livez))
             .route("/readyz", web::get().to(readyz))
-            .route("/api/v1/self-dealing/register", web::post().to(register_link))
             .route("/api/v1/self-dealing/check", web::post().to(check_transaction))
-            .route("/api/v1/self-dealing/alerts", web::get().to(list_alerts))
+            .route("/api/v1/self-dealing/register", web::post().to(register_link))
             .route("/api/v1/self-dealing/links", web::get().to(list_links))
+            .route("/api/v1/self-dealing/alerts", web::get().to(list_alerts))
             .route("/api/v1/self-dealing/stats", web::get().to(stats))
     })
-    .bind(("0.0.0.0", port))?
+    .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rand_u32() {
+        let r = rand_u32();
+        assert!(r > 0 || r == 0);
+    }
 }

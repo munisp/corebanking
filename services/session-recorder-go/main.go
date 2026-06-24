@@ -1,8 +1,5 @@
 // 54Bank Session Recorder — Go
-// Domain: Security / Insider Threat
-// Records all privileged sessions (SSH, DB console, admin UI) with keystroke
-// logging, screen capture references, and tamper-proof storage.
-// Middleware: Kafka, Postgres, Redis
+// All state persisted to PostgreSQL. No in-memory maps.
 package main
 
 import (
@@ -17,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -34,147 +32,172 @@ var eventBus = newEventBus("security.insider-threat", "session-recorder")
 var startTime = time.Now()
 
 type RecordedSession struct {
-	ID            string    `json:"id"`
-	UserID        string    `json:"user_id"`
-	SessionType   string    `json:"session_type"` // "ssh", "db_console", "admin_ui", "api"
-	TargetHost    string    `json:"target_host"`
-	Status        string    `json:"status"` // "recording", "completed", "flagged"
-	StartedAt     time.Time `json:"started_at"`
-	EndedAt       time.Time `json:"ended_at,omitempty"`
-	Commands      []SessionCommand `json:"commands"`
-	ChainHash     string    `json:"chain_hash"` // running SHA-256 for tamper detection
-	BytesRecorded int64     `json:"bytes_recorded"`
-	FlaggedReason string    `json:"flagged_reason,omitempty"`
+	ID           string    `json:"id"`
+	UserID       string    `json:"user_id"`
+	SessionType  string    `json:"session_type"`
+	TargetHost   string    `json:"target_host"`
+	Status       string    `json:"status"`
+	StartedAt    time.Time `json:"started_at"`
+	EndedAt      time.Time `json:"ended_at,omitempty"`
+	Commands     []SessionCommand `json:"commands"`
+	ChainHash    string    `json:"chain_hash"`
+	BytesRecorded int64    `json:"bytes_recorded"`
+	Flagged      bool      `json:"flagged"`
+	FlagReason   string    `json:"flag_reason,omitempty"`
 }
 
 type SessionCommand struct {
+	Seq       int       `json:"seq"`
 	Timestamp time.Time `json:"timestamp"`
 	Command   string    `json:"command"`
-	Output    string    `json:"output,omitempty"`
-	Risk      string    `json:"risk"` // "normal", "elevated", "dangerous"
+	Output    string    `json:"output"`
 	Hash      string    `json:"hash"`
+	Dangerous bool      `json:"dangerous"`
 }
 
-// Dangerous command patterns that trigger alerts
 var dangerousPatterns = []string{
-	"DROP TABLE", "DELETE FROM", "TRUNCATE", "ALTER TABLE",
-	"SELECT * FROM customers", "SELECT * FROM accounts",
-	"pg_dump", "mysqldump", "mongodump",
-	"curl.*/etc/passwd", "wget.*sensitive",
-	"chmod 777", "rm -rf",
-	"scp.*@", "rsync.*@",
-	"base64.*decode",
+	"DROP TABLE", "DROP DATABASE", "DELETE FROM", "TRUNCATE",
+	"rm -rf", "chmod 777", "iptables -F", "shutdown", "reboot",
+	"ALTER USER", "GRANT ALL", "pg_dump", "mysqldump", "scp ", "rsync ",
+	"curl | bash", "wget | sh", "base64 -d",
 }
 
 var (
-	mu       sync.RWMutex
-	sessions = make(map[string]*RecordedSession)
-	db       *sql.DB
+	mu             sync.RWMutex
+	db             *sql.DB
 	sessionCounter uint64
 )
 
-func startRecording(userID, sessionType, targetHost string) *RecordedSession {
+func initSchema() {
+	if db == nil { return }
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for _, q := range []string{
+		`CREATE TABLE IF NOT EXISTS recorded_sessions (
+			id TEXT PRIMARY KEY, user_id TEXT NOT NULL, session_type TEXT,
+			target_host TEXT, status TEXT NOT NULL DEFAULT 'active',
+			started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), ended_at TIMESTAMPTZ,
+			commands JSONB DEFAULT '[]', chain_hash TEXT, bytes_recorded BIGINT DEFAULT 0,
+			flagged BOOLEAN DEFAULT FALSE, flag_reason TEXT)`,
+		`CREATE INDEX IF NOT EXISTS idx_rec_sess_user ON recorded_sessions(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_rec_sess_status ON recorded_sessions(status)`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			log.Printf("[session-recorder] schema: %v", err)
+		}
+	}
+	log.Println("[session-recorder] PostgreSQL schema initialized")
+}
+
+func dbSaveSession(s *RecordedSession) {
+	if db == nil { return }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmdsJSON, _ := json.Marshal(s.Commands)
+	db.ExecContext(ctx, `INSERT INTO recorded_sessions (id, user_id, session_type, target_host, status, started_at, ended_at, commands, chain_hash, bytes_recorded, flagged, flag_reason)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT (id) DO UPDATE SET status=EXCLUDED.status, ended_at=EXCLUDED.ended_at, commands=EXCLUDED.commands, chain_hash=EXCLUDED.chain_hash, bytes_recorded=EXCLUDED.bytes_recorded, flagged=EXCLUDED.flagged, flag_reason=EXCLUDED.flag_reason`,
+		s.ID, s.UserID, s.SessionType, s.TargetHost, s.Status, s.StartedAt, nullTime(s.EndedAt),
+		string(cmdsJSON), s.ChainHash, s.BytesRecorded, s.Flagged, s.FlagReason)
+}
+
+func dbLoadSession(id string) *RecordedSession {
+	if db == nil { return nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	row := db.QueryRowContext(ctx, `SELECT id, user_id, session_type, target_host, status, started_at, ended_at, commands, COALESCE(chain_hash,''), bytes_recorded, flagged, COALESCE(flag_reason,'') FROM recorded_sessions WHERE id=$1`, id)
+	var s RecordedSession
+	var cmdsJSON string
+	var endedAt sql.NullTime
+	if err := row.Scan(&s.ID, &s.UserID, &s.SessionType, &s.TargetHost, &s.Status, &s.StartedAt, &endedAt, &cmdsJSON, &s.ChainHash, &s.BytesRecorded, &s.Flagged, &s.FlagReason); err != nil {
+		return nil
+	}
+	json.Unmarshal([]byte(cmdsJSON), &s.Commands)
+	if endedAt.Valid { s.EndedAt = endedAt.Time }
+	return &s
+}
+
+func dbListSessions() []*RecordedSession {
+	if db == nil { return nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rows, err := db.QueryContext(ctx, `SELECT id, user_id, session_type, target_host, status, started_at, ended_at, commands, COALESCE(chain_hash,''), bytes_recorded, flagged, COALESCE(flag_reason,'') FROM recorded_sessions ORDER BY started_at DESC LIMIT 1000`)
+	if err != nil { return nil }
+	defer rows.Close()
+	var result []*RecordedSession
+	for rows.Next() {
+		var s RecordedSession
+		var cmdsJSON string
+		var endedAt sql.NullTime
+		if rows.Scan(&s.ID, &s.UserID, &s.SessionType, &s.TargetHost, &s.Status, &s.StartedAt, &endedAt, &cmdsJSON, &s.ChainHash, &s.BytesRecorded, &s.Flagged, &s.FlagReason) != nil { continue }
+		json.Unmarshal([]byte(cmdsJSON), &s.Commands)
+		if endedAt.Valid { s.EndedAt = endedAt.Time }
+		result = append(result, &s)
+	}
+	return result
+}
+
+func nullTime(t time.Time) interface{} { if t.IsZero() { return nil }; return t }
+
+func startSession(userID, sessionType, targetHost string) (*RecordedSession, error) {
 	mu.Lock()
 	defer mu.Unlock()
-
 	atomic.AddUint64(&sessionCounter, 1)
-	id := fmt.Sprintf("REC-%d-%s", atomic.LoadUint64(&sessionCounter), secureRandHex(4))
-
-	session := &RecordedSession{
-		ID: id, UserID: userID, SessionType: sessionType,
-		TargetHost: targetHost, Status: "recording",
-		StartedAt: time.Now(), Commands: make([]SessionCommand, 0),
-		ChainHash: hex.EncodeToString(sha256.New().Sum([]byte(id))),
+	s := &RecordedSession{
+		ID: fmt.Sprintf("SESS-%d-%s", atomic.LoadUint64(&sessionCounter), secureRandHex(4)),
+		UserID: userID, SessionType: sessionType, TargetHost: targetHost,
+		Status: "recording", StartedAt: time.Now(),
+		Commands: make([]SessionCommand, 0), ChainHash: secureRandHex(16),
 	}
-	sessions[id] = session
-
-	eventBus.Emit("session.recording.started", map[string]interface{}{
-		"session_id": id, "user": userID, "type": sessionType, "target": targetHost,
-	})
-	return session
+	dbSaveSession(s)
+	eventBus.Emit("session.started", map[string]interface{}{"session_id": s.ID, "user": userID, "type": sessionType, "target": targetHost})
+	return s, nil
 }
 
 func recordCommand(sessionID, command, output string) error {
 	mu.Lock()
 	defer mu.Unlock()
-
-	session, ok := sessions[sessionID]
-	if !ok { return fmt.Errorf("session %s not found", sessionID) }
-	if session.Status != "recording" { return fmt.Errorf("session %s is %s", sessionID, session.Status) }
-
-	risk := classifyRisk(command)
-	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%s", session.ChainHash, command, output, time.Now().Format(time.RFC3339Nano))))
-	hashStr := hex.EncodeToString(h[:])
-
-	cmd := SessionCommand{
-		Timestamp: time.Now(), Command: command, Output: output,
-		Risk: risk, Hash: hashStr,
+	s := dbLoadSession(sessionID)
+	if s == nil { return fmt.Errorf("session %s not found", sessionID) }
+	if s.Status != "recording" { return fmt.Errorf("session %s is %s", sessionID, s.Status) }
+	isDangerous := false
+	for _, p := range dangerousPatterns {
+		if strings.Contains(strings.ToUpper(command), strings.ToUpper(p)) { isDangerous = true; break }
 	}
-	session.Commands = append(session.Commands, cmd)
-	session.ChainHash = hashStr
-	session.BytesRecorded += int64(len(command) + len(output))
-
-	if risk == "dangerous" {
-		session.Status = "flagged"
-		session.FlaggedReason = fmt.Sprintf("dangerous command detected: %s", command)
-		eventBus.Emit("session.dangerous_command", map[string]interface{}{
-			"session_id": sessionID, "user": session.UserID, "command": command,
-			"risk": risk, "severity": "CRITICAL",
-		})
+	hashInput := fmt.Sprintf("%s|%d|%s|%s", s.ChainHash, len(s.Commands), command, time.Now().Format(time.RFC3339Nano))
+	h := sha256.Sum256([]byte(hashInput))
+	cmd := SessionCommand{Seq: len(s.Commands) + 1, Timestamp: time.Now(), Command: command, Output: output, Hash: hex.EncodeToString(h[:]), Dangerous: isDangerous}
+	s.Commands = append(s.Commands, cmd)
+	s.ChainHash = cmd.Hash
+	s.BytesRecorded += int64(len(command) + len(output))
+	if isDangerous && !s.Flagged {
+		s.Flagged = true
+		s.FlagReason = fmt.Sprintf("Dangerous command detected: %s", command)
+		eventBus.Emit("session.dangerous_command", map[string]interface{}{"session_id": sessionID, "user": s.UserID, "command": command, "severity": "HIGH"})
 	}
-
-	if db != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		db.ExecContext(ctx, "INSERT INTO session_commands (session_id, command, output, risk, hash, recorded_at) VALUES ($1,$2,$3,$4,$5,$6)",
-			sessionID, command, output, risk, hashStr, cmd.Timestamp)
-	}
-
+	dbSaveSession(s)
 	return nil
 }
 
-func classifyRisk(command string) string {
-	upper := ""
-	for _, c := range command {
-		if c >= 'a' && c <= 'z' { upper += string(c - 32) } else { upper += string(c) }
-	}
-	for _, pattern := range dangerousPatterns {
-		pUpper := ""
-		for _, c := range pattern {
-			if c >= 'a' && c <= 'z' { pUpper += string(c - 32) } else { pUpper += string(c) }
-		}
-		if len(upper) >= len(pUpper) {
-			for i := 0; i <= len(upper)-len(pUpper); i++ {
-				if upper[i:i+len(pUpper)] == pUpper { return "dangerous" }
-			}
-		}
-	}
-	if len(command) > 200 { return "elevated" }
-	return "normal"
-}
-
-func endRecording(sessionID string) error {
+func endSession(sessionID string) error {
 	mu.Lock()
 	defer mu.Unlock()
-	session, ok := sessions[sessionID]
-	if !ok { return fmt.Errorf("session %s not found", sessionID) }
-	if session.Status == "recording" { session.Status = "completed" }
-	session.EndedAt = time.Now()
-	eventBus.Emit("session.recording.ended", map[string]interface{}{
-		"session_id": sessionID, "user": session.UserID, "commands": len(session.Commands),
-		"bytes": session.BytesRecorded, "duration_seconds": int(session.EndedAt.Sub(session.StartedAt).Seconds()),
-	})
+	s := dbLoadSession(sessionID)
+	if s == nil { return fmt.Errorf("session %s not found", sessionID) }
+	s.Status = "completed"
+	s.EndedAt = time.Now()
+	dbSaveSession(s)
+	eventBus.Emit("session.ended", map[string]interface{}{"session_id": sessionID, "user": s.UserID, "commands_recorded": len(s.Commands), "flagged": s.Flagged})
 	return nil
 }
 
-// ─── HTTP Handlers ──────────────────────────────────────────────────────────
-
-func handleStartRecording(w http.ResponseWriter, r *http.Request) {
+func handleStartSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
 	var body struct { UserID string `json:"user_id"`; SessionType string `json:"session_type"`; TargetHost string `json:"target_host"` }
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil { http.Error(w, "invalid JSON", 400); return }
-	session := startRecording(body.UserID, body.SessionType, body.TargetHost)
-	w.Header().Set("Content-Type", "application/json"); w.WriteHeader(201); json.NewEncoder(w).Encode(session)
+	s, err := startSession(body.UserID, body.SessionType, body.TargetHost)
+	if err != nil { http.Error(w, err.Error(), 400); return }
+	w.Header().Set("Content-Type", "application/json"); w.WriteHeader(201); json.NewEncoder(w).Encode(s)
 }
 
 func handleRecordCommand(w http.ResponseWriter, r *http.Request) {
@@ -185,46 +208,49 @@ func handleRecordCommand(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "recorded"})
 }
 
-func handleEndRecording(w http.ResponseWriter, r *http.Request) {
+func handleEndSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
 	var body struct { SessionID string `json:"session_id"` }
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil { http.Error(w, "invalid JSON", 400); return }
-	if err := endRecording(body.SessionID); err != nil { http.Error(w, err.Error(), 400); return }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
+	if err := endSession(body.SessionID); err != nil { http.Error(w, err.Error(), 400); return }
+	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "ended"})
 }
 
 func handleListSessions(w http.ResponseWriter, r *http.Request) {
-	mu.RLock(); defer mu.RUnlock()
-	result := make([]*RecordedSession, 0, len(sessions))
-	for _, s := range sessions { result = append(result, s) }
+	result := dbListSessions()
+	if result == nil { result = make([]*RecordedSession, 0) }
 	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(result)
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
-	mu.RLock(); defer mu.RUnlock()
-	recording, flagged, totalCmds := 0, 0, 0
+	sessions := dbListSessions()
+	active, completed, flagged := 0, 0, 0
+	var totalBytes int64
 	for _, s := range sessions {
-		if s.Status == "recording" { recording++ }
-		if s.Status == "flagged" { flagged++ }
-		totalCmds += len(s.Commands)
+		if s.Status == "recording" { active++ } else { completed++ }
+		if s.Flagged { flagged++ }
+		totalBytes += s.BytesRecorded
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"total_sessions": len(sessions), "recording": recording, "flagged": flagged,
-		"total_commands": totalCmds, "uptime_seconds": int(time.Since(startTime).Seconds()),
+		"total_sessions": len(sessions), "active": active, "completed": completed,
+		"flagged": flagged, "total_bytes_recorded": totalBytes,
+		"uptime_seconds": int(time.Since(startTime).Seconds()),
 	})
 }
 
-// ─── Standard Infrastructure ────────────────────────────────────────────────
 var healthyFlag int32 = 1; var lastActivity int64
 func healthzHandler(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]interface{}{"status": "healthy", "service": serviceName}) }
 func livezHandler(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "alive"}) }
-func readyzHandler(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "ready"}) }
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil { w.WriteHeader(503); json.NewEncoder(w).Encode(map[string]string{"status": "not_ready"}); return }
+	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
 func startWatchdog() { atomic.StoreInt64(&lastActivity, time.Now().Unix()); go func() { for { time.Sleep(15*time.Second); if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 60 { atomic.StoreInt32(&healthyFlag, 0) } else { atomic.StoreInt32(&healthyFlag, 1) } } }() }
 func recordActivity() { atomic.StoreInt64(&lastActivity, time.Now().Unix()) }
 type EventBusImpl struct { topic, source string; mu sync.Mutex; events []map[string]interface{} }
 func newEventBus(topic, source string) *EventBusImpl { return &EventBusImpl{topic: topic, source: source, events: make([]map[string]interface{}, 0)} }
-func (eb *EventBusImpl) Emit(eventType string, payload map[string]interface{}) { eb.mu.Lock(); defer eb.mu.Unlock(); eb.events = append(eb.events, map[string]interface{}{"event_type": eventType, "source": eb.source, "topic": eb.topic, "timestamp": time.Now().Format(time.RFC3339), "payload": payload}); log.Printf("[EventBus] %s → %s: %v", eb.topic, eventType, payload) }
+func (eb *EventBusImpl) Emit(eventType string, payload map[string]interface{}) { eb.mu.Lock(); defer eb.mu.Unlock(); eb.events = append(eb.events, map[string]interface{}{"event_type": eventType, "source": eb.source, "topic": eb.topic, "timestamp": time.Now().Format(time.RFC3339), "payload": payload}); log.Printf("[EventBus] %s -> %s", eb.topic, eventType) }
 func loggingMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { recordActivity(); start := time.Now(); next.ServeHTTP(w, r); log.Printf("[%s] %s %s %s", serviceName, r.Method, r.URL.Path, time.Since(start)) }) }
 func rateLimitMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { acquireSem(); defer releaseSem(); next.ServeHTTP(w, r) }) }
 func panicMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { defer func() { if err := recover(); err != nil { log.Printf("[PANIC] %v", err); http.Error(w, "internal error", 500) } }(); next.ServeHTTP(w, r) }) }
@@ -232,15 +258,22 @@ func panicMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w ht
 func main() {
 	port := os.Getenv("PORT"); if port == "" { port = "8080" }
 	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL != "" { var err error; db, err = sql.Open("postgres", dbURL); if err != nil { log.Printf("[session-recorder] DB: %v", err) } }
+	if dbURL != "" {
+		var err error; db, err = sql.Open("postgres", dbURL)
+		if err != nil { log.Printf("[session-recorder] DB: %v", err)
+		} else {
+			db.SetMaxOpenConns(25); db.SetMaxIdleConns(5); db.SetConnMaxLifetime(5*time.Minute)
+			if err := db.Ping(); err != nil { log.Printf("[session-recorder] DB ping: %v", err) } else { initSchema() }
+		}
+	} else { log.Println("[session-recorder] WARNING: DATABASE_URL not set") }
 	startWatchdog()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler); mux.HandleFunc("/livez", livezHandler); mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/api/v1/sessions/start", handleStartRecording)
-	mux.HandleFunc("/api/v1/sessions/command", handleRecordCommand)
-	mux.HandleFunc("/api/v1/sessions/end", handleEndRecording)
-	mux.HandleFunc("/api/v1/sessions/list", handleListSessions)
-	mux.HandleFunc("/api/v1/sessions/stats", handleStats)
+	mux.HandleFunc("/api/v1/session/start", handleStartSession)
+	mux.HandleFunc("/api/v1/session/record", handleRecordCommand)
+	mux.HandleFunc("/api/v1/session/end", handleEndSession)
+	mux.HandleFunc("/api/v1/session/list", handleListSessions)
+	mux.HandleFunc("/api/v1/session/stats", handleStats)
 	handler := panicMW(rateLimitMW(loggingMW(mux)))
 	srv := &http.Server{Addr: ":" + port, Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
 	go func() { log.Printf("[session-recorder] Starting on :%s", port); if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatal(err) } }()
