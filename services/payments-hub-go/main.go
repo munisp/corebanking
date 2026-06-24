@@ -13,15 +13,17 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"crypto/sha256"
 
 	_ "github.com/lib/pq"
-		"os/signal"
-	"syscall"
+	"github.com/redis/go-redis/v9"
 )
 
 var (
@@ -106,33 +108,76 @@ func initDB() {
 
 // --- Idempotency Middleware (Redis-backed) ---
 
-type IdempotencyStore struct {
-	mu    sync.RWMutex
-	cache map[string]cachedResponse
+var redisClient *redis.Client
+
+func initRedis() {
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "localhost:6379"
+	}
+	redisClient = redis.NewClient(&redis.Options{
+		Addr:         redisURL,
+		Password:     os.Getenv("REDIS_PASSWORD"),
+		DB:           0,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		PoolSize:     25,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Printf("[%s] Redis connection failed: %v — idempotency will use PostgreSQL fallback", serviceName, err)
+		redisClient = nil
+	} else {
+		log.Printf("[%s] Redis connected for idempotency", serviceName)
+	}
 }
 
 type cachedResponse struct {
-	Status int
-	Body   []byte
-	Expiry time.Time
+	Status int    `json:"status"`
+	Body   []byte `json:"body"`
 }
 
-var idempotencyStore = &IdempotencyStore{cache: make(map[string]cachedResponse)}
-
-func (s *IdempotencyStore) Get(key string) (cachedResponse, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	resp, ok := s.cache[key]
-	if !ok || time.Now().After(resp.Expiry) {
-		return cachedResponse{}, false
+func idempotencyGet(key string) (cachedResponse, bool) {
+	ctx := context.Background()
+	prefix := "idempotency:" + key
+	if redisClient != nil {
+		vals, err := redisClient.MGet(ctx, prefix+":status", prefix+":body").Result()
+		if err != nil || vals[0] == nil {
+			return cachedResponse{}, false
+		}
+		status, _ := strconv.Atoi(vals[0].(string))
+		body := []byte(vals[1].(string))
+		return cachedResponse{Status: status, Body: body}, true
 	}
-	return resp, true
+	if db != nil {
+		var status int
+		var body []byte
+		err := db.QueryRow("SELECT status_code, response_body FROM payments_hub_idempotency WHERE idempotency_key = $1 AND expires_at > NOW()", key).Scan(&status, &body)
+		if err == nil {
+			return cachedResponse{Status: status, Body: body}, true
+		}
+	}
+	return cachedResponse{}, false
 }
 
-func (s *IdempotencyStore) Set(key string, status int, body []byte, ttl time.Duration) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.cache[key] = cachedResponse{Status: status, Body: body, Expiry: time.Now().Add(ttl)}
+func idempotencySet(key string, status int, body []byte, ttl time.Duration) {
+	ctx := context.Background()
+	prefix := "idempotency:" + key
+	if redisClient != nil {
+		pipe := redisClient.Pipeline()
+		pipe.Set(ctx, prefix+":status", strconv.Itoa(status), ttl)
+		pipe.Set(ctx, prefix+":body", string(body), ttl)
+		if _, err := pipe.Exec(ctx); err != nil {
+			log.Printf("[%s] Redis idempotency SET error: %v", serviceName, err)
+		}
+		return
+	}
+	if db != nil {
+		db.Exec("INSERT INTO payments_hub_idempotency (idempotency_key, status_code, response_body, expires_at) VALUES ($1, $2, $3, NOW() + $4::interval) ON CONFLICT (idempotency_key) DO NOTHING",
+			key, status, body, fmt.Sprintf("%d seconds", int(ttl.Seconds())))
+	}
 }
 
 type responseRecorder struct {
@@ -162,7 +207,7 @@ func idempotencyMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if cached, ok := idempotencyStore.Get(key); ok {
+		if cached, ok := idempotencyGet(key); ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Idempotent-Replayed", "true")
 			w.WriteHeader(cached.Status)
@@ -171,7 +216,7 @@ func idempotencyMiddleware(next http.Handler) http.Handler {
 		}
 		rec := &responseRecorder{ResponseWriter: w, status: 200}
 		next.ServeHTTP(rec, r)
-		idempotencyStore.Set(key, rec.status, rec.body.Bytes(), 24*time.Hour)
+		idempotencySet(key, rec.status, rec.body.Bytes(), 24*time.Hour)
 	})
 }
 
@@ -711,6 +756,7 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" { port = "8100" }
 	initDB()
+	initRedis()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
@@ -768,7 +814,7 @@ func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
 	eb.mu.Lock()
 	eb.buffer = append(eb.buffer, event)
 	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
+	// DEFERRED: Kafka integration requires sarama.SyncProducer
 	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
 }
 
@@ -825,7 +871,7 @@ func (ec *EventConsumer) OnMessage(handler func(topic string, key string, value 
 
 func (ec *EventConsumer) Start() {
 	log.Printf("[EventConsumer] %s subscribing to %v", ec.groupID, ec.topics)
-	// In production: sarama.ConsumerGroup with rebalance strategy
+	// DEFERRED: Kafka consumer requires sarama.ConsumerGroup
 }
 
 var eventConsumer = newEventConsumer([]string{"banking.lending", "compliance.screening"}, serviceName)

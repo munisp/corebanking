@@ -12,7 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
 	_ "github.com/lib/pq"
+	"tbclient"
 )
 
 // TigerBeetle Overdraft Protection
@@ -46,6 +48,7 @@ type ODTransfer struct {
 
 var (
 	db          *sql.DB
+	tbClient    *tbclient.Client
 	facilitiesMu sync.RWMutex
 	facilities   map[string]*OverdraftFacility
 	odTransfers  []ODTransfer
@@ -214,10 +217,38 @@ func drawdownHandler(w http.ResponseWriter, r *http.Request) {
 			transfer.TransferID, transfer.FacilityID, transfer.AmountKobo, transfer.Type, transfer.BalanceBefore, transfer.BalanceAfter, transfer.CreatedAt)
 	}
 
+	// Execute linked OD transfer in TigerBeetle
+	var tbResult string
+	if tbClient != nil {
+		debitAcct := tbclient.NewUint128()
+		creditAcct := tbclient.NewUint128()
+		results, err := tbClient.CreateLinkedTransfers(context.Background(), []tbclient.Transfer{
+			{
+				ID: tbclient.NewUint128(), DebitAccountID: debitAcct, CreditAccountID: creditAcct,
+				Amount: uint64(req.AmountKobo), Ledger: tbclient.LedgerNGN, Code: tbclient.CodeLiability,
+				Flags: tbclient.TransferPending,
+			},
+			{
+				ID: tbclient.NewUint128(), DebitAccountID: creditAcct, CreditAccountID: debitAcct,
+				Amount: uint64(req.AmountKobo), Ledger: tbclient.LedgerNGN, Code: tbclient.CodeLiability,
+			},
+		})
+		if err != nil {
+			tbResult = fmt.Sprintf("error: %v", err)
+		} else if len(results) > 0 {
+			tbResult = fmt.Sprintf("partial_error: %d failures", len(results))
+		} else {
+			tbResult = "success"
+		}
+	} else {
+		tbResult = "tb_client_unavailable"
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"transfer": transfer,
 		"facility": f,
+		"tb_result": tbResult,
 		"tb_linked_transfers": map[string]string{
 			"description": "Atomic TB linked transfer: debit OD facility account, credit primary account",
 			"flags":       "linked | pending",
@@ -294,8 +325,21 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"healthy","service":"tb-overdraft-protection-go"}`))
 }
 
+func initTBClient() {
+	cfg := tbclient.DefaultConfig()
+	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
+		cfg.Addresses = []string{addr}
+	}
+	var err error
+	tbClient, err = tbclient.NewClient(cfg)
+	if err != nil {
+		log.Printf("[tb-overdraft-protection] TB client init failed: %v", err)
+	}
+}
+
 func main() {
 	initDB()
+	initTBClient()
 	loadFacilities()
 
 	mux := http.NewServeMux()

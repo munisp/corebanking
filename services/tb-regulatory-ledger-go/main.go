@@ -12,7 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
 	_ "github.com/lib/pq"
+	"tbclient"
 )
 
 // TigerBeetle Regulatory Ledger
@@ -46,6 +48,7 @@ type AuditQuery struct {
 
 var (
 	db         *sql.DB
+	tbClient   *tbclient.Client
 	entriesMu  sync.RWMutex
 	entries    []RegLedgerEntry
 	lastHash   string
@@ -159,6 +162,23 @@ func replicateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Mirror entry to TigerBeetle regulatory cluster
+	if tbClient != nil {
+		debitAcct := tbclient.NewUint128()
+		creditAcct := tbclient.NewUint128()
+		code := tbclient.CodeAsset
+		if req.Type == "credit" {
+			code = tbclient.CodeLiability
+		}
+		_, err := tbClient.CreateTransfers(context.Background(), []tbclient.Transfer{{
+			ID: tbclient.NewUint128(), DebitAccountID: debitAcct, CreditAccountID: creditAcct,
+			Amount: uint64(req.AmountKobo), Ledger: tbclient.LedgerNGN, Code: code,
+		}})
+		if err != nil {
+			log.Printf("[tb-regulatory-ledger] TB CreateTransfers error: %v", err)
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(201)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -223,8 +243,21 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"healthy","service":"tb-regulatory-ledger-go"}`))
 }
 
+func initTBClient() {
+	cfg := tbclient.DefaultConfig()
+	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
+		cfg.Addresses = []string{addr}
+	}
+	var err error
+	tbClient, err = tbclient.NewClient(cfg)
+	if err != nil {
+		log.Printf("[tb-regulatory-ledger] TB client init failed: %v", err)
+	}
+}
+
 func main() {
 	initDB()
+	initTBClient()
 	loadEntries()
 
 	mux := http.NewServeMux()

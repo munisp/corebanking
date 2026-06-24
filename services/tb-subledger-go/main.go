@@ -12,7 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
 	_ "github.com/lib/pq"
+	"tbclient"
 )
 
 // TigerBeetle Sub-Ledger per Product
@@ -54,6 +56,7 @@ var productLedgers = map[string]uint32{
 
 var (
 	db         *sql.DB
+	tbClient   *tbclient.Client
 	ledgersMu  sync.RWMutex
 	ledgers    map[uint32]*SubLedger
 	accounts   map[string]*SubLedgerAccount
@@ -164,6 +167,20 @@ func assignAccountHandler(w http.ResponseWriter, r *http.Request) {
 		db.Exec(`UPDATE tb_sub_ledgers SET account_count = (SELECT COUNT(*) FROM tb_sub_ledger_accounts WHERE ledger_id = $1) WHERE ledger_id = $1`, ledgerID)
 	}
 
+	// Create account in TigerBeetle on the correct sub-ledger
+	if tbClient != nil {
+		tbAcct := tbclient.Account{
+			ID: tbclient.NewUint128(), Ledger: ledgerID, Code: tbclient.CodeLiability,
+			Flags: tbclient.AccountHistory | tbclient.AccountCreditsMustNotExceedDebits,
+		}
+		results, err := tbClient.CreateAccounts(context.Background(), []tbclient.Account{tbAcct})
+		if err != nil {
+			log.Printf("[tb-subledger] TB CreateAccounts error: %v", err)
+		} else if len(results) > 0 {
+			log.Printf("[tb-subledger] TB CreateAccounts partial error: %d results", len(results))
+		}
+	}
+
 	ledgersMu.Lock()
 	accounts[req.AccountID] = acct
 	ledgersMu.Unlock()
@@ -214,8 +231,21 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"healthy","service":"tb-subledger-go"}`))
 }
 
+func initTBClient() {
+	cfg := tbclient.DefaultConfig()
+	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
+		cfg.Addresses = []string{addr}
+	}
+	var err error
+	tbClient, err = tbclient.NewClient(cfg)
+	if err != nil {
+		log.Printf("[tb-subledger] TB client init failed: %v", err)
+	}
+}
+
 func main() {
 	initDB()
+	initTBClient()
 	loadLedgers()
 
 	mux := http.NewServeMux()

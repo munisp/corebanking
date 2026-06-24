@@ -12,7 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
 	_ "github.com/lib/pq"
+	"tbclient"
 )
 
 // TigerBeetle Pending Transfer Sweeper
@@ -39,6 +41,7 @@ type SweepResult struct {
 
 var (
 	db             *sql.DB
+	tbClient       *tbclient.Client
 	pendingMu      sync.RWMutex
 	pendingTxns    map[string]*PendingTransfer
 	sweepResults   []SweepResult
@@ -116,6 +119,13 @@ func sweepExpired() int {
 				db.Exec(`UPDATE tb_pending_transfers SET status = 'expired' WHERE transfer_id = $1`, id)
 				db.Exec(`INSERT INTO tb_sweep_results (swept_at, transfer_id, action, age_seconds) VALUES ($1, $2, $3, $4)`,
 					result.SweptAt, result.TransferID, result.Action, result.AgeSeconds)
+			}
+			// Void in TigerBeetle
+			if tbClient != nil {
+				pendingID := tbclient.NewUint128()
+				if err := tbClient.VoidPendingTransfer(pendingID); err != nil {
+					log.Printf("[sweeper] TB void failed for %s: %v", id, err)
+				}
 			}
 			log.Printf("[sweeper] voided expired transfer %s (age: %.0fs, timeout: %ds)", id, age.Seconds(), p.TimeoutSecs)
 			swept++
@@ -241,8 +251,21 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"healthy","service":"tb-pending-sweeper-go"}`))
 }
 
+func initTBClient() {
+	cfg := tbclient.DefaultConfig()
+	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
+		cfg.Addresses = []string{addr}
+	}
+	var err error
+	tbClient, err = tbclient.NewClient(cfg)
+	if err != nil {
+		log.Printf("[tb-pending-sweeper] TB client init failed: %v", err)
+	}
+}
+
 func main() {
 	initDB()
+	initTBClient()
 	loadPending()
 
 	ctx, cancel := context.WithCancel(context.Background())

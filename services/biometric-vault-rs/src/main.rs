@@ -2,27 +2,22 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Mutex;
+use std::sync::Arc;
 use std::env;
 use sha2::{Sha256, Digest};
 use chrono::Utc;
 use uuid::Uuid;
-
-// Biometric Vault — ISO 24745 Cancelable Biometric Template Protection
-// Templates are never stored raw. Uses salted hashing + AES-256-GCM encryption.
-// If compromised, templates can be revoked and re-enrolled with a new salt.
+use tokio_postgres::NoTls;
 
 struct AppState {
-    db_url: Option<String>,
-    templates: Mutex<Vec<serde_json::Value>>,
-    match_logs: Mutex<Vec<serde_json::Value>>,
+    db: Option<Arc<tokio_postgres::Client>>,
 }
 
 #[derive(Deserialize)]
 struct EnrollRequest {
     user_id: String,
-    modality: String,   // "face", "fingerprint", "voice", "iris"
-    template_data: String, // base64-encoded raw template from SDK
+    modality: String,
+    template_data: String,
     quality_score: f64,
 }
 
@@ -30,7 +25,7 @@ struct EnrollRequest {
 struct MatchRequest {
     user_id: String,
     modality: String,
-    probe_template: String, // base64-encoded probe template
+    probe_template: String,
     threshold: Option<f64>,
 }
 
@@ -46,7 +41,6 @@ fn cancelable_transform(template_data: &str, salt: &str, user_id: &str) -> Strin
     hasher.update(template_data.as_bytes());
     hasher.update(salt.as_bytes());
     hasher.update(user_id.as_bytes());
-    // Multi-round hashing for cancelability
     let mut result = hasher.finalize();
     for _ in 0..1000 {
         let mut h = Sha256::new();
@@ -70,19 +64,15 @@ async fn enroll(body: web::Json<EnrollRequest>, state: web::Data<AppState>) -> H
     let salt = generate_salt();
     let protected = cancelable_transform(&body.template_data, &salt, &body.user_id);
     let template_id = Uuid::new_v4().to_string();
-    let entry = json!({
-        "template_id": template_id,
-        "user_id": body.user_id,
-        "modality": body.modality,
-        "protected_template": protected,
-        "salt": salt,
-        "quality_score": body.quality_score,
-        "version": 1,
-        "status": "active",
-        "enrolled_at": Utc::now().to_rfc3339(),
-        "protection_scheme": "ISO_24745_CANCELABLE_SHA256_1000R",
-    });
-    state.templates.lock().unwrap().push(entry.clone());
+    let now = Utc::now().to_rfc3339();
+
+    if let Some(ref db) = state.db {
+        let _ = db.execute(
+            "INSERT INTO biometric_templates (template_id, user_id, modality, protected_template, salt, quality_score, version, status, enrolled_at) VALUES ($1, $2, $3, $4, $5, $6, 1, 'active', $7)",
+            &[&template_id, &body.user_id, &body.modality, &protected, &salt, &body.quality_score, &now],
+        ).await;
+    }
+
     HttpResponse::Created().json(json!({
         "template_id": template_id,
         "modality": body.modality,
@@ -93,70 +83,100 @@ async fn enroll(body: web::Json<EnrollRequest>, state: web::Data<AppState>) -> H
 }
 
 async fn verify(body: web::Json<MatchRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let templates = state.templates.lock().unwrap();
-    let user_templates: Vec<&serde_json::Value> = templates.iter()
-        .filter(|t| t["user_id"].as_str() == Some(&body.user_id) && t["modality"].as_str() == Some(&body.modality) && t["status"].as_str() == Some("active"))
-        .collect();
-    if user_templates.is_empty() {
-        return HttpResponse::NotFound().json(json!({"error": "no enrolled template found", "user_id": body.user_id, "modality": body.modality}));
-    }
     let threshold = body.threshold.unwrap_or(0.85);
-    let enrolled = &user_templates[0];
-    let salt = enrolled["salt"].as_str().unwrap_or("");
-    let probe_protected = cancelable_transform(&body.probe_template, salt, &body.user_id);
-    let enrolled_protected = enrolled["protected_template"].as_str().unwrap_or("");
-    
-    // Compare protected templates (in production: Hamming distance on binary embeddings)
-    let matched = probe_protected == enrolled_protected;
-    let confidence = if matched { 0.99 } else { 0.15 };
-    let decision = if matched && confidence >= threshold { "MATCH" } else { "NO_MATCH" };
 
-    let log_entry = json!({
-        "match_id": Uuid::new_v4().to_string(),
-        "user_id": body.user_id,
-        "modality": body.modality,
-        "decision": decision,
-        "confidence": confidence,
-        "threshold": threshold,
-        "timestamp": Utc::now().to_rfc3339(),
-    });
-    state.match_logs.lock().unwrap().push(log_entry);
-    
-    HttpResponse::Ok().json(json!({
-        "decision": decision,
-        "confidence": confidence,
-        "threshold": threshold,
-        "modality": body.modality,
-        "raw_template_accessed": false,
-        "protection_scheme": "ISO_24745_CANCELABLE_SHA256_1000R",
-    }))
+    if let Some(ref db) = state.db {
+        let rows = db.query(
+            "SELECT protected_template, salt FROM biometric_templates WHERE user_id = $1 AND modality = $2 AND status = 'active' ORDER BY enrolled_at DESC LIMIT 1",
+            &[&body.user_id, &body.modality],
+        ).await;
+
+        match rows {
+            Ok(ref rows) if !rows.is_empty() => {
+                let enrolled_protected: String = rows[0].get(0);
+                let salt: String = rows[0].get(1);
+                let probe_protected = cancelable_transform(&body.probe_template, &salt, &body.user_id);
+                let matched = probe_protected == enrolled_protected;
+                let confidence = if matched { 0.99 } else { 0.15 };
+                let decision = if matched && confidence >= threshold { "MATCH" } else { "NO_MATCH" };
+
+                let match_id = Uuid::new_v4().to_string();
+                let now = Utc::now().to_rfc3339();
+                let _ = db.execute(
+                    "INSERT INTO biometric_match_logs (match_id, user_id, modality, decision, confidence, threshold, matched_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                    &[&match_id, &body.user_id, &body.modality, &decision.to_string(), &confidence, &threshold, &now],
+                ).await;
+
+                return HttpResponse::Ok().json(json!({
+                    "decision": decision,
+                    "confidence": confidence,
+                    "threshold": threshold,
+                    "modality": body.modality,
+                    "raw_template_accessed": false,
+                    "protection_scheme": "ISO_24745_CANCELABLE_SHA256_1000R",
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    HttpResponse::NotFound().json(json!({"error": "no enrolled template found", "user_id": body.user_id, "modality": body.modality}))
 }
 
 async fn revoke(body: web::Json<RevokeRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let mut templates = state.templates.lock().unwrap();
-    let mut revoked = 0;
-    for t in templates.iter_mut() {
-        if t["user_id"].as_str() == Some(&body.user_id) && t["modality"].as_str() == Some(&body.modality) {
-            t["status"] = json!("revoked");
-            t["revoked_at"] = json!(Utc::now().to_rfc3339());
-            t["revoke_reason"] = json!(body.reason);
-            revoked += 1;
-        }
+    let mut revoked: i64 = 0;
+    if let Some(ref db) = state.db {
+        let now = Utc::now().to_rfc3339();
+        let result = db.execute(
+            "UPDATE biometric_templates SET status = 'revoked', revoked_at = $1, revoke_reason = $2 WHERE user_id = $3 AND modality = $4 AND status = 'active'",
+            &[&now, &body.reason, &body.user_id, &body.modality],
+        ).await;
+        if let Ok(n) = result { revoked = n as i64; }
     }
     HttpResponse::Ok().json(json!({"revoked": revoked, "user_id": body.user_id, "note": "user can re-enroll with new salt — old templates are permanently invalidated"}))
 }
 
-async fn healthz() -> HttpResponse {
-    HttpResponse::Ok().json(json!({"status": "healthy", "service": "biometric-vault-rs", "version": "1.0.0", "protection": "ISO_24745", "encryption": "AES-256-GCM"}))
+async fn healthz(state: web::Data<AppState>) -> HttpResponse {
+    let db_status = if let Some(ref db) = state.db {
+        match db.execute("SELECT 1", &[]).await { Ok(_) => "connected", Err(_) => "unhealthy" }
+    } else { "not_configured" };
+    HttpResponse::Ok().json(json!({"status": "healthy", "service": "biometric-vault-rs", "version": "1.0.0", "database": db_status, "protection": "ISO_24745", "encryption": "AES-256-GCM"}))
+}
+
+async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
+    match tokio_postgres::connect(db_url, NoTls).await {
+        Ok((client, connection)) => {
+            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB error: {}", e); }});
+            let _ = client.batch_execute(
+                "CREATE TABLE IF NOT EXISTS biometric_templates (
+                    template_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, modality TEXT NOT NULL,
+                    protected_template TEXT NOT NULL, salt TEXT NOT NULL,
+                    quality_score DOUBLE PRECISION NOT NULL, version INTEGER NOT NULL DEFAULT 1,
+                    status TEXT NOT NULL DEFAULT 'active', enrolled_at TEXT NOT NULL,
+                    revoked_at TEXT, revoke_reason TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_bt_user ON biometric_templates(user_id, modality);
+                CREATE TABLE IF NOT EXISTS biometric_match_logs (
+                    match_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, modality TEXT NOT NULL,
+                    decision TEXT NOT NULL, confidence DOUBLE PRECISION NOT NULL,
+                    threshold DOUBLE PRECISION NOT NULL, matched_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_bml_user ON biometric_match_logs(user_id);",
+            ).await;
+            eprintln!("[biometric-vault-rs] PostgreSQL connected, schema ready");
+            Some(client)
+        }
+        Err(e) => { eprintln!("[biometric-vault-rs] DB connect failed: {}", e); None }
+    }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9032);
+    let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "host=localhost dbname=corebanking".to_string());
+    let db_client = init_db(&db_url).await;
     let state = web::Data::new(AppState {
-        db_url: env::var("DATABASE_URL").ok(),
-        templates: Mutex::new(Vec::new()),
-        match_logs: Mutex::new(Vec::new()),
+        db: db_client.map(Arc::new),
     });
     eprintln!("[biometric-vault-rs] Starting on :{}", port);
     HttpServer::new(move || {

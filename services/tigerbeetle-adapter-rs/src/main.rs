@@ -87,17 +87,36 @@ async fn tb_operation(req: actix_web::HttpRequest, state: web::Data<AppState>, b
 
 async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let records = state.records.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
-    let total = records.len();
-    let items: Vec<&serde_json::Value> = records.iter().skip((page-1)*limit).take(limit).collect();
-    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": if state.db_url.is_some() { "database" } else { "postgresql" }}))
+    let offset = (page - 1) * limit;
+    if let Some(ref client) = state.db_client {
+        let count_row = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = 'tigerbeetle-adapter-rs'", &[]).await;
+        let total: i64 = count_row.map(|r| r.get(0)).unwrap_or(0);
+        let rows = client.query(
+            "SELECT id, service, type, status, data, created_at FROM service_records WHERE service = 'tigerbeetle-adapter-rs' ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            &[&(limit as i64), &(offset as i64)],
+        ).await;
+        let items: Vec<serde_json::Value> = rows.unwrap_or_default().iter().map(|row| {
+            let id: String = row.get(0);
+            let svc: String = row.get(1);
+            let typ: String = row.get(2);
+            let status: String = row.get(3);
+            let data_str: String = row.get(4);
+            json!({"id": id, "service": svc, "type": typ, "status": status, "data": data_str})
+        }).collect();
+        return HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": "postgresql"}));
+    }
+    HttpResponse::Ok().json(json!({"items": [], "total": 0, "page": page, "source": "no_database"}))
 }
 
 async fn stats(state: web::Data<AppState>) -> HttpResponse {
-    let records = state.records.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    HttpResponse::Ok().json(json!({"total": records.len(), "service": "tigerbeetle-adapter-rs"}))
+    if let Some(ref client) = state.db_client {
+        let row = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = 'tigerbeetle-adapter-rs'", &[]).await;
+        let total: i64 = row.map(|r| r.get(0)).unwrap_or(0);
+        return HttpResponse::Ok().json(json!({"total": total, "service": "tigerbeetle-adapter-rs", "source": "postgresql"}));
+    }
+    HttpResponse::Ok().json(json!({"total": 0, "service": "tigerbeetle-adapter-rs", "source": "no_database"}))
 }
 
 
@@ -789,8 +808,6 @@ fn validate_amount(kobo: i64) -> bool {
     kobo > 0 && kobo <= MAX_AMOUNT
 }
 
-#[actix_web::main]
-async 
 // --- PII Masking (NDPR Compliance) ---
 fn mask_pii(value: &str, field_type: &str) -> String {
     if value.is_empty() { return "***".to_string(); }

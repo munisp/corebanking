@@ -1140,7 +1140,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
             fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
             return
         }
-        // In production: validate against Keycloak JWKS endpoint
+        // DEFERRED: Keycloak JWKS validation requires go-oidc or keycloak-go SDK
         // keycloakURL := os.Getenv("KEYCLOAK_URL")
         // Decode payload for claims
         r.Header.Set("X-User-Id", "validated")
@@ -2249,7 +2249,7 @@ func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
 	eb.mu.Lock()
 	eb.buffer = append(eb.buffer, event)
 	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
+	// DEFERRED: Kafka integration requires sarama.SyncProducer
 	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
 }
 

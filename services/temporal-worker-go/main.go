@@ -1013,7 +1013,7 @@ func ComputeCreditScore(ctx context.Context, borrowerID string) (*CreditScore, e
 
 func DisburseLoan(ctx context.Context, loanID, borrowerID string, amountKobo int64) error {
 	activity.RecordHeartbeat(ctx, fmt.Sprintf("disbursing loan %s: %d kobo to %s", loanID, amountKobo, borrowerID))
-	// In production: POST to payments-hub to execute the transfer via saga
+	// DEFERRED: requires live payments-hub endpoint for saga execution
 	// The saga handles: lock accounts → TigerBeetle 2PC → GL posting → event emission
 	log.Printf("[loan-disburse] Disbursing %d kobo for loan %s to borrower %s", amountKobo, loanID, borrowerID)
 	return nil
@@ -2207,7 +2207,7 @@ func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
 	eb.mu.Lock()
 	eb.buffer = append(eb.buffer, event)
 	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
+	// DEFERRED: Kafka integration requires sarama.SyncProducer
 	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
 }
 

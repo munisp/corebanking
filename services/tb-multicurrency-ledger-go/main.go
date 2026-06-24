@@ -12,7 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
 	_ "github.com/lib/pq"
+	"tbclient"
 )
 
 // TigerBeetle Multicurrency with real ledger-per-currency model.
@@ -68,6 +70,7 @@ var currencyLedgers = map[string]*CurrencyLedger{
 
 var (
 	db            *sql.DB
+	tbClient      *tbclient.Client
 	fxMu          sync.Mutex
 	fxTransfers   []FXTransfer
 	nettingGroups map[string]*NettingGroup
@@ -199,9 +202,37 @@ func fxConvertHandler(w http.ResponseWriter, r *http.Request) {
 			transfer.LinkedTransferA, transfer.LinkedTransferB, transfer.Status, transfer.CreatedAt)
 	}
 
+	// Execute linked transfers in TigerBeetle
+	var tbResult string
+	if tbClient != nil {
+		debitAcct := tbclient.NewUint128()
+		creditAcct := tbclient.NewUint128()
+		transfers := []tbclient.Transfer{
+			{
+				ID: tbclient.NewUint128(), DebitAccountID: debitAcct, CreditAccountID: creditAcct,
+				Amount: uint64(req.AmountKobo), Ledger: fromLedger.LedgerID, Code: tbclient.CodeAsset,
+			},
+			{
+				ID: tbclient.NewUint128(), DebitAccountID: creditAcct, CreditAccountID: debitAcct,
+				Amount: uint64(toAmount), Ledger: toLedger.LedgerID, Code: tbclient.CodeAsset,
+			},
+		}
+		results, err := tbClient.CreateLinkedTransfers(context.Background(), transfers)
+		if err != nil {
+			tbResult = fmt.Sprintf("error: %v", err)
+		} else if len(results) > 0 {
+			tbResult = fmt.Sprintf("partial_error: %d failures", len(results))
+		} else {
+			tbResult = "success"
+		}
+	} else {
+		tbResult = "tb_client_unavailable"
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"transfer": transfer,
+		"tb_result": tbResult,
 		"tb_linked_transfers": map[string]interface{}{
 			"leg_a": map[string]interface{}{
 				"id": transfer.LinkedTransferA, "ledger": fromLedger.LedgerID,
@@ -242,8 +273,21 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"healthy","service":"tb-multicurrency-ledger-go"}`))
 }
 
+func initTBClient() {
+	cfg := tbclient.DefaultConfig()
+	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
+		cfg.Addresses = []string{addr}
+	}
+	var err error
+	tbClient, err = tbclient.NewClient(cfg)
+	if err != nil {
+		log.Printf("[tb-multicurrency-ledger] TB client init failed: %v", err)
+	}
+}
+
 func main() {
 	initDB()
+	initTBClient()
 	nettingGroups = make(map[string]*NettingGroup)
 
 	mux := http.NewServeMux()

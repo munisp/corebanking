@@ -2,186 +2,296 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
+
 	_ "github.com/lib/pq"
 )
 
 var serviceName = "sanctions-streaming-go"
 
 type SanctionEntry struct {
-	ListSource  string   `json:"list_source"` // OFAC, EU, UN, UK, NFIU
-	EntityName  string   `json:"entity_name"`
-	EntityType  string   `json:"entity_type"` // individual, entity, vessel, aircraft
-	Aliases     []string `json:"aliases"`
-	DateOfBirth string   `json:"date_of_birth,omitempty"`
-	Nationality string   `json:"nationality,omitempty"`
-	Programs    []string `json:"programs"`
-	AddedDate   string   `json:"added_date"`
+	EntryID    string `json:"entry_id"`
+	ListSource string `json:"list_source"`
+	FullName   string `json:"full_name"`
+	AliasNames string `json:"alias_names"`
+	EntityType string `json:"entity_type"`
+	Country    string `json:"country"`
+	Programs   string `json:"programs"`
+	AddedDate  string `json:"added_date"`
 }
 
 type ScreenResult struct {
-	ScreenID   string  `json:"screen_id"`
-	QueryName  string  `json:"query_name"`
-	MatchScore float64 `json:"match_score"`
-	Matched    bool    `json:"matched"`
-	Matches    []struct {
-		Entry      SanctionEntry `json:"entry"`
-		Score      float64       `json:"score"`
-		MatchType  string        `json:"match_type"` // exact, fuzzy, alias, partial
-	} `json:"matches"`
-	ScreenedAt time.Time `json:"screened_at"`
-	ListsChecked []string `json:"lists_checked"`
+	ResultID      string    `json:"result_id"`
+	SubjectName   string    `json:"subject_name"`
+	SubjectType   string    `json:"subject_type"`
+	MatchedEntry  string    `json:"matched_entry"`
+	MatchScore    float64   `json:"match_score"`
+	ListSource    string    `json:"list_source"`
+	Status        string    `json:"status"`
+	ScreenedAt    time.Time `json:"screened_at"`
+	TransactionID string    `json:"transaction_id,omitempty"`
+	ReviewedBy    string    `json:"reviewed_by,omitempty"`
 }
 
 type App struct {
-	mu         sync.RWMutex
-	sanctions  []SanctionEntry
-	screenLogs []ScreenResult
+	db *sql.DB
 }
 
-var app = &App{
-	sanctions:  make([]SanctionEntry, 0),
-	screenLogs: make([]ScreenResult, 0),
+var app = &App{}
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://localhost:5432/corebanking?sslmode=disable"
+	}
+	var err error
+	app.db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[%s] DB connection failed: %v", serviceName, err)
+		return
+	}
+	app.db.SetMaxOpenConns(25)
+	app.db.SetMaxIdleConns(5)
+	app.db.SetConnMaxLifetime(5 * time.Minute)
+
+	schema := `CREATE TABLE IF NOT EXISTS sanction_entries (
+		entry_id TEXT PRIMARY KEY,
+		list_source TEXT NOT NULL,
+		full_name TEXT NOT NULL,
+		alias_names TEXT NOT NULL DEFAULT '',
+		entity_type TEXT NOT NULL DEFAULT 'individual',
+		country TEXT NOT NULL DEFAULT '',
+		programs TEXT NOT NULL DEFAULT '',
+		added_date TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX IF NOT EXISTS idx_sanctions_name ON sanction_entries(full_name);
+	CREATE INDEX IF NOT EXISTS idx_sanctions_source ON sanction_entries(list_source);
+
+	CREATE TABLE IF NOT EXISTS screen_results (
+		result_id TEXT PRIMARY KEY,
+		subject_name TEXT NOT NULL,
+		subject_type TEXT NOT NULL DEFAULT 'individual',
+		matched_entry TEXT NOT NULL DEFAULT '',
+		match_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+		list_source TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'clear',
+		screened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		transaction_id TEXT NOT NULL DEFAULT '',
+		reviewed_by TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX IF NOT EXISTS idx_screen_status ON screen_results(status);`
+	if _, err := app.db.Exec(schema); err != nil {
+		log.Printf("[%s] Schema init failed: %v", serviceName, err)
+	}
+
+	seedSanctions()
+	log.Printf("[%s] PostgreSQL connected, schema ready", serviceName)
 }
 
-func init() {
-	// Seed sample sanctions entries
-	app.sanctions = []SanctionEntry{
-		{ListSource: "OFAC", EntityName: "AL-QAIDA", EntityType: "entity", Programs: []string{"SDGT"}, AddedDate: "2001-10-12"},
-		{ListSource: "UN", EntityName: "BOKO HARAM", EntityType: "entity", Programs: []string{"UN_1267"}, AddedDate: "2014-05-22"},
-		{ListSource: "NFIU", EntityName: "SUSPECT COMPANY LTD", EntityType: "entity", Programs: []string{"NFIU_TF"}, AddedDate: "2025-03-15"},
-		{ListSource: "EU", EntityName: "SANCTIONED BANK PLC", EntityType: "entity", Programs: []string{"EU_SANCTIONS"}, AddedDate: "2024-01-01"},
+func seedSanctions() {
+	if app.db == nil {
+		return
+	}
+	seeds := []SanctionEntry{
+		{"OFAC-001", "OFAC_SDN", "Test Sanctioned Person", "TSP", "individual", "NG", "SDGT", "2024-01-01"},
+		{"EU-001", "EU_SANCTIONS", "Test EU Entity", "", "entity", "RU", "UKRAINE_CRISIS", "2024-03-01"},
+		{"UN-001", "UN_CONSOLIDATED", "Test UN Listed", "TUL", "individual", "SY", "UN_1267", "2023-06-15"},
+		{"NFIU-001", "NFIU_WATCHLIST", "Test NFIU Person", "", "individual", "NG", "NFIU_DOMESTIC", "2024-06-01"},
+		{"OFAC-002", "OFAC_SDN", "Test Corporation", "TC,TestCo", "entity", "IR", "IRAN_TRA", "2024-02-15"},
+	}
+	for _, s := range seeds {
+		app.db.Exec(`INSERT INTO sanction_entries (entry_id, list_source, full_name, alias_names, entity_type, country, programs, added_date)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (entry_id) DO NOTHING`,
+			s.EntryID, s.ListSource, s.FullName, s.AliasNames, s.EntityType, s.Country, s.Programs, s.AddedDate)
 	}
 }
 
-func fuzzyMatch(query, target string) float64 {
-	q := strings.ToLower(strings.TrimSpace(query))
-	t := strings.ToLower(strings.TrimSpace(target))
-	if q == t { return 1.0 }
-	if strings.Contains(t, q) || strings.Contains(q, t) { return 0.85 }
-	// Simple Jaccard similarity on words
-	qWords := strings.Fields(q)
-	tWords := strings.Fields(t)
-	if len(qWords) == 0 || len(tWords) == 0 { return 0 }
-	intersection := 0
-	for _, qw := range qWords {
-		for _, tw := range tWords {
-			if qw == tw { intersection++; break }
-		}
-	}
-	union := len(qWords) + len(tWords) - intersection
-	if union == 0 { return 0 }
-	return float64(intersection) / float64(union)
-}
-
-func screenHandler(w http.ResponseWriter, r *http.Request) {
+func screenName(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Name        string   `json:"name"`
-		DateOfBirth string   `json:"date_of_birth,omitempty"`
-		Nationality string   `json:"nationality,omitempty"`
-		Lists       []string `json:"lists,omitempty"` // which lists to check
-		Threshold   float64  `json:"threshold,omitempty"`
+		Name          string `json:"name"`
+		SubjectType   string `json:"subject_type"`
+		TransactionID string `json:"transaction_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, 400, map[string]string{"error": "invalid request"})
 		return
 	}
-	threshold := req.Threshold
-	if threshold == 0 { threshold = 0.80 }
-	lists := req.Lists
-	if len(lists) == 0 { lists = []string{"OFAC", "EU", "UN", "UK", "NFIU"} }
+	if app.db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	if req.SubjectType == "" {
+		req.SubjectType = "individual"
+	}
 
-	app.mu.RLock()
-	var matches []struct {
-		Entry     SanctionEntry `json:"entry"`
-		Score     float64       `json:"score"`
-		MatchType string        `json:"match_type"`
+	rows, err := app.db.Query(`SELECT entry_id, list_source, full_name, alias_names, entity_type, country, programs FROM sanction_entries`)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "query failed"})
+		return
 	}
-	for _, entry := range app.sanctions {
-		listMatch := false
-		for _, l := range lists { if l == entry.ListSource { listMatch = true; break } }
-		if !listMatch { continue }
-		
-		score := fuzzyMatch(req.Name, entry.EntityName)
-		matchType := "none"
-		if score >= 1.0 { matchType = "exact" } else if score >= 0.85 { matchType = "fuzzy" } else if score >= threshold { matchType = "partial" }
-		
-		// Also check aliases
-		for _, alias := range entry.Aliases {
-			aliasScore := fuzzyMatch(req.Name, alias)
-			if aliasScore > score { score = aliasScore; matchType = "alias" }
-		}
-		
-		if score >= threshold {
-			matches = append(matches, struct {
-				Entry     SanctionEntry `json:"entry"`
-				Score     float64       `json:"score"`
-				MatchType string        `json:"match_type"`
-			}{entry, score, matchType})
-		}
-	}
-	app.mu.RUnlock()
+	defer rows.Close()
 
-	result := ScreenResult{
-		ScreenID:     fmt.Sprintf("SCR-%d", time.Now().UnixNano()),
-		QueryName:    req.Name,
-		MatchScore:   0,
-		Matched:      len(matches) > 0,
-		ScreenedAt:   time.Now(),
-		ListsChecked: lists,
+	var matches []map[string]interface{}
+	nameUpper := strings.ToUpper(req.Name)
+	for rows.Next() {
+		var e SanctionEntry
+		if err := rows.Scan(&e.EntryID, &e.ListSource, &e.FullName, &e.AliasNames, &e.EntityType, &e.Country, &e.Programs); err != nil {
+			continue
+		}
+		score := fuzzyMatch(nameUpper, strings.ToUpper(e.FullName))
+		aliasScore := 0.0
+		if e.AliasNames != "" {
+			for _, alias := range strings.Split(e.AliasNames, ",") {
+				s := fuzzyMatch(nameUpper, strings.ToUpper(strings.TrimSpace(alias)))
+				if s > aliasScore {
+					aliasScore = s
+				}
+			}
+		}
+		if aliasScore > score {
+			score = aliasScore
+		}
+		if score >= 0.75 {
+			matches = append(matches, map[string]interface{}{
+				"entry_id": e.EntryID, "list_source": e.ListSource,
+				"matched_name": e.FullName, "match_score": score, "programs": e.Programs,
+			})
+		}
 	}
+
+	status := "clear"
 	if len(matches) > 0 {
-		result.MatchScore = matches[0].Score
+		status = "potential_match"
+		for _, m := range matches {
+			if m["match_score"].(float64) >= 0.95 {
+				status = "confirmed_match"
+				break
+			}
+		}
 	}
-	
-	app.mu.Lock()
-	app.screenLogs = append(app.screenLogs, result)
-	app.mu.Unlock()
 
-	status := 200
-	if len(matches) > 0 { status = 200 } // return 200 but with matched=true
+	resultID := fmt.Sprintf("SCR-%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%d", req.Name, time.Now().UnixNano()))))[0:22]
+	matchedEntry := ""
+	matchScore := 0.0
+	listSource := ""
+	if len(matches) > 0 {
+		matchedEntry = matches[0]["matched_name"].(string)
+		matchScore = matches[0]["match_score"].(float64)
+		listSource = matches[0]["list_source"].(string)
+	}
 
-	respondJSON(w, status, map[string]interface{}{
-		"screen_id": result.ScreenID, "matched": result.Matched,
-		"match_count": len(matches), "highest_score": result.MatchScore,
-		"matches": matches, "lists_checked": lists,
-		"action": func() string { if result.Matched { return "BLOCK_AND_ESCALATE" }; return "ALLOW" }(),
+	app.db.Exec(`INSERT INTO screen_results (result_id, subject_name, subject_type, matched_entry, match_score, list_source, status, screened_at, transaction_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		resultID, req.Name, req.SubjectType, matchedEntry, matchScore, listSource, status, time.Now(), req.TransactionID)
+
+	respondJSON(w, 200, map[string]interface{}{
+		"result_id": resultID, "subject_name": req.Name,
+		"status": status, "matches_count": len(matches),
+		"matches": matches, "screened_at": time.Now().Format(time.RFC3339),
+		"action_required": status != "clear",
 	})
 }
 
+func fuzzyMatch(a, b string) float64 {
+	if a == b {
+		return 1.0
+	}
+	if strings.Contains(a, b) || strings.Contains(b, a) {
+		shorter := len(a)
+		if len(b) < shorter {
+			shorter = len(b)
+		}
+		longer := len(a)
+		if len(b) > longer {
+			longer = len(b)
+		}
+		return float64(shorter) / float64(longer)
+	}
+	common := 0
+	for _, c := range a {
+		if strings.ContainsRune(b, c) {
+			common++
+		}
+	}
+	return float64(common) / float64(len(a)+len(b)) * 2
+}
+
+func getScreenHistory(w http.ResponseWriter, r *http.Request) {
+	if app.db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	rows, err := app.db.Query(`SELECT result_id, subject_name, subject_type, matched_entry, match_score, list_source, status, screened_at, transaction_id
+		FROM screen_results ORDER BY screened_at DESC LIMIT 100`)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "query failed"})
+		return
+	}
+	defer rows.Close()
+	results := make([]ScreenResult, 0)
+	for rows.Next() {
+		var sr ScreenResult
+		if err := rows.Scan(&sr.ResultID, &sr.SubjectName, &sr.SubjectType, &sr.MatchedEntry, &sr.MatchScore, &sr.ListSource, &sr.Status, &sr.ScreenedAt, &sr.TransactionID); err != nil {
+			continue
+		}
+		results = append(results, sr)
+	}
+	respondJSON(w, 200, map[string]interface{}{"count": len(results), "results": results})
+}
+
 func healthz(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	defer app.mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"status": "healthy", "service": serviceName, "version": "1.0.0",
-		"sanctions_entries": len(app.sanctions), "lists": []string{"OFAC", "EU", "UN", "UK", "NFIU"},
+	dbStatus := "disconnected"
+	if app.db != nil {
+		if err := app.db.Ping(); err == nil {
+			dbStatus = "connected"
+		}
+	}
+	respondJSON(w, 200, map[string]interface{}{"status": "healthy", "service": serviceName, "version": "1.0.0", "database": dbStatus,
+		"lists": []string{"OFAC_SDN", "EU_SANCTIONS", "UN_CONSOLIDATED", "NFIU_WATCHLIST"},
 	})
 }
 
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json"); w.WriteHeader(code); json.NewEncoder(w).Encode(data)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(data)
 }
 
 func main() {
-	port := os.Getenv("PORT"); if port == "" { port = "9048" }
+	initDB()
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "9050"
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
-	mux.HandleFunc("/api/v1/sanctions/screen", screenHandler)
+	mux.HandleFunc("/api/v1/sanctions/screen", screenName)
+	mux.HandleFunc("/api/v1/sanctions/history", getScreenHistory)
 	srv := &http.Server{Addr: ":" + port, Handler: mux}
-	go func() { log.Printf("[%s] Starting on :%s", serviceName, port); if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatalf("[%s] error: %v", serviceName, err) } }()
-	quit := make(chan os.Signal, 1); signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM); <-quit
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second); defer cancel(); srv.Shutdown(ctx)
-	_ = context.Background; _ = net.Dial; _ = strings.NewReader; _ = atomic.AddInt64; _ = sync.Once{}
+	go func() {
+		log.Printf("[%s] Starting on :%s", serviceName, port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("[%s] error: %v", serviceName, err)
+		}
+	}()
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
+	if app.db != nil {
+		app.db.Close()
+	}
+	log.Printf("[%s] Shutdown complete", serviceName)
 }
-func init() { _ = sql.Drivers }

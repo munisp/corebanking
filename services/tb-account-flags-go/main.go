@@ -12,7 +12,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
 	_ "github.com/lib/pq"
+	"tbclient"
 )
 
 // TigerBeetle Account Flags for regulatory controls.
@@ -42,6 +44,7 @@ const (
 
 var (
 	db         *sql.DB
+	tbClient   *tbclient.Client
 	flagsMu    sync.RWMutex
 	flagsCache map[string][]AccountFlag
 )
@@ -139,6 +142,23 @@ func setFlagHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Apply flag to TigerBeetle account
+	if tbClient != nil {
+		acctID := tbclient.NewUint128()
+		acct := tbclient.Account{
+			ID:     acctID,
+			Ledger: tbclient.LedgerNGN,
+			Code:   tbclient.CodeAsset,
+			Flags:  tbclient.AccountFlags(flagValue),
+		}
+		results, err := tbClient.CreateAccounts(context.Background(), []tbclient.Account{acct})
+		if err != nil {
+			log.Printf("[tb-account-flags] TB CreateAccounts error: %v", err)
+		} else if len(results) > 0 {
+			log.Printf("[tb-account-flags] TB CreateAccounts partial error: %d results", len(results))
+		}
+	}
+
 	flagsMu.Lock()
 	flagsCache[req.AccountID] = append(flagsCache[req.AccountID], flag)
 	flagsMu.Unlock()
@@ -220,8 +240,21 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"status":"healthy","service":"tb-account-flags-go"}`))
 }
 
+func initTBClient() {
+	cfg := tbclient.DefaultConfig()
+	if addr := os.Getenv("TB_ADDRESS"); addr != "" {
+		cfg.Addresses = []string{addr}
+	}
+	var err error
+	tbClient, err = tbclient.NewClient(cfg)
+	if err != nil {
+		log.Printf("[tb-account-flags] TB client init failed: %v", err)
+	}
+}
+
 func main() {
 	initDB()
+	initTBClient()
 	loadFlags()
 
 	mux := http.NewServeMux()

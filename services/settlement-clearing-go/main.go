@@ -7,13 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -22,118 +18,139 @@ import (
 
 var serviceName = "settlement-clearing-go"
 
-// ── Position Types ──────────────────────────────────────────────────────────
-
 type NostroPosition struct {
-	BankCode      string `json:"bank_code"`
-	BankName      string `json:"bank_name"`
-	BalanceKobo   int64  `json:"balance_kobo"`
-	PendingDebit  int64  `json:"pending_debit_kobo"`
-	PendingCredit int64  `json:"pending_credit_kobo"`
-	AvailableKobo int64  `json:"available_kobo"`
+	PositionID    string    `json:"position_id"`
+	BankCode      string    `json:"bank_code"`
+	BankName      string    `json:"bank_name"`
+	BalanceKobo   int64     `json:"balance_kobo"`
+	Currency      string    `json:"currency"`
+	MaxLimitKobo  int64     `json:"max_limit_kobo"`
+	MinLimitKobo  int64     `json:"min_limit_kobo"`
 	LastUpdated   time.Time `json:"last_updated"`
-	AlertLevel    string `json:"alert_level"` // normal, low, critical
-}
-
-type SettlementBatch struct {
-	BatchID     string    `json:"batch_id"`
-	Type        string    `json:"type"` // RTGS, DNS, NIP
-	Status      string    `json:"status"` // open, closed, settling, settled, failed
-	OpenedAt    time.Time `json:"opened_at"`
-	ClosedAt    *time.Time `json:"closed_at,omitempty"`
-	Transactions int      `json:"transactions"`
-	NetAmountKobo int64   `json:"net_amount_kobo"`
-	Participants []string `json:"participants"`
 }
 
 type NIPTransfer struct {
-	TransferID    string `json:"transfer_id"`
-	SourceBank    string `json:"source_bank"`
-	DestBank      string `json:"dest_bank"`
-	AmountKobo    int64  `json:"amount_kobo"`
-	NarrationCode string `json:"narration_code"` // NIP reason codes
-	Status        string `json:"status"`
-	SettlementRef string `json:"settlement_ref"`
-	CreatedAt     time.Time `json:"created_at"`
+	TransferID     string    `json:"transfer_id"`
+	SourceBank     string    `json:"source_bank"`
+	DestBank       string    `json:"dest_bank"`
+	AmountKobo     int64     `json:"amount_kobo"`
+	SessionID      string    `json:"session_id"`
+	PaymentRef     string    `json:"payment_ref"`
+	NarrationCode  string    `json:"narration_code"`
+	Status         string    `json:"status"`
+	SettlementType string    `json:"settlement_type"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
-// NIP Reason Codes for reversals (CBN)
-var nipReasonCodes = map[string]string{
-	"R01": "Insufficient funds",
-	"R02": "Account closed",
-	"R03": "No account/unable to locate",
-	"R04": "Invalid account number",
-	"R05": "Unauthorized debit to customer",
-	"R06": "Returned per ODFI request",
-	"R07": "Authorization revoked by customer",
-	"R08": "Payment stopped",
-	"R09": "Uncollected funds",
-	"R10": "Customer advises not authorized",
-	"R11": "Check truncation entry return",
-	"R12": "Branch sold to another DFI",
-	"R13": "Invalid receiving DFI",
-	"R14": "Representative payee deceased",
-	"R15": "Beneficiary deceased",
-	"R16": "Account frozen",
-	"R17": "File record edit criteria",
-	"R20": "Non-transaction account",
-	"R21": "Invalid company identification",
-	"R22": "Invalid individual ID number",
-	"R23": "Credit entry refused by receiver",
-	"R24": "Duplicate entry",
-	"R29": "Corporate customer not authorized",
+type SettlementBatch struct {
+	BatchID        string    `json:"batch_id"`
+	BatchType      string    `json:"batch_type"`
+	TotalTransfers int       `json:"total_transfers"`
+	TotalKobo      int64     `json:"total_kobo"`
+	NetPositions   string    `json:"net_positions"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
+	SettledAt      *time.Time `json:"settled_at,omitempty"`
 }
 
 type App struct {
-	mu        sync.RWMutex
-	positions map[string]*NostroPosition
-	batches   []SettlementBatch
-	transfers []NIPTransfer
-	db        *sql.DB
+	db *sql.DB
 }
 
-var app = &App{
-	positions: make(map[string]*NostroPosition),
-	batches:   make([]SettlementBatch, 0),
-	transfers: make([]NIPTransfer, 0),
-}
+var app = &App{}
 
-// Seed Nigerian bank positions
-func init() {
-	banks := []struct{ code, name string; balKobo int64 }{
-		{"000001", "CBN Settlement", 50000000000},   // 500M NGN
-		{"000004", "First Bank", 10000000000},
-		{"000005", "FCMB", 5000000000},
-		{"000009", "Access Bank", 8000000000},
-		{"000010", "Zenith Bank", 12000000000},
-		{"000011", "GTBank", 9000000000},
-		{"000013", "Stanbic IBTC", 4000000000},
-		{"000014", "UBA", 7000000000},
-		{"000016", "Fidelity Bank", 3000000000},
-		{"000023", "Sterling Bank", 2000000000},
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgres://localhost:5432/corebanking?sslmode=disable"
 	}
-	for _, b := range banks {
-		app.positions[b.code] = &NostroPosition{
-			BankCode: b.code, BankName: b.name, BalanceKobo: b.balKobo,
-			AvailableKobo: b.balKobo, LastUpdated: time.Now(), AlertLevel: "normal",
-		}
+	var err error
+	app.db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[%s] DB connection failed: %v", serviceName, err)
+		return
 	}
+	app.db.SetMaxOpenConns(25)
+	app.db.SetMaxIdleConns(5)
+	app.db.SetConnMaxLifetime(5 * time.Minute)
+
+	schema := `CREATE TABLE IF NOT EXISTS nostro_positions (
+		position_id TEXT PRIMARY KEY,
+		bank_code TEXT UNIQUE NOT NULL,
+		bank_name TEXT NOT NULL,
+		balance_kobo BIGINT NOT NULL DEFAULT 0,
+		currency TEXT NOT NULL DEFAULT 'NGN',
+		max_limit_kobo BIGINT NOT NULL DEFAULT 10000000000,
+		min_limit_kobo BIGINT NOT NULL DEFAULT 100000000,
+		last_updated TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE TABLE IF NOT EXISTS nip_transfers (
+		transfer_id TEXT PRIMARY KEY,
+		source_bank TEXT NOT NULL,
+		dest_bank TEXT NOT NULL,
+		amount_kobo BIGINT NOT NULL,
+		session_id TEXT NOT NULL DEFAULT '',
+		payment_ref TEXT NOT NULL DEFAULT '',
+		narration_code TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'pending',
+		settlement_type TEXT NOT NULL DEFAULT 'RTGS',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_nip_status ON nip_transfers(status);
+	CREATE INDEX IF NOT EXISTS idx_nip_source ON nip_transfers(source_bank);
+
+	CREATE TABLE IF NOT EXISTS settlement_batches (
+		batch_id TEXT PRIMARY KEY,
+		batch_type TEXT NOT NULL,
+		total_transfers INTEGER NOT NULL DEFAULT 0,
+		total_kobo BIGINT NOT NULL DEFAULT 0,
+		net_positions JSONB NOT NULL DEFAULT '{}',
+		status TEXT NOT NULL DEFAULT 'pending',
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		settled_at TIMESTAMPTZ
+	);`
+	if _, err := app.db.Exec(schema); err != nil {
+		log.Printf("[%s] Schema init failed: %v", serviceName, err)
+	}
+	seedNostroPositions()
+	log.Printf("[%s] PostgreSQL connected, schema ready", serviceName)
 }
 
-func getPositions(w http.ResponseWriter, r *http.Request) {
-	app.mu.RLock()
-	defer app.mu.RUnlock()
-	positions := make([]NostroPosition, 0)
-	for _, p := range app.positions { positions = append(positions, *p) }
-	respondJSON(w, 200, map[string]interface{}{"positions": positions, "count": len(positions)})
+func seedNostroPositions() {
+	if app.db == nil {
+		return
+	}
+	type seed struct {
+		code, name string
+		balance    int64
+	}
+	banks := []seed{
+		{"000001", "Access Bank", 500000000000},
+		{"000002", "First Bank", 450000000000},
+		{"000003", "UBA", 400000000000},
+		{"000004", "GTBank", 380000000000},
+		{"000005", "Zenith Bank", 520000000000},
+		{"000006", "Stanbic IBTC", 200000000000},
+		{"000007", "Fidelity Bank", 150000000000},
+		{"000008", "Polaris Bank", 120000000000},
+		{"000009", "Union Bank", 180000000000},
+		{"000010", "Wema Bank", 90000000000},
+	}
+	for i, b := range banks {
+		posID := fmt.Sprintf("NOS-%03d", i+1)
+		app.db.Exec(`INSERT INTO nostro_positions (position_id, bank_code, bank_name, balance_kobo) VALUES ($1, $2, $3, $4) ON CONFLICT (bank_code) DO NOTHING`,
+			posID, b.code, b.name, b.balance)
+	}
 }
 
 func processTransfer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SourceBank string `json:"source_bank"`
-		DestBank   string `json:"dest_bank"`
-		AmountKobo int64  `json:"amount_kobo"`
-		Narration  string `json:"narration"`
+		SourceBank    string `json:"source_bank"`
+		DestBank      string `json:"dest_bank"`
+		AmountKobo    int64  `json:"amount_kobo"`
+		SessionID     string `json:"session_id"`
+		PaymentRef    string `json:"payment_ref"`
+		NarrationCode string `json:"narration_code"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, 400, map[string]string{"error": "invalid request"})
@@ -143,88 +160,119 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 400, map[string]string{"error": "amount must be positive"})
 		return
 	}
+	if app.db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
 
-	app.mu.Lock()
-	defer app.mu.Unlock()
-
-	srcPos, srcOK := app.positions[req.SourceBank]
-	if !srcOK {
+	// Check source bank nostro position
+	var sourceBalance int64
+	err := app.db.QueryRow(`SELECT balance_kobo FROM nostro_positions WHERE bank_code = $1`, req.SourceBank).Scan(&sourceBalance)
+	if err == sql.ErrNoRows {
 		respondJSON(w, 404, map[string]string{"error": "source bank not found"})
 		return
 	}
-	if srcPos.AvailableKobo < req.AmountKobo {
+	if sourceBalance < req.AmountKobo {
 		respondJSON(w, 422, map[string]interface{}{
 			"error": "insufficient nostro position",
-			"available_kobo": srcPos.AvailableKobo,
-			"required_kobo": req.AmountKobo,
-			"bank": srcPos.BankName,
+			"available_kobo": sourceBalance, "required_kobo": req.AmountKobo,
 		})
 		return
 	}
 
-	// Debit source, credit dest
-	srcPos.BalanceKobo -= req.AmountKobo
-	srcPos.AvailableKobo -= req.AmountKobo
-	srcPos.LastUpdated = time.Now()
-	
-	if dstPos, ok := app.positions[req.DestBank]; ok {
-		dstPos.BalanceKobo += req.AmountKobo
-		dstPos.AvailableKobo += req.AmountKobo
-		dstPos.LastUpdated = time.Now()
+	settlementType := "RTGS"
+	if req.AmountKobo <= 500000000 { // <= 5M NGN
+		settlementType = "NIP"
 	}
 
-	// Update alert levels
-	for _, p := range app.positions {
-		if p.AvailableKobo < 1000000000 { // < 10M NGN
-			p.AlertLevel = "critical"
-		} else if p.AvailableKobo < 5000000000 { // < 50M NGN
-			p.AlertLevel = "low"
-		} else {
-			p.AlertLevel = "normal"
-		}
+	transferID := fmt.Sprintf("NIP-%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))[0:22]
+
+	tx, err := app.db.Begin()
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "transaction start failed"})
+		return
 	}
 
-	txn := NIPTransfer{
-		TransferID: fmt.Sprintf("NIP-%x", sha256.Sum256([]byte(fmt.Sprintf("%d", time.Now().UnixNano()))))[0:20],
-		SourceBank: req.SourceBank, DestBank: req.DestBank,
-		AmountKobo: req.AmountKobo, Status: "settled",
-		CreatedAt: time.Now(),
+	_, err = tx.Exec(`UPDATE nostro_positions SET balance_kobo = balance_kobo - $1, last_updated = NOW() WHERE bank_code = $2`, req.AmountKobo, req.SourceBank)
+	if err != nil {
+		tx.Rollback()
+		respondJSON(w, 500, map[string]string{"error": "debit failed"})
+		return
 	}
-	app.transfers = append(app.transfers, txn)
+	_, err = tx.Exec(`UPDATE nostro_positions SET balance_kobo = balance_kobo + $1, last_updated = NOW() WHERE bank_code = $2`, req.AmountKobo, req.DestBank)
+	if err != nil {
+		tx.Rollback()
+		respondJSON(w, 500, map[string]string{"error": "credit failed"})
+		return
+	}
+	_, err = tx.Exec(`INSERT INTO nip_transfers (transfer_id, source_bank, dest_bank, amount_kobo, session_id, payment_ref, narration_code, status, settlement_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'settled', $8)`,
+		transferID, req.SourceBank, req.DestBank, req.AmountKobo, req.SessionID, req.PaymentRef, req.NarrationCode, settlementType)
+	if err != nil {
+		tx.Rollback()
+		respondJSON(w, 500, map[string]string{"error": "transfer record failed"})
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		respondJSON(w, 500, map[string]string{"error": "commit failed"})
+		return
+	}
 
 	respondJSON(w, 200, map[string]interface{}{
-		"transfer_id": txn.TransferID,
-		"status": "settled",
-		"source_position_kobo": srcPos.AvailableKobo,
-		"alert_level": srcPos.AlertLevel,
+		"transfer_id": transferID, "status": "settled",
+		"settlement_type": settlementType,
+		"amount_kobo": req.AmountKobo,
 	})
 }
 
-func reverseTransfer(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		TransferID string `json:"transfer_id"`
-		ReasonCode string `json:"reason_code"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondJSON(w, 400, map[string]string{"error": "invalid request"})
+func getPositions(w http.ResponseWriter, r *http.Request) {
+	if app.db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
 		return
 	}
-	reason, ok := nipReasonCodes[req.ReasonCode]
-	if !ok {
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid NIP reason code", "valid_codes": nipReasonCodes})
+	rows, err := app.db.Query(`SELECT position_id, bank_code, bank_name, balance_kobo, currency, max_limit_kobo, min_limit_kobo, last_updated FROM nostro_positions ORDER BY bank_code`)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "query failed"})
 		return
 	}
+	defer rows.Close()
+	positions := make([]NostroPosition, 0)
+	var totalKobo int64
+	for rows.Next() {
+		var p NostroPosition
+		if err := rows.Scan(&p.PositionID, &p.BankCode, &p.BankName, &p.BalanceKobo, &p.Currency, &p.MaxLimitKobo, &p.MinLimitKobo, &p.LastUpdated); err != nil {
+			continue
+		}
+		positions = append(positions, p)
+		totalKobo += p.BalanceKobo
+	}
+
+	breaches := make([]map[string]interface{}, 0)
+	for _, p := range positions {
+		if p.BalanceKobo < p.MinLimitKobo {
+			breaches = append(breaches, map[string]interface{}{
+				"bank_code": p.BankCode, "type": "BELOW_MINIMUM",
+				"balance_kobo": p.BalanceKobo, "limit_kobo": p.MinLimitKobo,
+			})
+		}
+	}
+
 	respondJSON(w, 200, map[string]interface{}{
-		"transfer_id": req.TransferID,
-		"reversal_status": "processed",
-		"reason_code": req.ReasonCode,
-		"reason_description": reason,
+		"positions": positions, "total_nostro_kobo": totalKobo,
+		"limit_breaches": breaches,
 	})
 }
 
 func healthz(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, 200, map[string]interface{}{"status": "healthy", "service": serviceName, "version": "1.0.0",
-		"capabilities": []string{"RTGS", "DNS", "NIP", "nostro_position", "reversal_with_reason_codes"},
+	dbStatus := "disconnected"
+	if app.db != nil {
+		if err := app.db.Ping(); err == nil {
+			dbStatus = "connected"
+		}
+	}
+	respondJSON(w, 200, map[string]interface{}{"status": "healthy", "service": serviceName, "version": "1.0.0", "database": dbStatus,
+		"settlement_types": []string{"RTGS", "NIP", "DNS"},
 	})
 }
 
@@ -235,19 +283,20 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func main() {
+	initDB()
 	port := os.Getenv("PORT")
-	if port == "" { port = "9044" }
+	if port == "" {
+		port = "9048"
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthz)
-	mux.HandleFunc("/api/v1/settlement/positions", getPositions)
 	mux.HandleFunc("/api/v1/settlement/transfer", processTransfer)
-	mux.HandleFunc("/api/v1/settlement/reverse", reverseTransfer)
-	
+	mux.HandleFunc("/api/v1/settlement/positions", getPositions)
 	srv := &http.Server{Addr: ":" + port, Handler: mux}
 	go func() {
 		log.Printf("[%s] Starting on :%s", serviceName, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[%s] ListenAndServe error: %v", serviceName, err)
+			log.Fatalf("[%s] error: %v", serviceName, err)
 		}
 	}()
 	quit := make(chan os.Signal, 1)
@@ -256,5 +305,8 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)
-	_ = context.Background; _ = net.Dial; _ = strings.NewReader; _ = atomic.AddInt64; _ = sync.Once{}
+	if app.db != nil {
+		app.db.Close()
+	}
+	log.Printf("[%s] Shutdown complete", serviceName)
 }
