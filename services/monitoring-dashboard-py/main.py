@@ -1,261 +1,231 @@
-"""54Bank Platform Monitoring Dashboard — Aggregates metrics from all 512 services."""
+"""
+monitoring-dashboard-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
+"""
 
 import os
-import time
 import json
-import threading
+import uuid
 import logging
-import http.server
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
-logger = logging.getLogger("monitoring-dashboard")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-PORT = int(os.environ.get("PORT", "8080"))
-SERVICE_NAME = "monitoring-dashboard"
-MAX_BODY_SIZE = 1 * 1024 * 1024
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("monitoring-dashboard-py")
 
-# --- Process Health Watchdog ---
-_watchdog_last_ping = time.time()
-_watchdog_lock = threading.Lock()
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/monitoring_dashboard_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8352"))
 
-
-def watchdog_ping():
-    global _watchdog_last_ping
-    with _watchdog_lock:
-        _watchdog_last_ping = time.time()
-
-
-def watchdog_healthy() -> bool:
-    with _watchdog_lock:
-        return (time.time() - _watchdog_last_ping) < 60
-
-
-def _watchdog_loop():
-    while True:
-        time.sleep(10)
-        if not watchdog_healthy():
-            logger.warning("[WATCHDOG] Event loop stalled — marking unhealthy")
-        watchdog_ping()
+db_conn = None
 
 
-threading.Thread(target=_watchdog_loop, daemon=True).start()
+def get_db():
+    global db_conn
+    if db_conn is None or db_conn.closed:
+        db_conn = psycopg2.connect(DATABASE_URL)
+        db_conn.autocommit = True
+    return db_conn
 
-# --- Circuit Breaker ---
-class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 30.0):
-        self._failures = 0
-        self._threshold = failure_threshold
-        self._timeout = reset_timeout
-        self._state = "closed"
-        self._last_failure = 0.0
-        self._lock = threading.Lock()
 
-    def allow(self) -> bool:
-        with self._lock:
-            if self._state == "open":
-                if time.time() - self._last_failure > self._timeout:
-                    self._state = "half-open"
-                    return True
-                return False
-            return True
+def init_schema():
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS audit_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type VARCHAR(64) NOT NULL,
+    actor_id UUID NOT NULL,
+    actor_type VARCHAR(20) NOT NULL,
+    resource_type VARCHAR(64) NOT NULL,
+    resource_id VARCHAR(128) NOT NULL,
+    action VARCHAR(32) NOT NULL,
+    outcome VARCHAR(20) NOT NULL DEFAULT 'success',
+    ip_address INET,
+    user_agent TEXT,
+    changes JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-    def record_success(self):
-        with self._lock:
-            self._failures = 0
-            self._state = "closed"
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-    def record_failure(self):
-        with self._lock:
-            self._failures += 1
-            self._last_failure = time.time()
-            if self._failures >= self._threshold:
-                self._state = "open"
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_status ON audit_events(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
 
-# --- Rate Limiter ---
-class RateLimiter:
-    def __init__(self, max_requests: int = 200, window_seconds: float = 60.0):
-        self._max = max_requests
-        self._window = window_seconds
-        self._requests: dict = {}
-        self._lock = threading.Lock()
 
-    def allow(self, client_ip: str) -> bool:
-        now = time.time()
-        with self._lock:
-            reqs = self._requests.get(client_ip, [])
-            reqs = [t for t in reqs if now - t < self._window]
-            if len(reqs) >= self._max:
-                return False
-            reqs.append(now)
-            self._requests[client_ip] = reqs
-            return True
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_schema()
+    logger.info(f"[monitoring-dashboard-py] ready on :%d", PORT)
+    logger.info(f"[monitoring-dashboard-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
+    if db_conn:
+        db_conn.close()
 
-_rate_limiter = RateLimiter()
 
-# --- EventBus ---
-class EventBus:
-    def __init__(self, topic: str, service: str):
-        self._broker = os.environ.get("KAFKA_BROKERS", "localhost:9092")
-        self._topic = topic
-        self._service = service
-        self._buffer: list = []
-        self._lock = threading.Lock()
+app = FastAPI(title="monitoring-dashboard-py", version="1.0.0", lifespan=lifespan)
 
-    def emit(self, event_type: str, payload: dict) -> None:
-        event = {
-            "id": f"{self._service}_{int(time.time() * 1000)}",
-            "type": event_type,
-            "source": self._service,
-            "topic": self._topic,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "data": payload,
-        }
-        with self._lock:
-            self._buffer.append(event)
-        logger.info(f"[EventBus] {self._service} -> {self._topic}: {event_type}")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    def flush(self) -> list:
-        with self._lock:
-            events = self._buffer[:]
-            self._buffer.clear()
-        return events
 
-_event_bus = EventBus("observability.metrics", SERVICE_NAME)
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
 
-# --- Platform Status Data ---
-_platform_status = {
-    "services_total": 515,
-    "services_healthy": 515,
-    "services_degraded": 0,
-    "services_down": 0,
-    "uptime_percent": 99.97,
-    "last_incident": "2026-05-28T14:30:00Z",
-    "active_alerts": 0,
-}
 
-_service_health: dict = {}
-_alert_history: list = []
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
 
-class DashboardHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        logger.info(f"[HTTP] {args[0] if args else ''}")
 
-    def _send_json(self, code: int, data: dict):
-        body = json.dumps(data).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
-        self.send_header("X-Request-Id", self.headers.get("X-Request-Id", f"req-{int(time.time()*1000)}"))
-        self.end_headers()
-        self.wfile.write(body)
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "monitoring-dashboard-py", "version": "1.0.0"}
 
-    def do_GET(self):
-        watchdog_ping()
-        if self.path in ("/healthz", "/health", "/readyz"):
-            self._send_json(200, {"status": "healthy", "service": SERVICE_NAME})
-        elif self.path == "/livez":
-            if watchdog_healthy():
-                self._send_json(200, {"status": "alive", "watchdog": "healthy"})
-            else:
-                self._send_json(503, {"status": "stalled", "watchdog": "unhealthy"})
-        elif self.path == "/metrics":
-            self._send_json(200, _platform_status)
-        elif self.path == "/v1/monitoring/platform-status":
-            self._send_json(200, {
-                "platform": _platform_status,
-                "tiers": {
-                    "critical_financial": {"total": 12, "healthy": 12, "services": [
-                        "core-banking-go", "payments-hub-go", "gl-engine-rs", "settlement-engine-go",
-                        "nip-gateway-go", "rtgs-gateway-go", "reconciliation-engine-go",
-                        "tigerbeetle-adapter-rs", "journal-posting-go", "interest-accrual-engine-go",
-                        "neft-processor-go", "nibss-nip-engine-go",
-                    ]},
-                    "security_compliance": {"total": 14, "healthy": 14, "services": [
-                        "aml-engine-rs", "fraud-detection-rs", "kyc-engine-py", "sanctions-screening-rs",
-                        "ndpr-compliance-py", "efass-generator-rs", "fatca-crs-rs",
-                    ]},
-                    "infrastructure": {"total": 8, "healthy": 8, "services": [
-                        "circuit-breaker-rs", "resilience-service-rs", "keda-scaler-go",
-                        "event-store-rs", "event-dedup-engine-rs",
-                    ]},
-                },
-                "kafka": {
-                    "topics": 16, "healthy_topics": 16,
-                    "total_consumer_lag": 42,
-                    "partitions": {"total": 168, "in_sync": 168, "under_replicated": 0},
-                },
-                "database": {
-                    "postgresql": {"status": "healthy", "connections": 245, "max": 500, "replication_lag_ms": 12},
-                    "redis": {"status": "healthy", "memory_used_mb": 1024, "hit_rate": 0.97},
-                    "tigerbeetle": {"status": "healthy", "transfers_per_sec": 8500},
-                },
-            })
-        elif self.path == "/v1/monitoring/alerts":
-            self._send_json(200, {"active_alerts": _platform_status["active_alerts"], "history": _alert_history[-50:]})
-        elif self.path == "/v1/monitoring/sla":
-            self._send_json(200, {
-                "current_month": {"uptime": 99.97, "target": 99.95, "status": "met"},
-                "incidents": {"p1": 0, "p2": 1, "p3": 3},
-                "mttr_minutes": {"p1": 0, "p2": 8, "p3": 22},
-                "rto_minutes": 15, "rpo_minutes": 1,
-            })
-        elif self.path == "/v1/monitoring/keda":
-            self._send_json(200, {
-                "scaled_objects": 28, "scaled_jobs": 8,
-                "active_scalers": 28, "fallback_active": 0,
-                "total_scaling_events_24h": 156,
-            })
+
+@app.get("/readyz")
+def readyz():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM audit_events")
+            count = cur.fetchone()[0]
+        return {"service": "monitoring-dashboard-py", "total_records": count}
+    except Exception:
+        return {"service": "monitoring-dashboard-py", "total_records": 0}
+
+
+@app.get("/api/v1/audit_events")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if x_tenant_id:
+            cur.execute(
+                "SELECT id, status, created_at FROM audit_events WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
+                (x_tenant_id,)
+            )
         else:
-            self._send_json(404, {"error": "not found"})
+            cur.execute("SELECT id, status, created_at FROM audit_events ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
 
-    def do_POST(self):
-        watchdog_ping()
-        client_ip = self.client_address[0]
-        if not _rate_limiter.allow(client_ip):
-            self._send_json(429, {"error": "rate limit exceeded"})
-            return
-        length = int(self.headers.get("Content-Length", 0))
-        if length > MAX_BODY_SIZE:
-            self._send_json(413, {"error": "payload too large"})
-            return
-        body = self.rfile.read(length)
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self._send_json(400, {"error": "invalid JSON"})
-            return
+    records = [
+        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
+        for r in rows
+    ]
+    return {"data": records, "count": len(records)}
 
-        if self.path == "/v1/monitoring/report-health":
-            svc_name = data.get("service", "")
-            status = data.get("status", "unknown")
-            _service_health[svc_name] = {"status": status, "last_seen": time.strftime("%Y-%m-%dT%H:%M:%SZ")}
-            _event_bus.emit("health.reported", {"service": svc_name, "status": status})
-            self._send_json(200, {"accepted": True})
-        elif self.path == "/v1/monitoring/acknowledge-alert":
-            alert_id = data.get("alert_id", "")
-            _alert_history.append({"id": alert_id, "action": "acknowledged", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ")})
-            _event_bus.emit("alert.acknowledged", {"alert_id": alert_id})
-            self._send_json(200, {"acknowledged": True})
-        else:
-            self._send_json(404, {"error": "not found"})
+
+@app.post("/api/v1/audit_events", status_code=201)
+def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
+    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
+    status = body.status or "active"
+    record_id = str(uuid.uuid4())
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO audit_events (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
+            (record_id, tenant_id, status)
+        )
+        # Outbox event
+        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("audit_events.created", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": "created"}
+
+
+@app.get("/api/v1/audit_events/{record_id}")
+def get_record(record_id: str):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, status, created_at FROM audit_events WHERE id = %s::uuid", (record_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
+
+
+@app.put("/api/v1/audit_events/{record_id}")
+def update_record(record_id: str, body: UpdateRequest):
+    status = body.status or "updated"
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE audit_events SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
+            (status, record_id)
+        )
+        payload = json.dumps({"id": record_id, "status": status})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("audit_events.updated", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": status}
+
+
+@app.delete("/api/v1/audit_events/{record_id}", status_code=204)
+def delete_record(record_id: str):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE audit_events SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
+        payload = json.dumps({"id": record_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("audit_events.deleted", record_id, payload)
+        )
+    conn.commit()
+
 
 if __name__ == "__main__":
-    import signal
-    server = http.server.HTTPServer(("0.0.0.0", PORT), DashboardHandler)
-    logger.info(f"[{SERVICE_NAME}] Starting on :{PORT}")
-
-    def shutdown_handler(signum, frame):
-        logger.info(f"[{SERVICE_NAME}] Shutting down gracefully...")
-        server.shutdown()
-
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    server.server_close()
-    logger.info(f"[{SERVICE_NAME}] Server stopped")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

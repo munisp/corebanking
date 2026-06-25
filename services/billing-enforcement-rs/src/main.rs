@@ -592,7 +592,7 @@ impl EventBus {
             "data": payload,
         });
         eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
-        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+        EVENTS_EMITTED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -675,3 +675,5 @@ mod tests {
         assert!(after > before, "Event counter should increment");
     }
 }
+
+fn start_watchdog() { std::thread::spawn(|| { loop { std::thread::sleep(std::time::Duration::from_secs(30)); } }); }

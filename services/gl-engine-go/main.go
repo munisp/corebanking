@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 "sync"
 	"fmt"
-	"math"
 	"log"
 	"net/http"
 	"os"
@@ -81,7 +80,7 @@ type GLAccount struct {
 	Subcategory      string  `json:"subcategory"`
 	ParentCode       *string `json:"parentCode"`
 	Currency         string  `json:"currency"`
-	Balance          float64 `json:"balance"`
+	BalanceKobo      int64   `json:"balanceKobo"`
 	Status           string  `json:"status"`
 	IsControlAccount int     `json:"isControlAccount"`
 }
@@ -92,7 +91,7 @@ type JournalEntry struct {
 	AccountID      string    `json:"accountId"`
 	GLAccountCode  string    `json:"glAccountCode"`
 	Type           string    `json:"type"`
-	Amount         float64   `json:"amount"`
+	AmountKobo     int64     `json:"amountKobo"`
 	Currency       string    `json:"currency"`
 	Narration      string    `json:"narration"`
 	TransactionRef string    `json:"transactionRef"`
@@ -107,10 +106,10 @@ type TrialBalance struct {
 	GLAccountCode  string    `json:"glAccountCode"`
 	PeriodStart    time.Time `json:"periodStart"`
 	PeriodEnd      time.Time `json:"periodEnd"`
-	OpeningBalance float64   `json:"openingBalance"`
-	TotalDebits    float64   `json:"totalDebits"`
-	TotalCredits   float64   `json:"totalCredits"`
-	ClosingBalance float64   `json:"closingBalance"`
+	OpeningBalanceKobo int64 `json:"openingBalanceKobo"`
+	TotalDebitsKobo    int64 `json:"totalDebitsKobo"`
+	TotalCreditsKobo   int64 `json:"totalCreditsKobo"`
+	ClosingBalanceKobo int64 `json:"closingBalanceKobo"`
 	Currency       string    `json:"currency"`
 	Status         string    `json:"status"`
 }
@@ -120,7 +119,7 @@ type EFASSLine struct {
 	MBRLine        int     `json:"mbrLine"`
 	LineName       string  `json:"lineName"`
 	ReportCategory string  `json:"reportCategory"`
-	Amount         float64 `json:"amount"`
+	AmountKobo     int64   `json:"amountKobo"`
 	CBNCode        string  `json:"cbnCode"`
 }
 
@@ -135,12 +134,12 @@ type EFASSReport struct {
 }
 
 type ReportTotals struct {
-	TotalAssets      float64 `json:"totalAssets"`
-	TotalLiabilities float64 `json:"totalLiabilities"`
-	TotalEquity      float64 `json:"totalEquity"`
-	TotalIncome      float64 `json:"totalIncome"`
-	TotalExpenses    float64 `json:"totalExpenses"`
-	NetProfit        float64 `json:"netProfit"`
+	TotalAssetsKobo    int64 `json:"totalAssets"`
+	TotalLiabilitiesKobo int64 `json:"totalLiabilities"`
+	TotalEquityKobo    int64 `json:"totalEquity"`
+	TotalIncomeKobo    int64 `json:"totalIncome"`
+	TotalExpensesKobo  int64 `json:"totalExpenses"`
+	NetProfitKobo      int64 `json:"netProfit"`
 	CAR              float64 `json:"car"`
 	LiquidityRatio   float64 `json:"liquidityRatio"`
 }
@@ -150,7 +149,7 @@ type PostJournalRequest struct {
 	AccountID      string  `json:"accountId"`
 	GLAccountCode  string  `json:"glAccountCode"`
 	Type           string  `json:"type"`
-	Amount         float64 `json:"amount"`
+	AmountKobo     int64   `json:"amountKobo"`
 	Currency       string  `json:"currency"`
 	Narration      string  `json:"narration"`
 	TransactionRef string  `json:"transactionRef"`
@@ -268,7 +267,7 @@ func (app *App) listGLAccounts(w http.ResponseWriter, r *http.Request) {
 			for rows.Next() {
 				var a GLAccount
 				err := rows.Scan(&a.GLAccountCode, &a.TenantID, &a.Name, &a.Category,
-					&a.Subcategory, &a.ParentCode, &a.Currency, &a.Balance, &a.Status, &a.IsControlAccount)
+					&a.Subcategory, &a.ParentCode, &a.Currency, &a.BalanceKobo, &a.Status, &a.IsControlAccount)
 				if err == nil {
 					accounts = append(accounts, a)
 				}
@@ -289,7 +288,7 @@ func (app *App) listGLAccounts(w http.ResponseWriter, r *http.Request) {
 func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 	var req PostJournalRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		req.Amount = roundNaira(req.Amount)
+		// Amount already in kobo (int64)
 		writeJSON(w, 400, map[string]string{"error": "invalid request body"})
 		return
 	}
@@ -303,7 +302,7 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		AccountID:      req.AccountID,
 		GLAccountCode:  req.GLAccountCode,
 		Type:           req.Type,
-		Amount:         req.Amount,
+		AmountKobo:     req.AmountKobo,
 		Currency:       req.Currency,
 		Narration:      req.Narration,
 		TransactionRef: req.TransactionRef,
@@ -316,7 +315,7 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 			("entryId", "tenantId", "accountId", "glAccountCode", "type", "amount", "currency", "narration", "transactionRef", "postingDate", "valueDate")
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 			entry.EntryID, entry.TenantID, entry.AccountID, entry.GLAccountCode,
-			entry.Type, entry.Amount, entry.Currency, entry.Narration,
+			entry.Type, entry.AmountKobo, entry.Currency, entry.Narration,
 			entry.TransactionRef, entry.PostingDate, entry.ValueDate)
 		if err != nil {
 			writeJSON(w, 500, map[string]string{"error": err.Error()})
@@ -326,10 +325,10 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		// Update GL account balance
 		if entry.Type == "debit" {
 			app.db.Exec(`UPDATE "glAccounts" SET "balance" = "balance" + $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`,
-				entry.Amount, entry.GLAccountCode)
+				entry.AmountKobo, entry.GLAccountCode)
 		} else {
 			app.db.Exec(`UPDATE "glAccounts" SET "balance" = "balance" - $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`,
-				entry.Amount, entry.GLAccountCode)
+				entry.AmountKobo, entry.GLAccountCode)
 		}
 	}
 
@@ -339,7 +338,7 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		"entryId":   entryID,
 		"glCode":    req.GLAccountCode,
 		"type":      req.Type,
-		"amount":    req.Amount,
+		"amount":    req.AmountKobo,
 		"timestamp": now.Format(time.RFC3339),
 		"middleware": map[string]string{
 			"kafka_topic":       "gl.journal.posted",
@@ -457,7 +456,7 @@ func (app *App) generateEFASS(w http.ResponseWriter, r *http.Request) {
 			defer rows.Close()
 			for rows.Next() {
 				var l EFASSLine
-				rows.Scan(&l.MBRForm, &l.MBRLine, &l.LineName, &l.ReportCategory, &l.CBNCode, &l.Amount)
+				rows.Scan(&l.MBRForm, &l.MBRLine, &l.LineName, &l.ReportCategory, &l.CBNCode, &l.AmountKobo)
 				lines = append(lines, l)
 			}
 		}
@@ -472,30 +471,30 @@ func (app *App) generateEFASS(w http.ResponseWriter, r *http.Request) {
 	for _, l := range lines {
 		switch l.ReportCategory {
 		case "assets":
-			totals.TotalAssets += l.Amount
+			totals.TotalAssetsKobo += l.AmountKobo
 		case "liabilities":
-			totals.TotalLiabilities += l.Amount
+			totals.TotalLiabilitiesKobo += l.AmountKobo
 		case "equity":
-			totals.TotalEquity += l.Amount
+			totals.TotalEquityKobo += l.AmountKobo
 		case "income":
-			totals.TotalIncome += l.Amount
+			totals.TotalIncomeKobo += l.AmountKobo
 		case "expenses":
-			totals.TotalExpenses += l.Amount
+			totals.TotalExpensesKobo += l.AmountKobo
 		}
 	}
-	totals.NetProfit = totals.TotalIncome - totals.TotalExpenses
+	totals.NetProfitKobo = totals.TotalIncomeKobo - totals.TotalExpensesKobo
 
 	// CAR computation: (Tier1 + Tier2) / RWA
-	tier1 := totals.TotalEquity * 0.85
-	tier2 := totals.TotalEquity * 0.15
-	rwa := totals.TotalAssets * 0.65 // simplified risk weighting
+	tier1 := float64(totals.TotalEquityKobo) * 0.85
+	tier2 := float64(totals.TotalEquityKobo) * 0.15
+	rwa := float64(totals.TotalAssetsKobo) * 0.65 // simplified risk weighting
 	if rwa > 0 {
 		totals.CAR = ((tier1 + tier2) / rwa) * 100
 	}
 
 	// Liquidity ratio
-	liquidAssets := totals.TotalAssets * 0.35 // cash + govt securities
-	currentLiab := totals.TotalLiabilities * 0.60
+	liquidAssets := float64(totals.TotalAssetsKobo) * 0.35 // cash + govt securities
+	currentLiab := float64(totals.TotalLiabilitiesKobo) * 0.60
 	if currentLiab > 0 {
 		totals.LiquidityRatio = (liquidAssets / currentLiab) * 100
 	}
@@ -562,8 +561,8 @@ func (app *App) listTrialBalance(w http.ResponseWriter, r *http.Request) {
 			for rows.Next() {
 				var tb TrialBalance
 				rows.Scan(&tb.TrialBalanceID, &tb.TenantID, &tb.GLAccountCode, &tb.PeriodStart,
-					&tb.PeriodEnd, &tb.OpeningBalance, &tb.TotalDebits, &tb.TotalCredits,
-					&tb.ClosingBalance, &tb.Currency, &tb.Status)
+					&tb.PeriodEnd, &tb.OpeningBalanceKobo, &tb.TotalDebitsKobo, &tb.TotalCreditsKobo,
+					&tb.ClosingBalanceKobo, &tb.Currency, &tb.Status)
 				balances = append(balances, tb)
 			}
 			writeJSON(w, 200, map[string]interface{}{"items": balances, "total": len(balances), "source": "postgres"})
@@ -657,34 +656,34 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 
 func getSampleCoA() []GLAccount {
 	return []GLAccount{
-		{GLAccountCode: "1001", Name: "Cash in Vault - Local Currency", Category: "asset", Subcategory: "cash", Balance: 2850000000},
-		{GLAccountCode: "1005", Name: "Cash Reserve Requirement (CRR)", Category: "asset", Subcategory: "cash_cbn", Balance: 18500000000},
-		{GLAccountCode: "1201", Name: "Treasury Bills (NTBs)", Category: "asset", Subcategory: "investments_govt", Balance: 25000000000},
-		{GLAccountCode: "1301", Name: "Overdrafts - Corporate", Category: "asset", Subcategory: "loans_corporate", Balance: 28000000000},
-		{GLAccountCode: "2101", Name: "Demand Deposits - Current Accounts", Category: "liability", Subcategory: "deposits_demand", Balance: 85000000000},
-		{GLAccountCode: "2102", Name: "Savings Deposits", Category: "liability", Subcategory: "deposits_savings", Balance: 45000000000},
-		{GLAccountCode: "3002", Name: "Issued & Paid-up Capital", Category: "equity", Subcategory: "share_capital", Balance: 25000000000},
-		{GLAccountCode: "4101", Name: "Interest on Loans - Corporate", Category: "income", Subcategory: "interest_loans", Balance: 18500000000},
-		{GLAccountCode: "5101", Name: "Interest on Deposits - Savings", Category: "expense", Subcategory: "interest_deposits", Balance: 3500000000},
-		{GLAccountCode: "5301", Name: "Staff Costs - Salaries", Category: "expense", Subcategory: "staff_costs", Balance: 12000000000},
+		{GLAccountCode: "1001", Name: "Cash in Vault - Local Currency", Category: "asset", Subcategory: "cash", BalanceKobo: 2850000000},
+		{GLAccountCode: "1005", Name: "Cash Reserve Requirement (CRR)", Category: "asset", Subcategory: "cash_cbn", BalanceKobo: 18500000000},
+		{GLAccountCode: "1201", Name: "Treasury Bills (NTBs)", Category: "asset", Subcategory: "investments_govt", BalanceKobo: 25000000000},
+		{GLAccountCode: "1301", Name: "Overdrafts - Corporate", Category: "asset", Subcategory: "loans_corporate", BalanceKobo: 28000000000},
+		{GLAccountCode: "2101", Name: "Demand Deposits - Current Accounts", Category: "liability", Subcategory: "deposits_demand", BalanceKobo: 85000000000},
+		{GLAccountCode: "2102", Name: "Savings Deposits", Category: "liability", Subcategory: "deposits_savings", BalanceKobo: 45000000000},
+		{GLAccountCode: "3002", Name: "Issued & Paid-up Capital", Category: "equity", Subcategory: "share_capital", BalanceKobo: 25000000000},
+		{GLAccountCode: "4101", Name: "Interest on Loans - Corporate", Category: "income", Subcategory: "interest_loans", BalanceKobo: 18500000000},
+		{GLAccountCode: "5101", Name: "Interest on Deposits - Savings", Category: "expense", Subcategory: "interest_deposits", BalanceKobo: 3500000000},
+		{GLAccountCode: "5301", Name: "Staff Costs - Salaries", Category: "expense", Subcategory: "staff_costs", BalanceKobo: 12000000000},
 	}
 }
 
 func getSampleEFASSLines() []EFASSLine {
 	return []EFASSLine{
-		{MBRForm: "MBR100", MBRLine: 1, LineName: "Cash & Balances with Central Bank", ReportCategory: "assets", Amount: 28950000000, CBNCode: "BS-A-001"},
-		{MBRForm: "MBR100", MBRLine: 2, LineName: "Due from Banks", ReportCategory: "assets", Amount: 45500000000, CBNCode: "BS-A-002"},
-		{MBRForm: "MBR100", MBRLine: 3, LineName: "Investment Securities", ReportCategory: "assets", Amount: 75300000000, CBNCode: "BS-A-003"},
-		{MBRForm: "MBR100", MBRLine: 4, LineName: "Loans and Advances (Gross)", ReportCategory: "assets", Amount: 152000000000, CBNCode: "BS-A-004"},
-		{MBRForm: "MBR100", MBRLine: 5, LineName: "Less: Allowance for Loan Losses", ReportCategory: "assets", Amount: -14000000000, CBNCode: "BS-A-005"},
-		{MBRForm: "MBR200", MBRLine: 1, LineName: "Deposits from Customers", ReportCategory: "liabilities", Amount: 211200000000, CBNCode: "BS-L-001"},
-		{MBRForm: "MBR200", MBRLine: 2, LineName: "Due to Banks & Borrowings", ReportCategory: "liabilities", Amount: 39000000000, CBNCode: "BS-L-002"},
-		{MBRForm: "MBR300", MBRLine: 1, LineName: "Share Capital", ReportCategory: "equity", Amount: 40000000000, CBNCode: "BS-E-001"},
-		{MBRForm: "MBR300", MBRLine: 3, LineName: "Reserves", ReportCategory: "equity", Amount: 28900000000, CBNCode: "BS-E-003"},
-		{MBRForm: "MBR400", MBRLine: 1, LineName: "Interest & Similar Income", ReportCategory: "income", Amount: 37330000000, CBNCode: "PL-I-001"},
-		{MBRForm: "MBR400", MBRLine: 2, LineName: "Fees & Commission Income", ReportCategory: "income", Amount: 15770000000, CBNCode: "PL-I-002"},
-		{MBRForm: "MBR500", MBRLine: 1, LineName: "Interest & Similar Expense", ReportCategory: "expenses", Amount: 15000000000, CBNCode: "PL-E-001"},
-		{MBRForm: "MBR500", MBRLine: 3, LineName: "Operating Expenses", ReportCategory: "expenses", Amount: 28000000000, CBNCode: "PL-E-003"},
+		{MBRForm: "MBR100", MBRLine: 1, LineName: "Cash & Balances with Central Bank", ReportCategory: "assets", AmountKobo: 28950000000, CBNCode: "BS-A-001"},
+		{MBRForm: "MBR100", MBRLine: 2, LineName: "Due from Banks", ReportCategory: "assets", AmountKobo: 45500000000, CBNCode: "BS-A-002"},
+		{MBRForm: "MBR100", MBRLine: 3, LineName: "Investment Securities", ReportCategory: "assets", AmountKobo: 75300000000, CBNCode: "BS-A-003"},
+		{MBRForm: "MBR100", MBRLine: 4, LineName: "Loans and Advances (Gross)", ReportCategory: "assets", AmountKobo: 152000000000, CBNCode: "BS-A-004"},
+		{MBRForm: "MBR100", MBRLine: 5, LineName: "Less: Allowance for Loan Losses", ReportCategory: "assets", AmountKobo: -14000000000, CBNCode: "BS-A-005"},
+		{MBRForm: "MBR200", MBRLine: 1, LineName: "Deposits from Customers", ReportCategory: "liabilities", AmountKobo: 211200000000, CBNCode: "BS-L-001"},
+		{MBRForm: "MBR200", MBRLine: 2, LineName: "Due to Banks & Borrowings", ReportCategory: "liabilities", AmountKobo: 39000000000, CBNCode: "BS-L-002"},
+		{MBRForm: "MBR300", MBRLine: 1, LineName: "Share Capital", ReportCategory: "equity", AmountKobo: 40000000000, CBNCode: "BS-E-001"},
+		{MBRForm: "MBR300", MBRLine: 3, LineName: "Reserves", ReportCategory: "equity", AmountKobo: 28900000000, CBNCode: "BS-E-003"},
+		{MBRForm: "MBR400", MBRLine: 1, LineName: "Interest & Similar Income", ReportCategory: "income", AmountKobo: 37330000000, CBNCode: "PL-I-001"},
+		{MBRForm: "MBR400", MBRLine: 2, LineName: "Fees & Commission Income", ReportCategory: "income", AmountKobo: 15770000000, CBNCode: "PL-I-002"},
+		{MBRForm: "MBR500", MBRLine: 1, LineName: "Interest & Similar Expense", ReportCategory: "expenses", AmountKobo: 15000000000, CBNCode: "PL-E-001"},
+		{MBRForm: "MBR500", MBRLine: 3, LineName: "Operating Expenses", ReportCategory: "expenses", AmountKobo: 28000000000, CBNCode: "PL-E-003"},
 	}
 }
 
@@ -1208,16 +1207,16 @@ func rpcCall(target string, method string, payload map[string]interface{}) (map[
 }
 
 
-func validateJournalEntry(debitTotal, creditTotal float64) (bool, string) {
+func validateJournalEntry(debitTotal, creditTotal int64) (bool, string) {
 	diff := debitTotal - creditTotal
 	if diff < 0 { diff = -diff }
-	if diff > 0.01 { return false, fmt.Sprintf("Journal entry unbalanced: debit ₦%.2f != credit ₦%.2f", debitTotal, creditTotal) }
+	if diff > 0 { return false, fmt.Sprintf("Journal entry unbalanced: debit %d kobo != credit %d kobo", debitTotal, creditTotal) }
 	return true, "Journal entry balanced"
 }
-func computeTrialBalance(entries []map[string]float64) map[string]float64 {
-	totalDebit := 0.0; totalCredit := 0.0
+func computeTrialBalance(entries []map[string]int64) map[string]int64 {
+	var totalDebit, totalCredit int64
 	for _, e := range entries { totalDebit += e["debit"]; totalCredit += e["credit"] }
-	return map[string]float64{"total_debit": totalDebit, "total_credit": totalCredit, "difference": totalDebit - totalCredit}
+	return map[string]int64{"total_debit": totalDebit, "total_credit": totalCredit, "difference": totalDebit - totalCredit}
 }
 
 
@@ -1347,8 +1346,8 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 // AmountKobo represents money in smallest unit (kobo) to avoid floating-point errors
 type AmountKobo int64
 
-func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
-func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
+func nairaToKobo(nairaKobo int64) AmountKobo { return AmountKobo(nairaKobo) }
+func (a AmountKobo) Kobo() int64 { return int64(a) }
 func (a AmountKobo) String() string        { return fmt.Sprintf("₦%s", formatKobo(a)) }
 
 func formatKobo(k AmountKobo) string {
@@ -1870,16 +1869,14 @@ func dbExecAtomic(queries []string, params [][]interface{}) error {
 
 
 // --- Monetary Safety (kobo precision) ---
-// roundNaira eliminates floating-point drift by rounding to 2 decimal places (kobo precision).
-func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
 
-// validateAmount checks monetary amount is non-negative and within CBN limits.
-func validateAmount(amount float64) error {
-	if amount < 0 {
-		return fmt.Errorf("amount must be non-negative, got %.2f", amount)
+// validateAmountKobo checks monetary amount is non-negative and within CBN limits.
+func validateAmountKobo(amountKobo int64) error {
+	if amountKobo < 0 {
+		return fmt.Errorf("amount must be non-negative, got %d kobo", amountKobo)
 	}
-	if amount > 999_999_999_999.99 {
-		return fmt.Errorf("amount exceeds maximum (₦999,999,999,999.99), got %.2f", amount)
+	if amountKobo > 99_999_999_999_999 {
+		return fmt.Errorf("amount exceeds maximum (₦999,999,999,999.99 = 99999999999999 kobo), got %d", amountKobo)
 	}
 	return nil
 }
@@ -2060,7 +2057,7 @@ func validateNigerianPhone(phone string) bool {
 	return false
 }
 
-func validateAmountKobo(amount int64) bool {
+func isValidAmountKobo(amount int64) bool {
 	return amount > 0 && amount <= 500000000000
 }
 

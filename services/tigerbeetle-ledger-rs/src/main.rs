@@ -1,628 +1,257 @@
-use tokio_postgres /* pool_size=25, idle_timeout=300s */;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{Instant, Duration};
-use std::collections::HashMap;
-use sha2::{Sha256, Digest};
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
-static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 struct AppState {
-    records: Mutex<Vec<serde_json::Value>>,
-    db_client: Option<tokio_postgres::Client>,
-    start_time: Instant,
-    config: HashMap<String, String>,
-}
-
-// Rate limiter
-use std::sync::atomic::AtomicI64;
-use actix_cors::Cors;
-static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
-static RL_LAST: AtomicU64 = AtomicU64::new(0);
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let last = RL_LAST.load(AtomicOrdering::Relaxed);
-    if now > last { RL_TOKENS.store(100, AtomicOrdering::Relaxed); RL_LAST.store(now, AtomicOrdering::Relaxed); }
-    RL_TOKENS.fetch_sub(1, AtomicOrdering::Relaxed) > 0
-}
-
-// JWT check
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<String, HttpResponse> {
-    match req.headers().get("Authorization") {
-        Some(h) => {
-            let val = h.to_str().unwrap_or("");
-            if val.starts_with("Bearer ") { Ok(val[7..].to_string()) }
-            else { Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth"}))) }
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing auth"})))
-    }
-}
-
-// Idempotency cache
-lazy_static::lazy_static! {
-    static ref IDEMPOTENCY_CACHE: Mutex<HashMap<String, (serde_json::Value, u16, Instant)>> = Mutex::new(HashMap::new());
-}
-
-fn check_idempotency(key: &str) -> Option<(serde_json::Value, u16)> {
-    let cache = IDEMPOTENCY_CACHE.lock().ok()?;
-    cache.get(key).and_then(|(v, s, t)| {
-        if t.elapsed() < Duration::from_secs(86400) { Some((v.clone(), *s)) } else { None }
-    })
-}
-
-fn store_idempotency(key: &str, resp: serde_json::Value, status: u16) {
-    if let Ok(mut cache) = IDEMPOTENCY_CACHE.lock() {
-        cache.insert(key.to_string(), (resp, status, Instant::now()));
-        // Evict old entries
-        cache.retain(|_, (_, _, t)| t.elapsed() < Duration::from_secs(86400));
-    }
-}
-
-// Audit trail hash chain
-fn audit_hash(prev: &str, data: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(prev.as_bytes());
-    hasher.update(data.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-// Health check
-async fn health(state: web::Data<AppState>) -> HttpResponse {
-    let db_status = if let Some(ref client) = state.db_client {
-        match client.execute("SELECT 1", &[]).await {
-            Ok(_) => "connected",
-            Err(_) => "unhealthy",
-        }
-    } else { "not_configured" };
-    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
-    let _bus = init_data_flow();
-    _bus.emit("tigerbeetle-ledger.processed", &serde_json::json!({"status": "success"}));
-    HttpResponse::Ok().json(json!({
-        "status": overall, "service": "tigerbeetle-ledger-rs",
-        "version": "2.0.0", "uptime_secs": state.start_time.elapsed().as_secs(),
-        "requests": REQUEST_COUNT.load(AtomicOrdering::Relaxed),
-        "errors": ERROR_COUNT.load(AtomicOrdering::Relaxed),
-        "checks": { "database": db_status }
-    }))
-}
-
-async fn readyz(state: web::Data<AppState>) -> HttpResponse {
-    if state.db_client.is_some() { HttpResponse::Ok().json(json!({"ready": true})) }
-    else { HttpResponse::Ok().json(json!({"ready": true, "note": "no db configured"})) }
-}
-
-async fn livez() -> HttpResponse { HttpResponse::Ok().json(json!({"alive": true})) }
-
-async fn metrics() -> HttpResponse {
-    HttpResponse::Ok().body(format!(
-        "# HELP requests_total Total requests\n# TYPE requests_total counter\nrequests_total {}\n# HELP errors_total Total errors\n# TYPE errors_total counter\nerrors_total {}\n",
-        REQUEST_COUNT.load(AtomicOrdering::Relaxed), ERROR_COUNT.load(AtomicOrdering::Relaxed)
-    ))
-}
-
-
-// TigerBeetle ledger — double-entry accounting with two-phase commits
-async fn create_accounts(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limited"})); }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    
-    let empty_vec = vec![];
-    let accounts = body.get("accounts").and_then(|v| v.as_array()).unwrap_or(&empty_vec);
-    let results: Vec<_> = accounts.iter().enumerate().map(|(i, acc)| {
-        let id = acc.get("id").and_then(|v| v.as_u64()).unwrap_or(i as u64 + 1);
-        let ledger = acc.get("ledger").and_then(|v| v.as_u64()).unwrap_or(1);
-        let code = acc.get("code").and_then(|v| v.as_u64()).unwrap_or(1001);
-        json!({"id": id, "ledger": ledger, "code": code, "status": "created"})
-    }).collect();
-    
-    HttpResponse::Ok().json(json!({"accounts_created": results.len(), "results": results}))
-}
-
-async fn create_transfers(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limited"})); }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    
-    let input = body.into_inner();
-    let debit_id = input.get("debit_account_id").and_then(|v| v.as_u64()).unwrap_or(0);
-    let credit_id = input.get("credit_account_id").and_then(|v| v.as_u64()).unwrap_or(0);
-    let amount = input.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
-    let pending = input.get("pending").and_then(|v| v.as_bool()).unwrap_or(false);
-    
-    if debit_id == 0 || credit_id == 0 {
-        return HttpResponse::BadRequest().json(json!({"error": "debit_account_id and credit_account_id required"}));
-    }
-    if amount == 0 {
-        return HttpResponse::BadRequest().json(json!({"error": "amount must be > 0"}));
-    }
-    
-    let transfer_id = format!("TB-TXN-{}", REQUEST_COUNT.load(AtomicOrdering::Relaxed));
-    let status = if pending { "pending" } else { "posted" };
-    
-    HttpResponse::Ok().json(json!({
-        "transfer_id": transfer_id,
-        "debit_account_id": debit_id,
-        "credit_account_id": credit_id,
-        "amount_kobo": amount,
-        "status": status,
-        "two_phase": pending,
-        "ledger": 1,
-    }))
-}
-
-async fn commit_transfer(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let pending_id = body.get("pending_id").and_then(|v| v.as_str()).unwrap_or("");
-    let action = body.get("action").and_then(|v| v.as_str()).unwrap_or("post");
-    HttpResponse::Ok().json(json!({"pending_id": pending_id, "action": action, "status": "committed"}))
-}
-
-async fn lookup_accounts(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let ids = body.get("ids").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
-    HttpResponse::Ok().json(json!({"accounts": [], "count": ids}))
-}
-
-fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/v1/tigerbeetle-ledger/accounts/create", web::post().to(create_accounts))
-            .route("/audit", web::get().to(audit_handler))
-                .route("/healthz", web::get().to(healthz))
-            .route("/readyz", web::get().to(healthz))
-       .route("/v1/tigerbeetle-ledger/transfers/create", web::post().to(create_transfers))
-       .route("/v1/tigerbeetle-ledger/transfers/commit", web::post().to(commit_transfer))
-       .route("/v1/tigerbeetle-ledger/accounts/lookup", web::post().to(lookup_accounts));
-}
-
-
-async fn init_db(url: &str) -> Option<tokio_postgres::Client> {
-    use tokio_postgres::NoTls;
-    match tokio_postgres::connect(url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB error: {}", e); } });
-            Some(client)
-        }
-        Err(e) => { eprintln!("DB connect failed: {}", e); None }
-    }
-}
-
-
-// ─── Advanced TigerBeetle Features ─────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct LookupFilter {
-    account_id: Option<u128>,
-    min_credits: Option<i64>,
-    max_debits: Option<i64>,
-    flags: Option<u32>,
-    limit: Option<usize>,
-}
-
-#[derive(Deserialize)]
-struct BalanceAssertion {
-    account_id: u128,
-    expected_credits: i64,
-    expected_debits: i64,
-    tolerance_kobo: Option<i64>,
-}
-
-#[derive(Deserialize)]
-struct LinkedTransferChain {
-    transfers: Vec<LinkedTransfer>,
-    atomic: bool, // all-or-nothing
-}
-
-#[derive(Deserialize)]
-struct LinkedTransfer {
-    debit_account: u128,
-    credit_account: u128,
-    amount_kobo: i64,
-    code: u16,
-    ledger: u32,
-}
-
-async fn handle_lookup_filters(body: web::Json<LookupFilter>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let filter = body.into_inner();
-    let limit = filter.limit.unwrap_or(100);
-    // Simulate filtered lookup against TigerBeetle
-    let results: Vec<serde_json::Value> = (0..std::cmp::min(limit, 10))
-        .map(|i| serde_json::json!({
-            "account_id": filter.account_id.unwrap_or(1000 + i as u128),
-            "credits_posted": 500000000_i64 + (i as i64 * 10000),
-            "debits_posted": 200000000_i64 + (i as i64 * 5000),
-            "flags": filter.flags.unwrap_or(0),
-        }))
-        .collect();
-    HttpResponse::Ok().json(serde_json::json!({"results": results, "count": results.len(), "filter_applied": true}))
-}
-
-async fn handle_balance_assertion(body: web::Json<BalanceAssertion>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let assertion = body.into_inner();
-    let tolerance = assertion.tolerance_kobo.unwrap_or(0);
-    // Simulate balance check
-    let actual_credits: i64 = 500000000;
-    let actual_debits: i64 = 200000000;
-    let credits_ok = (actual_credits - assertion.expected_credits).abs() <= tolerance;
-    let debits_ok = (actual_debits - assertion.expected_debits).abs() <= tolerance;
-    let passed = credits_ok && debits_ok;
-    HttpResponse::Ok().json(serde_json::json!({
-        "account_id": assertion.account_id,
-        "assertion_passed": passed,
-        "actual_credits": actual_credits,
-        "actual_debits": actual_debits,
-        "expected_credits": assertion.expected_credits,
-        "expected_debits": assertion.expected_debits,
-    }))
-}
-
-async fn handle_linked_transfers(body: web::Json<LinkedTransferChain>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let chain = body.into_inner();
-    let results: Vec<serde_json::Value> = chain.transfers.iter().enumerate().map(|(i, t)| {
-        serde_json::json!({
-            "index": i,
-            "debit_account": t.debit_account,
-            "credit_account": t.credit_account,
-            "amount_kobo": t.amount_kobo,
-            "linked": i < chain.transfers.len() - 1,
-            "status": "committed",
-        })
-    }).collect();
-    HttpResponse::Ok().json(serde_json::json!({
-        "chain_id": format!("chain-{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)),
-        "atomic": chain.atomic,
-        "transfers": results,
-        "status": "all_committed",
-    }))
-}
-
-
-async fn healthz() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "tigerbeetle-ledger-rs"}))
-}
-
-
-// --- Request Tracing ---
-fn extract_trace_id(req: &actix_web::HttpRequest) -> String {
-    req.headers()
-        .get("X-Trace-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string()
-}
-
-
-// --- Circuit Breaker ---
-
-static CB_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
-static CB_LAST_FAIL: AtomicI64 = AtomicI64::new(0);
-const CB_THRESHOLD: u64 = 5;
-const CB_TIMEOUT_SECS: i64 = 30;
-
-fn cb_allow() -> bool {
-    let fails = CB_FAIL_COUNT.load(AtomicOrdering::Relaxed);
-    if fails < CB_THRESHOLD { return true; }
-    let now = chrono::Utc::now().timestamp();
-    now - CB_LAST_FAIL.load(AtomicOrdering::Relaxed) > CB_TIMEOUT_SECS
-}
-
-fn cb_record_success() { CB_FAIL_COUNT.store(0, AtomicOrdering::Relaxed); }
-fn cb_record_failure() {
-    CB_FAIL_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    CB_LAST_FAIL.store(chrono::Utc::now().timestamp(), AtomicOrdering::Relaxed);
-}
-
-
-// --- Observability ---
-fn init_tracing(service_name: &str) {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
-    if !endpoint.is_empty() {
-        println!("[{}] OTEL tracing configured: {}", service_name, endpoint);
-    }
-}
-
-
-
-
-fn security_headers() -> actix_web::middleware::DefaultHeaders {
-    actix_web::middleware::DefaultHeaders::new()
-        .add(("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'"))
-        .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-        .add(("X-Content-Type-Options", "nosniff"))
-        .add(("X-Frame-Options", "DENY"))
-        .add(("X-XSS-Protection", "1; mode=block"))
-        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
-}
-
-// --- Retry with Exponential Backoff ---
-fn retry_with_backoff<F, T, E>(max_retries: u32, mut f: F) -> Result<T, E>
-where F: FnMut() -> Result<T, E> {
-    let mut attempt = 0;
-    loop {
-        match f() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                attempt += 1;
-                if attempt >= max_retries { return Err(e); }
-                let delay = std::cmp::min(100 * (1 << attempt), 5000);
-                std::thread::sleep(std::time::Duration::from_millis(delay));
-            }
-        }
-    }
-}
-
-fn extract_request_id(req: &actix_web::HttpRequest) -> String {
-    req.headers().get("X-Request-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string()
-}
-
-
-fn validate_request(body: &serde_json::Value) -> Result<(), String> {
-    if body.is_null() { return Err("Request body is required".into()); }
-    if let Some(obj) = body.as_object() {
-        for (k, v) in obj {
-            if k.len() > 256 { return Err(format!("Field name too long: {}", &k[..32])); }
-            if let Some(s) = v.as_str() {
-                if s.len() > 10000 { return Err(format!("Field {} value too long", k)); }
-            }
-        }
-    }
-    Ok(())
-}
-
-
-fn mask_pii(value: &str, field_type: &str) -> String {
-    if value.len() < 4 { return "***".to_string(); }
-    match field_type {
-        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
-        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
-        "email" => {
-            if let Some(at) = value.find('@') {
-                format!("{}***@{}", &value[..1], &value[at+1..])
-            } else { "***".to_string() }
-        }
-        _ => format!("{}{}{}",
-            &value[..2],
-            "*".repeat(value.len().saturating_sub(4)),
-            &value[value.len().saturating_sub(2)..])
-    }
-}
-
-
-fn validate_bvn(bvn: &str) -> bool {
-    bvn.len() == 11 && bvn.chars().all(|c| c.is_ascii_digit())
-}
-
-fn validate_nuban(account_no: &str) -> bool {
-    account_no.len() == 10 && account_no.chars().all(|c| c.is_ascii_digit())
-}
-
-fn sanitize_input(s: &str, max_len: usize) -> String {
-    s.chars().take(max_len).filter(|c| *c >= ' ' && *c != '\x7f').collect()
-}
-
-fn validate_amount_kobo(amount: i64) -> bool {
-    amount > 0 && amount <= 500_000_000_000
-}
-
-
-// Audit trail for compliance
-static AUDIT_LOG: once_cell::sync::Lazy<std::sync::RwLock<Vec<serde_json::Value>>> =
-    once_cell::sync::Lazy::new(|| std::sync::RwLock::new(Vec::new()));
-
-fn audit_log(action: &str, details: &str) {
-    let entry = serde_json::json!({
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "action": action,
-        "details": details,
-        "service": env!("CARGO_PKG_NAME"),
-    });
-    if let Ok(mut log) = AUDIT_LOG.write() {
-        if log.len() > 10_000 { log.drain(..5_000); }
-        log.push(entry);
-    }
-}
-
-async fn audit_handler() -> impl actix_web::Responder {
-    let log = AUDIT_LOG.read().unwrap_or_else(|e| e.into_inner());
-    let recent: Vec<_> = log.iter().rev().take(100).collect();
-    actix_web::HttpResponse::Ok().json(recent)
+    db: PgPool,
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8301);
-    let db_client = if let Ok(url) = env::var("DATABASE_URL") {
-        init_db(&url).await
-    } else { None };
-    
-    let mut config = HashMap::new();
-    for (k, v) in env::vars() {
-        if k.starts_with("SERVICE_") { config.insert(k, v); }
-    }
-    
-    let state = web::Data::new(AppState {
-        records: Mutex::new(Vec::new()),
-        db_client, start_time: Instant::now(), config,
-    });
-    
-    println!("tigerbeetle-ledger-rs v2.0 on :{}", port);
-    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[tigerbeetle-ledger-rs] starting");
+
+    let db_name = "tigerbeetle-ledger-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    init_schema(&pool).await;
+    log::info!("[tigerbeetle-ledger-rs] database connected, schema initialized");
+
+    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
+    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
+    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
+    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
+
+    log::info!("[tigerbeetle-ledger-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
+        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
+
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8809".to_string()).parse().unwrap_or(8809);
+    let data = web::Data::new(AppState { db: pool });
+
+    log::info!("[tigerbeetle-ledger-rs] ready on :{}", port);
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
-            .wrap(
-                Cors::default()
-                    .allow_any_origin()
-                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
-                    .max_age(86400)
-            )
-            .app_data(state.clone())
-            .route("/v1/tigerbeetle-ledger/lookup/filter", web::post().to(handle_lookup_filters))
-                .route("/v1/tigerbeetle-ledger/balance/assert", web::post().to(handle_balance_assertion))
-                .route("/v1/tigerbeetle-ledger/transfers/linked", web::post().to(handle_linked_transfers))
-                .route("/health", web::get().to(health))
+            .app_data(data.clone())
+            .wrap(middleware::Logger::default())
+            .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
-            .configure(configure_routes)
-    }).keep_alive(std::time::Duration::from_secs(75))
-        .client_request_timeout(std::time::Duration::from_secs(30))
-        .bind(format!("0.0.0.0:{}", port))?.shutdown_timeout(30).run().await
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+    })
+    .bind(format!("0.0.0.0:{}", port))?
+    .run()
+    .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
 
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(64) NOT NULL,
+        aggregate_id VARCHAR(128) NOT NULL,
+        payload JSONB NOT NULL,
+        published BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .ok();
 
-// --- Event Bus (Kafka producer) ---
-
-// --- Process Health Watchdog ---
-static WATCHDOG_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn watchdog_ping() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    WATCHDOG_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
+        .execute(pool).await.ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
+        .execute(pool).await.ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
+        .execute(pool).await.ok();
 }
 
-fn watchdog_healthy() -> bool {
-    let last = WATCHDOG_LAST.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 { return true; }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    (now - last) < 60000
+async fn health(data: web::Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "service": "tigerbeetle-ledger-rs",
+        "version": "1.0.0"
+    }))
 }
 
-fn start_watchdog() {
-    watchdog_ping();
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if !watchdog_healthy() {
-                eprintln!("[WATCHDOG] Event loop stalled — marking unhealthy");
-            }
-            watchdog_ping();
+async fn readyz(data: web::Data<AppState>) -> HttpResponse {
+    match sqlx::query("SELECT 1").execute(&data.db).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
+        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
+    }
+}
+
+async fn metrics(data: web::Data<AppState>) -> HttpResponse {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
+        .fetch_one(&data.db).await.unwrap_or(0);
+    HttpResponse::Ok().json(serde_json::json!({
+        "service": "tigerbeetle-ledger-rs",
+        "total_records": count
+    }))
+}
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    let tenant_id = req.headers().get("X-Tenant-ID")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+
+    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+        .bind(tenant_id)
+        .fetch_all(&data.db)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "status": r.get::<String, _>("status"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+                })
+            }).collect();
+            let count = records.len();
+            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
         }
-    });
-}
-
-// --- EventBus (Kafka producer) ---
-struct EventBus {
-    broker_url: String,
-    topic: String,
-    service_name: String,
-}
-
-impl EventBus {
-    fn new(topic: &str, service: &str) -> Self {
-        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-        Self { broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }
-    }
-
-    fn emit(&self, event_type: &str, payload: &serde_json::Value) {
-        let event = serde_json::json!({
-            "type": event_type,
-            "source": &self.service_name,
-            "topic": &self.topic,
-            "data": payload,
-        });
-        eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
-        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
-fn chrono_now() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    format!("2026-01-01T{:05}Z", d.as_secs() % 86400)
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    let tenant_id = body.tenant_id.clone()
+        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
+        .unwrap_or_else(|| "default".to_string());
+
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
+    )
+    .bind(&tenant_id)
+    .bind(&status)
+    .fetch_one(&data.db)
+    .await;
+
+    match result {
+        Ok(id) => {
+            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.created")
+                .bind(id.to_string())
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
 }
 
-static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
 
-// --- Downstream Service Client ---
-struct DownstreamClient {
-    base_url: String,
-    timeout_ms: u64,
-}
-
-impl DownstreamClient {
-    fn new(env_var: &str, default_url: &str) -> Self {
-        let url = std::env::var(env_var).unwrap_or_else(|_| default_url.to_string());
-        Self { base_url: url, timeout_ms: 5000 }
-    }
-
-    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {
-        let url = format!("{}{}", self.base_url, path);
-        eprintln!("[Downstream] POST {}", url);
-        Ok(())
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
-// --- Data Flow Initialization ---
-fn init_data_flow() -> EventBus {
-    let bus = EventBus::new("accounting.ledger", "tigerbeetle-ledger");
-    eprintln!("[tigerbeetle-ledger] Data flow initialized: topic=accounting.ledger");
-    bus
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
 }
 
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
 
-    #[test]
-    fn test_service_config() {
-        // Verify service starts without panic
-        assert!(true, "tigerbeetle-ledger-rs service module loads");
-    }
-
-    #[test]
-    fn test_watchdog_initially_healthy() {
-        // Watchdog should report healthy before any ping
-        assert!(watchdog_healthy(), "Watchdog should be healthy initially");
-    }
-
-    #[test]
-    fn test_watchdog_ping_updates() {
-        watchdog_ping();
-        assert!(watchdog_healthy(), "Watchdog should be healthy after ping");
-    }
-
-    #[test]
-    fn test_eventbus_creation() {
-        let bus = EventBus::new("test.topic", "tigerbeetle_ledger");
-        assert_eq!(bus.topic, "test.topic");
-        assert_eq!(bus.service_name, "tigerbeetle_ledger");
-    }
-
-    #[test]
-    fn test_chrono_now_format() {
-        let ts = chrono_now();
-        assert!(ts.starts_with("2026-"), "Timestamp should start with year");
-        assert!(ts.ends_with("Z"), "Timestamp should end with Z");
-    }
-
-    #[test]
-    fn test_events_emitted_counter() {
-        let before = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        let bus = EventBus::new("test.topic", "tigerbeetle_ledger");
-        bus.emit("test.event", &serde_json::json!({"test": true}));
-        let after = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "Event counter should increment");
-    }
+    HttpResponse::NoContent().finish()
 }

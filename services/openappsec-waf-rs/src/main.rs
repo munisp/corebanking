@@ -1,666 +1,257 @@
-use tokio_postgres /* pool_size=25, idle_timeout=300s */;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-use std::time::{Instant, Duration};
-use std::collections::HashMap;
-use std::sync::Mutex as StdMutex;
-use sha2::{Sha256, Digest};
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
-static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 struct AppState {
-    records: Mutex<Vec<serde_json::Value>>,
-    db_client: Option<tokio_postgres::Client>,
-    start_time: Instant,
-    config: HashMap<String, String>,
-}
-
-// Rate limiter
-use std::sync::atomic::AtomicI64;
-static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
-static RL_LAST: AtomicU64 = AtomicU64::new(0);
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let last = RL_LAST.load(AtomicOrdering::Relaxed);
-    if now > last { RL_TOKENS.store(100, AtomicOrdering::Relaxed); RL_LAST.store(now, AtomicOrdering::Relaxed); }
-    RL_TOKENS.fetch_sub(1, AtomicOrdering::Relaxed) > 0
-}
-
-// JWT check
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<String, HttpResponse> {
-    match req.headers().get("Authorization") {
-        Some(h) => {
-            let val = h.to_str().unwrap_or("");
-            if val.starts_with("Bearer ") { Ok(val[7..].to_string()) }
-            else { Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth"}))) }
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing auth"})))
-    }
-}
-
-// Idempotency cache
-lazy_static::lazy_static! {
-    static ref IDEMPOTENCY_CACHE: Mutex<HashMap<String, (serde_json::Value, u16, Instant)>> = Mutex::new(HashMap::new());
-}
-
-fn check_idempotency(key: &str) -> Option<(serde_json::Value, u16)> {
-    let cache = IDEMPOTENCY_CACHE.lock().ok()?;
-    cache.get(key).and_then(|(v, s, t)| {
-        if t.elapsed() < Duration::from_secs(86400) { Some((v.clone(), *s)) } else { None }
-    })
-}
-
-fn store_idempotency(key: &str, resp: serde_json::Value, status: u16) {
-    if let Ok(mut cache) = IDEMPOTENCY_CACHE.lock() {
-        cache.insert(key.to_string(), (resp, status, Instant::now()));
-        // Evict old entries
-        cache.retain(|_, (_, _, t)| t.elapsed() < Duration::from_secs(86400));
-    }
-}
-
-// Audit trail hash chain
-fn audit_hash(prev: &str, data: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(prev.as_bytes());
-    hasher.update(data.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-// Health check
-async fn health(state: web::Data<AppState>) -> HttpResponse {
-    let db_status = if let Some(ref client) = state.db_client {
-        match client.execute("SELECT 1", &[]).await {
-            Ok(_) => "connected",
-            Err(_) => "unhealthy",
-        }
-    } else { "not_configured" };
-    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
-    let _bus = init_data_flow();
-    _bus.emit("openappsec-waf.processed", &serde_json::json!({"status": "success"}));
-    HttpResponse::Ok().json(json!({
-        "status": overall, "service": "openappsec-waf-rs",
-        "version": "2.0.0", "uptime_secs": state.start_time.elapsed().as_secs(),
-        "requests": REQUEST_COUNT.load(AtomicOrdering::Relaxed),
-        "errors": ERROR_COUNT.load(AtomicOrdering::Relaxed),
-        "checks": { "database": db_status }
-    }))
-}
-
-async fn readyz(state: web::Data<AppState>) -> HttpResponse {
-    if state.db_client.is_some() { HttpResponse::Ok().json(json!({"ready": true})) }
-    else { HttpResponse::Ok().json(json!({"ready": true, "note": "no db configured"})) }
-}
-
-async fn livez() -> HttpResponse { HttpResponse::Ok().json(json!({"alive": true})) }
-
-async fn metrics() -> HttpResponse {
-    HttpResponse::Ok().body(format!(
-        "# HELP requests_total Total requests\n# TYPE requests_total counter\nrequests_total {}\n# HELP errors_total Total errors\n# TYPE errors_total counter\nerrors_total {}\n",
-        REQUEST_COUNT.load(AtomicOrdering::Relaxed), ERROR_COUNT.load(AtomicOrdering::Relaxed)
-    ))
-}
-
-
-// OpenAppSec WAF — Web Application Firewall with OWASP CRS patterns
-use std::sync::RwLock;
-use actix_cors::Cors;
-
-lazy_static::lazy_static! {
-    static ref BLOCKED_IPS: RwLock<Vec<String>> = RwLock::new(Vec::new());
-    static ref WAF_RULES: Vec<WafRule> = vec![
-        WafRule { id: 941100, name: "XSS Detection", pattern: "<script", severity: 2, action: "block" },
-        WafRule { id: 942100, name: "SQL Injection", pattern: "UNION SELECT", severity: 1, action: "block" },
-        WafRule { id: 942110, name: "SQL Injection", pattern: "OR 1=1", severity: 1, action: "block" },
-        WafRule { id: 913100, name: "Scanner Detection", pattern: "sqlmap", severity: 2, action: "block" },
-        WafRule { id: 920350, name: "IP Reputation", pattern: "", severity: 3, action: "log" },
-        WafRule { id: 930100, name: "Path Traversal", pattern: "../", severity: 1, action: "block" },
-        WafRule { id: 931100, name: "RFI Detection", pattern: "http://", severity: 2, action: "log" },
-        WafRule { id: 932100, name: "RCE Detection", pattern: "; rm ", severity: 1, action: "block" },
-        WafRule { id: 933100, name: "PHP Injection", pattern: "<?php", severity: 1, action: "block" },
-        WafRule { id: 934100, name: "Node Injection", pattern: "require(", severity: 2, action: "block" },
-    ];
-}
-
-struct WafRule {
-    id: u32, name: &'static str, pattern: &'static str, severity: u8, action: &'static str,
-}
-
-async fn inspect_request(body: web::Json<serde_json::Value>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    let uri = body.get("uri").and_then(|v| v.as_str()).unwrap_or("/");
-    let request_body = body.get("body").and_then(|v| v.as_str()).unwrap_or("");
-    let headers = body.get("headers").and_then(|v| v.as_str()).unwrap_or("");
-    let source_ip = body.get("source_ip").and_then(|v| v.as_str()).unwrap_or("0.0.0.0");
-    
-    let full_input = format!("{} {} {}", uri, request_body, headers).to_uppercase();
-    let mut violations: Vec<serde_json::Value> = Vec::new();
-    let mut anomaly_score: u32 = 0;
-    
-    for rule in WAF_RULES.iter() {
-        if !rule.pattern.is_empty() && full_input.contains(&rule.pattern.to_uppercase()) {
-            anomaly_score += match rule.severity { 1 => 5, 2 => 3, _ => 1 };
-            violations.push(json!({"rule_id": rule.id, "name": rule.name, "severity": rule.severity, "action": rule.action}));
-        }
-    }
-    
-    // Check IP reputation
-    let ip_blocked = BLOCKED_IPS.read().map(|ips| ips.contains(&source_ip.to_string())).unwrap_or(false);
-    if ip_blocked { anomaly_score += 10; }
-    
-    let decision = if anomaly_score >= 5 { "BLOCK" } else if anomaly_score > 0 { "LOG" } else { "ALLOW" };
-    
-    HttpResponse::Ok().json(json!({
-        "decision": decision,
-        "anomaly_score": anomaly_score,
-        "threshold": 5,
-        "violations": violations,
-        "source_ip": source_ip,
-    }))
-}
-
-async fn block_ip(body: web::Json<serde_json::Value>) -> HttpResponse {
-    let ip = body.get("ip").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if let Ok(mut ips) = BLOCKED_IPS.write() { ips.push(ip.clone()); }
-    HttpResponse::Ok().json(json!({"ip": ip, "status": "blocked"}))
-}
-
-async fn waf_stats() -> HttpResponse {
-    let blocked_count = BLOCKED_IPS.read().map(|ips| ips.len()).unwrap_or(0);
-    HttpResponse::Ok().json(json!({
-        "rules_loaded": WAF_RULES.len(),
-        "blocked_ips": blocked_count,
-        "requests_inspected": REQUEST_COUNT.load(AtomicOrdering::Relaxed),
-        "mode": "detection_and_prevention",
-    }))
-}
-
-fn configure_routes(cfg: &mut web::ServiceConfig) {
-    cfg.route("/v1/openappsec-waf/waf/inspect", web::post().to(inspect_request))
-            .route("/audit", web::get().to(audit_handler))
-                .route("/healthz", web::get().to(healthz))
-            .route("/readyz", web::get().to(healthz))
-       .route("/v1/openappsec-waf/waf/block", web::post().to(block_ip))
-       .route("/v1/openappsec-waf/waf/stats", web::get().to(waf_stats));
-}
-
-
-async fn init_db(url: &str) -> Option<tokio_postgres::Client> {
-    use tokio_postgres::NoTls;
-    match tokio_postgres::connect(url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB error: {}", e); } });
-            Some(client)
-        }
-        Err(e) => { eprintln!("DB connect failed: {}", e); None }
-    }
-}
-
-
-// ─── Advanced OpenAppSec Features ───────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct CustomRuleReq {
-    name: String,
-    pattern: String,
-    action: String, // "block", "log", "challenge"
-    severity: String, // "low", "medium", "high", "critical"
-    category: String,
-}
-
-#[derive(Deserialize)]
-struct ThreatIntelQuery {
-    ip: Option<String>,
-    domain: Option<String>,
-    hash: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct RateLimitCoordReq {
-    client_id: String,
-    endpoint: String,
-    window_secs: u64,
-    max_requests: u64,
-}
-
-async fn handle_custom_rule(body: web::Json<CustomRuleReq>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let rule = body.into_inner();
-    let rule_id = format!("RULE-{}", chrono::Utc::now().timestamp_millis());
-    HttpResponse::Ok().json(serde_json::json!({
-        "rule_id": rule_id,
-        "name": rule.name,
-        "pattern": rule.pattern,
-        "action": rule.action,
-        "severity": rule.severity,
-        "category": rule.category,
-        "status": "active",
-    }))
-}
-
-async fn handle_threat_intel(body: web::Json<ThreatIntelQuery>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let query = body.into_inner();
-    let mut results = Vec::new();
-    if let Some(ip) = &query.ip {
-        results.push(serde_json::json!({
-            "indicator": ip,
-            "type": "ip",
-            "reputation_score": 75,
-            "tags": ["scanner", "bruteforce"],
-            "first_seen": "2024-01-15",
-            "last_seen": "2024-06-08",
-        }));
-    }
-    if let Some(domain) = &query.domain {
-        results.push(serde_json::json!({
-            "indicator": domain,
-            "type": "domain",
-            "reputation_score": 90,
-            "tags": ["clean"],
-        }));
-    }
-    HttpResponse::Ok().json(serde_json::json!({"results": results, "feeds_checked": 3}))
-}
-
-async fn handle_rate_coordination(body: web::Json<RateLimitCoordReq>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let req = body.into_inner();
-    // Distributed rate limiting coordination
-    let current_count: u64 = 42; // simulated
-    let allowed = current_count < req.max_requests;
-    let remaining = if allowed { req.max_requests - current_count - 1 } else { 0 };
-    HttpResponse::Ok().json(serde_json::json!({
-        "client_id": req.client_id,
-        "endpoint": req.endpoint,
-        "allowed": allowed,
-        "current_count": current_count,
-        "max_requests": req.max_requests,
-        "remaining": remaining,
-        "window_secs": req.window_secs,
-        "coordinated": true,
-    }))
-}
-
-
-async fn healthz() -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({"status": "healthy", "service": "openappsec-waf-rs"}))
-}
-
-
-// --- Monetary Safety (kobo precision) ---
-type AmountKobo = i64;
-
-fn naira_to_kobo(naira: f64) -> i64 { (naira * 100.0).round() as i64 }
-fn kobo_to_naira(kobo: i64) -> f64 { kobo as f64 / 100.0 }
-fn round_naira(amount: f64) -> f64 { (amount * 100.0).round() / 100.0 }
-fn validate_amount(amount: f64) -> Result<f64, String> {
-    if amount < 0.0 { return Err("amount must be non-negative".into()); }
-    if amount > 999_999_999_999.99 { return Err("exceeds CBN max limit".into()); }
-    Ok(round_naira(amount))
-}
-
-
-// --- Request Tracing ---
-fn extract_trace_id(req: &actix_web::HttpRequest) -> String {
-    req.headers()
-        .get("X-Trace-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string()
-}
-
-
-// --- Circuit Breaker ---
-
-static CB_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
-static CB_LAST_FAIL: AtomicI64 = AtomicI64::new(0);
-const CB_THRESHOLD: u64 = 5;
-const CB_TIMEOUT_SECS: i64 = 30;
-
-fn cb_allow() -> bool {
-    let fails = CB_FAIL_COUNT.load(AtomicOrdering::Relaxed);
-    if fails < CB_THRESHOLD { return true; }
-    let now = chrono::Utc::now().timestamp();
-    now - CB_LAST_FAIL.load(AtomicOrdering::Relaxed) > CB_TIMEOUT_SECS
-}
-
-fn cb_record_success() { CB_FAIL_COUNT.store(0, AtomicOrdering::Relaxed); }
-fn cb_record_failure() {
-    CB_FAIL_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    CB_LAST_FAIL.store(chrono::Utc::now().timestamp(), AtomicOrdering::Relaxed);
-}
-
-
-// --- Observability ---
-fn init_tracing(service_name: &str) {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
-    if !endpoint.is_empty() {
-        println!("[{}] OTEL tracing configured: {}", service_name, endpoint);
-    }
-}
-
-
-
-
-fn security_headers() -> actix_web::middleware::DefaultHeaders {
-    actix_web::middleware::DefaultHeaders::new()
-        .add(("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'"))
-        .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-        .add(("X-Content-Type-Options", "nosniff"))
-        .add(("X-Frame-Options", "DENY"))
-        .add(("X-XSS-Protection", "1; mode=block"))
-        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
-}
-
-// --- Retry with Exponential Backoff ---
-fn retry_with_backoff<F, T, E>(max_retries: u32, mut f: F) -> Result<T, E>
-where F: FnMut() -> Result<T, E> {
-    let mut attempt = 0;
-    loop {
-        match f() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                attempt += 1;
-                if attempt >= max_retries { return Err(e); }
-                let delay = std::cmp::min(100 * (1 << attempt), 5000);
-                std::thread::sleep(std::time::Duration::from_millis(delay));
-            }
-        }
-    }
-}
-
-fn extract_request_id(req: &actix_web::HttpRequest) -> String {
-    req.headers().get("X-Request-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string()
-}
-
-
-fn mask_pii(value: &str, field_type: &str) -> String {
-    if value.len() < 4 { return "***".to_string(); }
-    match field_type {
-        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
-        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
-        "email" => {
-            if let Some(at) = value.find('@') {
-                format!("{}***@{}", &value[..1], &value[at+1..])
-            } else { "***".to_string() }
-        }
-        _ => format!("{}{}{}",
-            &value[..2],
-            "*".repeat(value.len().saturating_sub(4)),
-            &value[value.len().saturating_sub(2)..])
-    }
-}
-
-
-fn validate_bvn(bvn: &str) -> bool {
-    bvn.len() == 11 && bvn.chars().all(|c| c.is_ascii_digit())
-}
-
-fn validate_nuban(account_no: &str) -> bool {
-    account_no.len() == 10 && account_no.chars().all(|c| c.is_ascii_digit())
-}
-
-fn sanitize_input(s: &str, max_len: usize) -> String {
-    s.chars().take(max_len).filter(|c| *c >= ' ' && *c != '\x7f').collect()
-}
-
-fn validate_amount_kobo(amount: i64) -> bool {
-    amount > 0 && amount <= 500_000_000_000
-}
-
-
-// Rate limiter
-
-struct RateLimiter {
-    visitors: StdMutex<HashMap<String, (u32, std::time::Instant)>>,
-    max_requests: u32,
-    window: std::time::Duration,
-}
-
-impl RateLimiter {
-    fn new(max_requests: u32, window_secs: u64) -> Self {
-        Self {
-            visitors: StdMutex::new(HashMap::new()),
-            max_requests,
-            window: std::time::Duration::from_secs(window_secs),
-        }
-    }
-    
-    fn allow(&self, ip: &str) -> bool {
-        let mut visitors = self.visitors.lock().unwrap();
-        let now = std::time::Instant::now();
-        let entry = visitors.entry(ip.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) > self.window {
-            *entry = (1, now);
-            return true;
-        }
-        if entry.0 >= self.max_requests {
-            return false;
-        }
-        entry.0 += 1;
-        true
-    }
-}
-
-lazy_static::lazy_static! {
-    static ref RATE_LIMITER: RateLimiter = RateLimiter::new(100, 60);
-}
-
-
-// Audit trail for compliance
-static AUDIT_LOG: once_cell::sync::Lazy<std::sync::RwLock<Vec<serde_json::Value>>> =
-    once_cell::sync::Lazy::new(|| std::sync::RwLock::new(Vec::new()));
-
-fn audit_log(action: &str, details: &str) {
-    let entry = serde_json::json!({
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "action": action,
-        "details": details,
-        "service": env!("CARGO_PKG_NAME"),
-    });
-    if let Ok(mut log) = AUDIT_LOG.write() {
-        if log.len() > 10_000 { log.drain(..5_000); }
-        log.push(entry);
-    }
-}
-
-async fn audit_handler() -> impl actix_web::Responder {
-    let log = AUDIT_LOG.read().unwrap_or_else(|e| e.into_inner());
-    let recent: Vec<_> = log.iter().rev().take(100).collect();
-    actix_web::HttpResponse::Ok().json(recent)
+    db: PgPool,
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8310);
-    let db_client = if let Ok(url) = env::var("DATABASE_URL") {
-        init_db(&url).await
-    } else { None };
-    
-    let mut config = HashMap::new();
-    for (k, v) in env::vars() {
-        if k.starts_with("SERVICE_") { config.insert(k, v); }
-    }
-    
-    let state = web::Data::new(AppState {
-        records: Mutex::new(Vec::new()),
-        db_client, start_time: Instant::now(), config,
-    });
-    
-    println!("openappsec-waf-rs v2.0 on :{}", port);
-    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[openappsec-waf-rs] starting");
+
+    let db_name = "openappsec-waf-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    init_schema(&pool).await;
+    log::info!("[openappsec-waf-rs] database connected, schema initialized");
+
+    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
+    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
+    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
+    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
+
+    log::info!("[openappsec-waf-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
+        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
+
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8424".to_string()).parse().unwrap_or(8424);
+    let data = web::Data::new(AppState { db: pool });
+
+    log::info!("[openappsec-waf-rs] ready on :{}", port);
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
-            .wrap(
-                Cors::default()
-                    .allow_any_origin()
-                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
-                    .max_age(86400)
-            )
-            .app_data(state.clone())
-            .route("/v1/openappsec-waf/rules/custom", web::post().to(handle_custom_rule))
-                .route("/v1/openappsec-waf/threat-intel/query", web::post().to(handle_threat_intel))
-                .route("/v1/openappsec-waf/rate-limit/coordinate", web::post().to(handle_rate_coordination))
-                .route("/health", web::get().to(health))
+            .app_data(data.clone())
+            .wrap(middleware::Logger::default())
+            .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
-            .configure(configure_routes)
-    }).keep_alive(std::time::Duration::from_secs(75))
-        .client_request_timeout(std::time::Duration::from_secs(30))
-        .bind(format!("0.0.0.0:{}", port))?.shutdown_timeout(30).run().await
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+    })
+    .bind(format!("0.0.0.0:{}", port))?
+    .run()
+    .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
 
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(64) NOT NULL,
+        aggregate_id VARCHAR(128) NOT NULL,
+        payload JSONB NOT NULL,
+        published BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .ok();
 
-// --- Event Bus (Kafka producer) ---
-
-// --- Process Health Watchdog ---
-static WATCHDOG_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn watchdog_ping() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    WATCHDOG_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
+        .execute(pool).await.ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
+        .execute(pool).await.ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
+        .execute(pool).await.ok();
 }
 
-fn watchdog_healthy() -> bool {
-    let last = WATCHDOG_LAST.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 { return true; }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    (now - last) < 60000
+async fn health(data: web::Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "service": "openappsec-waf-rs",
+        "version": "1.0.0"
+    }))
 }
 
-fn start_watchdog() {
-    watchdog_ping();
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if !watchdog_healthy() {
-                eprintln!("[WATCHDOG] Event loop stalled — marking unhealthy");
-            }
-            watchdog_ping();
+async fn readyz(data: web::Data<AppState>) -> HttpResponse {
+    match sqlx::query("SELECT 1").execute(&data.db).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
+        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
+    }
+}
+
+async fn metrics(data: web::Data<AppState>) -> HttpResponse {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
+        .fetch_one(&data.db).await.unwrap_or(0);
+    HttpResponse::Ok().json(serde_json::json!({
+        "service": "openappsec-waf-rs",
+        "total_records": count
+    }))
+}
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    let tenant_id = req.headers().get("X-Tenant-ID")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+
+    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+        .bind(tenant_id)
+        .fetch_all(&data.db)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "status": r.get::<String, _>("status"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+                })
+            }).collect();
+            let count = records.len();
+            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
         }
-    });
-}
-
-// --- EventBus (Kafka producer) ---
-struct EventBus {
-    broker_url: String,
-    topic: String,
-    service_name: String,
-}
-
-impl EventBus {
-    fn new(topic: &str, service: &str) -> Self {
-        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-        Self { broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }
-    }
-
-    fn emit(&self, event_type: &str, payload: &serde_json::Value) {
-        let event = serde_json::json!({
-            "type": event_type,
-            "source": &self.service_name,
-            "topic": &self.topic,
-            "data": payload,
-        });
-        eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
-        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
-fn chrono_now() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    format!("2026-01-01T{:05}Z", d.as_secs() % 86400)
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    let tenant_id = body.tenant_id.clone()
+        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
+        .unwrap_or_else(|| "default".to_string());
+
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
+    )
+    .bind(&tenant_id)
+    .bind(&status)
+    .fetch_one(&data.db)
+    .await;
+
+    match result {
+        Ok(id) => {
+            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.created")
+                .bind(id.to_string())
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
 }
 
-static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
 
-// --- Downstream Service Client ---
-struct DownstreamClient {
-    base_url: String,
-    timeout_ms: u64,
-}
-
-impl DownstreamClient {
-    fn new(env_var: &str, default_url: &str) -> Self {
-        let url = std::env::var(env_var).unwrap_or_else(|_| default_url.to_string());
-        Self { base_url: url, timeout_ms: 5000 }
-    }
-
-    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {
-        let url = format!("{}{}", self.base_url, path);
-        eprintln!("[Downstream] POST {}", url);
-        Ok(())
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
-// --- Data Flow Initialization ---
-fn init_data_flow() -> EventBus {
-    let bus = EventBus::new("security.infra", "openappsec-waf");
-    eprintln!("[openappsec-waf] Data flow initialized: topic=security.infra");
-    bus
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
 }
 
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
 
-    #[test]
-    fn test_service_config() {
-        // Verify service starts without panic
-        assert!(true, "openappsec-waf-rs service module loads");
-    }
-
-    #[test]
-    fn test_watchdog_initially_healthy() {
-        // Watchdog should report healthy before any ping
-        assert!(watchdog_healthy(), "Watchdog should be healthy initially");
-    }
-
-    #[test]
-    fn test_watchdog_ping_updates() {
-        watchdog_ping();
-        assert!(watchdog_healthy(), "Watchdog should be healthy after ping");
-    }
-
-    #[test]
-    fn test_eventbus_creation() {
-        let bus = EventBus::new("test.topic", "openappsec_waf");
-        assert_eq!(bus.topic, "test.topic");
-        assert_eq!(bus.service_name, "openappsec_waf");
-    }
-
-    #[test]
-    fn test_chrono_now_format() {
-        let ts = chrono_now();
-        assert!(ts.starts_with("2026-"), "Timestamp should start with year");
-        assert!(ts.ends_with("Z"), "Timestamp should end with Z");
-    }
-
-    #[test]
-    fn test_events_emitted_counter() {
-        let before = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        let bus = EventBus::new("test.topic", "openappsec_waf");
-        bus.emit("test.event", &serde_json::json!({"test": true}));
-        let after = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "Event counter should increment");
-    }
+    HttpResponse::NoContent().finish()
 }
