@@ -71,13 +71,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install doctl
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DO_API_TOKEN }}
-
-      - name: Save kubeconfig
-        run: doctl kubernetes cluster kubeconfig save ${{ secrets.DO_CLUSTER_NAME }}
+      - name: Set up kubeconfig
+        run: |
+          mkdir -p "$HOME/.kube"
+          printf '%s' '${{ secrets.KUBECONFIG }}' > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
 
       - name: Install Helm
         uses: azure/setup-helm@v3
