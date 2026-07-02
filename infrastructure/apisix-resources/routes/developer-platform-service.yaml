@@ -28,6 +28,15 @@ spec:
         - serviceName: channels-mobile-web
           servicePort: 9170
       plugins:
+        - name: 54link-jwt-payload-decoder
+          enable: true
+          config: {}
+        - name: 54link-access-plugin
+          enable: true
+          config:
+            authorizer_url: "http://auth-service/token"
+            mint_account_url: "http://core-accounts/system/create-mint-account"
+            keycloak_public_key_url: "http://platform-tenant/tenant/keycloak-public-key"
         - name: cors
           enable: true
           config:
