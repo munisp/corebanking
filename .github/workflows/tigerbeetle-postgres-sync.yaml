@@ -8,6 +8,9 @@ on:
       - 'services/tigerbeetle-postgres-sync/**'
       - '.github/workflows/tigerbeetle-postgres-sync.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/tigerbeetle-postgres-sync
           file: ./services/tigerbeetle-postgres-sync/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-tigerbeetle-postgres-sync:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-tigerbeetle-postgres-sync:${{ env.TAG }}

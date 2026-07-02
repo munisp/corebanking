@@ -8,6 +8,9 @@ on:
       - 'services/cif-management-go/**'
       - '.github/workflows/cif-management-go.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/cif-management-go
           file: ./services/cif-management-go/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-cif-management-go:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-cif-management-go:${{ env.TAG }}

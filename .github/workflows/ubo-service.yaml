@@ -8,6 +8,9 @@ on:
       - 'services/ubo-service/**'
       - '.github/workflows/ubo-service.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/ubo-service
           file: ./services/ubo-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-ubo-service:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-ubo-service:${{ env.TAG }}

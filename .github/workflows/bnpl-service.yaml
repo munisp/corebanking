@@ -8,6 +8,9 @@ on:
       - 'services/bnpl-service/**'
       - '.github/workflows/bnpl-service.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/bnpl-service
           file: ./services/bnpl-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-bnpl-service:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-bnpl-service:${{ env.TAG }}

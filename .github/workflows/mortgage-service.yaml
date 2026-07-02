@@ -8,6 +8,9 @@ on:
       - 'services/mortgage-service/**'
       - '.github/workflows/mortgage-service.yaml'
 
+env:
+  TAG: "0.0.4"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/mortgage-service
           file: ./services/mortgage-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-mortgage-service:0.0.4
+          tags: registry.digitalocean.com/talentgraph-auth/54link-mortgage-service:${{ env.TAG }}

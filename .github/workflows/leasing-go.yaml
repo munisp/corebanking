@@ -8,6 +8,9 @@ on:
       - 'services/leasing-go/**'
       - '.github/workflows/leasing-go.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/leasing-go
           file: ./services/leasing-go/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-leasing-go:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-leasing-go:${{ env.TAG }}

@@ -8,6 +8,9 @@ on:
       - 'services/data-intelligence/**'
       - '.github/workflows/data-intelligence.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/data-intelligence
           file: ./services/data-intelligence/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-data-intelligence:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-data-intelligence:${{ env.TAG }}

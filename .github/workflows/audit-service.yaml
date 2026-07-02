@@ -8,6 +8,9 @@ on:
       - 'services/audit-service/**'
       - '.github/workflows/audit-service.yaml'
 
+env:
+  TAG: "0.0.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/audit-service
           file: ./services/audit-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-audit-service:0.0.0
+          tags: registry.digitalocean.com/talentgraph-auth/54link-audit-service:${{ env.TAG }}

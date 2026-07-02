@@ -8,6 +8,9 @@ on:
       - 'services/card-service/**'
       - '.github/workflows/card-service.yaml'
 
+env:
+  TAG: "0.0.7"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/card-service
           file: ./services/card-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-card-service:0.0.7
+          tags: registry.digitalocean.com/talentgraph-auth/54link-card-service:${{ env.TAG }}

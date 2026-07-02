@@ -16,6 +16,9 @@ on:
       - 'docker/entrypoint.sh'
       - '.github/workflows/customer-management.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -44,4 +47,4 @@ jobs:
             SERVICES=customer-360-py,customer-engagement-py,customer-feedback-py,expense-mgmt-go,i18n-service-go,relationship-manager-service
             PRIMARY_LANG=python
             PORT_BASE=9348
-          tags: registry.digitalocean.com/talentgraph-auth/54link-customer-management:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-customer-management:${{ env.TAG }}

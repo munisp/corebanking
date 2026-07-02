@@ -24,6 +24,9 @@ on:
       - 'docker/entrypoint.sh'
       - '.github/workflows/ledger-gl.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -52,4 +55,4 @@ jobs:
             SERVICES=accounting-rules-rs,chart-of-accounts-service,finance-service,gl-engine-go,gl-engine-rs,operations-control-gl-rs,salary-processing-go,tigerbeetle-adapter-rs,tigerbeetle-batch-engine-rs,tigerbeetle-multicurrency-rs,tigerbeetle-postgres-sync,tigerbeetle-protocol-rs,tigerbeetle-sync-go,transaction-ledger
             PRIMARY_LANG=rust
             PORT_BASE=9465
-          tags: registry.digitalocean.com/talentgraph-auth/54link-ledger-gl:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-ledger-gl:${{ env.TAG }}

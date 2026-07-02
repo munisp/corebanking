@@ -8,6 +8,9 @@ on:
       - 'services/reporting-service/**'
       - '.github/workflows/reporting-service.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/reporting-service
           file: ./services/reporting-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-reporting-service:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-reporting-service:${{ env.TAG }}

@@ -8,6 +8,9 @@ on:
       - 'services/expense-mgmt-go/**'
       - '.github/workflows/expense-mgmt-go.yaml'
 
+env:
+  TAG: "0.0.2"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/expense-mgmt-go
           file: ./services/expense-mgmt-go/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-expense-mgmt-go:0.0.2
+          tags: registry.digitalocean.com/talentgraph-auth/54link-expense-mgmt-go:${{ env.TAG }}

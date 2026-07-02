@@ -8,6 +8,9 @@ on:
       - 'services/user-service/**'
       - '.github/workflows/user-service.yaml'
 
+env:
+  TAG: "0.0.10"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/user-service
           file: ./services/user-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-user-service:0.0.10
+          tags: registry.digitalocean.com/talentgraph-auth/54link-user-service:${{ env.TAG }}

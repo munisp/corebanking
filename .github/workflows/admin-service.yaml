@@ -8,6 +8,9 @@ on:
       - 'services/admin-service/**'
       - '.github/workflows/admin-service.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/admin-service
           file: ./services/admin-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-admin-service:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-admin-service:${{ env.TAG }}

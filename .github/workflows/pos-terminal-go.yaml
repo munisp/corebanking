@@ -8,6 +8,9 @@ on:
       - 'services/pos-terminal-go/**'
       - '.github/workflows/pos-terminal-go.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/pos-terminal-go
           file: ./services/pos-terminal-go/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-pos-terminal-go:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-pos-terminal-go:${{ env.TAG }}

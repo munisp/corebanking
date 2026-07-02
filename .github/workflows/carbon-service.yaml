@@ -8,6 +8,9 @@ on:
       - 'services/carbon-service/**'
       - '.github/workflows/carbon-service.yaml'
 
+env:
+  TAG: "0.0.2"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/carbon-service
           file: ./services/carbon-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-carbon-service:0.0.2
+          tags: registry.digitalocean.com/talentgraph-auth/54link-carbon-service:${{ env.TAG }}

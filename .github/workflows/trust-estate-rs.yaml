@@ -8,6 +8,9 @@ on:
       - 'services/trust-estate-rs/**'
       - '.github/workflows/trust-estate-rs.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/trust-estate-rs
           file: ./services/trust-estate-rs/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-trust-estate-rs:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-trust-estate-rs:${{ env.TAG }}

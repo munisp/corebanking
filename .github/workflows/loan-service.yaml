@@ -8,6 +8,9 @@ on:
       - 'services/loan-service/**'
       - '.github/workflows/loan-service.yaml'
 
+env:
+  TAG: "0.0.4"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/loan-service
           file: ./services/loan-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-loan-service:0.0.4
+          tags: registry.digitalocean.com/talentgraph-auth/54link-loan-service:${{ env.TAG }}

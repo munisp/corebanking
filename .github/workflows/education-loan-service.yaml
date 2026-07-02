@@ -8,6 +8,9 @@ on:
       - 'services/education-loan-service/**'
       - '.github/workflows/education-loan-service.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/education-loan-service
           file: ./services/education-loan-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-education-loan-service:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-education-loan-service:${{ env.TAG }}

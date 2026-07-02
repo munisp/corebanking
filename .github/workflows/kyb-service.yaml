@@ -8,6 +8,9 @@ on:
       - 'services/kyb-service/**'
       - '.github/workflows/kyb-service.yaml'
 
+env:
+  TAG: "0.0.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/kyb-service
           file: ./services/kyb-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-kyb-service:0.0.0
+          tags: registry.digitalocean.com/talentgraph-auth/54link-kyb-service:${{ env.TAG }}

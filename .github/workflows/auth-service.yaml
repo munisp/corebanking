@@ -8,6 +8,9 @@ on:
       - 'services/auth-service/**'
       - '.github/workflows/auth-service.yaml'
 
+env:
+  TAG: 0.0.11
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/auth-service
           file: ./services/auth-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-auth-service:0.0.11
+          tags: registry.digitalocean.com/talentgraph-auth/54link-auth-service:${{ env.TAG }}

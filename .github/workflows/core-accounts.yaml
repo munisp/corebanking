@@ -20,6 +20,9 @@ on:
       - 'docker/entrypoint.sh'
       - '.github/workflows/core-accounts.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -48,4 +51,4 @@ jobs:
             SERVICES=account-closure-go,account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go
             PRIMARY_LANG=go
             PORT_BASE=9278
-          tags: registry.digitalocean.com/talentgraph-auth/54link-core-accounts:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-core-accounts:${{ env.TAG }}

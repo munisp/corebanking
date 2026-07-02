@@ -8,6 +8,9 @@ on:
       - 'services/etherisc-service/**'
       - '.github/workflows/etherisc-service.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/etherisc-service
           file: ./services/etherisc-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-etherisc-service:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-etherisc-service:${{ env.TAG }}

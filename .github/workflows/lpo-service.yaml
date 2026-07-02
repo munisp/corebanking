@@ -8,6 +8,9 @@ on:
       - 'services/lpo-service/**'
       - '.github/workflows/lpo-service.yaml'
 
+env:
+  TAG: "0.0.3"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/lpo-service
           file: ./services/lpo-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-lpo-service:0.0.3
+          tags: registry.digitalocean.com/talentgraph-auth/54link-lpo-service:${{ env.TAG }}

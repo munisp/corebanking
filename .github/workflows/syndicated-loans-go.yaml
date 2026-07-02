@@ -8,6 +8,9 @@ on:
       - 'services/syndicated-loans-go/**'
       - '.github/workflows/syndicated-loans-go.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/syndicated-loans-go
           file: ./services/syndicated-loans-go/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-syndicated-loans-go:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-syndicated-loans-go:${{ env.TAG }}

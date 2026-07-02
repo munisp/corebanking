@@ -8,6 +8,9 @@ on:
       - 'services/compliaince-ui/**'
       - '.github/workflows/compliaince-ui.yaml'
 
+env:
+  TAG: "0.0.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/compliance-ui
           file: ./services/compliance-ui/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-compliance-ui:0.0.0
+          tags: registry.digitalocean.com/talentgraph-auth/54link-compliance-ui:${{ env.TAG }}

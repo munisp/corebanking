@@ -8,6 +8,9 @@ on:
       - 'services/document-service/**'
       - '.github/workflows/document-service.yaml'
 
+env:
+  TAG: "0.0.0"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/document-service
           file: ./services/document-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-document-service:0.0.0
+          tags: registry.digitalocean.com/talentgraph-auth/54link-document-service:${{ env.TAG }}

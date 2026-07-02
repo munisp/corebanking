@@ -8,6 +8,9 @@ on:
       - 'services/payment-processing-service/**'
       - '.github/workflows/payment-processing-service.yaml'
 
+env:
+  TAG: "0.0.10"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/payment-processing-service
           file: ./services/payment-processing-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-payment-processing-service:0.0.10
+          tags: registry.digitalocean.com/talentgraph-auth/54link-payment-processing-service:${{ env.TAG }}

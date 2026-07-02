@@ -12,6 +12,9 @@ on:
       - 'docker/entrypoint.sh'
       - '.github/workflows/mojaloop-connector.yaml'
 
+env:
+  TAG: "0.0.3"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -40,4 +43,4 @@ jobs:
             SERVICES=mojaloop-connector
             PRIMARY_LANG=go
             PORT_BASE=9489
-          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-mojaloop-connector:0.0.3
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-mojaloop-connector:${{ env.TAG }}

@@ -8,6 +8,9 @@ on:
       - 'services/orchestrator-service/**'
       - '.github/workflows/orchestrator-service.yaml'
 
+env:
+  TAG: "0.0.12"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/orchestrator-service
           file: ./services/orchestrator-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-orchestrator-service:0.0.12
+          tags: registry.digitalocean.com/talentgraph-auth/54link-orchestrator-service:${{ env.TAG }}

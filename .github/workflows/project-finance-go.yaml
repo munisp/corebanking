@@ -8,6 +8,9 @@ on:
       - 'services/project-finance-go/**'
       - '.github/workflows/project-finance-go.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/project-finance-go
           file: ./services/project-finance-go/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-project-finance-go:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-project-finance-go:${{ env.TAG }}

@@ -8,6 +8,9 @@ on:
       - 'services/insurance-service/**'
       - '.github/workflows/insurance-service.yaml'
 
+env:
+  TAG: "0.0.1"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/insurance-service
           file: ./services/insurance-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-insurance-service:0.0.1
+          tags: registry.digitalocean.com/talentgraph-auth/54link-insurance-service:${{ env.TAG }}

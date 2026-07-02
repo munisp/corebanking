@@ -8,6 +8,9 @@ on:
       - 'services/supply-chain-service/**'
       - '.github/workflows/supply-chain-service.yaml'
 
+env:
+  TAG: "0.0.2"
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -32,4 +35,4 @@ jobs:
           context: ./services/supply-chain-service
           file: ./services/supply-chain-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-supply-chain-service:0.0.2
+          tags: registry.digitalocean.com/talentgraph-auth/54link-supply-chain-service:${{ env.TAG }}
