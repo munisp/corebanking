@@ -6,28 +6,11 @@ import { billingAccountRepository } from "../repositories/billingAccountReposito
 import { billingApprovalMatrixRepository } from "../repositories/billingApprovalMatrixRepository";
 import { billingDiscountRuleRepository } from "../repositories/billingDiscountRuleRepository";
 import { billingRevenueShareRuleRepository } from "../repositories/billingRevenueShareRuleRepository";
+import { billingMeteringService } from "./billingMeteringService";
 import { BillingInvoice } from "../models/BillingInvoice";
 import { BillingInvoiceLine } from "../models/BillingInvoiceLine";
 import { BillingInvoiceApproval } from "../models/BillingInvoiceApproval";
-import { generateId, currentPeriodKey, generateInvoiceNumber } from "../utils/id";
-
-type PeriodType = "monthly" | "quarterly" | "semi_annual" | "annual" | "custom";
-
-function periodBounds(periodType: PeriodType): { start: Date; end: Date; periodKey: string } {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = now.getMonth();
-  const periodKey = `${year}-${String(month + 1).padStart(2, "0")}`;
-
-  if (periodType === "monthly") {
-    return { start: new Date(year, month, 1), end: new Date(year, month + 1, 0, 23, 59, 59), periodKey };
-  }
-  if (periodType === "quarterly") {
-    const q = Math.floor(month / 3);
-    return { start: new Date(year, q * 3, 1), end: new Date(year, q * 3 + 3, 0, 23, 59, 59), periodKey: `${year}-Q${q + 1}` };
-  }
-  return { start: new Date(year, month, 1), end: new Date(year, month + 1, 0, 23, 59, 59), periodKey };
-}
+import { generateId, generateInvoiceNumber, resolvePeriodBounds, PeriodType } from "../utils/id";
 
 function dueDate(start: Date): Date {
   const d = new Date(start);
@@ -44,7 +27,20 @@ export const billingInvoiceService = {
     const account = await billingAccountRepository.findById(billingAccountId);
     if (!account) throw Object.assign(new Error("Billing account not found"), { status: 404 });
 
-    const { start, end, periodKey } = periodBounds(periodType);
+    const { start, end, periodKey } = resolvePeriodBounds(periodType);
+
+    const existingInvoice = await billingInvoiceRepository.findByAccountAndPeriod(billingAccountId, periodKey);
+    if (existingInvoice) {
+      // Idempotent re-call: generate once per period, don't double-invoice.
+      const lines = await billingInvoiceLineRepository.findByInvoice(existingInvoice.id);
+      const approvals = await billingInvoiceApprovalRepository.findByInvoice(existingInvoice.id);
+      return { invoice: existingInvoice, lines, approvals };
+    }
+
+    // The gateway's API-call counter is keyed by calendar month (YYYY-MM), matching
+    // the "monthly" periodKey format — this flush is a no-op for non-monthly periodTypes.
+    await billingMeteringService.flushApiCallUsage(account, periodKey);
+
     const accruals = await billingAccrualSnapshotRepository.findByAccount(billingAccountId, periodKey);
 
     let subtotal = accruals.reduce((s, a) => s + Number(a.accruedAmount), 0);

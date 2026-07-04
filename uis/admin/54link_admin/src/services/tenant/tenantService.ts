@@ -237,7 +237,7 @@ export const GLOBAL_FEATURE_CATALOG: Array<{ name: string; label: string }> = [
 ];
 
 class TenantService {
-  // private readonly TENANT_CONFIG_KEY = 'tenant_config';
+  private readonly TENANT_CONFIG_KEY = "tenant_config";
   private readonly TENANT_ID_KEY = "tenant_id";
 
   /**
@@ -258,11 +258,7 @@ class TenantService {
 
   /**
    * Get tenant_id from environment variable, localStorage, or URL
-   * COMMENTED OUT: Not using API calls for now
-   * Kept for when API calls are re-enabled
    */
-  // eslint-disable-next-line @typescript-eslint/ban-ts-comment
-  // @ts-ignore - Kept for future use when API calls are re-enabled
   private getTenantId(): string | null {
     // First check environment variable
     const envTenantId = import.meta.env.VITE_TENANT_ID || "bpmgd";
@@ -302,7 +298,7 @@ class TenantService {
   async changeTenant(tenantId: string): Promise<Tenant> {
     this.setTenantId(tenantId);
     // Clear old config to force fresh fetch
-    // Removed call to non-existent removeTenantConfig
+    this.removeTenantConfig();
     // Fetch new tenant config
     return await this.getTenant(tenantId);
   }
@@ -356,8 +352,7 @@ class TenantService {
         // Clear tenant config if the deleted tenant is the current one
         const currentTenantId = this.getTenantId();
         if (currentTenantId === tenantId) {
-          // Removed call to non-existent removeTenantConfig
-          localStorage.removeItem(this.TENANT_ID_KEY);
+          this.removeTenantConfig();
         }
         return;
       }
@@ -441,21 +436,12 @@ class TenantService {
   }
 
   /**
-   * Get 54link default data - no tenant config needed
-   * @param _tenantId - Not used, kept for compatibility
+   * Fetch the tenant config from tenant-management and cache it in localStorage.
+   * @param tenantId - Tenant to fetch; defaults to the configured/stored tenant id.
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async getTenant(_tenantId?: string): Promise<Tenant> {
-    // Always return 54link default data - no storage needed
-    if (import.meta.env.DEV) {
-      console.log("Using 54link default data (no tenant config)");
-    }
-
-    return LINK54_DEFAULT_DATA;
-
-    /* COMMENTED OUT API CALL - Using mock data for now
+  async getTenant(tenantId?: string): Promise<Tenant> {
     const id = tenantId || this.getTenantId();
-    
+
     if (!id) {
       throw new Error('Tenant ID is required. Please set VITE_TENANT_ID environment variable or call setTenantId() first.');
     }
@@ -467,59 +453,61 @@ class TenantService {
 
       if (response.data.message === 'success' && response.data.tenant) {
         const tenant = response.data.tenant;
-        
+
         // Debug logging
         if (import.meta.env.DEV) {
           console.log('Tenant API response:', response.data);
           console.log('Tenant object to store:', tenant);
           console.log('Feature flags in response:', tenant.feature_flags);
         }
-        
+
         // Store tenant config in localStorage
         this.setTenantConfig(tenant);
         return tenant;
       }
 
       throw new Error('Invalid response format from tenant API');
-    } catch (error: any) {
+    } catch (error: unknown) {
       throw this.handleError(error);
     }
-    */
   }
 
   /**
-   * Get tenant config - always returns 54link default data
-   * No localStorage check - app is only for 54link
+   * Get tenant config from localStorage; falls back to 54link default data
+   * until the real config has been fetched via getTenant().
    */
   getTenantConfig(): Tenant | null {
-    // Always return 54link default data - no tenant config needed
+    const stored = localStorage.getItem(this.TENANT_CONFIG_KEY);
+    if (stored) {
+      try {
+        return JSON.parse(stored) as Tenant;
+      } catch (error) {
+        console.error("Failed to parse stored tenant config:", error);
+      }
+    }
     return LINK54_DEFAULT_DATA;
   }
 
   /**
    * Set tenant config in localStorage
-   * COMMENTED OUT: Not used - app always uses 54link default data
    */
-  // setTenantConfig(tenant: Tenant): void {
-  //   localStorage.setItem(this.TENANT_CONFIG_KEY, JSON.stringify(tenant));
-  // }
+  setTenantConfig(tenant: Tenant): void {
+    localStorage.setItem(this.TENANT_CONFIG_KEY, JSON.stringify(tenant));
+  }
 
   /**
    * Remove tenant config from localStorage
-   * COMMENTED OUT: Not used - app always uses 54link default data
    */
-  // removeTenantConfig(): void {
-  //   localStorage.removeItem(this.TENANT_CONFIG_KEY);
-  //   localStorage.removeItem(this.TENANT_ID_KEY);
-  // }
+  removeTenantConfig(): void {
+    localStorage.removeItem(this.TENANT_CONFIG_KEY);
+    localStorage.removeItem(this.TENANT_ID_KEY);
+  }
 
   /**
-   * Check if tenant config exists
-   * Always returns true since we always have 54link default data
+   * Check if a real tenant config has been fetched and cached
    */
   hasTenantConfig(): boolean {
-    // Always return true - we always have 54link default data
-    return true;
+    return localStorage.getItem(this.TENANT_CONFIG_KEY) !== null;
   }
 
   /**

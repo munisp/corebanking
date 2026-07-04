@@ -15,40 +15,6 @@ export default defineConfig({
   },
   server: {
     host: true,
-    allowedHosts: ["admin.54link-dev.upi.dev"],
-    proxy: Object.fromEntries(
-      [
-        // Auth & identity
-        "/auth", "/admin", "/orchestrator",
-        // Core banking
-        "/account", "/user", "/ledger", "/document", "/notification",
-        // Tenant & features
-        "/tenant-management", "/feature-flags-go",
-        // Payments & FX
-        "/payment-processing-service", "/payment-rails-connectors",
-        "/exchange-rate-service", "/mojaloop-connector", "/bill-payment-service",
-        // Compliance & risk
-        "/fraud", "/fraudfusion", "/txn-monitoring-rules-rs",
-        "/kyc", "/kyb-service", "/aml-compliance-dashboard-py",
-        "/aml-case-manager-go", "/aml-risk-scoring-rs",
-        // Lending
-        "/loan", "/loans", "/lpo", "/savings", "/microfinance-engine-go",
-        "/group-lending", "/esusu",
-        // Agent banking
-        "/agent-banking-go",
-        // Monitoring & analytics
-        "/kpi-engine-go", "/api-metering", "/reporting-service",
-        "/monitoring-service",
-        // Developer platform
-        "/developer-platform",
-        // Alerts
-        "/alert-rules-go", "/alert-settings-go",
-        // Disputes
-        "/dispute",
-      ].map((prefix) => [
-        prefix,
-        { target: "https://54link-dev.upi.dev", changeOrigin: true },
-      ])
-    ),
+    allowedHosts: ["admin.54link-dev.upi.dev","54link-dev.upi.dev"],
   },
 });

@@ -71,7 +71,7 @@ secrets:
   COMMISSION_SVC_URL: "http://core-payments.54link-dev.svc.cluster.local:9333"
   MAKER_CHECKER_URL: "https://54link-dev.upi.dev/approvals"
   NFIU_SERVICE_URL: "https://54link-dev.upi.dev/ctr"
-  BILLING_SVC_URL: "https://54link-dev.upi.dev/billing"
+  BILLING_SVC_URL: "https://54link-dev.upi.dev/billings"
   APP_PORT: "9330"
   PORT_BASE: "9330"
   SERVICE_GROUP: core-payments

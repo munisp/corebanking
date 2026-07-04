@@ -104,8 +104,7 @@ function Router() {
     if (isAuthenticated && !isLoginPage) {
       const fetchTenantData = async () => {
         try {
-          const existingConfig = tenantService.getTenantConfig();
-          if (!existingConfig) {
+          if (!tenantService.hasTenantConfig()) {
             await tenantService.getTenant();
             console.log('Tenant config loaded and stored in localStorage');
           }

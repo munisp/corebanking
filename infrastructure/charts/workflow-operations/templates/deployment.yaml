@@ -74,6 +74,8 @@ spec:
             - secretRef:
                 name: 54link-shared-app-svc-secret
             - secretRef:
+                name: document-service-minio
+            - secretRef:
                 name: {{ include "workflow-operations.fullname" . }}-secrets
           {{- with .Values.resources }}
           resources:

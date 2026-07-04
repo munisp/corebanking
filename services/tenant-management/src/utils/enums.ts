@@ -118,6 +118,11 @@ export enum BillingPlan {
   ENTERPRISE = "enterprise",
 }
 
+export enum BillingPeriod {
+  MONTHLY = "monthly",
+  ANNUAL = "annual",
+}
+
 export enum OnboardingWorkflowStatus {
   IN_PROGRESS = "in_progress",
   COMPLETED = "completed",

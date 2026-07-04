@@ -9,6 +9,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
+  Pagination,
+  PaginationContent,
+  PaginationItem,
+  PaginationNext,
+  PaginationPrevious,
+} from "@/components/ui/pagination";
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -41,10 +48,13 @@ import { Link } from "wouter";
 import { trpc } from "../lib/trpc";
 import { tenantService, type Tenant, type FeatureFlagConfig } from "../services/tenant";
 
+const TENANTS_PAGE_SIZE = 20;
+
 export default function BankManagement() {
   const [searchTerm, setSearchTerm] = useState("");
   const [filterTier, setFilterTier] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
+  const [currentPage, setCurrentPage] = useState(1);
   const { primaryColor, secondaryColor } = useTenantBranding();
   const [tenants, setTenants] = useState<Tenant[]>([]);
   // Removed unused metrics state
@@ -150,6 +160,14 @@ export default function BankManagement() {
       filterStatus === "all" || tenant.status === filterStatus;
     return matchesSearch && matchesTier && matchesStatus;
   });
+
+  // getTenants has no server-side pagination (it always returns every tenant),
+  // so we paginate the already-fetched list for display here instead.
+  const totalPages = Math.max(1, Math.ceil(filteredTenants.length / TENANTS_PAGE_SIZE));
+  const paginatedTenants = filteredTenants.slice(
+    (currentPage - 1) * TENANTS_PAGE_SIZE,
+    currentPage * TENANTS_PAGE_SIZE,
+  );
 
   const getTierColor = (tier: string) => {
     switch (tier) {
@@ -693,13 +711,13 @@ export default function BankManagement() {
                 placeholder="Search by name or tenant ID..."
                 className="w-full pl-10 pr-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-white"
                 value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
+                onChange={(e) => { setSearchTerm(e.target.value); setCurrentPage(1); }}
               />
             </div>
             <select
               className="px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-white"
               value={filterTier}
-              onChange={(e) => setFilterTier(e.target.value)}
+              onChange={(e) => { setFilterTier(e.target.value); setCurrentPage(1); }}
             >
               <option value="all">All Tiers</option>
               <option value="enterprise">Enterprise</option>
@@ -709,7 +727,7 @@ export default function BankManagement() {
             <select
               className="px-4 py-2 border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-white"
               value={filterStatus}
-              onChange={(e) => setFilterStatus(e.target.value)}
+              onChange={(e) => { setFilterStatus(e.target.value); setCurrentPage(1); }}
             >
               <option value="all">All Status</option>
               <option value="active">Active</option>
@@ -778,7 +796,7 @@ export default function BankManagement() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-200 dark:divide-slate-700">
-                  {filteredTenants.map((tenant) => (
+                  {paginatedTenants.map((tenant) => (
                     <tr
                       key={tenant.id}
                       className="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors"
@@ -895,10 +913,37 @@ export default function BankManagement() {
           )}
         </div>
 
-        {/* Pagination Info */}
+        {/* Pagination */}
         {tenants.length > 0 && (
-          <div className="mt-4 text-center text-sm text-slate-600 dark:text-slate-400">
-            Showing {filteredTenants.length} of {tenants.length} tenants
+          <div className="mt-4 flex items-center justify-between">
+            <p className="text-sm text-slate-600 dark:text-slate-400">
+              Showing {paginatedTenants.length} of {filteredTenants.length} tenants
+              {totalPages > 1 ? ` — page ${currentPage} of ${totalPages}` : ""}
+            </p>
+            {totalPages > 1 && (
+              <Pagination>
+                <PaginationContent>
+                  <PaginationItem>
+                    <PaginationPrevious
+                      onClick={(e) => {
+                        e.preventDefault();
+                        if (currentPage > 1) setCurrentPage((p) => p - 1);
+                      }}
+                      className={currentPage <= 1 ? "pointer-events-none opacity-50" : "cursor-pointer"}
+                    />
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationNext
+                      onClick={(e) => {
+                        e.preventDefault();
+                        if (currentPage < totalPages) setCurrentPage((p) => p + 1);
+                      }}
+                      className={currentPage >= totalPages ? "pointer-events-none opacity-50" : "cursor-pointer"}
+                    />
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
+            )}
           </div>
         )}
       </div>

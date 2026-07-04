@@ -6,8 +6,8 @@ import { billingAccountService } from "../services/billingAccountService";
 export const billingAccountController = {
   async createProfile(req: Request, res: Response) {
     const tenantId = req.headers["x-tenant-id"] as string;
-    const { plan } = req.body;
-    const billing_profile = await billingAccountService.createOrGetProfile(tenantId, plan ?? "hybrid");
+    const { plan, billingPeriod } = req.body;
+    const billing_profile = await billingAccountService.createOrGetProfile(tenantId, plan ?? "standard", billingPeriod ?? "monthly");
     return res.status(httpStatus.OK).json({ billing_profile });
   },
 

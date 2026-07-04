@@ -19,9 +19,9 @@ router.put(
   "/",
   asyncHandler(async (req, res) => {
     const tenantId = req.headers["x-tenant-id"] as string;
-    const { plan } = req.body;
-    const billing_profile = await billingService.createBillingProfile(tenantId, plan);
-    await tenantRepository.updateTenant(tenantId, { plan });
+    const { plan, billingPeriod } = req.body;
+    const billing_profile = await billingService.createBillingProfile(tenantId, plan, billingPeriod);
+    await tenantRepository.updateTenant(tenantId, { plan, billingPeriod });
     return res.status(httpStatus.OK).json({ billing_profile });
   })
 );

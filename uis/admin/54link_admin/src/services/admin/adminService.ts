@@ -26,8 +26,8 @@ export async function getAdminByKeycloakId(keycloakId: string) {
   return data;
 }
 
-export async function getAdmins() {
-  const { data } = await apiClient.get(API_BASE);
+export async function getAdmins(page = 1, limit = 100) {
+  const { data } = await apiClient.get(API_BASE, { params: { page, limit } });
   return data;
 }
 

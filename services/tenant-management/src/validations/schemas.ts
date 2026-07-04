@@ -16,4 +16,7 @@ export const EnvSchema = z.object({
   DB_DATABASE_TYPE: z.nativeEnum(SupportedDatabaseTypes),
   DAPR_HOST: z.string(),
   DAPR_HTTP_PORT: z.string(),
+  // billing-service is bundled in this same pod (not independently Dapr-addressable,
+  // since one pod only exposes one Dapr app-id/port) — reached directly over HTTP.
+  BILLING_SERVICE_URL: z.string().optional().default("http://localhost:9523"),
 });

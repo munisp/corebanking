@@ -14,6 +14,12 @@ export class BillingAccount {
   @Column({ name: "billing_model", type: "varchar", length: 30, default: "usage" })
   billingModel: "subscription" | "usage" | "hybrid" | "revenue_share";
 
+  @Column({ type: "varchar", length: 30, nullable: true })
+  plan: "standard" | "premium" | "enterprise" | null;
+
+  @Column({ name: "billing_period", type: "varchar", length: 20, default: "monthly" })
+  billingPeriod: "monthly" | "annual";
+
   @Column({ type: "varchar", length: 3, default: "NGN" })
   currency: string;
 

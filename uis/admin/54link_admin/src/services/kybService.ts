@@ -9,6 +9,56 @@ import type {
 } from "../types/kyb";
 import apiClient from "./api";
 
+// Raw shape returned by business-service (schemas/v1/business.py BusinessResponse)
+interface RawBusiness {
+  id: string;
+  tenant_id: string;
+  name: string;
+  registration_number?: string;
+  business_type?: string;
+  verification_status: string;
+  industry_code?: string;
+  headquarters_address?: string;
+  phone_number?: string;
+  email_address?: string;
+  metadata?: Record<string, unknown>;
+  created_at: string;
+  updated_at?: string;
+}
+
+// business-service uses id/name/industry_code/headquarters_address/phone_number/email_address;
+// the rest of this app was built against business_id/business_name/industry/address/contact_phone/contact_email.
+function toBusiness(raw: RawBusiness): Business {
+  return {
+    business_id: raw.id,
+    tenant_id: raw.tenant_id,
+    business_name: raw.name,
+    registration_number: raw.registration_number,
+    business_type: raw.business_type,
+    industry: raw.industry_code,
+    address: raw.headquarters_address,
+    contact_email: raw.email_address,
+    contact_phone: raw.phone_number,
+    verification_status: raw.verification_status as Business["verification_status"],
+    metadata: raw.metadata,
+    created_at: raw.created_at,
+    updated_at: raw.updated_at,
+  };
+}
+
+function toCreateBusinessRequest(payload: RegisterBusinessPayload): Record<string, unknown> {
+  return {
+    name: payload.business_name,
+    registration_number: payload.registration_number,
+    business_type: payload.business_type,
+    industry_code: payload.industry,
+    headquarters_address: payload.address,
+    email_address: payload.contact_email,
+    phone_number: payload.contact_phone,
+    metadata: payload.metadata,
+  };
+}
+
 class KYBService {
   private readonly BASE_URL = "/business/api/v1";
 
@@ -109,24 +159,28 @@ class KYBService {
 
   /**
    * Get all businesses for the tenant
-   * @returns Promise resolving to an array of businesses
+   * @returns Promise resolving to the businesses on this page and the total count
    */
-  async getAllBusinesses(): Promise<Business[]> {
+  async getAllBusinesses(skip = 0, limit = 100): Promise<{ businesses: Business[]; total: number }> {
     try {
       const response = await apiClient.get<
-        { total: number; skip: number; limit: number; businesses: Business[] } | Business[]
+        { total: number; skip: number; limit: number; businesses: RawBusiness[] } | RawBusiness[]
       >(
-        `${this.BASE_URL}/business`,
+        `${this.BASE_URL}/businesses`,
+        { params: { skip, limit } },
       );
       const payload = response.data;
       // Handle array response
-      if (Array.isArray(payload)) return payload;
+      if (Array.isArray(payload)) {
+        const businesses = payload.map(toBusiness);
+        return { businesses, total: businesses.length };
+      }
       // Handle object response with businesses array
-      if (payload && Array.isArray((payload as any).businesses)) {
-        return (payload as any).businesses;
+      if (payload && Array.isArray(payload.businesses)) {
+        return { businesses: payload.businesses.map(toBusiness), total: payload.total ?? payload.businesses.length };
       }
       // Fallback
-      return [];
+      return { businesses: [], total: 0 };
     } catch (error: unknown) {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown error";
@@ -142,11 +196,11 @@ class KYBService {
    */
   async registerBusiness(payload: RegisterBusinessPayload): Promise<Business> {
     try {
-      const response = await apiClient.post<Business>(
-        `${this.BASE_URL}`,
-        payload,
+      const response = await apiClient.post<RawBusiness>(
+        `${this.BASE_URL}/businesses`,
+        toCreateBusinessRequest(payload),
       );
-      return response.data;
+      return toBusiness(response.data);
     } catch (error: unknown) {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown error";

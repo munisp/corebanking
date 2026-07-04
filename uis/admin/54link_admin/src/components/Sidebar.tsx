@@ -3,6 +3,7 @@ import {
   ArrowLeftRight,
   Bell,
   Building2,
+  ChevronDown,
   ClipboardList,
   Clock,
   Code2,
@@ -84,6 +85,8 @@ const sections: Section[] = [
   },
 ];
 
+const SIDEBAR_COLLAPSED_KEY = "sidebar_collapsed_sections";
+
 export default function Sidebar() {
   const [location] = useLocation();
   const { name, logoUrl, primaryColor } = useTenantBranding();
@@ -91,6 +94,41 @@ export default function Sidebar() {
   const [accessLevel, setAccessLevel] = useState<string | null>(null);
   const [userInfo, setUserInfo] = useState<{ name: string; email: string } | null>(null);
   const { run: tourRun, startTour, stopTour } = useTour();
+  const [collapsedSections, setCollapsedSections] = useState<Set<string>>(() => {
+    try {
+      const stored = localStorage.getItem(SIDEBAR_COLLAPSED_KEY);
+      return stored ? new Set(JSON.parse(stored)) : new Set();
+    } catch {
+      return new Set();
+    }
+  });
+
+  const toggleSection = (label: string) => {
+    setCollapsedSections((prev) => {
+      const next = new Set(prev);
+      if (next.has(label)) next.delete(label);
+      else next.add(label);
+      localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(Array.from(next)));
+      return next;
+    });
+  };
+
+  // If a previously-collapsed section contains the page we're currently on
+  // (e.g. after a refresh), expand it once so the active item stays visible.
+  useEffect(() => {
+    const activeSection = sections.find((section) =>
+      section.items.some((item) => item.path === location),
+    );
+    if (activeSection && collapsedSections.has(activeSection.label)) {
+      setCollapsedSections((prev) => {
+        const next = new Set(prev);
+        next.delete(activeSection.label);
+        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify(Array.from(next)));
+        return next;
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [location]);
 
   useEffect(() => {
     const updateAccessLevel = () => {
@@ -194,38 +232,49 @@ export default function Sidebar() {
               ))}
             </div>
           ) : (
-            filteredSections.map((section) => (
-              <div key={section.label} className="mb-4">
-                <p
-                  data-tour={`section-${section.label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
-                  className="px-3 mb-1 text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-slate-500"
-                >
-                  {section.label}
-                </p>
-                <div className="space-y-0.5">
-                  {section.items.map((item) => {
-                    const Icon = item.icon;
-                    const isActive = location === item.path;
-                    return (
-                      <Link key={item.path} href={item.path}>
-                        <a
-                          data-tour={item.tourId}
-                          className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-sm ${
-                            isActive
-                              ? "font-semibold"
-                              : "text-gray-600 dark:text-slate-400 hover:bg-gray-50 dark:hover:bg-slate-800 font-medium"
-                          }`}
-                          style={isActive ? { backgroundColor: `${primaryColor}12`, color: primaryColor } : {}}
-                        >
-                          <Icon className="h-4 w-4 flex-shrink-0" />
-                          <span className="truncate tracking-tight">{item.label}</span>
-                        </a>
-                      </Link>
-                    );
-                  })}
+            filteredSections.map((section) => {
+              const isCollapsed = collapsedSections.has(section.label);
+              return (
+                <div key={section.label} className="mb-4">
+                  <button
+                    type="button"
+                    onClick={() => toggleSection(section.label)}
+                    data-tour={`section-${section.label.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`}
+                    className="w-full flex items-center justify-between px-3 mb-1 text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-slate-500 hover:text-gray-600 dark:hover:text-slate-300"
+                    aria-expanded={!isCollapsed}
+                  >
+                    <span>{section.label}</span>
+                    <ChevronDown
+                      className={`h-3 w-3 flex-shrink-0 transition-transform ${isCollapsed ? "-rotate-90" : ""}`}
+                    />
+                  </button>
+                  {!isCollapsed && (
+                    <div className="space-y-0.5">
+                      {section.items.map((item) => {
+                        const Icon = item.icon;
+                        const isActive = location === item.path;
+                        return (
+                          <Link
+                            key={item.path}
+                            href={item.path}
+                            data-tour={item.tourId}
+                            className={`flex items-center gap-3 px-3 py-2.5 rounded-lg transition-colors text-sm ${
+                              isActive
+                                ? "font-semibold"
+                                : "text-gray-600 dark:text-slate-400 hover:bg-gray-50 dark:hover:bg-slate-800 font-medium"
+                            }`}
+                            style={isActive ? { backgroundColor: `${primaryColor}12`, color: primaryColor } : {}}
+                          >
+                            <Icon className="h-4 w-4 flex-shrink-0" />
+                            <span className="truncate tracking-tight">{item.label}</span>
+                          </Link>
+                        );
+                      })}
+                    </div>
+                  )}
                 </div>
-              </div>
-            ))
+              );
+            })
           )}
         </nav>
 

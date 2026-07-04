@@ -29,7 +29,6 @@ class AccountRepository:
             ledger_id=ledger_id,
             account_number=account_number,
             name=name,
-            balance="0",
             account_type=account_type,
             account_currency=account_currency,
             tier=tier,

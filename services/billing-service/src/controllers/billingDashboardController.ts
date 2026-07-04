@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import httpStatus from "http-status";
 import { billingDashboardService } from "../services/billingDashboardService";
+import { billingAccountRepository } from "../repositories/billingAccountRepository";
 
 export const billingDashboardController = {
   async getDashboard(req: Request, res: Response) {
@@ -17,6 +18,17 @@ export const billingDashboardController = {
 
   async getStatus(req: Request, res: Response) {
     const tenantId = req.headers["x-tenant-id"] as string | undefined;
-    return res.status(httpStatus.OK).json({ status: "active", tenantId });
+    if (!tenantId) {
+      return res.status(httpStatus.BAD_REQUEST).json({ status: "inactive", message: "Missing tenant id" });
+    }
+
+    const accounts = await billingAccountRepository.findByTenant(tenantId);
+    const account = accounts[0];
+    if (!account) {
+      return res.status(httpStatus.OK).json({ status: "inactive", tenantId });
+    }
+
+    const status = account.status === "active" ? "active" : account.status === "suspended" ? "suspended" : "inactive";
+    return res.status(httpStatus.OK).json({ status, tenantId });
   },
 };

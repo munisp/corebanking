@@ -64,7 +64,7 @@ function getTenantHeadersFromStorage(): Record<string, string> {
 const initialTenantHeaders = getTenantHeadersFromStorage();
 
 const apiClient: AxiosInstance = axios.create({
-  baseURL: "https://54link-dev.upi.dev",
+  baseURL: BACKEND_URL,
   timeout: 60000,
   headers: {
     "Content-Type": "application/json",
@@ -117,6 +117,12 @@ apiClient.interceptors.request.use(
     const isTenantConfigEndpoint =
       config.url?.includes("/tenant-management/tenant/") && !token;
 
+    // Auth endpoints (login, change-password, etc.) are proxied straight to identity-auth,
+    // which has no 54link-access-plugin on its route — the gateway never requires or injects
+    // x-ledger-id / x-mint-account-id there. Requiring them client-side would block login for
+    // any tenant whose config hasn't been provisioned with an "accounts" feature flag yet.
+    const isAuthEndpoint = config.url?.includes("/auth/auth/");
+
     if (!isTenantConfigEndpoint) {
       const tenantHeaders = getTenantHeadersFromStorage();
 
@@ -124,25 +130,27 @@ apiClient.interceptors.request.use(
       Object.assign(config.headers, tenantHeaders);
       Object.assign(apiClient.defaults.headers.common || {}, tenantHeaders);
 
-      // If x-ledger-id is not in tenant config, fall back to localStorage / env — throw if missing
-      if (!config.headers["x-ledger-id"]) {
-        const ledgerId =
-          localStorage.getItem("ledger_id") ||
-          (import.meta.env.VITE_LEDGER_ID ? String(import.meta.env.VITE_LEDGER_ID) : null);
-        if (!ledgerId) throw new Error("Missing x-ledger-id: user session is invalid");
-        config.headers["x-ledger-id"] = ledgerId;
-      }
+      if (!isAuthEndpoint) {
+        // If x-ledger-id is not in tenant config, fall back to localStorage / env — throw if missing
+        if (!config.headers["x-ledger-id"]) {
+          const ledgerId =
+            localStorage.getItem("ledger_id") ||
+            (import.meta.env.VITE_LEDGER_ID ? String(import.meta.env.VITE_LEDGER_ID) : null);
+          if (!ledgerId) throw new Error("Missing x-ledger-id: user session is invalid");
+          config.headers["x-ledger-id"] = ledgerId;
+        }
 
-      // If x-mint-account-id is not in tenant config, fall back to localStorage / env / ledger-id — throw if missing
-      if (!config.headers["x-mint-account-id"]) {
-        const mintId =
-          localStorage.getItem("mint_id") ||
-          (import.meta.env.VITE_MINT_ID ? String(import.meta.env.VITE_MINT_ID) : null) ||
-          (config.headers["x-ledger-id"] as string | undefined) ||
-          null;
-        if (!mintId) throw new Error("Missing x-mint-account-id: user session is invalid");
-        config.headers["x-mint-id"]         = mintId;
-        config.headers["x-mint-account-id"] = mintId;
+        // If x-mint-account-id is not in tenant config, fall back to localStorage / env / ledger-id — throw if missing
+        if (!config.headers["x-mint-account-id"]) {
+          const mintId =
+            localStorage.getItem("mint_id") ||
+            (import.meta.env.VITE_MINT_ID ? String(import.meta.env.VITE_MINT_ID) : null) ||
+            (config.headers["x-ledger-id"] as string | undefined) ||
+            null;
+          if (!mintId) throw new Error("Missing x-mint-account-id: user session is invalid");
+          config.headers["x-mint-id"]         = mintId;
+          config.headers["x-mint-account-id"] = mintId;
+        }
       }
 
       // Debug logging
@@ -166,6 +174,8 @@ apiClient.interceptors.request.use(
 );
 
 // Response interceptor for error handling
+let isRedirectingToLogin = false;
+
 apiClient.interceptors.response.use(
   (response) => {
     return response;
@@ -175,11 +185,16 @@ apiClient.interceptors.response.use(
     if (error.response) {
       switch (error.response.status) {
         case 401:
-          // Unauthorized - clear token and redirect to login
-          localStorage.removeItem("auth_token");
-          localStorage.removeItem("auth_user");
-          localStorage.removeItem("54link-dev_auth");
-          if (window.location.pathname !== "/login") {
+          // Unauthorized - clear token and redirect to login.
+          // Guarded so a burst of parallel requests that all 401 (e.g. the
+          // several calls the dashboard fires on mount) only triggers this once,
+          // instead of each one redundantly clearing storage and reassigning
+          // window.location.href before the first navigation takes effect.
+          if (!isRedirectingToLogin && window.location.pathname !== "/login") {
+            isRedirectingToLogin = true;
+            localStorage.removeItem("auth_token");
+            localStorage.removeItem("auth_user");
+            localStorage.removeItem("54link-dev_auth");
             window.location.href = "/login";
           }
           break;

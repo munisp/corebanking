@@ -2,6 +2,7 @@ import { Router } from "express";
 import { asyncHandler } from "../../middlewares/async";
 import { billingDashboardController } from "../../controllers/billingDashboardController";
 import { billingAccountController } from "../../controllers/billingAccountController";
+import { billingPlanCatalogController } from "../../controllers/billingPlanCatalogController";
 import { billingRateCardController } from "../../controllers/billingRateCardController";
 import { billingUsageEventController } from "../../controllers/billingUsageEventController";
 import { billingInvoiceController } from "../../controllers/billingInvoiceController";
@@ -16,6 +17,7 @@ const router = Router();
 router.get("/status", asyncHandler(billingDashboardController.getStatus.bind(billingDashboardController)));
 router.get("/info", asyncHandler(billingAccountController.getBillingInfo.bind(billingAccountController)));
 router.put("/", asyncHandler(billingAccountController.createProfile.bind(billingAccountController)));
+router.get("/plan-catalog", asyncHandler(billingPlanCatalogController.list.bind(billingPlanCatalogController)));
 
 // ─── Dashboard ─────────────────────────────────────────────────────────────────
 router.get("/dashboard/extended", asyncHandler(billingDashboardController.getExtendedDashboard.bind(billingDashboardController)));

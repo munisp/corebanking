@@ -22,7 +22,7 @@ const config: CrudConfig = {
   ],
   idField: "id",
   searchFields: ["id", "tenantId", "pricingModel", "segment", "status"],
-  apiBase: "/billing/v1/invoices",
+  apiBase: "/billings/v1/invoices",
   pageSize: 25,
 };
 

@@ -20,7 +20,7 @@ const config: CrudConfig = {
   ],
   idField: "id",
   searchFields: ["id", "resource", "action", "enforcementMode"],
-  apiBase: "/billing/v1/roles",
+  apiBase: "/billings/v1/roles",
   pageSize: 25,
 };
 

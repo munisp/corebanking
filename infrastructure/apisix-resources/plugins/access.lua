@@ -245,14 +245,15 @@ function _M.access(conf, ctx)
     end
 
     local tenant_id = core.request.header(ctx, "x-tenant-id")
-    local keycloak_realm = "54link_" .. tenant_id
-    local ledger_id = "1"
 
     if not tenant_id then
         core.log.warn("Tenant ID not found")
         return 400, {message = "Missing tenant identifier"}
     end
-    
+
+    local keycloak_realm = "54link_" .. tenant_id
+    local ledger_id = "1"
+
     -- Billing gate — checked before auth to return 402 at the edge (fail-open on service error)
     if conf.billing_url then
         local billing_status, billing_err = get_billing_status(conf, tenant_id)
@@ -271,14 +272,14 @@ function _M.access(conf, ctx)
         return 401, {message = "Missing JWT token"}
     end
 
-    local keycloak_public_key, err = fetch_tenant_keycloak_public_key(conf.keycloak_public_key_url, tenant_id)
+    local keycloak_public_key, _, pub_key_err = fetch_tenant_keycloak_public_key(conf.keycloak_public_key_url, tenant_id)
     if not keycloak_public_key then
-        return 401, {message = err}
+        return 401, {message = pub_key_err}
     end
 
-    local keycloak_id, err = fetch_data_from_authorizer(conf.authorizer_url, token, tenant_id, keycloak_realm, keycloak_public_key)
+    local keycloak_id, _, authorizer_err = fetch_data_from_authorizer(conf.authorizer_url, token, tenant_id, keycloak_realm, keycloak_public_key)
     if not keycloak_id then
-        return 401, {message = err}
+        return 401, {message = authorizer_err}
     end
 
     core.request.set_header(ctx, "x-tenant-id", tenant_id)
@@ -288,9 +289,9 @@ function _M.access(conf, ctx)
     core.request.set_header(ctx, "x-ledger-id", ledger_id)
 
     if conf.mint_account_url then
-        local mint_account_id, err = fetch_mint_account_data(conf.mint_account_url, tenant_id, ledger_id, keycloak_id)
+        local mint_account_id, _, mint_err = fetch_mint_account_data(conf.mint_account_url, tenant_id, ledger_id, keycloak_id)
         if not mint_account_id then
-            return 401, {message = err}
+            return 401, {message = mint_err}
         end
         core.request.set_header(ctx, "x-mint-account-id", mint_account_id)
     end
@@ -298,6 +299,31 @@ end
 
 function _M.check_schema(conf, schema_type)
     return core.schema.check(schema, conf)
+end
+
+-- Metering: count API calls per tenant per calendar month. Runs in the log phase
+-- so it never blocks or slows down the request, and is a no-op unless redis_host
+-- is configured on the route (safe to ship globally while only some routes opt in).
+function _M.log(conf, ctx)
+    if not conf.redis_host then return end
+    if ctx.var.request_method == "OPTIONS" then return end
+
+    local tenant_id = core.request.header(ctx, "x-tenant-id")
+    if not tenant_id then return end
+
+    local period_key = os.date("%Y-%m")
+    local counter_key = "usage:api_call:" .. tenant_id .. ":" .. period_key
+
+    local red = redis_connector:new()
+    red:set_timeout(500)
+    local ok, err = red:connect(conf.redis_host, conf.redis_port or 6379)
+    if not ok then
+        core.log.warn("Metering: redis connect failed: " .. (err or "unknown"))
+        return
+    end
+
+    red:incr(counter_key)
+    red:set_keepalive(10000, 10)
 end
 
 return _M

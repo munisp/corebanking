@@ -54,12 +54,12 @@ service:
     - port: 9709
 resources:
   requests:
-    cpu: 200m
-    memory: 256Mi
-  limits:
-    ephemeral-storage: 2Gi
     cpu: 500m
     memory: 1Gi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 1500m
+    memory: 3Gi
 autoscaling:
   enabled: false
   minReplicas: 1
@@ -85,4 +85,6 @@ secrets:
   APP_PORT: "9671"
   PORT_BASE: "9671"
   SERVICE_GROUP: workflow-operations
+  MINIO_ENDPOINT: "minio.minio.svc.cluster.local:9000"
+  BUCKET_NAME: "documents"
   SERVICES: "animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-manager-service,branch-operations-go,cac-realtime-api-go,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-management-py,docling-service,document-management-py,document-service,erpnext-bridge-go,erpnext-integration-service,erpnext-sync-py,fixed-assets-go,immutable-audit-rs,inventory-py,ndpr-compliance-py,ocr-service,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-security-infra-go,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,tax-reporting-py,teller-operations-go,typology-detector-rs,ubo-ownership-graph-rs,vault-integration-rs"

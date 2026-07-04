@@ -38,6 +38,13 @@ import {
 import { Input } from "../components/ui/input";
 import { Label } from "../components/ui/label";
 import {
+    Pagination,
+    PaginationContent,
+    PaginationItem,
+    PaginationNext,
+    PaginationPrevious,
+} from "../components/ui/pagination";
+import {
     Select,
     SelectContent,
     SelectItem,
@@ -65,9 +72,16 @@ import type {
     RegisterBusinessPayload,
 } from "../types/kyb";
 
+// Search/status filter below run client-side on the fetched page, and the
+// backend has no free-text search param, so we fetch a large page to keep
+// search correct for realistic business counts. Pagination still applies beyond that.
+const PAGE_SIZE = 100;
+
 export default function BusinessManagement() {
   // const [, setLocation] = useLocation();
   const [businesses, setBusinesses] = useState<Business[]>([]);
+  const [totalBusinesses, setTotalBusinesses] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
   const [loading, setLoading] = useState(true);
   const [success, setSuccess] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -93,12 +107,16 @@ export default function BusinessManagement() {
     documents: [],
   });
 
-  // Fetch all businesses
+  // Fetch businesses for the current page
   const fetchBusinesses = async () => {
     try {
       setLoading(true);
-      const data = await kybService.getAllBusinesses();
-      setBusinesses(Array.isArray(data) ? data : []);
+      const { businesses: data, total } = await kybService.getAllBusinesses(
+        (currentPage - 1) * PAGE_SIZE,
+        PAGE_SIZE,
+      );
+      setBusinesses(data);
+      setTotalBusinesses(total);
       setError(null);
     } catch (err: unknown) {
       const errorMessage =
@@ -111,7 +129,7 @@ export default function BusinessManagement() {
 
   useEffect(() => {
     fetchBusinesses();
-  }, []);
+  }, [currentPage]);
 
   // Filter businesses
   const filteredBusinesses = businesses.filter((business) => {
@@ -298,7 +316,7 @@ export default function BusinessManagement() {
 
   // Stats
   const stats = {
-    total: businesses.length,
+    total: totalBusinesses,
     pending: businesses.filter((b) => b.verification_status === "pending")
       .length,
     approved: businesses.filter((b) => b.verification_status === "approved")
@@ -843,6 +861,37 @@ export default function BusinessManagement() {
             </Table>
           )}
         </CardContent>
+        {totalBusinesses > PAGE_SIZE && (
+          <CardContent className="pt-0">
+            <div className="flex items-center justify-between">
+              <p className="text-sm text-muted-foreground">
+                Page {currentPage} of {Math.ceil(totalBusinesses / PAGE_SIZE)}
+              </p>
+              <Pagination>
+                <PaginationContent>
+                  <PaginationItem>
+                    <PaginationPrevious
+                      onClick={(e) => {
+                        e.preventDefault();
+                        if (currentPage > 1) setCurrentPage((p) => p - 1);
+                      }}
+                      className={currentPage <= 1 ? "pointer-events-none opacity-50" : "cursor-pointer"}
+                    />
+                  </PaginationItem>
+                  <PaginationItem>
+                    <PaginationNext
+                      onClick={(e) => {
+                        e.preventDefault();
+                        if (currentPage < Math.ceil(totalBusinesses / PAGE_SIZE)) setCurrentPage((p) => p + 1);
+                      }}
+                      className={currentPage >= Math.ceil(totalBusinesses / PAGE_SIZE) ? "pointer-events-none opacity-50" : "cursor-pointer"}
+                    />
+                  </PaginationItem>
+                </PaginationContent>
+              </Pagination>
+            </div>
+          </CardContent>
+        )}
       </Card>
     </div>
   );

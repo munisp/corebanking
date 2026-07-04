@@ -1,30 +1,33 @@
-import { HttpMethod } from "@dapr/dapr";
 import { readEnv } from "../config/readEnv.config";
-import { daprClient } from "../lib/daprClient";
 import { IGetBillingInfoResponse, IBillingProfile } from "../types/billing";
 import logger from "../config/logger.config";
 
 class BillingService {
-  // cast the key to any to satisfy the typed readEnv signature for custom env keys
-  private APP_ID: string = readEnv(("BILLING_SERVICE_APP_ID" as any)) as string;
+  private BASE_URL: string = readEnv("BILLING_SERVICE_URL", "http://localhost:9523");
 
-  async createBillingProfile(tenantId: string, plan: string) {
+  async createBillingProfile(tenantId: string, plan: string, billingPeriod: string) {
     try {
       logger.info("[BillingService] Creating billing profile", {
         tenantId,
         plan,
-        appId: this.APP_ID,
+        billingPeriod,
+        baseUrl: this.BASE_URL,
       });
 
-      const response = await daprClient.invoke(
-        this.APP_ID,
-        "billing",
-        HttpMethod.PUT,
-        { plan: plan },
-        {
+      const res = await fetch(`${this.BASE_URL}/billing`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
           "x-tenant-id": tenantId,
-        }
-      );
+        },
+        body: JSON.stringify({ plan, billingPeriod }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`billing-service returned ${res.status}`);
+      }
+
+      const response = await res.json();
 
       logger.info("[BillingService] Billing profile created successfully", {
         tenantId,
@@ -37,7 +40,7 @@ class BillingService {
       logger.error("[BillingService] Failed to create billing profile", {
         tenantId,
         plan,
-        appId: this.APP_ID,
+        baseUrl: this.BASE_URL,
         errorMessage: error?.message,
         errorCode: error?.code,
         errorStatus: error?.status,
@@ -53,18 +56,21 @@ class BillingService {
     try {
       logger.info("[BillingService] Fetching billing info", {
         tenantId,
-        appId: this.APP_ID,
+        baseUrl: this.BASE_URL,
       });
 
-      const response = await daprClient.invoke(
-        this.APP_ID,
-        "billing/info",
-        HttpMethod.GET,
-        {},
-        {
+      const res = await fetch(`${this.BASE_URL}/billing/info`, {
+        method: "GET",
+        headers: {
           "x-tenant-id": tenantId,
-        }
-      );
+        },
+      });
+
+      if (!res.ok) {
+        throw new Error(`billing-service returned ${res.status}`);
+      }
+
+      const response = await res.json();
 
       logger.info("[BillingService] Billing info fetched successfully", {
         tenantId,
@@ -76,7 +82,7 @@ class BillingService {
     } catch (error: any) {
       logger.error("[BillingService] Failed to fetch billing info", {
         tenantId,
-        appId: this.APP_ID,
+        baseUrl: this.BASE_URL,
         errorMessage: error?.message,
         errorCode: error?.code,
         errorStatus: error?.status,

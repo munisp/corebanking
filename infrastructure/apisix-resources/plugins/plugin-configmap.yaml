@@ -423,16 +423,16 @@ data:
     end
 
     function _M.access(conf, ctx)
+        if ctx.var.request_method == "OPTIONS" then
+            core.log.info("Skipping OPTIONS request")
+            return
+        end
+
         local tenant_id = core.request.header(ctx, "x-tenant-id")
 
         if not tenant_id then
             core.log.warn("Tenant ID not found")
             return 400, {message = "Missing tenant identifier"}
-        end
-
-        if ctx.var.request_method == "OPTIONS" then
-            core.log.info("Skipping OPTIONS request")
-            return
         end
 
         -- Billing gate — checked before auth to return 402 at the edge (fail-open on service error)
@@ -483,6 +483,31 @@ data:
 
     function _M.check_schema(conf, schema_type)
         return core.schema.check(schema, conf)
+    end
+
+    -- Metering: count API calls per tenant per calendar month. Runs in the log phase
+    -- so it never blocks or slows down the request, and is a no-op unless redis_host
+    -- is configured on the route (safe to ship globally while only some routes opt in).
+    function _M.log(conf, ctx)
+        if not conf.redis_host then return end
+        if ctx.var.request_method == "OPTIONS" then return end
+
+        local tenant_id = core.request.header(ctx, "x-tenant-id")
+        if not tenant_id then return end
+
+        local period_key = os.date("%Y-%m")
+        local counter_key = "usage:api_call:" .. tenant_id .. ":" .. period_key
+
+        local red = redis_connector:new()
+        red:set_timeout(500)
+        local ok, err = red:connect(conf.redis_host, conf.redis_port or 6379)
+        if not ok then
+            core.log.warn("Metering: redis connect failed: " .. (err or "unknown"))
+            return
+        end
+
+        red:incr(counter_key)
+        red:set_keepalive(10000, 10)
     end
 
     return _M

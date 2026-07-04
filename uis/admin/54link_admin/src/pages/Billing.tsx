@@ -52,11 +52,6 @@ interface BillingRecord {
   billingCycle: 'monthly' | 'quarterly'; nextInvoice: string;
 }
 
-interface GlobalStats {
-  total_tenants: number; active: number;
-  total_mrr: number; currency: string; avg_arpu: number;
-}
-
 interface Invoice {
   invoiceNumber: string; tenantId: string; plan: string;
   amount: string; currency: string;
@@ -181,7 +176,6 @@ export default function Billing() {
 
   // accounts + stats
   const [records, setRecords] = useState<BillingRecord[]>([]);
-  const [globalStats, setGlobalStats] = useState<GlobalStats | null>(null);
   const [orchestratorProfiles, setOrchestratorProfiles] = useState<OrchestratorProfile[]>([]);
   const [loadingRecords, setLoadingRecords] = useState(true);
 
@@ -249,46 +243,84 @@ export default function Billing() {
   const [trendData, setTrendData] = useState<{ date: string; mrr: number; collected: number }[]>([]);
 
   // ── Load core data (accounts + invoices) on mount ─────────────────────────
+  // Source of truth is billing-service's own dashboard (real per-tenant accounts +
+  // invoices) — not tenant-billing-go, which is a disconnected scaffold service
+  // that never learns about tenants created through the onboarding workflow.
   useEffect(() => {
-    const fetchCore = async () => {
-      // tenant billing records + global stats
-      await Promise.all([
-        apiClient.get('/tenant-billing/v1/billing/records')
-          .then(r => {
-            const items: BillingRecord[] = r.data?.items ?? [];
-            setRecords(items);
-            const now = new Date();
-            setTrendData(Array.from({ length: 30 }, (_, i) => {
-              const d = new Date(now); d.setDate(d.getDate() - (29 - i));
-              const base = items.reduce((s, rec) => s + rec.monthlyAmount / 30, 0);
-              const j = 0.85 + 0.3 * ((d.getDate() * 17) % 11) / 11;
-              return {
-                date: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-                mrr: Math.round(base * j / 1000),
-                collected: Math.round(base * j * 0.93 / 1000),
-              };
-            }));
-          }).catch(() => {}),
+    const mapAccountStatus = (status: string): BillingRecord['status'] => {
+      if (status === 'active') return 'active';
+      if (status === 'suspended') return 'past_due';
+      return 'canceled'; // closed, draft
+    };
 
-        apiClient.get('/tenant-billing/v1/stats')
-          .then(r => setGlobalStats(r.data)).catch(() => {}),
+    const mapInvoiceStatus = (status: string, dueDate: string): Invoice['status'] => {
+      if (status === 'paid') return 'paid';
+      if (status === 'rejected' || status === 'void') return 'pending';
+      return new Date(dueDate) < new Date() ? 'overdue' : 'pending';
+    };
+
+    const fetchCore = async () => {
+      await Promise.all([
+        Promise.all([
+          apiClient.get('/billings/dashboard'),
+          apiClient.get('/billings/plan-catalog'),
+        ]).then(([dashboardRes, catalogRes]) => {
+          const accounts: any[] = dashboardRes.data?.accounts ?? [];
+          const rawInvoices: any[] = dashboardRes.data?.invoices ?? [];
+          const catalog: any[] = catalogRes.data?.items ?? [];
+
+          const priceByPlanPeriod = new Map<string, number>(
+            catalog.map(c => [`${c.plan}:${c.billingPeriod}`, Number(c.basePrice)]),
+          );
+          const planByAccountId = new Map<string, string>(
+            accounts.map(a => [a.id, a.plan ?? 'standard']),
+          );
+
+          const items: BillingRecord[] = accounts.map(a => ({
+            id: a.id,
+            tenantId: a.tenantId,
+            tenantName: a.accountName ?? a.tenantId,
+            plan: (a.plan ?? 'standard') as BillingRecord['plan'],
+            monthlyAmount: priceByPlanPeriod.get(`${a.plan}:${a.billingPeriod}`) ?? 0,
+            currency: a.currency ?? 'NGN',
+            status: mapAccountStatus(a.status),
+            billingCycle: a.billingPeriod === 'annual' ? 'quarterly' : 'monthly',
+            nextInvoice: a.contractEndAt ?? '',
+          }));
+          setRecords(items);
+
+          const mappedInvoices: Invoice[] = rawInvoices.map(inv => ({
+            invoiceNumber: inv.invoiceNumber,
+            tenantId: inv.tenantId,
+            plan: planByAccountId.get(inv.billingAccountId) ?? 'standard',
+            amount: String(inv.totalAmount),
+            currency: inv.currency,
+            status: mapInvoiceStatus(inv.status, inv.dueAt),
+            dueDate: inv.dueAt,
+            paidAt: inv.status === 'paid' ? inv.issuedAt : null,
+            createdAt: inv.generatedAt,
+          }));
+          setInvoices(mappedInvoices);
+          setLoadingInvoices(false);
+
+          const now = new Date();
+          setTrendData(Array.from({ length: 30 }, (_, i) => {
+            const d = new Date(now); d.setDate(d.getDate() - (29 - i));
+            const base = items.reduce((s, rec) => s + rec.monthlyAmount / 30, 0);
+            const j = 0.85 + 0.3 * ((d.getDate() * 17) % 11) / 11;
+            return {
+              date: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+              mrr: Math.round(base * j / 1000),
+              collected: Math.round(base * j * 0.93 / 1000),
+            };
+          }));
+        }).catch(() => { setLoadingInvoices(false); }),
 
         // billing profiles from orchestrator
         apiClient.get('/billing-orchestrator/v1/billing/profiles')
           .then(r => setOrchestratorProfiles(r.data?.items ?? [])).catch(() => {}),
       ]);
       setLoadingRecords(false);
-
-      // invoices for all seeded tenants
-      const all: Invoice[] = [];
-      await Promise.all(SEED_TENANT_IDS.map(tid =>
-        apiClient.get('/tenant-billing/v1/billing/invoices', { headers: { 'x-tenant-id': tid } })
-          .then(r => all.push(...(r.data?.invoices ?? [])))
-          .catch(() => {})
-      ));
-      all.sort((a, b) => new Date(b.dueDate).getTime() - new Date(a.dueDate).getTime());
-      setInvoices(all);
-      setLoadingInvoices(false);
     };
 
     fetchCore();
@@ -423,8 +455,8 @@ export default function Billing() {
   };
 
   // ── Derived stats ──────────────────────────────────────────────────────────
-  const totalMrr = globalStats?.total_mrr ?? records.reduce((s, r) => s + r.monthlyAmount, 0);
-  const activeCount = globalStats?.active ?? records.filter(r => r.status === 'active').length;
+  const totalMrr = records.reduce((s, r) => s + r.monthlyAmount, 0);
+  const activeCount = records.filter(r => r.status === 'active').length;
   const paidInvoices = invoices.filter(i => i.status === 'paid');
   const totalCollected = paidInvoices.reduce((s, i) => s + parseFloat(i.amount), 0);
   const totalBilled = invoices.reduce((s, i) => s + parseFloat(i.amount), 0);

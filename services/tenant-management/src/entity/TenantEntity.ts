@@ -1,6 +1,6 @@
 import { Column, Entity, Index, JoinColumn, OneToMany, OneToOne } from "typeorm";
 import { BaseEntity } from "./BaseEntity";
-import { BillingPlan, TenantStatus, TenantType } from "../utils/enums";
+import { BillingPeriod, BillingPlan, TenantStatus, TenantType } from "../utils/enums";
 import { TenantFeatureFlagEntity } from "./TenantFeatureFlagEntity";
 import { TenantBrandingEntity } from "./TenantBrandingEntity";
 import { TenantContactEntity } from "./TenantContactEntity";
@@ -25,6 +25,9 @@ export class TenantEntity extends BaseEntity {
 
   @Column({ type: "enum", enum: BillingPlan, default: BillingPlan.STANDARD, nullable: true })
   plan?: BillingPlan;
+
+  @Column({ type: "enum", enum: BillingPeriod, default: BillingPeriod.MONTHLY, nullable: true })
+  billingPeriod?: BillingPeriod;
 
   @OneToOne(() => TenantContactEntity, (contact) => contact.tenant, { cascade: true, eager: true })
   @JoinColumn()

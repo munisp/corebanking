@@ -2,7 +2,7 @@ import httpStatus from "http-status";
 import { asyncHandler } from "../../middlewares/async";
 import { PostCreateTenantSchema, validateRequest } from "../../validations";
 import { tenantRepository } from "../../repositories/tenantRepository";
-import { BillingPlan } from "../../utils/enums";
+import { BillingPeriod, BillingPlan } from "../../utils/enums";
 import logger from "../../config/logger.config";
 
 export const postCreateTenant = asyncHandler(async (req, res) => {
@@ -27,12 +27,17 @@ export const postCreateTenant = asyncHandler(async (req, res) => {
     });
 
     const plan = payload?.plan || BillingPlan.STANDARD;
+    const billingPeriod = payload?.billingPeriod || BillingPeriod.MONTHLY;
     logger.info("[postCreateTenant] Creating billing profile", {
       tenantId,
       plan,
+      billingPeriod,
     });
 
-    const billingProfile = await tenantRepository.createBillingProfile(tenantId, plan);
+    // If this call fails, the tenant row above is already committed with no
+    // compensation — recovery works via retry since createOrGetProfile (billing-service
+    // side) is idempotent per tenantId, so a repeat PUT /billing call is safe.
+    const billingProfile = await tenantRepository.createBillingProfile(tenantId, plan, billingPeriod);
     logger.info("[postCreateTenant] Billing profile created successfully", {
       tenantId,
       profileKeys: Object.keys(billingProfile || {}),

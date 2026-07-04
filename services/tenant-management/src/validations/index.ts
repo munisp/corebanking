@@ -2,7 +2,7 @@ import { ApiError } from "../middlewares/error";
 import * as z from "zod";
 import httpStatus from "http-status";
 import logger from "../config/logger.config";
-import { BillingPlan, FeatureFlag, TenantType } from "../utils/enums";
+import { BillingPeriod, BillingPlan, FeatureFlag, TenantType } from "../utils/enums";
 
 export function validateRequest<T>(schema: z.ZodType<T>, payload: object) {
   try {
@@ -41,6 +41,7 @@ export const PostCreateTenantSchema = z.object({
     })
   ),
   plan: z.nativeEnum(BillingPlan).optional(),
+  billingPeriod: z.nativeEnum(BillingPeriod).optional(),
   apiConfiguration: z
     .object({
       webhookUrl: z.string().optional(),
@@ -79,6 +80,7 @@ export const PutUpdateTenantSchema = z.object({
     )
     .optional(),
   plan: z.nativeEnum(BillingPlan).optional(),
+  billingPeriod: z.nativeEnum(BillingPeriod).optional(),
   apiConfiguration: z
     .object({
       webhookUrl: z.string().optional(),

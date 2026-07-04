@@ -2213,11 +2213,11 @@ export async function createExportJob(
 }
 
 export async function getBillingDashboard() {
-  return requestJson<BillingDashboardResponse>("/billing/dashboard");
+  return requestJson<BillingDashboardResponse>("/billings/dashboard");
 }
 
 export async function getBillingRateCards() {
-  return requestJson<{ asOf: string; items: BillingRateCardRecord[]; total: number }>("/billing/rate-cards");
+  return requestJson<{ asOf: string; items: BillingRateCardRecord[]; total: number }>("/billings/rate-cards");
 }
 
 export async function createBillingRateCard(payload: {
@@ -2225,14 +2225,14 @@ export async function createBillingRateCard(payload: {
   name: string;
   pricingCurrency?: string;
 }) {
-  return requestJson<BillingRateCardRecord>("/billing/rate-cards", {
+  return requestJson<BillingRateCardRecord>("/billings/rate-cards", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export async function getBillingUsageEvents() {
-  return requestJson<{ asOf: string; items: BillingUsageEventRecord[]; total: number }>("/billing/usage-events");
+  return requestJson<{ asOf: string; items: BillingUsageEventRecord[]; total: number }>("/billings/usage-events");
 }
 
 export async function createBillingUsageEvent(payload: {
@@ -2249,14 +2249,14 @@ export async function createBillingUsageEvent(payload: {
   resourceId?: string;
   payload?: Record<string, unknown>;
 }) {
-  return requestJson<BillingUsageEventRecord>("/billing/usage-events", {
+  return requestJson<BillingUsageEventRecord>("/billings/usage-events", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export async function getBillingAccruals() {
-  return requestJson<{ asOf: string; items: BillingAccrualSnapshotRecord[]; total: number }>("/billing/accruals");
+  return requestJson<{ asOf: string; items: BillingAccrualSnapshotRecord[]; total: number }>("/billings/accruals");
 }
 
 export async function getBillingInvoices() {
@@ -2266,7 +2266,7 @@ export async function getBillingInvoices() {
     lines: BillingInvoiceLineRecord[];
     approvals: BillingInvoiceApprovalRecord[];
     total: number;
-  }>("/billing/invoices");
+  }>("/billings/invoices");
 }
 
 export async function generateBillingInvoices(payload: {
@@ -2279,7 +2279,7 @@ export async function generateBillingInvoices(payload: {
     invoiceLines: BillingInvoiceLineRecord[];
     invoiceApprovals: BillingInvoiceApprovalRecord[];
     total: number;
-  }>("/billing/invoices/generate", {
+  }>("/billings/invoices/generate", {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -2291,7 +2291,7 @@ export async function resolveBillingInvoiceApproval(
   payload: { decision: "approve" | "reject"; note?: string },
   role: "operations" | "treasury" | "compliance" | "branch" = "operations",
 ) {
-  return requestJson<BillingInvoiceRecord>(`/billing/invoices/${invoiceId}/approvals/${approvalId}`, {
+  return requestJson<BillingInvoiceRecord>(`/billings/invoices/${invoiceId}/approvals/${approvalId}`, {
     method: "POST",
     body: JSON.stringify(payload),
     role,
@@ -2299,7 +2299,7 @@ export async function resolveBillingInvoiceApproval(
 }
 
 export async function getBillingContractOverrides() {
-  return requestJson<{ asOf: string; items: BillingContractOverrideRecord[]; total: number }>("/billing/contract-overrides");
+  return requestJson<{ asOf: string; items: BillingContractOverrideRecord[]; total: number }>("/billings/contract-overrides");
 }
 
 export async function createBillingContractOverride(payload: {
@@ -2314,14 +2314,14 @@ export async function createBillingContractOverride(payload: {
   status?: "draft" | "active" | "expired";
   notes?: string;
 }) {
-  return requestJson<BillingContractOverrideRecord>("/billing/contract-overrides", {
+  return requestJson<BillingContractOverrideRecord>("/billings/contract-overrides", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export async function getBillingDiscountRules() {
-  return requestJson<{ asOf: string; items: BillingDiscountRuleRecord[]; total: number }>("/billing/discount-rules");
+  return requestJson<{ asOf: string; items: BillingDiscountRuleRecord[]; total: number }>("/billings/discount-rules");
 }
 
 export async function createBillingDiscountRule(payload: {
@@ -2337,14 +2337,14 @@ export async function createBillingDiscountRule(payload: {
   effectiveTo?: string;
   status?: "draft" | "active" | "expired";
 }) {
-  return requestJson<BillingDiscountRuleRecord>("/billing/discount-rules", {
+  return requestJson<BillingDiscountRuleRecord>("/billings/discount-rules", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export async function getBillingRevenueShareRules() {
-  return requestJson<{ asOf: string; items: BillingRevenueShareRuleRecord[]; total: number }>("/billing/revenue-share-rules");
+  return requestJson<{ asOf: string; items: BillingRevenueShareRuleRecord[]; total: number }>("/billings/revenue-share-rules");
 }
 
 export async function createBillingRevenueShareRule(payload: {
@@ -2358,7 +2358,7 @@ export async function createBillingRevenueShareRule(payload: {
   effectiveTo?: string;
   status?: "draft" | "active" | "expired";
 }) {
-  return requestJson<BillingRevenueShareRuleRecord>("/billing/revenue-share-rules", {
+  return requestJson<BillingRevenueShareRuleRecord>("/billings/revenue-share-rules", {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -2464,11 +2464,11 @@ export interface BillingExtendedDashboardResponse extends BillingDashboardRespon
 }
 
 export async function getBillingExtendedDashboard() {
-  return requestJson<BillingExtendedDashboardResponse>("/billing/dashboard/extended");
+  return requestJson<BillingExtendedDashboardResponse>("/billings/dashboard/extended");
 }
 
 export async function getBillingApprovalMatrices() {
-  return requestJson<{ asOf: string; items: BillingApprovalMatrixRecord[]; total: number }>("/billing/approval-matrices");
+  return requestJson<{ asOf: string; items: BillingApprovalMatrixRecord[]; total: number }>("/billings/approval-matrices");
 }
 
 export async function createBillingApprovalMatrix(payload: {
@@ -2478,7 +2478,7 @@ export async function createBillingApprovalMatrix(payload: {
   status?: "draft" | "active" | "retired";
   stages: BillingApprovalMatrixRecord["stages"];
 }) {
-  return requestJson<BillingApprovalMatrixRecord>("/billing/approval-matrices", {
+  return requestJson<BillingApprovalMatrixRecord>("/billings/approval-matrices", {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -2494,36 +2494,36 @@ export async function generateBillingInvoicesAdvanced(payload: {
     invoiceLines: BillingInvoiceLineRecord[];
     invoiceApprovals: BillingInvoiceApprovalRecord[];
     total: number;
-  }>("/billing/invoices/generate-advanced", {
+  }>("/billings/invoices/generate-advanced", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export function getBillingInvoiceExportUrl(invoiceId: string, format: "csv" | "json" | "html" = "json") {
-  return `${API_BASE_URL}/billing/invoices/${invoiceId}/export?format=${format}`;
+  return `${API_BASE_URL}/billings/invoices/${invoiceId}/export?format=${format}`;
 }
 
 export async function getBillingErpPostings() {
-  return requestJson<{ asOf: string; items: BillingErpPostingRecord[]; total: number }>("/billing/erp-postings");
+  return requestJson<{ asOf: string; items: BillingErpPostingRecord[]; total: number }>("/billings/erp-postings");
 }
 
 export async function queueBillingInvoiceErpPost(invoiceId: string, payload?: { erpSystem?: "erpnext" | "lakehouse_finance" }) {
-  return requestJson<BillingErpPostingRecord>(`/billing/invoices/${invoiceId}/erp-post`, {
+  return requestJson<BillingErpPostingRecord>(`/billings/invoices/${invoiceId}/erp-post`, {
     method: "POST",
     body: JSON.stringify(payload ?? {}),
   });
 }
 
 export async function resolveBillingErpPosting(attemptId: string, payload: { status: "posted" | "failed"; errorMessage?: string }) {
-  return requestJson<BillingErpPostingRecord>(`/billing/erp-postings/${attemptId}/resolve`, {
+  return requestJson<BillingErpPostingRecord>(`/billings/erp-postings/${attemptId}/resolve`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export async function getBillingDisputes() {
-  return requestJson<{ asOf: string; items: BillingInvoiceDisputeRecord[]; total: number }>("/billing/disputes");
+  return requestJson<{ asOf: string; items: BillingInvoiceDisputeRecord[]; total: number }>("/billings/disputes");
 }
 
 export async function createBillingDispute(payload: {
@@ -2535,14 +2535,14 @@ export async function createBillingDispute(payload: {
   detail: string;
   assignedRole?: "operations" | "treasury" | "compliance" | "branch";
 }) {
-  return requestJson<BillingInvoiceDisputeRecord>("/billing/disputes", {
+  return requestJson<BillingInvoiceDisputeRecord>("/billings/disputes", {
     method: "POST",
     body: JSON.stringify(payload),
   });
 }
 
 export async function resolveBillingDispute(disputeId: string, payload: { status: "under_review" | "resolved" | "rejected"; resolutionNote?: string }) {
-  return requestJson<BillingInvoiceDisputeRecord>(`/billing/disputes/${disputeId}/resolve`, {
+  return requestJson<BillingInvoiceDisputeRecord>(`/billings/disputes/${disputeId}/resolve`, {
     method: "POST",
     body: JSON.stringify(payload),
   });
@@ -2563,7 +2563,7 @@ export async function ingestBillingUsageEvent(payload: {
   bridge?: "kafka" | "dapr" | "fluvio" | "tigerbeetle";
   payload?: Record<string, unknown>;
 }) {
-  return requestJson<BillingUsageEventRecord>("/billing/usage-events/ingest", {
+  return requestJson<BillingUsageEventRecord>("/billings/usage-events/ingest", {
     method: "POST",
     body: JSON.stringify(payload),
   });

@@ -17,6 +17,13 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
+    Pagination,
+    PaginationContent,
+    PaginationItem,
+    PaginationNext,
+    PaginationPrevious,
+} from "@/components/ui/pagination";
+import {
     Select,
     SelectContent,
     SelectItem,
@@ -84,9 +91,16 @@ type Admin = {
   city?: string;
 };
 
+// Search/filter below run client-side on the fetched page, and the backend has
+// no search param, so we fetch at its max page size (100) to keep search
+// correct for realistic admin counts. Pagination still applies beyond that.
+const PAGE_SIZE = 100;
+
 export default function AdminManagement() {
   const { primaryColor, secondaryColor } = useTenantBranding();
   const [admins, setAdmins] = useState<Admin[]>([]);
+  const [totalAdmins, setTotalAdmins] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [isAddingAdmin, setIsAddingAdmin] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
@@ -121,10 +135,11 @@ export default function AdminManagement() {
   // Fetch admins from API
   useEffect(() => {
     setLoading(true);
-    getAdmins()
+    getAdmins(currentPage, PAGE_SIZE)
       .then((data) => {
-        // If response is { message, admins: [...] }
+        // If response is { message, admins: [...], total } or a bare array
         const adminsRaw = data.admins || data;
+        setTotalAdmins(typeof data.total === "number" ? data.total : adminsRaw.length);
         setAdmins(
           adminsRaw.map((admin: any) => ({
             id: admin.id,
@@ -151,7 +166,7 @@ export default function AdminManagement() {
       })
       .catch(() => setAdmins([]))
       .finally(() => setLoading(false));
-  }, []);
+  }, [currentPage]);
 
   const handleAddAdmin = async () => {
     setIsAddingAdmin(true);
@@ -354,7 +369,7 @@ export default function AdminManagement() {
   };
 
   const stats = {
-    total: admins.length,
+    total: totalAdmins,
     active: admins.filter((a) => a.status === "active").length,
     superAdmins: admins.filter((a) => a.role === "super_admin").length,
     recentlyAdded: admins.filter((a) => {
@@ -505,7 +520,7 @@ export default function AdminManagement() {
             <div className="text-sm text-slate-600 dark:text-slate-400">
               {loading
                 ? "Loading admins..."
-                : `Showing ${filteredAdmins.length} of ${admins.length} admins`}
+                : `Showing ${filteredAdmins.length} of ${totalAdmins} admins`}
             </div>
           </div>
         </div>
@@ -656,6 +671,37 @@ export default function AdminManagement() {
             </table>
           </div>
         </div>
+
+        {/* Pagination */}
+        {totalAdmins > PAGE_SIZE && (
+          <div className="flex items-center justify-between mt-4">
+            <p className="text-sm text-slate-600 dark:text-slate-400">
+              Page {currentPage} of {Math.ceil(totalAdmins / PAGE_SIZE)}
+            </p>
+            <Pagination>
+              <PaginationContent>
+                <PaginationItem>
+                  <PaginationPrevious
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (currentPage > 1) setCurrentPage((p) => p - 1);
+                    }}
+                    className={currentPage <= 1 ? "pointer-events-none opacity-50" : "cursor-pointer"}
+                  />
+                </PaginationItem>
+                <PaginationItem>
+                  <PaginationNext
+                    onClick={(e) => {
+                      e.preventDefault();
+                      if (currentPage < Math.ceil(totalAdmins / PAGE_SIZE)) setCurrentPage((p) => p + 1);
+                    }}
+                    className={currentPage >= Math.ceil(totalAdmins / PAGE_SIZE) ? "pointer-events-none opacity-50" : "cursor-pointer"}
+                  />
+                </PaginationItem>
+              </PaginationContent>
+            </Pagination>
+          </div>
+        )}
       </div>
 
       {/* Add Admin Dialog */}

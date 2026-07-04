@@ -16,6 +16,10 @@ export const billingInvoiceRepository = {
     return this.repo().find({ where: { billingAccountId }, order: { generatedAt: "DESC" } });
   },
 
+  findByAccountAndPeriod(billingAccountId: string, billingPeriodKey: string): Promise<BillingInvoice | null> {
+    return this.repo().findOne({ where: { billingAccountId, billingPeriodKey } });
+  },
+
   findByStatus(status: BillingInvoice["status"]): Promise<BillingInvoice[]> {
     return this.repo().find({ where: { status }, order: { generatedAt: "DESC" } });
   },

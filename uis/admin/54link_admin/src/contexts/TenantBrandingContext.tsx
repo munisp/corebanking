@@ -17,6 +17,18 @@ interface TenantBrandingContextType {
   isLoading: boolean;
 }
 
+// This is the platform (54link) admin, not a tenant admin — its branding is
+// fixed and must never be overridden by whatever tenant config happens to load
+// (that config is still fetched for its headers, e.g. x-tenant-id/x-ledger-id).
+const PLATFORM_BRANDING = {
+  name: '54Link',
+  logoUrl: null as string | null,
+  faviconUrl: null as string | null,
+  primaryColor: '#22c55e',
+  secondaryColor: '#16a34a',
+  domain: '54link.com',
+};
+
 const TenantBrandingContext = createContext<TenantBrandingContextType | undefined>(undefined);
 
 export function TenantBrandingProvider({ children }: { children: ReactNode }) {
@@ -36,30 +48,24 @@ export function TenantBrandingProvider({ children }: { children: ReactNode }) {
       // const role = tenantService.getUserRole();
       // setUserRole(role);
 
-      // Always use 54Link branding
-      if (config?.branding) {
-        const root = document.documentElement;
-        root.style.setProperty('--tenant-primary-color', config.branding.primary_color || '#22c55e');
-        root.style.setProperty('--tenant-secondary-color', config.branding.secondary_color || '#16a34a');
-        
-        // Set favicon if available
-        if (config.branding.favicon_url) {
-          const link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
-          if (link) {
-            link.href = config.branding.favicon_url;
-          } else {
-            const newLink = document.createElement('link');
-            newLink.rel = 'icon';
-            newLink.href = config.branding.favicon_url;
-            document.head.appendChild(newLink);
-          }
-        }
+      // Platform admin always uses fixed 54Link branding, regardless of tenant config
+      const root = document.documentElement;
+      root.style.setProperty('--tenant-primary-color', PLATFORM_BRANDING.primaryColor);
+      root.style.setProperty('--tenant-secondary-color', PLATFORM_BRANDING.secondaryColor);
 
-        // Update page title
-        if (config?.name) {
-          document.title = `${config.name} - Admin Portal`;
+      if (PLATFORM_BRANDING.faviconUrl) {
+        const link = document.querySelector("link[rel~='icon']") as HTMLLinkElement;
+        if (link) {
+          link.href = PLATFORM_BRANDING.faviconUrl;
+        } else {
+          const newLink = document.createElement('link');
+          newLink.rel = 'icon';
+          newLink.href = PLATFORM_BRANDING.faviconUrl;
+          document.head.appendChild(newLink);
         }
       }
+
+      document.title = `${PLATFORM_BRANDING.name} - Admin Portal`;
     };
 
     loadTenant();
@@ -83,15 +89,15 @@ export function TenantBrandingProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
-  // Always use 54Link branding - no role-based overrides
+  // Platform admin always uses fixed 54Link branding - never derived from tenant config
   const branding = tenant?.branding || null;
-  const name = tenant?.name || '54Link';
-  const logoUrl = branding?.logo_url || null;
-  const faviconUrl = branding?.favicon_url || null;
-  const primaryColor = branding?.primary_color || '#22c55e';
-  const secondaryColor = branding?.secondary_color || '#16a34a';
-  const domain = branding?.domain || null;
-  
+  const name = PLATFORM_BRANDING.name;
+  const logoUrl = PLATFORM_BRANDING.logoUrl;
+  const faviconUrl = PLATFORM_BRANDING.faviconUrl;
+  const primaryColor = PLATFORM_BRANDING.primaryColor;
+  const secondaryColor = PLATFORM_BRANDING.secondaryColor;
+  const domain = PLATFORM_BRANDING.domain;
+
   // Extract headers from tenant config
   const headers = getTenantHeaders(tenant);
 
