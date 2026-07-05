@@ -35,4 +35,4 @@ jobs:
           context: ./services/compliance-ui
           file: ./services/compliance-ui/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-compliance-ui:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-compliance-ui:${{ env.TAG }}

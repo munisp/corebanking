@@ -35,4 +35,4 @@ jobs:
           context: ./services/etherisc-service
           file: ./services/etherisc-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-etherisc-service:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-etherisc-service:${{ env.TAG }}

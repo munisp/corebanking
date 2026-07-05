@@ -10,7 +10,7 @@ on:
       - '.github/workflows/beneficial-ownership-go.yaml'
 
 env:
-  IMAGE: registry.digitalocean.com/talentgraph-auth/54link-beneficial-ownership-go
+  IMAGE: registry.digitalocean.com/talentgraph-auth/54link-dev-beneficial-ownership-go
   TAG: "0.0.1"
   CHART: infrastructure/charts/beneficial-ownership-go
   RELEASE: beneficial-ownership-go
@@ -41,36 +41,3 @@ jobs:
           push: true
           tags: ${{ env.IMAGE }}:${{ env.TAG }}
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Install doctl
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DO_API_TOKEN }}
-
-      - name: Save kubeconfig
-        run: |
-          mkdir -p "$HOME/.kube"
-          printf '%s' '${{ secrets.KUBECONFIG }}' > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
-
-      - name: Install Helm
-        uses: azure/setup-helm@v3
-
-      - name: Deploy via Helm
-        run: |
-          helm upgrade --install ${{ env.RELEASE }} ./${{ env.CHART }} \
-            --namespace ${{ env.NAMESPACE }} \
-            --set image.tag=${{ env.TAG }} \
-            --wait \
-            --timeout 5m
-
-      - name: Apply APISIX route
-        run: |
-          kubectl apply -f infrastructure/apisix-resources/routes/beneficial-ownership-go.yaml \
-            -n ${{ env.NAMESPACE }}

@@ -35,4 +35,4 @@ jobs:
           context: ./services/employee-service
           file: ./services/employee-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-employee-service:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-employee-service:${{ env.TAG }}

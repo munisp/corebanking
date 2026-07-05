@@ -35,4 +35,4 @@ jobs:
           context: ./services/insurance-service
           file: ./services/insurance-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-insurance-service:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-insurance-service:${{ env.TAG }}

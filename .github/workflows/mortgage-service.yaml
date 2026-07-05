@@ -35,4 +35,4 @@ jobs:
           context: ./services/mortgage-service
           file: ./services/mortgage-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-mortgage-service:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-mortgage-service:${{ env.TAG }}

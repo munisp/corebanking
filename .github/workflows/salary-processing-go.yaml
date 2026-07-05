@@ -35,4 +35,4 @@ jobs:
           context: ./services/salary-processing-go
           file: ./services/salary-processing-go/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-salary-processing-go:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-salary-processing-go:${{ env.TAG }}

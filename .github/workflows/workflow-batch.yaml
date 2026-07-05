@@ -64,34 +64,3 @@ jobs:
             PORT_BASE=9658
           tags: ${{ env.IMAGE }}:${{ env.TAG }}
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Set up kubeconfig
-        run: |
-          mkdir -p "$HOME/.kube"
-          printf '%s' '${{ secrets.KUBECONFIG }}' > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
-
-      - name: Install Helm
-        uses: azure/setup-helm@v3
-
-      - name: Deploy via Helm
-        run: |
-          helm upgrade --install ${{ env.RELEASE }} ./${{ env.CHART }} \
-            --namespace ${{ env.NAMESPACE }} \
-            --set image.tag=${{ env.TAG }} \
-            --wait \
-            --timeout 5m
-
-      - name: Apply APISIX routes
-        run: |
-          kubectl apply -f infrastructure/apisix-resources/routes/temporal-access-service.yaml -n ${{ env.NAMESPACE }}
-          kubectl apply -f infrastructure/apisix-resources/routes/temporal-memoizer-go.yaml -n ${{ env.NAMESPACE }}
-          kubectl apply -f infrastructure/apisix-resources/routes/temporal-orchestrator-py.yaml -n ${{ env.NAMESPACE }}
-          kubectl apply -f infrastructure/apisix-resources/routes/temporal-sagas-go.yaml -n ${{ env.NAMESPACE }}
-          kubectl apply -f infrastructure/apisix-resources/routes/temporal-worker-go.yaml -n ${{ env.NAMESPACE }}

@@ -35,4 +35,4 @@ jobs:
           context: ./services/savings-service
           file: ./services/savings-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-savings-service:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-savings-service:${{ env.TAG }}

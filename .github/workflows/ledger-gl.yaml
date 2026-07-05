@@ -55,4 +55,4 @@ jobs:
             SERVICES=accounting-rules-rs,chart-of-accounts-service,finance-service,gl-engine-go,gl-engine-rs,operations-control-gl-rs,salary-processing-go,tigerbeetle-adapter-rs,tigerbeetle-batch-engine-rs,tigerbeetle-multicurrency-rs,tigerbeetle-postgres-sync,tigerbeetle-protocol-rs,tigerbeetle-sync-go,transaction-ledger
             PRIMARY_LANG=rust
             PORT_BASE=9465
-          tags: registry.digitalocean.com/talentgraph-auth/54link-ledger-gl:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-ledger-gl:${{ env.TAG }}

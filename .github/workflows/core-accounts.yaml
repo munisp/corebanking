@@ -21,7 +21,7 @@ on:
       - '.github/workflows/core-accounts.yaml'
 
 env:
-  TAG: "0.0.1"
+  TAG: "0.0.11"
 
 jobs:
   build:
@@ -51,4 +51,4 @@ jobs:
             SERVICES=account-closure-go,account-opening-go,account-service,account-statement-go,agent-account-opening-py,cif-management-go,customer-onboarding,dormancy-management-rs,virtual-account-service,virtual-accounts-go
             PRIMARY_LANG=go
             PORT_BASE=9278
-          tags: registry.digitalocean.com/talentgraph-auth/54link-core-accounts:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-core-accounts:${{ env.TAG }}

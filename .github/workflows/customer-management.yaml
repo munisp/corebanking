@@ -47,4 +47,4 @@ jobs:
             SERVICES=customer-360-py,customer-engagement-py,customer-feedback-py,expense-mgmt-go,i18n-service-go,relationship-manager-service
             PRIMARY_LANG=python
             PORT_BASE=9348
-          tags: registry.digitalocean.com/talentgraph-auth/54link-customer-management:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-customer-management:${{ env.TAG }}

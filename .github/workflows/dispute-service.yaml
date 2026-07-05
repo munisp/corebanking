@@ -35,4 +35,4 @@ jobs:
           context: ./services/dispute-service
           file: ./services/dispute-service/Dockerfile
           push: true
-          tags: registry.digitalocean.com/talentgraph-auth/54link-dispute-service:${{ env.TAG }}
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-dispute-service:${{ env.TAG }}
