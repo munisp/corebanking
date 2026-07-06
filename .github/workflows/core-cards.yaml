@@ -1,0 +1,53 @@
+name: Build Core Cards Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/atm-management/**'
+      - 'services/atm-management-go/**'
+      - 'services/card-management-go/**'
+      - 'services/card-service/**'
+      - 'services/grid-token-card-go/**'
+      - 'services/pin-block-engine-rs/**'
+      - 'services/pin-hasher-rs/**'
+      - 'services/pos-terminal-go/**'
+      - 'services/scratch-card-pin-go/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - '.github/workflows/core-cards.yaml'
+
+env:
+  TAG: "0.0.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=atm-management,atm-management-go,card-management-go,card-service,grid-token-card-go,pin-block-engine-rs,pin-hasher-rs,pos-terminal-go,scratch-card-pin-go
+            PRIMARY_LANG=go
+            PORT_BASE=9290
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-core-cards:${{ env.TAG }}

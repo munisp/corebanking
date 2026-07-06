@@ -1,0 +1,75 @@
+name: Build Compliance Kyc Aml Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/address-verification-py/**'
+      - 'services/adverse-media-scanner-py/**'
+      - 'services/adverse-media-screening-py/**'
+      - 'services/agent-kyc-capture-go/**'
+      - 'services/aml-case-manager-go/**'
+      - 'services/aml-compliance-dashboard-py/**'
+      - 'services/aml-engine-rs/**'
+      - 'services/aml-risk-scoring-rs/**'
+      - 'services/aml-training-tracker-go/**'
+      - 'services/bvn-nin-verification-go/**'
+      - 'services/cbn-tiered-kyc-rs/**'
+      - 'services/corporate-doc-verification-py/**'
+      - 'services/efass-kyc-returns-py/**'
+      - 'services/goaml-integration-go/**'
+      - 'services/kyb-service/**'
+      - 'services/kyc-aml-screening-py/**'
+      - 'services/kyc-analytics-dashboard-py/**'
+      - 'services/kyc-data-quality-py/**'
+      - 'services/kyc-event-consumer-py/**'
+      - 'services/kyc-self-service-py/**'
+      - 'services/kyc-workflow-orchestration-py/**'
+      - 'services/multi-bureau-verification-go/**'
+      - 'services/pep-enhanced-dd-py/**'
+      - 'services/sanctions-batch-rescreener-rs/**'
+      - 'services/sanctions-engine-rs/**'
+      - 'services/sanctions-screening-rs/**'
+      - 'services/signature-verification-rs/**'
+      - 'services/telegram-kyc-bot-rs/**'
+      - 'services/ubo-service/**'
+      - 'services/video-kyc-py/**'
+      - 'services/watchlist-manager-rs/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - '.github/workflows/compliance-kyc-aml.yaml'
+
+env:
+  TAG: "0.0.4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=address-verification-py,adverse-media-scanner-py,adverse-media-screening-py,agent-kyc-capture-go,aml-case-manager-go,aml-compliance-dashboard-py,aml-engine-rs,aml-risk-scoring-rs,aml-training-tracker-go,bvn-nin-verification-go,cbn-tiered-kyc-rs,corporate-doc-verification-py,efass-kyc-returns-py,goaml-integration-go,kyb-service,kyc-aml-screening-py,kyc-analytics-dashboard-py,kyc-data-quality-py,kyc-event-consumer-py,kyc-self-service-py,kyc-workflow-orchestration-py,multi-bureau-verification-go,pep-enhanced-dd-py,sanctions-batch-rescreener-rs,sanctions-engine-rs,sanctions-screening-rs,signature-verification-rs,telegram-kyc-bot-rs,ubo-service,video-kyc-py,watchlist-manager-rs
+            PRIMARY_LANG=go
+            PORT_BASE=9209
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-compliance-kyc-aml:${{ env.TAG }}

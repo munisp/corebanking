@@ -1,0 +1,49 @@
+name: Build Ai Ml Inference Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/art-adversarial-robustness-py/**'
+      - 'services/crop-yield-prediction-py/**'
+      - 'services/customer-insights-py/**'
+      - 'services/ml-service/**'
+      - 'services/soil-analysis-py/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - '.github/workflows/ai-ml-inference.yaml'
+
+env:
+  TAG: "0.0.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=art-adversarial-robustness-py,crop-yield-prediction-py,customer-insights-py,ml-service,soil-analysis-py
+            PRIMARY_LANG=go
+            PORT_BASE=9128
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-ai-ml-inference:${{ env.TAG }}

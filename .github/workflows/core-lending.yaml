@@ -1,0 +1,62 @@
+name: Build Core Lending Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/agent-loan-origination-py/**'
+      - 'services/bnpl-service/**'
+      - 'services/collateral-valuation-rs/**'
+      - 'services/cooperative-credit-scoring-py/**'
+      - 'services/credit-scoring-py/**'
+      - 'services/credit-service/**'
+      - 'services/debt-collection-go/**'
+      - 'services/education-loan-service/**'
+      - 'services/education-loans-py/**'
+      - 'services/group-lending-go/**'
+      - 'services/interbank-lending-rs/**'
+      - 'services/loan-calculator-go/**'
+      - 'services/loan-origination-go/**'
+      - 'services/loan-service/**'
+      - 'services/microfinance-engine-go/**'
+      - 'services/microfinance-py/**'
+      - 'services/mortgage-service/**'
+      - 'services/syndicated-loans-go/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - '.github/workflows/core-lending.yaml'
+
+env:
+  TAG: "0.0.6"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,education-loans-py,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go
+            PRIMARY_LANG=go
+            PORT_BASE=9310
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-core-lending:${{ env.TAG }}

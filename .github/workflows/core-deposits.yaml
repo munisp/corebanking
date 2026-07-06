@@ -1,0 +1,51 @@
+name: Build Core Deposits Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/agri-savings-cycles-go/**'
+      - 'services/interest-accrual-engine-go/**'
+      - 'services/interest-computation-rs/**'
+      - 'services/interest-rate-engine-go/**'
+      - 'services/safe-deposit-go/**'
+      - 'services/savings-products-go/**'
+      - 'services/savings-service/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - '.github/workflows/core-deposits.yaml'
+
+env:
+  TAG: "0.0.4"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=agri-savings-cycles-go,interest-accrual-engine-go,interest-computation-rs,interest-rate-engine-go,safe-deposit-go,savings-products-go,savings-service
+            PRIMARY_LANG=go
+            PORT_BASE=9301
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-core-deposits:${{ env.TAG }}

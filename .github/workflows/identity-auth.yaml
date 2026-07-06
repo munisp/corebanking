@@ -1,0 +1,63 @@
+name: Build Identity Auth Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/auth-enforcer-rs/**'
+      - 'services/auth-service/**'
+      - 'services/biometric-auth-rs/**'
+      - 'services/biometric-service/**'
+      - 'services/browser-fingerprint-go/**'
+      - 'services/continuous-liveness-rs/**'
+      - 'services/face-match-rs/**'
+      - 'services/identity-channels-go/**'
+      - 'services/identity-verification-go/**'
+      - 'services/identity-verification-service/**'
+      - 'services/jwt-validator-rs/**'
+      - 'services/liveness-detection-rs/**'
+      - 'services/liveness-inference-py/**'
+      - 'services/liveness-orchestrator-go/**'
+      - 'services/mfa-orchestrator-go/**'
+      - 'services/otp-hardening-rs/**'
+      - 'services/pkce-auth-flow-go/**'
+      - 'services/token-rotation-rs/**'
+      - 'services/user-service/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - '.github/workflows/identity-auth.yaml'
+
+env:
+  TAG: "0.0.14"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=auth-enforcer-rs,auth-service,biometric-auth-rs,biometric-service,browser-fingerprint-go,continuous-liveness-rs,face-match-rs,identity-channels-go,identity-verification-go,identity-verification-service,jwt-validator-rs,liveness-detection-rs,liveness-inference-py,liveness-orchestrator-go,mfa-orchestrator-go,otp-hardening-rs,pkce-auth-flow-go,token-rotation-rs,user-service
+            PRIMARY_LANG=go
+            PORT_BASE=9364
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-identity-auth:${{ env.TAG }}
