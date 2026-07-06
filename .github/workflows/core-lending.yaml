@@ -25,6 +25,7 @@ on:
       - 'services/mortgage-service/**'
       - 'services/syndicated-loans-go/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/core-lending.yaml'
 

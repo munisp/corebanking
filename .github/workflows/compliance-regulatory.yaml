@@ -30,6 +30,7 @@ on:
       - 'services/sar-filing-engine-go/**'
       - 'services/soc2-evidence-collector-py/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/compliance-regulatory.yaml'
 

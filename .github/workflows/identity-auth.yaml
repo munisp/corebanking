@@ -26,6 +26,7 @@ on:
       - 'services/token-rotation-rs/**'
       - 'services/user-service/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/identity-auth.yaml'
 

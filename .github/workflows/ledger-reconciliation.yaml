@@ -13,6 +13,7 @@ on:
       - 'services/reconciliation-engine-rs/**'
       - 'services/reconciliation-service/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/ledger-reconciliation.yaml'
 

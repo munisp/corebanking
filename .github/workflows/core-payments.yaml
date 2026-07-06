@@ -21,6 +21,7 @@ on:
       - 'services/utility-payments-go/**'
       - 'services/whatsapp-payment-integration-go/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/core-payments.yaml'
 

@@ -16,6 +16,7 @@ on:
       - 'services/pos-terminal-go/**'
       - 'services/scratch-card-pin-go/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/core-cards.yaml'
 

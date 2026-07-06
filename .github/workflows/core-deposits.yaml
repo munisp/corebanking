@@ -14,6 +14,7 @@ on:
       - 'services/savings-products-go/**'
       - 'services/savings-service/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/core-deposits.yaml'
 

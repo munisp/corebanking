@@ -10,6 +10,7 @@ on:
       - 'services/erpnext-integration-service/**'
       - 'services/erpnext-sync-py/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/erp-integration.yaml'
 

@@ -38,6 +38,7 @@ on:
       - 'services/video-kyc-py/**'
       - 'services/watchlist-manager-rs/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/compliance-kyc-aml.yaml'
 

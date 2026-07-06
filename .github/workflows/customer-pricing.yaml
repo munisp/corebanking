@@ -12,6 +12,7 @@ on:
       - 'services/realtime-pricing-rs/**'
       - 'services/relationship-pricing-rs/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/customer-pricing.yaml'
 

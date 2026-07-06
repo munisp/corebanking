@@ -15,6 +15,7 @@ on:
       - 'services/agent-reconciliation-py/**'
       - 'services/agent-transaction-investigation-py/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/channels-agents.yaml'
 

@@ -17,6 +17,7 @@ on:
       - 'services/mcmc-bayesian-risk-py/**'
       - 'services/txn-pattern-analyzer-py/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/compliance-fraud.yaml'
 

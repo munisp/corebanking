@@ -17,6 +17,7 @@ on:
       - 'services/redis-session-store-go/**'
       - 'services/sw-api-cache-go/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/infra-caching.yaml'
 

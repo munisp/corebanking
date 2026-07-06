@@ -12,6 +12,7 @@ on:
       - 'services/ml-service/**'
       - 'services/soil-analysis-py/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/ai-ml-inference.yaml'
 

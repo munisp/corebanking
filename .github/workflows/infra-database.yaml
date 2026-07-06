@@ -16,6 +16,7 @@ on:
       - 'services/route-schema-enforcer-go/**'
       - 'services/table-partitioner-rs/**'
       - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
       - '.github/workflows/infra-database.yaml'
 
