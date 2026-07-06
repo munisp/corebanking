@@ -10,7 +10,7 @@ on:
       - '.github/workflows/communication-hub.yaml'
 
 env:
-  TAG: "0.0.1"
+  TAG: "0.0.10"
 
 jobs:
   build:
