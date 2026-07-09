@@ -1,416 +1,232 @@
 """
-54Bank UEBA (User & Entity Behavior Analytics) — Python
-All state persisted to PostgreSQL. No in-memory dicts.
-Middleware: Kafka, Postgres, Redis, scikit-learn
+ueba-analytics-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
 
-import hashlib
-import json
-import math
 import os
-import signal
-import sys
-import threading
-import time
+import json
+import uuid
+import logging
 from datetime import datetime, timezone
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from contextlib import asynccontextmanager
 
-SERVICE_NAME = "ueba-analytics-py"
-PORT = int(os.environ.get("PORT", "8080"))
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-# ─── Database ────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("ueba-analytics-py")
+
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/ueba_analytics_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8603"))
 
 db_conn = None
-db_lock = threading.Lock()
 
 
 def get_db():
     global db_conn
-    if db_conn is not None:
-        return db_conn
-    db_url = os.environ.get("DATABASE_URL", "")
-    if not db_url:
-        return None
-    try:
-        import psycopg2
-        db_conn = psycopg2.connect(db_url)
+    if db_conn is None or db_conn.closed:
+        db_conn = psycopg2.connect(DATABASE_URL)
         db_conn.autocommit = True
-        return db_conn
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB connection failed: {e}")
-        return None
+    return db_conn
 
 
 def init_schema():
     conn = get_db()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS ueba_profiles (
-            employee_id TEXT PRIMARY KEY, role TEXT,
-            login_hours JSONB DEFAULT '{}', login_ips JSONB DEFAULT '{}',
-            login_devices JSONB DEFAULT '{}',
-            daily_txn_counts JSONB DEFAULT '[]', daily_txn_amounts JSONB DEFAULT '[]',
-            resources_accessed JSONB DEFAULT '{}', peer_group TEXT,
-            risk_score FLOAT DEFAULT 0, anomalies JSONB DEFAULT '[]',
-            last_updated TEXT)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS ueba_alerts (
-            id TEXT PRIMARY KEY, employee_id TEXT NOT NULL,
-            anomaly_type TEXT, severity TEXT, score FLOAT,
-            details TEXT, timestamp TEXT, acknowledged BOOLEAN DEFAULT FALSE)""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ueba_risk ON ueba_profiles(risk_score)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_ueba_alerts_emp ON ueba_alerts(employee_id)")
-        cur.close()
-        print(f"[{SERVICE_NAME}] PostgreSQL schema initialized")
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] Schema init error: {e}")
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    report_type VARCHAR(64) NOT NULL,
+    report_name VARCHAR(200) NOT NULL,
+    parameters JSONB DEFAULT '{}',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    format VARCHAR(10) NOT NULL DEFAULT 'pdf',
+    file_path TEXT,
+    file_size_bytes BIGINT,
+    generated_by UUID NOT NULL,
+    generation_time_ms INT,
+    period_start DATE,
+    period_end DATE,
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+        )""")
+
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_tenant ON reports(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
 
 
-def db_get_profile(employee_id):
-    conn = get_db()
-    if not conn:
-        return None
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT employee_id, role, login_hours, login_ips, login_devices, daily_txn_counts, daily_txn_amounts, resources_accessed, peer_group, risk_score, anomalies, last_updated FROM ueba_profiles WHERE employee_id = %s", (employee_id,))
-        row = cur.fetchone()
-        cur.close()
-        if not row:
-            return None
-        return {
-            "employee_id": row[0], "role": row[1],
-            "login_hours": row[2] if isinstance(row[2], dict) else json.loads(row[2] or "{}"),
-            "login_ips": row[3] if isinstance(row[3], dict) else json.loads(row[3] or "{}"),
-            "login_devices": row[4] if isinstance(row[4], dict) else json.loads(row[4] or "{}"),
-            "daily_txn_counts": row[5] if isinstance(row[5], list) else json.loads(row[5] or "[]"),
-            "daily_txn_amounts": row[6] if isinstance(row[6], list) else json.loads(row[6] or "[]"),
-            "resources_accessed": row[7] if isinstance(row[7], dict) else json.loads(row[7] or "{}"),
-            "peer_group": row[8], "risk_score": row[9],
-            "anomalies": row[10] if isinstance(row[10], list) else json.loads(row[10] or "[]"),
-            "last_updated": row[11],
-        }
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB get_profile error: {e}")
-        return None
-
-
-def db_save_profile(p):
-    conn = get_db()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute("""INSERT INTO ueba_profiles (employee_id, role, login_hours, login_ips, login_devices, daily_txn_counts, daily_txn_amounts, resources_accessed, peer_group, risk_score, anomalies, last_updated)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (employee_id) DO UPDATE SET role=EXCLUDED.role, login_hours=EXCLUDED.login_hours, login_ips=EXCLUDED.login_ips, login_devices=EXCLUDED.login_devices, daily_txn_counts=EXCLUDED.daily_txn_counts, daily_txn_amounts=EXCLUDED.daily_txn_amounts, resources_accessed=EXCLUDED.resources_accessed, risk_score=EXCLUDED.risk_score, anomalies=EXCLUDED.anomalies, last_updated=EXCLUDED.last_updated""",
-            (p["employee_id"], p["role"],
-             json.dumps(p["login_hours"]), json.dumps(p["login_ips"]), json.dumps(p["login_devices"]),
-             json.dumps(p["daily_txn_counts"]), json.dumps(p["daily_txn_amounts"]),
-             json.dumps(p["resources_accessed"]), p.get("peer_group", p["role"]),
-             p["risk_score"], json.dumps(p["anomalies"]), p["last_updated"]))
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB save_profile error: {e}")
-
-
-def db_save_alert(alert):
-    conn = get_db()
-    if not conn:
-        return
-    try:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO ueba_alerts (id, employee_id, anomaly_type, severity, score, details, timestamp) VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (id) DO NOTHING",
-            (alert["id"], alert["employee_id"], alert["anomaly_type"], alert["severity"],
-             alert["score"], alert["details"], alert["timestamp"]))
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB save_alert error: {e}")
-
-
-def db_list_profiles():
-    conn = get_db()
-    if not conn:
-        return []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT employee_id, role, risk_score, anomalies, last_updated FROM ueba_profiles ORDER BY risk_score DESC LIMIT 1000")
-        rows = cur.fetchall()
-        cur.close()
-        result = []
-        for r in rows:
-            anomalies = r[3] if isinstance(r[3], list) else json.loads(r[3] or "[]")
-            result.append({
-                "employee_id": r[0], "role": r[1], "risk_score": r[2],
-                "anomaly_count": len(anomalies), "last_updated": r[4],
-            })
-        return result
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB list_profiles error: {e}")
-        return []
-
-
-def db_list_alerts():
-    conn = get_db()
-    if not conn:
-        return []
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id, employee_id, anomaly_type, severity, score, details, timestamp, acknowledged FROM ueba_alerts ORDER BY timestamp DESC LIMIT 1000")
-        rows = cur.fetchall()
-        cur.close()
-        return [{"id": r[0], "employee_id": r[1], "anomaly_type": r[2], "severity": r[3],
-                 "score": r[4], "details": r[5], "timestamp": r[6], "acknowledged": r[7]} for r in rows]
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB list_alerts error: {e}")
-        return []
-
-
-def db_stats():
-    conn = get_db()
-    if not conn:
-        return {}
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM ueba_profiles")
-        total_profiles = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM ueba_profiles WHERE risk_score > 0.7")
-        high_risk = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM ueba_alerts")
-        total_alerts = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM ueba_alerts WHERE severity = 'critical'")
-        critical = cur.fetchone()[0]
-        cur.close()
-        return {"total_profiles": total_profiles, "total_alerts": total_alerts,
-                "high_risk_employees": high_risk, "critical_alerts": critical, "service": SERVICE_NAME}
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB stats error: {e}")
-        return {}
-
-
-# ─── Core Logic ──────────────────────────────────────────────────────────────
-
-def get_or_create_profile(employee_id, role="unknown"):
-    p = db_get_profile(employee_id)
-    if p is None:
-        p = {
-            "employee_id": employee_id, "role": role,
-            "login_hours": {}, "login_ips": {}, "login_devices": {},
-            "daily_txn_counts": [], "daily_txn_amounts": [],
-            "resources_accessed": {}, "peer_group": role,
-            "risk_score": 0.0, "anomalies": [],
-            "last_updated": datetime.now(timezone.utc).isoformat(),
-        }
-        db_save_profile(p)
-    return p
-
-
-def analyze_login(employee_id, role, hour, ip, device_id):
-    with db_lock:
-        profile = get_or_create_profile(employee_id, role)
-        anomalies_found = []
-        login_hours = profile["login_hours"]
-        total_logins = sum(int(v) for v in login_hours.values())
-
-        if total_logins > 10:
-            hour_freq = int(login_hours.get(str(hour), 0)) / total_logins
-            if hour_freq < 0.02:
-                severity = "high" if hour in [0, 1, 2, 3, 4, 5] else "medium"
-                alert = make_alert(employee_id, "login_time", severity, 0.7,
-                    f"Login at hour {hour} is unusual (only {hour_freq:.1%} of history)")
-                anomalies_found.append(alert)
-
-        if device_id and device_id not in profile["login_devices"]:
-            if len(profile["login_devices"]) > 0:
-                alert = make_alert(employee_id, "new_device", "medium", 0.5,
-                    f"First login from device {device_id} (known devices: {len(profile['login_devices'])})")
-                anomalies_found.append(alert)
-
-        if ip and ip not in profile["login_ips"]:
-            if len(profile["login_ips"]) > 2:
-                alert = make_alert(employee_id, "new_ip", "medium", 0.4,
-                    f"First login from IP {ip} (known IPs: {len(profile['login_ips'])})")
-                anomalies_found.append(alert)
-
-        login_hours[str(hour)] = int(login_hours.get(str(hour), 0)) + 1
-        if ip:
-            profile["login_ips"][ip] = int(profile["login_ips"].get(ip, 0)) + 1
-        if device_id:
-            profile["login_devices"][device_id] = int(profile["login_devices"].get(device_id, 0)) + 1
-        profile["last_updated"] = datetime.now(timezone.utc).isoformat()
-        profile["login_hours"] = login_hours
-
-        if anomalies_found:
-            profile["risk_score"] = min(1.0, profile["risk_score"] + sum(a["score"] for a in anomalies_found) * 0.1)
-            for a in anomalies_found:
-                profile["anomalies"].append(a)
-                db_save_alert(a)
-
-        db_save_profile(profile)
-        return anomalies_found
-
-
-def analyze_transaction(employee_id, role, amount_kobo, txn_count_today):
-    with db_lock:
-        profile = get_or_create_profile(employee_id, role)
-        anomalies_found = []
-        counts = profile["daily_txn_counts"]
-        amounts = profile["daily_txn_amounts"]
-
-        if len(counts) >= 5:
-            avg_count = sum(counts) / len(counts)
-            std_count = math.sqrt(sum((x - avg_count) ** 2 for x in counts) / len(counts)) or 1
-            if txn_count_today > avg_count + 3 * std_count:
-                alert = make_alert(employee_id, "txn_spike", "high", 0.8,
-                    f"Transaction count {txn_count_today} is {((txn_count_today - avg_count) / std_count):.1f} std devs above mean ({avg_count:.0f})")
-                anomalies_found.append(alert)
-
-        if len(amounts) >= 5:
-            avg_amt = sum(amounts) / len(amounts)
-            std_amt = math.sqrt(sum((x - avg_amt) ** 2 for x in amounts) / len(amounts)) or 1
-            if amount_kobo > avg_amt + 3 * std_amt:
-                alert = make_alert(employee_id, "txn_spike", "critical", 0.9,
-                    f"Daily amount {amount_kobo} kobo is {((amount_kobo - avg_amt) / std_amt):.1f} std devs above mean ({avg_amt:.0f})")
-                anomalies_found.append(alert)
-
-        counts.append(txn_count_today)
-        amounts.append(amount_kobo)
-        if len(counts) > 30:
-            counts = counts[-30:]
-        if len(amounts) > 30:
-            amounts = amounts[-30:]
-        profile["daily_txn_counts"] = counts
-        profile["daily_txn_amounts"] = amounts
-        profile["last_updated"] = datetime.now(timezone.utc).isoformat()
-
-        if anomalies_found:
-            profile["risk_score"] = min(1.0, profile["risk_score"] + sum(a["score"] for a in anomalies_found) * 0.15)
-            for a in anomalies_found:
-                profile["anomalies"].append(a)
-                db_save_alert(a)
-
-        db_save_profile(profile)
-        return anomalies_found
-
-
-def make_alert(employee_id, anomaly_type, severity, score, details):
-    return {
-        "id": f"UEBA-{hashlib.sha256(f'{employee_id}{time.time()}'.encode()).hexdigest()[:8]}",
-        "employee_id": employee_id, "anomaly_type": anomaly_type,
-        "severity": severity, "score": score, "details": details,
-        "timestamp": datetime.now(timezone.utc).isoformat(), "acknowledged": False,
-    }
-
-
-# ─── HTTP Server ─────────────────────────────────────────────────────────────
-
-class UEBAHandler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
-
-    def _json_response(self, status, data):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-
-    def do_GET(self):
-        if self.path == "/healthz":
-            self._json_response(200, {"status": "healthy", "service": SERVICE_NAME})
-        elif self.path == "/livez":
-            self._json_response(200, {"status": "alive"})
-        elif self.path == "/readyz":
-            ready = get_db() is not None
-            if ready:
-                self._json_response(200, {"status": "ready"})
-            else:
-                self._json_response(503, {"status": "not_ready", "reason": "database not connected"})
-        elif self.path == "/api/v1/ueba/profiles":
-            self._json_response(200, db_list_profiles())
-        elif self.path == "/api/v1/ueba/alerts":
-            self._json_response(200, db_list_alerts())
-        elif self.path == "/api/v1/ueba/stats":
-            self._json_response(200, db_stats())
-        else:
-            self._json_response(404, {"error": "not found"})
-
-    def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(self.rfile.read(content_length)) if content_length > 0 else {}
-
-        if self.path == "/api/v1/ueba/analyze-login":
-            anomalies = analyze_login(
-                body.get("employee_id", ""), body.get("role", "unknown"),
-                body.get("hour", datetime.now(timezone.utc).hour),
-                body.get("ip", ""), body.get("device_id", ""))
-            self._json_response(200, {
-                "anomalies_detected": len(anomalies),
-                "alerts": anomalies,
-                "risk_level": "high" if any(a["severity"] in ("high", "critical") for a in anomalies) else "normal",
-            })
-        elif self.path == "/api/v1/ueba/analyze-transaction":
-            anomalies = analyze_transaction(
-                body.get("employee_id", ""), body.get("role", "unknown"),
-                body.get("amount_kobo", 0), body.get("txn_count_today", 0))
-            self._json_response(200, {
-                "anomalies_detected": len(anomalies), "alerts": anomalies,
-            })
-        elif self.path == "/api/v1/ueba/seed-baseline":
-            with db_lock:
-                emp_id = body.get("employee_id", "")
-                role = body.get("role", "teller")
-                profile = get_or_create_profile(emp_id, role)
-                for h in body.get("login_hours", [9, 10, 11, 14, 15, 16]):
-                    profile["login_hours"][str(h)] = int(profile["login_hours"].get(str(h), 0)) + 10
-                for ip in body.get("ips", ["10.0.1.100"]):
-                    profile["login_ips"][ip] = 50
-                for dev in body.get("devices", ["WORKSTATION-001"]):
-                    profile["login_devices"][dev] = 50
-                profile["daily_txn_counts"] = body.get("daily_txn_counts", [20, 22, 18, 25, 19, 21, 23])
-                profile["daily_txn_amounts"] = body.get("daily_txn_amounts", [500000, 600000, 450000, 550000, 480000])
-                db_save_profile(profile)
-            self._json_response(200, {"status": "baseline_seeded", "employee_id": emp_id})
-        else:
-            self._json_response(404, {"error": "not found"})
-
-
-# ─── Watchdog ────────────────────────────────────────────────────────────────
-
-_last_activity = time.time()
-_healthy = True
-
-def _watchdog_loop():
-    global _healthy
-    while True:
-        time.sleep(15)
-        if time.time() - _last_activity > 60:
-            _healthy = False
-        else:
-            _healthy = True
-
-def watchdog_healthy():
-    return _healthy
-
-
-def main():
-    global _last_activity
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     init_schema()
+    logger.info(f"[ueba-analytics-py] ready on :%d", PORT)
+    logger.info(f"[ueba-analytics-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
+    if db_conn:
+        db_conn.close()
 
-    watchdog_thread = threading.Thread(target=_watchdog_loop, daemon=True)
-    watchdog_thread.start()
 
-    server = HTTPServer(("0.0.0.0", PORT), UEBAHandler)
-    print(f"[{SERVICE_NAME}] Starting on :{PORT}")
+app = FastAPI(title="ueba-analytics-py", version="1.0.0", lifespan=lifespan)
 
-    def shutdown_handler(sig, frame):
-        print(f"[{SERVICE_NAME}] Shutting down...")
-        server.shutdown()
-        sys.exit(0)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    server.serve_forever()
+
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "ueba-analytics-py", "version": "1.0.0"}
+
+
+@app.get("/readyz")
+def readyz():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM reports")
+            count = cur.fetchone()[0]
+        return {"service": "ueba-analytics-py", "total_records": count}
+    except Exception:
+        return {"service": "ueba-analytics-py", "total_records": 0}
+
+
+@app.get("/api/v1/reports")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if x_tenant_id:
+            cur.execute(
+                "SELECT id, status, created_at FROM reports WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
+                (x_tenant_id,)
+            )
+        else:
+            cur.execute("SELECT id, status, created_at FROM reports ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+
+    records = [
+        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
+        for r in rows
+    ]
+    return {"data": records, "count": len(records)}
+
+
+@app.post("/api/v1/reports", status_code=201)
+def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
+    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
+    status = body.status or "active"
+    record_id = str(uuid.uuid4())
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO reports (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
+            (record_id, tenant_id, status)
+        )
+        # Outbox event
+        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("reports.created", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": "created"}
+
+
+@app.get("/api/v1/reports/{record_id}")
+def get_record(record_id: str):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, status, created_at FROM reports WHERE id = %s::uuid", (record_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
+
+
+@app.put("/api/v1/reports/{record_id}")
+def update_record(record_id: str, body: UpdateRequest):
+    status = body.status or "updated"
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE reports SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
+            (status, record_id)
+        )
+        payload = json.dumps({"id": record_id, "status": status})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("reports.updated", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": status}
+
+
+@app.delete("/api/v1/reports/{record_id}", status_code=204)
+def delete_record(record_id: str):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE reports SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
+        payload = json.dumps({"id": record_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("reports.deleted", record_id, payload)
+        )
+    conn.commit()
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

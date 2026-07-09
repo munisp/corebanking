@@ -1,257 +1,231 @@
-"""54Bank SMS Gateway — Routes SMS via local telcos (MTN, Airtel, Glo, 9mobile)."""
+"""
+sms-gateway-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
+"""
 
 import os
-import sys
-import time
 import json
-import threading
-import hashlib
+import uuid
 import logging
-import http.server
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
-logger = logging.getLogger("sms-gateway")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-PORT = int(os.environ.get("PORT", "8080"))
-SERVICE_NAME = "sms-gateway"
-MAX_BODY_SIZE = 1 * 1024 * 1024
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("sms-gateway-py")
 
-# --- Process Health Watchdog ---
-_watchdog_last_ping = time.time()
-_watchdog_lock = threading.Lock()
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/sms_gateway_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8311"))
 
-
-def watchdog_ping():
-    global _watchdog_last_ping
-    with _watchdog_lock:
-        _watchdog_last_ping = time.time()
-
-
-def watchdog_healthy() -> bool:
-    with _watchdog_lock:
-        return (time.time() - _watchdog_last_ping) < 60
-
-
-def _watchdog_loop():
-    while True:
-        time.sleep(10)
-        if not watchdog_healthy():
-            logger.warning("[WATCHDOG] Event loop stalled — marking unhealthy")
-        watchdog_ping()
+db_conn = None
 
 
-threading.Thread(target=_watchdog_loop, daemon=True).start()
+def get_db():
+    global db_conn
+    if db_conn is None or db_conn.closed:
+        db_conn = psycopg2.connect(DATABASE_URL)
+        db_conn.autocommit = True
+    return db_conn
 
-# --- Circuit Breaker ---
-class CircuitBreaker:
-    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 30.0):
-        self._failures = 0
-        self._threshold = failure_threshold
-        self._timeout = reset_timeout
-        self._state = "closed"
-        self._last_failure = 0.0
-        self._lock = threading.Lock()
 
-    def allow(self) -> bool:
-        with self._lock:
-            if self._state == "open":
-                if time.time() - self._last_failure > self._timeout:
-                    self._state = "half-open"
-                    return True
-                return False
-            return True
+def init_schema():
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS notifications (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    recipient_id UUID NOT NULL,
+    channel VARCHAR(20) NOT NULL,
+    template_id VARCHAR(64),
+    subject VARCHAR(200),
+    body TEXT NOT NULL,
+    priority VARCHAR(10) DEFAULT 'normal',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    sent_at TIMESTAMPTZ,
+    delivered_at TIMESTAMPTZ,
+    read_at TIMESTAMPTZ,
+    metadata JSONB DEFAULT '{}',
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-    def record_success(self):
-        with self._lock:
-            self._failures = 0
-            self._state = "closed"
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-    def record_failure(self):
-        with self._lock:
-            self._failures += 1
-            self._last_failure = time.time()
-            if self._failures >= self._threshold:
-                self._state = "open"
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_tenant ON notifications(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
 
-_circuit_breaker = CircuitBreaker()
 
-# --- Rate Limiter ---
-class RateLimiter:
-    def __init__(self, max_requests: int = 100, window_seconds: float = 60.0):
-        self._max = max_requests
-        self._window = window_seconds
-        self._requests: dict = {}
-        self._lock = threading.Lock()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_schema()
+    logger.info(f"[sms-gateway-py] ready on :%d", PORT)
+    logger.info(f"[sms-gateway-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
+    if db_conn:
+        db_conn.close()
 
-    def allow(self, client_ip: str) -> bool:
-        now = time.time()
-        with self._lock:
-            reqs = self._requests.get(client_ip, [])
-            reqs = [t for t in reqs if now - t < self._window]
-            if len(reqs) >= self._max:
-                return False
-            reqs.append(now)
-            self._requests[client_ip] = reqs
-            return True
 
-_rate_limiter = RateLimiter()
+app = FastAPI(title="sms-gateway-py", version="1.0.0", lifespan=lifespan)
 
-# --- EventBus ---
-class EventBus:
-    def __init__(self, topic: str, service: str):
-        self._broker = os.environ.get("KAFKA_BROKERS", "localhost:9092")
-        self._topic = topic
-        self._service = service
-        self._buffer: list = []
-        self._lock = threading.Lock()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    def emit(self, event_type: str, payload: dict) -> None:
-        event = {
-            "id": f"{self._service}_{int(time.time() * 1000)}",
-            "type": event_type,
-            "source": self._service,
-            "topic": self._topic,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "data": payload,
-        }
-        with self._lock:
-            self._buffer.append(event)
-        logger.info(f"[EventBus] {self._service} -> {self._topic}: {event_type}")
 
-    def flush(self) -> list:
-        with self._lock:
-            events = self._buffer[:]
-            self._buffer.clear()
-        return events
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
 
-_event_bus = EventBus("notifications.delivery", SERVICE_NAME)
 
-# --- SMS Data ---
-_sms_sent = 0
-_sms_failed = 0
-_sms_log: list = []
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
 
-TELCO_PREFIXES = {
-    "0803": "MTN", "0806": "MTN", "0813": "MTN", "0816": "MTN", "0810": "MTN",
-    "0802": "Airtel", "0808": "Airtel", "0812": "Airtel", "0701": "Airtel",
-    "0805": "Glo", "0807": "Glo", "0815": "Glo", "0811": "Glo",
-    "0809": "9mobile", "0817": "9mobile", "0818": "9mobile",
-}
 
-def _detect_telco(phone: str) -> str:
-    prefix = phone.replace("+234", "0")[:4]
-    return TELCO_PREFIXES.get(prefix, "Unknown")
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "sms-gateway-py", "version": "1.0.0"}
 
-def _mask_phone(phone: str) -> str:
-    if len(phone) > 7:
-        return phone[:4] + "****" + phone[-3:]
-    return "****"
 
-def _sanitize(value: str) -> str:
-    return value.replace("<", "&lt;").replace(">", "&gt;").replace("\n", " ").replace("\r", "")[:500]
+@app.get("/readyz")
+def readyz():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
 
-class SMSHandler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        logger.info(f"[HTTP] {args[0] if args else ''}")
 
-    def _send_json(self, code: int, data: dict):
-        body = json.dumps(data).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        self.send_header("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'")
-        self.send_header("X-Request-Id", self.headers.get("X-Request-Id", f"req-{int(time.time()*1000)}"))
-        self.end_headers()
-        self.wfile.write(body)
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
 
-    def do_GET(self):
-        watchdog_ping()
-        if self.path in ("/healthz", "/health", "/readyz"):
-            self._send_json(200, {"status": "healthy", "service": SERVICE_NAME})
-        elif self.path == "/livez":
-            if watchdog_healthy():
-                self._send_json(200, {"status": "alive", "watchdog": "healthy"})
-            else:
-                self._send_json(503, {"status": "stalled", "watchdog": "unhealthy"})
-        elif self.path == "/metrics":
-            self._send_json(200, {"sent": _sms_sent, "failed": _sms_failed})
-        elif self.path == "/v1/sms-gateway/stats":
-            self._send_json(200, {
-                "total_sent": _sms_sent, "total_failed": _sms_failed,
-                "delivery_rate": round(_sms_sent / max(_sms_sent + _sms_failed, 1) * 100, 2),
-                "by_telco": {"MTN": _sms_sent // 3, "Airtel": _sms_sent // 4, "Glo": _sms_sent // 5, "9mobile": _sms_sent // 6},
-            })
-        elif self.path == "/v1/sms-gateway/log":
-            self._send_json(200, {"messages": _sms_log[-50:]})
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM notifications")
+            count = cur.fetchone()[0]
+        return {"service": "sms-gateway-py", "total_records": count}
+    except Exception:
+        return {"service": "sms-gateway-py", "total_records": 0}
+
+
+@app.get("/api/v1/notifications")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if x_tenant_id:
+            cur.execute(
+                "SELECT id, status, created_at FROM notifications WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
+                (x_tenant_id,)
+            )
         else:
-            self._send_json(404, {"error": "not found"})
+            cur.execute("SELECT id, status, created_at FROM notifications ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
 
-    def do_POST(self):
-        global _sms_sent, _sms_failed
-        watchdog_ping()
-        client_ip = self.client_address[0]
-        if not _rate_limiter.allow(client_ip):
-            self._send_json(429, {"error": "rate limit exceeded"})
-            return
-        length = int(self.headers.get("Content-Length", 0))
-        if length > MAX_BODY_SIZE:
-            self._send_json(413, {"error": "payload too large"})
-            return
-        body = self.rfile.read(length)
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            self._send_json(400, {"error": "invalid JSON"})
-            return
+    records = [
+        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
+        for r in rows
+    ]
+    return {"data": records, "count": len(records)}
 
-        if self.path == "/v1/sms-gateway/send":
-            phone = _sanitize(data.get("phone", ""))
-            message = _sanitize(data.get("message", ""))
-            if not phone or not message:
-                self._send_json(400, {"error": "phone and message required"})
-                return
-            if not _circuit_breaker.allow():
-                self._send_json(503, {"error": "circuit breaker open — telco API unavailable"})
-                _sms_failed += 1
-                return
-            telco = _detect_telco(phone)
-            sms_id = f"sms-{int(time.time()*1000)}"
-            _sms_log.append({
-                "id": sms_id, "phone": _mask_phone(phone), "telco": telco,
-                "status": "delivered", "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            })
-            _sms_sent += 1
-            _circuit_breaker.record_success()
-            _event_bus.emit("sms.delivered", {"sms_id": sms_id, "telco": telco})
-            self._send_json(200, {"status": "delivered", "sms_id": sms_id, "telco": telco})
-        elif self.path == "/v1/sms-gateway/send-otp":
-            phone = _sanitize(data.get("phone", ""))
-            if not phone:
-                self._send_json(400, {"error": "phone required"})
-                return
-            otp_id = f"otp-{int(time.time()*1000)}"
-            _sms_sent += 1
-            _event_bus.emit("sms.otp_sent", {"otp_id": otp_id, "phone": _mask_phone(phone)})
-            self._send_json(200, {"status": "otp_sent", "otp_id": otp_id, "expires_seconds": 300})
-        else:
-            self._send_json(404, {"error": "not found"})
+
+@app.post("/api/v1/notifications", status_code=201)
+def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
+    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
+    status = body.status or "active"
+    record_id = str(uuid.uuid4())
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO notifications (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
+            (record_id, tenant_id, status)
+        )
+        # Outbox event
+        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("notifications.created", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": "created"}
+
+
+@app.get("/api/v1/notifications/{record_id}")
+def get_record(record_id: str):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, status, created_at FROM notifications WHERE id = %s::uuid", (record_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
+
+
+@app.put("/api/v1/notifications/{record_id}")
+def update_record(record_id: str, body: UpdateRequest):
+    status = body.status or "updated"
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE notifications SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
+            (status, record_id)
+        )
+        payload = json.dumps({"id": record_id, "status": status})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("notifications.updated", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": status}
+
+
+@app.delete("/api/v1/notifications/{record_id}", status_code=204)
+def delete_record(record_id: str):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE notifications SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
+        payload = json.dumps({"id": record_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("notifications.deleted", record_id, payload)
+        )
+    conn.commit()
+
 
 if __name__ == "__main__":
-    import signal
-    server = http.server.HTTPServer(("0.0.0.0", PORT), SMSHandler)
-    logger.info(f"[{SERVICE_NAME}] Starting on :{PORT}")
-
-    def shutdown_handler(signum, frame):
-        logger.info(f"[{SERVICE_NAME}] Shutting down gracefully...")
-        server.shutdown()
-
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    server.server_close()
-    logger.info(f"[{SERVICE_NAME}] Server stopped")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

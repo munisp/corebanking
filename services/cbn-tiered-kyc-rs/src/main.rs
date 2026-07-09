@@ -1,1312 +1,272 @@
-#![allow(unused)]
-use std::env;
-use actix_web::dev::Service;
-use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
-use std::time::Instant;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use std::env;
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// ─── CBN Tiered KYC Rules Engine ────────────────────────────────────────────
-// Implements CBN Tier 1/2/3 account requirements, limits, upgrade paths,
-// compliance validation, and regulatory reporting per CBN circulars.
-
-#[derive(Clone, Serialize, Deserialize)]
-struct TierConfig {
-    tier: String,
-    description: String,
-    max_balance_ngn: Option<u64>,
-    daily_txn_limit_ngn: Option<u64>,
-    single_txn_limit_ngn: Option<u64>,
-    required_docs: Vec<String>,
-    liveness_required: bool,
-    bvn_required: bool,
-    nin_required: bool,
-    address_required: bool,
-    photo_required: bool,
-    upgrade_path: Option<String>,
-    cbn_circular: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct TierAssessment {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    customer_id: String,
-    current_tier: String,
-    eligible_tier: String,
-    docs_present: Vec<String>,
-    docs_missing: Vec<String>,
-    liveness_passed: bool,
-    bvn_verified: bool,
-    nin_verified: bool,
-    address_verified: bool,
-    upgrade_possible: bool,
-    upgrade_blockers: Vec<String>,
-    compliance_score: f64,
-    assessed_at: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct LimitCheck {
-    customer_id: String,
-    tier: String,
-    transaction_amount: u64,
-    transaction_type: String,
-    current_daily_total: u64,
-    current_balance: u64,
-    allowed: bool,
-    reason: String,
-    remaining_daily: Option<u64>,
-    remaining_balance: Option<u64>,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
-    start_time: Instant,
-    assessments: Mutex<Vec<TierAssessment>>,
-    limit_checks: Mutex<Vec<LimitCheck>>,
-    db_client: Option<std::sync::Arc<tokio_postgres /* pool_size=25, idle_timeout=300s */::Client>>,
+    db: PgPool,
 }
-
-fn default_tiers() -> Vec<TierConfig> {
-    vec![
-        TierConfig {
-            tier: "tier1".into(), description: "CBN Tier 1 — Basic (Mobile Money)".into(),
-            max_balance_ngn: Some(300_000), daily_txn_limit_ngn: Some(50_000),
-            single_txn_limit_ngn: Some(50_000),
-            required_docs: vec!["phone_number".into(), "name".into(), "dob".into()],
-            liveness_required: false, bvn_required: false, nin_required: false,
-            address_required: false, photo_required: false,
-            upgrade_path: Some("tier2".into()),
-            cbn_circular: "CBN/DIR/GEN/CIR/04/010".into(),
-        },
-        TierConfig {
-            tier: "tier2".into(), description: "CBN Tier 2 — Standard".into(),
-            max_balance_ngn: Some(500_000), daily_txn_limit_ngn: Some(200_000),
-            single_txn_limit_ngn: Some(200_000),
-            required_docs: vec!["phone_number".into(), "name".into(), "dob".into(), "bvn".into(), "id_document".into()],
-            liveness_required: true, bvn_required: true, nin_required: false,
-            address_required: false, photo_required: true,
-            upgrade_path: Some("tier3".into()),
-            cbn_circular: "CBN/DIR/GEN/CIR/04/010".into(),
-        },
-        TierConfig {
-            tier: "tier3".into(), description: "CBN Tier 3 — Enhanced (Full Banking)".into(),
-            max_balance_ngn: None, daily_txn_limit_ngn: None,
-            single_txn_limit_ngn: None,
-            required_docs: vec!["phone_number".into(), "name".into(), "dob".into(), "bvn".into(), "nin".into(), "id_document".into(), "utility_bill".into(), "passport_photo".into(), "signature".into()],
-            liveness_required: true, bvn_required: true, nin_required: true,
-            address_required: true, photo_required: true,
-            upgrade_path: None,
-            cbn_circular: "CBN/DIR/GEN/CIR/04/010".into(),
-        },
-    ]
-}
-
-fn assess_tier_eligibility(customer_id: &str, docs: &[String], liveness: bool, bvn: bool, nin: bool, address: bool) -> TierAssessment {
-    let tiers = default_tiers();
-    let mut best_tier = "tier1".to_string();
-    let mut missing = vec![];
-
-    // Check tier3 first
-    let t3 = &tiers[2];
-    let t3_missing: Vec<String> = t3.required_docs.iter()
-        .filter(|d| !docs.contains(d))
-        .cloned().collect();
-    if t3_missing.is_empty() && liveness && bvn && nin && address {
-        best_tier = "tier3".to_string();
-    } else {
-        // Check tier2
-        let t2 = &tiers[1];
-        let t2_missing: Vec<String> = t2.required_docs.iter()
-            .filter(|d| !docs.contains(d))
-            .cloned().collect();
-        if t2_missing.is_empty() && liveness && bvn {
-            best_tier = "tier2".to_string();
-            missing = t3_missing;
-        } else {
-            missing = t2_missing;
-        }
-    }
-
-    let mut blockers = vec![];
-    if best_tier != "tier3" {
-        if !liveness { blockers.push("liveness_not_passed".into()); }
-        if !bvn { blockers.push("bvn_not_verified".into()); }
-        if best_tier == "tier1" && !nin { blockers.push("nin_not_verified".into()); }
-        if !address { blockers.push("address_not_verified".into()); }
-    }
-
-    let compliance = match best_tier.as_str() {
-        "tier3" => 100.0,
-        "tier2" => 75.0 + (docs.len() as f64 * 2.0),
-        _ => 50.0 + (docs.len() as f64 * 5.0),
-    };
-
-    TierAssessment {
-        id: format!("ASM-{:08X}", rand_u32()),
-        customer_id: customer_id.to_string(),
-        current_tier: "tier1".into(),
-        eligible_tier: best_tier.clone(),
-        docs_present: docs.to_vec(),
-        docs_missing: missing,
-        liveness_passed: liveness,
-        bvn_verified: bvn,
-        nin_verified: nin,
-        address_verified: address,
-        upgrade_possible: best_tier != "tier1",
-        upgrade_blockers: blockers,
-        compliance_score: compliance.min(100.0),
-        assessed_at: chrono_now(),
-    }
-}
-
-fn check_limit(tier: &str, amount: u64, daily_total: u64, balance: u64) -> LimitCheck {
-    let tiers = default_tiers();
-    let config = tiers.iter().find(|t| t.tier == tier).unwrap_or(&tiers[0]);
-
-    let mut allowed = true;
-    let mut reason = "within_limits".to_string();
-    let mut remaining_daily = None;
-    let mut remaining_balance = None;
-
-    if let Some(daily_limit) = config.daily_txn_limit_ngn {
-        if daily_total + amount > daily_limit {
-            allowed = false;
-            reason = format!("daily_limit_exceeded: {} + {} > {}", daily_total, amount, daily_limit);
-        }
-        remaining_daily = Some(daily_limit.saturating_sub(daily_total + amount));
-    }
-
-    if let Some(single_limit) = config.single_txn_limit_ngn {
-        if amount > single_limit {
-            allowed = false;
-            reason = format!("single_txn_limit_exceeded: {} > {}", amount, single_limit);
-        }
-    }
-
-    if let Some(max_bal) = config.max_balance_ngn {
-        if balance + amount > max_bal {
-            allowed = false;
-            reason = format!("balance_limit_exceeded: {} + {} > {}", balance, amount, max_bal);
-        }
-        remaining_balance = Some(max_bal.saturating_sub(balance + amount));
-    }
-
-    LimitCheck {
-        customer_id: String::new(),
-        tier: tier.to_string(),
-        transaction_amount: amount,
-        transaction_type: "transfer".into(),
-        current_daily_total: daily_total,
-        current_balance: balance,
-        allowed,
-        reason,
-        remaining_daily,
-        remaining_balance,
-    }
-}
-
-fn rand_u32() -> u32 {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    (t.as_nanos() % u32::MAX as u128) as u32
-}
-
-fn chrono_now() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    format!("2026-05-09T{:02}:{:02}:{:02}Z", (d.as_secs() / 3600) % 24, (d.as_secs() / 60) % 60, d.as_secs() % 60)
-}
-
-// ─── Handlers ───────────────────────────────────────────────────────────────
-
-
-// --- Graceful Degradation ---
-use std::sync::atomic::AtomicBool;
-
-static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
-static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
-
-fn degradation_mode() -> &'static str {
-    if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
-}
-
-async fn degradation_status() -> HttpResponse {
-    let _bus = init_data_flow();
-    _bus.emit("cbn-tiered-kyc.processed", &serde_json::json!({"status": "success"}));
-    HttpResponse::Ok().json(json!({
-        "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
-        "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
-        "mode": degradation_mode(),
-    }))
-}
-
-async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    let db_status = if let Some(ref client) = state.db_client {
-        match client.execute("SELECT 1", &[]).await {
-            Ok(_) => "connected",
-            Err(_) => "unhealthy",
-        }
-    } else {
-        "not_configured"
-    };
-    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "status": overall,
-        "service": "cbn-tiered-kyc-rs",
-        "version": "1.0.0",
-        "checks": {
-            "database": db_status,
-        },
-    }))
-}
-
-async fn get_tiers() -> HttpResponse {
-    HttpResponse::Ok().json(json!({"tiers": default_tiers()}))
-}
-
-async fn assess_tier(body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
-    let _sanitized = sanitize_input("");
-    let customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
-    let docs: Vec<String> = body.get("docsPresent")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
-        .unwrap_or_default();
-    let liveness = body.get("livenessPassed").and_then(|v| v.as_bool()).unwrap_or(false);
-    let bvn = body.get("bvnVerified").and_then(|v| v.as_bool()).unwrap_or(false);
-    let nin = body.get("ninVerified").and_then(|v| v.as_bool()).unwrap_or(false);
-    let address = body.get("addressVerified").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    let assessment = assess_tier_eligibility(customer_id, &docs, liveness, bvn, nin, address);
-    let mut assessments = state.assessments.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    assessments.push(assessment.clone());
-
-    db_persist(&state, "assess_tier", &json!({"action": "assess_tier"})).await;
-    HttpResponse::Ok().json(json!({"assessment": assessment}))
-}
-
-async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
-    let tier = body.get("tier").and_then(|v| v.as_str()).unwrap_or("tier1");
-    let amount = body.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
-    let daily = body.get("currentDailyTotal").and_then(|v| v.as_u64()).unwrap_or(0);
-    let balance = body.get("currentBalance").and_then(|v| v.as_u64()).unwrap_or(0);
-
-    let mut check = check_limit(tier, amount, daily, balance);
-    check.customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-    check.transaction_type = body.get("transactionType").and_then(|v| v.as_str()).unwrap_or("transfer").to_string();
-
-    let mut checks = state.limit_checks.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    checks.push(check.clone());
-
-    db_persist(&state, "check_transaction_limit", &json!({"action": "check_transaction_limit"})).await;
-    HttpResponse::Ok().json(json!({"limitCheck": check}))
-}
-
-async fn get_assessments(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let assessments = state.assessments.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    db_persist(&state, "get_assessments", &json!({"action": "get_assessments"})).await;
-    HttpResponse::Ok().json(json!({"assessments": *assessments, "total": assessments.len()}))
-}
-
-async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let assessments = state.assessments.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    let checks = state.limit_checks.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    let mut tier_counts = std::collections::HashMap::new();
-    for a in assessments.iter() {
-        *tier_counts.entry(a.eligible_tier.clone()).or_insert(0) += 1;
-    }
-    let denied = checks.iter().filter(|c| !c.allowed).count();
-    db_persist(&state, "get_stats", &json!({"action": "get_stats"})).await;
-    HttpResponse::Ok().json(json!({
-        "totalAssessments": assessments.len(),
-        "totalLimitChecks": checks.len(),
-        "limitDenials": denied,
-        "tierDistribution": tier_counts,
-        "avgComplianceScore": if assessments.is_empty() { 0.0 } else {
-            assessments.iter().map(|a| a.compliance_score).sum::<f64>() / assessments.len() as f64
-        },
-    }))
-}
-
-
-// --- Production Hardening: readyz / livez / metrics ---
-static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
-static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
-const RATE_LIMIT_PER_SECOND: u64 = 100;
-
-
-
-// --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
-    let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
-    let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
-    let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
-    let mut fired = Vec::<serde_json::Value>::new();
-    if error_rate > 0.05 {
-        fired.push(json!({"rule": "high_error_rate", "value": error_rate, "severity": "critical"}));
-    }
-    HttpResponse::Ok().json(json!({
-        "alerts": fired,
-        "rules": 3,
-        "error_rate": error_rate,
-    }))
-}
-
-async fn readyz() -> HttpResponse {
-    HttpResponse::Ok().json(json!({"ready": true, "service": "cbn-tiered-kyc-rs"}))
-}
-async fn livez() -> HttpResponse {
-    HttpResponse::Ok().json(json!({"alive": true}))
-}
-async fn prom_metrics() -> HttpResponse {
-    let r = _REQ_COUNT.load(AtomicOrdering::Relaxed);
-    let e = _ERR_COUNT.load(AtomicOrdering::Relaxed);
-    let body = format!(
-        "# TYPE requests_total counter\nrequests_total{{service=\"cbn-tiered-kyc-rs\"}} {}\n         # TYPE errors_total counter\nerrors_total{{service=\"cbn-tiered-kyc-rs\"}} {}\n", r, e);
-    HttpResponse::Ok().content_type("text/plain").body(body)
-}
-
-
-// --- Database Connection ---
-use tokio_postgres::NoTls;
-
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS service_records (
-                    id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-                    status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
-            Some(client)
-        }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
-    }
-}
-
-
-// --- JWT Auth Check ---
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
-    let path = req.path();
-    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
-        return Ok(());
-    }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
-    }
-}
-
-
-// --- Security Headers Middleware ---
-#[allow(dead_code)]
-fn add_security_headers(resp: &mut actix_web::HttpResponse) {
-    let hdrs = resp.headers_mut();
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("x-content-type-options"),
-        actix_web::http::header::HeaderValue::from_static("nosniff"),
-    );
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("x-frame-options"),
-        actix_web::http::header::HeaderValue::from_static("DENY"),
-    );
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("x-xss-protection"),
-        actix_web::http::header::HeaderValue::from_static("1; mode=block"),
-    );
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("strict-transport-security"),
-        actix_web::http::header::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-    );
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("referrer-policy"),
-        actix_web::http::header::HeaderValue::from_static("strict-origin-when-cross-origin"),
-    );
-}
-
-fn sanitize_input(s: &str) -> String {
-    let s = s.replace('<', "&lt;").replace('>', "&gt;")
-        .replace('\'', "&#39;").replace('"', "&quot;");
-    if s.len() > 10000 { s[..10000].to_string() } else { s }
-}
-
-
-async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
-        let id = format!("{}_{}_{}", "cbn_tiered_kyc_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let svc_name = String::from("cbn-tiered-kyc-rs");
-        let status = String::from("active");
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        if let Err(e) = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await {
-            eprintln!("CRITICAL: DB persist failed for {}: {}", endpoint, e);
-        }
-    } else {
-        eprintln!("CRITICAL: No database connection configured for {} — data not persisted for endpoint: {}", env!("CARGO_PKG_NAME"), endpoint);
-    }
-}
-
-
-
-// --- Circuit Breaker + Retry for gRPC/HTTP calls ---
-use std::sync::atomic::{AtomicI32, AtomicI64};
-
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Deep Domain Logic — Production-Ready Business Rules
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// AmountKobo — monetary amounts in kobo (smallest unit) to avoid float precision errors
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct AmountKobo(i64);
-
-impl AmountKobo {
-    fn from_naira(naira: f64) -> Self { AmountKobo((naira * 100.0).round() as i64) }
-    fn naira(&self) -> f64 { self.0 as f64 / 100.0 }
-    fn zero() -> Self { AmountKobo(0) }
-}
-
-impl std::ops::Add for AmountKobo { type Output = Self; fn add(self, rhs: Self) -> Self { AmountKobo(self.0 + rhs.0) } }
-impl std::ops::Sub for AmountKobo { type Output = Self; fn sub(self, rhs: Self) -> Self { AmountKobo(self.0 - rhs.0) } }
-impl std::fmt::Display for AmountKobo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "₦{}.{:02}", self.0 / 100, (self.0 % 100).abs())
-    }
-}
-
-/// Formal state machine with transition guards
-#[derive(Debug, Clone, PartialEq)]
-enum EntityState {
-    Draft, Submitted, UnderReview, Approved, Processing, Completed, Failed, Reversed, Cancelled,
-}
-
-impl EntityState {
-    fn can_transition_to(&self, target: &EntityState) -> bool {
-        match self {
-            EntityState::Draft => matches!(target, EntityState::Submitted | EntityState::Cancelled),
-            EntityState::Submitted => matches!(target, EntityState::UnderReview | EntityState::Cancelled),
-            EntityState::UnderReview => matches!(target, EntityState::Approved | EntityState::Failed),
-            EntityState::Approved => matches!(target, EntityState::Processing | EntityState::Cancelled),
-            EntityState::Processing => matches!(target, EntityState::Completed | EntityState::Failed),
-            EntityState::Completed => matches!(target, EntityState::Reversed),
-            EntityState::Failed => matches!(target, EntityState::Submitted), // retry
-            _ => false,
-        }
-    }
-}
-
-/// CBN Tier Limits
-struct CbnTierLimit {
-    max_single_debit: AmountKobo,
-    max_daily: AmountKobo,
-    max_balance: AmountKobo,
-}
-
-fn cbn_tier_limits(tier: &str) -> Option<CbnTierLimit> {
-    match tier {
-        "tier1" => Some(CbnTierLimit {
-            max_single_debit: AmountKobo::from_naira(50_000.0),
-            max_daily: AmountKobo::from_naira(300_000.0),
-            max_balance: AmountKobo::from_naira(300_000.0),
-        }),
-        "tier2" => Some(CbnTierLimit {
-            max_single_debit: AmountKobo::from_naira(200_000.0),
-            max_daily: AmountKobo::from_naira(500_000.0),
-            max_balance: AmountKobo::from_naira(500_000.0),
-        }),
-        "tier3" => Some(CbnTierLimit {
-            max_single_debit: AmountKobo::from_naira(5_000_000.0),
-            max_daily: AmountKobo::from_naira(10_000_000.0),
-            max_balance: AmountKobo(0), // unlimited
-        }),
-        _ => None,
-    }
-}
-
-fn validate_tier_transaction(tier: &str, amount: AmountKobo, daily_total: AmountKobo) -> Result<(), String> {
-    let limits = cbn_tier_limits(tier).ok_or("Unknown KYC tier")?;
-    if amount > limits.max_single_debit {
-        return Err(format!("Exceeds {} single debit limit {}", tier, limits.max_single_debit));
-    }
-    let new_daily = AmountKobo(daily_total.0 + amount.0);
-    if new_daily > limits.max_daily {
-        return Err(format!("Exceeds {} daily limit {}", tier, limits.max_daily));
-    }
-    Ok(())
-}
-
-/// BVN Validation (11-digit Bank Verification Number)
-fn validate_bvn(bvn: &str) -> Result<(), String> {
-    if bvn.len() != 11 { return Err("BVN must be 11 digits".to_string()); }
-    if !bvn.chars().all(|c| c.is_ascii_digit()) { return Err("BVN must contain only digits".to_string()); }
-    if &bvn[..2] == "00" { return Err("Invalid BVN issuer code".to_string()); }
-    Ok(())
-}
-
-/// NIN Validation (11-digit National ID)
-fn validate_nin(nin: &str) -> Result<(), String> {
-    if nin.len() != 11 { return Err("NIN must be 11 digits".to_string()); }
-    if !nin.chars().all(|c| c.is_ascii_digit()) { return Err("NIN must contain only digits".to_string()); }
-    Ok(())
-}
-
-/// NUBAN validation with check digit algorithm
-fn validate_nuban(bank_code: &str, account_number: &str) -> Result<(), String> {
-    if account_number.len() != 10 { return Err("NUBAN must be 10 digits".to_string()); }
-    if bank_code.len() != 3 { return Err("Bank code must be 3 digits".to_string()); }
-    let serial = format!("{}{}", bank_code, &account_number[..9]);
-    let weights = [3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3];
-    let sum: u32 = serial.chars().zip(weights.iter())
-        .map(|(c, w)| c.to_digit(10).unwrap_or(0) * (*w as u32))
-        .sum();
-    let check_digit = (10 - (sum % 10)) % 10;
-    let actual = account_number.chars().last().and_then(|c| c.to_digit(10)).unwrap_or(99);
-    if check_digit != actual {
-        return Err(format!("NUBAN check digit mismatch: expected {}, got {}", check_digit, actual));
-    }
-    Ok(())
-}
-
-/// NFIU threshold check
-fn check_nfiu_threshold(amount: AmountKobo, txn_type: &str) -> Option<String> {
-    match txn_type {
-        "cash_deposit" | "cash_withdrawal" => {
-            if amount >= AmountKobo::from_naira(5_000_000.0) {
-                Some("NFIU: Cash transaction ≥₦5M requires CTR filing".to_string())
-            } else { None }
-        }
-        "transfer" | "wire" => {
-            if amount >= AmountKobo::from_naira(10_000_000.0) {
-                Some("NFIU: Transfer ≥₦10M requires CTR filing".to_string())
-            } else { None }
-        }
-        _ => None,
-    }
-}
-
-/// EMI (Equated Monthly Installment) computation
-fn compute_emi(principal: AmountKobo, annual_rate_pct: f64, tenor_months: u32) -> AmountKobo {
-    if tenor_months == 0 { return AmountKobo::zero(); }
-    if annual_rate_pct == 0.0 { return AmountKobo(principal.0 / tenor_months as i64); }
-    let monthly_rate = annual_rate_pct / 12.0 / 100.0;
-    let n = tenor_months as f64;
-    let power = (1.0 + monthly_rate).powf(n);
-    let emi = principal.0 as f64 * monthly_rate * power / (power - 1.0);
-    AmountKobo(emi.round() as i64)
-}
-
-/// DTI (Debt-to-Income) ratio
-fn compute_dti(monthly_income: AmountKobo, existing_debt: AmountKobo, proposed_emi: AmountKobo) -> f64 {
-    if monthly_income.0 <= 0 { return 100.0; }
-    (existing_debt.0 + proposed_emi.0) as f64 / monthly_income.0 as f64 * 100.0
-}
-
-/// Interest computation with day-count conventions
-fn compute_simple_interest(principal: AmountKobo, annual_rate_pct: f64, days: u32, day_basis: u32) -> AmountKobo {
-    let interest = principal.0 as f64 * (annual_rate_pct / 100.0) * (days as f64 / day_basis as f64);
-    AmountKobo(interest.round() as i64)
-}
-
-fn compute_compound_interest(principal: AmountKobo, annual_rate_pct: f64, days: u32, day_basis: u32, freq: u32) -> AmountKobo {
-    let periods = days as f64 / (day_basis as f64 / freq as f64);
-    let rate_per_period = annual_rate_pct / 100.0 / freq as f64;
-    let amount = principal.0 as f64 * (1.0 + rate_per_period).powf(periods);
-    AmountKobo((amount - principal.0 as f64).round() as i64)
-}
-
-fn get_day_basis(convention: &str) -> u32 {
-    match convention { "ACT/360" => 360, "ACT/365" => 365, "30/360" => 360, _ => 365 }
-}
-
-/// AML Risk Scoring
-fn compute_aml_risk_score(
-    txn_amount: AmountKobo, is_pep: bool, is_high_risk_country: bool,
-    cash_intensive: bool, is_structuring: bool, has_adverse_media: bool,
-    account_age_months: u32,
-) -> (f64, Vec<&'static str>) {
-    let mut score = 0.0f64;
-    let mut indicators = Vec::new();
-    if is_pep { score += 30.0; indicators.push("PEP_STATUS"); }
-    if is_high_risk_country { score += 25.0; indicators.push("HIGH_RISK_JURISDICTION"); }
-    if cash_intensive { score += 15.0; indicators.push("CASH_INTENSIVE"); }
-    if is_structuring { score += 35.0; indicators.push("STRUCTURING_DETECTED"); }
-    if has_adverse_media { score += 20.0; indicators.push("ADVERSE_MEDIA"); }
-    if txn_amount > AmountKobo::from_naira(10_000_000.0) { score += 10.0; indicators.push("HIGH_VALUE_TXN"); }
-    if account_age_months < 3 { score += 10.0; indicators.push("NEW_ACCOUNT"); }
-    (score.min(100.0), indicators)
-}
-
-/// CBN Provisioning rates (Prudential Guidelines)
-fn compute_provisioning_rate(days_past_due: u32) -> f64 {
-    match days_past_due {
-        0..=90 => 1.0,       // Performing
-        91..=180 => 10.0,    // Watchlist
-        181..=360 => 50.0,   // Substandard
-        361..=720 => 75.0,   // Doubtful
-        _ => 100.0,          // Lost
-    }
-}
-
-/// Withholding Tax on interest — 10%
-fn compute_wht(interest: AmountKobo) -> AmountKobo {
-    AmountKobo((interest.0 as f64 * 0.10).round() as i64)
-}
-
-/// NIP charge computation (NIBSS Instant Payment)
-fn compute_nip_charge(amount: AmountKobo) -> AmountKobo {
-    match amount.naira() as u64 {
-        0..=5000 => AmountKobo::from_naira(10.0),
-        5001..=50000 => AmountKobo::from_naira(25.0),
-        _ => AmountKobo::from_naira(50.0),
-    }
-}
-
-/// Comprehensive validation with error accumulation
-fn validate_transaction_deep(
-    sender: &str, receiver: &str, amount: AmountKobo,
-    currency: &str, channel: &str,
-) -> Result<(), Vec<String>> {
-    let mut errors = Vec::new();
-    if sender.is_empty() { errors.push("Sender account required".to_string()); }
-    if receiver.is_empty() { errors.push("Receiver account required".to_string()); }
-    if sender == receiver { errors.push("Sender and receiver cannot be same".to_string()); }
-    if amount.0 <= 0 { errors.push("Amount must be positive".to_string()); }
-    if amount > AmountKobo::from_naira(100_000_000.0) { errors.push("Single transfer limit ₦100M exceeded".to_string()); }
-    if !["NGN", "USD", "GBP", "EUR"].contains(&currency) { errors.push(format!("Unsupported currency: {}", currency)); }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
-}
-
-/// Luhn algorithm for card PAN validation
-fn validate_luhn(card_number: &str) -> bool {
-    let mut sum = 0u32;
-    let n = card_number.len();
-    let parity = n % 2;
-    for (i, c) in card_number.chars().enumerate() {
-        let mut digit = match c.to_digit(10) { Some(d) => d, None => return false };
-        if i % 2 == parity { digit *= 2; if digit > 9 { digit -= 9; } }
-        sum += digit;
-    }
-    sum % 10 == 0
-}
-
-/// Velocity check for fraud detection
-fn check_velocity(recent_count: u32, recent_amount: AmountKobo, window_hours: u32) -> Result<(), String> {
-    if window_hours <= 1 && recent_count >= 10 {
-        return Err("Velocity: 10+ transactions in 1 hour".to_string());
-    }
-    if window_hours <= 24 && recent_count >= 20 {
-        return Err("Velocity: 20+ transactions in 24 hours".to_string());
-    }
-    if window_hours <= 24 && recent_amount > AmountKobo::from_naira(50_000_000.0) {
-        return Err("Velocity: cumulative amount exceeds ₦50M in 24h".to_string());
-    }
-    Ok(())
-}
-
-/// Payment reversal
-fn generate_reversal(txn_id: &str, amount: AmountKobo, sender: &str, receiver: &str, reason: &str) -> serde_json::Value {
-    json!({
-        "reversal_id": format!("REV-{}-{}", txn_id, chrono::Utc::now().timestamp_millis()),
-        "original_txn_id": txn_id,
-        "amount_kobo": amount.0,
-        "reason": reason,
-        "status": "reversed",
-        "gl_entries": [{
-            "debit": receiver, "credit": sender,
-            "amount_kobo": amount.0, "narration": format!("Reversal: {}", reason)
-        }]
-    })
-}
-
-
-
-static CB_FAILURES: AtomicI32 = AtomicI32::new(0);
-static CB_LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
-const CB_THRESHOLD: i32 = 5;
-const CB_RESET_SECS: i64 = 30;
-
-fn cb_allow() -> bool {
-    let failures = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
-    if failures >= CB_THRESHOLD {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64).unwrap_or(0);
-        let last = CB_LAST_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
-        if now - last > CB_RESET_SECS {
-            CB_FAILURES.store(CB_THRESHOLD / 2, std::sync::atomic::Ordering::Relaxed);
-            return true;
-        }
-        return false;
-    }
-    true
-}
-
-fn cb_record_success() {
-    let f = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
-    if f > 0 { CB_FAILURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
-}
-
-fn cb_record_failure() {
-    CB_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64).unwrap_or(0);
-    CB_LAST_FAILURE.store(now, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn call_service_with_retry(url: &str, body: &str, retries: u32) -> Result<String, String> {
-    if !cb_allow() {
-        return Err(format!("circuit breaker open for {}", url));
-    }
-    for attempt in 0..retries {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
-        }
-        match call_service_sync(url, body) {
-            Ok(resp) => { cb_record_success(); return Ok(resp); }
-            Err(e) => {
-                cb_record_failure();
-                eprintln!("[inter-service] {} attempt {} failed: {}", url, attempt + 1, e);
-            }
-        }
-    }
-    Err(format!("all {} retries exhausted for {}", retries, url))
-}
-
-fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    let url_parsed = url.strip_prefix("http://").unwrap_or(url);
-    let (host_port, path) = url_parsed.split_once('/').unwrap_or((url_parsed, "/"));
-    let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
-    match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
-        Ok(mut stream) => {
-            let host = host_port.split(':').next().unwrap_or("localhost");
-            let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
-            stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
-            let mut resp = String::new();
-            stream.read_to_string(&mut resp).map_err(|e| format!("{}", e))?;
-            Ok(resp)
-        }
-        Err(e) => Err(format!("connection failed: {}", e))
-    }
-}
-
-
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
-    }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
-}
-
-
-// Multi-tenant: extract tenant ID from request
-fn get_tenant_id(req: &actix_web::HttpRequest) -> String {
-    req.headers().get("X-Tenant-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("platform")
-        .to_string()
-}
-
-
-// --- gRPC Server (binary protocol, length-prefixed) ---
-fn start_grpc_server(service_name: &'static str, port: u16) {
-    std::thread::spawn(move || {
-        let listener = match std::net::TcpListener::bind(format!("0.0.0.0:{}", port)) {
-            Ok(l) => l,
-            Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
-        };
-        eprintln!("[{}] gRPC server on :{}", service_name, port);
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                std::thread::spawn(move || {
-                    use std::io::{Read, Write};
-                    let mut len_buf = [0u8; 4];
-                    if stream.read_exact(&mut len_buf).is_err() { return; }
-                    let msg_len = u32::from_be_bytes(len_buf) as usize;
-                    if msg_len > 4 * 1024 * 1024 { return; }
-                    let mut payload = vec![0u8; msg_len];
-                    if stream.read_exact(&mut payload).is_err() { return; }
-                    let resp = format!(r#"{{"status":"ok","service":"{}"}}"#, service_name);
-                    let resp_bytes = resp.as_bytes();
-                    let resp_len = (resp_bytes.len() as u32).to_be_bytes();
-                    let _ = stream.write_all(&resp_len);
-                    let _ = stream.write_all(resp_bytes);
-                });
-            }
-        }
-    });
-}
-
-fn grpc_call(target: &str, method: &str, payload: &str) -> Result<String, String> {
-    if !cb_allow() { return Err("circuit breaker open".to_string()); }
-    use std::io::{Read, Write};
-    for attempt in 0..3u32 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
-        }
-        match std::net::TcpStream::connect_timeout(
-            &target.parse().map_err(|e| format!("{}", e))?,
-            std::time::Duration::from_secs(5),
-        ) {
-            Ok(mut stream) => {
-                let data = format!(r#"{{"method":"{}","payload":{}}}"#, method, payload);
-                let data_bytes = data.as_bytes();
-                let len_bytes = (data_bytes.len() as u32).to_be_bytes();
-                if stream.write_all(&len_bytes).is_err() { cb_record_failure(); continue; }
-                if stream.write_all(data_bytes).is_err() { cb_record_failure(); continue; }
-                let mut resp_len_buf = [0u8; 4];
-                if stream.read_exact(&mut resp_len_buf).is_err() { cb_record_failure(); continue; }
-                let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-                let mut resp_buf = vec![0u8; resp_len];
-                if stream.read_exact(&mut resp_buf).is_err() { cb_record_failure(); continue; }
-                cb_record_success();
-                return Ok(String::from_utf8_lossy(&resp_buf).to_string());
-            }
-            Err(e) => { cb_record_failure(); eprintln!("gRPC {} attempt {} failed: {}", target, attempt+1, e); }
-        }
-    }
-    Err(format!("gRPC retries exhausted for {}", target))
-}
-
-
-// --- mTLS Configuration ---
-fn mtls_config() -> (bool, String, String, String) {
-    let enabled = env::var("MTLS_ENABLED").unwrap_or_default() == "true";
-    let cert = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/etc/54bank/certs/service.crt".to_string());
-    let key = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/etc/54bank/certs/service.key".to_string());
-    let ca = env::var("TLS_CA_PATH").unwrap_or_else(|_| "/etc/54bank/certs/ca.crt".to_string());
-    (enabled, cert, key, ca)
-}
-
-
-// ─── Idempotency Enforcement ────────────────────────────────────────────────
-use std::collections::HashMap as IdempHashMap;
-use std::sync::RwLock as IdempRwLock;
-use std::time::Instant as IdempInstant;
-
-struct IdempotencyEntry {
-    response: Vec<u8>,
-    status_code: u16,
-    created_at: IdempInstant,
-}
-
-lazy_static::lazy_static! {
-    static ref IDEMPOTENCY_CACHE: IdempRwLock<IdempHashMap<String, IdempotencyEntry>> =
-        IdempRwLock::new(IdempHashMap::new());
-}
-
-fn check_idempotency(key: &str) -> Option<(u16, Vec<u8>)> {
-    let cache = IDEMPOTENCY_CACHE.read().unwrap();
-    cache.get(key).map(|e| (e.status_code, e.response.clone()))
-}
-
-fn store_idempotency(key: String, status_code: u16, response: Vec<u8>) {
-    let mut cache = IDEMPOTENCY_CACHE.write().unwrap();
-    cache.insert(key, IdempotencyEntry { response, status_code, created_at: IdempInstant::now() });
-    // Cleanup entries older than 24h
-    let cutoff = std::time::Duration::from_secs(86400);
-    cache.retain(|_, v| v.created_at.elapsed() < cutoff);
-}
-
-
-// ─── Maker-Checker (Dual Authorization) ────────────────────────────────────
-#[derive(Clone, serde::Serialize)]
-struct MakerCheckerRequest {
-    request_id: String,
-    operation: String,
-    maker_id: String,
-    checker_id: Option<String>,
-    amount_kobo: i64,
-    status: String, // pending_approval|approved|rejected
-    created_at: String,
-}
-
-fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
-    let threshold = match operation {
-        "transfer" => 100_000_000,      // ₦1M
-        "loan_disburse" => 100_000_000, // ₦1M
-        "gl_posting" => 50_000_000,     // ₦500K
-        "account_close" => 0,           // Always
-        _ => 100_000_000,               // Default ₦1M
-    };
-    amount_kobo >= threshold
-}
-
-
-// ─── Immutable Audit Trail ──────────────────────────────────────────────────
-use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
-use actix_cors::Cors;
-
-#[derive(Clone, serde::Serialize)]
-struct AuditEntry {
-    id: String,
-    timestamp: String,
-    service: String,
-    operation: String,
-    actor_id: String,
-    entity_id: String,
-    entity_type: String,
-    old_state: String,
-    new_state: String,
-    checksum: String,
-    immutable: bool,
-}
-
-fn append_audit_entry(service: &str, operation: &str, actor_id: &str, entity_id: &str,
-                      entity_type: &str, old_state: &str, new_state: &str) -> AuditEntry {
-    let id = format!("AUD-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let raw = format!("{}|{}|{}|{}|{}|{}|{}|{}", id, timestamp, service, operation, actor_id, entity_id, old_state, new_state);
-    let mut hasher = AuditSha256::new();
-    hasher.update(raw.as_bytes());
-    let checksum = format!("{:x}", hasher.finalize());
-    AuditEntry { id, timestamp: timestamp.clone(), service: service.into(), operation: operation.into(),
-                 actor_id: actor_id.into(), entity_id: entity_id.into(), entity_type: entity_type.into(),
-                 old_state: old_state.into(), new_state: new_state.into(), checksum, immutable: true }
-}
-
-
-
-// --- Observability ---
-fn init_tracing(service_name: &str) {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
-    if !endpoint.is_empty() {
-        println!("[{}] OTEL tracing configured: {}", service_name, endpoint);
-    }
-}
-
-
-static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
-static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
-
-// Rate limiter
-use std::sync::Mutex as StdMutex;
-use std::collections::HashMap;
-
-struct RateLimiter {
-    visitors: StdMutex<HashMap<String, (u32, std::time::Instant)>>,
-    max_requests: u32,
-    window: std::time::Duration,
-}
-
-impl RateLimiter {
-    fn new(max_requests: u32, window_secs: u64) -> Self {
-        Self {
-            visitors: StdMutex::new(HashMap::new()),
-            max_requests,
-            window: std::time::Duration::from_secs(window_secs),
-        }
-    }
-    
-    fn allow(&self, ip: &str) -> bool {
-        let mut visitors = self.visitors.lock().unwrap();
-        let now = std::time::Instant::now();
-        let entry = visitors.entry(ip.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) > self.window {
-            *entry = (1, now);
-            return true;
-        }
-        if entry.0 >= self.max_requests {
-            return false;
-        }
-        entry.0 += 1;
-        true
-    }
-}
-
-lazy_static::lazy_static! {
-    static ref RATE_LIMITER: RateLimiter = RateLimiter::new(100, 60);
-}
-
-
-// Monetary safety — prevent float drift in financial calculations
-fn naira_to_kobo(naira: f64) -> i64 {
-    (naira * 100.0 + 0.5) as i64
-}
-
-fn kobo_to_naira(kobo: i64) -> f64 {
-    kobo as f64 / 100.0
-}
-
-fn round_naira(amount: f64) -> f64 {
-    ((amount * 100.0) + 0.5).floor() / 100.0
-}
-
-fn validate_amount(kobo: i64) -> bool {
-    const MAX_AMOUNT: i64 = 500_000_000_000; // ₦5B CBN limit
-    kobo > 0 && kobo <= MAX_AMOUNT
-}
-
-#[actix_web::main]
-async 
-// --- PII Masking (NDPR Compliance) ---
-fn mask_pii(value: &str, field_type: &str) -> String {
-    if value.is_empty() { return "***".to_string(); }
-    match field_type {
-        "bvn" | "nin" => {
-            if value.len() >= 4 { format!("***{}", &value[value.len()-4..]) }
-            else { "***".to_string() }
-        },
-        "phone" => {
-            if value.len() >= 4 { format!("+234***{}", &value[value.len()-4..]) }
-            else { "+234***".to_string() }
-        },
-        "email" => {
-            if let Some(at) = value.find('@') {
-                let local = &value[..at]; let domain = &value[at+1..];
-                format!("{}***@{}", &local[..1], domain)
-            } else { "***@***".to_string() }
-        },
-        "account" => {
-            if value.len() >= 4 { format!("****{}", &value[value.len()-4..]) }
-            else { "****".to_string() }
-        },
-        _ => {
-            if value.len() > 2 { format!("{}***{}", &value[..1], &value[value.len()-1..]) }
-            else { "***".to_string() }
-        }
-    }
-}
-
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port = std::env::var("PORT").unwrap_or_else(|_| "9210".to_string());
-    let state = AppState {
-        start_time: Instant::now(),
-        assessments: Mutex::new(vec![]),
-        limit_checks: Mutex::new(vec![]),
-        db_client: None,
-    };
-    println!("CBN Tiered KYC Rules Engine v2.0 (Rust) on :{}", port);
-        let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
-        start_grpc_server("cbn-tiered-kyc-rs", 10330);
-    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[cbn-tiered-kyc-rs] starting");
+
+    let db_name = "cbn-tiered-kyc-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    init_schema(&pool).await;
+    log::info!("[cbn-tiered-kyc-rs] database connected, schema initialized");
+
+    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
+    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
+    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
+    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
+
+    log::info!("[cbn-tiered-kyc-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
+        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
+
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8341".to_string()).parse().unwrap_or(8341);
+    let data = web::Data::new(AppState { db: pool });
+
+    log::info!("[cbn-tiered-kyc-rs] ready on :{}", port);
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
-            .wrap(
-                Cors::default()
-                    .allow_any_origin()
-                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
-                    .max_age(86400)
-            )
-                .wrap(
-                    actix_web::middleware::DefaultHeaders::new()
-                        .add(("X-Content-Type-Options", "nosniff"))
-                        .add(("X-Frame-Options", "DENY"))
-                        .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-                        .add(("Content-Security-Policy", "default-src 'self'"))
-                        .add(("X-XSS-Protection", "1; mode=block"))
-                        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
-                )
-            .wrap_fn(|req, srv| {
-                _REQ_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-                let trace_id = req.headers().get("X-Trace-Id")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("none")
-                    .to_string();
-                eprintln!("[cbn-tiered-kyc-rs] {} {} trace={}", req.method(), req.path(), trace_id);
-                let fut = srv.call(req);
-                async move {
-                    let res = fut.await?;
-                    if res.status().is_server_error() || res.status().is_client_error() {
-                        _ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    Ok(res)
-                }
-            })
-            .app_data(web::Data::new(AppState {
-                start_time: state.start_time,
-                assessments: Mutex::new(vec![]),
-                limit_checks: Mutex::new(vec![]),
-                db_client: None,
-            }))
-            .wrap(actix_web::middleware::DefaultHeaders::new()
-                .add(("X-Content-Type-Options", "nosniff"))
-                .add(("X-Frame-Options", "DENY"))
-                .add(("X-XSS-Protection", "1; mode=block"))
-                .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-                .add(("Content-Security-Policy", "default-src 'self'"))
-                .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
-            .route("/v1/degradation", web::get().to(degradation_status))
-            .route("/healthz", web::get().to(healthz))
-            .route("/v1/cbn-kyc/tiers", web::get().to(get_tiers))
-            .route("/v1/cbn-kyc/assess", web::post().to(assess_tier))
-            .route("/v1/cbn-kyc/check-limit", web::post().to(check_transaction_limit))
-            .route("/v1/cbn-kyc/assessments", web::get().to(get_assessments))
-            .route("/v1/cbn-kyc/stats", web::get().to(get_stats))
-            .route("/v1/alerts", web::get().to(alerts_endpoint))
+            .app_data(data.clone())
+            .wrap(middleware::Logger::default())
+            .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
-    }).keep_alive(std::time::Duration::from_secs(75))
-        .client_request_timeout(std::time::Duration::from_secs(30))
-        .bind(format!("0.0.0.0:{}", port))?.shutdown_timeout(30).run().await
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/kyc_records", web::get().to(list_records))
+            .route("/api/v1/kyc_records", web::post().to(create_record))
+            .route("/api/v1/kyc_records/{id}", web::get().to(get_record))
+            .route("/api/v1/kyc_records/{id}", web::put().to(update_record))
+            .route("/api/v1/kyc_records/{id}", web::delete().to(delete_record))
+    })
+    .bind(format!("0.0.0.0:{}", port))?
+    .run()
+    .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS kyc_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id UUID NOT NULL,
+    verification_type VARCHAR(32) NOT NULL,
+    document_type VARCHAR(32),
+    document_number VARCHAR(64),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    risk_score INT DEFAULT 0,
+    risk_level VARCHAR(20) DEFAULT 'low',
+    bvn VARCHAR(11),
+    nin VARCHAR(11),
+    verified_name VARCHAR(200),
+    date_of_birth DATE,
+    address TEXT,
+    lga VARCHAR(100),
+    state VARCHAR(50),
+    country VARCHAR(3) DEFAULT 'NGA',
+    selfie_match_score REAL,
+    document_match_score REAL,
+    pep_check BOOLEAN DEFAULT FALSE,
+    sanctions_check BOOLEAN DEFAULT FALSE,
+    adverse_media_check BOOLEAN DEFAULT FALSE,
+    reviewer_id UUID,
+    reviewed_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create kyc_records table");
 
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(64) NOT NULL,
+        aggregate_id VARCHAR(128) NOT NULL,
+        payload JSONB NOT NULL,
+        published BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .ok();
 
-// --- Event Bus (Kafka producer) ---
-
-// --- Process Health Watchdog ---
-static WATCHDOG_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn watchdog_ping() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    WATCHDOG_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_kyc_records_tenant ON kyc_records(tenant_id)")
+        .execute(pool).await.ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_kyc_records_status ON kyc_records(status)")
+        .execute(pool).await.ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_kyc_records_created ON kyc_records(created_at DESC)")
+        .execute(pool).await.ok();
 }
 
-fn watchdog_healthy() -> bool {
-    let last = WATCHDOG_LAST.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 { return true; }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    (now - last) < 60000
+async fn health(data: web::Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "service": "cbn-tiered-kyc-rs",
+        "version": "1.0.0"
+    }))
 }
 
-fn start_watchdog() {
-    watchdog_ping();
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if !watchdog_healthy() {
-                eprintln!("[WATCHDOG] Event loop stalled — marking unhealthy");
-            }
-            watchdog_ping();
+async fn readyz(data: web::Data<AppState>) -> HttpResponse {
+    match sqlx::query("SELECT 1").execute(&data.db).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
+        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
+    }
+}
+
+async fn metrics(data: web::Data<AppState>) -> HttpResponse {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kyc_records")
+        .fetch_one(&data.db).await.unwrap_or(0);
+    HttpResponse::Ok().json(serde_json::json!({
+        "service": "cbn-tiered-kyc-rs",
+        "total_records": count
+    }))
+}
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    let tenant_id = req.headers().get("X-Tenant-ID")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+
+    let rows = sqlx::query("SELECT id, status, created_at FROM kyc_records WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+        .bind(tenant_id)
+        .fetch_all(&data.db)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "status": r.get::<String, _>("status"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+                })
+            }).collect();
+            let count = records.len();
+            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
         }
-    });
-}
-
-// --- EventBus (Kafka producer) ---
-struct EventBus {
-    broker_url: String,
-    topic: String,
-    service_name: String,
-}
-
-impl EventBus {
-    fn new(topic: &str, service: &str) -> Self {
-        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-        Self { broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }
-    }
-
-    fn emit(&self, event_type: &str, payload: &serde_json::Value) {
-        let event = serde_json::json!({
-            "type": event_type,
-            "source": &self.service_name,
-            "topic": &self.topic,
-            "data": payload,
-        });
-        eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
-        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    let tenant_id = body.tenant_id.clone()
+        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
+        .unwrap_or_else(|| "default".to_string());
 
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
 
-static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO kyc_records (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
+    )
+    .bind(&tenant_id)
+    .bind(&status)
+    .fetch_one(&data.db)
+    .await;
 
-// --- Downstream Service Client ---
-struct DownstreamClient {
-    base_url: String,
-    timeout_ms: u64,
+    match result {
+        Ok(id) => {
+            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("kyc_records.created")
+                .bind(id.to_string())
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
 }
 
-impl DownstreamClient {
-    fn new(env_var: &str, default_url: &str) -> Self {
-        let url = std::env::var(env_var).unwrap_or_else(|_| default_url.to_string());
-        Self { base_url: url, timeout_ms: 5000 }
-    }
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM kyc_records WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
 
-    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {
-        let url = format!("{}{}", self.base_url, path);
-        eprintln!("[Downstream] POST {}", url);
-        Ok(())
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
-// --- Data Flow Initialization ---
-fn init_data_flow() -> EventBus {
-    let bus = EventBus::new("identity.verification", "cbn-tiered-kyc");
-    eprintln!("[cbn-tiered-kyc] Data flow initialized: topic=identity.verification");
-    bus
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE kyc_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("kyc_records.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
 }
 
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("kyc_records.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
 
-    #[test]
-    fn test_service_config() {
-        // Verify service starts without panic
-        assert!(true, "cbn-tiered-kyc-rs service module loads");
-    }
-
-    #[test]
-    fn test_watchdog_initially_healthy() {
-        // Watchdog should report healthy before any ping
-        assert!(watchdog_healthy(), "Watchdog should be healthy initially");
-    }
-
-    #[test]
-    fn test_watchdog_ping_updates() {
-        watchdog_ping();
-        assert!(watchdog_healthy(), "Watchdog should be healthy after ping");
-    }
-
-    #[test]
-    fn test_eventbus_creation() {
-        let bus = EventBus::new("test.topic", "cbn_tiered_kyc");
-        assert_eq!(bus.topic, "test.topic");
-        assert_eq!(bus.service_name, "cbn_tiered_kyc");
-    }
-
-    #[test]
-    fn test_chrono_now_format() {
-        let ts = chrono_now();
-        assert!(ts.starts_with("2026-"), "Timestamp should start with year");
-        assert!(ts.ends_with("Z"), "Timestamp should end with Z");
-    }
-
-    #[test]
-    fn test_events_emitted_counter() {
-        let before = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        let bus = EventBus::new("test.topic", "cbn_tiered_kyc");
-        bus.emit("test.event", &serde_json::json!({"test": true}));
-        let after = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "Event counter should increment");
-    }
+    HttpResponse::NoContent().finish()
 }

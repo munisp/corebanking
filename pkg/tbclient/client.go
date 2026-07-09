@@ -1,403 +1,382 @@
-// Package tbclient provides a production TigerBeetle client for 54Bank.
-// Wraps the official tigerbeetle-go SDK with batching, retry, and observability.
+// Package tbclient provides a production-ready TigerBeetle client for 54Bank.
+// Uses the official tigerbeetle-go SDK to connect to a real TigerBeetle cluster.
+// Optionally maintains a PostgreSQL audit trail for compliance/reporting.
 package tbclient
 
 import (
 	"context"
-	"crypto/rand"
+	"database/sql"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	tb "github.com/tigerbeetle/tigerbeetle-go"
+	_ "github.com/lib/pq"
 )
 
-// ── Types matching TigerBeetle wire format ──────────────────────────────────
+// Re-export SDK types so downstream services import only this package.
+type (
+	Account              = tb.Account
+	Transfer             = tb.Transfer
+	Uint128              = tb.Uint128
+	AccountFlags         = tb.AccountFlags
+	TransferFlags        = tb.TransferFlags
+	CreateAccountResult  = tb.CreateAccountResult
+	CreateTransferResult = tb.CreateTransferResult
+)
 
-type Uint128 [16]byte
+// Re-export SDK functions.
+var (
+	ToUint128      = tb.ToUint128
+	BytesToUint128 = tb.BytesToUint128
+)
 
-func NewUint128() Uint128 {
-	var id Uint128
-	if _, err := rand.Read(id[:]); err != nil {
-		panic("crypto/rand failed")
-	}
-	return id
+// Re-export SDK status constants.
+var (
+	AccountCreated  = tb.AccountCreated
+	AccountExists   = tb.AccountExists
+	TransferCreated = tb.TransferCreated
+	TransferExists  = tb.TransferExists
+)
+
+// ID generates a TigerBeetle time-based unique identifier.
+func ID() Uint128 {
+	return tb.ID()
 }
 
+// Uint128FromU64 constructs a Uint128 from low and high 64-bit halves (little-endian).
 func Uint128FromU64(lo, hi uint64) Uint128 {
-	var id Uint128
-	binary.LittleEndian.PutUint64(id[:8], lo)
-	binary.LittleEndian.PutUint64(id[8:], hi)
-	return id
+	var buf [16]byte
+	binary.LittleEndian.PutUint64(buf[:8], lo)
+	binary.LittleEndian.PutUint64(buf[8:], hi)
+	return BytesToUint128(buf)
 }
 
-func (u Uint128) Lo() uint64 { return binary.LittleEndian.Uint64(u[:8]) }
-func (u Uint128) Hi() uint64 { return binary.LittleEndian.Uint64(u[8:]) }
-func (u Uint128) String() string { return fmt.Sprintf("%016x%016x", u.Hi(), u.Lo()) }
-
-type AccountFlags uint32
-
-const (
-	AccountLinked                        AccountFlags = 1 << 0
-	AccountDebitsMustNotExceedCredits    AccountFlags = 1 << 1
-	AccountCreditsMustNotExceedDebits    AccountFlags = 1 << 2
-	AccountHistory                       AccountFlags = 1 << 3
-)
-
-type TransferFlags uint32
-
-const (
-	TransferLinked              TransferFlags = 1 << 0
-	TransferPending             TransferFlags = 1 << 1
-	TransferPostPendingTransfer TransferFlags = 1 << 2
-	TransferVoidPendingTransfer TransferFlags = 1 << 3
-)
-
-type Account struct {
-	ID             Uint128
-	DebitsPending  uint64
-	DebitsPosted   uint64
-	CreditsPending uint64
-	CreditsPosted  uint64
-	UserData128    Uint128
-	UserData64     uint64
-	UserData32     uint32
-	Reserved       uint32
-	Ledger         uint32
-	Code           uint16
-	Flags          AccountFlags
-	Timestamp      uint64
+// Uint128Low returns the lower 64 bits of a Uint128 value.
+func Uint128Low(v Uint128) uint64 {
+	lo, _ := v.Uint64()
+	return lo
 }
 
-type Transfer struct {
-	ID              Uint128
-	DebitAccountID  Uint128
-	CreditAccountID Uint128
-	Amount          uint64
-	PendingID       Uint128
-	UserData128     Uint128
-	UserData64      uint64
-	UserData32      uint32
-	Timeout         uint32
-	Ledger          uint32
-	Code            uint16
-	Flags           TransferFlags
-	Timestamp       uint64
-}
-
-type CreateAccountResult struct {
-	Index  uint32
-	Result uint32
-}
-
-type CreateTransferResult struct {
-	Index  uint32
-	Result uint32
-}
-
-// ── Ledger IDs for Nigerian banking ─────────────────────────────────────────
-
-const (
-	LedgerNGN       uint32 = 1   // Nigerian Naira
-	LedgerUSD       uint32 = 2   // US Dollar
-	LedgerGBP       uint32 = 3   // British Pound
-	LedgerEUR       uint32 = 4   // Euro
-	LedgerGHS       uint32 = 5   // Ghanaian Cedi
-	LedgerKES       uint32 = 6   // Kenyan Shilling
-	LedgerZAR       uint32 = 7   // South African Rand
-	LedgerXOF       uint32 = 8   // West African CFA
-	LedgerSavings   uint32 = 100 // Savings sub-ledger
-	LedgerCurrent   uint32 = 101 // Current account sub-ledger
-	LedgerFixed     uint32 = 102 // Fixed deposit sub-ledger
-	LedgerLoan      uint32 = 103 // Loan sub-ledger
-	LedgerFee       uint32 = 104 // Fee sub-ledger
-	LedgerSuspense  uint32 = 105 // Suspense sub-ledger
-)
-
-// ── Account Codes ───────────────────────────────────────────────────────────
-
-const (
-	CodeAsset     uint16 = 1
-	CodeLiability uint16 = 2
-	CodeEquity    uint16 = 3
-	CodeRevenue   uint16 = 4
-	CodeExpense   uint16 = 5
-)
-
-// ── Client ──────────────────────────────────────────────────────────────────
-
+// Client wraps the official TigerBeetle client with optional PostgreSQL audit trail.
 type Client struct {
-	mu              sync.Mutex
-	clusterID       Uint128
-	addresses       []string
-	connected       atomic.Bool
-	batchBuffer     []Transfer
-	batchMu         sync.Mutex
-	batchSize       int
-	flushInterval   time.Duration
-	flushTimer      *time.Timer
-	onBatchComplete func([]CreateTransferResult, error)
-
-	// Metrics
-	TransfersCreated atomic.Int64
-	AccountsCreated  atomic.Int64
-	BatchesFlushed   atomic.Int64
-	Errors           atomic.Int64
+	tb      tb.Client
+	auditDB *sql.DB
+	mu      sync.RWMutex
+	closed  bool
 }
 
+// Config holds client configuration.
 type Config struct {
-	ClusterID     Uint128
-	Addresses     []string
-	BatchSize     int
-	FlushInterval time.Duration
+	// ClusterID is the TigerBeetle cluster identifier (default: 0).
+	ClusterID uint64
+
+	// Addresses is the list of TigerBeetle replica addresses.
+	// Format: "3000" or "127.0.0.1:3000".
+	// Falls back to TB_ADDRESS or TIGERBEETLE_ADDRESSES env vars.
+	Addresses []string
+
+	// AuditDatabaseURL is an optional PostgreSQL connection string for audit trail.
+	// If empty, checks TIGERBEETLE_AUDIT_DB_URL env var. If still empty, no audit.
+	AuditDatabaseURL string
 }
 
-func DefaultConfig() Config {
-	return Config{
-		ClusterID:     Uint128FromU64(0, 0),
-		Addresses:     []string{"3001"},
-		BatchSize:     8190, // TigerBeetle max batch
-		FlushInterval: time.Millisecond,
-	}
-}
-
+// NewClient creates a production TigerBeetle client connected to a real cluster.
+// Returns an error if no addresses are configured or if the connection fails.
 func NewClient(cfg Config) (*Client, error) {
-	if len(cfg.Addresses) == 0 {
-		return nil, errors.New("at least one address required")
-	}
-	if cfg.BatchSize <= 0 || cfg.BatchSize > 8190 {
-		cfg.BatchSize = 8190
-	}
-	if cfg.FlushInterval <= 0 {
-		cfg.FlushInterval = time.Millisecond
+	addresses := cfg.Addresses
+	if len(addresses) == 0 {
+		if env := os.Getenv("TB_ADDRESS"); env != "" {
+			addresses = strings.Split(env, ",")
+		} else if env := os.Getenv("TIGERBEETLE_ADDRESSES"); env != "" {
+			addresses = strings.Split(env, ",")
+		}
 	}
 
-	c := &Client{
-		clusterID:     cfg.ClusterID,
-		addresses:     cfg.Addresses,
-		batchBuffer:   make([]Transfer, 0, cfg.BatchSize),
-		batchSize:     cfg.BatchSize,
-		flushInterval: cfg.FlushInterval,
+	if len(addresses) == 0 {
+		return nil, fmt.Errorf("tbclient: no TigerBeetle addresses configured — set TB_ADDRESS or TIGERBEETLE_ADDRESSES env var, or pass Config.Addresses")
 	}
-	c.connected.Store(true)
-	c.flushTimer = time.AfterFunc(cfg.FlushInterval, c.autoFlush)
-	log.Printf("[tbclient] connected to cluster %s at %v (batch=%d, flush=%v)",
-		cfg.ClusterID, cfg.Addresses, cfg.BatchSize, cfg.FlushInterval)
+
+	for i := range addresses {
+		addresses[i] = strings.TrimSpace(addresses[i])
+	}
+
+	clusterID := tb.ToUint128(cfg.ClusterID)
+
+	log.Printf("[tbclient] connecting to TigerBeetle cluster %d at %v", cfg.ClusterID, addresses)
+
+	tbClient, err := tb.NewClient(clusterID, addresses)
+	if err != nil {
+		return nil, fmt.Errorf("tbclient: failed to connect to TigerBeetle cluster: %w", err)
+	}
+
+	log.Printf("[tbclient] connected to TigerBeetle cluster %d (%d replicas)", cfg.ClusterID, len(addresses))
+
+	c := &Client{tb: tbClient}
+
+	// Optional audit trail
+	auditDSN := cfg.AuditDatabaseURL
+	if auditDSN == "" {
+		auditDSN = os.Getenv("TIGERBEETLE_AUDIT_DB_URL")
+	}
+	if auditDSN != "" {
+		auditDB, err := sql.Open("postgres", auditDSN)
+		if err != nil {
+			log.Printf("[tbclient] WARNING: audit DB connection failed (non-fatal): %v", err)
+		} else {
+			auditDB.SetMaxOpenConns(10)
+			auditDB.SetMaxIdleConns(3)
+			auditDB.SetConnMaxLifetime(5 * time.Minute)
+			if err := auditDB.Ping(); err != nil {
+				log.Printf("[tbclient] WARNING: audit DB ping failed (non-fatal): %v", err)
+				auditDB.Close()
+			} else {
+				c.auditDB = auditDB
+				if err := c.initAuditSchema(); err != nil {
+					log.Printf("[tbclient] WARNING: audit schema init failed (non-fatal): %v", err)
+				} else {
+					log.Printf("[tbclient] audit trail enabled (PostgreSQL)")
+				}
+			}
+		}
+	}
+
 	return c, nil
 }
 
-// CreateAccounts creates accounts in TigerBeetle.
-func (c *Client) CreateAccounts(ctx context.Context, accounts []Account) ([]CreateAccountResult, error) {
-	if !c.connected.Load() {
-		return nil, errors.New("client disconnected")
+func (c *Client) initAuditSchema() error {
+	if c.auditDB == nil {
+		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	schema := `
+	CREATE TABLE IF NOT EXISTS tb_audit_accounts (
+		id BYTEA PRIMARY KEY,
+		ledger INT NOT NULL,
+		code SMALLINT NOT NULL,
+		flags SMALLINT NOT NULL DEFAULT 0,
+		user_data_128 BYTEA,
+		user_data_64 BIGINT DEFAULT 0,
+		user_data_32 INT DEFAULT 0,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE TABLE IF NOT EXISTS tb_audit_transfers (
+		id BYTEA PRIMARY KEY,
+		debit_account_id BYTEA NOT NULL,
+		credit_account_id BYTEA NOT NULL,
+		amount BYTEA NOT NULL,
+		pending_id BYTEA,
+		user_data_128 BYTEA,
+		user_data_64 BIGINT DEFAULT 0,
+		user_data_32 INT DEFAULT 0,
+		timeout INT DEFAULT 0,
+		ledger INT NOT NULL,
+		code SMALLINT NOT NULL,
+		flags SMALLINT NOT NULL DEFAULT 0,
+		timestamp BIGINT NOT NULL DEFAULT 0,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_tb_audit_transfers_debit ON tb_audit_transfers(debit_account_id);
+	CREATE INDEX IF NOT EXISTS idx_tb_audit_transfers_credit ON tb_audit_transfers(credit_account_id);`
+	_, err := c.auditDB.Exec(schema)
+	return err
+}
 
-	results := make([]CreateAccountResult, 0)
-	for i, acc := range accounts {
-		if acc.ID == (Uint128{}) {
-			results = append(results, CreateAccountResult{Index: uint32(i), Result: 1})
-			c.Errors.Add(1)
-			continue
-		}
-		// Validate flags
-		if acc.Flags&AccountDebitsMustNotExceedCredits != 0 && acc.Flags&AccountCreditsMustNotExceedDebits != 0 {
-			results = append(results, CreateAccountResult{Index: uint32(i), Result: 2})
-			c.Errors.Add(1)
-			continue
-		}
+// CreateAccounts creates accounts in the TigerBeetle cluster.
+// ctx is accepted for interface compatibility but TB operations are not cancellable.
+func (c *Client) CreateAccounts(_ context.Context, accounts []Account) ([]CreateAccountResult, error) {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return nil, fmt.Errorf("tbclient: client closed")
 	}
-	c.AccountsCreated.Add(int64(len(accounts) - len(results)))
-	log.Printf("[tbclient] created %d accounts (%d errors)", len(accounts)-len(results), len(results))
+	c.mu.RUnlock()
+
+	results, err := c.tb.CreateAccounts(accounts)
+	if err != nil {
+		return nil, fmt.Errorf("tbclient: create accounts: %w", err)
+	}
+
+	if c.auditDB != nil {
+		go c.auditCreateAccounts(accounts, results)
+	}
+
 	return results, nil
 }
 
-// CreateTransfers creates transfers. For batch mode, use EnqueueTransfer.
-func (c *Client) CreateTransfers(ctx context.Context, transfers []Transfer) ([]CreateTransferResult, error) {
-	if !c.connected.Load() {
-		return nil, errors.New("client disconnected")
+func (c *Client) auditCreateAccounts(accounts []Account, results []CreateAccountResult) {
+	failed := make(map[int]bool)
+	for i, r := range results {
+		if r.Status != tb.AccountCreated && r.Status != tb.AccountExists {
+			failed[i] = true
+		}
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	for i, acct := range accounts {
+		if failed[i] {
+			continue
+		}
+		idBytes := acct.ID.Bytes()
+		udBytes := acct.UserData128.Bytes()
+		_, err := c.auditDB.Exec(
+			`INSERT INTO tb_audit_accounts (id, ledger, code, flags, user_data_128, user_data_64, user_data_32)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 ON CONFLICT (id) DO NOTHING`,
+			idBytes[:], acct.Ledger, acct.Code, acct.Flags,
+			udBytes[:], acct.UserData64, acct.UserData32,
+		)
+		if err != nil {
+			log.Printf("[tbclient] audit: failed to record account: %v", err)
+		}
+	}
+}
 
-	results := make([]CreateTransferResult, 0)
-	for i, t := range transfers {
-		// Post/void pending transfers may have Amount=0 (use full pending amount)
-		isPostOrVoid := t.Flags&TransferPostPendingTransfer != 0 || t.Flags&TransferVoidPendingTransfer != 0
-		if t.Amount == 0 && !isPostOrVoid {
-			results = append(results, CreateTransferResult{Index: uint32(i), Result: 1})
-			c.Errors.Add(1)
-			continue
-		}
-		if t.DebitAccountID == t.CreditAccountID && !isPostOrVoid {
-			results = append(results, CreateTransferResult{Index: uint32(i), Result: 2})
-			c.Errors.Add(1)
-			continue
-		}
-		// Validate pending/post/void mutually exclusive
-		if t.Flags&TransferPostPendingTransfer != 0 && t.Flags&TransferVoidPendingTransfer != 0 {
-			results = append(results, CreateTransferResult{Index: uint32(i), Result: 3})
-			c.Errors.Add(1)
-			continue
-		}
+// CreateTransfers creates transfers (journal entries) in the TigerBeetle cluster.
+func (c *Client) CreateTransfers(_ context.Context, transfers []Transfer) ([]CreateTransferResult, error) {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return nil, fmt.Errorf("tbclient: client closed")
 	}
-	c.TransfersCreated.Add(int64(len(transfers) - len(results)))
-	c.BatchesFlushed.Add(1)
+	c.mu.RUnlock()
+
+	results, err := c.tb.CreateTransfers(transfers)
+	if err != nil {
+		return nil, fmt.Errorf("tbclient: create transfers: %w", err)
+	}
+
+	if c.auditDB != nil {
+		go c.auditCreateTransfers(transfers, results)
+	}
+
 	return results, nil
 }
 
-// EnqueueTransfer adds a transfer to the batch buffer; auto-flushes at capacity or interval.
-func (c *Client) EnqueueTransfer(t Transfer) {
-	c.batchMu.Lock()
-	c.batchBuffer = append(c.batchBuffer, t)
-	shouldFlush := len(c.batchBuffer) >= c.batchSize
-	c.batchMu.Unlock()
-
-	if shouldFlush {
-		c.FlushBatch()
-	}
-}
-
-func (c *Client) autoFlush() {
-	c.FlushBatch()
-	c.flushTimer.Reset(c.flushInterval)
-}
-
-// FlushBatch sends all buffered transfers to TigerBeetle.
-func (c *Client) FlushBatch() {
-	c.batchMu.Lock()
-	if len(c.batchBuffer) == 0 {
-		c.batchMu.Unlock()
-		return
-	}
-	batch := make([]Transfer, len(c.batchBuffer))
-	copy(batch, c.batchBuffer)
-	c.batchBuffer = c.batchBuffer[:0]
-	c.batchMu.Unlock()
-
-	results, err := c.CreateTransfers(context.Background(), batch)
-	if c.onBatchComplete != nil {
-		c.onBatchComplete(results, err)
-	}
-}
-
-// LookupAccounts returns account data by IDs.
-func (c *Client) LookupAccounts(ctx context.Context, ids []Uint128) ([]Account, error) {
-	if !c.connected.Load() {
-		return nil, errors.New("client disconnected")
-	}
-	accounts := make([]Account, len(ids))
-	for i, id := range ids {
-		accounts[i] = Account{
-			ID:        id,
-			Timestamp: uint64(time.Now().UnixNano()),
+func (c *Client) auditCreateTransfers(transfers []Transfer, results []CreateTransferResult) {
+	failed := make(map[int]bool)
+	for i, r := range results {
+		if r.Status != tb.TransferCreated && r.Status != tb.TransferExists {
+			failed[i] = true
 		}
+	}
+	for i, xfer := range transfers {
+		if failed[i] {
+			continue
+		}
+		idBytes := xfer.ID.Bytes()
+		debitBytes := xfer.DebitAccountID.Bytes()
+		creditBytes := xfer.CreditAccountID.Bytes()
+		amountBytes := xfer.Amount.Bytes()
+		udBytes := xfer.UserData128.Bytes()
+		var pendingID interface{}
+		if xfer.PendingID != tb.ToUint128(0) {
+			pidBytes := xfer.PendingID.Bytes()
+			pendingID = pidBytes[:]
+		}
+		_, err := c.auditDB.Exec(
+			`INSERT INTO tb_audit_transfers (id, debit_account_id, credit_account_id, amount, pending_id, user_data_128, user_data_64, user_data_32, timeout, ledger, code, flags, timestamp)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			 ON CONFLICT (id) DO NOTHING`,
+			idBytes[:], debitBytes[:], creditBytes[:], amountBytes[:],
+			pendingID, udBytes[:], xfer.UserData64, xfer.UserData32,
+			xfer.Timeout, xfer.Ledger, xfer.Code, xfer.Flags, xfer.Timestamp,
+		)
+		if err != nil {
+			log.Printf("[tbclient] audit: failed to record transfer: %v", err)
+		}
+	}
+}
+
+// LookupAccounts fetches accounts by their IDs from the TigerBeetle cluster.
+func (c *Client) LookupAccounts(_ context.Context, ids []Uint128) ([]Account, error) {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return nil, fmt.Errorf("tbclient: client closed")
+	}
+	c.mu.RUnlock()
+
+	accounts, err := c.tb.LookupAccounts(ids)
+	if err != nil {
+		return nil, fmt.Errorf("tbclient: lookup accounts: %w", err)
 	}
 	return accounts, nil
 }
 
-// LookupTransfers returns transfer data by IDs.
-func (c *Client) LookupTransfers(ctx context.Context, ids []Uint128) ([]Transfer, error) {
-	if !c.connected.Load() {
-		return nil, errors.New("client disconnected")
+// LookupTransfers fetches transfers by their IDs from the TigerBeetle cluster.
+func (c *Client) LookupTransfers(_ context.Context, ids []Uint128) ([]Transfer, error) {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return nil, fmt.Errorf("tbclient: client closed")
 	}
-	transfers := make([]Transfer, len(ids))
-	for i, id := range ids {
-		transfers[i] = Transfer{
-			ID:        id,
-			Timestamp: uint64(time.Now().UnixNano()),
-		}
+	c.mu.RUnlock()
+
+	transfers, err := c.tb.LookupTransfers(ids)
+	if err != nil {
+		return nil, fmt.Errorf("tbclient: lookup transfers: %w", err)
 	}
 	return transfers, nil
 }
 
-// CreateLinkedTransfers creates an atomic batch of linked transfers (all-or-nothing).
-func (c *Client) CreateLinkedTransfers(ctx context.Context, transfers []Transfer) ([]CreateTransferResult, error) {
-	if len(transfers) < 2 {
-		return nil, errors.New("linked transfers require at least 2 entries")
-	}
-	for i := range transfers {
-		if i < len(transfers)-1 {
-			transfers[i].Flags |= TransferLinked
-		}
-	}
-	return c.CreateTransfers(ctx, transfers)
+// BalanceInfo provides detailed balance information for an account.
+// All amounts are in the lowest denomination (e.g., kobo for NGN).
+type BalanceInfo struct {
+	DebitsPending  uint64
+	DebitsPosted   uint64
+	CreditsPending uint64
+	CreditsPosted  uint64
+	NetBalance     int64 // CreditsPosted - DebitsPosted (lower 64 bits)
 }
 
-// CreatePendingTransfer creates a two-phase pending transfer.
-func (c *Client) CreatePendingTransfer(debit, credit Uint128, amount uint64, ledger uint32, code uint16, timeout uint32) (*Transfer, error) {
-	t := Transfer{
-		ID:              NewUint128(),
-		DebitAccountID:  debit,
-		CreditAccountID: credit,
-		Amount:          amount,
-		Ledger:          ledger,
-		Code:            code,
-		Flags:           TransferPending,
-		Timeout:         timeout,
+// GetAccountBalance returns the net balance (credits_posted - debits_posted) for an account.
+// Returns the lower 64 bits which is sufficient for banking amounts.
+func (c *Client) GetAccountBalance(ctx context.Context, id Uint128) (int64, error) {
+	accounts, err := c.LookupAccounts(ctx, []Uint128{id})
+	if err != nil {
+		return 0, err
 	}
-	results, err := c.CreateTransfers(context.Background(), []Transfer{t})
+	if len(accounts) == 0 {
+		return 0, fmt.Errorf("tbclient: account not found")
+	}
+	acct := accounts[0]
+	credits := Uint128Low(acct.CreditsPosted)
+	debits := Uint128Low(acct.DebitsPosted)
+	return int64(credits) - int64(debits), nil
+}
+
+// GetAccountBalanceFull returns detailed balance info for an account.
+func (c *Client) GetAccountBalanceFull(ctx context.Context, id Uint128) (*BalanceInfo, error) {
+	accounts, err := c.LookupAccounts(ctx, []Uint128{id})
 	if err != nil {
 		return nil, err
 	}
-	if len(results) > 0 {
-		return nil, fmt.Errorf("transfer error: code %d", results[0].Result)
+	if len(accounts) == 0 {
+		return nil, fmt.Errorf("tbclient: account not found")
 	}
-	return &t, nil
+	acct := accounts[0]
+	return &BalanceInfo{
+		DebitsPending:  Uint128Low(acct.DebitsPending),
+		DebitsPosted:   Uint128Low(acct.DebitsPosted),
+		CreditsPending: Uint128Low(acct.CreditsPending),
+		CreditsPosted:  Uint128Low(acct.CreditsPosted),
+		NetBalance:     int64(Uint128Low(acct.CreditsPosted)) - int64(Uint128Low(acct.DebitsPosted)),
+	}, nil
 }
 
-// PostPendingTransfer commits a pending transfer.
-func (c *Client) PostPendingTransfer(pendingID Uint128) error {
-	t := Transfer{
-		ID:        NewUint128(),
-		PendingID: pendingID,
-		Flags:     TransferPostPendingTransfer,
+// Close closes the TigerBeetle client connection and audit DB.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
 	}
-	results, err := c.CreateTransfers(context.Background(), []Transfer{t})
-	if err != nil {
-		return err
-	}
-	if len(results) > 0 {
-		return fmt.Errorf("post pending error: code %d", results[0].Result)
+	c.closed = true
+	c.tb.Close()
+	if c.auditDB != nil {
+		return c.auditDB.Close()
 	}
 	return nil
-}
-
-// VoidPendingTransfer releases a pending transfer.
-func (c *Client) VoidPendingTransfer(pendingID Uint128) error {
-	t := Transfer{
-		ID:        NewUint128(),
-		PendingID: pendingID,
-		Flags:     TransferVoidPendingTransfer,
-	}
-	results, err := c.CreateTransfers(context.Background(), []Transfer{t})
-	if err != nil {
-		return err
-	}
-	if len(results) > 0 {
-		return fmt.Errorf("void pending error: code %d", results[0].Result)
-	}
-	return nil
-}
-
-// Stats returns client metrics.
-func (c *Client) Stats() map[string]int64 {
-	return map[string]int64{
-		"transfers_created": c.TransfersCreated.Load(),
-		"accounts_created":  c.AccountsCreated.Load(),
-		"batches_flushed":   c.BatchesFlushed.Load(),
-		"errors":            c.Errors.Load(),
-	}
-}
-
-// Close shuts down the client.
-func (c *Client) Close() {
-	c.flushTimer.Stop()
-	c.FlushBatch()
-	c.connected.Store(false)
-	log.Printf("[tbclient] closed (transfers=%d, accounts=%d, errors=%d)",
-		c.TransfersCreated.Load(), c.AccountsCreated.Load(), c.Errors.Load())
 }
