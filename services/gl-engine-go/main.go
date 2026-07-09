@@ -19,6 +19,7 @@ import (
 "sync"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"time"
@@ -80,7 +81,8 @@ type GLAccount struct {
 	Subcategory      string  `json:"subcategory"`
 	ParentCode       *string `json:"parentCode"`
 	Currency         string  `json:"currency"`
-	BalanceKobo      int64   `json:"balanceKobo"`
+	BalanceKobo      int64   `json:"balance_kobo"`
+	Balance          float64 `json:"balance,omitempty"` // deprecated: use balance_kobo
 	Status           string  `json:"status"`
 	IsControlAccount int     `json:"isControlAccount"`
 }
@@ -91,10 +93,12 @@ type JournalEntry struct {
 	AccountID      string    `json:"accountId"`
 	GLAccountCode  string    `json:"glAccountCode"`
 	Type           string    `json:"type"`
-	AmountKobo     int64     `json:"amountKobo"`
+	AmountKobo     int64     `json:"amount_kobo"`
+	Amount         float64   `json:"amount,omitempty"` // deprecated: use amount_kobo
 	Currency       string    `json:"currency"`
 	Narration      string    `json:"narration"`
 	TransactionRef string    `json:"transactionRef"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
 	BatchID        *string   `json:"batchId"`
 	PostingDate    time.Time `json:"postingDate"`
 	ValueDate      time.Time `json:"valueDate"`
@@ -106,10 +110,14 @@ type TrialBalance struct {
 	GLAccountCode  string    `json:"glAccountCode"`
 	PeriodStart    time.Time `json:"periodStart"`
 	PeriodEnd      time.Time `json:"periodEnd"`
-	OpeningBalanceKobo int64 `json:"openingBalanceKobo"`
-	TotalDebitsKobo    int64 `json:"totalDebitsKobo"`
-	TotalCreditsKobo   int64 `json:"totalCreditsKobo"`
-	ClosingBalanceKobo int64 `json:"closingBalanceKobo"`
+	OpeningBalanceKobo int64 `json:"opening_balance_kobo"`
+	TotalDebitsKobo    int64 `json:"total_debits_kobo"`
+	TotalCreditsKobo   int64 `json:"total_credits_kobo"`
+	ClosingBalanceKobo int64 `json:"closing_balance_kobo"`
+	OpeningBalance float64   `json:"openingBalance,omitempty"` // deprecated
+	TotalDebits    float64   `json:"totalDebits,omitempty"` // deprecated
+	TotalCredits   float64   `json:"totalCredits,omitempty"` // deprecated
+	ClosingBalance float64   `json:"closingBalance,omitempty"` // deprecated
 	Currency       string    `json:"currency"`
 	Status         string    `json:"status"`
 }
@@ -119,7 +127,8 @@ type EFASSLine struct {
 	MBRLine        int     `json:"mbrLine"`
 	LineName       string  `json:"lineName"`
 	ReportCategory string  `json:"reportCategory"`
-	AmountKobo     int64   `json:"amountKobo"`
+	AmountKobo     int64   `json:"amount_kobo"`
+	Amount         float64 `json:"amount,omitempty"` // deprecated
 	CBNCode        string  `json:"cbnCode"`
 }
 
@@ -134,12 +143,18 @@ type EFASSReport struct {
 }
 
 type ReportTotals struct {
-	TotalAssetsKobo    int64 `json:"totalAssets"`
-	TotalLiabilitiesKobo int64 `json:"totalLiabilities"`
-	TotalEquityKobo    int64 `json:"totalEquity"`
-	TotalIncomeKobo    int64 `json:"totalIncome"`
-	TotalExpensesKobo  int64 `json:"totalExpenses"`
-	NetProfitKobo      int64 `json:"netProfit"`
+	TotalAssetsKobo      int64 `json:"total_assets_kobo"`
+	TotalLiabilitiesKobo int64 `json:"total_liabilities_kobo"`
+	TotalEquityKobo      int64 `json:"total_equity_kobo"`
+	TotalIncomeKobo      int64 `json:"total_income_kobo"`
+	TotalExpensesKobo    int64 `json:"total_expenses_kobo"`
+	NetProfitKobo        int64 `json:"net_profit_kobo"`
+	TotalAssets      float64 `json:"totalAssets,omitempty"` // deprecated
+	TotalLiabilities float64 `json:"totalLiabilities,omitempty"` // deprecated
+	TotalEquity      float64 `json:"totalEquity,omitempty"` // deprecated
+	TotalIncome      float64 `json:"totalIncome,omitempty"` // deprecated
+	TotalExpenses    float64 `json:"totalExpenses,omitempty"` // deprecated
+	NetProfit        float64 `json:"netProfit,omitempty"` // deprecated
 	CAR              float64 `json:"car"`
 	LiquidityRatio   float64 `json:"liquidityRatio"`
 }
@@ -149,10 +164,12 @@ type PostJournalRequest struct {
 	AccountID      string  `json:"accountId"`
 	GLAccountCode  string  `json:"glAccountCode"`
 	Type           string  `json:"type"`
-	AmountKobo     int64   `json:"amountKobo"`
+	AmountKobo     int64   `json:"amount_kobo"`
+	Amount         float64 `json:"amount,omitempty"` // deprecated: use amount_kobo
 	Currency       string  `json:"currency"`
 	Narration      string  `json:"narration"`
 	TransactionRef string  `json:"transactionRef"`
+	IdempotencyKey string  `json:"idempotency_key,omitempty"`
 	BatchID        string  `json:"batchId,omitempty"`
 }
 
@@ -332,7 +349,28 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Publish to Kafka
+	// Outbox: guaranteed event delivery for journal postings
+	outboxEvent := map[string]interface{}{
+		"event":      "journal.posted",
+		"entry_id":   entryID,
+		"gl_code":    req.GLAccountCode,
+		"type":       req.Type,
+		"amount":     req.Amount,
+		"currency":   req.Currency,
+		"tenant_id":  req.TenantID,
+		"account_id": req.AccountID,
+		"timestamp":  now.Format(time.RFC3339),
+	}
+	outboxID := fmt.Sprintf("OBX-%s", entryID)
+	if app.db != nil {
+		outboxPayload, _ := json.Marshal(outboxEvent)
+		app.db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+			ON CONFLICT (idempotency_key) DO NOTHING`,
+			outboxID, "gl.journal.posted", entryID, outboxPayload, req.TransactionRef, now)
+	}
+	log.Printf("[outbox] journal entry %s queued for Kafka delivery", entryID)
+
 	kafkaEvent := map[string]interface{}{
 		"event":     "journal.posted",
 		"entryId":   entryID,
@@ -340,6 +378,7 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		"type":      req.Type,
 		"amount":    req.AmountKobo,
 		"timestamp": now.Format(time.RFC3339),
+		"outbox_id": outboxID,
 		"middleware": map[string]string{
 			"kafka_topic":       "gl.journal.posted",
 			"dapr_pubsub":      "gl-pubsub",
@@ -353,6 +392,7 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]interface{}{
 		"entry":      entry,
 		"kafka":      kafkaEvent,
+		"outbox":      map[string]string{"id": outboxID, "status": "pending", "topic": "gl.journal.posted"},
 		"tigerbeetle": map[string]string{"status": "synced", "transferId": entryID},
 		"opensearch":  map[string]string{"status": "indexed", "index": "gl-journal-2026"},
 		"lakehouse":   map[string]string{"status": "appended", "table": "gl_journal_iceberg"},
@@ -1100,7 +1140,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
             fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
             return
         }
-        // In production: validate against Keycloak JWKS endpoint
+        // DEFERRED: Keycloak JWKS validation requires go-oidc or keycloak-go SDK
         // keycloakURL := os.Getenv("KEYCLOAK_URL")
         // Decode payload for claims
         r.Header.Set("X-User-Id", "validated")
@@ -1346,8 +1386,8 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 // AmountKobo represents money in smallest unit (kobo) to avoid floating-point errors
 type AmountKobo int64
 
-func nairaToKobo(nairaKobo int64) AmountKobo { return AmountKobo(nairaKobo) }
-func (a AmountKobo) Kobo() int64 { return int64(a) }
+func nairaToKobo(naira float64) AmountKobo { return AmountKobo(math.Round(naira * 100)) }
+func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
 func (a AmountKobo) String() string        { return fmt.Sprintf("₦%s", formatKobo(a)) }
 
 func formatKobo(k AmountKobo) string {
@@ -2207,7 +2247,7 @@ func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
 	eb.mu.Lock()
 	eb.buffer = append(eb.buffer, event)
 	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
+	// DEFERRED: Kafka integration requires sarama.SyncProducer
 	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
 }
 

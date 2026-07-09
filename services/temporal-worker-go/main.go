@@ -981,6 +981,23 @@ func CreditAccount(ctx context.Context, accountID string, amountKobo int64, refe
 func ReverseLedgerEntry(ctx context.Context, entryID string) error {
 	activity.RecordHeartbeat(ctx, "reversing "+entryID)
 	log.Printf("[saga-compensation] Reversing ledger entry: %s", entryID)
+	// POST reversal to GL engine with idempotency key
+	reversalPayload := fmt.Sprintf(`{"tenant_id":"%s","transaction_ref":"REV-%s","type":"reversal","idempotency_key":"rev-%s","narration":"Saga compensation reversal"}`, "default", entryID, entryID)
+	resp, err := http.Post(
+		fmt.Sprintf("%s/v1/gl/journal/reverse", os.Getenv("GL_ENGINE_URL")),
+		"application/json",
+		strings.NewReader(reversalPayload),
+	)
+	if err != nil {
+		log.Printf("[saga-compensation] GL reversal failed for %s: %v", entryID, err)
+		return err
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		log.Printf("[saga-compensation] GL reversal HTTP %d for %s", resp.StatusCode, entryID)
+		return fmt.Errorf("GL reversal failed: HTTP %d", resp.StatusCode)
+	}
+	log.Printf("[saga-compensation] GL reversal complete for %s", entryID)
 	return nil
 }
 
@@ -996,7 +1013,7 @@ func ComputeCreditScore(ctx context.Context, borrowerID string) (*CreditScore, e
 
 func DisburseLoan(ctx context.Context, loanID, borrowerID string, amountKobo int64) error {
 	activity.RecordHeartbeat(ctx, fmt.Sprintf("disbursing loan %s: %d kobo to %s", loanID, amountKobo, borrowerID))
-	// In production: POST to payments-hub to execute the transfer via saga
+	// DEFERRED: requires live payments-hub endpoint for saga execution
 	// The saga handles: lock accounts → TigerBeetle 2PC → GL posting → event emission
 	log.Printf("[loan-disburse] Disbursing %d kobo for loan %s to borrower %s", amountKobo, loanID, borrowerID)
 	return nil
@@ -1007,7 +1024,38 @@ func DisburseLoan(ctx context.Context, loanID, borrowerID string, amountKobo int
 func ReverseLoanDisbursement(ctx context.Context, loanID, borrowerID string, amountKobo int64) error {
 	activity.RecordHeartbeat(ctx, fmt.Sprintf("reversing loan disbursement %s", loanID))
 	log.Printf("[saga-compensation] Reversing loan disbursement: loan=%s borrower=%s amount=%d kobo", loanID, borrowerID, amountKobo)
-	// In production: Create a reversal transfer via saga (credit loan account, debit borrower)
+	// TigerBeetle 2PC void + GL reversal + notification
+	voidPayload := fmt.Sprintf(`{"pending_id":"LOAN-%s","action":"void","reason":"saga_compensation"}`, loanID)
+	voidResp, voidErr := http.Post(
+		fmt.Sprintf("%s/v1/tb/pending/void", os.Getenv("TIGERBEETLE_ADAPTER_URL")),
+		"application/json",
+		strings.NewReader(voidPayload),
+	)
+	if voidErr != nil {
+		log.Printf("[saga-compensation] TB void failed for loan %s: %v", loanID, voidErr)
+	} else {
+		voidResp.Body.Close()
+	}
+	// Reverse GL entry
+	glPayload := fmt.Sprintf(`{"tenant_id":"default","amount_kobo":%d,"type":"reversal","narration":"Loan disbursement reversal for %s","idempotency_key":"rev-loan-%s"}`, amountKobo, loanID, loanID)
+	glResp, glErr := http.Post(
+		fmt.Sprintf("%s/v1/gl/journal/reverse", os.Getenv("GL_ENGINE_URL")),
+		"application/json",
+		strings.NewReader(glPayload),
+	)
+	if glErr != nil {
+		log.Printf("[saga-compensation] GL reversal failed for loan %s: %v", loanID, glErr)
+	} else {
+		glResp.Body.Close()
+	}
+	// Notify customer
+	notifPayload := fmt.Sprintf(`{"customer_id":"%s","template":"loan_disbursement_reversed","loan_id":"%s","amount_kobo":%d}`, borrowerID, loanID, amountKobo)
+	notifResp, _ := http.Post(
+		fmt.Sprintf("%s/v1/notifications/send", os.Getenv("NOTIFICATION_URL")),
+		"application/json",
+		strings.NewReader(notifPayload),
+	)
+	if notifResp != nil { notifResp.Body.Close() }
 	return nil
 }
 
@@ -2159,7 +2207,7 @@ func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
 	eb.mu.Lock()
 	eb.buffer = append(eb.buffer, event)
 	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
+	// DEFERRED: Kafka integration requires sarama.SyncProducer
 	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
 }
 

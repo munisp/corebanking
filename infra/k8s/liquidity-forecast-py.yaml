@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: liquidity-forecast-py
+  labels:
+    app: liquidity-forecast-py
+    tier: platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: liquidity-forecast-py
+  template:
+    metadata:
+      labels:
+        app: liquidity-forecast-py
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z postgres 5432; do sleep 2; done"]
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z kafka 9092; do sleep 2; done"]
+      containers:
+        - name: liquidity-forecast-py
+          image: 54bank/liquidity-forecast-py:latest
+          ports:
+            - containerPort: 9050
+          env:
+            - name: PORT
+              value: "9050"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: db-credentials
+                  key: url
+            - name: KAFKA_BROKERS
+              value: "kafka:9092"
+            - name: REDIS_URL
+              value: "redis://redis:6379"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 9050
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 9050
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: liquidity-forecast-py
+spec:
+  selector:
+    app: liquidity-forecast-py
+  ports:
+    - port: 9050
+      targetPort: 9050
+  type: ClusterIP
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: liquidity-forecast-py-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: liquidity-forecast-py
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: liquidity-forecast-py-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: liquidity-forecast-py

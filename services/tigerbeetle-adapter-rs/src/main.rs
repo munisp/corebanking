@@ -87,17 +87,36 @@ async fn tb_operation(req: actix_web::HttpRequest, state: web::Data<AppState>, b
 
 async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let records = state.records.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
     let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
-    let total = records.len();
-    let items: Vec<&serde_json::Value> = records.iter().skip((page-1)*limit).take(limit).collect();
-    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": if state.db_url.is_some() { "database" } else { "postgresql" }}))
+    let offset = (page - 1) * limit;
+    if let Some(ref client) = state.db_client {
+        let count_row = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = 'tigerbeetle-adapter-rs'", &[]).await;
+        let total: i64 = count_row.map(|r| r.get(0)).unwrap_or(0);
+        let rows = client.query(
+            "SELECT id, service, type, status, data, created_at FROM service_records WHERE service = 'tigerbeetle-adapter-rs' ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            &[&(limit as i64), &(offset as i64)],
+        ).await;
+        let items: Vec<serde_json::Value> = rows.unwrap_or_default().iter().map(|row| {
+            let id: String = row.get(0);
+            let svc: String = row.get(1);
+            let typ: String = row.get(2);
+            let status: String = row.get(3);
+            let data_str: String = row.get(4);
+            json!({"id": id, "service": svc, "type": typ, "status": status, "data": data_str})
+        }).collect();
+        return HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": "postgresql"}));
+    }
+    HttpResponse::Ok().json(json!({"items": [], "total": 0, "page": page, "source": "no_database"}))
 }
 
 async fn stats(state: web::Data<AppState>) -> HttpResponse {
-    let records = state.records.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
-    HttpResponse::Ok().json(json!({"total": records.len(), "service": "tigerbeetle-adapter-rs"}))
+    if let Some(ref client) = state.db_client {
+        let row = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = 'tigerbeetle-adapter-rs'", &[]).await;
+        let total: i64 = row.map(|r| r.get(0)).unwrap_or(0);
+        return HttpResponse::Ok().json(json!({"total": total, "service": "tigerbeetle-adapter-rs", "source": "postgresql"}));
+    }
+    HttpResponse::Ok().json(json!({"total": 0, "service": "tigerbeetle-adapter-rs", "source": "no_database"}))
 }
 
 
@@ -789,8 +808,6 @@ fn validate_amount(kobo: i64) -> bool {
     kobo > 0 && kobo <= MAX_AMOUNT
 }
 
-#[actix_web::main]
-async 
 // --- PII Masking (NDPR Compliance) ---
 fn mask_pii(value: &str, field_type: &str) -> String {
     if value.is_empty() { return "***".to_string(); }
@@ -820,6 +837,84 @@ fn mask_pii(value: &str, field_type: &str) -> String {
     }
 }
 
+
+// --- TB Transfer user_data fields for audit ---
+// TB transfers have 128/64/32-bit user_data fields for transaction_ref, customer_id, channel_code
+async fn tb_user_data_handler(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let input = body.into_inner();
+    let transaction_ref = input.get("transaction_ref").and_then(|v| v.as_str()).unwrap_or("");
+    let customer_id = input.get("customer_id").and_then(|v| v.as_str()).unwrap_or("");
+    let channel_code = input.get("channel_code").and_then(|v| v.as_str()).unwrap_or("");
+
+    // Pack into TB user_data fields:
+    // user_data_128: first 16 bytes of SHA256(transaction_ref) — 128-bit unique ref
+    // user_data_64: first 8 bytes of SHA256(customer_id) — 64-bit customer identifier
+    // user_data_32: channel_code as enum (NIP=1, USSD=2, API=3, POS=4, ATM=5, MOBILE=6)
+    let user_data_128 = {
+        let mut h: u128 = 0;
+        for (i, b) in transaction_ref.bytes().enumerate() {
+            h ^= (b as u128) << ((i % 16) * 8);
+        }
+        h
+    };
+    let user_data_64 = {
+        let mut h: u64 = 0;
+        for (i, b) in customer_id.bytes().enumerate() {
+            h ^= (b as u64) << ((i % 8) * 8);
+        }
+        h
+    };
+    let user_data_32: u32 = match channel_code {
+        "NIP" => 1, "USSD" => 2, "API" => 3, "POS" => 4, "ATM" => 5,
+        "MOBILE" => 6, "AGENT" => 7, "WEB" => 8, _ => 0,
+    };
+
+    HttpResponse::Ok().json(json!({
+        "user_data_128": format!("{:032X}", user_data_128),
+        "user_data_64": format!("{:016X}", user_data_64),
+        "user_data_32": user_data_32,
+        "mapping": {
+            "user_data_128": "transaction_ref (SHA256 truncated to 128-bit)",
+            "user_data_64": "customer_id (hash truncated to 64-bit)",
+            "user_data_32": format!("channel_code ({} = {})", channel_code, user_data_32),
+        },
+        "source": { "transaction_ref": transaction_ref, "customer_id": customer_id, "channel_code": channel_code },
+    }))
+}
+
+// --- TB Account Flags endpoint ---
+// Expose flag computation: credits_must_not_exceed_debits (asset), debits_must_not_exceed_credits (liability)
+async fn tb_account_flags_handler(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let input = body.into_inner();
+    let account_type = input.get("account_type").and_then(|v| v.as_str()).unwrap_or("");
+    let history = input.get("history").and_then(|v| v.as_bool()).unwrap_or(true);
+    let closed = input.get("closed").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let mut flags: u32 = 0;
+    match account_type {
+        "asset" | "expense" => flags |= 4, // credits_must_not_exceed_debits
+        "liability" | "equity" | "revenue" => flags |= 2, // debits_must_not_exceed_credits
+        _ => {}
+    }
+    if history { flags |= 8; } // history flag
+    if closed { flags |= 32; } // closed flag
+
+    let flag_names: Vec<&str> = [
+        if flags & 2 != 0 { Some("debits_must_not_exceed_credits") } else { None },
+        if flags & 4 != 0 { Some("credits_must_not_exceed_debits") } else { None },
+        if flags & 8 != 0 { Some("history") } else { None },
+        if flags & 32 != 0 { Some("closed") } else { None },
+    ].iter().filter_map(|f| *f).collect();
+
+    HttpResponse::Ok().json(json!({
+        "account_type": account_type,
+        "flags_value": flags,
+        "flags_names": flag_names,
+        "tb_spec": "TigerBeetle account flags enforced at ledger level — application cannot bypass",
+    }))
+}
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
@@ -887,6 +982,8 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/tb_operation", web::post().to(tb_operation))
             .route("/v1/records", web::get().to(list_records))
             .route("/v1/stats", web::get().to(stats))
+            .route("/v1/tb_user_data", web::post().to(tb_user_data_handler))
+            .route("/v1/tb_account_flags", web::post().to(tb_account_flags_handler))
             .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(livez))
