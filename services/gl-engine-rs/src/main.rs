@@ -132,6 +132,88 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
 }
 
 
+// ── Middleware integration: TigerBeetle ledger + Kafka events ──────────────
+// Fire-and-forget raw HTTP over tokio (no extra crate dependency). A broker or
+// ledger outage is logged but never fails the journal posting.
+fn mw_tigerbeetle_url() -> String {
+    std::env::var("TIGERBEETLE_URL").unwrap_or_else(|_| "http://tigerbeetle-adapter:3000".to_string())
+}
+fn mw_kafka_url() -> String {
+    std::env::var("KAFKA_REST_URL")
+        .or_else(|_| std::env::var("KAFKA_BROKER_URL"))
+        .unwrap_or_else(|_| "http://kafka-rest-proxy:8082".to_string())
+}
+
+async fn mw_http_post(url: &str, body: String) {
+    use tokio::io::AsyncWriteExt;
+    let stripped = match url.strip_prefix("http://") {
+        Some(s) => s,
+        None => return,
+    };
+    let (hostport, path) = match stripped.find('/') {
+        Some(i) => (&stripped[..i], &stripped[i..]),
+        None => (stripped, "/"),
+    };
+    let addr = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{}:80", hostport)
+    };
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await;
+    let mut stream = match connect {
+        Ok(Ok(s)) => s,
+        _ => {
+            eprintln!("[gl-engine-rs] middleware post: connect failed {}", addr);
+            return;
+        }
+    };
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, hostport, body.len(), body
+    );
+    let _ = stream.write_all(req.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+async fn mw_post_ledger(entry_id: &str, entries: &[JournalEntry]) {
+    let transfers: Vec<serde_json::Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            json!({
+                "id": format!("{}-{}", entry_id, i),
+                "debitAccount": e.debit_account,
+                "creditAccount": e.credit_account,
+                "amount": e.amount_kobo,
+                "currency": e.currency,
+                "ledger": 1,
+                "code": 1000,
+                "flags": 0,
+            })
+        })
+        .collect();
+    let body = json!({ "transfers": transfers }).to_string();
+    let url = format!("{}/transfers", mw_tigerbeetle_url());
+    mw_http_post(&url, body).await;
+}
+
+async fn mw_publish_event(entry_id: &str, count: usize) {
+    let body = json!({
+        "eventType": "gl.journal.posted",
+        "service": "gl-engine-rs",
+        "entryId": entry_id,
+        "entries": count,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    })
+    .to_string();
+    let url = format!("{}/topics/gl-engine.journals", mw_kafka_url());
+    mw_http_post(&url, body).await;
+}
+
 async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppState>) -> HttpResponse {
     let _sanitized = sanitize_input("");
     let entries = body.into_inner();
@@ -148,7 +230,10 @@ async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppSt
             *acc.balance_kobo.get_or_insert(0) -= entry.amount_kobo;
         }
     }
+    drop(accounts);
     db_persist(&state, "post_journal", &json!({"action": "post_journal"})).await;
+    mw_post_ledger(&entry_id, &entries).await;
+    mw_publish_event(&entry_id, entries.len()).await;
     HttpResponse::Ok().json(json!({"entry_id": entry_id, "status": "posted", "entries": entries.len()}))
 }
 

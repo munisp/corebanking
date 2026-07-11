@@ -662,6 +662,10 @@ func (s *CreditServer) createFacilityHandler(w http.ResponseWriter, r *http.Requ
 	}
 	f.SubFacilities = []SubFacility{}
 	f.Collaterals = []CollateralLink{}
+	if f.Utilized > 0 {
+		postLedgerTransfer(f.ID, f.Utilized, f.TenantID, f.Currency)
+	}
+	publishDomainEvent("credit.facility.created", f.TenantID, f)
 	respondJSON(w, http.StatusCreated, f)
 }
 

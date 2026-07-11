@@ -12,6 +12,8 @@ from enum import Enum
 import asyncpg
 import json
 
+from middleware_events import post_ledger_transfer, publish_domain_event
+
 router = APIRouter(prefix="/api/v1/merchants", tags=["Settlement"])
 
 class SettlementFrequency(str, Enum):
@@ -194,6 +196,11 @@ async def create_settlement(
             summary['gross_amount'], summary['total_fees'], summary['net_amount'],
             settlement.bank_account_number, settlement.bank_code, settlement.account_name)
         
+        await publish_domain_event("merchant.settlement.created", merchant_id, {
+            "settlement_id": settlement_id,
+            "merchant_id": merchant_id,
+            "net_amount": summary['net_amount'],
+        })
         return {
             "status": "created",
             "settlement": dict(row),
@@ -251,6 +258,14 @@ async def process_settlement(
                 settlement['bank_account_number'], settlement['bank_code'],
                 settlement['account_name'])
             
+            # Post the payout to the ledger (Dr settlement payable, Cr cash) and
+            # publish the settlement-completed event.
+            await post_ledger_transfer(settlement_id, float(settlement['net_amount']), merchant_id)
+            await publish_domain_event("merchant.settlement.completed", merchant_id, {
+                "settlement_id": settlement_id,
+                "merchant_id": merchant_id,
+                "amount": float(settlement['net_amount']),
+            })
             return {
                 "status": "completed",
                 "settlement_id": settlement_id,

@@ -49,6 +49,8 @@ struct EclCalcRequest {
     lgd: f64,              // loss given default 0–100 — ratio, stays f64
     stage: u8,
     remaining_years: f64,
+    #[serde(default)]
+    exposure_id: Option<String>,
 }
 
 struct AppState {
@@ -156,6 +158,91 @@ async fn transition_matrix(data: web::Data<AppState>) -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({ "items": *t, "total": t.len() }))
 }
 
+// ── Middleware integration: TigerBeetle ledger + Kafka events ──────────────
+// The IFRS9 impairment provision is posted to the ledger (Dr impairment charge
+// 5100, Cr loan-loss provision 2600) and an event is published. Fire-and-forget
+// raw HTTP (no extra crate dependency); an outage is logged, never fatal.
+fn mw_tigerbeetle_url() -> String {
+    std::env::var("TIGERBEETLE_URL").unwrap_or_else(|_| "http://tigerbeetle-adapter:3000".to_string())
+}
+fn mw_kafka_url() -> String {
+    std::env::var("KAFKA_REST_URL")
+        .or_else(|_| std::env::var("KAFKA_BROKER_URL"))
+        .unwrap_or_else(|_| "http://kafka-rest-proxy:8082".to_string())
+}
+
+async fn mw_http_post(url: &str, body: String) {
+    use tokio::io::AsyncWriteExt;
+    let stripped = match url.strip_prefix("http://") {
+        Some(s) => s,
+        None => return,
+    };
+    let (hostport, path) = match stripped.find('/') {
+        Some(i) => (&stripped[..i], &stripped[i..]),
+        None => (stripped, "/"),
+    };
+    let addr = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{}:80", hostport)
+    };
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await;
+    let mut stream = match connect {
+        Ok(Ok(s)) => s,
+        _ => {
+            eprintln!("[ifrs9-engine-rs] middleware post: connect failed {}", addr);
+            return;
+        }
+    };
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, hostport, body.len(), body
+    );
+    let _ = stream.write_all(req.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+async fn mw_post_provision(exposure_id: &str, ecl_kobo: i64) {
+    if ecl_kobo <= 0 {
+        return;
+    }
+    let body = serde_json::json!({
+        "transfers": [{
+            "id": format!("ECL-{}", exposure_id),
+            "debitAccount": "5100",
+            "creditAccount": "2600",
+            "amount": ecl_kobo,
+            "currency": "NGN",
+            "ledger": 1,
+            "code": 5001,
+            "flags": 0,
+        }]
+    })
+    .to_string();
+    mw_http_post(&format!("{}/transfers", mw_tigerbeetle_url()), body).await;
+}
+
+async fn mw_publish_provision_event(exposure_id: &str, ecl_kobo: i64, stage: u8) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let body = serde_json::json!({
+        "eventType": "ifrs9.provision.posted",
+        "service": "ifrs9-engine-rs",
+        "exposureId": exposure_id,
+        "eclKobo": ecl_kobo,
+        "stage": stage,
+        "timestampMs": ts,
+    })
+    .to_string();
+    mw_http_post(&format!("{}/topics/ifrs9.provisions", mw_kafka_url()), body).await;
+}
+
 async fn calculate_ecl(body: web::Json<EclCalcRequest>) -> HttpResponse {
     let req = body.into_inner();
     if req.outstanding_kobo <= 0 {
@@ -175,6 +262,9 @@ async fn calculate_ecl(body: web::Json<EclCalcRequest>) -> HttpResponse {
     let coverage_ratio_bps = if req.outstanding_kobo > 0 {
         (ecl_kobo as f64 / req.outstanding_kobo as f64 * 10000.0).round() / 100.0
     } else { 0.0 };
+    let exposure_id = req.exposure_id.clone().unwrap_or_else(|| "unknown".to_string());
+    mw_post_provision(&exposure_id, ecl_kobo).await;
+    mw_publish_provision_event(&exposure_id, ecl_kobo, req.stage).await;
     HttpResponse::Ok().json(serde_json::json!({
         "outstanding_kobo": req.outstanding_kobo,
         "stage": req.stage, "pd_12m": req.pd_12m, "lgd": req.lgd,

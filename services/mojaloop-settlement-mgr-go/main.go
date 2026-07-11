@@ -171,6 +171,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if rec.Type == "" { rec.Type = "primary" }
 	records = append(records, rec)
+	publishDomainEvent("mojaloop-settlement.created", rec.TenantID, rec)
 	domainStats.TotalRecords = len(records)
 
 	// Persist to database
@@ -238,6 +239,8 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
 			records[i].Status = "completed"
 			domainStats.ProcessedToday++
+			postLedgerTransfer(records[i].ID, mwExtractKobo(records[i].Data), records[i].TenantID, getString(records[i].Data, "currency"))
+			publishDomainEvent("mojaloop-settlement.processed", records[i].TenantID, records[i])
 			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
 			return
 		}

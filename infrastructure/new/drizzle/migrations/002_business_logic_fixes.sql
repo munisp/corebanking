@@ -18,9 +18,10 @@ CREATE TABLE IF NOT EXISTS audit_trail (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_audit_trail_entity ON audit_trail (entity_id, entity_type);
-CREATE INDEX IF NOT EXISTS idx_audit_trail_actor ON audit_trail (actor_id, timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_audit_trail_service ON audit_trail (service, timestamp DESC);
+-- NOTE: audit_trail is created by 001_initial_schema.sql with a different
+-- column set (resource_id/resource_type/created_at), so the entity_id/service/
+-- timestamp indexes below cannot be created here. They are created in
+-- 004_reconcile_audit_trail.sql after the missing columns are added.
 
 -- Prevent UPDATE/DELETE via a rule (PostgreSQL enforcement of immutability)
 CREATE OR REPLACE RULE no_update_audit AS ON UPDATE TO audit_trail DO INSTEAD NOTHING;
