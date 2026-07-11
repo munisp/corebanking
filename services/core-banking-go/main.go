@@ -45,6 +45,7 @@ type PostingRequest struct {
 	DebitAccount  string  `json:"debit_account"`
 	CreditAccount string  `json:"credit_account"`
 	Amount        float64 `json:"amount"`
+	Currency      string  `json:"currency"`
 	Narration     string  `json:"narration"`
 	ValueDate     string  `json:"value_date"`
 }
@@ -199,12 +200,19 @@ func postingHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 400, map[string]interface{}{"errors": errs})
 		return
 	}
+	ref := fmt.Sprintf("POST-%d", time.Now().UnixNano())
+	tenant := r.Header.Get("X-Tenant-ID")
+	postLedgerTransferAccounts(ref, req.DebitAccount, req.CreditAccount, req.Amount, req.Currency, tenant)
+	publishDomainEvent("core.posting.posted", tenant, map[string]interface{}{
+		"posting_ref": ref, "debit": req.DebitAccount, "credit": req.CreditAccount,
+		"amount": req.Amount, "narration": req.Narration,
+	})
 	jsonResp(w, 200, map[string]interface{}{
 		"status": "posted",
 		"debit": req.DebitAccount,
 		"credit": req.CreditAccount,
 		"amount": req.Amount,
-		"posting_ref": fmt.Sprintf("POST-%d", time.Now().UnixNano()),
+		"posting_ref": ref,
 	})
 }
 

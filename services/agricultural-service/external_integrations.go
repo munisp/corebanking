@@ -240,6 +240,34 @@ type ExternalIntegrationsService struct {
 	commodityExchange *CommodityExchangeService
 }
 
+// ensureAgriculturalLoansTable lazily provisions the agricultural_loans table
+// used by the external-integrations flows (CRMS submission, NCR collateral
+// registration and NAIC insurance linking). Follows the service's existing
+// idempotent CREATE TABLE IF NOT EXISTS convention.
+func (s *ExternalIntegrationsService) ensureAgriculturalLoansTable(r *http.Request) error {
+	_, err := s.db.ExecContext(r.Context(), `
+		CREATE TABLE IF NOT EXISTS agricultural_loans (
+			id                   VARCHAR(64) PRIMARY KEY,
+			tenant_id            VARCHAR(64) NOT NULL,
+			customer_id          VARCHAR(64),
+			farmer_id            VARCHAR(64),
+			product_type         VARCHAR(64) NOT NULL DEFAULT 'input_finance',
+			amount               NUMERIC(18,2) NOT NULL DEFAULT 0,
+			currency             VARCHAR(3) NOT NULL DEFAULT 'NGN',
+			status               VARCHAR(32) NOT NULL DEFAULT 'active',
+			ncr_registered       BOOLEAN NOT NULL DEFAULT FALSE,
+			ncr_registration_no  VARCHAR(128),
+			insurance_policy_id  VARCHAR(128),
+			disbursed_at         TIMESTAMPTZ,
+			created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+		CREATE INDEX IF NOT EXISTS idx_agri_loans_tenant ON agricultural_loans(tenant_id);
+		CREATE INDEX IF NOT EXISTS idx_agri_loans_status ON agricultural_loans(status);
+	`)
+	return err
+}
+
 func NewExternalIntegrationsService(db *sql.DB) *ExternalIntegrationsService {
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 
@@ -464,6 +492,7 @@ func (s *ExternalIntegrationsService) SubmitToCRMS(w http.ResponseWriter, r *htt
 		return
 	}
 
+	_ = s.ensureAgriculturalLoansTable(r)
 	// Query agricultural loans for submission
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT COUNT(*) FROM agricultural_loans 
@@ -585,6 +614,7 @@ func (s *ExternalIntegrationsService) RegisterCollateral(w http.ResponseWriter, 
 
 	// Update loan with NCR registration
 	if req.LoanID != "" {
+		_ = s.ensureAgriculturalLoansTable(r)
 		s.db.ExecContext(r.Context(), `
 			UPDATE agricultural_loans 
 			SET ncr_registered = true, ncr_registration_no = $1
@@ -718,6 +748,7 @@ func (s *ExternalIntegrationsService) CreateNAICPolicy(w http.ResponseWriter, r 
 
 	// Link to loan if provided
 	if req.LinkedLoanID != "" {
+		_ = s.ensureAgriculturalLoansTable(r)
 		s.db.ExecContext(r.Context(), `
 			UPDATE agricultural_loans 
 			SET insurance_policy_id = $1

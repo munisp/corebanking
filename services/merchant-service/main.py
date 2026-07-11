@@ -292,6 +292,24 @@ async def startup():
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_analytics_merchant_period ON merchant_analytics(merchant_id, period, period_start);
+
+                CREATE TABLE IF NOT EXISTS kyb_documents (
+                    id SERIAL PRIMARY KEY,
+                    document_id VARCHAR(64) UNIQUE NOT NULL,
+                    merchant_id VARCHAR(50) NOT NULL,
+                    tenant_id VARCHAR(64) NOT NULL,
+                    document_type VARCHAR(64) NOT NULL,
+                    extracted_data JSONB,
+                    confidence_score DECIMAL(5,2) DEFAULT 0,
+                    verification_status VARCHAR(32) DEFAULT 'pending',
+                    original_filename VARCHAR(255),
+                    processing_metadata JSONB,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_kyb_documents_merchant ON kyb_documents(merchant_id, tenant_id);
+                CREATE INDEX IF NOT EXISTS idx_kyb_documents_type ON kyb_documents(document_type);
             """)
 
         print("Merchant service started successfully")
