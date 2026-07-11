@@ -1,6 +1,6 @@
 [package]
 name = "fluvio-streams"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 
 [dependencies]
@@ -18,3 +18,6 @@ sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid"
 log = "0.4"
 env_logger = "0.11"
 uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.11", features = ["json"] }
+# Fluvio SDK — real stream processing client (enable when Fluvio cluster is in build env)
+# fluvio = "0.21"

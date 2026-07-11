@@ -144,16 +144,81 @@ services:
       timeout: 5s
       retries: 5
 
-  # Fluvio — Streaming platform
+  # Fluvio — Streaming platform (SC + SPU)
   fluvio:
     image: infinyon/fluvio:0.11.9
     command: ["fluvio", "cluster", "start", "--local"]
-    ports: ["9003:9003"]
+    ports: ["9003:9003", "9005:9005"]
+    environment:
+      FLUVIO_LOG: "info"
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9003 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Temporal — Durable workflow orchestration server
+  temporal:
+    image: temporalio/auto-setup:1.24.2
+    ports: ["7233:7233"]
+    environment:
+      DB: postgresql
+      DB_PORT: "5432"
+      POSTGRES_USER: banking
+      POSTGRES_PWD: banking_dev_password
+      POSTGRES_SEEDS: postgres
+      TEMPORAL_ADDRESS: "0.0.0.0:7233"
+      TEMPORAL_BROADCAST_ADDRESS: "temporal"
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 7233 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Temporal UI — Web interface for workflow visibility
+  temporal-ui:
+    image: temporalio/ui:2.26.2
+    ports: ["8088:8080"]
+    environment:
+      TEMPORAL_ADDRESS: "temporal:7233"
+      TEMPORAL_CORS_ORIGINS: "http://localhost:3000"
+    depends_on:
+      temporal: { condition: service_healthy }
+    profiles: ["monitoring"]
+
+  # OpenAppSec — Open-source ML-based WAF (Web Application Firewall)
+  openappsec:
+    image: openappsec/agent:latest
+    ports: ["8085:8080"]
+    environment:
+      OPENAPPSEC_TOKEN: "${OPENAPPSEC_TOKEN:-local-dev-token}"
+      OPENAPPSEC_UPSTREAM: "http://apisix:9080"
+      OPENAPPSEC_LOG_LEVEL: "info"
+      OPENAPPSEC_LEARNING_MODE: "true"
+      OPENAPPSEC_PREVENT_MODE: "false"
+    volumes:
+      - ./config/openappsec:/etc/openappsec
+    depends_on:
+      apisix: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    profiles: ["security"]
+
+  # Dapr Dashboard — Web UI for Dapr observability
+  dapr-dashboard:
+    image: daprio/dashboard:0.14.0
+    ports: ["8082:8082"]
+    environment:
+      DAPR_DASHBOARD_PORT: "8082"
+    depends_on:
+      - dapr-placement
+    profiles: ["monitoring"]
 
   # ── Express Gateway (BFF) ──
 

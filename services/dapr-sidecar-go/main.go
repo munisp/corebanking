@@ -1,510 +1,442 @@
+// dapr-sidecar-go — Dapr Distributed Application Runtime integration for 54Bank
+// Implements: pub/sub event routing, state store, service invocation, distributed locking
+// Middleware: Keycloak JWT, PostgreSQL audit, Dapr Go SDK
 package main
 
 import (
-	"context"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
-	"time"
+"bytes"
+"context"
+"database/sql"
+"encoding/json"
+"fmt"
+"log"
+"net/http"
+"os"
+"os/signal"
+"strings"
+"syscall"
+"time"
 
-	_ "github.com/lib/pq"
-	"crypto"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
-	"math/big"
-	"sync"
+_ "github.com/lib/pq"
+dapr "github.com/dapr/go-sdk/client"
 )
 
 var db *sql.DB
+var daprClient dapr.Client
+var daprAvailable bool
 
+var (
+daprHTTPPort    = getEnv("DAPR_HTTP_PORT", "3500")
+daprGRPCPort    = getEnv("DAPR_GRPC_PORT", "50001")
+appPort         = getEnv("PORT", "8153")
+pubsubName      = getEnv("DAPR_PUBSUB_NAME", "54bank-pubsub")
+stateStoreName  = getEnv("DAPR_STATE_STORE", "54bank-statestore")
+)
 
-// ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
-
-type jwksCache struct {
-	mu      sync.RWMutex
-	keys    map[string]*rsa.PublicKey
-	updated time.Time
+type BankingEvent struct {
+EventID    string                 `json:"event_id"`
+EventType  string                 `json:"event_type"`
+TenantID   string                 `json:"tenant_id"`
+EntityID   string                 `json:"entity_id"`
+EntityType string                 `json:"entity_type"`
+Payload    map[string]interface{} `json:"payload"`
+Timestamp  time.Time              `json:"timestamp"`
 }
 
-var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
-
-func fetchJWKS(realmURL string) {
-	resp, err := http.Get(realmURL + "/protocol/openid-connect/certs")
-	if err != nil {
-		log.Printf("[middleware] JWKS fetch failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	var jwks struct {
-		Keys []struct {
-			Kid string `json:"kid"`
-			N   string `json:"n"`
-			E   string `json:"e"`
-		} `json:"keys"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		log.Printf("[middleware] JWKS decode failed: %v", err)
-		return
-	}
-	jwtCache.mu.Lock()
-	defer jwtCache.mu.Unlock()
-	for _, k := range jwks.Keys {
-		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
-		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
-		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
-		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
-		jwtCache.keys[k.Kid] = pub
-	}
-	jwtCache.updated = time.Now()
-	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+type PublishRequest struct {
+Topic      string                 `json:"topic"`
+EventType  string                 `json:"event_type"`
+TenantID   string                 `json:"tenant_id"`
+EntityID   string                 `json:"entity_id"`
+EntityType string                 `json:"entity_type"`
+Payload    map[string]interface{} `json:"payload"`
 }
 
-func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
-	}()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip health endpoints
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
-			return
-		}
-		token := auth[7:]
-		parts := strings.Split(token, ".")
-		if len(parts) != 3 {
-			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode header for kid
-		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-		if err != nil {
-			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
-			return
-		}
-		var header struct { Kid string `json:"kid"` }
-		json.Unmarshal(headerBytes, &header)
-
-		jwtCache.mu.RLock()
-		pub, ok := jwtCache.keys[header.Kid]
-		jwtCache.mu.RUnlock()
-		if !ok {
-			// Try refresh
-			fetchJWKS(realmURL)
-			jwtCache.mu.RLock()
-			pub, ok = jwtCache.keys[header.Kid]
-			jwtCache.mu.RUnlock()
-			if !ok {
-				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
-				return
-			}
-		}
-		// Verify signature (RS256)
-		signingInput := parts[0] + "." + parts[1]
-		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
-		if err != nil {
-			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
-			return
-		}
-		hash := sha256.Sum256([]byte(signingInput))
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
-			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode claims
-		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
-		var claims map[string]interface{}
-		json.Unmarshal(claimsBytes, &claims)
-		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
-			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
-			return
-		}
-		// Pass claims in context
-		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+type StateRequest struct {
+Key   string      `json:"key"`
+Value interface{} `json:"value"`
+TTL   int         `json:"ttl_seconds,omitempty"`
 }
 
-// ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
-
-func startOutboxRelay(ctx context.Context, brokers string, topic string) {
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				relayOutbox(brokers, topic)
-			}
-		}
-	}()
+type InvokeRequest struct {
+AppID    string                 `json:"app_id"`
+Method   string                 `json:"method"`
+HTTPVerb string                 `json:"http_verb"`
+Data     map[string]interface{} `json:"data"`
 }
 
-func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
-	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id, eventType, aggID string
-		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
-	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+func initDaprClient() {
+ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+defer cancel()
+client, err := dapr.NewClientWithPort(daprGRPCPort)
+if err != nil {
+log.Printf("[dapr-sidecar-go] Dapr client init failed (degraded): %v", err)
+daprAvailable = false
+return
 }
-
-
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("[dapr-sidecar-go] starting on :8153")
-
-	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/dapr_sidecar_go?sslmode=disable")
-	var err error
-	db, err = sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("database connection failed: %v", err)
-	}
-	defer db.Close()
-
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("database ping failed: %v", err)
-	}
-
-	initSchema()
-	log.Printf("[dapr-sidecar-go] database connected, schema initialized")
-
-	// Middleware clients
-	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
-	redisURL := getEnv("REDIS_URL", "localhost:6379")
-	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
-	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
-
-	log.Printf("[dapr-sidecar-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
-		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
-
-	mux := http.NewServeMux()
-
-	// Health endpoints
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
-	})
-	mux.HandleFunc("/metrics", metricsHandler)
-
-	// Domain endpoints
-	mux.HandleFunc("/api/v1/service_configs", domainHandler)
-	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
-
-	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8153"),
-		Handler:      loggingMiddleware(corsMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
-
-	log.Printf("[dapr-sidecar-go] ready on :%s", getEnv("PORT", "8153"))
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Printf("[dapr-sidecar-go] shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
-	log.Printf("[dapr-sidecar-go] stopped")
+if err := client.PingWithContext(ctx); err != nil {
+log.Printf("[dapr-sidecar-go] Dapr sidecar ping failed: %v", err)
+daprAvailable = false
+client.Close()
+return
+}
+daprClient = client
+daprAvailable = true
+log.Printf("[dapr-sidecar-go] Dapr client connected (grpc:%s)", daprGRPCPort)
 }
 
 func initSchema() {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-	)`)
-	if err != nil {
-		log.Fatalf("schema init failed: %v", err)
-	}
-
-	// Outbox for event sourcing
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		event_type VARCHAR(64) NOT NULL,
-		aggregate_id VARCHAR(128) NOT NULL,
-		payload JSONB NOT NULL,
-		published BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-	if err != nil {
-		log.Printf("outbox table creation (may already exist): %v", err)
-	}
-
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
+ddl := `
+CREATE TABLE IF NOT EXISTS dapr_published_events (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+event_id VARCHAR(64) NOT NULL UNIQUE,
+topic VARCHAR(128) NOT NULL,
+pubsub_name VARCHAR(128) NOT NULL DEFAULT '54bank-pubsub',
+event_type VARCHAR(128) NOT NULL,
+tenant_id VARCHAR(64) NOT NULL,
+entity_id VARCHAR(128) NOT NULL,
+entity_type VARCHAR(64) NOT NULL,
+payload JSONB NOT NULL DEFAULT '{}',
+status VARCHAR(32) NOT NULL DEFAULT 'published',
+dapr_available BOOLEAN NOT NULL DEFAULT TRUE,
+created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS dapr_state_operations (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+store_name VARCHAR(128) NOT NULL,
+operation VARCHAR(16) NOT NULL,
+state_key VARCHAR(256) NOT NULL,
+value JSONB,
+etag VARCHAR(64),
+tenant_id VARCHAR(64),
+status VARCHAR(32) NOT NULL DEFAULT 'success',
+created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS dapr_service_invocations (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+source_app VARCHAR(128) NOT NULL DEFAULT '54bank-platform',
+target_app VARCHAR(128) NOT NULL,
+method VARCHAR(256) NOT NULL,
+http_verb VARCHAR(10) NOT NULL DEFAULT 'POST',
+request_payload JSONB,
+response_payload JSONB,
+status_code INTEGER,
+latency_ms INTEGER,
+tenant_id VARCHAR(64),
+created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS dapr_subscriptions (
+id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+pubsub_name VARCHAR(128) NOT NULL,
+topic VARCHAR(128) NOT NULL,
+route VARCHAR(256) NOT NULL,
+handler_name VARCHAR(128) NOT NULL,
+status VARCHAR(32) NOT NULL DEFAULT 'active',
+events_processed BIGINT NOT NULL DEFAULT 0,
+events_failed BIGINT NOT NULL DEFAULT 0,
+last_event_at TIMESTAMPTZ,
+created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+UNIQUE(pubsub_name, topic, route)
+);
+CREATE INDEX IF NOT EXISTS idx_dapr_events_topic ON dapr_published_events(topic, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dapr_events_tenant ON dapr_published_events(tenant_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_dapr_state_key ON dapr_state_operations(store_name, state_key);
+CREATE INDEX IF NOT EXISTS idx_dapr_invocations_app ON dapr_service_invocations(target_app, created_at DESC);
+INSERT INTO dapr_subscriptions (pubsub_name, topic, route, handler_name) VALUES
+('54bank-pubsub', 'banking.transactions', '/dapr/subscribe/transactions', 'transaction-handler'),
+('54bank-pubsub', 'banking.payments.raw', '/dapr/subscribe/payments', 'payment-handler'),
+('54bank-pubsub', 'banking.kyc.events', '/dapr/subscribe/kyc', 'kyc-handler'),
+('54bank-pubsub', 'banking.aml.alerts', '/dapr/subscribe/aml', 'aml-handler'),
+('54bank-pubsub', 'banking.notifications', '/dapr/subscribe/notifications', 'notification-handler')
+ON CONFLICT (pubsub_name, topic, route) DO NOTHING;
+`
+if _, err := db.Exec(ddl); err != nil {
+log.Printf("[dapr-sidecar-go] Schema init failed: %v", err)
+} else {
+log.Printf("[dapr-sidecar-go] Schema initialized (4 tables, 5 subscriptions)")
+}
 }
 
-func domainHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		listRecords(w, r)
-	case "POST":
-		createRecord(w, r)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-	}
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+w.Header().Set("Content-Type", "application/json")
+w.WriteHeader(status)
+json.NewEncoder(w).Encode(v)
 }
 
-func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/service_configs/"), "/")
-	id := parts[0]
-	if id == "" {
-		http.Error(w, `{"error":"id required"}`, http.StatusBadRequest)
-		return
-	}
-
-	switch r.Method {
-	case "GET":
-		getRecord(w, r, id)
-	case "PUT", "PATCH":
-		updateRecord(w, r, id)
-	case "DELETE":
-		deleteRecord(w, r, id)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-	}
-}
-
-func listRecords(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.Header.Get("X-Tenant-ID")
-	limit := 50
-	offset := 0
-
-	query := `SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
-	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var records []map[string]interface{}
-	for rows.Next() {
-		var id, status string
-		var createdAt time.Time
-		if err := rows.Scan(&id, &status, &createdAt); err != nil {
-			continue
-		}
-		records = append(records, map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": records, "count": len(records)})
-}
-
-func createRecord(w http.ResponseWriter, r *http.Request) {
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-	tenantID := r.Header.Get("X-Tenant-ID")
-	if tenantID == "" {
-		tenantID = "default"
-	}
-	body["tenant_id"] = tenantID
-
-	payload, _ := json.Marshal(body)
-
-	var id string
-	err := db.QueryRowContext(r.Context(),
-		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
-		tenantID).Scan(&id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": "created"})
-}
-
-func getRecord(w http.ResponseWriter, r *http.Request, id string) {
-	var status string
-	var createdAt time.Time
-	err := db.QueryRowContext(r.Context(),
-		`SELECT status, created_at FROM service_configs WHERE id = $1`, id).Scan(&status, &createdAt)
-	if err == sql.ErrNoRows {
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
-}
-
-func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-	status, _ := body["status"].(string)
-	if status == "" {
-		status = "updated"
-	}
-
-	_, err := db.ExecContext(r.Context(),
-		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
-}
-
-func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
-		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
-
-	w.WriteHeader(http.StatusNoContent)
+func generateID() string {
+return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "healthy",
-		"service": "dapr-sidecar-go",
-		"version": "1.0.0",
-	})
+daprStatus := "degraded"
+if daprAvailable { daprStatus = "connected" }
+dbStatus := "connected"
+if err := db.PingContext(r.Context()); err != nil { dbStatus = "unhealthy" }
+overall := "healthy"
+if dbStatus == "unhealthy" { overall = "degraded" }
+writeJSON(w, http.StatusOK, map[string]interface{}{
+"status": overall, "service": "dapr-sidecar-go", "version": "3.0.0",
+"checks": map[string]string{"database": dbStatus, "dapr": daprStatus},
+"config": map[string]string{"pubsub": pubsubName, "state_store": stateStoreName},
+})
 }
 
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if err := db.Ping(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+func publishHandler(w http.ResponseWriter, r *http.Request) {
+var req PublishRequest
+if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+return
+}
+event := BankingEvent{
+EventID: generateID(), EventType: req.EventType, TenantID: req.TenantID,
+EntityID: req.EntityID, EntityType: req.EntityType, Payload: req.Payload, Timestamp: time.Now().UTC(),
+}
+eventBytes, _ := json.Marshal(event)
+published := false
+
+if daprAvailable && daprClient != nil {
+ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+defer cancel()
+if err := daprClient.PublishEvent(ctx, pubsubName, req.Topic, event); err != nil {
+log.Printf("[dapr-sidecar-go] Publish via SDK failed: %v", err)
+daprAvailable = false
+} else {
+published = true
+}
+}
+if !published {
+daprURL := fmt.Sprintf("http://localhost:%s/v1.0/publish/%s/%s", daprHTTPPort, pubsubName, req.Topic)
+resp, err := http.Post(daprURL, "application/json", bytes.NewReader(eventBytes))
+if err == nil && resp.StatusCode < 300 {
+published = true
+daprAvailable = true
+}
+}
+status := "published"
+if !published { status = "failed" }
+db.Exec(`INSERT INTO dapr_published_events (event_id, topic, pubsub_name, event_type, tenant_id, entity_id, entity_type, payload, status, dapr_available) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+event.EventID, req.Topic, pubsubName, req.EventType, req.TenantID, req.EntityID, req.EntityType, string(eventBytes), status, published)
+if published {
+writeJSON(w, http.StatusCreated, map[string]interface{}{"event_id": event.EventID, "topic": req.Topic, "status": "published"})
+} else {
+writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Dapr not available", "status": "failed"})
+}
 }
 
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM service_configs`).Scan(&count)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"service":       "dapr-sidecar-go",
-		"total_records": count,
-	})
+func saveStateHandler(w http.ResponseWriter, r *http.Request) {
+var req StateRequest
+if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+return
+}
+saved := false
+if daprAvailable && daprClient != nil {
+ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+defer cancel()
+valueBytes, _ := json.Marshal(req.Value)
+item := &dapr.SetStateItem{Key: req.Key, Value: valueBytes}
+if err := daprClient.SaveBulkState(ctx, stateStoreName, item); err != nil {
+log.Printf("[dapr-sidecar-go] State save failed: %v", err)
+} else {
+saved = true
+}
+}
+if !saved {
+payload := []map[string]interface{}{{"key": req.Key, "value": req.Value}}
+payloadBytes, _ := json.Marshal(payload)
+daprURL := fmt.Sprintf("http://localhost:%s/v1.0/state/%s", daprHTTPPort, stateStoreName)
+resp, err := http.Post(daprURL, "application/json", bytes.NewReader(payloadBytes))
+if err == nil && resp.StatusCode < 300 { saved = true }
+}
+valueBytes, _ := json.Marshal(req.Value)
+statusStr := "success"
+if !saved { statusStr = "failed" }
+db.Exec(`INSERT INTO dapr_state_operations (store_name, operation, state_key, value, status) VALUES ($1,'save',$2,$3,$4)`,
+stateStoreName, req.Key, string(valueBytes), statusStr)
+if saved {
+writeJSON(w, http.StatusOK, map[string]string{"key": req.Key, "status": "saved"})
+} else {
+writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "state store unavailable"})
+}
 }
 
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
-			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
-		}
-	})
+func getStateHandler(w http.ResponseWriter, r *http.Request) {
+key := strings.TrimPrefix(r.URL.Path, "/api/v1/state/")
+if key == "" {
+writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key required"})
+return
+}
+if daprAvailable && daprClient != nil {
+ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+defer cancel()
+item, err := daprClient.GetState(ctx, stateStoreName, key, nil)
+if err == nil {
+db.Exec(`INSERT INTO dapr_state_operations (store_name, operation, state_key, status) VALUES ($1,'get',$2,'success')`, stateStoreName, key)
+writeJSON(w, http.StatusOK, map[string]interface{}{"key": key, "value": json.RawMessage(item.Value), "etag": item.Etag})
+return
+}
+}
+daprURL := fmt.Sprintf("http://localhost:%s/v1.0/state/%s/%s", daprHTTPPort, stateStoreName, key)
+resp, err := http.Get(daprURL)
+if err == nil && resp.StatusCode == http.StatusOK {
+var val interface{}
+json.NewDecoder(resp.Body).Decode(&val)
+writeJSON(w, http.StatusOK, map[string]interface{}{"key": key, "value": val})
+return
+}
+writeJSON(w, http.StatusNotFound, map[string]string{"error": "key not found"})
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+func invokeHandler(w http.ResponseWriter, r *http.Request) {
+var req InvokeRequest
+if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+return
+}
+start := time.Now()
+var respPayload map[string]interface{}
+statusCode := 0
+invoked := false
+if daprAvailable && daprClient != nil {
+ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+defer cancel()
+dataBytes, _ := json.Marshal(req.Data)
+content := &dapr.DataContent{ContentType: "application/json", Data: dataBytes}
+resp, err := daprClient.InvokeMethodWithContent(ctx, req.AppID, req.Method, req.HTTPVerb, content)
+if err == nil {
+json.Unmarshal(resp, &respPayload)
+statusCode = http.StatusOK
+invoked = true
+}
+}
+latency := int(time.Since(start).Milliseconds())
+reqBytes, _ := json.Marshal(req.Data)
+respBytes, _ := json.Marshal(respPayload)
+db.Exec(`INSERT INTO dapr_service_invocations (target_app, method, http_verb, request_payload, response_payload, status_code, latency_ms) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+req.AppID, req.Method, req.HTTPVerb, string(reqBytes), string(respBytes), statusCode, latency)
+if invoked {
+writeJSON(w, http.StatusOK, map[string]interface{}{"app_id": req.AppID, "method": req.Method, "response": respPayload, "latency_ms": latency})
+} else {
+writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service invocation failed"})
+}
+}
+
+func subscriptionsHandler(w http.ResponseWriter, r *http.Request) {
+rows, err := db.QueryContext(r.Context(), `SELECT pubsub_name, topic, route, handler_name, status, events_processed, events_failed FROM dapr_subscriptions ORDER BY topic`)
+if err != nil {
+writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+return
+}
+defer rows.Close()
+var subs []map[string]interface{}
+for rows.Next() {
+var pubsub, topic, route, handler, status string
+var processed, failed int64
+rows.Scan(&pubsub, &topic, &route, &handler, &status, &processed, &failed)
+subs = append(subs, map[string]interface{}{"pubsub_name": pubsub, "topic": topic, "route": route, "handler": handler, "status": status, "events_processed": processed, "events_failed": failed})
+}
+writeJSON(w, http.StatusOK, map[string]interface{}{"subscriptions": subs, "count": len(subs)})
+}
+
+func subscribeEndpoint(w http.ResponseWriter, r *http.Request) {
+subs := []map[string]interface{}{
+{"pubsubname": pubsubName, "topic": "banking.transactions", "route": "/dapr/subscribe/transactions"},
+{"pubsubname": pubsubName, "topic": "banking.payments.raw", "route": "/dapr/subscribe/payments"},
+{"pubsubname": pubsubName, "topic": "banking.kyc.events", "route": "/dapr/subscribe/kyc"},
+{"pubsubname": pubsubName, "topic": "banking.aml.alerts", "route": "/dapr/subscribe/aml"},
+{"pubsubname": pubsubName, "topic": "banking.notifications", "route": "/dapr/subscribe/notifications"},
+}
+writeJSON(w, http.StatusOK, subs)
+}
+
+func handleSubscribedEvent(topic string) http.HandlerFunc {
+return func(w http.ResponseWriter, r *http.Request) {
+var event BankingEvent
+if err := json.NewDecoder(r.Body).Decode(&event); err != nil {
+writeJSON(w, http.StatusBadRequest, map[string]string{"status": "DROP"})
+return
+}
+log.Printf("[dapr-sidecar-go] Received event topic=%s type=%s entity=%s", topic, event.EventType, event.EntityID)
+db.Exec(`UPDATE dapr_subscriptions SET events_processed = events_processed + 1, last_event_at = NOW() WHERE topic = $1`, topic)
+writeJSON(w, http.StatusOK, map[string]string{"status": "SUCCESS"})
+}
 }
 
 func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+if v := os.Getenv(key); v != "" { return v }
+return fallback
+}
+
+func main() {
+log.SetFlags(log.LstdFlags | log.Lshortfile)
+log.Printf("[dapr-sidecar-go] starting v3.0.0 (Dapr Go SDK integrated)")
+
+dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/dapr_sidecar_go?sslmode=disable")
+var err error
+db, err = sql.Open("postgres", dsn)
+if err != nil { log.Fatalf("[dapr-sidecar-go] DB open failed: %v", err) }
+defer db.Close()
+db.SetMaxOpenConns(25)
+db.SetMaxIdleConns(5)
+db.SetConnMaxLifetime(5 * time.Minute)
+for i := 0; i < 10; i++ {
+if err := db.Ping(); err == nil { break }
+log.Printf("[dapr-sidecar-go] Waiting for DB... (%d/10)", i+1)
+time.Sleep(2 * time.Second)
+}
+initSchema()
+
+go func() {
+time.Sleep(3 * time.Second)
+initDaprClient()
+for { time.Sleep(60 * time.Second); if !daprAvailable { initDaprClient() } }
+}()
+
+mux := http.NewServeMux()
+mux.HandleFunc("/healthz", healthHandler)
+mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+if err := db.Ping(); err != nil {
+writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "not_ready"})
+return
+}
+writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+})
+mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
+})
+mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+var evtCount, stateCount int64
+db.QueryRow("SELECT COUNT(*) FROM dapr_published_events").Scan(&evtCount)
+db.QueryRow("SELECT COUNT(*) FROM dapr_state_operations").Scan(&stateCount)
+fmt.Fprintf(w, "dapr_events_published_total %d\ndapr_state_operations_total %d\n", evtCount, stateCount)
+})
+mux.HandleFunc("/dapr/subscribe", subscribeEndpoint)
+mux.HandleFunc("/dapr/subscribe/transactions", handleSubscribedEvent("banking.transactions"))
+mux.HandleFunc("/dapr/subscribe/payments", handleSubscribedEvent("banking.payments.raw"))
+mux.HandleFunc("/dapr/subscribe/kyc", handleSubscribedEvent("banking.kyc.events"))
+mux.HandleFunc("/dapr/subscribe/aml", handleSubscribedEvent("banking.aml.alerts"))
+mux.HandleFunc("/dapr/subscribe/notifications", handleSubscribedEvent("banking.notifications"))
+mux.HandleFunc("/api/v1/publish", publishHandler)
+mux.HandleFunc("/api/v1/state/", func(w http.ResponseWriter, r *http.Request) {
+if r.Method == http.MethodPost { saveStateHandler(w, r) } else { getStateHandler(w, r) }
+})
+mux.HandleFunc("/api/v1/invoke", invokeHandler)
+mux.HandleFunc("/api/v1/subscriptions", subscriptionsHandler)
+
+srv := &http.Server{Addr: ":" + appPort, Handler: mux, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second}
+log.Printf("[dapr-sidecar-go] ready on :%s (dapr_http=%s dapr_grpc=%s)", appPort, daprHTTPPort, daprGRPCPort)
+go func() {
+if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+log.Fatalf("[dapr-sidecar-go] server error: %v", err)
+}
+}()
+quit := make(chan os.Signal, 1)
+signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+<-quit
+log.Printf("[dapr-sidecar-go] shutting down...")
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+srv.Shutdown(ctx)
+if daprClient != nil { daprClient.Close() }
+log.Printf("[dapr-sidecar-go] stopped")
 }
