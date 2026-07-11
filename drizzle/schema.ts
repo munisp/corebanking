@@ -5428,3 +5428,233 @@ export const kycEventTriggers = pgTable("kyc_event_triggers", {
 ]);
 
 
+
+// ─── Middleware Integration Tables ──────────────────────────────────────────
+// Dapr pub/sub events
+export const daprPublishedEvents = pgTable("dapr_published_events", {
+  id: serial("id").primaryKey(),
+  eventId: varchar("eventId", { length: 64 }).notNull().unique(),
+  topic: varchar("topic", { length: 128 }).notNull(),
+  pubsubName: varchar("pubsubName", { length: 128 }).notNull().default("54bank-pubsub"),
+  eventType: varchar("eventType", { length: 128 }).notNull(),
+  tenantId: varchar("tenantId", { length: 64 }).notNull(),
+  entityId: varchar("entityId", { length: 128 }).notNull(),
+  entityType: varchar("entityType", { length: 64 }).notNull(),
+  payload: jsonb("payload").notNull().default({}),
+  status: varchar("status", { length: 32 }).notNull().default("published"),
+  daprAvailable: boolean("daprAvailable").notNull().default(true),
+  createdAt: timestamp("createdAt").defaultNow(),
+}, (t) => [
+  index("dapr_published_events_topic_idx").on(t.topic),
+  index("dapr_published_events_tenant_idx").on(t.tenantId),
+]);
+
+export const daprStateOperations = pgTable("dapr_state_operations", {
+  id: serial("id").primaryKey(),
+  storeName: varchar("storeName", { length: 128 }).notNull(),
+  operation: varchar("operation", { length: 16 }).notNull(),
+  stateKey: varchar("stateKey", { length: 256 }).notNull(),
+  value: jsonb("value"),
+  etag: varchar("etag", { length: 64 }),
+  tenantId: varchar("tenantId", { length: 64 }),
+  status: varchar("status", { length: 32 }).notNull().default("success"),
+  createdAt: timestamp("createdAt").defaultNow(),
+}, (t) => [
+  index("dapr_state_operations_key_idx").on(t.stateKey),
+]);
+
+export const daprServiceInvocations = pgTable("dapr_service_invocations", {
+  id: serial("id").primaryKey(),
+  sourceApp: varchar("sourceApp", { length: 128 }).notNull().default("54bank-platform"),
+  targetApp: varchar("targetApp", { length: 128 }).notNull(),
+  method: varchar("method", { length: 256 }).notNull(),
+  httpVerb: varchar("httpVerb", { length: 10 }).notNull().default("POST"),
+  requestPayload: jsonb("requestPayload"),
+  responsePayload: jsonb("responsePayload"),
+  statusCode: integer("statusCode"),
+  latencyMs: integer("latencyMs"),
+  tenantId: varchar("tenantId", { length: 64 }),
+  createdAt: timestamp("createdAt").defaultNow(),
+}, (t) => [
+  index("dapr_service_invocations_target_idx").on(t.targetApp),
+]);
+
+export const daprSubscriptions = pgTable("daprSubscriptions", {
+  id: serial("id").primaryKey(),
+  pubsubName: varchar("pubsubName", { length: 128 }).notNull(),
+  topic: varchar("topic", { length: 128 }).notNull(),
+  route: varchar("route", { length: 256 }).notNull(),
+  handlerName: varchar("handlerName", { length: 128 }).notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  eventsProcessed: bigint("eventsProcessed", { mode: "number" }).notNull().default(0),
+  eventsFailed: bigint("eventsFailed", { mode: "number" }).notNull().default(0),
+  lastEventAt: timestamp("lastEventAt"),
+  createdAt: timestamp("createdAt").defaultNow(),
+}, (t) => [
+  index("dapr_subscriptions_topic_idx").on(t.topic),
+  uniqueIndex("dapr_subscriptions_unique_idx").on(t.pubsubName, t.topic, t.route),
+]);
+
+// Temporal workflow executions
+export const temporalWorkflowExecutions = pgTable("temporalWorkflowExecutions", {
+  id: serial("id").primaryKey(),
+  workflowId: varchar("workflowId", { length: 128 }).notNull(),
+  workflowRunId: varchar("workflowRunId", { length: 128 }),
+  workflowType: varchar("workflowType", { length: 128 }).notNull(),
+  taskQueue: varchar("taskQueue", { length: 128 }).notNull(),
+  tenantId: varchar("tenantId", { length: 64 }),
+  inputPayload: jsonb("inputPayload"),
+  resultPayload: jsonb("resultPayload"),
+  status: varchar("status", { length: 32 }).notNull().default("running"),
+  startedAt: timestamp("startedAt").defaultNow(),
+  completedAt: timestamp("completedAt"),
+  errorMessage: text("errorMessage"),
+}, (t) => [
+  index("temporal_workflow_executions_type_idx").on(t.workflowType),
+  index("temporal_workflow_executions_status_idx").on(t.status),
+  uniqueIndex("temporal_workflow_executions_unique_idx").on(t.workflowId, t.workflowRunId),
+]);
+
+export const temporalActivityLog = pgTable("temporalActivityLog", {
+  id: serial("id").primaryKey(),
+  workflowId: varchar("workflowId", { length: 128 }).notNull(),
+  activityName: varchar("activityName", { length: 128 }).notNull(),
+  attempt: integer("attempt").notNull().default(1),
+  status: varchar("status", { length: 32 }).notNull().default("completed"),
+  payload: jsonb("payload"),
+  errorMessage: text("errorMessage"),
+  startedAt: timestamp("startedAt").defaultNow(),
+  completedAt: timestamp("completedAt").defaultNow(),
+}, (t) => [
+  index("temporal_activity_log_workflow_idx").on(t.workflowId),
+]);
+
+export const temporalSagaCompensations = pgTable("temporalSagaCompensations", {
+  id: serial("id").primaryKey(),
+  workflowId: varchar("workflowId", { length: 128 }).notNull(),
+  sagaType: varchar("sagaType", { length: 64 }).notNull(),
+  stepName: varchar("stepName", { length: 128 }).notNull(),
+  compensationActivity: varchar("compensationActivity", { length: 128 }).notNull(),
+  status: varchar("status", { length: 32 }).notNull().default("pending"),
+  executedAt: timestamp("executedAt"),
+  createdAt: timestamp("createdAt").defaultNow(),
+}, (t) => [
+  index("temporal_saga_compensations_workflow_idx").on(t.workflowId),
+  index("temporal_saga_compensations_status_idx").on(t.status),
+]);
+
+// Fluvio topics registry
+export const fluvioTopics = pgTable("fluvioTopics", {
+  id: serial("id").primaryKey(),
+  name: varchar("name", { length: 128 }).notNull().unique(),
+  partitions: integer("partitions").notNull().default(12),
+  replicationFactor: integer("replicationFactor").notNull().default(3),
+  retentionMs: bigint("retentionMs", { mode: "number" }).default(604800000),
+  compression: varchar("compression", { length: 16 }).default("lz4"),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  tenantId: varchar("tenantId", { length: 64 }),
+  createdAt: timestamp("createdAt").defaultNow(),
+  updatedAt: timestamp("updatedAt").defaultNow(),
+}, (t) => [
+  index("fluvio_topics_status_idx").on(t.status),
+]);
+
+export const fluvioEventLog = pgTable("fluvioEventLog", {
+  id: serial("id").primaryKey(),
+  eventId: varchar("eventId", { length: 64 }).notNull().unique(),
+  topic: varchar("topic", { length: 128 }).notNull(),
+  eventType: varchar("eventType", { length: 128 }).notNull(),
+  tenantId: varchar("tenantId", { length: 64 }).notNull(),
+  entityId: varchar("entityId", { length: 128 }).notNull(),
+  entityType: varchar("entityType", { length: 64 }).notNull(),
+  payload: jsonb("payload").notNull().default({}),
+  partitionKey: varchar("partitionKey", { length: 128 }),
+  fluvioOffset: bigint("fluvioOffset", { mode: "number" }),
+  backend: varchar("backend", { length: 32 }).notNull().default("fluvio"),
+  producedAt: timestamp("producedAt").defaultNow(),
+}, (t) => [
+  index("fluvio_event_log_topic_idx").on(t.topic),
+  index("fluvio_event_log_tenant_idx").on(t.tenantId),
+]);
+
+export const fluvioEventOutbox = pgTable("fluvioEventOutbox", {
+  id: serial("id").primaryKey(),
+  eventId: varchar("eventId", { length: 64 }).notNull().unique(),
+  topic: varchar("topic", { length: 128 }).notNull(),
+  eventType: varchar("eventType", { length: 128 }).notNull(),
+  tenantId: varchar("tenantId", { length: 64 }).notNull(),
+  entityId: varchar("entityId", { length: 128 }).notNull(),
+  payload: jsonb("payload").notNull().default({}),
+  status: varchar("status", { length: 32 }).notNull().default("pending"),
+  attempts: integer("attempts").notNull().default(0),
+  lastError: text("lastError"),
+  createdAt: timestamp("createdAt").defaultNow(),
+  processedAt: timestamp("processedAt"),
+}, (t) => [
+  index("fluvio_event_outbox_status_idx").on(t.status),
+  index("fluvio_event_outbox_topic_idx").on(t.topic),
+]);
+
+export const fluvioConsumerGroups = pgTable("fluvioConsumerGroups", {
+  id: serial("id").primaryKey(),
+  groupId: varchar("groupId", { length: 128 }).notNull(),
+  topic: varchar("topic", { length: 128 }).notNull(),
+  partitionId: integer("partitionId").notNull().default(0),
+  committedOffset: bigint("committedOffset", { mode: "number" }).notNull().default(0),
+  lag: bigint("lag", { mode: "number" }).notNull().default(0),
+  consumerId: varchar("consumerId", { length: 128 }),
+  status: varchar("status", { length: 32 }).notNull().default("active"),
+  lastHeartbeat: timestamp("lastHeartbeat"),
+  createdAt: timestamp("createdAt").defaultNow(),
+  updatedAt: timestamp("updatedAt").defaultNow(),
+}, (t) => [
+  uniqueIndex("fluvio_consumer_groups_unique_idx").on(t.groupId, t.topic, t.partitionId),
+]);
+
+// Redis rate limit log
+export const redisRateLimitLog = pgTable("redisRateLimitLog", {
+  id: serial("id").primaryKey(),
+  rateKey: varchar("rateKey", { length: 512 }).notNull(),
+  tenantId: varchar("tenantId", { length: 64 }),
+  windowStart: timestamp("windowStart").defaultNow(),
+  windowSeconds: integer("windowSeconds").notNull(),
+  requestCount: bigint("requestCount", { mode: "number" }).notNull().default(1),
+  limitValue: bigint("limitValue", { mode: "number" }).notNull(),
+  allowed: boolean("allowed").notNull().default(true),
+  createdAt: timestamp("createdAt").defaultNow(),
+}, (t) => [
+  index("redis_rate_limit_log_key_idx").on(t.rateKey),
+]);
+
+// OpenAppSec WAF events
+export const openappsecWafEvents = pgTable("openappsecWafEvents", {
+  id: serial("id").primaryKey(),
+  eventType: varchar("eventType", { length: 64 }).notNull(),
+  severity: varchar("severity", { length: 16 }).notNull().default("medium"),
+  sourceIp: varchar("sourceIp", { length: 64 }),
+  requestUri: text("requestUri"),
+  method: varchar("method", { length: 10 }),
+  userAgent: text("userAgent"),
+  attackType: varchar("attackType", { length: 64 }),
+  confidence: varchar("confidence", { length: 16 }),
+  action: varchar("action", { length: 16 }).notNull().default("detect"),
+  tenantId: varchar("tenantId", { length: 64 }),
+  createdAt: timestamp("createdAt").defaultNow(),
+}, (t) => [
+  index("openappsec_waf_events_type_idx").on(t.eventType),
+  index("openappsec_waf_events_ip_idx").on(t.sourceIp),
+  index("openappsec_waf_events_severity_idx").on(t.severity),
+]);
+
+export const openappsecLearningData = pgTable("openappsecLearningData", {
+  id: serial("id").primaryKey(),
+  endpoint: varchar("endpoint", { length: 256 }).notNull(),
+  method: varchar("method", { length: 10 }).notNull(),
+  paramName: varchar("paramName", { length: 128 }),
+  paramType: varchar("paramType", { length: 32 }),
+  sampleCount: integer("sampleCount").default(0),
+  lastSeen: timestamp("lastSeen").defaultNow(),
+  createdAt: timestamp("createdAt").defaultNow(),
+}, (t) => [
+  index("openappsec_learning_data_endpoint_idx").on(t.endpoint),
+]);

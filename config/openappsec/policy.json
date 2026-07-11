@@ -1,0 +1,33 @@
+{
+  "policies": {
+    "default": {
+      "mode": "learning",
+      "practices": ["WebAttacks", "Snort"],
+      "triggers": ["log"],
+      "exceptions": []
+    }
+  },
+  "assets": [
+    {
+      "name": "54bank-api",
+      "urls": ["http://apisix:9080/api/v1/*"],
+      "policy": "default"
+    }
+  ],
+  "triggers": [
+    {
+      "name": "log",
+      "type": "log",
+      "verbosity": "standard",
+      "extendedLogging": true
+    }
+  ],
+  "practices": [
+    {
+      "name": "WebAttacks",
+      "type": "WebAttacks",
+      "overrideMode": "learning",
+      "minimumConfidence": "medium"
+    }
+  ]
+}
