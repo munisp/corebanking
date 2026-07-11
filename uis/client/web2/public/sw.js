@@ -1,165 +1,132 @@
 /* eslint-disable no-restricted-globals */
 /**
  * Service Worker for PWA Offline Functionality
- * Handles caching, background sync, and offline support
+ * Handles caching, background sync, and offline support.
+ *
+ * CACHE BUSTING: The CACHE_VERSION below is bumped by the build pipeline
+ * (vite-plugin-version-inject or CI sed). When it changes, the activate
+ * handler deletes every old cache, guaranteeing users get fresh assets.
  */
 
-const CACHE_NAME = '54link-pwa-cache-v1';
+const CACHE_VERSION = '__BUILD_HASH__';
+const CACHE_NAME = `54link-pwa-cache-${CACHE_VERSION}`;
 const OFFLINE_PAGE = '/offline';
 
-// Assets to cache on install
-// Don't cache the root HTML page - it's dynamically generated with tenant colors
 const STATIC_ASSETS = [
   '/offline',
   '/manifest.json',
 ];
 
-// Install event - cache static assets
+// Install — cache static assets and activate immediately
 self.addEventListener('install', (event) => {
-  console.log('[Service Worker] Installing...');
   event.waitUntil(
     caches.open(CACHE_NAME)
-      .then((cache) => {
-        console.log('[Service Worker] Caching static assets');
-        return cache.addAll(STATIC_ASSETS);
-      })
+      .then((cache) => cache.addAll(STATIC_ASSETS))
       .then(() => self.skipWaiting())
   );
 });
 
-// Activate event - clean up old caches
+// Activate — delete ALL caches that don't match the current version
 self.addEventListener('activate', (event) => {
-  console.log('[Service Worker] Activating...');
   event.waitUntil(
     caches.keys().then((cacheNames) => {
       return Promise.all(
-        cacheNames.map((cacheName) => {
-          if (cacheName !== CACHE_NAME) {
-            console.log('[Service Worker] Deleting old cache:', cacheName);
-            return caches.delete(cacheName);
-          }
-        })
+        cacheNames
+          .filter((name) => name !== CACHE_NAME)
+          .map((name) => {
+            console.log('[SW] Purging stale cache:', name);
+            return caches.delete(name);
+          })
       );
-    }).then(() => self.clients.claim())
+    })
+    .then(() => self.clients.claim())
+    .then(() => {
+      // Notify all open tabs that a new version is active
+      return self.clients.matchAll({ type: 'window' }).then((clients) => {
+        clients.forEach((client) => {
+          client.postMessage({ type: 'SW_UPDATED', version: CACHE_VERSION });
+        });
+      });
+    })
   );
 });
 
-// Fetch event - serve from cache when offline
+// Fetch — network-first for HTML, cache-first for hashed assets
 self.addEventListener('fetch', (event) => {
   const { request } = event;
   const url = new URL(request.url);
 
-  // Skip non-GET requests and external URLs
-  if (request.method !== 'GET' || url.origin !== location.origin) {
-    return;
-  }
+  if (request.method !== 'GET' || url.origin !== location.origin) return;
+  if (url.pathname.startsWith('/api/') || url.pathname.includes('/api/')) return;
 
-  // Skip API calls - let them fail for offline handling
-  if (url.pathname.startsWith('/api/') || url.pathname.includes('/api/')) {
-    return;
-  }
-
-  // For HTML pages (navigation requests), use network-first strategy
-  // This ensures tenant colors are always fresh and not cached
+  // HTML navigation — always network-first (never serve stale HTML)
   if (request.mode === 'navigate' || request.headers.get('accept')?.includes('text/html')) {
     event.respondWith(
       fetch(request)
-        .then((response) => {
-          // Don't cache HTML pages - they contain dynamic tenant colors
-          return response;
-        })
-        .catch(() => {
-          // If offline, show offline page
-          return caches.match(OFFLINE_PAGE) || new Response('Offline', { status: 503 });
-        })
+        .catch(() => caches.match(OFFLINE_PAGE) || new Response('Offline', { status: 503 }))
     );
     return;
   }
 
-  // For other assets (JS, CSS, images), use cache-first strategy
-  event.respondWith(
-    caches.match(request)
-      .then((cachedResponse) => {
-        // Return cached version if available
-        if (cachedResponse) {
-          return cachedResponse;
-        }
-
-        // Try network, fallback to offline page if offline
-        return fetch(request)
-          .then((response) => {
-            // Cache successful responses (but not HTML pages)
-            if (response.status === 200 && !response.headers.get('content-type')?.includes('text/html')) {
-              const responseToCache = response.clone();
-              caches.open(CACHE_NAME).then((cache) => {
-                cache.put(request, responseToCache);
-              });
-            }
-            return response;
-          })
-          .catch(() => {
-            // If offline and no cache, return error
-            return new Response('Offline', { status: 503 });
-          });
+  // Hashed assets under /assets/ — cache-first (immutable filenames)
+  if (url.pathname.startsWith('/assets/')) {
+    event.respondWith(
+      caches.match(request).then((cached) => {
+        if (cached) return cached;
+        return fetch(request).then((response) => {
+          if (response.status === 200) {
+            const clone = response.clone();
+            caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+          }
+          return response;
+        });
       })
+    );
+    return;
+  }
+
+  // Other assets — stale-while-revalidate
+  event.respondWith(
+    caches.match(request).then((cached) => {
+      const networkFetch = fetch(request).then((response) => {
+        if (response.status === 200) {
+          const clone = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(request, clone));
+        }
+        return response;
+      }).catch(() => cached || new Response('Offline', { status: 503 }));
+
+      return cached || networkFetch;
+    })
   );
 });
 
 // Background sync for queued operations
 self.addEventListener('sync', (event) => {
-  console.log('[Service Worker] Background sync:', event.tag);
-  
   if (event.tag === 'sync-pending-transfers') {
-    event.waitUntil(syncPendingTransfers());
+    event.waitUntil(notifyClients('SYNC_PENDING_TRANSFERS'));
   }
-  
   if (event.tag === 'sync-scheduled-transfers') {
-    event.waitUntil(syncScheduledTransfers());
+    event.waitUntil(notifyClients('SYNC_SCHEDULED_TRANSFERS'));
   }
 });
 
-// Sync pending transfers
-async function syncPendingTransfers() {
-  try {
-    // This will be handled by the sync service in the app
-    // The service worker just triggers the sync
-    const clients = await self.clients.matchAll();
-    clients.forEach((client) => {
-      client.postMessage({
-        type: 'SYNC_PENDING_TRANSFERS',
-      });
-    });
-  } catch (error) {
-    console.error('[Service Worker] Sync error:', error);
-  }
+async function notifyClients(type) {
+  const clients = await self.clients.matchAll();
+  clients.forEach((client) => client.postMessage({ type }));
 }
 
-// Sync scheduled transfers
-async function syncScheduledTransfers() {
-  try {
-    const clients = await self.clients.matchAll();
-    clients.forEach((client) => {
-      client.postMessage({
-        type: 'SYNC_SCHEDULED_TRANSFERS',
-      });
-    });
-  } catch (error) {
-    console.error('[Service Worker] Sync error:', error);
-  }
-}
-
-// Message handler for communication with app
+// Message handler
 self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
+  if (event.data?.type === 'SKIP_WAITING') {
     self.skipWaiting();
   }
-  
-  if (event.data && event.data.type === 'CACHE_URLS') {
+  if (event.data?.type === 'CACHE_URLS') {
     event.waitUntil(
-      caches.open(CACHE_NAME).then((cache) => {
-        return cache.addAll(event.data.urls);
-      })
+      caches.open(CACHE_NAME).then((cache) => cache.addAll(event.data.urls))
     );
   }
+  if (event.data?.type === 'GET_VERSION') {
+    event.source.postMessage({ type: 'SW_VERSION', version: CACHE_VERSION });
+  }
 });
-

@@ -1,13 +1,61 @@
-# tenant-web-app
+# tenant-web-app (PUP)
 apiVersion: apisix.apache.org/v2
 kind: ApisixRoute
 metadata:
   name: 54link-tenant-web-app-route
   namespace: 54link-dev
 spec:
-  ingressClassName:  apisix
+  ingressClassName: apisix
   http:
-    - name: rule-1
+    # Static hashed assets — immutable cache (1 year)
+    - name: hashed-assets
+      priority: 20
+      match:
+        hosts:
+          - pup.54link-dev.upi.dev
+        paths:
+          - /assets/*
+      backends:
+        - serviceName: pup-web-app
+          servicePort: 80
+      plugins:
+        - name: response-rewrite
+          enable: true
+          config:
+            headers:
+              set:
+                Cache-Control: "public, max-age=31536000, immutable"
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "*"
+            allow_methods: "*"
+            allow_headers: "*"
+            expose_headers: "*"
+
+    # Service worker — never cache
+    - name: service-worker
+      priority: 15
+      match:
+        hosts:
+          - pup.54link-dev.upi.dev
+        paths:
+          - /sw.js
+      backends:
+        - serviceName: pup-web-app
+          servicePort: 80
+      plugins:
+        - name: response-rewrite
+          enable: true
+          config:
+            headers:
+              set:
+                Cache-Control: "no-cache, no-store, must-revalidate"
+                Pragma: "no-cache"
+                Expires: "0"
+
+    # HTML pages and fallback — no cache
+    - name: html-no-cache
       priority: 10
       match:
         hosts:
@@ -18,6 +66,14 @@ spec:
         - serviceName: pup-web-app
           servicePort: 80
       plugins:
+        - name: response-rewrite
+          enable: true
+          config:
+            headers:
+              set:
+                Cache-Control: "no-cache, no-store, must-revalidate"
+                Pragma: "no-cache"
+                Expires: "0"
         - name: cors
           enable: true
           config:
