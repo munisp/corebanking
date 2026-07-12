@@ -1,12 +1,13 @@
 FROM golang:1.22-alpine AS builder
+RUN apk add --no-cache ca-certificates
 WORKDIR /app
-COPY main.go .
-RUN CGO_ENABLED=0 go build -o /service main.go
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o eod-processor .
 
 FROM alpine:3.19
-COPY --from=builder /service /service
-EXPOSE 8200
-RUN adduser -D -u 1001 appuser
-USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8200/healthz || exit 1
-CMD ["/service"]
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /app/eod-processor /usr/local/bin/
+EXPOSE 8207
+CMD ["eod-processor"]

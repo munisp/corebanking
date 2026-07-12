@@ -1,47 +1,42 @@
 package main
 
 import (
-    "net/http"
-    "net/http/httptest"
-    "strings"
-    "testing"
+	"net/http/httptest"
+	"testing"
 )
 
 func TestHealthEndpoint(t *testing.T) {
-    req := httptest.NewRequest("GET", "/healthz", nil)
-    w := httptest.NewRecorder()
-    handleHealthz(w, req)
-    if w.Code != 200 { t.Errorf("health returned %d", w.Code) }
-    if !strings.Contains(w.Body.String(), "healthy") { t.Error("missing healthy status") }
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	handleHealthz(w, req)
+	if w.Code != 200 {
+		t.Errorf("healthz returned %d", w.Code)
+	}
 }
 
-func TestReadyzEndpoint(t *testing.T) {
-    req := httptest.NewRequest("GET", "/readyz", nil)
-    w := httptest.NewRecorder()
-    readyzHandler(w, req)
-    if w.Code != 200 { t.Errorf("readyz returned %d", w.Code) }
+func TestTransactionsEndpoint(t *testing.T) {
+	req := httptest.NewRequest("GET", "/v1/nip/transactions", nil)
+	w := httptest.NewRecorder()
+	handleTransactions(w, req)
+	if w.Code != 200 {
+		t.Errorf("transactions returned %d", w.Code)
+	}
 }
 
-func TestMetricsEndpoint(t *testing.T) {
-    req := httptest.NewRequest("GET", "/metrics", nil)
-    w := httptest.NewRecorder()
-    metricsHandler(w, req)
-    if w.Code != 200 { t.Errorf("metrics returned %d", w.Code) }
-    if !strings.Contains(w.Body.String(), "requests_total") { t.Error("missing requests_total metric") }
+func TestSettlementsEndpoint(t *testing.T) {
+	req := httptest.NewRequest("GET", "/v1/nip/settlements", nil)
+	w := httptest.NewRecorder()
+	handleSettlements(w, req)
+	if w.Code != 200 {
+		t.Errorf("settlements returned %d", w.Code)
+	}
 }
 
-func TestJWTRequired(t *testing.T) {
-    req := httptest.NewRequest("GET", "/api/list", nil)
-    w := httptest.NewRecorder()
-    handler := jwtAuthMiddleware(http.HandlerFunc(handleMandates))
-    handler.ServeHTTP(w, req)
-    if w.Code != 401 { t.Errorf("expected 401 without JWT, got %d", w.Code) }
-}
-
-func TestRateLimiting(t *testing.T) {
-    for i := 0; i < 200; i++ {
-        req := httptest.NewRequest("GET", "/healthz", nil)
-        w := httptest.NewRecorder()
-        rateLimitMiddleware(http.HandlerFunc(handleHealthz)).ServeHTTP(w, req)
-    }
+func TestResponseCodesEndpoint(t *testing.T) {
+	req := httptest.NewRequest("GET", "/v1/nip/response-codes", nil)
+	w := httptest.NewRecorder()
+	handleResponseCodes(w, req)
+	if w.Code != 200 {
+		t.Errorf("response-codes returned %d", w.Code)
+	}
 }

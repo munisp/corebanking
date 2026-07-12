@@ -1,0 +1,78 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-core-payments
+  pullPolicy: IfNotPresent
+  tag: "0.0.24"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9330
+    - port: 9333
+    - port: 9334
+    - port: 9335
+    - port: 9336
+    - port: 9337
+    - port: 9338
+    - port: 9339
+    - port: 9340
+    - port: 9341
+    - port: 9342
+    - port: 9343
+    - port: 9344
+    - port: 9345
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: core-payments
+  appPort: 9338
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  DB_DATABASE_TYPE: "postgres"
+  DB_DATABASE: link_core_banking
+  DB_USERNAME: doadmin
+  USER_SERVICE_URL: "https://54link-dev.upi.dev/user"
+  TRANSACTION_LEDGER_URL: "https://54link-dev.upi.dev/ledger"
+  SANCTIONS_SCREENING_URL: "https://54link-dev.upi.dev/sanctions"
+  MOJALOOP_CONNECTOR_URL: "http://mojaloop-connector.54link-dev.svc.cluster.local:9489"
+  ACCOUNT_SVC_URL: "http://core-accounts.54link-dev.svc.cluster.local:9280"
+  FRAUD_ENGINE_SVC_URL: "http://compliance-fraud.54link-dev.svc.cluster.local:9200"
+  COMMISSION_SVC_URL: "http://core-payments.54link-dev.svc.cluster.local:9333"
+  MAKER_CHECKER_URL: "https://54link-dev.upi.dev/approvals"
+  NFIU_SERVICE_URL: "https://54link-dev.upi.dev/ctr"
+  BILLING_SVC_URL: "https://54link-dev.upi.dev/billings"
+  APP_PORT: "9330"
+  PORT_BASE: "9330"
+  SERVICE_GROUP: core-payments
+  SERVICES: "beneficiary-management-go,commission-settlement,mandate-management-go,merchant-service,nibss-direct-debit-go,nibss-nip-engine-go,payment-hub,payment-investigation-go,payment-processing-service,payment-rails-connectors,qr-payments-go,standing-orders-go,utility-payments-go,whatsapp-payment-integration-go"

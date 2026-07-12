@@ -1,0 +1,55 @@
+name: Build Infra Caching Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/bloom-filter-cache-rs/**'
+      - 'services/cache-invalidation-rs/**'
+      - 'services/cdn-edge-cache-go/**'
+      - 'services/hot-data-cache-rs/**'
+      - 'services/prepared-stmt-cache-go/**'
+      - 'services/query-cache-engine-rs/**'
+      - 'services/redis-cache-middleware-rs/**'
+      - 'services/redis-cache-rs/**'
+      - 'services/redis-session-store-go/**'
+      - 'services/sw-api-cache-go/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
+      - 'docker/build-services.sh'
+      - '.github/workflows/infra-caching.yaml'
+
+env:
+  TAG: "0.0.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=bloom-filter-cache-rs,cache-invalidation-rs,cdn-edge-cache-go,hot-data-cache-rs,prepared-stmt-cache-go,query-cache-engine-rs,redis-cache-middleware-rs,redis-cache-rs,redis-session-store-go,sw-api-cache-go
+            PRIMARY_LANG=go
+            PORT_BASE=9387
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-infra-caching:${{ env.TAG }}

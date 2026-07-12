@@ -8,11 +8,11 @@ import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 REMITTANCE_CORRIDORS = [
-    {"id": "RC-001", "corridor": "UK→NG", "sourceCurrency": "GBP", "targetCurrency": "NGN", "rate": 1950.00, "fee": 4.99, "feeCurrency": "GBP", "minAmount": 10, "maxAmount": 50000, "estimatedTime": "15 minutes", "provider": "54Bank Direct", "status": "active"},
-    {"id": "RC-002", "corridor": "US→NG", "sourceCurrency": "USD", "targetCurrency": "NGN", "rate": 1500.00, "fee": 3.99, "feeCurrency": "USD", "minAmount": 10, "maxAmount": 50000, "estimatedTime": "15 minutes", "provider": "54Bank Direct", "status": "active"},
-    {"id": "RC-003", "corridor": "EU→NG", "sourceCurrency": "EUR", "targetCurrency": "NGN", "rate": 1680.00, "fee": 4.49, "feeCurrency": "EUR", "minAmount": 10, "maxAmount": 50000, "estimatedTime": "30 minutes", "provider": "54Bank Direct", "status": "active"},
-    {"id": "RC-004", "corridor": "CA→NG", "sourceCurrency": "CAD", "targetCurrency": "NGN", "rate": 1100.00, "fee": 5.99, "feeCurrency": "CAD", "minAmount": 10, "maxAmount": 25000, "estimatedTime": "1 hour", "provider": "54Bank Direct", "status": "active"},
-    {"id": "RC-005", "corridor": "AE→NG", "sourceCurrency": "AED", "targetCurrency": "NGN", "rate": 408.00, "fee": 15.00, "feeCurrency": "AED", "minAmount": 50, "maxAmount": 100000, "estimatedTime": "30 minutes", "provider": "54Bank Direct", "status": "active"},
+    {"id": "RC-001", "corridor": "UK→NG", "sourceCurrency": "GBP", "targetCurrency": "NGN", "rate": 1950.00, "fee": 4.99, "feeCurrency": "GBP", "minAmount": 10, "maxAmount": 50000, "estimatedTime": "15 minutes", "provider": "54link-dev Direct", "status": "active"},
+    {"id": "RC-002", "corridor": "US→NG", "sourceCurrency": "USD", "targetCurrency": "NGN", "rate": 1500.00, "fee": 3.99, "feeCurrency": "USD", "minAmount": 10, "maxAmount": 50000, "estimatedTime": "15 minutes", "provider": "54link-dev Direct", "status": "active"},
+    {"id": "RC-003", "corridor": "EU→NG", "sourceCurrency": "EUR", "targetCurrency": "NGN", "rate": 1680.00, "fee": 4.49, "feeCurrency": "EUR", "minAmount": 10, "maxAmount": 50000, "estimatedTime": "30 minutes", "provider": "54link-dev Direct", "status": "active"},
+    {"id": "RC-004", "corridor": "CA→NG", "sourceCurrency": "CAD", "targetCurrency": "NGN", "rate": 1100.00, "fee": 5.99, "feeCurrency": "CAD", "minAmount": 10, "maxAmount": 25000, "estimatedTime": "1 hour", "provider": "54link-dev Direct", "status": "active"},
+    {"id": "RC-005", "corridor": "AE→NG", "sourceCurrency": "AED", "targetCurrency": "NGN", "rate": 408.00, "fee": 15.00, "feeCurrency": "AED", "minAmount": 50, "maxAmount": 100000, "estimatedTime": "30 minutes", "provider": "54link-dev Direct", "status": "active"},
 ]
 
 DIASPORA_ACCOUNTS = [
@@ -39,7 +39,7 @@ MIDDLEWARE_CONFIG = {
     "redis": {"url": os.environ.get("REDIS_URL", "redis://localhost:6379")},
     "postgres": {"url": os.environ.get("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db")},
     "opensearch": {"url": os.environ.get("OPENSEARCH_URL", "http://localhost:9200")},
-    "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank"},
+    "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev"},
     "permify": {"url": os.environ.get("PERMIFY_URL", "http://localhost:3476")},
     "dapr": {"url": os.environ.get("DAPR_URL", "http://localhost:3500")},
     "fluvio": {"url": os.environ.get("FLUVIO_URL", "localhost:9003")},

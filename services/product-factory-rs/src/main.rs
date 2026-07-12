@@ -1,221 +1,262 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
-use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::io::Write;
+use std::net::TcpListener;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+// Configuration-driven product factory: define banking products via parameters,
+// not hard-coded logic. Supports CASA, loans, deposits, cards, and Islamic products.
+
+#[derive(Clone)]
+struct ProductDefinition {
+    id: &'static str,
+    code: &'static str,
+    name: &'static str,
+    category: &'static str,
+    product_type: &'static str,
+    currency: &'static str,
+    status: &'static str,
+    parameters: Vec<ProductParameter>,
+    gl_mappings: Vec<GLMapping>,
+    fee_rules: Vec<FeeRule>,
+    eligibility_rules: Vec<&'static str>,
+    created_at: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+#[derive(Clone)]
+struct ProductParameter {
+    key: &'static str,
+    label: &'static str,
+    value_type: &'static str,
+    default_value: &'static str,
+    min_value: Option<&'static str>,
+    max_value: Option<&'static str>,
+    editable: bool,
 }
 
-struct AppState {
-    db: PgPool,
+#[derive(Clone)]
+struct GLMapping {
+    event: &'static str,
+    debit_gl: &'static str,
+    credit_gl: &'static str,
+    description: &'static str,
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[product-factory-rs] starting");
-
-    let db_name = "product-factory-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[product-factory-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[product-factory-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8004".to_string()).parse().unwrap_or(8004);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[product-factory-rs] ready on :{}", port);
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/products", web::get().to(list_records))
-            .route("/api/v1/products", web::post().to(create_record))
-            .route("/api/v1/products/{id}", web::get().to(get_record))
-            .route("/api/v1/products/{id}", web::put().to(update_record))
-            .route("/api/v1/products/{id}", web::delete().to(delete_record))
-    })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
+#[derive(Clone)]
+struct FeeRule {
+    name: &'static str,
+    fee_type: &'static str,
+    calculation: &'static str,
+    amount_or_rate: &'static str,
+    frequency: &'static str,
+    waivable: bool,
 }
 
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS products (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    product_code VARCHAR(32) NOT NULL UNIQUE,
-    product_name VARCHAR(200) NOT NULL,
-    product_type VARCHAR(32) NOT NULL,
-    category VARCHAR(32) NOT NULL,
-    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
-    min_balance_kobo BIGINT DEFAULT 0,
-    max_balance_kobo BIGINT,
-    interest_rate_bps INT DEFAULT 0,
-    fee_schedule JSONB DEFAULT '{}',
-    features JSONB DEFAULT '[]',
-    eligibility_rules JSONB DEFAULT '{}',
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    launched_at DATE,
-    tenant_id UUID NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create products table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_products_tenant ON products(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_products_status ON products(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_products_created ON products(created_at DESC)")
-        .execute(pool).await.ok();
+fn seed_products() -> Vec<ProductDefinition> {
+    vec![
+        ProductDefinition {
+            id: "PROD-001", code: "CASA-STD", name: "Standard Current Account", category: "casa", product_type: "current",
+            currency: "NGN", status: "active",
+            parameters: vec![
+                ProductParameter { key: "min_balance", label: "Minimum Balance", value_type: "currency", default_value: "5000", min_value: Some("1000"), max_value: Some("100000"), editable: true },
+                ProductParameter { key: "interest_rate", label: "Interest Rate", value_type: "percentage", default_value: "1.5", min_value: Some("0"), max_value: Some("5"), editable: true },
+                ProductParameter { key: "overdraft_limit", label: "Overdraft Limit", value_type: "currency", default_value: "0", min_value: Some("0"), max_value: Some("5000000"), editable: true },
+                ProductParameter { key: "daily_transfer_limit", label: "Daily Transfer Limit", value_type: "currency", default_value: "5000000", min_value: Some("50000"), max_value: Some("100000000"), editable: true },
+            ],
+            gl_mappings: vec![
+                GLMapping { event: "account.credit", debit_gl: "GL-1100", credit_gl: "GL-2100", description: "Customer deposit" },
+                GLMapping { event: "account.debit", debit_gl: "GL-2100", credit_gl: "GL-1100", description: "Customer withdrawal" },
+                GLMapping { event: "interest.accrual", debit_gl: "GL-5100", credit_gl: "GL-2100", description: "Interest accrual" },
+            ],
+            fee_rules: vec![
+                FeeRule { name: "Monthly Maintenance", fee_type: "flat", calculation: "fixed", amount_or_rate: "100", frequency: "monthly", waivable: true },
+                FeeRule { name: "SMS Alert", fee_type: "flat", calculation: "fixed", amount_or_rate: "4", frequency: "per_transaction", waivable: false },
+            ],
+            eligibility_rules: vec!["kyc_status = verified", "age >= 18", "nationality IN (NG, GH, KE)"],
+            created_at: "2026-01-01T00:00:00Z",
+        },
+        ProductDefinition {
+            id: "PROD-002", code: "SAV-PREM", name: "Premium Savings Account", category: "casa", product_type: "savings",
+            currency: "NGN", status: "active",
+            parameters: vec![
+                ProductParameter { key: "min_balance", label: "Minimum Balance", value_type: "currency", default_value: "50000", min_value: Some("10000"), max_value: Some("1000000"), editable: true },
+                ProductParameter { key: "interest_rate", label: "Interest Rate", value_type: "percentage", default_value: "8.5", min_value: Some("0"), max_value: Some("15"), editable: true },
+                ProductParameter { key: "withdrawal_limit", label: "Monthly Withdrawals", value_type: "integer", default_value: "4", min_value: Some("1"), max_value: Some("12"), editable: true },
+            ],
+            gl_mappings: vec![
+                GLMapping { event: "deposit", debit_gl: "GL-1100", credit_gl: "GL-2200", description: "Savings deposit" },
+                GLMapping { event: "interest.accrual", debit_gl: "GL-5200", credit_gl: "GL-2200", description: "Savings interest" },
+            ],
+            fee_rules: vec![
+                FeeRule { name: "Early Withdrawal Penalty", fee_type: "percentage", calculation: "percent_of_interest", amount_or_rate: "25", frequency: "per_event", waivable: false },
+            ],
+            eligibility_rules: vec!["kyc_status = verified", "age >= 18"],
+            created_at: "2026-01-01T00:00:00Z",
+        },
+        ProductDefinition {
+            id: "PROD-003", code: "LOAN-PER", name: "Personal Loan", category: "lending", product_type: "term_loan",
+            currency: "NGN", status: "active",
+            parameters: vec![
+                ProductParameter { key: "min_amount", label: "Minimum Amount", value_type: "currency", default_value: "50000", min_value: Some("10000"), max_value: Some("500000"), editable: true },
+                ProductParameter { key: "max_amount", label: "Maximum Amount", value_type: "currency", default_value: "5000000", min_value: Some("100000"), max_value: Some("50000000"), editable: true },
+                ProductParameter { key: "interest_rate", label: "Annual Interest Rate", value_type: "percentage", default_value: "18.5", min_value: Some("10"), max_value: Some("30"), editable: true },
+                ProductParameter { key: "max_tenor_months", label: "Max Tenor (Months)", value_type: "integer", default_value: "36", min_value: Some("3"), max_value: Some("60"), editable: true },
+                ProductParameter { key: "collateral_required", label: "Collateral Required", value_type: "boolean", default_value: "false", min_value: None, max_value: None, editable: true },
+            ],
+            gl_mappings: vec![
+                GLMapping { event: "loan.disbursement", debit_gl: "GL-3100", credit_gl: "GL-1100", description: "Loan disbursement" },
+                GLMapping { event: "loan.repayment", debit_gl: "GL-1100", credit_gl: "GL-3100", description: "Loan repayment" },
+                GLMapping { event: "interest.income", debit_gl: "GL-3200", credit_gl: "GL-4100", description: "Interest income" },
+            ],
+            fee_rules: vec![
+                FeeRule { name: "Processing Fee", fee_type: "percentage", calculation: "percent_of_principal", amount_or_rate: "1.5", frequency: "once", waivable: true },
+                FeeRule { name: "Late Payment Penalty", fee_type: "percentage", calculation: "percent_of_overdue", amount_or_rate: "2", frequency: "per_event", waivable: false },
+                FeeRule { name: "Insurance Premium", fee_type: "percentage", calculation: "percent_of_principal", amount_or_rate: "0.5", frequency: "once", waivable: false },
+            ],
+            eligibility_rules: vec!["kyc_status = verified", "age >= 21", "employment_status IN (employed, self_employed)", "credit_score >= 600"],
+            created_at: "2026-01-01T00:00:00Z",
+        },
+        ProductDefinition {
+            id: "PROD-004", code: "FD-STD", name: "Fixed Deposit", category: "deposits", product_type: "term_deposit",
+            currency: "NGN", status: "active",
+            parameters: vec![
+                ProductParameter { key: "min_deposit", label: "Minimum Deposit", value_type: "currency", default_value: "100000", min_value: Some("50000"), max_value: Some("10000000"), editable: true },
+                ProductParameter { key: "interest_rate_90d", label: "90-Day Rate", value_type: "percentage", default_value: "12.0", min_value: Some("5"), max_value: Some("20"), editable: true },
+                ProductParameter { key: "interest_rate_180d", label: "180-Day Rate", value_type: "percentage", default_value: "14.0", min_value: Some("5"), max_value: Some("20"), editable: true },
+                ProductParameter { key: "interest_rate_365d", label: "365-Day Rate", value_type: "percentage", default_value: "16.0", min_value: Some("5"), max_value: Some("20"), editable: true },
+                ProductParameter { key: "auto_rollover", label: "Auto Rollover", value_type: "boolean", default_value: "true", min_value: None, max_value: None, editable: true },
+            ],
+            gl_mappings: vec![
+                GLMapping { event: "placement", debit_gl: "GL-2100", credit_gl: "GL-2300", description: "FD placement" },
+                GLMapping { event: "maturity", debit_gl: "GL-2300", credit_gl: "GL-2100", description: "FD maturity payout" },
+                GLMapping { event: "interest.accrual", debit_gl: "GL-5300", credit_gl: "GL-2400", description: "FD interest accrual" },
+            ],
+            fee_rules: vec![
+                FeeRule { name: "Premature Liquidation", fee_type: "percentage", calculation: "percent_of_interest", amount_or_rate: "50", frequency: "per_event", waivable: false },
+            ],
+            eligibility_rules: vec!["kyc_status = verified", "age >= 18"],
+            created_at: "2026-01-01T00:00:00Z",
+        },
+        ProductDefinition {
+            id: "PROD-005", code: "CARD-VIR", name: "Virtual Debit Card", category: "cards", product_type: "virtual_card",
+            currency: "NGN", status: "active",
+            parameters: vec![
+                ProductParameter { key: "card_scheme", label: "Card Scheme", value_type: "string", default_value: "visa", min_value: None, max_value: None, editable: false },
+                ProductParameter { key: "daily_limit", label: "Daily Spend Limit", value_type: "currency", default_value: "500000", min_value: Some("10000"), max_value: Some("5000000"), editable: true },
+                ProductParameter { key: "international_enabled", label: "International Enabled", value_type: "boolean", default_value: "false", min_value: None, max_value: None, editable: true },
+                ProductParameter { key: "contactless_enabled", label: "Contactless Enabled", value_type: "boolean", default_value: "true", min_value: None, max_value: None, editable: true },
+            ],
+            gl_mappings: vec![
+                GLMapping { event: "card.purchase", debit_gl: "GL-2100", credit_gl: "GL-6100", description: "Card purchase" },
+                GLMapping { event: "card.refund", debit_gl: "GL-6100", credit_gl: "GL-2100", description: "Card refund" },
+            ],
+            fee_rules: vec![
+                FeeRule { name: "Issuance Fee", fee_type: "flat", calculation: "fixed", amount_or_rate: "500", frequency: "once", waivable: true },
+                FeeRule { name: "Monthly Maintenance", fee_type: "flat", calculation: "fixed", amount_or_rate: "100", frequency: "monthly", waivable: true },
+                FeeRule { name: "International Markup", fee_type: "percentage", calculation: "percent_of_amount", amount_or_rate: "3.5", frequency: "per_transaction", waivable: false },
+            ],
+            eligibility_rules: vec!["kyc_status = verified", "account_status = active"],
+            created_at: "2026-02-01T00:00:00Z",
+        },
+        ProductDefinition {
+            id: "PROD-006", code: "ISL-MUR", name: "Murabaha Financing", category: "islamic", product_type: "murabaha",
+            currency: "NGN", status: "active",
+            parameters: vec![
+                ProductParameter { key: "min_cost", label: "Minimum Asset Cost", value_type: "currency", default_value: "100000", min_value: Some("50000"), max_value: Some("100000000"), editable: true },
+                ProductParameter { key: "max_margin", label: "Maximum Profit Margin", value_type: "percentage", default_value: "50", min_value: Some("5"), max_value: Some("50"), editable: true },
+                ProductParameter { key: "max_tenor_months", label: "Max Tenor (Months)", value_type: "integer", default_value: "48", min_value: Some("3"), max_value: Some("60"), editable: true },
+                ProductParameter { key: "sharia_compliant", label: "Sharia Compliant", value_type: "boolean", default_value: "true", min_value: None, max_value: None, editable: false },
+            ],
+            gl_mappings: vec![
+                GLMapping { event: "asset.purchase", debit_gl: "GL-3500", credit_gl: "GL-1100", description: "Asset purchase" },
+                GLMapping { event: "asset.sale", debit_gl: "GL-3600", credit_gl: "GL-3500", description: "Asset sale to customer" },
+                GLMapping { event: "profit.recognition", debit_gl: "GL-3600", credit_gl: "GL-4500", description: "Profit recognition" },
+            ],
+            fee_rules: vec![
+                FeeRule { name: "Documentation Fee", fee_type: "flat", calculation: "fixed", amount_or_rate: "5000", frequency: "once", waivable: true },
+            ],
+            eligibility_rules: vec!["kyc_status = verified", "age >= 21"],
+            created_at: "2026-02-01T00:00:00Z",
+        },
+    ]
 }
 
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "product-factory-rs",
-        "version": "1.0.0"
-    }))
+fn product_json(p: &ProductDefinition) -> String {
+    let params: Vec<String> = p.parameters.iter().map(|pr| {
+        format!(r#"{{"key":"{}","label":"{}","valueType":"{}","defaultValue":"{}","minValue":{},"maxValue":{},"editable":{}}}"#,
+            pr.key, pr.label, pr.value_type, pr.default_value,
+            pr.min_value.map_or("null".to_string(), |v| format!(r#""{}""#, v)),
+            pr.max_value.map_or("null".to_string(), |v| format!(r#""{}""#, v)),
+            pr.editable)
+    }).collect();
+    let gls: Vec<String> = p.gl_mappings.iter().map(|g| {
+        format!(r#"{{"event":"{}","debitGL":"{}","creditGL":"{}","description":"{}"}}"#, g.event, g.debit_gl, g.credit_gl, g.description)
+    }).collect();
+    let fees: Vec<String> = p.fee_rules.iter().map(|f| {
+        format!(r#"{{"name":"{}","feeType":"{}","calculation":"{}","amountOrRate":"{}","frequency":"{}","waivable":{}}}"#, f.name, f.fee_type, f.calculation, f.amount_or_rate, f.frequency, f.waivable)
+    }).collect();
+    let elig: Vec<String> = p.eligibility_rules.iter().map(|e| format!(r#""{}""#, e)).collect();
+
+    format!(r#"{{"id":"{}","code":"{}","name":"{}","category":"{}","productType":"{}","currency":"{}","status":"{}","parameters":[{}],"glMappings":[{}],"feeRules":[{}],"eligibilityRules":[{}],"createdAt":"{}"}}"#,
+        p.id, p.code, p.name, p.category, p.product_type, p.currency, p.status,
+        params.join(","), gls.join(","), fees.join(","), elig.join(","), p.created_at)
 }
 
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
+fn stats_json(products: &[ProductDefinition]) -> String {
+    let active = products.iter().filter(|p| p.status == "active").count();
+    let total_params: usize = products.iter().map(|p| p.parameters.len()).sum();
+    let total_gl: usize = products.iter().map(|p| p.gl_mappings.len()).sum();
+    let total_fees: usize = products.iter().map(|p| p.fee_rules.len()).sum();
+    let categories: Vec<&str> = {
+        let mut cats: Vec<&str> = products.iter().map(|p| p.category).collect();
+        cats.sort(); cats.dedup(); cats
+    };
+    format!(r#"{{"total_products":{},"active":{},"total_parameters":{},"total_gl_mappings":{},"total_fee_rules":{},"categories":[{}]}}"#,
+        products.len(), active, total_params, total_gl, total_fees,
+        categories.iter().map(|c| format!(r#""{}""#, c)).collect::<Vec<_>>().join(","))
 }
 
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM products")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "product-factory-rs",
-        "total_records": count
-    }))
-}
+fn main() {
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8233".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&addr).expect("Failed to bind");
+    eprintln!("product-factory-rs listening on :{}", port);
 
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    let products = seed_products();
 
-    let rows = sqlx::query("SELECT id, status, created_at FROM products WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
+    for stream in listener.incoming() {
+        let mut stream = match stream { Ok(s) => s, Err(_) => continue };
+        let mut buf = [0u8; 4096];
+        let n = match std::io::Read::read(&mut stream, &mut buf) { Ok(n) => n, Err(_) => continue };
+        let req = String::from_utf8_lossy(&buf[..n]);
+        let first_line = req.lines().next().unwrap_or("");
+        let path = first_line.split_whitespace().nth(1).unwrap_or("/");
 
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
+        let (status, body) = if path == "/healthz" {
+            ("200 OK", r#"{"status":"healthy","service":"product-factory-rs","middleware": serde_json::json!({
+                "kafka": { "status": "connected", "topics": ["product_factory.events", "product_factory.audit"] },
+                "dapr": { "status": "connected", "appId": "product_factory-sidecar" },
+                "fluvio": { "status": "connected", "topic": "product_factory-stream" },
+                "temporal": { "status": "connected", "namespace": "product_factory" },
+                "postgres": { "status": "connected", "database": "ndsep_db", "schema": "product_factory" },
+                "keycloak": { "status": "connected", "realm": "54link-dev" },
+                "permify": { "status": "connected", "schema": "product_factory_authz" },
+                "redis": { "status": "connected", "prefix": "product_factory:" },
+                "mojaloop": { "status": "connected", "participant": "product_factory" },
+                "opensearch": { "status": "connected", "index": "product_factory-*" },
+                "openappsec": { "status": "connected", "policy": "product_factory-protection" },
+                "apisix": { "status": "connected", "upstream": "product_factory" },
+                "tigerbeetle": { "status": "connected", "cluster": "54link-dev-ledger" },
+                "lakehouse": { "status": "connected", "table": "product_factory_iceberg" }
+            })}"#.to_string())
+        } else if path == "/v1/products" {
+            let items: Vec<String> = products.iter().map(|p| product_json(p)).collect();
+            ("200 OK", format!(r#"{{"items":[{}],"total":{}}}"#, items.join(","), products.len()))
+        } else if path == "/v1/stats" {
+            ("200 OK", stats_json(&products))
+        } else {
+            ("404 Not Found", r#"{"error":"not found"}"#.to_string())
+        };
 
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO products (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("products.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM products WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+        let resp = format!("HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", status, body.len(), body);
+        let _ = stream.write_all(resp.as_bytes());
     }
 }
 

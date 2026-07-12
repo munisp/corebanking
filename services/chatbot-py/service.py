@@ -8,7 +8,7 @@ MW = {
     "redis": {"url": os.environ.get("REDIS_URL", "redis://localhost:6379"), "cache_keys": ["chatbot:sessions", "chatbot:faqs", "chatbot:context"]},
     "postgres": {"url": os.environ.get("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": ["chatbot_conversations", "chatbot_intents", "chatbot_training", "escalation_log"]},
     "opensearch": {"url": os.environ.get("OPENSEARCH_URL", "http://localhost:9200"), "indices": ["chatbot-conversations", "chatbot-analytics"]},
-    "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "chatbot"},
+    "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "client": "chatbot"},
     "permify": {"url": os.environ.get("PERMIFY_URL", "http://localhost:3476"), "resources": ["chatbot_session"]},
     "dapr": {"url": os.environ.get("DAPR_URL", "http://localhost:3500"), "app_id": "chatbot", "pubsub": "chatbot-pubsub"},
     "fluvio": {"url": os.environ.get("FLUVIO_URL", "localhost:9003"), "topics": ["chatbot-event-stream"]},

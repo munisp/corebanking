@@ -1,4 +1,4 @@
-module github.com/54bank/quality-certification-go
+module github.com/54link-dev/quality-certification-go
 
 go 1.21
 

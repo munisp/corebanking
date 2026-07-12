@@ -1,0 +1,50 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-dispute-service
+  pullPolicy: IfNotPresent
+  tag: "0.0.5"
+nameOverride: ""
+fullnameOverride: "dispute-service"
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  port: 8019
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    ephemeral-storage: 1Gi
+    cpu: 300m
+    memory: 512Mi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: dispute-service
+  appPort: 8019
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 50m
+  cpu-limit: 150m
+  memory-request: 128Mi
+  memory-limit: 512Mi
+secrets:
+  TRANSACTION_LEDGER_URL: "http://transaction-ledger.54link-dev.svc.cluster.local"
+  PORT: "8019"
+  APP_PORT: "8019"

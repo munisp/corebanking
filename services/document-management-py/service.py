@@ -1,4 +1,4 @@
-"""54Bank Document Management Service — customer documents, KYC files,
+"""54link-dev Document Management Service — customer documents, KYC files,
 loan documentation, compliance records, version control, expiry tracking."""
 
 from __future__ import annotations
@@ -7,51 +7,6 @@ import os
 from dataclasses import dataclass, asdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
-
-
-
-SERVICE_NAME = "document-management-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
 
 
 @dataclass
@@ -76,14 +31,14 @@ class Document:
 
 
 DOCUMENTS: list[Document] = [
-    Document("DOC-001", "CUST-001", "Aisha Mohammed", "kyc", "national_id", "National ID Card", "aisha_nin.pdf", 245_000, "application/pdf", 1, "verified", "e.nwosu@54bank.ng", "2026-01-15T10:00:00Z", "2031-01-15", True, "e.nwosu@54bank.ng", ["kyc", "tier2", "identity"]),
-    Document("DOC-002", "CUST-001", "Aisha Mohammed", "kyc", "utility_bill", "EKEDC Bill — March 2026", "aisha_utility.pdf", 180_000, "application/pdf", 1, "verified", "e.nwosu@54bank.ng", "2026-03-20T09:00:00Z", "2026-09-20", True, "e.nwosu@54bank.ng", ["kyc", "address_proof"]),
-    Document("DOC-003", "CUST-010", "Pinnacle Holdings Ltd", "corporate", "cac_certificate", "CAC Certificate of Incorporation", "pinnacle_cac.pdf", 520_000, "application/pdf", 2, "verified", "n.eze@54bank.ng", "2025-06-10T14:00:00Z", None, True, "n.eze@54bank.ng", ["corporate", "incorporation", "kyc"]),
-    Document("DOC-004", "CUST-010", "Pinnacle Holdings Ltd", "loan", "offer_letter", "Term Loan Facility Offer — ₦700M", "pinnacle_loan_offer.pdf", 890_000, "application/pdf", 3, "executed", "a.ogundimu@54bank.ng", "2026-04-01T11:00:00Z", "2029-04-01", True, "legal@54bank.ng", ["loan", "facility", "corporate"]),
-    Document("DOC-005", "CUST-003", "Zenith Construction Ltd", "collateral", "property_title", "Title Deed — Victoria Island Plot 45", "zenith_title.pdf", 1_200_000, "application/pdf", 1, "verified", "legal@54bank.ng", "2025-12-01T15:00:00Z", None, True, "legal@54bank.ng", ["collateral", "property", "title"]),
+    Document("DOC-001", "CUST-001", "Aisha Mohammed", "kyc", "national_id", "National ID Card", "aisha_nin.pdf", 245_000, "application/pdf", 1, "verified", "e.nwosu@54link-dev.ng", "2026-01-15T10:00:00Z", "2031-01-15", True, "e.nwosu@54link-dev.ng", ["kyc", "tier2", "identity"]),
+    Document("DOC-002", "CUST-001", "Aisha Mohammed", "kyc", "utility_bill", "EKEDC Bill — March 2026", "aisha_utility.pdf", 180_000, "application/pdf", 1, "verified", "e.nwosu@54link-dev.ng", "2026-03-20T09:00:00Z", "2026-09-20", True, "e.nwosu@54link-dev.ng", ["kyc", "address_proof"]),
+    Document("DOC-003", "CUST-010", "Pinnacle Holdings Ltd", "corporate", "cac_certificate", "CAC Certificate of Incorporation", "pinnacle_cac.pdf", 520_000, "application/pdf", 2, "verified", "n.eze@54link-dev.ng", "2025-06-10T14:00:00Z", None, True, "n.eze@54link-dev.ng", ["corporate", "incorporation", "kyc"]),
+    Document("DOC-004", "CUST-010", "Pinnacle Holdings Ltd", "loan", "offer_letter", "Term Loan Facility Offer — ₦700M", "pinnacle_loan_offer.pdf", 890_000, "application/pdf", 3, "executed", "a.ogundimu@54link-dev.ng", "2026-04-01T11:00:00Z", "2029-04-01", True, "legal@54link-dev.ng", ["loan", "facility", "corporate"]),
+    Document("DOC-005", "CUST-003", "Zenith Construction Ltd", "collateral", "property_title", "Title Deed — Victoria Island Plot 45", "zenith_title.pdf", 1_200_000, "application/pdf", 1, "verified", "legal@54link-dev.ng", "2025-12-01T15:00:00Z", None, True, "legal@54link-dev.ng", ["collateral", "property", "title"]),
     Document("DOC-006", "CUST-005", "Fatimah Abdullahi", "kyc", "bvn_slip", "BVN Verification Slip", "fatimah_bvn.pdf", 95_000, "application/pdf", 1, "pending", "self-service", "2026-05-09T08:00:00Z", None, False, None, ["kyc", "bvn", "tier1"]),
-    Document("DOC-007", "CUST-012", "Dangote Cement PLC", "compliance", "aml_report", "Annual AML/CFT Compliance Report 2025", "dangote_aml_2025.pdf", 3_400_000, "application/pdf", 1, "verified", "compliance@54bank.ng", "2026-02-15T10:00:00Z", "2027-02-15", True, "n.eze@54bank.ng", ["compliance", "aml", "institutional"]),
-    Document("DOC-008", "CUST-002", "Ibrahim Musa", "investment", "mandate_form", "Investment Mandate — T-Bills", "ibrahim_mandate.pdf", 340_000, "application/pdf", 1, "executed", "a.ogundimu@54bank.ng", "2026-03-01T09:00:00Z", "2027-03-01", True, "a.ogundimu@54bank.ng", ["investment", "mandate", "tbills"]),
+    Document("DOC-007", "CUST-012", "Dangote Cement PLC", "compliance", "aml_report", "Annual AML/CFT Compliance Report 2025", "dangote_aml_2025.pdf", 3_400_000, "application/pdf", 1, "verified", "compliance@54link-dev.ng", "2026-02-15T10:00:00Z", "2027-02-15", True, "n.eze@54link-dev.ng", ["compliance", "aml", "institutional"]),
+    Document("DOC-008", "CUST-002", "Ibrahim Musa", "investment", "mandate_form", "Investment Mandate — T-Bills", "ibrahim_mandate.pdf", 340_000, "application/pdf", 1, "executed", "a.ogundimu@54link-dev.ng", "2026-03-01T09:00:00Z", "2027-03-01", True, "a.ogundimu@54link-dev.ng", ["investment", "mandate", "tbills"]),
 ]
 
 
@@ -110,14 +65,14 @@ class Handler(BaseHTTPRequestHandler):
                 "fluvio": {"status": "connected", "topic": "document_management-stream"},
                 "temporal": {"status": "connected", "namespace": "document_management"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "document_management"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "document_management_authz"},
                 "redis": {"status": "connected", "prefix": "document_management:"},
                 "mojaloop": {"status": "connected", "participant": "document_management"},
                 "opensearch": {"status": "connected", "index": "document_management-*"},
                 "openappsec": {"status": "connected", "policy": "document_management-protection"},
                 "apisix": {"status": "connected", "upstream": "document_management"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "document_management_iceberg"}
             },
                              "storage": "S3-compatible",
@@ -167,7 +122,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8152"))
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"document-management listening on :{port}")

@@ -1,0 +1,63 @@
+"""Foreign Exchange Service"""
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+from datetime import datetime
+from decimal import Decimal
+import uvicorn, asyncpg, os
+
+app = FastAPI(title="54link-dev FX Service", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+db_pool = None
+
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    db_pool = await asyncpg.create_pool(host=os.getenv("DB_HOST", "postgres"), port=os.getenv("DB_PORT", "5432"),
+        user=os.getenv("DB_USER", "postgres"), password=os.getenv("DB_PASSWORD", "postgres"),
+        database=os.getenv("DB_NAME", "fx_db"), min_size=5, max_size=20)
+    async with db.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS fx_rates (
+                id SERIAL PRIMARY KEY, from_currency VARCHAR(3) NOT NULL, to_currency VARCHAR(3) NOT NULL,
+                rate DECIMAL(10,4) NOT NULL, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS fx_transactions (
+                id SERIAL PRIMARY KEY, transaction_id VARCHAR(50) UNIQUE NOT NULL, customer_id VARCHAR(50) NOT NULL,
+                from_currency VARCHAR(3) NOT NULL, to_currency VARCHAR(3) NOT NULL,
+                from_amount DECIMAL(15,2) NOT NULL, to_amount DECIMAL(15,2) NOT NULL,
+                exchange_rate DECIMAL(10,4) NOT NULL, status VARCHAR(20) DEFAULT 'completed',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+@app.on_event("shutdown")
+async def shutdown():
+    if db_pool: await db_pool.close()
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "fx-service"}
+
+@app.get("/api/v1/fx/rates")
+async def get_fx_rates(from_currency: str, to_currency: str, db=Depends(lambda: db_pool)):
+    async with db.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM fx_rates WHERE from_currency = $1 AND to_currency = $2", from_currency, to_currency)
+        if not row: return {"from_currency": from_currency, "to_currency": to_currency, "rate": 1.0}
+        return dict(row)
+
+@app.post("/api/v1/fx/exchange")
+async def exchange_currency(customer_id: str, from_currency: str, to_currency: str, from_amount: Decimal, db=Depends(lambda: db_pool)):
+    transaction_id = f"FX{int(datetime.now().timestamp())}"
+    exchange_rate = Decimal("1.0")
+    to_amount = from_amount * exchange_rate
+    async with db.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO fx_transactions (transaction_id, customer_id, from_currency, to_currency, from_amount, to_amount, exchange_rate)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """, transaction_id, customer_id, from_currency, to_currency, from_amount, to_amount, exchange_rate)
+    return {"status": "exchanged", "transaction_id": transaction_id, "to_amount": float(to_amount)}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8007")))

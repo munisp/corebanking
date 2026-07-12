@@ -1,0 +1,73 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-channels-messaging
+  pullPolicy: IfNotPresent
+  tag: "0.0.2"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9145
+    - port: 9146
+    - port: 9147
+    - port: 9148
+    - port: 9149
+    - port: 9150
+    - port: 9151
+    - port: 9152
+    - port: 9153
+    - port: 9154
+    - port: 9155
+    - port: 9156
+    - port: 9157
+    - port: 9158
+    - port: 9159
+    - port: 9160
+    - port: 9161
+    - port: 9162
+    - port: 9163
+    - port: 9164
+    - port: 9165
+    - port: 9166
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: channels-messaging
+  appPort: 9146
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9145"
+  PORT_BASE: "9145"
+  SERVICE_GROUP: channels-messaging
+  SERVICES: "branded-comms-py,communication-hub,notification-router-go,notification-service,omini-service,realtime-notification-service,sms-alert-notification-py,sms-banking-gateway-go,sms-email-gateway-go,sms-otp-service-rs,sms-service,telegram-banking-commands-rs,telegram-bot-gateway-go,telegram-mini-app-go,telegram-notification-py,telegram-service,whatsapp-banking-flows-rs,whatsapp-business-gateway-go,whatsapp-cloud-api-go,whatsapp-document-service-rs,whatsapp-notification-py,whatsapp-service"

@@ -1,4 +1,4 @@
-"""54Bank Customer Feedback & NPS Service — surveys, ratings, sentiment analysis,
+"""54link-dev Customer Feedback & NPS Service — surveys, ratings, sentiment analysis,
 complaint-to-feedback linking, NPS trending, branch/channel scoring."""
 
 from __future__ import annotations
@@ -7,51 +7,6 @@ import os
 from dataclasses import dataclass, asdict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
-
-
-
-SERVICE_NAME = "customer-feedback-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
 
 
 @dataclass
@@ -90,7 +45,7 @@ FEEDBACK: list[FeedbackEntry] = [
     FeedbackEntry("FB-005", "CUST-003", "Zenith Construction Ltd", "call_center", "complaint", 1, 1, "Card was blocked without notice. Took 3 days to resolve. Unacceptable for a corporate account.", "negative", None, "54Card Corporate", False, None, "2026-05-06T16:00:00Z"),
     FeedbackEntry("FB-006", "CUST-020", "Olusegun Bakare", "mobile_app", "general", 4, 7, "Diaspora transfer rates are competitive. Would prefer faster settlement to Nigerian accounts.", "neutral", None, "Diaspora Banking", True, "Settlement now T+0 for intra-bank. Inter-bank remains T+1.", "2026-05-05T12:00:00Z"),
     FeedbackEntry("FB-007", "CUST-008", "Farmgate Commodities Ltd", "branch", "product", 3, 5, "Warehouse receipt financing approval took too long. 3 weeks vs promised 5 days.", "negative", "Ikeja", "Agri Finance", False, None, "2026-05-04T10:00:00Z"),
-    FeedbackEntry("FB-008", "CUST-012", "Dangote Cement PLC", "relationship_manager", "general", 5, 10, "Seamless syndicated facility arrangement. 54Bank led the consortium efficiently.", "positive", "Head Office", "Institutional Banking", True, None, "2026-05-03T11:00:00Z"),
+    FeedbackEntry("FB-008", "CUST-012", "Dangote Cement PLC", "relationship_manager", "general", 5, 10, "Seamless syndicated facility arrangement. 54link-dev led the consortium efficiently.", "positive", "Head Office", "Institutional Banking", True, None, "2026-05-03T11:00:00Z"),
 ]
 
 NPS_TRENDS: list[NPSTrend] = [
@@ -125,14 +80,14 @@ class Handler(BaseHTTPRequestHandler):
                 "fluvio": {"status": "connected", "topic": "customer_feedback-stream"},
                 "temporal": {"status": "connected", "namespace": "customer_feedback"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "customer_feedback"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "customer_feedback_authz"},
                 "redis": {"status": "connected", "prefix": "customer_feedback:"},
                 "mojaloop": {"status": "connected", "participant": "customer_feedback"},
                 "opensearch": {"status": "connected", "index": "customer_feedback-*"},
                 "openappsec": {"status": "connected", "policy": "customer_feedback-protection"},
                 "apisix": {"status": "connected", "upstream": "customer_feedback"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "customer_feedback_iceberg"}
             },
                              "middleware": ["Postgres", "Redis", "Kafka", "OpenSearch"]})
@@ -192,7 +147,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8155"))
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"customer-feedback listening on :{port}")

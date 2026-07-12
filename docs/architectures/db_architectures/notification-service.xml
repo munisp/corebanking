@@ -1,0 +1,26 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Notification Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- SUPPORT TICKETS -->
+        <mxCell id="support_tickets" value="support_tickets&#xa;----------------------&#xa;id (PK, int)&#xa;ticket_number (varchar(50), unique, indexed)&#xa;tenant_id (varchar, indexed)&#xa;user_id (varchar, indexed)&#xa;subject (varchar)&#xa;description (text)&#xa;category (varchar, indexed)&#xa;priority (enum: low/medium/high/urgent)&#xa;status (enum: open/in_progress/resolved/closed)&#xa;assigned_to (varchar, indexed)&#xa;created_at (datetime)&#xa;updated_at (datetime)&#xa;resolved_at (datetime)&#xa;closed_at (datetime)&#xa;resolution (text)&#xa;metadata (JSON)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="380" as="geometry"/>
+        </mxCell>
+
+        <!-- TICKET MESSAGES -->
+        <mxCell id="ticket_messages" value="ticket_messages&#xa;----------------------&#xa;id (PK, int)&#xa;ticket_id (FK -> support_tickets.id)&#xa;sender_id (varchar)&#xa;sender_type (varchar: user/agent/system)&#xa;message (text)&#xa;created_at (datetime)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="280" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationship -->
+        <mxCell id="e1" edge="1" parent="1" source="support_tickets" target="ticket_messages" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,0 +1,62 @@
+name: Build Channels Voice Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/chatbot-py/**'
+      - 'services/chatbot-service/**'
+      - 'services/interactive-ussd-agri-py/**'
+      - 'services/ussd-banking-gateway-go/**'
+      - 'services/ussd-gateway-service/**'
+      - 'services/ussd-multilingual-py/**'
+      - 'services/ussd-service/**'
+      - 'services/ussd-sim-toolkit-go/**'
+      - 'services/ussd-transaction-engine-rs/**'
+      - 'services/voice-agent-escalation-go/**'
+      - 'services/voice-asr-nigerian-py/**'
+      - 'services/voice-banking-gateway-go/**'
+      - 'services/voice-biometric-auth-rs/**'
+      - 'services/voice-call-analytics-py/**'
+      - 'services/voice-ivr-menu-go/**'
+      - 'services/voice-nlu-banking-py/**'
+      - 'services/voice-tts-nigerian-rs/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/channels-voice.yaml'
+
+env:
+  TAG: "0.0.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=chatbot-py,chatbot-service,interactive-ussd-agri-py,ussd-banking-gateway-go,ussd-gateway-service,ussd-multilingual-py,ussd-service,ussd-sim-toolkit-go,ussd-transaction-engine-rs,voice-agent-escalation-go,voice-asr-nigerian-py,voice-banking-gateway-go,voice-biometric-auth-rs,voice-call-analytics-py,voice-ivr-menu-go,voice-nlu-banking-py,voice-tts-nigerian-rs
+            PRIMARY_LANG=go
+            PORT_BASE=9178
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-channels-voice:${{ env.TAG }}

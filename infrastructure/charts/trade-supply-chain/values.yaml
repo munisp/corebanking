@@ -1,0 +1,63 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-trade-supply-chain
+  pullPolicy: IfNotPresent
+  tag: "0.0.3"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9627
+    - port: 9628
+    - port: 9629
+    - port: 9630
+    - port: 9631
+    - port: 9632
+    - port: 9633
+    - port: 9634
+    - port: 9635
+    - port: 9636
+    - port: 9637
+    - port: 9638
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: trade-supply-chain
+  appPort: 9632
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9627"
+  PORT_BASE: "9627"
+  SERVICE_GROUP: trade-supply-chain
+  SERVICES: "bank-guarantees-go,equipment-leasing-go,escrow-go,escrow-service,factoring-go,leasing-go,locker-go,lpo-service,project-finance-go,supply-chain-finance-go,supply-chain-service,trust-estate-rs"

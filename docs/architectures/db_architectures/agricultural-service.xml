@@ -1,0 +1,79 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Agricultural Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- FARMERS -->
+        <mxCell id="farmers" value="farmers&#xa;----------------------&#xa;id (PK, serial)&#xa;farmer_id (varchar, unique)&#xa;tenant_id (varchar, indexed)&#xa;full_name (varchar)&#xa;phone_number (varchar)&#xa;bvn (varchar(11))&#xa;farm_location (varchar)&#xa;farm_size (decimal(10,2), hectares)&#xa;years_experience (int)&#xa;credit_score (int, default 0)&#xa;status (varchar: active/inactive/blacklisted)&#xa;kyc_verified (bool)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="280" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- FARMS -->
+        <mxCell id="farms" value="farms&#xa;----------------------&#xa;id (PK, serial)&#xa;farm_id (varchar, unique)&#xa;tenant_id (varchar, indexed)&#xa;farmer_id (FK -> farmers.farmer_id)&#xa;location (varchar)&#xa;size (decimal(10,2), ha)&#xa;soil_type (varchar)&#xa;irrigation_type (varchar)&#xa;land_title_number (varchar)&#xa;land_value (decimal)&#xa;current_crop (varchar)&#xa;planting_date (date)&#xa;status (varchar: pending/verified/active)&#xa;verified_by / verified_at&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="380" y="40" width="280" height="340" as="geometry"/>
+        </mxCell>
+
+        <!-- AGRICULTURAL LOANS -->
+        <mxCell id="agri_loans" value="agricultural_loans&#xa;----------------------&#xa;id (PK, serial)&#xa;loan_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;farmer_id (FK -> farmers)&#xa;farm_id (FK -> farms)&#xa;loan_amount (decimal(15,2))&#xa;crop_type (varchar)&#xa;planting_date / expected_harvest_date (date)&#xa;interest_rate (decimal)&#xa;grace_period (int, days)&#xa;collateral_type / collateral_value&#xa;insurance_policy (varchar)&#xa;status (varchar: pending/approved/disbursed/repaid/defaulted)&#xa;disbursed_at / maturity_date&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="720" y="40" width="280" height="380" as="geometry"/>
+        </mxCell>
+
+        <!-- LOAN REPAYMENTS -->
+        <mxCell id="loan_repayments" value="loan_repayments&#xa;----------------------&#xa;id (PK, serial)&#xa;repayment_id (varchar, unique)&#xa;loan_id (FK -> agricultural_loans)&#xa;amount (decimal(15,2))&#xa;payment_date (timestamp)&#xa;payment_method (varchar)&#xa;transaction_ref (varchar)&#xa;status (varchar: completed/failed)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="720" y="460" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- WEATHER DATA -->
+        <mxCell id="weather_data" value="weather_data&#xa;----------------------&#xa;id (PK, serial)&#xa;location (varchar, indexed)&#xa;recorded_at (timestamp)&#xa;temperature / humidity / rainfall&#xa;wind_speed (decimal)&#xa;weather_condition (varchar)&#xa;forecast_data (JSONB)&#xa;source (varchar: API/manual)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="40" y="400" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- CROP PRICES -->
+        <mxCell id="crop_prices" value="crop_prices&#xa;----------------------&#xa;id (PK, serial)&#xa;crop_type (varchar, indexed)&#xa;market_location (varchar)&#xa;price_per_kg (decimal)&#xa;currency (varchar)&#xa;price_date (date, indexed)&#xa;source (varchar)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="40" y="660" width="280" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- AGTECH DEVICES -->
+        <mxCell id="agtech_devices" value="agtech_devices&#xa;----------------------&#xa;id (PK, serial)&#xa;device_id (varchar, unique)&#xa;tenant_id / farmer_id / farm_id (FK)&#xa;device_type (varchar: soil_sensor/weather_station/...)&#xa;manufacturer / model / serial_number&#xa;status (varchar: active/offline/maintenance)&#xa;battery_level (int)&#xa;last_reading_at (timestamp)&#xa;firmware_version (varchar)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="380" y="420" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- DEVICE READINGS -->
+        <mxCell id="device_readings" value="device_readings&#xa;----------------------&#xa;id (PK, serial)&#xa;device_id (FK -> agtech_devices)&#xa;farm_id (FK -> farms)&#xa;reading_type (varchar)&#xa;value (decimal)&#xa;unit (varchar)&#xa;recorded_at (timestamp, indexed)&#xa;raw_data (JSONB)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="380" y="740" width="280" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- AGTECH MANUFACTURERS -->
+        <mxCell id="manufacturers" value="agtech_manufacturers&#xa;----------------------&#xa;id (PK, serial)&#xa;manufacturer_id (varchar, unique)&#xa;name (varchar)&#xa;country (varchar)&#xa;contact_email / contact_phone&#xa;website (varchar)&#xa;is_approved (bool)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="720" y="720" width="280" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="farmers" target="farms" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="farmers" target="agri_loans" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="farms" target="agri_loans" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="agri_loans" target="loan_repayments" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="farms" target="agtech_devices" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="agtech_devices" target="device_readings" style="endArrow=block;strokeColor=#666666;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="manufacturers" target="agtech_devices" style="endArrow=block;dashed=1;strokeColor=#666666;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

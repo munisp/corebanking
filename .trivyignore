@@ -1,5 +1,0 @@
-# Trivy vulnerability scanner ignore list
-# https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/
-
-# Ignored vulnerabilities (document reason for each):
-# None currently — all HIGH/CRITICAL should be addressed

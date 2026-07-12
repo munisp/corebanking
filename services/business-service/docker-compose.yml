@@ -1,0 +1,76 @@
+version: '3.8'
+
+services:
+  business-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8086:8086"
+    environment:
+      ENVIRONMENT: development
+      DEBUG: "true"
+      DATABASE_URI: postgresql://banking:banking@postgres:5432/banking54
+      KAFKA_BROKERS: kafka:9092
+      KEYCLOAK_URL: http://keycloak:8080
+      PERMIFY_HOST: permify
+      PERMIFY_PORT: 3476
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    networks:
+      - banking
+    volumes:
+      - .:/app
+    command: python -m uvicorn main:app --host 0.0.0.0 --port 8086 --reload
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: banking
+      POSTGRES_PASSWORD: banking
+      POSTGRES_DB: banking54
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U banking"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - banking
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    networks:
+      - banking
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    ports:
+      - "2181:2181"
+    networks:
+      - banking
+
+volumes:
+  postgres_data:
+
+networks:
+  banking:
+    driver: bridge

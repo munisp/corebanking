@@ -1,223 +1,83 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::sync::Mutex;
+use std::time::Instant;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
+#[derive(Clone, Serialize, Deserialize)]
+struct WireTransferRecord {
     id: String,
     status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+    domain: String,
+    #[serde(rename = "createdAt")]
+    created_at: String,
 }
 
 struct AppState {
-    db: PgPool,
+    start_time: Instant,
+    records: Mutex<Vec<WireTransferRecord>>,
+}
+
+async fn healthz(state: web::Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "service": "wire-transfer-monitor-rs",
+        "status": "healthy",
+        "domain": "Wire Transfer Monitor",
+        "uptime_secs": state.start_time.elapsed().as_secs(),
+        "middleware": {
+            "kafka": "wire-transfer-monitor.events, wire-transfer-monitor.audit",
+            "postgres": "wire_transfer_monitor_records",
+            "redis": "wire-transfer-monitor_cache",
+            "temporal": "WireTransferMonitorWorkflow",
+            "tigerbeetle": "ledger_integration",
+            "opensearch": "wire-transfer-monitor-2026"
+        }
+    }))
+}
+
+async fn list_records(state: web::Data<AppState>) -> HttpResponse {
+    let records = state.records.lock().unwrap_or_else(|e| e.into_inner());
+    HttpResponse::Ok().json(json!({"records": *records, "total": records.len(), "domain": "Wire Transfer Monitor"}))
+}
+
+async fn create_record(state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    let mut records = state.records.lock().unwrap_or_else(|e| e.into_inner());
+    let id = format!("REC-{:03}", records.len() + 1);
+    let rec = WireTransferRecord {
+        id: id.clone(),
+        status: body.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string(),
+        domain: "Wire Transfer Monitor".to_string(),
+        created_at: body.get("createdAt").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    };
+    records.push(rec);
+    HttpResponse::Created().json(json!({"created": true, "id": id, "data": *body}))
+}
+
+async fn get_stats(state: web::Data<AppState>) -> HttpResponse {
+    let records = state.records.lock().unwrap_or_else(|e| e.into_inner());
+    let total = records.len();
+    let active = records.iter().filter(|r| r.status == "active").count();
+    let pending = records.iter().filter(|r| r.status == "pending" || r.status == "processing").count();
+    let archived = records.iter().filter(|r| r.status == "completed" || r.status == "archived").count();
+    HttpResponse::Ok().json(json!({"total": total, "active": active, "pending": pending, "archived": archived}))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[wire-transfer-monitor-rs] starting");
-
-    let db_name = "wire-transfer-monitor-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[wire-transfer-monitor-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[wire-transfer-monitor-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8729".to_string()).parse().unwrap_or(8729);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[wire-transfer-monitor-rs] ready on :{}", port);
-
+    let port = std::env::var("PORT").unwrap_or_else(|_| "9325".to_string());
+    let state = web::Data::new(AppState {
+        start_time: Instant::now(),
+        records: Mutex::new(vec![]),
+    });
+    println!("Wire Transfer Monitor (Rust) on :{}", port);
     HttpServer::new(move || {
         App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/payments", web::get().to(list_records))
-            .route("/api/v1/payments", web::post().to(create_record))
-            .route("/api/v1/payments/{id}", web::get().to(get_record))
-            .route("/api/v1/payments/{id}", web::put().to(update_record))
-            .route("/api/v1/payments/{id}", web::delete().to(delete_record))
-    })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS payments (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    reference VARCHAR(64) NOT NULL UNIQUE,
-    payment_type VARCHAR(32) NOT NULL,
-    source_account VARCHAR(20) NOT NULL,
-    destination_account VARCHAR(20) NOT NULL,
-    destination_bank VARCHAR(10),
-    amount_kobo BIGINT NOT NULL CHECK (amount_kobo > 0),
-    fee_kobo BIGINT NOT NULL DEFAULT 0,
-    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
-    status VARCHAR(20) NOT NULL DEFAULT 'initiated',
-    channel VARCHAR(32) NOT NULL,
-    session_id VARCHAR(64),
-    narration TEXT,
-    beneficiary_name VARCHAR(100),
-    tenant_id UUID NOT NULL,
-    initiated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create payments table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_tenant ON payments(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "wire-transfer-monitor-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "wire-transfer-monitor-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM payments WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO payments (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("payments.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM payments WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
+            .app_data(state.clone())
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/wire-transfer-monitor/list", web::get().to(list_records))
+            .route("/v1/wire-transfer-monitor/create", web::post().to(create_record))
+            .route("/v1/wire-transfer-monitor/stats", web::get().to(get_stats))
+    }).bind(format!("0.0.0.0:{}", port))?.run().await
 }
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {

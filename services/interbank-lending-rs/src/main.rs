@@ -1,217 +1,104 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::Mutex;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
+#[derive(Clone, Serialize, Deserialize)]
+struct MiddlewareConfig {
+    kafka_broker: String, redis_url: String, postgres_url: String, opensearch_url: String,
+    keycloak_url: String, permify_url: String, dapr_url: String, fluvio_url: String,
+    temporal_url: String, mojaloop_url: String, tigerbeetle_url: String, lakehouse_url: String,
+    apisix_url: String, openappsec_url: String,
+}
+
+fn mw() -> MiddlewareConfig {
+    MiddlewareConfig {
+        kafka_broker: std::env::var("KAFKA_BROKER").unwrap_or_else(|_| "localhost:9092".into()),
+        redis_url: std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into()),
+        postgres_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db".into()),
+        opensearch_url: std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".into()),
+        keycloak_url: std::env::var("KEYCLOAK_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
+        permify_url: std::env::var("PERMIFY_URL").unwrap_or_else(|_| "http://localhost:3476".into()),
+        dapr_url: std::env::var("DAPR_URL").unwrap_or_else(|_| "http://localhost:3500".into()),
+        fluvio_url: std::env::var("FLUVIO_URL").unwrap_or_else(|_| "localhost:9003".into()),
+        temporal_url: std::env::var("TEMPORAL_URL").unwrap_or_else(|_| "localhost:7233".into()),
+        mojaloop_url: std::env::var("MOJALOOP_URL").unwrap_or_else(|_| "http://localhost:3002".into()),
+        tigerbeetle_url: std::env::var("TIGERBEETLE_URL").unwrap_or_else(|_| "localhost:3000".into()),
+        lakehouse_url: std::env::var("LAKEHOUSE_URL").unwrap_or_else(|_| "http://localhost:8181".into()),
+        apisix_url: std::env::var("APISIX_URL").unwrap_or_else(|_| "http://localhost:9080".into()),
+        openappsec_url: std::env::var("OPENAPPSEC_URL").unwrap_or_else(|_| "http://localhost:4000".into()),
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct InterbankDeal {
     id: String,
+    deal_type: String,
+    counterparty_bank: String,
+    counterparty_bic: String,
+    direction: String,
+    currency: String,
+    principal: f64,
+    rate: f64,
+    tenor_days: u32,
+    value_date: String,
+    maturity_date: String,
     status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+    accrued_interest: f64,
+    nibss_ref: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+fn seed() -> Vec<InterbankDeal> {
+    vec![
+        InterbankDeal { id: "IB-001".into(), deal_type: "call_placement".into(), counterparty_bank: "First Bank of Nigeria".into(), counterparty_bic: "FBNINGLA".into(), direction: "lend".into(), currency: "NGN".into(), principal: 5_000_000_000.0, rate: 12.5, tenor_days: 7, value_date: "2026-05-01".into(), maturity_date: "2026-05-08".into(), status: "active".into(), accrued_interest: 11_986_301.37, nibss_ref: "NIBSS-IB-2026050101".into() },
+        InterbankDeal { id: "IB-002".into(), deal_type: "overnight".into(), counterparty_bank: "Access Bank Plc".into(), counterparty_bic: "ABORNGLA".into(), direction: "borrow".into(), currency: "NGN".into(), principal: 3_000_000_000.0, rate: 11.75, tenor_days: 1, value_date: "2026-05-09".into(), maturity_date: "2026-05-10".into(), status: "active".into(), accrued_interest: 965_753.42, nibss_ref: "NIBSS-IB-2026050901".into() },
+        InterbankDeal { id: "IB-003".into(), deal_type: "term_deposit".into(), counterparty_bank: "Zenith Bank Plc".into(), counterparty_bic: "ZELOINGLA".into(), direction: "lend".into(), currency: "NGN".into(), principal: 10_000_000_000.0, rate: 14.25, tenor_days: 30, value_date: "2026-04-15".into(), maturity_date: "2026-05-15".into(), status: "active".into(), accrued_interest: 93_698_630.14, nibss_ref: "NIBSS-IB-2026041501".into() },
+        InterbankDeal { id: "IB-004".into(), deal_type: "takeback".into(), counterparty_bank: "GTBank Plc".into(), counterparty_bic: "GTBIINGLA".into(), direction: "borrow".into(), currency: "NGN".into(), principal: 2_000_000_000.0, rate: 13.0, tenor_days: 14, value_date: "2026-04-28".into(), maturity_date: "2026-05-12".into(), status: "matured".into(), accrued_interest: 9_972_602.74, nibss_ref: "NIBSS-IB-2026042801".into() },
+        InterbankDeal { id: "IB-005".into(), deal_type: "repo".into(), counterparty_bank: "UBA Plc".into(), counterparty_bic: "UBAINLG0".into(), direction: "lend".into(), currency: "NGN".into(), principal: 7_500_000_000.0, rate: 15.0, tenor_days: 90, value_date: "2026-03-01".into(), maturity_date: "2026-05-30".into(), status: "active".into(), accrued_interest: 215_753_424.66, nibss_ref: "NIBSS-IB-2026030101".into() },
+        InterbankDeal { id: "IB-006".into(), deal_type: "call_placement".into(), counterparty_bank: "Stanbic IBTC".into(), counterparty_bic: "SBICNLAG".into(), direction: "lend".into(), currency: "USD".into(), principal: 10_000_000.0, rate: 5.25, tenor_days: 30, value_date: "2026-04-10".into(), maturity_date: "2026-05-10".into(), status: "matured".into(), accrued_interest: 43_150.68, nibss_ref: "NIBSS-IB-2026041001".into() },
+    ]
 }
 
-struct AppState {
-    db: PgPool,
+struct AppState { deals: Mutex<Vec<InterbankDeal>> }
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "ok"
+    }))
+}
+         
+
+async fn list_deals(data: web::Data<AppState>) -> HttpResponse {
+    let d = data.deals.lock().unwrap();
+    HttpResponse::Ok().json(serde_json::json!({ "items": *d, "total": d.len() }))
+}
+
+async fn get_stats(data: web::Data<AppState>) -> HttpResponse {
+    let d = data.deals.lock().unwrap();
+    let total_lent: f64 = d.iter().filter(|x| x.direction == "lend").map(|x| x.principal).sum();
+    let total_borrowed: f64 = d.iter().filter(|x| x.direction == "borrow").map(|x| x.principal).sum();
+    let net_position = total_lent - total_borrowed;
+    let active = d.iter().filter(|x| x.status == "active").count();
+    let total_accrued: f64 = d.iter().map(|x| x.accrued_interest).sum();
+    HttpResponse::Ok().json(serde_json::json!({
+        "total_deals": d.len(), "active_deals": active,
+        "total_lent": total_lent, "total_borrowed": total_borrowed,
+        "net_position": net_position, "total_accrued_interest": total_accrued,
+        "avg_lending_rate": d.iter().filter(|x| x.direction == "lend").map(|x| x.rate).sum::<f64>() / d.iter().filter(|x| x.direction == "lend").count().max(1) as f64
+    }))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[interbank-lending-rs] starting");
-
-    let db_name = "interbank-lending-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[interbank-lending-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[interbank-lending-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8644".to_string()).parse().unwrap_or(8644);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[interbank-lending-rs] ready on :{}", port);
-
+    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8166".into()).parse().unwrap_or(8166);
+    let data = web::Data::new(AppState { deals: Mutex::new(seed()) });
+    println!("Interbank Lending Service running on port {}", port);
     HttpServer::new(move || {
         App::new()
             .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
-    })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "interbank-lending-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "interbank-lending-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/interbank/deals", web::get().to(list_deals))
+            .route("/v1/interbank/stats", web::get().to(get_stats))
+    }).bind(("0.0.0.0", port))?.run().await
 }
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {

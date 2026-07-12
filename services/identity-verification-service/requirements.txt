@@ -1,0 +1,16 @@
+# Identity Verification Service
+# Integrations with NIMC, BVN, Passport, FRSC
+
+# API Framework
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+httpx==0.25.2
+
+# Database
+asyncpg==0.29.0
+redis==5.0.1
+
+# Utilities
+pydantic==2.9.2
+structlog==24.1.0
+python-jose[cryptography]==3.3.0  # For API authentication

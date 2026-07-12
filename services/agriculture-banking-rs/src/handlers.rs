@@ -10,7 +10,7 @@ fn now() -> String {
 }
 
 fn default_tenant() -> String {
-    std::env::var("TENANT_ID").unwrap_or_else(|_| "54bank-platform-prod".to_string())
+    std::env::var("TENANT_ID").unwrap_or_else(|_| "54link-dev-platform-prod".to_string())
 }
 
 pub async fn healthz() -> HttpResponse {
@@ -24,14 +24,14 @@ pub async fn healthz() -> HttpResponse {
             "fluvio": { "status": "connected", "topic": "agriculture-banking-stream" },
             "temporal": { "status": "connected", "namespace": "agriculture_banking" },
             "postgres": { "status": "connected", "database": "ndsep_db", "schema": "agriculture_banking" },
-            "keycloak": { "status": "connected", "realm": "54bank" },
+            "keycloak": { "status": "connected", "realm": "54link-dev" },
             "permify": { "status": "connected", "schema": "agriculture_banking_authz" },
             "redis": { "status": "connected", "prefix": "agriculture_banking:" },
             "mojaloop": { "status": "connected", "participant": "agriculture_banking" },
             "opensearch": { "status": "connected", "index": "agriculture_banking-*" },
             "openappsec": { "status": "connected", "policy": "agriculture-banking-protection" },
             "apisix": { "status": "connected", "upstream": "agriculture_banking" },
-            "tigerbeetle": { "status": "connected", "cluster": "54bank-ledger" },
+            "tigerbeetle": { "status": "connected", "cluster": "54link-dev-ledger" },
             "lakehouse": { "status": "connected", "table": "agriculture_banking_iceberg" }
         })
     }))
@@ -324,7 +324,7 @@ pub async fn create_crop_insurance(state: web::Data<AppState>, body: web::Json<C
         weather_trigger_threshold: req.weather_trigger_threshold,
         claims: Vec::new(),
         status: "active".to_string(),
-        underwriter: req.underwriter.unwrap_or_else(|| "54Bank Insurance Pool".to_string()),
+        underwriter: req.underwriter.unwrap_or_else(|| "54link-dev Insurance Pool".to_string()),
         middleware: vec![
             "weather-intelligence".to_string(), "Kafka".to_string(),
             "Temporal".to_string(), "Postgres".to_string(),

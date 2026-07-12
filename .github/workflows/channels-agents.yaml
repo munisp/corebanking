@@ -1,0 +1,53 @@
+name: Build Channels Agents Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/agent-banking-go/**'
+      - 'services/agent-cash-management-py/**'
+      - 'services/agent-customer-360-py/**'
+      - 'services/agent-dormancy-prevention-py/**'
+      - 'services/agent-farmer-onboarding-go/**'
+      - 'services/agent-nl-reporting-py/**'
+      - 'services/agent-reconciliation-py/**'
+      - 'services/agent-transaction-investigation-py/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/entrypoint.sh'
+      - 'docker/build-services.sh'
+      - '.github/workflows/channels-agents.yaml'
+
+env:
+  TAG: "0.0.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=agent-banking-go,agent-cash-management-py,agent-customer-360-py,agent-dormancy-prevention-py,agent-farmer-onboarding-go,agent-nl-reporting-py,agent-reconciliation-py,agent-transaction-investigation-py
+            PRIMARY_LANG=go
+            PORT_BASE=9135
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-channels-agents:${{ env.TAG }}

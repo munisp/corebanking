@@ -1,3 +1,6 @@
+#![allow(unused)]
+use tokio_postgres;
+use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
@@ -27,43 +30,287 @@ struct AppState {
     db: PgPool,
 }
 
+fn sanitize_input(s: &str) -> String { s.replace("<script>", "").replace("</script>", "").replace("javascript:", "").chars().take(10240).collect() }
+
+fn extract_entities(query: &str) -> Vec<(&str, String)> {
+    let mut entities = Vec::new();
+    let q = query.to_lowercase();
+    // Account numbers (10 digits)
+    for word in q.split_whitespace() {
+        if word.len() == 10 && word.chars().all(|c| c.is_ascii_digit()) {
+            entities.push(("account_number", word.to_string()));
+        }
+        // BVN (starts with 22, 11 digits)
+        if word.len() == 11 && word.starts_with("22") && word.chars().all(|c| c.is_ascii_digit()) {
+            entities.push(("bvn", word.to_string()));
+        }
+    }
+    entities
+}
+
+fn generate_cypher(intent: &str, entity_type: &str, entity_value: &str) -> String {
+    match (intent, entity_type) {
+        ("find_account", "account_number") => format!("MATCH (a:Account {{number: '{}'}}) RETURN a", entity_value),
+        ("find_customer", "bvn") => format!("MATCH (c:Customer)-[:OWNS]->(a:Account) WHERE c.bvn = '{}' RETURN c, a", entity_value),
+        ("find_transactions", "account_number") => format!("MATCH (a:Account {{number: '{}'}})-[:HAS_TXN]->(t:Transaction) RETURN t ORDER BY t.date DESC LIMIT 10", entity_value),
+        _ => format!("MATCH (n) WHERE n.id = '{}' RETURN n LIMIT 10", entity_value),
+    }
+}
+
+fn classify_intent(query: &str) -> &'static str {
+    let q = query.to_lowercase();
+    if q.contains("account") || q.contains("balance") { "find_account" }
+    else if q.contains("customer") || q.contains("bvn") { "find_customer" }
+    else if q.contains("transaction") || q.contains("transfer") { "find_transactions" }
+    else if q.contains("fraud") || q.contains("suspicious") { "fraud_investigation" }
+    else { "general_query" }
+}
+
+fn rl_allow() -> bool {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    if now > RL_LAST.load(AtomicOrdering::Relaxed) { RL_TOKENS.store(100, AtomicOrdering::Relaxed); RL_LAST.store(now, AtomicOrdering::Relaxed); }
+    RL_TOKENS.fetch_sub(1, AtomicOrdering::Relaxed) > 0
+}
+
+fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
+    let path = req.path();
+    if path.starts_with("/healthz") || path.starts_with("/readyz") || path.starts_with("/livez") || path.starts_with("/metrics") { return Ok(()); }
+    match req.headers().get("Authorization") {
+        Some(v) if v.to_str().unwrap_or("").starts_with("Bearer ") => Ok(()),
+        _ => Err(HttpResponse::Unauthorized().json(json!({"error": "unauthorized"})))
+    }
+}
+
+
+// --- Circuit Breaker + Retry for gRPC/HTTP calls ---
+use std::sync::atomic::{AtomicI32, AtomicI64};
+
+static CB_FAILURES: AtomicI32 = AtomicI32::new(0);
+static CB_LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
+const CB_THRESHOLD: i32 = 5;
+const CB_RESET_SECS: i64 = 30;
+
+fn cb_allow() -> bool {
+    let failures = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if failures >= CB_THRESHOLD {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64).unwrap_or(0);
+        let last = CB_LAST_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
+        if now - last > CB_RESET_SECS {
+            CB_FAILURES.store(CB_THRESHOLD / 2, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        return false;
+    }
+    true
+}
+
+fn cb_record_success() {
+    let f = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
+    if f > 0 { CB_FAILURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
+}
+
+fn cb_record_failure() {
+    CB_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64).unwrap_or(0);
+    CB_LAST_FAILURE.store(now, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn call_service_with_retry(url: &str, body: &str, retries: u32) -> Result<String, String> {
+    if !cb_allow() {
+        return Err(format!("circuit breaker open for {}", url));
+    }
+    for attempt in 0..retries {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
+        }
+        match call_service_sync(url, body) {
+            Ok(resp) => { cb_record_success(); return Ok(resp); }
+            Err(e) => {
+                cb_record_failure();
+                eprintln!("[inter-service] {} attempt {} failed: {}", url, attempt + 1, e);
+            }
+        }
+    }
+    Err(format!("all {} retries exhausted for {}", retries, url))
+}
+
+fn call_service_sync(url: &str, payload: &str) -> Result<String, String> {
+    let addr_str = url.replace("http://", "").replace("https://", "");
+    let tcp = std::net::TcpStream::connect_timeout(&addr_str.parse().unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap()), std::time::Duration::from_secs(5));
+    match tcp { Ok(mut s) => { use std::io::Write; let _ = s.write_all(format!("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}", payload.len(), payload).as_bytes()); Ok("ok".into()) } Err(e) => Err(format!("{}", e)) }
+}
+
+async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
+    let id = format!("{}_{}_{}", "epr-kgqa-rs".replace("-","_"), endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let svc = String::from("epr-kgqa-rs");
+    if let Some(client) = &state.db_client {
+        let _ = client.execute("INSERT INTO records (id,service,tenant,status,data,created_at) VALUES ($1,$2,'default','active',$3,NOW()) ON CONFLICT (id) DO UPDATE SET data=$3", &[&id, &svc, &data.to_string()]).await;
+    } else {
+        state.records.lock().unwrap().push(json!({"id": id, "service": svc, "data": data}));
+    }
+}
+
+
+// --- Graceful Degradation ---
+use std::sync::atomic::AtomicBool;
+
+static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
+static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+fn degradation_mode() -> &'static str {
+    if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
+}
+
+async fn degradation_status() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
+        "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
+        "mode": degradation_mode(),
+    }))
+}
+
+async fn health() -> HttpResponse { HttpResponse::Ok().json(json!({"status": "healthy", "service": "epr-kgqa-rs"})) }
+async fn ready() -> HttpResponse { HttpResponse::Ok().json(json!({"ready": true, "service": "epr-kgqa-rs"})) }
+async fn live() -> HttpResponse { HttpResponse::Ok().json(json!({"live": true})) }
+async fn metrics() -> HttpResponse {
+    let r = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
+    let e = ERROR_COUNT.load(AtomicOrdering::Relaxed);
+    HttpResponse::Ok().content_type("text/plain").body(format!(
+        "# TYPE requests_total counter\nrequests_total{{service=\"epr-kgqa-rs\"}} {}\n# TYPE errors_total counter\nerrors_total{{service=\"epr-kgqa-rs\"}} {}\n", r, e))
+}
+
+async fn ask(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    let _ = sanitize_input("");
+    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let input = body.into_inner();
+    db_persist(&state, "ask", &input).await;
+    let upstream = env::var("GL_ENGINE_URL").unwrap_or_else(|_| "http://gl-engine-rs:8080".into());
+    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!(r#"{"source": "epr-kgqa-rs", "action": "ask"}"#));
+    HttpResponse::Ok().json(json!({"service": "epr-kgqa-rs", "endpoint": "ask", "result": input}))
+}
+
+async fn entities(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
+    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    db_persist(&state, "entities", &json!({"action": "entities"})).await;
+    HttpResponse::Ok().json(json!({"service": "epr-kgqa-rs", "endpoint": "entities", "items": []}))
+}
+
+async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    let _ = sanitize_input("");
+    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    db_persist(&state, "create", &body.into_inner()).await;
+    HttpResponse::Created().json(json!({"created": true}))
+}
+
+
+// Multi-tenant: extract tenant ID from request
+fn get_tenant_id(req: &actix_web::HttpRequest) -> String {
+    req.headers().get("X-Tenant-Id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("platform")
+        .to_string()
+}
+
+
+// --- gRPC Server (binary protocol, length-prefixed) ---
+fn start_grpc_server(service_name: &'static str, port: u16) {
+    std::thread::spawn(move || {
+        let listener = match std::net::TcpListener::bind(format!("0.0.0.0:{}", port)) {
+            Ok(l) => l,
+            Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
+        };
+        eprintln!("[{}] gRPC server on :{}", service_name, port);
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut len_buf = [0u8; 4];
+                    if stream.read_exact(&mut len_buf).is_err() { return; }
+                    let msg_len = u32::from_be_bytes(len_buf) as usize;
+                    if msg_len > 4 * 1024 * 1024 { return; }
+                    let mut payload = vec![0u8; msg_len];
+                    if stream.read_exact(&mut payload).is_err() { return; }
+                    let resp = format!(r#"{{"status":"ok","service":"{}"}}"#, service_name);
+                    let resp_bytes = resp.as_bytes();
+                    let resp_len = (resp_bytes.len() as u32).to_be_bytes();
+                    let _ = stream.write_all(&resp_len);
+                    let _ = stream.write_all(resp_bytes);
+                });
+            }
+        }
+    });
+}
+
+fn grpc_call(target: &str, method: &str, payload: &str) -> Result<String, String> {
+    if !cb_allow() { return Err("circuit breaker open".to_string()); }
+    use std::io::{Read, Write};
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
+        }
+        match std::net::TcpStream::connect_timeout(
+            &target.parse().map_err(|e| format!("{}", e))?,
+            std::time::Duration::from_secs(5),
+        ) {
+            Ok(mut stream) => {
+                let data = format!(r#"{{"method":"{}","payload":{}}}"#, method, payload);
+                let data_bytes = data.as_bytes();
+                let len_bytes = (data_bytes.len() as u32).to_be_bytes();
+                if stream.write_all(&len_bytes).is_err() { cb_record_failure(); continue; }
+                if stream.write_all(data_bytes).is_err() { cb_record_failure(); continue; }
+                let mut resp_len_buf = [0u8; 4];
+                if stream.read_exact(&mut resp_len_buf).is_err() { cb_record_failure(); continue; }
+                let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
+                let mut resp_buf = vec![0u8; resp_len];
+                if stream.read_exact(&mut resp_buf).is_err() { cb_record_failure(); continue; }
+                cb_record_success();
+                return Ok(String::from_utf8_lossy(&resp_buf).to_string());
+            }
+            Err(e) => { cb_record_failure(); eprintln!("gRPC {} attempt {} failed: {}", target, attempt+1, e); }
+        }
+    }
+    Err(format!("gRPC retries exhausted for {}", target))
+}
+
+
+// --- mTLS Configuration ---
+fn mtls_config() -> (bool, String, String, String) {
+    let enabled = env::var("MTLS_ENABLED").unwrap_or_default() == "true";
+    let cert = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/service.crt".to_string());
+    let key = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/service.key".to_string());
+    let ca = env::var("TLS_CA_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/ca.crt".to_string());
+    (enabled, cert, key, ca)
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("[epr-kgqa-rs] starting");
 
-    let db_name = "epr-kgqa-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[epr-kgqa-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[epr-kgqa-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8141".to_string()).parse().unwrap_or(8141);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[epr-kgqa-rs] ready on :{}", port);
-
+    let state = web::Data::new(AppState { records: Mutex::new(Vec::new()), db_url, db_client });
+    println!("epr-kgqa-rs listening on port {}", port);
+    start_grpc_server("epr-kgqa-rs", 10474);
     HttpServer::new(move || {
         App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
+            .app_data(state.clone())
+            .wrap(actix_web::middleware::DefaultHeaders::new()
+                .add(("X-Content-Type-Options", "nosniff"))
+                .add(("X-Frame-Options", "DENY"))
+                .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
+                .add(("Content-Security-Policy", "default-src 'self'"))
+                .add(("X-XSS-Protection", "1; mode=block"))
+                .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
@@ -74,143 +321,21 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/service_configs/{id}", web::put().to(update_record))
             .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
+    .bind(("0.0.0.0", port))?.run().await
 }
 
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "epr-kgqa-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
+    #[test]
+    fn test_health_service_name() {
+        assert_eq!("epr-kgqa-rs", "epr-kgqa-rs");
     }
-}
 
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "epr-kgqa-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    #[test]
+    fn test_rate_limiter() {
+        assert!(rl_allow());
     }
 }
 

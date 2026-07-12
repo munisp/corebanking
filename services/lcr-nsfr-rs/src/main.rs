@@ -1,216 +1,135 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
-use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
-}
+fn get_env(key: &str, default: &str) -> String { env::var(key).unwrap_or_else(|_| default.to_string()) }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
-struct AppState {
-    db: PgPool,
-}
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[lcr-nsfr-rs] starting");
-
-    let db_name = "lcr-nsfr-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[lcr-nsfr-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[lcr-nsfr-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8061".to_string()).parse().unwrap_or(8061);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[lcr-nsfr-rs] ready on :{}", port);
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+fn middleware_config() -> serde_json::Value {
+    serde_json::json!({
+        "kafka": {"broker": get_env("KAFKA_BROKER", "localhost:9092"), "topics": "liquidity.lcr-computed,liquidity.nsfr-computed,liquidity.limit-breached"},
+        "redis": {"url": get_env("REDIS_URL", "redis://localhost:6379"), "purpose": "liquidity-ratio-cache"},
+        "postgres": {"url": get_env("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": "lcr_reports,nsfr_reports,liquidity_buckets"},
+        "opensearch": {"url": get_env("OPENSEARCH_URL", "http://localhost:9200"), "index": "liquidity-metrics"},
+        "keycloak": {"url": get_env("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "role": "treasury-officer,alco-member,risk-officer"},
+        "permify": {"url": get_env("PERMIFY_URL", "http://localhost:3476"), "schema": "liquidity:compute,liquidity:override,liquidity:report"},
+        "dapr": {"url": get_env("DAPR_URL", "http://localhost:3500"), "pubsub": "liquidity-events"},
+        "fluvio": {"url": get_env("FLUVIO_URL", "localhost:9003"), "topic": "liquidity-ratios"},
+        "temporal": {"url": get_env("TEMPORAL_URL", "localhost:7233"), "workflow": "LiquidityComputationWorkflow"},
+        "mojaloop": {"url": get_env("MOJALOOP_URL", "http://localhost:4000"), "purpose": "payment-flow-data"},
+        "tigerbeetle": {"url": get_env("TIGERBEETLE_URL", "localhost:3000"), "purpose": "balance-sheet-data"},
+        "lakehouse": {"url": get_env("LAKEHOUSE_URL", "http://localhost:8206"), "tables": "lcr_history,nsfr_history"},
+        "apisix": {"url": get_env("APISIX_URL", "http://localhost:9080"), "route": "/liquidity/*"},
+        "openappsec": {"url": get_env("OPENAPPSEC_URL", "http://localhost:8090"), "policy": "liquidity-data-protection"}
     })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
 }
 
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "lcr-nsfr-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "lcr-nsfr-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
+fn seed_data() -> serde_json::Value {
+    serde_json::json!({
+        "lcr": {
+            "reportDate": "2026-05-10",
+            "hqla": {
+                "level1": {"cashAndReserves": 78000000000.0, "govSecurities": 45000000000.0, "total": 123000000000.0, "weight": 1.0},
+                "level2a": {"corporateBonds": 12000000000.0, "coveredBonds": 5000000000.0, "total": 17000000000.0, "weight": 0.85, "weighted": 14450000000.0},
+                "level2b": {"equities": 3000000000.0, "rmbs": 2000000000.0, "total": 5000000000.0, "weight": 0.5, "weighted": 2500000000.0},
+                "totalHQLA": 139950000000.0
+            },
+            "netCashOutflows": {
+                "retailDepositsStable": {"amount": 180000000000.0, "runoffRate": 0.05, "outflow": 9000000000.0},
+                "retailDepositsLessStable": {"amount": 98000000000.0, "runoffRate": 0.10, "outflow": 9800000000.0},
+                "wholesaleOperational": {"amount": 120000000000.0, "runoffRate": 0.25, "outflow": 30000000000.0},
+                "wholesaleNonOperational": {"amount": 45000000000.0, "runoffRate": 0.40, "outflow": 18000000000.0},
+                "committedFacilities": {"amount": 75600000000.0, "drawdownRate": 0.10, "outflow": 7560000000.0},
+                "totalOutflows": 74360000000.0,
+                "inflows": {"retailInflows": 8000000000.0, "wholesaleInflows": 12000000000.0, "totalInflows": 20000000000.0, "cappedInflows": 20000000000.0},
+                "netOutflows": 54360000000.0
+            },
+            "lcr": 257.4,
+            "minimum": 100.0,
+            "buffer": 157.4,
+            "status": "compliant"
+        },
+        "nsfr": {
+            "reportDate": "2026-05-10",
+            "asf": {
+                "tier1Capital": {"amount": 62000000000.0, "factor": 1.0, "weighted": 62000000000.0},
+                "tier2Capital": {"amount": 13000000000.0, "factor": 1.0, "weighted": 13000000000.0},
+                "stableRetailDeposits": {"amount": 180000000000.0, "factor": 0.95, "weighted": 171000000000.0},
+                "lessStableRetailDeposits": {"amount": 98000000000.0, "factor": 0.90, "weighted": 88200000000.0},
+                "wholesaleFunding1Y": {"amount": 85000000000.0, "factor": 1.0, "weighted": 85000000000.0},
+                "wholesaleFundingLess1Y": {"amount": 45000000000.0, "factor": 0.50, "weighted": 22500000000.0},
+                "totalASF": 441700000000.0
+            },
+            "rsf": {
+                "cashAndReserves": {"amount": 78000000000.0, "factor": 0.0, "weighted": 0.0},
+                "govSecurities": {"amount": 45000000000.0, "factor": 0.05, "weighted": 2250000000.0},
+                "corporateLoans1Y": {"amount": 120000000000.0, "factor": 0.50, "weighted": 60000000000.0},
+                "retailLoans": {"amount": 220000000000.0, "factor": 0.85, "weighted": 187000000000.0},
+                "mortgages": {"amount": 45000000000.0, "factor": 0.65, "weighted": 29250000000.0},
+                "otherAssets": {"amount": 12000000000.0, "factor": 1.0, "weighted": 12000000000.0},
+                "offBalanceSheet": {"amount": 75600000000.0, "factor": 0.05, "weighted": 3780000000.0},
+                "totalRSF": 294280000000.0
+            },
+            "nsfr": 150.1,
+            "minimum": 100.0,
+            "buffer": 50.1,
+            "status": "compliant"
+        },
+        "history": [
+            {"date": "2026-05-10", "lcr": 257.4, "nsfr": 150.1},
+            {"date": "2026-04-30", "lcr": 245.2, "nsfr": 148.5},
+            {"date": "2026-03-31", "lcr": 238.8, "nsfr": 145.2},
+            {"date": "2026-02-28", "lcr": 232.1, "nsfr": 142.8},
+            {"date": "2025-12-31", "lcr": 225.5, "nsfr": 138.9},
+        ],
+        "stats": {
+            "currentLCR": 257.4, "currentNSFR": 150.1,
+            "lcrMinimum": 100.0, "nsfrMinimum": 100.0,
+            "lcrTrend": "improving", "nsfrTrend": "improving",
+            "totalHQLA": 139950000000.0, "netCashOutflows30D": 54360000000.0,
+            "totalASF": 441700000000.0, "totalRSF": 294280000000.0,
+            "complianceStatus": "fully_compliant"
         }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
+    })
 }
 
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
+fn handle_request(request: &str, data: &Arc<RwLock<serde_json::Value>>) -> (u16, String) {
+    let first_line = request.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() < 2 { return (400, r#"{"error":"Bad request"}"#.to_string()); }
+    let path = parts[1];
+    let d = data.read().unwrap();
 
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    if path == "/healthz" {
+        return (200, serde_json::json!({"status": "healthy", "service": "lcr-nsfr",
+            "compliance": {"lcr": d["stats"]["currentLCR"], "nsfr": d["stats"]["currentNSFR"], "status": "compliant"},
+            "middleware": middleware_config()}).to_string());
+    }
+    if path == "/v1/lcr" { return (200, d["lcr"].to_string()); }
+    if path == "/v1/nsfr" { return (200, d["nsfr"].to_string()); }
+    if path == "/v1/history" { return (200, serde_json::json!({"items": d["history"], "total": d["history"].as_array().map_or(0, |a| a.len())}).to_string()); }
+    if path == "/v1/stats" { return (200, d["stats"].to_string()); }
+    (404, r#"{"error":"Not found"}"#.to_string())
+}
 
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+fn main() {
+    let port = get_env("PORT", "8217");
+    let data = Arc::new(RwLock::new(seed_data()));
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).expect("Failed to bind");
+    eprintln!("[lcr-nsfr] Listening on :{} — LCR: 257.4%, NSFR: 150.1%", port);
+    for stream in listener.incoming() {
+        if let Ok(mut stream) = stream {
+            let data = Arc::clone(&data);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = handle_request(&req, &data);
+                let st = match status { 200 => "OK", _ => "Error" };
+                let resp = format!("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", status, st, body.len(), body);
+                let _ = stream.write_all(resp.as_bytes());
+            });
         }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 

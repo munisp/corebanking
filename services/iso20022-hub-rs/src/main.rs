@@ -1,257 +1,230 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::Mutex;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.into())
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+#[derive(Clone, Serialize, Deserialize)]
+struct Iso20022Message {
+    id: String,
+    message_type: String, // pacs.008, pacs.004, pacs.002, pain.001, pain.002, camt.053, camt.054, camt.052
+    business_service: String, // credit_transfer, return, status, initiation, notification, statement
+    sender_bic: String,
+    receiver_bic: String,
+    msg_id: String,
+    creation_datetime: String,
+    number_of_transactions: u32,
+    total_amount: f64,
+    currency: String,
+    settlement_method: String,
+    clearing_system: String, // NIP, NEFT, RTGS, SWIFT
+    status: String, // received, validated, enriched, routed, settled, rejected
+    validation_errors: Vec<String>,
+    debtor_name: Option<String>,
+    debtor_account: Option<String>,
+    creditor_name: Option<String>,
+    creditor_account: Option<String>,
+    end_to_end_id: Option<String>,
+    uetr: Option<String>, // Unique End-to-end Transaction Reference (SWIFT gpi)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ValidationRule {
+    id: String,
+    rule_name: String,
+    message_type: String,
+    field_path: String,
+    validation_type: String, // mandatory, format, length, code_list, business_rule
+    description: String,
+    severity: String, // error, warning
+}
+
+#[derive(Deserialize)]
+struct ParseRequest {
+    message_type: String,
+    sender_bic: String,
+    receiver_bic: String,
+    amount: f64,
+    currency: String,
+    debtor_name: Option<String>,
+    debtor_account: Option<String>,
+    creditor_name: Option<String>,
+    creditor_account: Option<String>,
 }
 
 struct AppState {
-    db: PgPool,
+    messages: Mutex<Vec<Iso20022Message>>,
+    rules: Mutex<Vec<ValidationRule>>,
+}
+
+fn seed() -> (Vec<Iso20022Message>, Vec<ValidationRule>) {
+    let messages = vec![
+        Iso20022Message {
+            id: "ISO-001".into(), message_type: "pacs.008".into(), business_service: "credit_transfer".into(),
+            sender_bic: "54link-devLAGOS".into(), receiver_bic: "ABORNGLA".into(),
+            msg_id: "PACS008-2026050901".into(), creation_datetime: "2026-05-09T10:00:00Z".into(),
+            number_of_transactions: 1, total_amount: 25_000_000.0, currency: "NGN".into(),
+            settlement_method: "CLRG".into(), clearing_system: "NIP".into(),
+            status: "settled".into(), validation_errors: vec![],
+            debtor_name: Some("Dangote Industries".into()), debtor_account: Some("0012345678".into()),
+            creditor_name: Some("MTN Nigeria".into()), creditor_account: Some("0098765432".into()),
+            end_to_end_id: Some("E2E-DGL-MTN-001".into()), uetr: Some("a1b2c3d4-e5f6-7890-abcd-ef1234567890".into()),
+        },
+        Iso20022Message {
+            id: "ISO-002".into(), message_type: "pacs.004".into(), business_service: "return".into(),
+            sender_bic: "ZENITHNGLA".into(), receiver_bic: "54link-devLAGOS".into(),
+            msg_id: "PACS004-2026050901".into(), creation_datetime: "2026-05-09T11:30:00Z".into(),
+            number_of_transactions: 1, total_amount: 5_000_000.0, currency: "NGN".into(),
+            settlement_method: "CLRG".into(), clearing_system: "NIP".into(),
+            status: "validated".into(), validation_errors: vec![],
+            debtor_name: None, debtor_account: None, creditor_name: None, creditor_account: None,
+            end_to_end_id: Some("E2E-RTN-001".into()), uetr: Some("b2c3d4e5-f6a7-8901-bcde-f23456789012".into()),
+        },
+        Iso20022Message {
+            id: "ISO-003".into(), message_type: "pain.001".into(), business_service: "initiation".into(),
+            sender_bic: "54link-devLAGOS".into(), receiver_bic: "CLEARING".into(),
+            msg_id: "PAIN001-2026050901".into(), creation_datetime: "2026-05-09T09:00:00Z".into(),
+            number_of_transactions: 50, total_amount: 500_000_000.0, currency: "NGN".into(),
+            settlement_method: "INDA".into(), clearing_system: "NEFT".into(),
+            status: "enriched".into(), validation_errors: vec![],
+            debtor_name: Some("Access Corp".into()), debtor_account: Some("0033344455".into()),
+            creditor_name: None, creditor_account: None,
+            end_to_end_id: Some("E2E-BATCH-ACC-001".into()), uetr: None,
+        },
+        Iso20022Message {
+            id: "ISO-004".into(), message_type: "camt.053".into(), business_service: "statement".into(),
+            sender_bic: "54link-devLAGOS".into(), receiver_bic: "CBNNGLA".into(),
+            msg_id: "CAMT053-20260509".into(), creation_datetime: "2026-05-09T23:59:00Z".into(),
+            number_of_transactions: 1250, total_amount: 85_000_000_000.0, currency: "NGN".into(),
+            settlement_method: "INDA".into(), clearing_system: "RTGS".into(),
+            status: "settled".into(), validation_errors: vec![],
+            debtor_name: None, debtor_account: None, creditor_name: None, creditor_account: None,
+            end_to_end_id: None, uetr: None,
+        },
+        Iso20022Message {
+            id: "ISO-005".into(), message_type: "pacs.002".into(), business_service: "status".into(),
+            sender_bic: "CBNNGLA".into(), receiver_bic: "54link-devLAGOS".into(),
+            msg_id: "PACS002-2026050905".into(), creation_datetime: "2026-05-09T14:00:00Z".into(),
+            number_of_transactions: 1, total_amount: 0.0, currency: "NGN".into(),
+            settlement_method: "CLRG".into(), clearing_system: "RTGS".into(),
+            status: "rejected".into(), validation_errors: vec!["AC01: Incorrect Account Number".into()],
+            debtor_name: None, debtor_account: None, creditor_name: None, creditor_account: None,
+            end_to_end_id: Some("E2E-FAILED-001".into()), uetr: Some("c3d4e5f6-a7b8-9012-cdef-345678901234".into()),
+        },
+        Iso20022Message {
+            id: "ISO-006".into(), message_type: "camt.054".into(), business_service: "notification".into(),
+            sender_bic: "54link-devLAGOS".into(), receiver_bic: "DGLNGLA".into(),
+            msg_id: "CAMT054-2026050901".into(), creation_datetime: "2026-05-09T16:00:00Z".into(),
+            number_of_transactions: 5, total_amount: 150_000_000.0, currency: "NGN".into(),
+            settlement_method: "INDA".into(), clearing_system: "NIP".into(),
+            status: "settled".into(), validation_errors: vec![],
+            debtor_name: None, debtor_account: None,
+            creditor_name: Some("Dangote Industries".into()), creditor_account: Some("0012345678".into()),
+            end_to_end_id: None, uetr: None,
+        },
+    ];
+
+    let rules = vec![
+        ValidationRule { id: "VR-001".into(), rule_name: "BIC format".into(), message_type: "pacs.008".into(), field_path: "GrpHdr/SttlmInf/SttlmAcct/Id/IBAN".into(), validation_type: "format".into(), description: "BIC must be 8 or 11 characters".into(), severity: "error".into() },
+        ValidationRule { id: "VR-002".into(), rule_name: "Amount positive".into(), message_type: "pacs.008".into(), field_path: "CdtTrfTxInf/Amt/InstdAmt".into(), validation_type: "business_rule".into(), description: "Amount must be greater than zero".into(), severity: "error".into() },
+        ValidationRule { id: "VR-003".into(), rule_name: "Currency code".into(), message_type: "pacs.008".into(), field_path: "CdtTrfTxInf/Amt/InstdAmt/@Ccy".into(), validation_type: "code_list".into(), description: "Currency must be valid ISO 4217".into(), severity: "error".into() },
+        ValidationRule { id: "VR-004".into(), rule_name: "UETR format".into(), message_type: "pacs.008".into(), field_path: "CdtTrfTxInf/PmtId/UETR".into(), validation_type: "format".into(), description: "UETR must be UUID v4 format".into(), severity: "error".into() },
+        ValidationRule { id: "VR-005".into(), rule_name: "Debtor account".into(), message_type: "pain.001".into(), field_path: "PmtInf/DbtrAcct/Id".into(), validation_type: "mandatory".into(), description: "Debtor account is mandatory for payment initiation".into(), severity: "error".into() },
+    ];
+
+    (messages, rules)
+}
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "ok"}))
+}
+
+async fn list_messages(data: web::Data<AppState>) -> HttpResponse {
+    let m = data.messages.lock().unwrap();
+    HttpResponse::Ok().json(serde_json::json!({ "items": *m, "total": m.len() }))
+}
+
+async fn list_rules(data: web::Data<AppState>) -> HttpResponse {
+    let r = data.rules.lock().unwrap();
+    HttpResponse::Ok().json(serde_json::json!({ "items": *r, "total": r.len() }))
+}
+
+async fn parse_and_validate(body: web::Json<ParseRequest>, data: web::Data<AppState>) -> HttpResponse {
+    let req = body.into_inner();
+    let valid_types = ["pacs.008", "pacs.004", "pacs.002", "pain.001", "pain.002", "camt.053", "camt.054", "camt.052"];
+    if !valid_types.contains(&req.message_type.as_str()) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": format!("message_type must be one of: {}", valid_types.join(", "))}));
+    }
+    if req.amount < 0.0 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "amount must be non-negative"}));
+    }
+    if req.sender_bic.len() != 11 && req.sender_bic.len() != 8 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "sender_bic must be 8 or 11 characters"}));
+    }
+    let mut errors = vec![];
+    if req.message_type == "pain.001" && req.debtor_account.is_none() {
+        errors.push("VR-005: Debtor account is mandatory for payment initiation".to_string());
+    }
+    let status = if errors.is_empty() { "validated" } else { "rejected" };
+    let mut msgs = data.messages.lock().unwrap();
+    let msg = Iso20022Message {
+        id: format!("ISO-{:03}", msgs.len() + 1),
+        message_type: req.message_type.clone(), business_service: match req.message_type.as_str() {
+            "pacs.008" => "credit_transfer", "pacs.004" => "return", "pacs.002" => "status",
+            "pain.001" => "initiation", "camt.053" => "statement", "camt.054" => "notification",
+            _ => "other"
+        }.into(),
+        sender_bic: req.sender_bic, receiver_bic: req.receiver_bic,
+        msg_id: format!("{}-{}", req.message_type.to_uppercase().replace('.', ""), msgs.len() + 1),
+        creation_datetime: "2026-05-10T00:00:00Z".into(),
+        number_of_transactions: 1, total_amount: req.amount, currency: req.currency,
+        settlement_method: "CLRG".into(), clearing_system: "NIP".into(),
+        status: status.into(), validation_errors: errors,
+        debtor_name: req.debtor_name, debtor_account: req.debtor_account,
+        creditor_name: req.creditor_name, creditor_account: req.creditor_account,
+        end_to_end_id: Some(format!("E2E-NEW-{:03}", msgs.len() + 1)), uetr: None,
+    };
+    msgs.push(msg.clone());
+    if msg.status == "rejected" {
+        HttpResponse::UnprocessableEntity().json(msg)
+    } else {
+        HttpResponse::Created().json(msg)
+    }
+}
+
+async fn stats(data: web::Data<AppState>) -> HttpResponse {
+    let m = data.messages.lock().unwrap();
+    let settled = m.iter().filter(|x| x.status == "settled").count();
+    let rejected = m.iter().filter(|x| x.status == "rejected").count();
+    let total_settled_amount: f64 = m.iter().filter(|x| x.status == "settled").map(|x| x.total_amount).sum();
+    let mut by_type: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for msg in m.iter() { *by_type.entry(msg.message_type.clone()).or_insert(0) += 1; }
+    let mut by_clearing: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for msg in m.iter() { *by_clearing.entry(msg.clearing_system.clone()).or_insert(0) += 1; }
+    HttpResponse::Ok().json(serde_json::json!({
+        "totalMessages": m.len(), "settled": settled, "rejected": rejected,
+        "totalSettledAmount": total_settled_amount,
+        "byMessageType": by_type, "byClearingSystem": by_clearing,
+    }))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[iso20022-hub-rs] starting");
-
-    let db_name = "iso20022-hub-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[iso20022-hub-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[iso20022-hub-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8182".to_string()).parse().unwrap_or(8182);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[iso20022-hub-rs] ready on :{}", port);
-
+    let (msgs, rules) = seed();
+    let state = web::Data::new(AppState { messages: Mutex::new(msgs), rules: Mutex::new(rules) });
+    eprintln!("ISO 20022 Hub service on :8162");
     HttpServer::new(move || {
         App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .app_data(state.clone())
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/iso20022/messages", web::get().to(list_messages))
+            .route("/v1/iso20022/rules", web::get().to(list_rules))
+            .route("/v1/iso20022/parse", web::post().to(parse_and_validate))
+            .route("/v1/iso20022/stats", web::get().to(stats))
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .bind("0.0.0.0:8162")?
     .run()
     .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "iso20022-hub-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "iso20022-hub-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

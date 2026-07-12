@@ -1,4 +1,4 @@
-module github.com/54bank/erpnext-bridge-go
+module github.com/54link-dev/erpnext-bridge-go
 
 go 1.22
 

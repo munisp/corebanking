@@ -1,257 +1,182 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::Mutex;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+#[derive(Clone, Serialize, Deserialize)]
+struct MiddlewareConfig {
+    kafka_broker: String,
+    redis_url: String,
+    postgres_url: String,
+    opensearch_url: String,
+    keycloak_url: String,
+    permify_url: String,
+    dapr_url: String,
+    fluvio_url: String,
+    temporal_url: String,
+    mojaloop_url: String,
+    tigerbeetle_url: String,
+    lakehouse_url: String,
+    apisix_url: String,
+    openappsec_url: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+fn mw() -> MiddlewareConfig {
+    MiddlewareConfig {
+        kafka_broker: std::env::var("KAFKA_BROKER").unwrap_or_else(|_| "localhost:9092".into()),
+        redis_url: std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into()),
+        postgres_url: std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db".into()
+        }),
+        opensearch_url: std::env::var("OPENSEARCH_URL").unwrap_or_else(|_| "http://localhost:9200".into()),
+        keycloak_url: std::env::var("KEYCLOAK_URL").unwrap_or_else(|_| "http://localhost:8080".into()),
+        permify_url: std::env::var("PERMIFY_URL").unwrap_or_else(|_| "http://localhost:3476".into()),
+        dapr_url: std::env::var("DAPR_URL").unwrap_or_else(|_| "http://localhost:3500".into()),
+        fluvio_url: std::env::var("FLUVIO_URL").unwrap_or_else(|_| "localhost:9003".into()),
+        temporal_url: std::env::var("TEMPORAL_URL").unwrap_or_else(|_| "localhost:7233".into()),
+        mojaloop_url: std::env::var("MOJALOOP_URL").unwrap_or_else(|_| "http://localhost:3002".into()),
+        tigerbeetle_url: std::env::var("TIGERBEETLE_URL").unwrap_or_else(|_| "localhost:3000".into()),
+        lakehouse_url: std::env::var("LAKEHOUSE_URL").unwrap_or_else(|_| "http://localhost:8181".into()),
+        apisix_url: std::env::var("APISIX_URL").unwrap_or_else(|_| "http://localhost:9080".into()),
+        openappsec_url: std::env::var("OPENAPPSEC_URL").unwrap_or_else(|_| "http://localhost:4000".into()),
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Portfolio {
+    id: String,
+    portfolio_name: String,
+    client_name: String,
+    client_id: String,
+    portfolio_type: String,
+    currency: String,
+    total_aum: f64,
+    asset_allocation: Vec<AssetAlloc>,
+    benchmark: String,
+    ytd_return: f64,
+    risk_score: f64,
+    inception_date: String,
+    status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AssetAlloc {
+    asset_class: String,
+    weight: f64,
+    value: f64,
+}
+
+fn seed() -> Vec<Portfolio> {
+    vec![
+        Portfolio {
+            id: "PF-001".into(),
+            portfolio_name: "Conservative Income Fund".into(),
+            client_name: "Dangote Industries Ltd".into(),
+            client_id: "C-001".into(),
+            portfolio_type: "institutional".into(),
+            currency: "NGN".into(),
+            total_aum: 50_000_000_000.0,
+            asset_allocation: vec![
+                AssetAlloc { asset_class: "fgn_bonds".into(), weight: 45.0, value: 22_500_000_000.0 },
+                AssetAlloc { asset_class: "treasury_bills".into(), weight: 30.0, value: 15_000_000_000.0 },
+                AssetAlloc { asset_class: "money_market".into(), weight: 15.0, value: 7_500_000_000.0 },
+                AssetAlloc { asset_class: "equities".into(), weight: 10.0, value: 5_000_000_000.0 },
+            ],
+            benchmark: "S&P/FMDQ Nigerian Bond Index".into(),
+            ytd_return: 8.75,
+            risk_score: 3.2,
+            inception_date: "2023-01-15".into(),
+            status: "active".into(),
+        }
+    ]
 }
 
 struct AppState {
-    db: PgPool,
+    portfolios: Mutex<Vec<Portfolio>>,
 }
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[portfolio-mgmt-rs] starting");
-
-    let db_name = "portfolio-mgmt-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[portfolio-mgmt-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[portfolio-mgmt-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8050".to_string()).parse().unwrap_or(8050);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[portfolio-mgmt-rs] ready on :{}", port);
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
-    })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
+async fn healthz() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
         "service": "portfolio-mgmt-rs",
+        "status": "ok",
         "version": "1.0.0"
     }))
 }
 
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
+async fn list_portfolios(data: web::Data<AppState>) -> HttpResponse {
+    let p = match data.portfolios.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(
+                serde_json::json!({ "error": "failed to acquire lock" })
+            );
+        }
+    };
 
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
     HttpResponse::Ok().json(serde_json::json!({
-        "service": "portfolio-mgmt-rs",
-        "total_records": count
+        "items": *p,
+        "total": p.len()
     }))
 }
 
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
+async fn get_performance(data: web::Data<AppState>) -> HttpResponse {
+    let p = match data.portfolios.lock() {
+        Ok(v) => v,
+        Err(_) => {
+            return HttpResponse::InternalServerError().json(
+                serde_json::json!({ "error": "failed to acquire lock" })
+            );
         }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
+    };
+
+    let total_aum: f64 = p.iter().map(|x| x.total_aum).sum();
+    let avg_return = if p.is_empty() {
+        0.0
+    } else {
+        p.iter().map(|x| x.ytd_return).sum::<f64>() / p.len() as f64
+    };
+
+    let avg_risk = if p.is_empty() {
+        0.0
+    } else {
+        p.iter().map(|x| x.risk_score).sum::<f64>() / p.len() as f64
+    };
+
+    let sharpe_ratio = if avg_risk == 0.0 {
+        0.0
+    } else {
+        (avg_return - 5.0) / avg_risk
+    };
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "total_aum": total_aum,
+        "portfolio_count": p.len(),
+        "avg_ytd_return": (avg_return * 100.0).round() / 100.0,
+        "avg_risk_score": (avg_risk * 100.0).round() / 100.0,
+        "sharpe_ratio": (sharpe_ratio * 100.0).round() / 100.0
+    }))
 }
 
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let port: u16 = std::env::var("PORT")
+        .unwrap_or_else(|_| "8167".into())
+        .parse()
+        .unwrap_or(8167);
 
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    let data = web::Data::new(AppState {
+        portfolios: Mutex::new(seed()),
+    });
 
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
+    println!("Portfolio Management Service running on port {}", port);
 
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
+    HttpServer::new(move || {
+        App::new()
+            .app_data(data.clone())
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/portfolios", web::get().to(list_portfolios))
+            .route("/v1/portfolios/performance", web::get().to(get_performance))
+    })
+    .bind(("0.0.0.0", port))?
+    .run()
+    .await
 }

@@ -1,0 +1,47 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Risk Manager Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- NOTE: In-memory service -->
+        <mxCell id="note_storage" value="Storage model: In-memory state + external aggregation.&#xa;Risk scores computed dynamically from:&#xa;  - Account service (transaction history)&#xa;  - Fraud service (fraud scores)&#xa;  - Credit engine outputs&#xa;No dedicated PostgreSQL tables — events&#xa;persisted to Lakehouse via Kafka." style="text;html=1;strokeColor=#b85450;fillColor=#f8cecc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="340" height="140" as="geometry"/>
+        </mxCell>
+
+        <!-- CREDIT RISK -->
+        <mxCell id="credit_risk" value="CreditRiskProfile (computed)&#xa;----------------------&#xa;entity_id (varchar)&#xa;entity_type (varchar: customer/business)&#xa;tenant_id (varchar)&#xa;credit_score (int)&#xa;pd (float: probability of default)&#xa;lgd (float: loss given default)&#xa;ead (float: exposure at default)&#xa;risk_grade (varchar: A/B/C/D/E)&#xa;credit_limit (int64)&#xa;outstanding_exposure (int64)&#xa;collateral_value (int64)&#xa;last_assessed_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="240" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- MARKET RISK -->
+        <mxCell id="market_risk" value="MarketRiskPosition (computed)&#xa;----------------------&#xa;position_id (varchar)&#xa;tenant_id (varchar)&#xa;asset_type (varchar: fx/equity/bond/commodity)&#xa;currency / asset_id (varchar)&#xa;notional_value / market_value (int64)&#xa;var_1d / var_10d (float: Value at Risk)&#xa;sensitivity (float: delta/gamma/vega)&#xa;stress_loss (int64)&#xa;limit / utilization (float)&#xa;status (varchar)&#xa;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="400" y="240" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- OPERATIONAL RISK -->
+        <mxCell id="operational_risk" value="OperationalRiskEvent (computed)&#xa;----------------------&#xa;event_id (varchar)&#xa;tenant_id (varchar)&#xa;event_type (varchar: fraud/system_failure/human_error)&#xa;category (varchar: people/process/technology/external)&#xa;severity (varchar)&#xa;actual_loss / potential_loss (int64)&#xa;description (text)&#xa;root_cause / mitigation (text)&#xa;status (varchar: open/mitigated/closed)&#xa;occurred_at / reported_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="40" y="580" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- RISK LIMITS -->
+        <mxCell id="risk_limits" value="RiskLimit (computed)&#xa;----------------------&#xa;limit_id (varchar)&#xa;tenant_id (varchar)&#xa;limit_type (varchar: credit/market/operational/liquidity)&#xa;entity_type / entity_id (varchar)&#xa;limit_value (int64)&#xa;current_utilization (int64)&#xa;utilization_pct (float)&#xa;warning_threshold / breach_threshold (float)&#xa;status (varchar: normal/warning/breached)&#xa;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="400" y="580" width="300" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="credit_risk" target="risk_limits" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="market_risk" target="risk_limits" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="operational_risk" target="risk_limits" style="endArrow=block;dashed=1;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

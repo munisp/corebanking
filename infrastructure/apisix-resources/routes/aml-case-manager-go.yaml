@@ -1,0 +1,42 @@
+# aml-case-manager-go
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: 54link-dev-aml-case-manager-go-route
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  http:
+    - name: rule-1
+      priority: 10
+      match:
+        hosts:
+          - 54link-dev.upi.dev
+        paths:
+          - /aml-case-manager/*
+      backends:
+        - serviceName: compliance-kyc-aml
+          servicePort: 9213
+      plugins:
+        - name: proxy-rewrite
+          enable: true
+          config:
+            regex_uri:
+              - "^/aml-case-manager/(.*)"
+              - "/$1"
+        - name: 54link-jwt-payload-decoder
+          enable: true
+          config: {}
+        - name: 54link-access-plugin
+          enable: true
+          config:
+            authorizer_url: "http://identity-auth.54link-dev.svc.cluster.local:9365/token"
+            mint_account_url: "http://core-accounts.54link-dev.svc.cluster.local:9280/system/create-mint-account"
+            keycloak_public_key_url: "http://platform-tenant.54link-dev.svc.cluster.local:9528/tenant/keycloak-public-key"
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "https://54link-dev.upi.dev,http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"
+            allow_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+            allow_headers: "Content-Type,Authorization,x-keycloak-realm,X-API-Key,X-Request-Id,X-Request-ID,X-Correlation-Id,X-Trace-Id,X-CSRF-Token,Idempotency-Key,x-idempotency-key,x-tenant-id,X-Tenant-ID,x-tenant-name,X-Tenant-Name,x-keycloak-id,X-Keycloak-ID,x-ledger-id,X-Ledger-ID,x-mint-id,X-Mint-ID,x-mint-account-id,X-Mint-Account-ID,x-staff-id,X-Staff-ID,x-user-id,X-User-ID,x-user-role,X-User-Role,x-branch-id,X-Branch-ID,x-customer-id,X-Customer-ID,x-default-account-id,X-Default-Account-ID,x-device-id,X-Device-ID,x-actor-id,X-Actor-ID,x-bank-code,X-Bank-Code,x-bank-id,X-Bank-ID,x-client-id,X-Client-ID,x-merchant-id,X-Merchant-ID,x-network-type,X-Network-Type,x-service-name,X-Service-Name,x-source-service,X-Source-Service,x-synthetic-test,X-Synthetic-Test,X-Timestamp,x-keycloak-pub-key,X-Keycloak-Pub-Key,x-operator-role,X-Operator-Role,x-switch-name,X-Switch-Name,x-ams-name,X-Ams-Name"
+            expose_headers: "Content-Length"

@@ -1,0 +1,1 @@
+dapr run --app-id 54link-payment-processing --app-port 8007 -- uvicorn main:app --reload --host 0.0.0.0 --port 8007

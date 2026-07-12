@@ -1,4 +1,4 @@
-module github.com/54bank/agri-logistics-go
+module github.com/54link-dev/agri-logistics-go
 
 go 1.21
 

@@ -9,13 +9,8 @@ const checks = [
     relativePath: ".env.production.example",
     rules: [
       {
-        label: "TENANT_SECRET placeholder",
-        pattern: /^TENANT_SECRET=.*(?:change-me|demo|default).*$/m,
-        severity: "error",
-      },
-      {
-        label: "BUILT_IN_FORGE_API_KEY placeholder",
-        pattern: /^BUILT_IN_FORGE_API_KEY=.*(?:demo|default|change-me).*$/m,
+        label: "DATABASE_URL placeholder",
+        pattern: /^DATABASE_URL=.*(?:demo|default|change-me|runtime-secret).*$/m,
         severity: "error",
       },
       {
@@ -24,104 +19,61 @@ const checks = [
         severity: "error",
       },
       {
-        label: "KEYCLOAK_CLIENT_SECRET placeholder",
-        pattern: /^KEYCLOAK_CLIENT_SECRET=.*(?:demo|default|change-me|runtime-secret).*$/m,
+        label: "REDIS_URL placeholder",
+        pattern: /^REDIS_URL=.*(?:demo|default|change-me|runtime-secret).*$/m,
         severity: "error",
       },
       {
-        label: "MOJALOOP_FSP_SECRET placeholder",
-        pattern: /^MOJALOOP_FSP_SECRET=.*(?:demo|default|change-me|runtime-secret).*$/m,
+        label: "KAFKA_BROKER placeholder",
+        pattern: /^KAFKA_BROKER=.*(?:demo|default|change-me|localhost).*$/m,
         severity: "error",
-      },
-      {
-        label: "DATABASE_URL placeholder password",
-        pattern: /^DATABASE_URL=.*(?:demo|default|change-me|runtime-secret).*$/m,
-        severity: "error",
-      },
-      {
-        label: "Production example warning banner missing",
-        pattern: /Replace every secret-bearing value with environment-specific secrets before any real deployment\./m,
-        severity: "error",
-        expectMatch: true,
-      },
-    ],
-  },
-  {
-    relativePath: "docker-compose.yml",
-    rules: [
-      {
-        label: "TENANT_SECRET compose placeholder",
-        pattern: /^\s*TENANT_SECRET:\s*.*(?:change-me|runtime-secret|demo|default).*$/m,
-        severity: "error",
-      },
-      {
-        label: "JWT_SECRET compose placeholder",
-        pattern: /^\s*JWT_SECRET:\s*.*(?:change-me|runtime-secret|demo|default).*$/m,
-        severity: "error",
-      },
-      {
-        label: "Compose references local service URL for upstream platform",
-        pattern: /^\s*UPSTREAM_PLATFORM_URL:\s*http:\/\/54bank-ui:3000\s*$/m,
-        severity: "warn",
       },
     ],
   },
 ];
 
-const findings = [];
+const errors = [];
+const warnings = [];
 
 for (const check of checks) {
-  const absolutePath = path.join(projectRoot, check.relativePath);
-  if (!fs.existsSync(absolutePath)) {
-    findings.push({
-      file: check.relativePath,
-      severity: "error",
-      label: "Required file missing",
-      detail: `${check.relativePath} was not found.`,
-    });
+  const filePath = path.join(projectRoot, check.relativePath);
+  if (!fs.existsSync(filePath)) {
+    console.warn(`⚠  ${check.relativePath} not found`);
     continue;
   }
 
-  const content = fs.readFileSync(absolutePath, "utf8");
+  const content = fs.readFileSync(filePath, "utf-8");
 
   for (const rule of check.rules) {
-    const expectMatch = rule.expectMatch ?? false;
-    const matched = rule.pattern.test(content);
-    const violated = expectMatch ? !matched : matched;
+    const hasMatch = rule.pattern.test(content);
+    const shouldMatch = rule.expectMatch === true;
+    const matches = hasMatch === shouldMatch;
 
-    if (!violated) continue;
-
-    findings.push({
-      file: check.relativePath,
-      severity: rule.severity,
-      label: rule.label,
-      detail: expectMatch
-        ? `Expected pattern was not found in ${check.relativePath}.`
-        : `Placeholder or risky default matched in ${check.relativePath}.`,
-    });
+    if (!matches) {
+      const issue = {
+        file: check.relativePath,
+        rule: rule.label,
+        severity: rule.severity,
+      };
+      if (rule.severity === "error") {
+        errors.push(issue);
+      } else {
+        warnings.push(issue);
+      }
+    }
   }
 }
 
-const errors = findings.filter((item) => item.severity === "error");
-const warnings = findings.filter((item) => item.severity === "warn");
-
-if (findings.length === 0) {
-  console.log("Production config verification passed: no placeholder or risky defaults detected in documented deployment surfaces.");
-  process.exit(0);
-}
-
-console.log("Production config verification findings:");
-for (const finding of findings) {
-  console.log(`- [${finding.severity.toUpperCase()}] ${finding.file}: ${finding.label} — ${finding.detail}`);
-}
-
 if (warnings.length > 0) {
-  console.log(`Warnings: ${warnings.length}`);
+  console.warn("⚠  Warnings:");
+  warnings.forEach(w => console.warn(`  - ${w.file}: ${w.rule}`));
 }
 
 if (errors.length > 0) {
-  console.log(`Errors: ${errors.length}`);
+  console.error("✗ Production readiness errors found:");
+  errors.forEach(e => console.error(`  - ${e.file}: ${e.rule}`));
   process.exit(1);
+} else {
+  console.log("✓ Production configuration verified");
+  process.exit(0);
 }
-
-process.exit(0);

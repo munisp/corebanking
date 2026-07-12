@@ -1,4 +1,4 @@
-"""54Bank Dispute Management Service (Python)
+"""54link-dev Dispute Management Service (Python)
 
 Implements dispute/chargeback lifecycle:
   - Dispute filing with category classification
@@ -22,51 +22,6 @@ from middleware import (
     Bundle, gen_id, now_iso, default_tenant, record_audit,
     parse_json_body, respond_json,
 )
-
-
-SERVICE_NAME = "dispute-management-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
-
 
 bundle = Bundle()
 disputes: dict[str, dict] = {}
@@ -106,7 +61,7 @@ class Handler(BaseHTTPRequestHandler):
                     "fluvio":      {"status": "connected", "topic": "dispute-realtime-stream"},
                     "temporal":    {"status": "connected", "workflows": ["dispute-lifecycle", "dispute-escalation", "dispute-resolution", "chargeback-processing"]},
                     "postgres":    {"status": "connected", "tables": ["disputes", "dispute_evidence", "dispute_communications", "dispute_audit"]},
-                    "keycloak":    {"status": "connected", "realm": "54bank", "roles": ["dispute_admin", "dispute_officer", "dispute_viewer"]},
+                    "keycloak":    {"status": "connected", "realm": "54link-dev", "roles": ["dispute_admin", "dispute_officer", "dispute_viewer"]},
                     "permify":     {"status": "connected", "schema": "dispute_rbac", "permissions": 10},
                     "redis":       {"status": "connected", "caches": ["dispute-case-cache", "dispute-sla-cache"]},
                     "mojaloop":    {"status": "connected", "settlement": "dispute-chargeback-settlement"},
@@ -242,7 +197,6 @@ class Handler(BaseHTTPRequestHandler):
             "createdAt": now_iso(),
         }
         evidence_items.append(evidence)
-        db_persist("evidence_items", evidence.to_dict() if hasattr(evidence, "to_dict") else evidence if isinstance(evidence, dict) else {"value": str(evidence)})
         disputes[did]["updatedAt"] = now_iso()
         respond_json(self, 201, evidence)
 
@@ -319,7 +273,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8102"))
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"Dispute Management service listening on :{port}")

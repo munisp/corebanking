@@ -1,0 +1,44 @@
+name: Build and Deploy Cheque Clearing Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/cheque-clearing-go/**'
+      - 'infrastructure/charts/cheque-clearing-go/**'
+      - 'infrastructure/apisix-resources/routes/cheque-clearing-go.yaml'
+      - '.github/workflows/cheque-clearing-go.yaml'
+
+env:
+  IMAGE: registry.digitalocean.com/talentgraph-auth/54link-dev-cheque-clearing-go
+  TAG: "0.0.1"
+  CHART: infrastructure/charts/cheque-clearing-go
+  RELEASE: cheque-clearing-go
+  NAMESPACE: 54link-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/cheque-clearing-go
+          file: ./services/cheque-clearing-go/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+

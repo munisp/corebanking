@@ -1,229 +1,197 @@
 """
-opensearch-indexer-py - Production-ready service with PostgreSQL persistence.
-Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
+opensearch-indexer-py — Consumes transaction events via Dapr pub/sub and indexes them into OpenSearch.
+
+Subscribes to:
+  - transaction_initiated
+  - transaction_failed
+  - transaction_success
+
+Published by payment-processing-service using TransactionEventSchema.
 """
 
 import os
-import json
-import uuid
 import logging
 from datetime import datetime, timezone
-from contextlib import asynccontextmanager
+from typing import Optional, Any
 
-import psycopg2
-import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from opensearchpy import OpenSearch, RequestsHttpConnection
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("opensearch-indexer-py")
 
-# Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/opensearch_indexer_py")
-KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
-KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
-REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
-OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
-PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
-PORT = int(os.getenv("PORT", "8335"))
+OPENSEARCH_URL      = os.environ.get("OPENSEARCH_URL", "http://opensearch:9200")
+OPENSEARCH_USERNAME = os.environ.get("OPENSEARCH_USERNAME", "")
+OPENSEARCH_PASSWORD = os.environ.get("OPENSEARCH_PASSWORD", "")
+DAPR_PUBSUB         = os.environ.get("DAPR_PUBSUB_NAME", os.environ.get("DAPR_PUBSUB", "pubsub"))
+INDEX_NAME          = "transactions"
 
-db_conn = None
+app = FastAPI(title="opensearch-indexer-py", version="1.0.0")
 
+# ---------------------------------------------------------------------------
+# OpenSearch client
+# ---------------------------------------------------------------------------
 
-def get_db():
-    global db_conn
-    if db_conn is None or db_conn.closed:
-        db_conn = psycopg2.connect(DATABASE_URL)
-        db_conn.autocommit = True
-    return db_conn
+def _build_client() -> OpenSearch:
+    url = OPENSEARCH_URL.rstrip("/")
+    scheme, rest = url.split("://", 1)
+    host, *port_part = rest.rsplit(":", 1)
+    port = int(port_part[0]) if port_part else (443 if scheme == "https" else 9200)
+    kwargs = dict(
+        hosts=[{"host": host, "port": port}],
+        http_compress=True,
+        use_ssl=(scheme == "https"),
+        verify_certs=False,
+        connection_class=RequestsHttpConnection,
+        timeout=10,
+    )
+    if OPENSEARCH_USERNAME and OPENSEARCH_PASSWORD:
+        kwargs["http_auth"] = (OPENSEARCH_USERNAME, OPENSEARCH_PASSWORD)
+    return OpenSearch(**kwargs)
 
+_client: Optional[OpenSearch] = None
 
-def init_schema():
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-        )""")
-
-        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
-            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            event_type VARCHAR(64) NOT NULL,
-            aggregate_id VARCHAR(128) NOT NULL,
-            payload JSONB NOT NULL,
-            published BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )""")
-
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
-    conn.commit()
-    logger.info("Schema initialized")
+def get_client() -> OpenSearch:
+    global _client
+    if _client is None:
+        _client = _build_client()
+    return _client
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    init_schema()
-    logger.info(f"[opensearch-indexer-py] ready on :%d", PORT)
-    logger.info(f"[opensearch-indexer-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
-                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
-    yield
-    if db_conn:
-        db_conn.close()
+INDEX_MAPPING = {
+    "mappings": {
+        "properties": {
+            "transaction_id": {"type": "keyword"},
+            "payer":          {"type": "keyword"},
+            "payee":          {"type": "keyword"},
+            "amount":         {"type": "float"},
+            "status":         {"type": "keyword"},
+            "currency":       {"type": "keyword"},
+            "completed_at":   {"type": "date"},
+            "@timestamp":     {"type": "date"},
+            "note":           {"type": "text"},
+            "tag":            {"type": "keyword"},
+            "tenant_id":      {"type": "keyword"},
+            "ledger_id":      {"type": "keyword"},
+            "topic":          {"type": "keyword"},
+        }
+    },
+    "settings": {
+        "number_of_shards": 2,
+        "number_of_replicas": 1,
+    },
+}
 
 
-app = FastAPI(title="opensearch-indexer-py", version="1.0.0", lifespan=lifespan)
+@app.on_event("startup")
+async def startup():
+    try:
+        client = get_client()
+        if not client.indices.exists(index=INDEX_NAME):
+            client.indices.create(index=INDEX_NAME, body=INDEX_MAPPING)
+            logger.info("Created index '%s'", INDEX_NAME)
+        else:
+            logger.info("Index '%s' already exists", INDEX_NAME)
+    except Exception as e:
+        logger.warning("OpenSearch not ready at startup (will retry on first event): %s", e)
+        global _client
+        _client = None
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+# ---------------------------------------------------------------------------
+# Dapr event model
+# ---------------------------------------------------------------------------
+
+class DaprEvent(BaseModel):
+    id: str = ""
+    source: str = ""
+    type: str = ""
+    specversion: str = "1.0"
+    datacontenttype: str = "application/json"
+    data: dict[str, Any] = {}
 
 
-class CreateRequest(BaseModel):
-    status: Optional[str] = "active"
-    tenant_id: Optional[str] = None
-    data: Optional[Dict[str, Any]] = None
+def _index(event: DaprEvent, topic: str) -> None:
+    data = event.data.copy()
+    data["topic"]      = topic
+    data["@timestamp"] = datetime.now(timezone.utc).isoformat()
+
+    if "amount" in data:
+        try:
+            data["amount"] = float(data["amount"])
+        except (ValueError, TypeError):
+            pass
+
+    get_client().index(
+        index=INDEX_NAME,
+        id=data.get("transaction_id"),
+        body=data,
+    )
+    logger.info("Indexed %s [%s]", data.get("transaction_id"), topic)
 
 
-class UpdateRequest(BaseModel):
-    status: Optional[str] = None
-    data: Optional[Dict[str, Any]] = None
+# ---------------------------------------------------------------------------
+# Dapr pub/sub subscription declaration
+# ---------------------------------------------------------------------------
 
+@app.get("/dapr/subscribe")
+def dapr_subscribe():
+    return [
+        {"pubsubname": DAPR_PUBSUB, "topic": "transaction_initiated", "route": "/transaction_initiated"},
+        {"pubsubname": DAPR_PUBSUB, "topic": "transaction_failed",    "route": "/transaction_failed"},
+        {"pubsubname": DAPR_PUBSUB, "topic": "transaction_success",   "route": "/transaction_success"},
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Event handlers
+# ---------------------------------------------------------------------------
+
+@app.post("/transaction_initiated")
+def on_initiated(event: DaprEvent):
+    try:
+        _index(event, "transaction_initiated")
+        return {"status": "SUCCESS"}
+    except Exception as e:
+        logger.error("Index failed [transaction_initiated]: %s", e)
+        return {"status": "RETRY"}
+
+
+@app.post("/transaction_failed")
+def on_failed(event: DaprEvent):
+    try:
+        _index(event, "transaction_failed")
+        return {"status": "SUCCESS"}
+    except Exception as e:
+        logger.error("Index failed [transaction_failed]: %s", e)
+        return {"status": "RETRY"}
+
+
+@app.post("/transaction_success")
+def on_success(event: DaprEvent):
+    try:
+        _index(event, "transaction_success")
+        return {"status": "SUCCESS"}
+    except Exception as e:
+        logger.error("Index failed [transaction_success]: %s", e)
+        return {"status": "RETRY"}
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
 @app.get("/healthz")
-def health():
-    return {"status": "healthy", "service": "opensearch-indexer-py", "version": "1.0.0"}
+def healthz():
+    os_ok = False
+    try:
+        os_ok = get_client().ping()
+    except Exception:
+        pass
+    return {"status": "healthy", "service": "opensearch-indexer-py", "opensearch": os_ok}
 
 
 @app.get("/readyz")
 def readyz():
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-        return {"status": "ready"}
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"not ready: {e}")
-
-
-@app.get("/livez")
-def livez():
-    return {"status": "alive"}
-
-
-@app.get("/metrics")
-def metrics():
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM service_configs")
-            count = cur.fetchone()[0]
-        return {"service": "opensearch-indexer-py", "total_records": count}
-    except Exception:
-        return {"service": "opensearch-indexer-py", "total_records": 0}
-
-
-@app.get("/api/v1/service_configs")
-def list_records(x_tenant_id: Optional[str] = Header(None)):
-    conn = get_db()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        if x_tenant_id:
-            cur.execute(
-                "SELECT id, status, created_at FROM service_configs WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
-                (x_tenant_id,)
-            )
-        else:
-            cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
-
-    records = [
-        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
-        for r in rows
-    ]
-    return {"data": records, "count": len(records)}
-
-
-@app.post("/api/v1/service_configs", status_code=201)
-def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
-    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
-    status = body.status or "active"
-    record_id = str(uuid.uuid4())
-
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO service_configs (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
-            (record_id, tenant_id, status)
-        )
-        # Outbox event
-        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("service_configs.created", record_id, payload)
-        )
-    conn.commit()
-    return {"id": record_id, "status": "created"}
-
-
-@app.get("/api/v1/service_configs/{record_id}")
-def get_record(record_id: str):
-    conn = get_db()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT id, status, created_at FROM service_configs WHERE id = %s::uuid", (record_id,))
-        row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="not found")
-    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
-
-
-@app.put("/api/v1/service_configs/{record_id}")
-def update_record(record_id: str, body: UpdateRequest):
-    status = body.status or "updated"
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE service_configs SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
-            (status, record_id)
-        )
-        payload = json.dumps({"id": record_id, "status": status})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("service_configs.updated", record_id, payload)
-        )
-    conn.commit()
-    return {"id": record_id, "status": status}
-
-
-@app.delete("/api/v1/service_configs/{record_id}", status_code=204)
-def delete_record(record_id: str):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
-        payload = json.dumps({"id": record_id})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("service_configs.deleted", record_id, payload)
-        )
-    conn.commit()
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    return {"ready": True}

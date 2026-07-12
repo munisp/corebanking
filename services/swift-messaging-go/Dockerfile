@@ -8,7 +8,4 @@ RUN CGO_ENABLED=0 go build -o /swift-messaging-go .
 FROM alpine:3.19
 RUN apk --no-cache add ca-certificates
 COPY --from=builder /swift-messaging-go /swift-messaging-go
-RUN adduser -D -u 1001 appuser
-USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:9439/healthz || exit 1
 ENTRYPOINT ["/swift-messaging-go"]

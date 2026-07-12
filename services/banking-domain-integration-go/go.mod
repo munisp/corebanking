@@ -1,4 +1,4 @@
-module github.com/54bank/banking-domain-integration-go
+module github.com/54link-dev/banking-domain-integration-go
 
 go 1.21
 

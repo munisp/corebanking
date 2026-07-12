@@ -1,0 +1,59 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-platform-devops
+  pullPolicy: IfNotPresent
+  tag: "0.0.2"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9508
+    - port: 9509
+    - port: 9510
+    - port: 9511
+    - port: 9512
+    - port: 9513
+    - port: 9514
+    - port: 9515
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: platform-devops
+  appPort: 9515
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9508"
+  PORT_BASE: "9508"
+  SERVICE_GROUP: platform-devops
+  SERVICES: "ab-testing-py,certificate-manager-py,feature-entitlement-go,feature-flag-engine-rs,flag-audit-rs,graduated-rollout-rs,hpa-autoscaler-go,keda-scaler-go"

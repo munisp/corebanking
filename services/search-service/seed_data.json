@@ -1,0 +1,26 @@
+{
+  "service": "search-service",
+  "version": "production-readiness-v1",
+  "records": [
+    {
+      "id": "search-service-demo-001",
+      "tenant_id": "tenant-demo",
+      "status": "active",
+      "source": "seed",
+      "metadata": {
+        "channel": "ops-dashboard",
+        "workflow_state": "validated"
+      }
+    },
+    {
+      "id": "search-service-demo-002",
+      "tenant_id": "tenant-demo",
+      "status": "pending-review",
+      "source": "seed",
+      "metadata": {
+        "channel": "api",
+        "workflow_state": "queued"
+      }
+    }
+  ]
+}

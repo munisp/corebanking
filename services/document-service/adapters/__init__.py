@@ -1,0 +1,1 @@
+from .ocr_service_adapter import OcrServiceAdapter

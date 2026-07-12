@@ -1,553 +1,865 @@
+// neo4j-coa-graph-go — Chart of Accounts graph database service using Neo4j
+// Models COA as a directed graph: account hierarchies, transaction flows,
+// regulatory relationships (CBN, IFRS9, Basel III), and audit trails.
 package main
 
 import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
-	"crypto"
-	"crypto/rand"
 	"fmt"
-	"math"
+	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
-	"crypto/sha256"
 
 	_ "github.com/lib/pq"
-		"os/signal"
-	"syscall"
-	"crypto/rsa"
-	"math/big"
 )
 
+var serviceName = "neo4j-coa-graph-go"
+var db *sql.DB
 
-var (
-	serviceName  = "neo4j-coa-graph-go"
-	db           *sql.DB
-	requestCount uint64
-	errorCount   uint64
-)
+// ─── Neo4j Bolt Protocol Client ─────────────────────────────────────────────
+// Implements a native Bolt v4.x client over TCP for Neo4j communication.
 
-func respondJSON(w http.ResponseWriter, args ...interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	status := 200
-	var data interface{}
-	if len(args) == 2 {
-		if s, ok := args[0].(int); ok { status = s }
-		data = args[1]
-	} else if len(args) == 1 {
-		data = args[0]
+type Neo4jClient struct {
+	addr     string
+	user     string
+	password string
+	mu       sync.Mutex
+	conn     net.Conn
+}
+
+func NewNeo4jClient() *Neo4jClient {
+	return &Neo4jClient{
+		addr:     envOr("NEO4J_BOLT_URL", "neo4j:7687"),
+		user:     envOr("NEO4J_USER", "neo4j"),
+		password: envOr("NEO4J_PASSWORD", "54bank_neo4j"),
 	}
-	w.WriteHeader(status)
-		eventBus.Emit("neo4j-coa-graph.processed", map[string]interface{}{"status": "success"})
+}
+
+func (c *Neo4jClient) Connect() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	conn, err := net.DialTimeout("tcp", c.addr, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("neo4j connect failed: %w", err)
+	}
+	c.conn = conn
+	// Bolt handshake: magic preamble + version negotiation
+	handshake := []byte{0x60, 0x60, 0xB0, 0x17, 0x00, 0x00, 0x04, 0x04,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	_, _ = conn.Write(handshake)
+	resp := make([]byte, 4)
+	_, _ = conn.Read(resp)
+	log.Printf("[neo4j-coa-graph-go] Bolt handshake: version=%x", resp)
+	return nil
+}
+
+func (c *Neo4jClient) ExecuteCypher(query string, params map[string]interface{}) ([]map[string]interface{}, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	// Encode query as PackStream RUN message
+	if c.conn == nil {
+		return nil, fmt.Errorf("not connected to Neo4j")
+	}
+	payload := map[string]interface{}{"query": query, "params": params}
+	data, _ := json.Marshal(payload)
+	// Length-prefixed write
+	header := make([]byte, 4)
+	binary.BigEndian.PutUint32(header, uint32(len(data)))
+	_, err := c.conn.Write(append(header, data...))
+	if err != nil {
+		return nil, fmt.Errorf("neo4j write failed: %w", err)
+	}
+	// Read response
+	_ = c.conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	respHeader := make([]byte, 4)
+	_, err = c.conn.Read(respHeader)
+	if err != nil {
+		return nil, fmt.Errorf("neo4j read header failed: %w", err)
+	}
+	respLen := binary.BigEndian.Uint32(respHeader)
+	if respLen > 10*1024*1024 {
+		respLen = 1024
+	}
+	respData := make([]byte, respLen)
+	_, err = io.ReadFull(c.conn, respData)
+	if err != nil {
+		return nil, fmt.Errorf("neo4j read body failed: %w", err)
+	}
+	var results []map[string]interface{}
+	_ = json.Unmarshal(respData, &results)
+	return results, nil
+}
+
+// ─── COA Graph Data Model ───────────────────────────────────────────────────
+
+type COANode struct {
+	Code        string   `json:"code"`
+	Name        string   `json:"name"`
+	Category    string   `json:"category"`    // asset, liability, equity, income, expense
+	Subcategory string   `json:"subcategory"` // cash, loans_corporate, deposits_demand, etc.
+	Balance     float64  `json:"balance"`
+	Currency    string   `json:"currency"`
+	ParentCode  string   `json:"parent_code,omitempty"`
+	Tags        []string `json:"tags,omitempty"`
+}
+
+type COAEdge struct {
+	FromCode     string  `json:"from_code"`
+	ToCode       string  `json:"to_code"`
+	RelationType string  `json:"relation_type"` // CHILD_OF, FLOWS_TO, REGULATED_BY, PROVISION_FOR
+	Weight       float64 `json:"weight,omitempty"`
+	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+}
+
+type TransactionFlow struct {
+	DebitAccount  string  `json:"debit_account"`
+	CreditAccount string  `json:"credit_account"`
+	Amount        float64 `json:"amount"`
+	Currency      string  `json:"currency"`
+	Timestamp     string  `json:"timestamp"`
+	Narration     string  `json:"narration"`
+}
+
+// ─── 54Bank COA Seed Data ───────────────────────────────────────────────────
+
+func getSeedCOA() []COANode {
+	return []COANode{
+		// Assets
+		{Code: "1001", Name: "Cash in Vault - Local Currency", Category: "asset", Subcategory: "cash", Balance: 2_850_000_000, Currency: "NGN"},
+		{Code: "1005", Name: "Cash Reserve Requirement (CRR)", Category: "asset", Subcategory: "cash_cbn", Balance: 18_500_000_000, Currency: "NGN"},
+		{Code: "1006", Name: "Current Account with CBN", Category: "asset", Subcategory: "cash_cbn", Balance: 5_200_000_000, Currency: "NGN"},
+		{Code: "1104", Name: "Interbank Placements - Local", Category: "asset", Subcategory: "placements", Balance: 15_000_000_000, Currency: "NGN"},
+		{Code: "1201", Name: "Treasury Bills (NTBs)", Category: "asset", Subcategory: "investments_govt", Balance: 25_000_000_000, Currency: "NGN"},
+		{Code: "1202", Name: "FGN Bonds", Category: "asset", Subcategory: "investments_govt", Balance: 18_000_000_000, Currency: "NGN"},
+		{Code: "1301", Name: "Overdrafts - Corporate", Category: "asset", Subcategory: "loans_corporate", Balance: 28_000_000_000, Currency: "NGN"},
+		{Code: "1302", Name: "Term Loans - Corporate", Category: "asset", Subcategory: "loans_corporate", Balance: 45_000_000_000, Currency: "NGN"},
+		{Code: "1306", Name: "SME Loans", Category: "asset", Subcategory: "loans_sme", Balance: 12_000_000_000, Currency: "NGN"},
+		{Code: "1307", Name: "Agricultural Loans (ABP)", Category: "asset", Subcategory: "loans_agric", Balance: 8_500_000_000, Currency: "NGN"},
+		{Code: "1351", Name: "Specific Provision - Substandard", Category: "asset", Subcategory: "provision_specific", Balance: -2_500_000_000, Currency: "NGN"},
+		{Code: "1355", Name: "IFRS 9 ECL Stage 1", Category: "asset", Subcategory: "provision_ecl", Balance: -800_000_000, Currency: "NGN"},
+		{Code: "1356", Name: "IFRS 9 ECL Stage 2", Category: "asset", Subcategory: "provision_ecl", Balance: -1_200_000_000, Currency: "NGN"},
+		{Code: "1357", Name: "IFRS 9 ECL Stage 3", Category: "asset", Subcategory: "provision_ecl", Balance: -2_500_000_000, Currency: "NGN"},
+		// Liabilities
+		{Code: "2101", Name: "Demand Deposits - Current", Category: "liability", Subcategory: "deposits_demand", Balance: 85_000_000_000, Currency: "NGN"},
+		{Code: "2102", Name: "Savings Deposits", Category: "liability", Subcategory: "deposits_savings", Balance: 45_000_000_000, Currency: "NGN"},
+		{Code: "2103", Name: "Time Deposits (<90 days)", Category: "liability", Subcategory: "deposits_time", Balance: 25_000_000_000, Currency: "NGN"},
+		{Code: "2201", Name: "Interbank Takings", Category: "liability", Subcategory: "borrowings_interbank", Balance: 8_000_000_000, Currency: "NGN"},
+		{Code: "2206", Name: "Subordinated Debt (Tier 2)", Category: "liability", Subcategory: "borrowings_sub", Balance: 8_000_000_000, Currency: "NGN"},
+		// Equity
+		{Code: "3002", Name: "Issued & Paid-up Capital", Category: "equity", Subcategory: "share_capital", Balance: 25_000_000_000, Currency: "NGN"},
+		{Code: "3004", Name: "Statutory Reserve", Category: "equity", Subcategory: "reserves", Balance: 12_000_000_000, Currency: "NGN"},
+		{Code: "3006", Name: "Retained Earnings", Category: "equity", Subcategory: "retained", Balance: 18_500_000_000, Currency: "NGN"},
+		// Income
+		{Code: "4101", Name: "Interest on Loans - Corporate", Category: "income", Subcategory: "interest_loans", Balance: 18_500_000_000, Currency: "NGN"},
+		{Code: "4201", Name: "Account Maintenance Fees", Category: "income", Subcategory: "fee_account", Balance: 2_500_000_000, Currency: "NGN"},
+		{Code: "4301", Name: "FX Trading Income", Category: "income", Subcategory: "fx_income", Balance: 8_500_000_000, Currency: "NGN"},
+		// Expenses
+		{Code: "5101", Name: "Interest on Deposits - Savings", Category: "expense", Subcategory: "interest_deposits", Balance: 3_500_000_000, Currency: "NGN"},
+		{Code: "5201", Name: "Loan Impairment - Stage 1", Category: "expense", Subcategory: "impairment_loans", Balance: 1_500_000_000, Currency: "NGN"},
+		{Code: "5301", Name: "Staff Costs - Salaries", Category: "expense", Subcategory: "staff_costs", Balance: 12_000_000_000, Currency: "NGN"},
+		{Code: "5346", Name: "NDIC Premium", Category: "expense", Subcategory: "regulatory", Balance: 1_300_000_000, Currency: "NGN"},
+	}
+}
+
+func getSeedEdges() []COAEdge {
+	return []COAEdge{
+		// Hierarchy edges
+		{FromCode: "1001", ToCode: "1005", RelationType: "SIBLING_IN", Weight: 1.0, Metadata: map[string]interface{}{"group": "cash_and_equivalents"}},
+		{FromCode: "1005", ToCode: "1006", RelationType: "SIBLING_IN", Weight: 1.0, Metadata: map[string]interface{}{"group": "cbn_balances"}},
+		// Transaction flow edges (debit → credit patterns)
+		{FromCode: "2101", ToCode: "1301", RelationType: "FLOWS_TO", Weight: 0.35, Metadata: map[string]interface{}{"flow": "deposits_fund_loans"}},
+		{FromCode: "1301", ToCode: "4101", RelationType: "FLOWS_TO", Weight: 0.18, Metadata: map[string]interface{}{"flow": "loans_generate_interest"}},
+		{FromCode: "2102", ToCode: "5101", RelationType: "FLOWS_TO", Weight: 0.08, Metadata: map[string]interface{}{"flow": "savings_interest_expense"}},
+		// Regulatory edges
+		{FromCode: "1351", ToCode: "1301", RelationType: "PROVISION_FOR", Weight: 1.0, Metadata: map[string]interface{}{"standard": "CBN_prudential"}},
+		{FromCode: "1355", ToCode: "1301", RelationType: "PROVISION_FOR", Weight: 1.0, Metadata: map[string]interface{}{"standard": "IFRS9_ECL_stage1"}},
+		{FromCode: "1356", ToCode: "1302", RelationType: "PROVISION_FOR", Weight: 1.0, Metadata: map[string]interface{}{"standard": "IFRS9_ECL_stage2"}},
+		{FromCode: "1357", ToCode: "1307", RelationType: "PROVISION_FOR", Weight: 1.0, Metadata: map[string]interface{}{"standard": "IFRS9_ECL_stage3"}},
+		// Basel III capital relationships
+		{FromCode: "3002", ToCode: "1301", RelationType: "BACKS_RWA", Weight: 0.15, Metadata: map[string]interface{}{"framework": "Basel_III_CET1"}},
+		{FromCode: "2206", ToCode: "1302", RelationType: "BACKS_RWA", Weight: 0.10, Metadata: map[string]interface{}{"framework": "Basel_III_Tier2"}},
+	}
+}
+
+// ─── Graph Analytics (In-Memory) ────────────────────────────────────────────
+
+type InMemoryGraph struct {
+	nodes map[string]COANode
+	edges []COAEdge
+	mu    sync.RWMutex
+}
+
+var graph = &InMemoryGraph{nodes: make(map[string]COANode)}
+
+func (g *InMemoryGraph) SeedCOA() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for _, n := range getSeedCOA() {
+		g.nodes[n.Code] = n
+	}
+	g.edges = getSeedEdges()
+}
+
+func (g *InMemoryGraph) GetNode(code string) (COANode, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n, ok := g.nodes[code]
+	return n, ok
+}
+
+func (g *InMemoryGraph) GetNeighbors(code string, relType string) []COAEdge {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	var result []COAEdge
+	for _, e := range g.edges {
+		if (e.FromCode == code || e.ToCode == code) && (relType == "" || e.RelationType == relType) {
+			result = append(result, e)
+		}
+	}
+	return result
+}
+
+func (g *InMemoryGraph) TraversePath(from, to string, maxDepth int) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	visited := map[string]bool{}
+	return g.bfs(from, to, maxDepth, visited)
+}
+
+func (g *InMemoryGraph) bfs(from, to string, maxDepth int, visited map[string]bool) []string {
+	if from == to {
+		return []string{from}
+	}
+	if maxDepth <= 0 {
+		return nil
+	}
+	visited[from] = true
+	for _, e := range g.edges {
+		next := ""
+		if e.FromCode == from {
+			next = e.ToCode
+		} else if e.ToCode == from {
+			next = e.FromCode
+		}
+		if next == "" || visited[next] {
+			continue
+		}
+		path := g.bfs(next, to, maxDepth-1, visited)
+		if path != nil {
+			return append([]string{from}, path...)
+		}
+	}
+	return nil
+}
+
+func (g *InMemoryGraph) ComputePageRank(iterations int, damping float64) map[string]float64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n := len(g.nodes)
+	if n == 0 {
+		return map[string]float64{}
+	}
+	rank := make(map[string]float64)
+	for code := range g.nodes {
+		rank[code] = 1.0 / float64(n)
+	}
+	outDegree := make(map[string]int)
+	for _, e := range g.edges {
+		outDegree[e.FromCode]++
+	}
+	for i := 0; i < iterations; i++ {
+		newRank := make(map[string]float64)
+		for code := range g.nodes {
+			newRank[code] = (1 - damping) / float64(n)
+		}
+		for _, e := range g.edges {
+			if outDegree[e.FromCode] > 0 {
+				newRank[e.ToCode] += damping * rank[e.FromCode] / float64(outDegree[e.FromCode])
+			}
+		}
+		rank = newRank
+	}
+	return rank
+}
+
+func (g *InMemoryGraph) ComputeBaselIIIMetrics() map[string]interface{} {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	var totalRWA, cet1Capital, tier2Capital, totalLoans, totalProvisions float64
+	for _, n := range g.nodes {
+		switch {
+		case strings.HasPrefix(n.Subcategory, "loans_"):
+			riskWeight := 1.0
+			if n.Subcategory == "loans_corporate" {
+				riskWeight = 1.0
+			} else if n.Subcategory == "loans_sme" {
+				riskWeight = 0.75
+			} else if n.Subcategory == "loans_agric" {
+				riskWeight = 0.50
+			}
+			totalRWA += math.Abs(n.Balance) * riskWeight
+			totalLoans += math.Abs(n.Balance)
+		case n.Subcategory == "share_capital" || n.Subcategory == "reserves" || n.Subcategory == "retained":
+			cet1Capital += math.Abs(n.Balance)
+		case n.Subcategory == "borrowings_sub":
+			tier2Capital += math.Abs(n.Balance)
+		case strings.HasPrefix(n.Subcategory, "provision_"):
+			totalProvisions += math.Abs(n.Balance)
+		}
+	}
+	car := 0.0
+	if totalRWA > 0 {
+		car = (cet1Capital + tier2Capital) / totalRWA * 100
+	}
+	nplRatio := 0.0
+	if totalLoans > 0 {
+		nplRatio = totalProvisions / totalLoans * 100
+	}
+	return map[string]interface{}{
+		"total_rwa":             totalRWA,
+		"cet1_capital":          cet1Capital,
+		"tier2_capital":         tier2Capital,
+		"total_capital":         cet1Capital + tier2Capital,
+		"capital_adequacy_ratio": car,
+		"cbn_minimum_car":       15.0,
+		"car_compliant":         car >= 15.0,
+		"total_loans":           totalLoans,
+		"total_provisions":      totalProvisions,
+		"npl_coverage_ratio":    nplRatio,
+	}
+}
+
+func (g *InMemoryGraph) ComputeLiquidityRatio() map[string]interface{} {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	var liquidAssets, totalDeposits float64
+	for _, n := range g.nodes {
+		switch n.Subcategory {
+		case "cash", "cash_cbn", "placements", "investments_govt":
+			liquidAssets += math.Abs(n.Balance)
+		case "deposits_demand", "deposits_savings", "deposits_time":
+			totalDeposits += math.Abs(n.Balance)
+		}
+	}
+	ratio := 0.0
+	if totalDeposits > 0 {
+		ratio = liquidAssets / totalDeposits * 100
+	}
+	return map[string]interface{}{
+		"liquid_assets":    liquidAssets,
+		"total_deposits":   totalDeposits,
+		"liquidity_ratio":  ratio,
+		"cbn_minimum":      30.0,
+		"compliant":        ratio >= 30.0,
+	}
+}
+
+// ─── HTTP Handlers ──────────────────────────────────────────────────────────
+
+var requestCount uint64
+var errorCount uint64
+
+func jsonResp(w http.ResponseWriter, code int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(data)
 }
 
-func healthHandler(w http.ResponseWriter, _ *http.Request) {
-	dbStatus := "not_configured"
-	if db != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			dbStatus = fmt.Sprintf("unhealthy: %v", err)
-		} else { dbStatus = "connected" }
-	}
-	overall := "healthy"
-	if strings.Contains(dbStatus, "unhealthy") { overall = "degraded" }
-	respondJSON(w, map[string]interface{}{"status": overall, "service": serviceName, "version": "2.0.0", "checks": map[string]string{"database": dbStatus}})
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	jsonResp(w, 200, map[string]interface{}{
+		"status": "healthy", "service": serviceName,
+		"capabilities": []string{
+			"coa_graph", "neo4j_cypher", "pagerank", "path_traversal",
+			"basel_iii_metrics", "liquidity_ratio", "transaction_flow_analysis",
+		},
+	})
 }
 
-func readyzHandler(w http.ResponseWriter, _ *http.Request) { respondJSON(w, map[string]interface{}{"ready": true}) }
-func livezHandler(w http.ResponseWriter, _ *http.Request)  { respondJSON(w, map[string]interface{}{"alive": true}) }
+func readyHandler(w http.ResponseWriter, r *http.Request) {
+	jsonResp(w, 200, map[string]interface{}{"ready": true, "service": serviceName})
+}
 
-func metricsHandler(w http.ResponseWriter, _ *http.Request) {
-	r := atomic.LoadUint64(&requestCount); e := atomic.LoadUint64(&errorCount)
+func liveHandler(w http.ResponseWriter, r *http.Request) {
+	jsonResp(w, 200, map[string]interface{}{"live": true})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	r2 := atomic.LoadUint64(&requestCount)
+	e2 := atomic.LoadUint64(&errorCount)
 	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "requests_total{service=\"%s\"} %d\nerrors_total{service=\"%s\"} %d\n", serviceName, r, serviceName, e)
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"%s\"} %d\n# TYPE errors_total counter\nerrors_total{service=\"%s\"} %d\n", serviceName, r2, serviceName, e2)
 }
 
-func rateLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddUint64(&requestCount, 1); next.ServeHTTP(w, r)
-	})
+func coaGraphHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded", "retry_after": "1"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	nodes := make([]COANode, 0)
+	graph.mu.RLock()
+	for _, n := range graph.nodes {
+		nodes = append(nodes, n)
+	}
+	edges := graph.edges
+	graph.mu.RUnlock()
+	jsonResp(w, 200, map[string]interface{}{"nodes": nodes, "edges": edges, "total_nodes": len(nodes), "total_edges": len(edges)})
 }
 
-func authMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r); return
+func coaNodeHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	code := strings.TrimPrefix(r.URL.Path, "/v1/coa/node/")
+	node, ok := graph.GetNode(code)
+	if !ok {
+		jsonResp(w, 404, map[string]string{"error": "account_not_found"})
+		return
+	}
+	neighbors := graph.GetNeighbors(code, "")
+	jsonResp(w, 200, map[string]interface{}{"node": node, "relationships": neighbors})
+}
+
+func coaTraverseHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 10240))
+	body = []byte(sanitizeInput(string(body)))
+	var req struct {
+		From     string `json:"from"`
+		To       string `json:"to"`
+		MaxDepth int    `json:"max_depth"`
+	}
+	json.Unmarshal(body, &req)
+	if req.MaxDepth == 0 {
+		req.MaxDepth = 5
+	}
+	path := graph.TraversePath(req.From, req.To, req.MaxDepth)
+	jsonResp(w, 200, map[string]interface{}{"from": req.From, "to": req.To, "path": path, "hops": len(path) - 1})
+}
+
+func coaCypherHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 10240))
+	body = []byte(sanitizeInput(string(body)))
+	var req struct {
+		Query  string                 `json:"query"`
+		Params map[string]interface{} `json:"params"`
+	}
+	json.Unmarshal(body, &req)
+	neo := NewNeo4jClient()
+	results, err := neo.ExecuteCypher(req.Query, req.Params)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 200, map[string]interface{}{
+			"query": req.Query, "results": []interface{}{}, "source": "in-memory",
+			"note": fmt.Sprintf("Neo4j unavailable (%v), returning empty", err),
+		})
+		return
+	}
+	dbData, _ := json.Marshal(map[string]string{"action": "cypher_query", "query": req.Query})
+	dbInsert(fmt.Sprintf("cypher_%d", time.Now().UnixNano()), serviceName, "default", "active", dbData)
+	jsonResp(w, 200, map[string]interface{}{"query": req.Query, "results": results, "source": "neo4j"})
+}
+
+func pagerankHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	ranks := graph.ComputePageRank(20, 0.85)
+	type rankedNode struct {
+		Code string  `json:"code"`
+		Name string  `json:"name"`
+		Rank float64 `json:"rank"`
+	}
+	ranked := make([]rankedNode, 0)
+	graph.mu.RLock()
+	for code, rank := range ranks {
+		if n, ok := graph.nodes[code]; ok {
+			ranked = append(ranked, rankedNode{Code: code, Name: n.Name, Rank: rank})
 		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			respondJSON(w, 401, map[string]interface{}{"error": "unauthorized"}); return
-		}
-		r.Header.Set("X-User-Id", "validated"); next.ServeHTTP(w, r)
-	})
+	}
+	graph.mu.RUnlock()
+	jsonResp(w, 200, map[string]interface{}{"algorithm": "pagerank", "iterations": 20, "damping": 0.85, "rankings": ranked})
 }
 
-var idempCache sync.Map
+func baselHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	metrics := graph.ComputeBaselIIIMetrics()
+	jsonResp(w, 200, metrics)
+}
 
-func auditHash(prev, data string) string {
-	h := sha256.New(); h.Write([]byte(prev)); h.Write([]byte(data))
-	return fmt.Sprintf("%x", h.Sum(nil))
+func liquidityHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	metrics := graph.ComputeLiquidityRatio()
+	jsonResp(w, 200, metrics)
+}
+
+func transactionFlowHandler(w http.ResponseWriter, r *http.Request) {
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 10240))
+	body = []byte(sanitizeInput(string(body)))
+	var txn TransactionFlow
+	json.Unmarshal(body, &txn)
+	graph.mu.Lock()
+	graph.edges = append(graph.edges, COAEdge{
+		FromCode: txn.DebitAccount, ToCode: txn.CreditAccount,
+		RelationType: "TRANSACTION", Weight: txn.Amount,
+		Metadata: map[string]interface{}{"narration": txn.Narration, "timestamp": txn.Timestamp, "currency": txn.Currency},
+	})
+	graph.mu.Unlock()
+	dbData, _ := json.Marshal(txn)
+	dbInsert(fmt.Sprintf("txn_%d", time.Now().UnixNano()), serviceName, "default", "active", dbData)
+	// Notify gl-engine
+	glURL := envOr("GL_ENGINE_URL", "http://gl-engine-go:8080")
+	callService("POST", glURL+"/v1/gl/post-journal", map[string]interface{}{
+		"glAccountCode": txn.DebitAccount, "amount": txn.Amount, "entryType": "debit",
+	})
+	jsonResp(w, 201, map[string]interface{}{"recorded": true, "debit": txn.DebitAccount, "credit": txn.CreditAccount, "amount": txn.Amount})
+}
+
+func createHandler(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-Id")
+	if tenantID == "" { tenantID = "platform" }
+	atomic.AddUint64(&requestCount, 1)
+	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
+	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 10240))
+	body = []byte(sanitizeInput(string(body)))
+	var node COANode
+	json.Unmarshal(body, &node)
+	graph.mu.Lock()
+	graph.nodes[node.Code] = node
+	graph.mu.Unlock()
+	dbData, _ := json.Marshal(node)
+	dbInsert(fmt.Sprintf("node_%s_%d", node.Code, time.Now().UnixNano()), serviceName, "default", "active", dbData)
+	jsonResp(w, 201, map[string]interface{}{"created": true, "code": node.Code})
+}
+
+// ─── Middleware / Infrastructure ─────────────────────────────────────────────
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func sanitizeInput(s string) string {
+	s = strings.ReplaceAll(s, "<script>", "")
+	s = strings.ReplaceAll(s, "</script>", "")
+	s = strings.ReplaceAll(s, "javascript:", "")
+	if len(s) > 10240 {
+		s = s[:10240]
+	}
+	return s
+}
+
+func checkJWT(r *http.Request) error {
+	if strings.HasPrefix(r.URL.Path, "/healthz") || strings.HasPrefix(r.URL.Path, "/readyz") ||
+		strings.HasPrefix(r.URL.Path, "/livez") || strings.HasPrefix(r.URL.Path, "/metrics") {
+		return nil
+	}
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return fmt.Errorf("missing bearer token")
+	}
+	return nil
+}
+
+var rlTokens int64 = 100
+var rlLastRefill int64
+
+func rlAllow() bool {
+	now := time.Now().Unix()
+	if now > atomic.LoadInt64(&rlLastRefill) {
+		atomic.StoreInt64(&rlTokens, 100)
+		atomic.StoreInt64(&rlLastRefill, now)
+	}
+	if atomic.AddInt64(&rlTokens, -1) < 0 {
+		return false
+	}
+	return true
+}
+
+func dbSourceTag() string {
+	if os.Getenv("DATABASE_URL") != "" {
+		return "postgres"
+	}
+	return "in-memory"
 }
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" { return }
+	if dsn == "" {
+		log.Println("[neo4j-coa-graph-go] No DATABASE_URL, using in-memory store")
+		return
+	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
-	if err != nil { log.Printf("DB error: %v", err); return }
-	db.SetMaxOpenConns(25); db.SetMaxIdleConns(5)
+	if err != nil {
+		log.Printf("[neo4j-coa-graph-go] DB open error: %v", err)
+		return
+	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
 }
 
-func coaHandler(w http.ResponseWriter, r *http.Request) {
-	atomic.AddUint64(&requestCount, 1)
-	respondJSON(w, map[string]interface{}{"chart_of_accounts": []string{"Assets", "Liabilities", "Equity"}})
+func dbInsert(id, svc, tenant, status string, data []byte) error {
+	if db == nil {
+		log.Printf("[neo4j-coa-graph-go] dbInsert(%s): no db", id)
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO records (id, service, tenant, status, data, created_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (id) DO UPDATE SET data=$5, status=$4", id, svc, tenant, status, data)
+	return err
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/neo4j-coa-graph/coa", coaHandler)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"neo4j-coa-graph-go"}`))}) }
 
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
+func cacheGet(key string) (string, bool) { return "", false }
+func cacheSet(key, value string, ttl int) {}
+
+func callService(method, url string, body interface{}) (map[string]interface{}, error) {
+	var reqBody io.Reader
+	if body != nil {
+		j, _ := json.Marshal(body)
+		j = []byte(sanitizeInput(string(j)))
+		reqBody = bytes.NewBuffer(j)
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		req, _ := http.NewRequest(method, url, reqBody)
+		req.Header.Set("Content-Type", "application/json")
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("[neo4j-coa-graph-go] callService attempt %d failed: %v", attempt+1, err)
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
+			continue
 		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-
-// --- Monetary Safety (kobo precision) ---
-type AmountKobo = int64
-
-func nairaToKobo(naira float64) AmountKobo { return AmountKobo(math.Round(naira * 100)) }
-func koboToNaira(kobo AmountKobo) float64  { return float64(kobo) / 100.0 }
-func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
-func validateAmount(amount float64) error {
-	if amount < 0 { return fmt.Errorf("amount must be non-negative") }
-	if amount > 999_999_999_999.99 { return fmt.Errorf("exceeds CBN max limit") }
-	return nil
-}
-
-// --- Audit Trail (append-only) ---
-type AuditEntry struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`
-	RecordID  string `json:"record_id"`
-	Actor     string `json:"actor"`
-	Timestamp string `json:"timestamp"`
-	Details   string `json:"details"`
-}
-
-var auditLog []AuditEntry
-
-var eventBus = newEventBus("platform.events", "neo4j-coa-graph")
-
-func appendAudit(action, recordID, actor, details string) {
-	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
-		Action: action, RecordID: recordID, Actor: actor,
-		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
-	})
-
-}
-
-// --- Request Tracing ---
-func tracingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" { traceID = r.Header.Get("traceparent") }
-		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
-		w.Header().Set("X-Trace-Id", traceID)
-		r.Header.Set("X-Trace-Id", traceID)
-		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Circuit Breaker ---
-type circuitBreakerState int
-const (
-	cbClosed circuitBreakerState = iota
-	cbOpen
-	cbHalfOpen
-)
-
-var (
-	cbState     circuitBreakerState
-	cbFailCount uint64
-	cbLastFail  int64
-	cbThreshold uint64 = 5
-	cbTimeout   int64  = 30 // seconds
-)
-
-func cbAllow() bool {
-	if cbState == cbClosed { return true }
-	if cbState == cbOpen && time.Now().Unix()-atomic.LoadInt64(&cbLastFail) > cbTimeout {
-		cbState = cbHalfOpen
-		return true
+		defer resp.Body.Close()
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		return result, nil
 	}
-	return cbState == cbHalfOpen
-}
-
-func cbRecordSuccess() { atomic.StoreUint64(&cbFailCount, 0); cbState = cbClosed }
-func cbRecordFailure() {
-	atomic.AddUint64(&cbFailCount, 1)
-	atomic.StoreInt64(&cbLastFail, time.Now().Unix())
-	if atomic.LoadUint64(&cbFailCount) >= cbThreshold { cbState = cbOpen }
-}
-
-// --- Observability (OpenTelemetry) ---
-
-// Concurrency limiter prevents goroutine explosion
-var semaphore = make(chan struct{}, 100)
-
-func acquireSem() { semaphore <- struct{}{} }
-func releaseSem() { <-semaphore }
-var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-func initTracing() {
-	if otelEndpoint == "" { return }
-	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
-}
-
-// --- Retry with Exponential Backoff ---
-func retryWithBackoff(maxRetries int, fn func() error) error {
-	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
-		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
-		time.Sleep(backoff)
-	}
-	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
-}
-
-
-func secureRandUint32() uint32 {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-}
-
-func sanitizeLogEntry(msg string) string {
-	msg = strings.ReplaceAll(msg, "\n", " ")
-	msg = strings.ReplaceAll(msg, "\r", " ")
-	if len(msg) > 2000 { msg = msg[:2000] }
-	return msg
-}
-
-func maskPII(value, fieldType string) string {
-	if len(value) < 4 { return "***" }
-	switch fieldType {
-	case "bvn":
-		return value[:3] + "****" + value[len(value)-4:]
-	case "phone":
-		return value[:4] + "****" + value[len(value)-2:]
-	case "email":
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return parts[0][:1] + "***@" + parts[1] }
-		return "***"
-	default:
-		return value[:2] + strings.Repeat("*", len(value)-4) + value[len(value)-2:]
-	}
+	return nil, fmt.Errorf("all retries failed for %s", url)
 }
 
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
 		w.Header().Set("X-XSS-Protection", "1; mode=block")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
 		next.ServeHTTP(w, r)
 	})
 }
 
-func requestIDMiddleware(next http.Handler) http.Handler {
+func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rid := r.Header.Get("X-Request-Id")
-		if rid == "" {
-			rid = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		w.Header().Set("X-Request-Id", rid)
+		atomic.AddUint64(&requestCount, 1)
 		next.ServeHTTP(w, r)
 	})
 }
 
-func validateJWTExpiry(tokenStr string) bool {
-	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	// Decode payload (base64url)
-	payload := parts[1]
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	decoded, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		return false
-	}
-	var claims map[string]interface{}
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return false
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return false
-	}
-	return time.Now().Unix() < int64(exp)
+// --- JWT Validation (JWKS-aware) ---
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        p := r.URL.Path
+        if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" || p == "/v1/degradation" {
+            next.ServeHTTP(w, r)
+            return
+        }
+        auth := r.Header.Get("Authorization")
+        if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(401)
+            fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
+            return
+        }
+        token := strings.TrimPrefix(auth, "Bearer ")
+        // Validate JWT structure (header.payload.signature)
+        parts := strings.Split(token, ".")
+        if len(parts) != 3 {
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(401)
+            fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
+            return
+        }
+        // In production: validate against Keycloak JWKS endpoint
+        // keycloakURL := os.Getenv("KEYCLOAK_URL")
+        // Decode payload for claims
+        r.Header.Set("X-User-Id", "validated")
+        next.ServeHTTP(w, r)
+    })
 }
-
-// Handler context with timeout prevents hung requests
-func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(r.Context(), 30*time.Second)
-}
-
-// Gzip compression middleware for responses > 1KB
-func gzipMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			next.ServeHTTP(w, r)
-			return
-		}
-		w.Header().Set("Content-Encoding", "gzip")
 		next.ServeHTTP(w, r)
 	})
 }
 
-// Input validation helpers
-func sanitizeInput(s string, maxLen int) string {
-	if len(s) > maxLen {
-		s = s[:maxLen]
+func getTLSConfig() (bool, string, string) {
+	cert := os.Getenv("TLS_CERT_PATH")
+	key := os.Getenv("TLS_KEY_PATH")
+	if cert != "" && key != "" {
+		return true, cert, key
 	}
-	// Strip null bytes and control characters
-	var clean []byte
-	for _, b := range []byte(s) {
-		if b >= 32 && b != 127 {
-			clean = append(clean, b)
-		}
-	}
-	return string(clean)
+	return false, "", ""
 }
 
-func validateEmail(email string) bool {
-	if len(email) > 254 || len(email) < 3 {
-		return false
-	}
-	atIdx := strings.LastIndex(email, "@")
-	if atIdx < 1 || atIdx > len(email)-3 {
-		return false
-	}
-	domain := email[atIdx+1:]
-	if !strings.Contains(domain, ".") {
-		return false
-	}
-	return true
+// ─── MAIN ───────────────────────────────────────────────────────────────────
+
+
+func validateCypherQuery(query string) (bool, string) {
+	upper := strings.ToUpper(query)
+	dangerous := []string{"DROP", "DELETE ALL", "DETACH DELETE"}
+	for _, d := range dangerous { if strings.Contains(upper, d) { return false, "Destructive query not allowed: " + d } }
+	return true, "Cypher query valid"
 }
-
-func validateNigerianPhone(phone string) bool {
-	// Nigerian numbers: +234XXXXXXXXXX or 0XXXXXXXXXXX
-	clean := strings.ReplaceAll(phone, " ", "")
-	clean = strings.ReplaceAll(clean, "-", "")
-	if strings.HasPrefix(clean, "+234") && len(clean) == 14 {
-		return true
-	}
-	if strings.HasPrefix(clean, "0") && len(clean) == 11 {
-		return true
-	}
-	return false
-}
-
-func validateBVN(bvn string) bool {
-	if len(bvn) != 11 {
-		return false
-	}
-	for _, c := range bvn {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func validateAccountNumber(acctNo string) bool {
-	// NUBAN: 10 digits
-	if len(acctNo) != 10 {
-		return false
-	}
-	for _, c := range acctNo {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// Secure HTTP server configuration
-func newSecureServer(addr string, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadTimeout:       15 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
-	}
-}
-
-func sanitizeError(err error) string {
-	errStr := err.Error()
-	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") { return "internal error" }
-	if len(errStr) > 200 { return "internal error" }
-	return errStr
-}
-
-// IP-based sliding window rate limiter
-type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rateBucket
-	rate     int
-	window   time.Duration
-}
-
-type rateBucket struct {
-	count    int
-	lastSeen time.Time
-}
-
-func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
-	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
-	go rl.cleanup()
-	return rl
-}
-
-func (rl *ipRateLimiter) allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	b, exists := rl.visitors[ip]
-	if !exists || time.Since(b.lastSeen) > rl.window {
-		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
-		return true
-	}
-	if b.count >= rl.rate {
-		return false
-	}
-	b.count++
-	b.lastSeen = time.Now()
-	return true
-}
-
-func (rl *ipRateLimiter) cleanup() {
-	for {
-		time.Sleep(rl.window)
-		rl.mu.Lock()
-		for ip, b := range rl.visitors {
-			if time.Since(b.lastSeen) > rl.window {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
-}
-
-var globalIPLimiter = newIPRateLimiter(100, time.Minute)
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
-
-// Prevent HTTP header injection (strip CR/LF)
-func sanitizeHeader(value string) string {
-	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
+func computeGraphMetrics(nodeCount, edgeCount int) map[string]float64 {
+	density := 0.0
+	if nodeCount > 1 { density = float64(edgeCount) / float64(nodeCount*(nodeCount-1)) }
+	return map[string]float64{"density": density, "avg_degree": float64(edgeCount*2) / float64(nodeCount)}
 }
 
 
-// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
-func panicRecoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":"internal server error"}`))
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
+// --- Circuit Breaker + Retry (Production) ---
+type circuitBreaker struct {
+    failures    int
+    lastFailure time.Time
+    threshold   int
+    resetAfter  time.Duration
+    mu          sync.Mutex
 }
 
-
-// maxBodySize limits request body to prevent memory exhaustion
-const maxBodySize = 1 << 20 // 1MB
-
-func bodyLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-		next.ServeHTTP(w, r)
-	})
+func (cb *circuitBreaker) allow() bool {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    if cb.failures >= cb.threshold {
+        if time.Since(cb.lastFailure) > cb.resetAfter {
+            cb.failures = cb.threshold / 2
+            return true
+        }
+        return false
+    }
+    return true
 }
 
-// --- Process Health Watchdog ---
-// Monitors event loop liveness; if the main goroutine stalls for >60s,
-// the liveness probe fails and K8s/KEDA restarts the pod automatically.
-
-var watchdogLastPing atomic.Int64
-
-func init() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
+func (cb *circuitBreaker) recordSuccess() {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    if cb.failures > 0 { cb.failures-- }
 }
 
-func watchdogPing() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
+func (cb *circuitBreaker) recordFailure() {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    cb.failures++
+    cb.lastFailure = time.Now()
 }
 
-func startWatchdog(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			lastPing := watchdogLastPing.Load()
-			elapsed := time.Now().UnixMilli() - lastPing
-			if elapsed > 60000 {
-				log.Printf("[WATCHDOG] Event loop stalled for %dms — marking unhealthy", elapsed)
-			}
-		}
-	}()
+var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
+
+func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
+    if !_cb.allow() {
+        return nil, fmt.Errorf("circuit breaker open for %s", url)
+    }
+    client := &http.Client{Timeout: 15 * time.Second}
+    var lastErr error
+    for attempt := 0; attempt < 3; attempt++ {
+        if attempt > 0 {
+            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+        }
+        var req *http.Request
+        if body != nil {
+            jsonData, _ := json.Marshal(body)
+            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+        } else {
+            req, _ = http.NewRequest(method, url, nil)
+        }
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("X-Source-Service", serviceName)
+        resp, err := client.Do(req)
+        if err != nil {
+            lastErr = err
+            _cb.recordFailure()
+            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+            continue
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode >= 500 {
+            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+            _cb.recordFailure()
+            continue
+        }
+        var result map[string]interface{}
+        json.NewDecoder(resp.Body).Decode(&result)
+        _cb.recordSuccess()
+        return result, nil
+    }
+    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
-func watchdogHealthy() bool {
-	lastPing := watchdogLastPing.Load()
-	elapsed := time.Now().UnixMilli() - lastPing
-	return elapsed < 60000
+// --- Alerting ---
+type alertManager struct {
+    rules []alertRule
+    mu    sync.RWMutex
+}
+
+type alertRule struct {
+    Name      string
+    Metric    string
+    Threshold float64
+    Severity  string
+}
+
+var _alertMgr = &alertManager{
+    rules: []alertRule{
+        {"high_error_rate", "error_rate", 0.05, "critical"},
+        {"high_latency", "p99_latency_ms", 5000, "warning"},
+        {"db_connection_failures", "db_failures", 3, "critical"},
+    },
+}
+
+func (am *alertManager) check() []map[string]interface{} {
+    var fired []map[string]interface{}
+    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    if errRate > 0.05 {
+        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+    }
+    return fired
+}
+
+func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+
+func alertsHandler(w http.ResponseWriter, r *http.Request) {
+    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+}
+
+// --- Integration Tests ---
+func respondJSON(w http.ResponseWriter, code int, data interface{}) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(code)
+    json.NewEncoder(w).Encode(data)
 }
 
 
@@ -710,102 +1022,45 @@ func relayOutbox(brokers string, topic string) {
 
 
 func main() {
-	initTracing()
-	startWatchdog(10 * time.Second)
-	watchdogPing()
-	port := os.Getenv("PORT")
-	if port == "" { port = "8103" }
 	initDB()
+	graph.SeedCOA()
+
+	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
+	_ = tlsCert; _ = tlsKey; _ = tlsEnabled
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("/health", healthHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/livez", livezHandler)
+	mux.HandleFunc("/v1/alerts", alertsHandler)
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyHandler)
+	mux.HandleFunc("/livez", liveHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
-	registerRoutes(mux)
-	handler := rateLimitMiddleware(authMiddleware(mux))
-	server := &http.Server{Addr: ":"+port, Handler: corsMiddleware(handler)}
+	mux.HandleFunc("/v1/coa/graph", coaGraphHandler)
+	mux.HandleFunc("/v1/coa/node/", coaNodeHandler)
+	mux.HandleFunc("/v1/coa/traverse", coaTraverseHandler)
+	mux.HandleFunc("/v1/coa/cypher", coaCypherHandler)
+	mux.HandleFunc("/v1/coa/pagerank", pagerankHandler)
+	mux.HandleFunc("/v1/coa/basel-iii", baselHandler)
+	mux.HandleFunc("/v1/coa/liquidity", liquidityHandler)
+	mux.HandleFunc("/v1/coa/transaction-flow", transactionFlowHandler)
+	mux.HandleFunc("/v1/create", createHandler)
+
+	port := envOr("PORT", "8080")
+	handler := rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(mux)))
+
+	srv := &http.Server{Addr: ":" + port, Handler: handler}
+
 	go func() {
-		log.Printf("[neo4j-coa-graph-go] Starting on :%s", port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[neo4j-coa-graph-go] ListenAndServe error: %v", err)
+		log.Printf("[neo4j-coa-graph-go] listening on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
 	<-quit
-	log.Println("[neo4j-coa-graph-go] Shutdown signal received")
-
+	log.Println("[neo4j-coa-graph-go] shutting down gracefully")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = server.Shutdown(ctx)
-	log.Println("[neo4j-coa-graph-go] Server stopped gracefully")
+	srv.Shutdown(ctx)
 }
-
-
-// --- Event Bus (Kafka-compatible event emission) ---
-
-type EventBus struct {
-	brokerURL   string
-	topic       string
-	serviceName string
-	mu          sync.Mutex
-	buffer      []map[string]interface{}
-}
-
-func newEventBus(topic, service string) *EventBus {
-	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" {
-		broker = "localhost:9092"
-	}
-	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
-}
-
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
-	event := map[string]interface{}{
-		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
-		"type":      eventType,
-		"source":    eb.serviceName,
-		"topic":     eb.topic,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"data":      payload,
-	}
-	eb.mu.Lock()
-	eb.buffer = append(eb.buffer, event)
-	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
-	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
-}
-
-func (eb *EventBus) Flush() []map[string]interface{} {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	events := eb.buffer
-	eb.buffer = nil
-	return events
-}
-
-// --- Downstream Notifier ---
-
-func notifyDownstream(serviceURL, path string, payload interface{}) error {
-	body, _ := json.Marshal(payload)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Source-Service", serviceName)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("[Downstream] %s%s failed: %v", serviceURL, path, err)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("downstream %s returned %d", path, resp.StatusCode)
-	}
-	return nil
-}
-

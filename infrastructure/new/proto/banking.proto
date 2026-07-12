@@ -1,0 +1,192 @@
+// C5: gRPC proto definitions for high-frequency inter-service calls
+// These replace HTTP REST for hot paths (balance inquiries, rate lookups, auth checks)
+
+syntax = "proto3";
+
+package banking.v1;
+
+option go_package = "github.com/54bank/proto/banking/v1;bankingv1";
+
+// ── Account Service ──
+
+service AccountService {
+  rpc GetBalance(GetBalanceRequest) returns (BalanceResponse);
+  rpc GetAccount(GetAccountRequest) returns (AccountResponse);
+  rpc ListAccounts(ListAccountsRequest) returns (ListAccountsResponse);
+  rpc CreateAccount(CreateAccountRequest) returns (AccountResponse);
+  rpc FreezeAccount(FreezeAccountRequest) returns (AccountResponse);
+}
+
+message GetBalanceRequest {
+  string account_number = 1;
+  string currency = 2;
+}
+
+message BalanceResponse {
+  string account_number = 1;
+  double available_balance = 2;
+  double ledger_balance = 3;
+  double hold_amount = 4;
+  string currency = 5;
+  string as_of = 6;
+}
+
+message GetAccountRequest {
+  string account_number = 1;
+}
+
+message AccountResponse {
+  string id = 1;
+  string account_number = 2;
+  string customer_id = 3;
+  string customer_name = 4;
+  string product_type = 5;
+  string currency = 6;
+  double available_balance = 7;
+  double ledger_balance = 8;
+  string status = 9;
+  string opened_date = 10;
+}
+
+message ListAccountsRequest {
+  string customer_id = 1;
+  int32 page = 2;
+  int32 page_size = 3;
+}
+
+message ListAccountsResponse {
+  repeated AccountResponse accounts = 1;
+  int32 total = 2;
+}
+
+message CreateAccountRequest {
+  string customer_id = 1;
+  string product_type = 2;
+  string currency = 3;
+  double initial_deposit = 4;
+}
+
+message FreezeAccountRequest {
+  string account_number = 1;
+  string reason = 2;
+  string frozen_by = 3;
+}
+
+// ── Transfer Service ──
+
+service TransferService {
+  rpc InitiateTransfer(TransferRequest) returns (TransferResponse);
+  rpc GetTransferStatus(GetTransferStatusRequest) returns (TransferResponse);
+  rpc ListTransfers(ListTransfersRequest) returns (ListTransfersResponse);
+}
+
+message TransferRequest {
+  string source_account = 1;
+  string destination_account = 2;
+  double amount = 3;
+  string currency = 4;
+  string narration = 5;
+  string channel = 6;  // nip, neft, rtgs, internal
+  string reference = 7;
+}
+
+message TransferResponse {
+  string id = 1;
+  string reference = 2;
+  string status = 3;  // pending, processing, completed, failed, reversed
+  double amount = 4;
+  string currency = 5;
+  double fee = 6;
+  string source_account = 7;
+  string destination_account = 8;
+  string completed_at = 9;
+  string failure_reason = 10;
+}
+
+message GetTransferStatusRequest {
+  string reference = 1;
+}
+
+message ListTransfersRequest {
+  string account_number = 1;
+  string start_date = 2;
+  string end_date = 3;
+  int32 page = 4;
+  int32 page_size = 5;
+}
+
+message ListTransfersResponse {
+  repeated TransferResponse transfers = 1;
+  int32 total = 2;
+}
+
+// ── Rate Service (high-frequency lookups) ──
+
+service RateService {
+  rpc GetExchangeRate(ExchangeRateRequest) returns (ExchangeRateResponse);
+  rpc GetInterestRate(InterestRateRequest) returns (InterestRateResponse);
+  rpc GetAllRates(Empty) returns (AllRatesResponse);
+}
+
+message ExchangeRateRequest {
+  string base_currency = 1;
+  string quote_currency = 2;
+}
+
+message ExchangeRateResponse {
+  string base_currency = 1;
+  string quote_currency = 2;
+  double bid = 3;
+  double ask = 4;
+  double mid = 5;
+  string source = 6;
+  string timestamp = 7;
+}
+
+message InterestRateRequest {
+  string product_type = 1;
+  string tenor = 2;
+}
+
+message InterestRateResponse {
+  string product_type = 1;
+  double base_rate = 2;
+  double spread = 3;
+  double effective_rate = 4;
+  string currency = 5;
+}
+
+message AllRatesResponse {
+  repeated ExchangeRateResponse exchange_rates = 1;
+  repeated InterestRateResponse interest_rates = 2;
+}
+
+message Empty {}
+
+// ── Authorization Service (hot path for every request) ──
+
+service AuthorizationService {
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+  rpc BatchCheckPermissions(BatchCheckRequest) returns (BatchCheckResponse);
+}
+
+message CheckPermissionRequest {
+  string subject = 1;
+  string resource = 2;
+  string action = 3;
+  map<string, string> context = 4;
+}
+
+message CheckPermissionResponse {
+  bool allowed = 1;
+  string policy_name = 2;
+  string reason = 3;
+}
+
+message BatchCheckRequest {
+  repeated CheckPermissionRequest checks = 1;
+}
+
+message BatchCheckResponse {
+  repeated CheckPermissionResponse results = 1;
+}

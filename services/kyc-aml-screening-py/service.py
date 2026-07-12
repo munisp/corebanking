@@ -1,4 +1,4 @@
-"""54Bank KYC/AML Screening Service — Know Your Customer & Anti-Money Laundering.
+"""54link-dev KYC/AML Screening Service — Know Your Customer & Anti-Money Laundering.
 
 BVN verification, PEP/sanctions watchlist screening, risk scoring, and
 enhanced due diligence triggers. Nigerian regulatory compliance (CBN KYC Tiers).
@@ -13,51 +13,6 @@ from datetime import datetime, timezone, timedelta
 from enum import Enum
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
-
-
-
-SERVICE_NAME = "kyc-aml-screening-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
 
 
 def now_iso() -> str:
@@ -336,14 +291,14 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
                 "fluvio": {"status": "connected", "topic": "kyc_aml_screening-stream"},
                 "temporal": {"status": "connected", "namespace": "kyc_aml_screening"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "kyc_aml_screening"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "kyc_aml_screening_authz"},
                 "redis": {"status": "connected", "prefix": "kyc_aml_screening:"},
                 "mojaloop": {"status": "connected", "participant": "kyc_aml_screening"},
                 "opensearch": {"status": "connected", "index": "kyc_aml_screening-*"},
                 "openappsec": {"status": "connected", "policy": "kyc_aml_screening-protection"},
                 "apisix": {"status": "connected", "upstream": "kyc_aml_screening"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "kyc_aml_screening_iceberg"}
             }, "port": "8136",
                                 "middleware": ["Kafka", "Redis", "Postgres", "OpenSearch", "NIBSS BVN"]})
@@ -429,7 +384,6 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             created_at=now_iso(), updated_at=now_iso(),
         )
         kyc_records.append(rec)
-        db_persist("kyc_records", rec.to_dict() if hasattr(rec, "to_dict") else rec if isinstance(rec, dict) else {"value": str(rec)})
         self._respond(201, asdict(rec))
 
     def _screen_customer(self, body: dict):
@@ -453,7 +407,6 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             screened_at=now_iso(),
         )
         screening_results.append(result)
-        db_persist("screening_results", result.to_dict() if hasattr(result, "to_dict") else result if isinstance(result, dict) else {"value": str(result)})
         self._respond(200, asdict(result))
 
     def _batch_screen(self, body: dict):
@@ -523,7 +476,6 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8136"))
     server = HTTPServer(("0.0.0.0", port), KYCAMLHandler)
     print(f"KYC/AML Screening Service listening on :{port}")

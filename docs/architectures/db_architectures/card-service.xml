@@ -1,0 +1,16 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Card Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- CARDS TABLE -->
+        <mxCell id="cards" value="cards&#xa;----------------------&#xa;id (PK, serial)&#xa;tenant_id (varchar)&#xa;card_id (varchar, unique)&#xa;card_number (varchar(16), unique)&#xa;card_type (varchar: debit/credit/prepaid)&#xa;customer_id (varchar, indexed)&#xa;account_id (varchar)&#xa;name_on_card (varchar)&#xa;expiry_date (date)&#xa;cvv (varchar(3))&#xa;pin_hash (varchar, nullable)&#xa;status (varchar: active/blocked/expired)&#xa;daily_limit (decimal, default 500000)&#xa;monthly_limit (decimal, default 5000000)&#xa;daily_spent (decimal, default 0)&#xa;monthly_spent (decimal, default 0)&#xa;created_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="200" y="60" width="320" height="380" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

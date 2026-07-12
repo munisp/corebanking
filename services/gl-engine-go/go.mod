@@ -1,4 +1,4 @@
-module github.com/54bank/gl-engine-go
+module github.com/54link-dev/gl-engine-go
 
 go 1.21
 

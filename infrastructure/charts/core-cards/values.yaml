@@ -1,0 +1,60 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-core-cards
+  pullPolicy: IfNotPresent
+  tag: "0.0.2"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9290
+    - port: 9291
+    - port: 9292
+    - port: 9293
+    - port: 9294
+    - port: 9295
+    - port: 9296
+    - port: 9297
+    - port: 9298
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: core-cards
+  appPort: 9290
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9290"
+  PORT_BASE: "9290"
+  SERVICE_GROUP: core-cards
+  SERVICES: "atm-management,atm-management-go,card-management-go,card-service,grid-token-card-go,pin-block-engine-rs,pin-hasher-rs,pos-terminal-go,scratch-card-pin-go"

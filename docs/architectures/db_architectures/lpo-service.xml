@@ -1,0 +1,34 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="LPO Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- LPO APPLICATIONS -->
+        <mxCell id="lpo_applications" value="lpo_applications&#xa;----------------------&#xa;id (PK, serial)&#xa;lpo_id (varchar, unique)&#xa;supplier_id (varchar)&#xa;tenant_id (varchar)&#xa;lpo_number (varchar)&#xa;issuing_organization (varchar)&#xa;lpo_amount (decimal(15,2))&#xa;currency (varchar, default NGN)&#xa;financing_amount (decimal)&#xa;interest_rate (decimal, default 5.0%)&#xa;total_repayment (decimal)&#xa;repayment_days (int)&#xa;repayment_due_date (date)&#xa;lpo_document_url (varchar)&#xa;additional_documents (JSONB)&#xa;status (varchar: submitted/under_review/approved/disbursed/repaid)&#xa;risk_score (int)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="400" as="geometry"/>
+        </mxCell>
+
+        <!-- LPO VERIFICATIONS -->
+        <mxCell id="lpo_verifications" value="lpo_verifications&#xa;----------------------&#xa;id (PK, serial)&#xa;verification_id (varchar, unique)&#xa;lpo_id (FK -> lpo_applications.lpo_id)&#xa;verified_by (varchar)&#xa;is_authentic (bool)&#xa;verification_method (varchar)&#xa;verification_notes (text)&#xa;verified_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- LPO DISBURSEMENTS -->
+        <mxCell id="lpo_disbursements" value="lpo_disbursements&#xa;----------------------&#xa;id (PK, serial)&#xa;disbursement_id (varchar, unique)&#xa;lpo_id (FK -> lpo_applications.lpo_id)&#xa;amount (decimal(15,2))&#xa;disbursed_to (varchar)&#xa;bank_account (JSONB)&#xa;transaction_reference (varchar)&#xa;status (varchar: pending/completed/failed)&#xa;disbursed_at (timestamp)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="400" y="300" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="lpo_applications" target="lpo_verifications" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="lpo_applications" target="lpo_disbursements" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

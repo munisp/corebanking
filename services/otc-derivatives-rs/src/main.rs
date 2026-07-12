@@ -1,257 +1,227 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::Mutex;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.into())
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+#[derive(Clone, Serialize, Deserialize)]
+struct Derivative {
+    id: String,
+    instrument_type: String, // irs, ccs, fra, cap, floor, collar, fx_option, swaption
+    trade_id: String,
+    counterparty: String,
+    counterparty_id: String,
+    notional: f64,
+    currency: String,
+    secondary_currency: Option<String>,
+    fixed_rate: Option<f64>,
+    floating_index: Option<String>, // CBN_MPR, NIBOR_3M, NIBOR_6M, LIBOR_3M, SOFR
+    floating_spread: Option<f64>,
+    strike_price: Option<f64>,
+    option_type: Option<String>, // call, put
+    start_date: String,
+    maturity_date: String,
+    payment_frequency: String, // monthly, quarterly, semi_annual, annual
+    day_count: String,
+    mtm_value: f64,
+    collateral_posted: f64,
+    collateral_received: f64,
+    hedge_designation: Option<String>, // fair_value, cash_flow, net_investment, none
+    status: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ValuationResult {
+    trade_id: String,
+    instrument_type: String,
+    notional: f64,
+    mtm_value: f64,
+    pv01: f64,
+    delta: Option<f64>,
+    gamma: Option<f64>,
+    vega: Option<f64>,
+    cva: f64,
+    dva: f64,
+}
+
+#[derive(Deserialize)]
+struct PricingRequest {
+    instrument_type: String,
+    notional: f64,
+    fixed_rate: Option<f64>,
+    floating_index: Option<String>,
+    tenor_years: f64,
+    strike: Option<f64>,
+    volatility: Option<f64>,
 }
 
 struct AppState {
-    db: PgPool,
+    derivatives: Mutex<Vec<Derivative>>,
+}
+
+fn seed() -> Vec<Derivative> {
+    vec![
+        Derivative {
+            id: "DRV-001".into(), instrument_type: "irs".into(), trade_id: "IRS-2026-001".into(),
+            counterparty: "Access Bank PLC".into(), counterparty_id: "ABP-001".into(),
+            notional: 50_000_000_000.0, currency: "NGN".into(), secondary_currency: None,
+            fixed_rate: Some(16.5), floating_index: Some("CBN_MPR".into()), floating_spread: Some(2.0),
+            strike_price: None, option_type: None,
+            start_date: "2026-01-15".into(), maturity_date: "2031-01-15".into(),
+            payment_frequency: "quarterly".into(), day_count: "ACT/360".into(),
+            mtm_value: 1_250_000_000.0, collateral_posted: 0.0, collateral_received: 500_000_000.0,
+            hedge_designation: Some("cash_flow".into()), status: "active".into(),
+        },
+        Derivative {
+            id: "DRV-002".into(), instrument_type: "ccs".into(), trade_id: "CCS-2026-001".into(),
+            counterparty: "Standard Chartered Bank".into(), counterparty_id: "SCB-001".into(),
+            notional: 100_000_000.0, currency: "USD".into(), secondary_currency: Some("NGN".into()),
+            fixed_rate: Some(5.5), floating_index: Some("SOFR".into()), floating_spread: Some(1.5),
+            strike_price: None, option_type: None,
+            start_date: "2026-03-01".into(), maturity_date: "2029-03-01".into(),
+            payment_frequency: "semi_annual".into(), day_count: "30/360".into(),
+            mtm_value: -15_000_000.0, collateral_posted: 10_000_000.0, collateral_received: 0.0,
+            hedge_designation: Some("fair_value".into()), status: "active".into(),
+        },
+        Derivative {
+            id: "DRV-003".into(), instrument_type: "fra".into(), trade_id: "FRA-2026-001".into(),
+            counterparty: "First Bank of Nigeria".into(), counterparty_id: "FBN-001".into(),
+            notional: 20_000_000_000.0, currency: "NGN".into(), secondary_currency: None,
+            fixed_rate: Some(18.0), floating_index: Some("NIBOR_3M".into()), floating_spread: None,
+            strike_price: None, option_type: None,
+            start_date: "2026-06-15".into(), maturity_date: "2026-09-15".into(),
+            payment_frequency: "quarterly".into(), day_count: "ACT/360".into(),
+            mtm_value: 350_000_000.0, collateral_posted: 0.0, collateral_received: 200_000_000.0,
+            hedge_designation: None, status: "active".into(),
+        },
+        Derivative {
+            id: "DRV-004".into(), instrument_type: "cap".into(), trade_id: "CAP-2026-001".into(),
+            counterparty: "Zenith Bank PLC".into(), counterparty_id: "ZBP-001".into(),
+            notional: 10_000_000_000.0, currency: "NGN".into(), secondary_currency: None,
+            fixed_rate: None, floating_index: Some("CBN_MPR".into()), floating_spread: None,
+            strike_price: Some(20.0), option_type: Some("call".into()),
+            start_date: "2026-02-01".into(), maturity_date: "2028-02-01".into(),
+            payment_frequency: "quarterly".into(), day_count: "ACT/360".into(),
+            mtm_value: 450_000_000.0, collateral_posted: 200_000_000.0, collateral_received: 0.0,
+            hedge_designation: Some("cash_flow".into()), status: "active".into(),
+        },
+        Derivative {
+            id: "DRV-005".into(), instrument_type: "fx_option".into(), trade_id: "FXO-2026-001".into(),
+            counterparty: "Citibank Nigeria".into(), counterparty_id: "CITI-001".into(),
+            notional: 50_000_000.0, currency: "USD".into(), secondary_currency: Some("NGN".into()),
+            fixed_rate: None, floating_index: None, floating_spread: None,
+            strike_price: Some(1550.0), option_type: Some("put".into()),
+            start_date: "2026-04-01".into(), maturity_date: "2026-10-01".into(),
+            payment_frequency: "monthly".into(), day_count: "ACT/365".into(),
+            mtm_value: 2_500_000.0, collateral_posted: 0.0, collateral_received: 1_000_000.0,
+            hedge_designation: Some("cash_flow".into()), status: "active".into(),
+        },
+        Derivative {
+            id: "DRV-006".into(), instrument_type: "swaption".into(), trade_id: "SWN-2025-001".into(),
+            counterparty: "GTBank PLC".into(), counterparty_id: "GTB-001".into(),
+            notional: 30_000_000_000.0, currency: "NGN".into(), secondary_currency: None,
+            fixed_rate: Some(17.0), floating_index: Some("NIBOR_6M".into()), floating_spread: Some(1.0),
+            strike_price: Some(17.0), option_type: Some("call".into()),
+            start_date: "2025-12-01".into(), maturity_date: "2026-06-01".into(),
+            payment_frequency: "semi_annual".into(), day_count: "ACT/360".into(),
+            mtm_value: -800_000_000.0, collateral_posted: 500_000_000.0, collateral_received: 0.0,
+            hedge_designation: None, status: "expired".into(),
+        },
+    ]
+}
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({"status": "ok", "version": env_or("VERSION", "0.0.1")})) 
+}
+
+async fn list_derivatives(data: web::Data<AppState>) -> HttpResponse {
+    let d = data.derivatives.lock().unwrap();
+    HttpResponse::Ok().json(serde_json::json!({ "items": *d, "total": d.len() }))
+}
+
+async fn price_derivative(body: web::Json<PricingRequest>) -> HttpResponse {
+    let req = body.into_inner();
+    if req.notional <= 0.0 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "notional must be positive"}));
+    }
+    if req.tenor_years <= 0.0 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "tenor_years must be positive"}));
+    }
+    let valid_types = ["irs", "ccs", "fra", "cap", "floor", "collar", "fx_option", "swaption"];
+    if !valid_types.contains(&req.instrument_type.as_str()) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "invalid instrument_type"}));
+    }
+    // Simplified pricing models
+    let (mtm, pv01, delta, gamma, vega, cva, dva) = match req.instrument_type.as_str() {
+        "irs" => {
+            let rate = req.fixed_rate.unwrap_or(16.5);
+            let mtm = req.notional * (rate - 18.75) / 100.0 * req.tenor_years * 0.5;
+            let pv01 = req.notional * 0.0001 * req.tenor_years;
+            (mtm, pv01, None, None, None, req.notional * 0.002, req.notional * 0.001)
+        },
+        "fra" => {
+            let rate = req.fixed_rate.unwrap_or(18.0);
+            let mtm = req.notional * (rate - 18.75) / 100.0 * (req.tenor_years / 4.0);
+            let pv01 = req.notional * 0.0001 * req.tenor_years;
+            (mtm, pv01, None, None, None, req.notional * 0.001, req.notional * 0.0005)
+        },
+        "cap" | "floor" | "collar" | "fx_option" | "swaption" => {
+            let vol = req.volatility.unwrap_or(20.0);
+            let strike = req.strike.unwrap_or(20.0);
+            let premium = req.notional * vol / 100.0 * (req.tenor_years).sqrt() * 0.05;
+            let d = Some(0.55);
+            let g = Some(0.02);
+            let v = Some(req.notional * 0.001 * req.tenor_years);
+            (premium, req.notional * 0.0001, d, g, v, req.notional * 0.0015, req.notional * 0.0008)
+        },
+        _ => {
+            let mtm = req.notional * 0.01 * req.tenor_years;
+            (mtm, req.notional * 0.0001, None, None, None, req.notional * 0.002, req.notional * 0.001)
+        }
+    };
+    HttpResponse::Ok().json(ValuationResult {
+        trade_id: "PRICING-QUOTE".into(), instrument_type: req.instrument_type,
+        notional: req.notional, mtm_value: (mtm * 100.0).round() / 100.0,
+        pv01: (pv01 * 100.0).round() / 100.0,
+        delta, gamma, vega,
+        cva: (cva * 100.0).round() / 100.0, dva: (dva * 100.0).round() / 100.0,
+    })
+}
+
+async fn portfolio_risk(data: web::Data<AppState>) -> HttpResponse {
+    let d = data.derivatives.lock().unwrap();
+    let total_notional: f64 = d.iter().filter(|x| x.status == "active").map(|x| x.notional).sum();
+    let total_mtm: f64 = d.iter().filter(|x| x.status == "active").map(|x| x.mtm_value).sum();
+    let total_collateral_posted: f64 = d.iter().map(|x| x.collateral_posted).sum();
+    let total_collateral_received: f64 = d.iter().map(|x| x.collateral_received).sum();
+    let net_exposure = total_mtm - total_collateral_received + total_collateral_posted;
+    let mut by_type: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for drv in d.iter() { *by_type.entry(drv.instrument_type.clone()).or_insert(0) += 1; }
+    HttpResponse::Ok().json(serde_json::json!({
+        "totalTrades": d.len(),
+        "activeTrades": d.iter().filter(|x| x.status == "active").count(),
+        "totalNotional": total_notional, "totalMtM": total_mtm,
+        "collateralPosted": total_collateral_posted, "collateralReceived": total_collateral_received,
+        "netExposure": net_exposure, "byType": by_type,
+    }))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[otc-derivatives-rs] starting");
-
-    let db_name = "otc-derivatives-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[otc-derivatives-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[otc-derivatives-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8530".to_string()).parse().unwrap_or(8530);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[otc-derivatives-rs] ready on :{}", port);
-
+    let port = env_or("PORT", "8080");
+    let state = web::Data::new(AppState { derivatives: Mutex::new(seed()) });
+    eprintln!("OTC Derivatives service on :{}", port);
     HttpServer::new(move || {
         App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .app_data(state.clone())
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/derivatives", web::get().to(list_derivatives))
+            .route("/v1/derivatives/price", web::post().to(price_derivative))
+            .route("/v1/derivatives/risk", web::get().to(portfolio_risk))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "otc-derivatives-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "otc-derivatives-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

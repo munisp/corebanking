@@ -1,0 +1,68 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-channels-voice
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9178
+    - port: 9179
+    - port: 9180
+    - port: 9181
+    - port: 9182
+    - port: 9183
+    - port: 9184
+    - port: 9185
+    - port: 9186
+    - port: 9187
+    - port: 9188
+    - port: 9189
+    - port: 9190
+    - port: 9191
+    - port: 9192
+    - port: 9193
+    - port: 9194
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: channels-voice
+  appPort: 9179
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9178"
+  PORT_BASE: "9178"
+  SERVICE_GROUP: channels-voice
+  SERVICES: "chatbot-py,chatbot-service,interactive-ussd-agri-py,ussd-banking-gateway-go,ussd-gateway-service,ussd-multilingual-py,ussd-service,ussd-sim-toolkit-go,ussd-transaction-engine-rs,voice-agent-escalation-go,voice-asr-nigerian-py,voice-banking-gateway-go,voice-biometric-auth-rs,voice-call-analytics-py,voice-ivr-menu-go,voice-nlu-banking-py,voice-tts-nigerian-rs"

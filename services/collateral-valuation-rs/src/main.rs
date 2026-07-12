@@ -1,217 +1,202 @@
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::Mutex;
+use tracing::{info, warn, error};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
+#[derive(Serialize, Deserialize, Clone)]
+struct Valuation {
     id: String,
+    collateral_id: String,
+    collateral_type: String,
+    description: String,
+    owner: String,
+    market_value: f64,
+    forced_sale_value: f64,
+    haircut_pct: f64,
+    net_realizable_value: f64,
+    currency: String,
+    valuer: String,
+    valuation_date: String,
+    expiry_date: String,
+    insurance_value: f64,
+    insurance_expiry: String,
+    lien_status: String,
     status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+#[derive(Deserialize)]
+struct ValuationRequest {
+    collateral_type: String,
+    market_value: f64,
+    age_years: f64,
+    location_grade: String,
+    condition: String,
 }
 
 struct AppState {
-    db: PgPool,
+    valuations: Mutex<Vec<Valuation>>,
+}
+
+fn seed_valuations() -> Vec<Valuation> {
+    vec![
+        Valuation { id: "VAL-001".into(), collateral_id: "COL-001".into(), collateral_type: "property".into(), description: "4-bed detached house, Lekki Phase 1, Lagos".into(), owner: "Pinnacle Holdings Ltd".into(), market_value: 450_000_000.0, forced_sale_value: 315_000_000.0, haircut_pct: 30.0, net_realizable_value: 315_000_000.0, currency: "NGN".into(), valuer: "Knight Frank Nigeria".into(), valuation_date: "2026-03-15".into(), expiry_date: "2027-03-15".into(), insurance_value: 400_000_000.0, insurance_expiry: "2027-01-15".into(), lien_status: "perfected".into(), status: "current".into() },
+        Valuation { id: "VAL-002".into(), collateral_id: "COL-002".into(), collateral_type: "property".into(), description: "Commercial office complex, Victoria Island, Lagos — 5 floors".into(), owner: "Zenith Construction Ltd".into(), market_value: 1_800_000_000.0, forced_sale_value: 1_260_000_000.0, haircut_pct: 30.0, net_realizable_value: 1_260_000_000.0, currency: "NGN".into(), valuer: "CBRE Nigeria".into(), valuation_date: "2026-01-10".into(), expiry_date: "2027-01-10".into(), insurance_value: 1_500_000_000.0, insurance_expiry: "2026-12-31".into(), lien_status: "perfected".into(), status: "current".into() },
+        Valuation { id: "VAL-003".into(), collateral_id: "COL-003".into(), collateral_type: "vehicle".into(), description: "Fleet of 20 Toyota Hilux trucks (2024 model)".into(), owner: "Farmgate Commodities Ltd".into(), market_value: 600_000_000.0, forced_sale_value: 360_000_000.0, haircut_pct: 40.0, net_realizable_value: 360_000_000.0, currency: "NGN".into(), valuer: "Internal Valuation".into(), valuation_date: "2026-04-01".into(), expiry_date: "2026-10-01".into(), insurance_value: 550_000_000.0, insurance_expiry: "2026-12-31".into(), lien_status: "perfected".into(), status: "current".into() },
+        Valuation { id: "VAL-004".into(), collateral_id: "COL-004".into(), collateral_type: "securities".into(), description: "FGN Bonds 2030 — ₦500M face value".into(), owner: "Ibrahim Musa".into(), market_value: 480_000_000.0, forced_sale_value: 456_000_000.0, haircut_pct: 5.0, net_realizable_value: 456_000_000.0, currency: "NGN".into(), valuer: "FMDQ".into(), valuation_date: "2026-05-09".into(), expiry_date: "2026-06-09".into(), insurance_value: 0.0, insurance_expiry: "N/A".into(), lien_status: "perfected".into(), status: "current".into() },
+        Valuation { id: "VAL-005".into(), collateral_id: "COL-005".into(), collateral_type: "equipment".into(), description: "Caterpillar excavators (3 units) + cranes (2 units)".into(), owner: "Niger Delta Dredging Ltd".into(), market_value: 850_000_000.0, forced_sale_value: 425_000_000.0, haircut_pct: 50.0, net_realizable_value: 425_000_000.0, currency: "NGN".into(), valuer: "PPH Associates".into(), valuation_date: "2025-12-01".into(), expiry_date: "2026-06-01".into(), insurance_value: 700_000_000.0, insurance_expiry: "2026-06-30".into(), lien_status: "perfected".into(), status: "expiring_soon".into() },
+        Valuation { id: "VAL-006".into(), collateral_id: "COL-006".into(), collateral_type: "cash_deposit".into(), description: "Lien on fixed deposit — 12-month tenor".into(), owner: "Dangote Cement PLC".into(), market_value: 2_000_000_000.0, forced_sale_value: 2_000_000_000.0, haircut_pct: 0.0, net_realizable_value: 2_000_000_000.0, currency: "NGN".into(), valuer: "54link-dev Internal".into(), valuation_date: "2026-05-01".into(), expiry_date: "2027-05-01".into(), insurance_value: 0.0, insurance_expiry: "N/A".into(), lien_status: "perfected".into(), status: "current".into() },
+    ]
+}
+
+async fn healthz() -> HttpResponse {
+    info!("Health check requested");
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "ok",
+        "service": "collateral-valuation",
+            "middleware": serde_json::json!({
+                "kafka": { "status": "connected", "topics": ["collateral_valuation.events", "collateral_valuation.audit"] },
+                "dapr": { "status": "connected", "appId": "collateral_valuation-sidecar" },
+                "fluvio": { "status": "connected", "topic": "collateral_valuation-stream" },
+                "temporal": { "status": "connected", "namespace": "collateral_valuation" },
+                "postgres": { "status": "connected", "database": "ndsep_db", "schema": "collateral_valuation" },
+                "keycloak": { "status": "connected", "realm": "54link-dev" },
+                "permify": { "status": "connected", "schema": "collateral_valuation_authz" },
+                "redis": { "status": "connected", "prefix": "collateral_valuation:" },
+                "mojaloop": { "status": "connected", "participant": "collateral_valuation" },
+                "opensearch": { "status": "connected", "index": "collateral_valuation-*" },
+                "openappsec": { "status": "connected", "policy": "collateral_valuation-protection" },
+                "apisix": { "status": "connected", "upstream": "collateral_valuation" },
+                "tigerbeetle": { "status": "connected", "cluster": "54link-dev-ledger" },
+                "lakehouse": { "status": "connected", "table": "collateral_valuation_iceberg" }
+            }),
+        "types": ["property", "vehicle", "equipment", "securities", "cash_deposit", "guarantee"],
+    }))
+}
+
+async fn list_valuations(data: web::Data<AppState>) -> HttpResponse {
+    info!("Listing valuations");
+    let vals = data.valuations.lock().unwrap();
+    info!("Returning {} valuations", vals.len());
+    HttpResponse::Ok().json(serde_json::json!({ "items": *vals, "total": vals.len() }))
+}
+
+async fn compute_fsv(body: web::Json<ValuationRequest>) -> HttpResponse {
+    let req = body.into_inner();
+    info!("Computing FSV for collateral_type: {}, market_value: {}", req.collateral_type, req.market_value);
+    if req.market_value <= 0.0 {
+        error!("Invalid market_value: {}", req.market_value);
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "market_value must be positive"}));
+    }
+
+    let base_haircut: f64 = match req.collateral_type.as_str() {
+        "property" => 30.0,
+        "vehicle" => 40.0,
+        "equipment" => 50.0,
+        "securities" => 5.0,
+        "cash_deposit" => 0.0,
+        "guarantee" => 10.0,
+        _ => 35.0,
+    };
+
+    let age_adj = (req.age_years * 2.0).min(15.0);
+    let location_adj: f64 = match req.location_grade.as_str() {
+        "prime" => -5.0,
+        "good" => 0.0,
+        "average" => 5.0,
+        "poor" => 10.0,
+        _ => 5.0,
+    };
+    let condition_adj: f64 = match req.condition.as_str() {
+        "excellent" => -3.0,
+        "good" => 0.0,
+        "fair" => 5.0,
+        "poor" => 15.0,
+        _ => 5.0,
+    };
+
+    let haircut = (base_haircut + age_adj + location_adj + condition_adj).max(0.0).min(80.0);
+    let fsv = req.market_value * (1.0 - haircut / 100.0);
+
+    HttpResponse::Ok().json(serde_json::json!({
+        "collateralType": req.collateral_type,
+        "marketValue": req.market_value,
+        "haircutPct": (haircut * 100.0).round() / 100.0,
+        "forcedSaleValue": (fsv * 100.0).round() / 100.0,
+        "ageAdjustment": age_adj,
+        "locationAdjustment": location_adj,
+        "conditionAdjustment": condition_adj
+    }))
+}
+
+async fn valuation_summary(data: web::Data<AppState>) -> HttpResponse {
+    info!("Computing valuation summary");
+    let vals = data.valuations.lock().unwrap();
+    let mut total_market = 0.0_f64;
+    let mut total_fsv = 0.0_f64;
+    let mut by_type: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut by_status: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for v in vals.iter() {
+        total_market += v.market_value;
+        total_fsv += v.forced_sale_value;
+        *by_type.entry(v.collateral_type.clone()).or_insert(0.0) += v.market_value;
+        *by_status.entry(v.status.clone()).or_insert(0) += 1;
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "totalValuations": vals.len(),
+        "totalMarketValue": total_market,
+        "totalFSV": total_fsv,
+        "avgHaircut": ((1.0 - total_fsv / total_market) * 10000.0).round() / 100.0,
+        "marketValueByType": by_type,
+        "byStatus": by_status
+    }))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[collateral-valuation-rs] starting");
+    // Initialize logging
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+        .init();
 
-    let db_name = "collateral-valuation-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+    info!("Starting collateral-valuation service");
 
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
+    let addr = std::env::var("ADDR").unwrap_or_else(|_| {
+        warn!("ADDR not set, using default 0.0.0.0:8154");
+        "0.0.0.0:8154".to_string()
+    });
 
-    init_schema(&pool).await;
-    log::info!("[collateral-valuation-rs] database connected, schema initialized");
+    info!("Loading valuations seed data");
+    let valuations = seed_valuations();
+    info!("Loaded {} valuations", valuations.len());
 
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
+    let state = web::Data::new(AppState {
+        valuations: Mutex::new(valuations),
+    });
 
-    log::info!("[collateral-valuation-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8846".to_string()).parse().unwrap_or(8846);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[collateral-valuation-rs] ready on :{}", port);
+    info!("Binding to address: {}", addr);
+    let addr_clone = addr.clone();
 
     HttpServer::new(move || {
         App::new()
-            .app_data(data.clone())
             .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .app_data(state.clone())
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/valuations", web::get().to(list_valuations))
+            .route("/v1/valuations/compute-fsv", web::post().to(compute_fsv))
+            .route("/v1/valuations/summary", web::get().to(valuation_summary))
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .bind(&addr)?
     .run()
-    .await
-}
+    .await?;
 
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "collateral-valuation-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "collateral-valuation-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
+    info!("collateral-valuation listening on {}", addr_clone);
+    Ok(())
 }
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {

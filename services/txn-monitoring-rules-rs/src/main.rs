@@ -1,219 +1,52 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::Mutex;
+fn ev(k: &str, d: &str) -> String { std::env::var(k).unwrap_or_else(|_| d.into()) }
+fn mw() -> serde_json::Value { serde_json::json!({"kafka":{"broker":ev("KAFKA_BROKER","localhost:9092"),"topics":["txn.monitored","txn.alert-generated","txn.rule-triggered","txn.case-opened","txn.sar-recommended"]},"dapr":{"app_id":"txn-monitoring-rules-rs"},"fluvio":{"url":ev("FLUVIO_URL","localhost:9003"),"topics":["txn-monitoring-stream","txn-alert-stream"]},"temporal":{"url":ev("TEMPORAL_URL","localhost:7233"),"namespace":"txn-monitoring","workflows":["RealTimeMonitorWorkflow","BatchMonitorWorkflow","CaseManagementWorkflow"]},"postgres":{"url":ev("DATABASE_URL","postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"),"tables":["txn_monitoring_rules","txn_alerts","txn_cases","txn_scenarios"]},"keycloak":{"url":ev("KEYCLOAK_URL","http://localhost:8080"),"realm":"54link-dev","client_id":"txn-monitoring"},"permify":{"url":ev("PERMIFY_URL","http://localhost:3476"),"schema":"txn_monitoring"},"redis":{"url":ev("REDIS_URL","redis://localhost:6379"),"keys":["txn:velocity:{customer_id}","txn:pattern:{customer_id}","txn:alert-count"]},"mojaloop":{"url":ev("MOJALOOP_URL","http://localhost:3002"),"purpose":"cross-border-txn-monitoring"},"opensearch":{"url":ev("OPENSEARCH_URL","http://localhost:9200"),"indices":["txn-monitoring-alerts","txn-cases"]},"openappsec":{"url":ev("OPENAPPSEC_URL","http://localhost:4000")},"apisix":{"url":ev("APISIX_URL","http://localhost:9080"),"routes":["/v1/txn-monitoring/*"]},"tigerbeetle":{"url":ev("TIGERBEETLE_URL","localhost:3000"),"ledger":"txn-monitoring"},"lakehouse":{"url":ev("LAKEHOUSE_URL","http://localhost:8181"),"tables":["txn_alert_analytics","txn_pattern_analytics"]}}) }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
-}
+#[derive(Clone, Serialize, Deserialize)]
+struct MonitoringRule { id: String, name: String, category: String, description: String, scenario_code: String, threshold_ngn: Option<u64>, time_window_hours: Option<u32>, min_transactions: Option<u32>, risk_score_impact: u32, action: String, enabled: bool, cbn_prescribed: bool }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
-}
+#[derive(Clone, Serialize, Deserialize)]
+struct TxnAlert { id: String, customer_id: String, customer_name: String, rule_id: String, rule_name: String, category: String, risk_score: u32, alert_details: String, transactions_involved: u32, total_amount_ngn: u64, period: String, status: String, assigned_to: Option<String>, generated_at: String, sar_recommended: bool }
 
-struct AppState {
-    db: PgPool,
-}
+#[derive(Clone, Serialize, Deserialize)]
+struct TxnCase { id: String, alert_ids: Vec<String>, customer_id: String, customer_name: String, case_type: String, risk_level: String, status: String, assigned_to: String, opened_at: String, due_date: String, outcome: Option<String>, sar_filed: bool }
+
+fn seed_rules() -> Vec<MonitoringRule> { vec![
+    MonitoringRule{id:"MR-001".into(),name:"Structuring Detection".into(),category:"structuring".into(),description:"Multiple cash transactions just below CTR threshold (₦5M) within rolling 5-day window".into(),scenario_code:"CBN-AML-001".into(),threshold_ngn:Some(4500000),time_window_hours:Some(120),min_transactions:Some(3),risk_score_impact:90,action:"alert_and_sar_review".into(),enabled:true,cbn_prescribed:true},
+    MonitoringRule{id:"MR-002".into(),name:"Rapid Fund Movement".into(),category:"rapid_movement".into(),description:"Funds received and transferred out within 24 hours (>80% of received amount)".into(),scenario_code:"CBN-AML-002".into(),threshold_ngn:Some(1000000),time_window_hours:Some(24),min_transactions:Some(2),risk_score_impact:85,action:"alert_and_hold".into(),enabled:true,cbn_prescribed:true},
+    MonitoringRule{id:"MR-003".into(),name:"Dormant-Then-Active".into(),category:"dormant_reactivation".into(),description:"Account dormant >6 months then sudden high-volume activity".into(),scenario_code:"CBN-AML-003".into(),threshold_ngn:Some(500000),time_window_hours:Some(168),min_transactions:Some(5),risk_score_impact:75,action:"alert_and_review".into(),enabled:true,cbn_prescribed:true},
+    MonitoringRule{id:"MR-004".into(),name:"Round-Tripping".into(),category:"round_tripping".into(),description:"Funds sent to account and returned (±5%) within 48 hours".into(),scenario_code:"CBN-AML-004".into(),threshold_ngn:Some(2000000),time_window_hours:Some(48),min_transactions:Some(2),risk_score_impact:80,action:"alert_and_sar_review".into(),enabled:true,cbn_prescribed:true},
+    MonitoringRule{id:"MR-005".into(),name:"PEP Threshold Monitoring".into(),category:"pep_monitoring".into(),description:"PEP customer transactions exceeding ₦1M (lower threshold than standard)".into(),scenario_code:"CBN-AML-005".into(),threshold_ngn:Some(1000000),time_window_hours:Some(24),min_transactions:Some(1),risk_score_impact:70,action:"alert_and_edd".into(),enabled:true,cbn_prescribed:true},
+    MonitoringRule{id:"MR-006".into(),name:"Geographic Anomaly".into(),category:"geographic".into(),description:"Rural branch account with large urban transfers or international activity".into(),scenario_code:"CBN-AML-006".into(),threshold_ngn:Some(5000000),time_window_hours:Some(720),min_transactions:Some(3),risk_score_impact:65,action:"alert_and_review".into(),enabled:true,cbn_prescribed:true},
+    MonitoringRule{id:"MR-007".into(),name:"Trade-Based ML".into(),category:"trade_based_ml".into(),description:"LC/trade values significantly above/below market prices for declared goods".into(),scenario_code:"CBN-AML-007".into(),threshold_ngn:None,time_window_hours:None,min_transactions:None,risk_score_impact:85,action:"alert_and_sar_review".into(),enabled:true,cbn_prescribed:true},
+    MonitoringRule{id:"MR-008".into(),name:"Velocity Spike".into(),category:"velocity".into(),description:"Transaction count exceeds 3x monthly average".into(),scenario_code:"INT-001".into(),threshold_ngn:None,time_window_hours:Some(720),min_transactions:None,risk_score_impact:60,action:"alert_and_review".into(),enabled:true,cbn_prescribed:false},
+]}
+
+fn seed_alerts() -> Vec<TxnAlert> { vec![
+    TxnAlert{id:"TA-001".into(),customer_id:"CUS-8001".into(),customer_name:"Suspicious Patterns Ltd".into(),rule_id:"MR-001".into(),rule_name:"Structuring Detection".into(),category:"structuring".into(),risk_score:92,alert_details:"12 cash deposits averaging ₦4.9M each over 5 business days — classic structuring pattern".into(),transactions_involved:12,total_amount_ngn:58800000,period:"2026-05-06 to 2026-05-10".into(),status:"sar_filed".into(),assigned_to:Some("compliance-officer-2".into()),generated_at:"2026-05-10T18:00:00Z".into(),sar_recommended:true},
+    TxnAlert{id:"TA-002".into(),customer_id:"CUS-2089".into(),customer_name:"Chinedu Okeke".into(),rule_id:"MR-002".into(),rule_name:"Rapid Fund Movement".into(),category:"rapid_movement".into(),risk_score:85,alert_details:"Received ₦15M via NIP, transferred ₦14.8M to 5 accounts within 4 hours".into(),transactions_involved:6,total_amount_ngn:14800000,period:"2026-05-11".into(),status:"under_investigation".into(),assigned_to:Some("aml-analyst-1".into()),generated_at:"2026-05-11T22:00:00Z".into(),sar_recommended:true},
+    TxnAlert{id:"TA-003".into(),customer_id:"CUS-5050".into(),customer_name:"Dormant Acct Holder".into(),rule_id:"MR-003".into(),rule_name:"Dormant-Then-Active".into(),category:"dormant_reactivation".into(),risk_score:75,alert_details:"Account dormant since Nov 2025, sudden 8 transactions totaling ₦12M in 3 days".into(),transactions_involved:8,total_amount_ngn:12000000,period:"2026-05-09 to 2026-05-11".into(),status:"new".into(),assigned_to:None,generated_at:"2026-05-12T06:00:00Z".into(),sar_recommended:false},
+]}
+
+fn seed_cases() -> Vec<TxnCase> { vec![
+    TxnCase{id:"TC-001".into(),alert_ids:vec!["TA-001".into()],customer_id:"CUS-8001".into(),customer_name:"Suspicious Patterns Ltd".into(),case_type:"structuring".into(),risk_level:"critical".into(),status:"closed_sar_filed".into(),assigned_to:"compliance-officer-2".into(),opened_at:"2026-05-10T18:30:00Z".into(),due_date:"2026-05-13T18:00:00Z".into(),outcome:Some("SAR filed — CBN/STR/2026/05/0001".into()),sar_filed:true},
+    TxnCase{id:"TC-002".into(),alert_ids:vec!["TA-002".into()],customer_id:"CUS-2089".into(),customer_name:"Chinedu Okeke".into(),case_type:"rapid_movement".into(),risk_level:"high".into(),status:"under_investigation".into(),assigned_to:"aml-analyst-1".into(),opened_at:"2026-05-11T22:30:00Z".into(),due_date:"2026-05-14T22:00:00Z".into(),outcome:None,sar_filed:false},
+]}
+
+struct St { rules: Mutex<Vec<MonitoringRule>>, alerts: Mutex<Vec<TxnAlert>>, cases: Mutex<Vec<TxnCase>> }
+async fn healthz() -> HttpResponse { HttpResponse::Ok().json(serde_json::json!({"status":"healthy","service":"txn-monitoring-rules-rs","version":"1.0.0","middleware":mw()})) }
+async fn get_rules(d: web::Data<St>) -> HttpResponse { let r = d.rules.lock().unwrap(); HttpResponse::Ok().json(serde_json::json!({"items":*r,"total":r.len()})) }
+async fn get_alerts(d: web::Data<St>) -> HttpResponse { let a = d.alerts.lock().unwrap(); HttpResponse::Ok().json(serde_json::json!({"items":*a,"total":a.len()})) }
+async fn get_cases(d: web::Data<St>) -> HttpResponse { let c = d.cases.lock().unwrap(); HttpResponse::Ok().json(serde_json::json!({"items":*c,"total":c.len()})) }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[txn-monitoring-rules-rs] starting");
-
-    let db_name = "txn-monitoring-rules-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[txn-monitoring-rules-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[txn-monitoring-rules-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8373".to_string()).parse().unwrap_or(8373);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[txn-monitoring-rules-rs] ready on :{}", port);
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/audit_events", web::get().to(list_records))
-            .route("/api/v1/audit_events", web::post().to(create_record))
-            .route("/api/v1/audit_events/{id}", web::get().to(get_record))
-            .route("/api/v1/audit_events/{id}", web::put().to(update_record))
-            .route("/api/v1/audit_events/{id}", web::delete().to(delete_record))
-    })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS audit_events (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_type VARCHAR(64) NOT NULL,
-    actor_id UUID NOT NULL,
-    actor_type VARCHAR(20) NOT NULL,
-    resource_type VARCHAR(64) NOT NULL,
-    resource_id VARCHAR(128) NOT NULL,
-    action VARCHAR(32) NOT NULL,
-    outcome VARCHAR(20) NOT NULL DEFAULT 'success',
-    ip_address INET,
-    user_agent TEXT,
-    changes JSONB DEFAULT '{}',
-    metadata JSONB DEFAULT '{}',
-    tenant_id UUID NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create audit_events table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_events_status ON audit_events(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "txn-monitoring-rules-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_events")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "txn-monitoring-rules-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM audit_events WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO audit_events (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("audit_events.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM audit_events WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
+    let port: u16 = ev("PORT","8285").parse().unwrap_or(8285);
+    let d = web::Data::new(St{rules:Mutex::new(seed_rules()),alerts:Mutex::new(seed_alerts()),cases:Mutex::new(seed_cases())});
+    println!("txn-monitoring-rules-rs listening on :{}",port);
+    HttpServer::new(move||App::new().app_data(d.clone()).route("/healthz",web::get().to(healthz)).route("/api/rules",web::get().to(get_rules)).route("/api/alerts",web::get().to(get_alerts)).route("/api/cases",web::get().to(get_cases))).bind(("0.0.0.0",port))?.run().await
 }
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {

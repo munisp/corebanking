@@ -1,0 +1,16 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Dispute Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- DISPUTES TABLE -->
+        <mxCell id="disputes" value="disputes&#xa;----------------------&#xa;id (PK, serial)&#xa;dispute_id (varchar, unique)&#xa;customer_id (varchar, indexed)&#xa;transaction_id (varchar)&#xa;dispute_type (varchar)&#xa;tenant_id (varchar)&#xa;amount (decimal(15,2))&#xa;description (text)&#xa;status (varchar: open/in_review/resolved/closed)&#xa;resolution (text, nullable)&#xa;created_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="200" y="60" width="320" height="260" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

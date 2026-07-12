@@ -1,0 +1,38 @@
+name: Build Orchestrator Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/orchestrator-service/**'
+      - '.github/workflows/orchestrator-service.yaml'
+
+env:
+  TAG: "0.0.12"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/orchestrator-service
+          file: ./services/orchestrator-service/Dockerfile
+          push: true
+          tags: registry.digitalocean.com/talentgraph-auth/54link-orchestrator-service:${{ env.TAG }}

@@ -1,216 +1,113 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
-use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, RwLock};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+fn get_env(key: &str, default: &str) -> String {
+    env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
-struct AppState {
-    db: PgPool,
-}
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[multicurrency-revaluation-rs] starting");
-
-    let db_name = "multicurrency-revaluation-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[multicurrency-revaluation-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[multicurrency-revaluation-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8510".to_string()).parse().unwrap_or(8510);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[multicurrency-revaluation-rs] ready on :{}", port);
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+fn middleware_config() -> serde_json::Value {
+    serde_json::json!({
+        "kafka": {"broker": get_env("KAFKA_BROKER", "localhost:9092"), "topics": "fx.revaluation-completed,fx.rate-updated,fx.position-changed"},
+        "redis": {"url": get_env("REDIS_URL", "redis://localhost:6379"), "purpose": "rate-cache,position-cache"},
+        "postgres": {"url": get_env("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": "fx_rates,fx_positions,fx_revaluations,currency_accounts"},
+        "opensearch": {"url": get_env("OPENSEARCH_URL", "http://localhost:9200"), "index": "fx-revaluation-history"},
+        "keycloak": {"url": get_env("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "role": "treasury-officer"},
+        "permify": {"url": get_env("PERMIFY_URL", "http://localhost:3476"), "schema": "fx:revalue,fx:override-rate,fx:close-position"},
+        "dapr": {"url": get_env("DAPR_URL", "http://localhost:3500"), "pubsub": "fx-events"},
+        "fluvio": {"url": get_env("FLUVIO_URL", "localhost:9003"), "topic": "fx-rate-feed"},
+        "temporal": {"url": get_env("TEMPORAL_URL", "localhost:7233"), "workflow": "FXRevaluationBatchWorkflow"},
+        "mojaloop": {"url": get_env("MOJALOOP_URL", "http://localhost:4000"), "purpose": "cross-border-fx-settlement"},
+        "tigerbeetle": {"url": get_env("TIGERBEETLE_URL", "localhost:3000"), "purpose": "fx-pnl-double-entry"},
+        "lakehouse": {"url": get_env("LAKEHOUSE_URL", "http://localhost:8206"), "tables": "fx_rate_history,revaluation_pnl"},
+        "apisix": {"url": get_env("APISIX_URL", "http://localhost:9080"), "route": "/fx/*"},
+        "openappsec": {"url": get_env("OPENAPPSEC_URL", "http://localhost:8090"), "policy": "fx-trading-protection"}
     })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
 }
 
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "multicurrency-revaluation-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "multicurrency-revaluation-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
+fn seed_data() -> serde_json::Value {
+    serde_json::json!({
+        "currencies": [
+            {"code": "NGN", "name": "Nigerian Naira", "type": "local", "decimalPlaces": 2, "isBaseCurrency": true},
+            {"code": "USD", "name": "US Dollar", "type": "major", "decimalPlaces": 2, "isBaseCurrency": false},
+            {"code": "GBP", "name": "British Pound", "type": "major", "decimalPlaces": 2, "isBaseCurrency": false},
+            {"code": "EUR", "name": "Euro", "type": "major", "decimalPlaces": 2, "isBaseCurrency": false},
+            {"code": "CNY", "name": "Chinese Yuan", "type": "emerging", "decimalPlaces": 2, "isBaseCurrency": false},
+            {"code": "XAF", "name": "CFA Franc", "type": "regional", "decimalPlaces": 0, "isBaseCurrency": false},
+            {"code": "GHS", "name": "Ghanaian Cedi", "type": "regional", "decimalPlaces": 2, "isBaseCurrency": false},
+        ],
+        "rates": [
+            {"pair": "USD/NGN", "bidRate": 1580.00, "askRate": 1585.00, "midRate": 1582.50, "cbnRate": 1550.00, "previousClose": 1575.00, "source": "NAFEM", "updatedAt": "2026-05-10T16:00:00Z"},
+            {"pair": "GBP/NGN", "bidRate": 1990.00, "askRate": 1998.00, "midRate": 1994.00, "cbnRate": 1960.00, "previousClose": 1985.00, "source": "NAFEM", "updatedAt": "2026-05-10T16:00:00Z"},
+            {"pair": "EUR/NGN", "bidRate": 1720.00, "askRate": 1726.00, "midRate": 1723.00, "cbnRate": 1700.00, "previousClose": 1715.00, "source": "NAFEM", "updatedAt": "2026-05-10T16:00:00Z"},
+            {"pair": "CNY/NGN", "bidRate": 218.00, "askRate": 220.00, "midRate": 219.00, "cbnRate": 215.00, "previousClose": 217.50, "source": "CBN", "updatedAt": "2026-05-10T16:00:00Z"},
+        ],
+        "positions": [
+            {"id": "POS-USD-001", "currency": "USD", "accountType": "nostro", "balance": 45000000.00, "localEquivalent": 71212500.00, "prevLocalEquivalent": 70875000.00, "revalPnL": 337500.00, "accountCount": 12500},
+            {"id": "POS-GBP-001", "currency": "GBP", "accountType": "nostro", "balance": 12000000.00, "localEquivalent": 23928000.00, "prevLocalEquivalent": 23820000.00, "revalPnL": 108000.00, "accountCount": 3200},
+            {"id": "POS-EUR-001", "currency": "EUR", "accountType": "nostro", "balance": 18000000.00, "localEquivalent": 31014000.00, "prevLocalEquivalent": 30870000.00, "revalPnL": 144000.00, "accountCount": 5800},
+            {"id": "POS-CNY-001", "currency": "CNY", "accountType": "vostro", "balance": 25000000.00, "localEquivalent": 5475000.00, "prevLocalEquivalent": 5437500.00, "revalPnL": 37500.00, "accountCount": 450},
+        ],
+        "revaluationRuns": [
+            {"id": "REVAL-2026-05-10", "businessDate": "2026-05-10", "status": "completed", "executedAt": "2026-05-10T22:01:15Z", "totalPositions": 4, "totalAccounts": 21950, "totalPnL": 627000.00, "pnlBreakdown": {"USD": 337500.00, "GBP": 108000.00, "EUR": 144000.00, "CNY": 37500.00}, "glEntries": [
+                {"debit": "GL-2200-DOM-FCY", "credit": "GL-4200-REVAL-GAIN", "amount": 627000.00, "narrative": "FX revaluation gain 2026-05-10"}
+            ]},
+            {"id": "REVAL-2026-05-09", "businessDate": "2026-05-09", "status": "completed", "executedAt": "2026-05-09T22:01:08Z", "totalPositions": 4, "totalAccounts": 21890, "totalPnL": -234000.00, "pnlBreakdown": {"USD": -180000.00, "GBP": 45000.00, "EUR": -120000.00, "CNY": 21000.00}, "glEntries": [
+                {"debit": "GL-5200-REVAL-LOSS", "credit": "GL-2200-DOM-FCY", "amount": 234000.00, "narrative": "FX revaluation loss 2026-05-09"}
+            ]},
+        ],
+        "stats": {
+            "totalCurrencies": 7, "activePairs": 4, "totalFCYBalance": 100000000.00,
+            "totalLocalEquivalent": 131629500.00, "netRevalPnLToday": 627000.00,
+            "netRevalPnLMTD": 393000.00, "totalAccountsRevalued": 21950,
+            "revaluationMethod": "closing-rate", "glAccountGain": "GL-4200-REVAL-GAIN",
+            "glAccountLoss": "GL-5200-REVAL-LOSS"
         }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
+    })
 }
 
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
+fn handle_request(request: &str, data: &Arc<RwLock<serde_json::Value>>) -> (u16, String) {
+    let first_line = request.lines().next().unwrap_or("");
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+    if parts.len() < 2 { return (400, r#"{"error":"Bad request"}"#.to_string()); }
+    let path = parts[1];
+    let d = data.read().unwrap();
 
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    if path == "/healthz" {
+        return (200, serde_json::json!({
+            "status": "healthy", "service": "multicurrency-revaluation",
+            "fx": {"currencies": d["stats"]["totalCurrencies"], "activePairs": d["stats"]["activePairs"], "todayPnL": d["stats"]["netRevalPnLToday"]},
+            "middleware": middleware_config()
+        }).to_string());
+    }
+    if path == "/v1/currencies" { return (200, serde_json::json!({"items": d["currencies"], "total": d["currencies"].as_array().map_or(0, |a| a.len())}).to_string()); }
+    if path == "/v1/rates" { return (200, serde_json::json!({"items": d["rates"], "total": d["rates"].as_array().map_or(0, |a| a.len())}).to_string()); }
+    if path == "/v1/positions" { return (200, serde_json::json!({"items": d["positions"], "total": d["positions"].as_array().map_or(0, |a| a.len())}).to_string()); }
+    if path == "/v1/revaluation-runs" { return (200, serde_json::json!({"items": d["revaluationRuns"], "total": d["revaluationRuns"].as_array().map_or(0, |a| a.len())}).to_string()); }
+    if path == "/v1/stats" { return (200, d["stats"].to_string()); }
+    (404, r#"{"error":"Not found"}"#.to_string())
+}
 
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
+fn main() {
+    let port = get_env("PORT", "8211");
+    let data = Arc::new(RwLock::new(seed_data()));
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).expect("Failed to bind");
+    eprintln!("[multicurrency-revaluation] Listening on :{} with 7 currencies, 4 rate pairs, 4 positions", port);
 
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+    for stream in listener.incoming() {
+        if let Ok(mut stream) = stream {
+            let data = Arc::clone(&data);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = handle_request(&request, &data);
+                let st = match status { 200 => "OK", 404 => "Not Found", _ => "Error" };
+                let resp = format!("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Service: multicurrency-revaluation\r\n\r\n{}", status, st, body.len(), body);
+                let _ = stream.write_all(resp.as_bytes());
+            });
         }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 

@@ -1,0 +1,16 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="KYB Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- BUSINESSES TABLE -->
+        <mxCell id="businesses" value="businesses&#xa;----------------------&#xa;id (PK, int, autoincrement)&#xa;business_id (varchar, unique, indexed)&#xa;tenant_id (varchar, indexed)&#xa;business_name (varchar)&#xa;registration_number (varchar, nullable)&#xa;tin (varchar, nullable)&#xa;business_type (varchar, nullable)&#xa;industry (varchar, nullable)&#xa;country (varchar, nullable)&#xa;address (text, nullable)&#xa;is_verified (bool, default false)&#xa;verification_status (varchar: pending/verified/rejected)&#xa;verification_date (timestamp, nullable)&#xa;verification_path (varchar, nullable)&#xa;contact_email (varchar, nullable)&#xa;contact_phone (varchar, nullable)&#xa;documents (JSON array: [{title, url}])&#xa;metadata (JSON)&#xa;created_at / updated_at / deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="180" y="40" width="360" height="420" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

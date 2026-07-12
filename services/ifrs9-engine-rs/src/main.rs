@@ -1,257 +1,329 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::Mutex;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.into())
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
+// IFRS9 Exposure — monetary fields stored in kobo (i64).
+// Ratios (PD, LGD) remain f64 — they are percentages, not money.
+// i64 max = 9,223,372,036,854,775,807 kobo ≈ ₦92 trillion — safe for any Nigerian exposure.
+#[derive(Clone, Serialize, Deserialize)]
+struct Exposure {
+    id: String,
+    account_id: String,
+    customer_name: String,
+    product_type: String,       // term_loan, overdraft, mortgage, credit_card, trade_finance, bond
+    outstanding_balance_kobo: i64,  // outstanding principal in kobo
+    original_amount_kobo: i64,      // original disbursement in kobo
+    currency: String,
+    stage: u8,                  // 1 = performing, 2 = SICR, 3 = credit-impaired
+    stage_reason: String,
+    days_past_due: u32,
+    pd_12m: f64,                // 12-month probability of default (%) — ratio, not money
+    pd_lifetime: f64,           // lifetime PD (%) — ratio, not money
+    lgd: f64,                   // loss given default (%) — ratio, not money
+    ead_kobo: i64,              // exposure at default in kobo
+    ecl_kobo: i64,              // expected credit loss in kobo
+    ecl_12m_kobo: i64,         // 12-month ECL in kobo
+    ecl_lifetime_kobo: i64,    // lifetime ECL in kobo
+    collateral_value_kobo: i64, // collateral value in kobo
+    origination_date: String,
+    maturity_date: String,
+    last_review_date: String,
+    sicr_triggered: bool,       // significant increase in credit risk
+    write_off: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TransitionMatrix {
+    from_rating: String,
+    to_aaa: f64, to_aa: f64, to_a: f64, to_bbb: f64, to_bb: f64, to_b: f64, to_ccc: f64, to_default: f64,
+}
+
+#[derive(Deserialize)]
+struct EclCalcRequest {
+    outstanding_kobo: i64, // outstanding balance in kobo — integer, no float
+    pd_12m: f64,           // probability of default 0–100 — ratio, stays f64
+    lgd: f64,              // loss given default 0–100 — ratio, stays f64
+    stage: u8,
+    remaining_years: f64,
     #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+    exposure_id: Option<String>,
 }
 
 struct AppState {
-    db: PgPool,
+    exposures: Mutex<Vec<Exposure>>,
+    transitions: Mutex<Vec<TransitionMatrix>>,
+}
+
+// calc_ecl_kobo: returns ECL values in kobo (i64).
+// outstanding_kobo: integer kobo input.
+// PD and LGD are percentages (f64 ratios) — not money, intermediate float is correct.
+// Result is rounded to nearest kobo — no sub-kobo precision stored.
+fn calc_ecl_kobo(outstanding_kobo: i64, pd_12m: f64, lgd: f64, stage: u8, years: f64) -> (i64, i64) {
+    let outstanding_f = outstanding_kobo as f64;
+    let ecl_12m_f = outstanding_f * (pd_12m / 100.0) * (lgd / 100.0);
+    let ecl_lifetime_f = if stage == 1 {
+        ecl_12m_f
+    } else {
+        let pd_lt = 1.0 - (1.0 - pd_12m / 100.0).powf(years);
+        outstanding_f * pd_lt * (lgd / 100.0)
+    };
+    (ecl_12m_f.round() as i64, ecl_lifetime_f.round() as i64)
+}
+
+// naira_to_kobo: converts NGN amount to kobo integer. Only for seed data initialisation.
+fn naira_to_kobo(naira: f64) -> i64 { (naira * 100.0).round() as i64 }
+
+fn seed() -> (Vec<Exposure>, Vec<TransitionMatrix>) {
+    // Seed amounts are in NGN (f64) for readability, converted to kobo (i64) immediately.
+    // (id, account_id, name, product, outstanding_ngn, original_ngn, stage, reason, dpd, pd12m%, pdlt%, lgd%, orig_date, mat_date, sicr)
+    let exposures_raw: Vec<(&str, &str, &str, &str, f64, f64, u8, &str, u32, f64, f64, f64, &str, &str, bool)> = vec![
+        ("EXP-001", "LN-001", "Dangote Industries",  "term_loan",    45_000_000_000.0, 50_000_000_000.0,  1, "Performing - current",           0,   0.5,  2.5, 40.0, "2024-01-15", "2029-01-15", false),
+        ("EXP-002", "LN-002", "MTN Nigeria",          "term_loan",    30_000_000_000.0, 30_000_000_000.0,  1, "Performing - current",           0,   0.8,  4.0, 45.0, "2025-06-01", "2030-06-01", false),
+        ("EXP-003", "LN-003", "Pan Ocean Oil",        "trade_finance",15_000_000_000.0, 20_000_000_000.0,  2, "SICR - rating downgrade",       45,   3.5, 15.0, 55.0, "2024-03-01", "2026-09-01", true),
+        ("EXP-004", "LN-004", "Arik Air",             "term_loan",     8_000_000_000.0, 12_000_000_000.0,  3, "Credit-impaired - 90+ DPD",    120,  25.0, 80.0, 65.0, "2023-01-01", "2028-01-01", false),
+        ("EXP-005", "MG-001", "Retail Mortgage Pool", "mortgage",    120_000_000_000.0,150_000_000_000.0,  1, "Performing - current",           0,   1.2,  6.0, 25.0, "various",    "various",    false),
+        ("EXP-006", "OD-001", "SME Overdraft Pool",   "overdraft",    25_000_000_000.0, 25_000_000_000.0,  2, "SICR - 30+ DPD",                35,   5.0, 20.0, 60.0, "various",    "various",    true),
+        ("EXP-007", "CC-001", "Credit Card Pool",     "credit_card",  10_000_000_000.0, 15_000_000_000.0,  1, "Performing - current",           5,   2.0, 10.0, 70.0, "various",    "various",    false),
+        ("EXP-008", "BD-001", "Corporate Bond",       "bond",         50_000_000_000.0, 50_000_000_000.0,  1, "Performing - investment grade",  0,   0.3,  1.5, 35.0, "2025-01-01", "2030-12-31", false),
+    ];
+
+    let exposures = exposures_raw.into_iter().map(|(id, acc, name, prod, bal_ngn, orig_ngn, stage, reason, dpd, pd12, pdlt, lgd, odate, mdate, sicr)| {
+        let bal_kobo  = naira_to_kobo(bal_ngn);
+        let orig_kobo = naira_to_kobo(orig_ngn);
+        let remaining = 3.0;
+        let (ecl_12m_kobo, ecl_lifetime_kobo) = calc_ecl_kobo(bal_kobo, pd12, lgd, stage, remaining);
+        let ecl_kobo = if stage == 1 { ecl_12m_kobo } else { ecl_lifetime_kobo };
+        let collateral_kobo = (bal_kobo as f64 * 0.3).round() as i64;
+        Exposure {
+            id: id.into(), account_id: acc.into(), customer_name: name.into(),
+            product_type: prod.into(),
+            outstanding_balance_kobo: bal_kobo,
+            original_amount_kobo: orig_kobo,
+            currency: "NGN".into(), stage, stage_reason: reason.into(),
+            days_past_due: dpd, pd_12m: pd12, pd_lifetime: pdlt, lgd,
+            ead_kobo: bal_kobo,
+            ecl_kobo, ecl_12m_kobo, ecl_lifetime_kobo,
+            collateral_value_kobo: collateral_kobo,
+            origination_date: odate.into(), maturity_date: mdate.into(),
+            last_review_date: "2026-03-31".into(), sicr_triggered: sicr, write_off: false,
+        }
+    }).collect();
+
+    let transitions = vec![
+        TransitionMatrix { from_rating: "AAA".into(), to_aaa: 90.0, to_aa: 8.0, to_a: 1.5, to_bbb: 0.3, to_bb: 0.1, to_b: 0.05, to_ccc: 0.03, to_default: 0.02 },
+        TransitionMatrix { from_rating: "AA".into(), to_aaa: 2.0, to_aa: 88.0, to_a: 7.0, to_bbb: 2.0, to_bb: 0.5, to_b: 0.3, to_ccc: 0.1, to_default: 0.1 },
+        TransitionMatrix { from_rating: "A".into(), to_aaa: 0.5, to_aa: 3.0, to_a: 85.0, to_bbb: 8.0, to_bb: 2.0, to_b: 1.0, to_ccc: 0.3, to_default: 0.2 },
+        TransitionMatrix { from_rating: "BBB".into(), to_aaa: 0.1, to_aa: 0.5, to_a: 3.0, to_bbb: 82.0, to_bb: 10.0, to_b: 3.0, to_ccc: 1.0, to_default: 0.4 },
+        TransitionMatrix { from_rating: "BB".into(), to_aaa: 0.05, to_aa: 0.1, to_a: 0.5, to_bbb: 5.0, to_bb: 75.0, to_b: 12.0, to_ccc: 5.0, to_default: 2.35 },
+        TransitionMatrix { from_rating: "B".into(), to_aaa: 0.02, to_aa: 0.05, to_a: 0.1, to_bbb: 0.5, to_bb: 5.0, to_b: 70.0, to_ccc: 15.0, to_default: 9.33 },
+    ];
+
+    (exposures, transitions)
+}
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "ok"
+    }))
+}
+
+async fn list_exposures(data: web::Data<AppState>) -> HttpResponse {
+    let e = match data.exposures.lock() {
+    Ok(v) => v,
+    Err(_) => {
+        return HttpResponse::InternalServerError()
+            .json(serde_json::json!({
+                "error": "internal state lock failed"
+            }));
+    }
+};
+    HttpResponse::Ok().json(serde_json::json!({ "items": *e, "total": e.len() }))
+}
+
+async fn transition_matrix(data: web::Data<AppState>) -> HttpResponse {
+    let t = match data.transitions.lock() {
+    Ok(v) => v,
+    Err(_) => {
+        return HttpResponse::InternalServerError().json(
+            serde_json::json!({
+                "error": "failed to lock transitions state"
+            })
+        );
+    }
+};
+    HttpResponse::Ok().json(serde_json::json!({ "items": *t, "total": t.len() }))
+}
+
+// ── Middleware integration: TigerBeetle ledger + Kafka events ──────────────
+// The IFRS9 impairment provision is posted to the ledger (Dr impairment charge
+// 5100, Cr loan-loss provision 2600) and an event is published. Fire-and-forget
+// raw HTTP (no extra crate dependency); an outage is logged, never fatal.
+fn mw_tigerbeetle_url() -> String {
+    std::env::var("TIGERBEETLE_URL").unwrap_or_else(|_| "http://tigerbeetle-adapter:3000".to_string())
+}
+fn mw_kafka_url() -> String {
+    std::env::var("KAFKA_REST_URL")
+        .or_else(|_| std::env::var("KAFKA_BROKER_URL"))
+        .unwrap_or_else(|_| "http://kafka-rest-proxy:8082".to_string())
+}
+
+async fn mw_http_post(url: &str, body: String) {
+    use tokio::io::AsyncWriteExt;
+    let stripped = match url.strip_prefix("http://") {
+        Some(s) => s,
+        None => return,
+    };
+    let (hostport, path) = match stripped.find('/') {
+        Some(i) => (&stripped[..i], &stripped[i..]),
+        None => (stripped, "/"),
+    };
+    let addr = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{}:80", hostport)
+    };
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await;
+    let mut stream = match connect {
+        Ok(Ok(s)) => s,
+        _ => {
+            eprintln!("[ifrs9-engine-rs] middleware post: connect failed {}", addr);
+            return;
+        }
+    };
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, hostport, body.len(), body
+    );
+    let _ = stream.write_all(req.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
+async fn mw_post_provision(exposure_id: &str, ecl_kobo: i64) {
+    if ecl_kobo <= 0 {
+        return;
+    }
+    let body = serde_json::json!({
+        "transfers": [{
+            "id": format!("ECL-{}", exposure_id),
+            "debitAccount": "5100",
+            "creditAccount": "2600",
+            "amount": ecl_kobo,
+            "currency": "NGN",
+            "ledger": 1,
+            "code": 5001,
+            "flags": 0,
+        }]
+    })
+    .to_string();
+    mw_http_post(&format!("{}/transfers", mw_tigerbeetle_url()), body).await;
+}
+
+async fn mw_publish_provision_event(exposure_id: &str, ecl_kobo: i64, stage: u8) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let body = serde_json::json!({
+        "eventType": "ifrs9.provision.posted",
+        "service": "ifrs9-engine-rs",
+        "exposureId": exposure_id,
+        "eclKobo": ecl_kobo,
+        "stage": stage,
+        "timestampMs": ts,
+    })
+    .to_string();
+    mw_http_post(&format!("{}/topics/ifrs9.provisions", mw_kafka_url()), body).await;
+}
+
+async fn calculate_ecl(body: web::Json<EclCalcRequest>) -> HttpResponse {
+    let req = body.into_inner();
+    if req.outstanding_kobo <= 0 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "outstanding_kobo must be positive"}));
+    }
+    if req.pd_12m < 0.0 || req.pd_12m > 100.0 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "pd_12m must be 0-100"}));
+    }
+    if req.lgd < 0.0 || req.lgd > 100.0 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "lgd must be 0-100"}));
+    }
+    if req.stage < 1 || req.stage > 3 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "stage must be 1, 2, or 3"}));
+    }
+    let (ecl_12m_kobo, ecl_lifetime_kobo) = calc_ecl_kobo(req.outstanding_kobo, req.pd_12m, req.lgd, req.stage, req.remaining_years);
+    let ecl_kobo = if req.stage == 1 { ecl_12m_kobo } else { ecl_lifetime_kobo };
+    let coverage_ratio_bps = if req.outstanding_kobo > 0 {
+        (ecl_kobo as f64 / req.outstanding_kobo as f64 * 10000.0).round() / 100.0
+    } else { 0.0 };
+    let exposure_id = req.exposure_id.clone().unwrap_or_else(|| "unknown".to_string());
+    mw_post_provision(&exposure_id, ecl_kobo).await;
+    mw_publish_provision_event(&exposure_id, ecl_kobo, req.stage).await;
+    HttpResponse::Ok().json(serde_json::json!({
+        "outstanding_kobo": req.outstanding_kobo,
+        "stage": req.stage, "pd_12m": req.pd_12m, "lgd": req.lgd,
+        "remaining_years": req.remaining_years,
+        "ecl_12m_kobo": ecl_12m_kobo,
+        "ecl_lifetime_kobo": ecl_lifetime_kobo,
+        "ecl_kobo": ecl_kobo,
+        "coverage_ratio_pct": coverage_ratio_bps,
+        "measurement_basis": if req.stage == 1 { "12-month ECL" } else { "Lifetime ECL" },
+    }))
+}
+
+async fn summary(data: web::Data<AppState>) -> HttpResponse {
+    let e = match data.exposures.lock() {
+    Ok(v) => v,
+    Err(_) => {
+        return HttpResponse::InternalServerError()
+            .json(serde_json::json!({
+                "error": "internal state lock failed"
+            }));
+    }
+};
+    let total_exposure_kobo: i64 = e.iter().map(|x| x.outstanding_balance_kobo).sum();
+    let total_ecl_kobo: i64 = e.iter().map(|x| x.ecl_kobo).sum();
+    let stage1_exposure_kobo: i64 = e.iter().filter(|x| x.stage == 1).map(|x| x.outstanding_balance_kobo).sum();
+    let stage2_exposure_kobo: i64 = e.iter().filter(|x| x.stage == 2).map(|x| x.outstanding_balance_kobo).sum();
+    let stage3_exposure_kobo: i64 = e.iter().filter(|x| x.stage == 3).map(|x| x.outstanding_balance_kobo).sum();
+    let stage1_ecl_kobo: i64 = e.iter().filter(|x| x.stage == 1).map(|x| x.ecl_kobo).sum();
+    let stage2_ecl_kobo: i64 = e.iter().filter(|x| x.stage == 2).map(|x| x.ecl_kobo).sum();
+    let stage3_ecl_kobo: i64 = e.iter().filter(|x| x.stage == 3).map(|x| x.ecl_kobo).sum();
+    let cov = |ecl: i64, exp: i64| -> f64 {
+        if exp == 0 { 0.0 } else { (ecl as f64 / exp as f64 * 10000.0).round() / 100.0 }
+    };
+    HttpResponse::Ok().json(serde_json::json!({
+        "total_exposures": e.len(),
+        "total_exposure_kobo": total_exposure_kobo,
+        "total_ecl_kobo": total_ecl_kobo,
+        "overall_coverage_pct": cov(total_ecl_kobo, total_exposure_kobo),
+        "stage1": { "count": e.iter().filter(|x| x.stage == 1).count(), "exposure_kobo": stage1_exposure_kobo, "ecl_kobo": stage1_ecl_kobo, "coverage_pct": cov(stage1_ecl_kobo, stage1_exposure_kobo) },
+        "stage2": { "count": e.iter().filter(|x| x.stage == 2).count(), "exposure_kobo": stage2_exposure_kobo, "ecl_kobo": stage2_ecl_kobo, "coverage_pct": cov(stage2_ecl_kobo, stage2_exposure_kobo) },
+        "stage3": { "count": e.iter().filter(|x| x.stage == 3).count(), "exposure_kobo": stage3_exposure_kobo, "ecl_kobo": stage3_ecl_kobo, "coverage_pct": cov(stage3_ecl_kobo, stage3_exposure_kobo) },
+    }))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[ifrs9-engine-rs] starting");
-
-    let db_name = "ifrs9-engine-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[ifrs9-engine-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[ifrs9-engine-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8917".to_string()).parse().unwrap_or(8917);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[ifrs9-engine-rs] ready on :{}", port);
-
+    let (exposures, transitions) = seed();
+    let state = web::Data::new(AppState { exposures: Mutex::new(exposures), transitions: Mutex::new(transitions) });
+    println!("IFRS 9 Engine on :8164");
     HttpServer::new(move || {
         App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .app_data(state.clone())
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/ifrs9/exposures", web::get().to(list_exposures))
+            .route("/v1/ifrs9/transition-matrix", web::get().to(transition_matrix))
+            .route("/v1/ifrs9/calculate-ecl", web::post().to(calculate_ecl))
+            .route("/v1/ifrs9/summary", web::get().to(summary))
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .bind("0.0.0.0:8164")?
     .run()
     .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "ifrs9-engine-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "ifrs9-engine-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

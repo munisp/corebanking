@@ -1,0 +1,6 @@
+apiVersion: v2
+name: etherisc-service
+description: 54link Etherisc Parametric Insurance Service Helm Chart
+type: application
+version: 0.0.2
+appVersion: "1.0.0"

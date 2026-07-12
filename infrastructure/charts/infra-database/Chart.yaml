@@ -1,0 +1,6 @@
+apiVersion: v2
+name: infra-database
+description: 54link Infra Database Consolidated Helm Chart
+type: application
+version: 0.0.2
+appVersion: "1.0.1"

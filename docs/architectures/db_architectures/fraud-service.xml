@@ -1,0 +1,47 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Fraud Service DB Architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- FRAUD CHECKS -->
+        <mxCell id="fraud_checks" value="fraud_checks&#xa;----------------------&#xa;id (PK, serial)&#xa;check_id (varchar, unique)&#xa;transaction_id (varchar)&#xa;customer_id (varchar)&#xa;tenant_id (varchar)&#xa;fraud_score (int)&#xa;risk_level (varchar: low/medium/high/critical)&#xa;fraud_indicators (JSONB)&#xa;recommended_action (varchar: allow/review/block)&#xa;final_decision (varchar, nullable)&#xa;decided_by (varchar, nullable)&#xa;check_duration_ms (int)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="280" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- FRAUD RULES -->
+        <mxCell id="fraud_rules" value="fraud_rules&#xa;----------------------&#xa;id (PK, serial)&#xa;rule_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;rule_name (varchar)&#xa;rule_type (varchar)&#xa;conditions (JSONB)&#xa;risk_level (varchar)&#xa;action (varchar: allow/flag/block)&#xa;is_active (bool)&#xa;triggered_count (int)&#xa;last_triggered_at (timestamp)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="380" y="40" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- DEVICE FINGERPRINTS -->
+        <mxCell id="device_fingerprints" value="device_fingerprints&#xa;----------------------&#xa;id (PK, serial)&#xa;fingerprint_id (varchar, unique)&#xa;customer_id (varchar)&#xa;device_id (varchar)&#xa;device_type (varchar)&#xa;os / browser (varchar)&#xa;ip_address (varchar)&#xa;location (JSONB)&#xa;is_trusted (bool)&#xa;first_seen (timestamp)&#xa;last_seen (timestamp)&#xa;usage_count (int)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="720" y="40" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- FRAUD PATTERNS -->
+        <mxCell id="fraud_patterns" value="fraud_patterns&#xa;----------------------&#xa;id (PK, serial)&#xa;pattern_id (varchar, unique)&#xa;pattern_name (varchar)&#xa;pattern_type (varchar)&#xa;pattern_definition (JSONB)&#xa;severity (varchar)&#xa;detection_count (int)&#xa;is_active (bool)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="400" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- FRAUD ALERTS -->
+        <mxCell id="fraud_alerts" value="fraud_alerts&#xa;----------------------&#xa;id (PK, serial)&#xa;alert_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;customer_id (varchar)&#xa;alert_type (varchar)&#xa;severity (varchar)&#xa;description (text)&#xa;related_entities (JSONB)&#xa;status (varchar: open/in_review/resolved)&#xa;assigned_to (varchar)&#xa;resolved_at (timestamp)&#xa;resolution_notes (text)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="380" y="380" width="280" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="fraud_rules" target="fraud_checks" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="fraud_patterns" target="fraud_alerts" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="fraud_checks" target="fraud_alerts" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,257 +1,213 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::Mutex;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.into())
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+#[derive(Clone, Serialize, Deserialize)]
+struct RwaExposure {
+    id: String,
+    asset_class: String, // sovereign, bank, corporate, retail, mortgage, sme, equity, securitization
+    exposure_type: String, // on_balance, off_balance, derivative, repo
+    counterparty: String,
+    rating: String, // AAA, AA, A, BBB, BB, B, CCC, unrated
+    original_exposure: f64,
+    credit_conversion_factor: f64,
+    ead: f64, // exposure at default
+    risk_weight: f64, // percentage
+    rwa: f64, // risk-weighted asset
+    currency: String,
+    maturity_date: String,
+    collateral_value: f64,
+    collateral_type: String,
+    netting_set: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CapitalRatio {
+    id: String,
+    report_date: String,
+    tier1_common_equity: f64,
+    additional_tier1: f64,
+    tier2_capital: f64,
+    total_capital: f64,
+    total_rwa: f64,
+    credit_rwa: f64,
+    market_rwa: f64,
+    operational_rwa: f64,
+    cet1_ratio: f64,
+    tier1_ratio: f64,
+    total_car: f64,
+    leverage_ratio: f64,
+    lcr: f64, // liquidity coverage ratio
+    nsfr: f64, // net stable funding ratio
+    countercyclical_buffer: f64,
+    systemic_buffer: f64,
+    capital_conservation_buffer: f64,
+    minimum_cet1: f64,
+    minimum_tier1: f64,
+    minimum_total: f64,
+    cet1_surplus: f64,
+    compliant: bool,
+}
+
+#[derive(Deserialize)]
+struct RwaCalcRequest {
+    asset_class: String,
+    rating: String,
+    exposure: f64,
+    collateral_value: Option<f64>,
+    maturity_years: Option<f64>,
 }
 
 struct AppState {
-    db: PgPool,
+    exposures: Mutex<Vec<RwaExposure>>,
+    capital: Mutex<Vec<CapitalRatio>>,
+}
+
+fn risk_weight(asset_class: &str, rating: &str) -> f64 {
+    match (asset_class, rating) {
+        ("sovereign", "AAA") | ("sovereign", "AA") => 0.0,
+        ("sovereign", "A") => 20.0,
+        ("sovereign", "BBB") => 50.0,
+        ("sovereign", "BB") | ("sovereign", "B") => 100.0,
+        ("sovereign", _) => 150.0,
+        ("bank", "AAA") | ("bank", "AA") => 20.0,
+        ("bank", "A") => 50.0,
+        ("bank", "BBB") | ("bank", "BB") => 100.0,
+        ("bank", _) => 150.0,
+        ("corporate", "AAA") | ("corporate", "AA") => 20.0,
+        ("corporate", "A") => 50.0,
+        ("corporate", "BBB") => 100.0,
+        ("corporate", _) => 150.0,
+        ("retail", _) => 75.0,
+        ("mortgage", _) => 35.0,
+        ("sme", _) => 85.0,
+        ("equity", _) => 100.0,
+        ("securitization", "AAA") => 20.0,
+        ("securitization", "AA") => 25.0,
+        ("securitization", "A") => 50.0,
+        ("securitization", _) => 1250.0,
+        _ => 100.0,
+    }
+}
+
+fn seed() -> (Vec<RwaExposure>, Vec<CapitalRatio>) {
+    let exposures = vec![
+        RwaExposure { id: "RWA-001".into(), asset_class: "sovereign".into(), exposure_type: "on_balance".into(), counterparty: "Federal Government of Nigeria".into(), rating: "B".into(), original_exposure: 150_000_000_000.0, credit_conversion_factor: 1.0, ead: 150_000_000_000.0, risk_weight: 100.0, rwa: 150_000_000_000.0, currency: "NGN".into(), maturity_date: "2030-12-31".into(), collateral_value: 0.0, collateral_type: "none".into(), netting_set: None },
+        RwaExposure { id: "RWA-002".into(), asset_class: "bank".into(), exposure_type: "on_balance".into(), counterparty: "First Bank of Nigeria".into(), rating: "BBB".into(), original_exposure: 50_000_000_000.0, credit_conversion_factor: 1.0, ead: 50_000_000_000.0, risk_weight: 100.0, rwa: 50_000_000_000.0, currency: "NGN".into(), maturity_date: "2027-06-30".into(), collateral_value: 10_000_000_000.0, collateral_type: "cash".into(), netting_set: Some("NETTING-FBN-001".into()) },
+        RwaExposure { id: "RWA-003".into(), asset_class: "corporate".into(), exposure_type: "on_balance".into(), counterparty: "Dangote Industries".into(), rating: "A".into(), original_exposure: 80_000_000_000.0, credit_conversion_factor: 1.0, ead: 80_000_000_000.0, risk_weight: 50.0, rwa: 40_000_000_000.0, currency: "NGN".into(), maturity_date: "2028-03-15".into(), collateral_value: 30_000_000_000.0, collateral_type: "property".into(), netting_set: None },
+        RwaExposure { id: "RWA-004".into(), asset_class: "retail".into(), exposure_type: "on_balance".into(), counterparty: "Retail Portfolio".into(), rating: "unrated".into(), original_exposure: 200_000_000_000.0, credit_conversion_factor: 1.0, ead: 200_000_000_000.0, risk_weight: 75.0, rwa: 150_000_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 50_000_000_000.0, collateral_type: "mixed".into(), netting_set: None },
+        RwaExposure { id: "RWA-005".into(), asset_class: "mortgage".into(), exposure_type: "on_balance".into(), counterparty: "Mortgage Portfolio".into(), rating: "unrated".into(), original_exposure: 120_000_000_000.0, credit_conversion_factor: 1.0, ead: 120_000_000_000.0, risk_weight: 35.0, rwa: 42_000_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 180_000_000_000.0, collateral_type: "residential_property".into(), netting_set: None },
+        RwaExposure { id: "RWA-006".into(), asset_class: "sme".into(), exposure_type: "on_balance".into(), counterparty: "SME Portfolio".into(), rating: "unrated".into(), original_exposure: 60_000_000_000.0, credit_conversion_factor: 1.0, ead: 60_000_000_000.0, risk_weight: 85.0, rwa: 51_000_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 15_000_000_000.0, collateral_type: "inventory".into(), netting_set: None },
+        RwaExposure { id: "RWA-007".into(), asset_class: "derivative".into(), exposure_type: "derivative".into(), counterparty: "OTC Derivative Portfolio".into(), rating: "A".into(), original_exposure: 25_000_000_000.0, credit_conversion_factor: 0.5, ead: 12_500_000_000.0, risk_weight: 50.0, rwa: 6_250_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 5_000_000_000.0, collateral_type: "cash_margin".into(), netting_set: Some("NETTING-OTC-001".into()) },
+        RwaExposure { id: "RWA-008".into(), asset_class: "off_balance".into(), exposure_type: "off_balance".into(), counterparty: "Guarantee Portfolio".into(), rating: "BBB".into(), original_exposure: 40_000_000_000.0, credit_conversion_factor: 0.5, ead: 20_000_000_000.0, risk_weight: 100.0, rwa: 20_000_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 15_000_000_000.0, collateral_type: "cash_margin".into(), netting_set: None },
+    ];
+
+    // CBN minimum ratios: CET1=6%, Tier1=8%, Total CAR=15% (for systemically important banks)
+    let credit_rwa = 509_250_000_000.0;
+    let market_rwa = 25_000_000_000.0;
+    let operational_rwa = 45_000_000_000.0;
+    let total_rwa = credit_rwa + market_rwa + operational_rwa;
+    let cet1 = 120_000_000_000.0;
+    let at1 = 15_000_000_000.0;
+    let t2 = 25_000_000_000.0;
+    let total_cap = cet1 + at1 + t2;
+
+    let capital = vec![CapitalRatio {
+        id: "CAP-2026Q1".into(), report_date: "2026-03-31".into(),
+        tier1_common_equity: cet1, additional_tier1: at1, tier2_capital: t2, total_capital: total_cap,
+        total_rwa, credit_rwa, market_rwa, operational_rwa,
+        cet1_ratio: (cet1 / total_rwa * 10000.0).round() / 100.0,
+        tier1_ratio: ((cet1 + at1) / total_rwa * 10000.0).round() / 100.0,
+        total_car: (total_cap / total_rwa * 10000.0).round() / 100.0,
+        leverage_ratio: ((cet1 + at1) / 800_000_000_000.0 * 10000.0).round() / 100.0,
+        lcr: 145.0, nsfr: 112.0,
+        countercyclical_buffer: 0.0, systemic_buffer: 1.0, capital_conservation_buffer: 2.5,
+        minimum_cet1: 6.0, minimum_tier1: 8.0, minimum_total: 15.0,
+        cet1_surplus: (cet1 / total_rwa * 100.0) - 6.0,
+        compliant: (total_cap / total_rwa * 100.0) >= 15.0,
+    }];
+
+    (exposures, capital)
+}
+
+async fn healthz() -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "ok", "service": "basel-engine"
+    }))
+}
+
+async fn list_exposures(data: web::Data<AppState>) -> HttpResponse {
+    let e = data.exposures.lock().unwrap();
+    HttpResponse::Ok().json(serde_json::json!({ "items": *e, "total": e.len() }))
+}
+
+async fn capital_ratios(data: web::Data<AppState>) -> HttpResponse {
+    let c = data.capital.lock().unwrap();
+    HttpResponse::Ok().json(serde_json::json!({ "items": *c, "total": c.len() }))
+}
+
+async fn calculate_rwa(body: web::Json<RwaCalcRequest>) -> HttpResponse {
+    let req = body.into_inner();
+    if req.exposure <= 0.0 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "exposure must be positive"}));
+    }
+    let valid_classes = ["sovereign", "bank", "corporate", "retail", "mortgage", "sme", "equity", "securitization"];
+    if !valid_classes.contains(&req.asset_class.as_str()) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "invalid asset_class"}));
+    }
+    let rw = risk_weight(&req.asset_class, &req.rating);
+    let collateral = req.collateral_value.unwrap_or(0.0);
+    let ead = (req.exposure - collateral * 0.8).max(0.0); // 80% LGD mitigation
+    let rwa = ead * rw / 100.0;
+    let capital_charge = rwa * 0.15; // 15% CBN minimum CAR
+    HttpResponse::Ok().json(serde_json::json!({
+        "assetClass": req.asset_class, "rating": req.rating,
+        "originalExposure": req.exposure, "collateralValue": collateral,
+        "ead": (ead * 100.0).round() / 100.0,
+        "riskWeight": rw, "rwa": (rwa * 100.0).round() / 100.0,
+        "capitalCharge": (capital_charge * 100.0).round() / 100.0,
+    }))
+}
+
+async fn pillar3(data: web::Data<AppState>) -> HttpResponse {
+    let exposures = data.exposures.lock().unwrap();
+    let capital = data.capital.lock().unwrap();
+    let latest = capital.last();
+    let mut by_asset_class: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    for e in exposures.iter() {
+        *by_asset_class.entry(e.asset_class.clone()).or_insert(0.0) += e.rwa;
+    }
+    HttpResponse::Ok().json(serde_json::json!({
+        "pillar3Disclosure": {
+            "reportDate": latest.map(|c| c.report_date.clone()).unwrap_or_default(),
+            "capitalRatios": latest,
+            "rwaByAssetClass": by_asset_class,
+            "totalExposures": exposures.len(),
+            "regulatoryMinimums": { "cet1": 6.0, "tier1": 8.0, "totalCar": 15.0, "lcr": 100.0, "nsfr": 100.0 },
+            "buffers": { "capitalConservation": 2.5, "countercyclical": 0.0, "systemic": 1.0 },
+        }
+    }))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[basel-engine-rs] starting");
-
-    let db_name = "basel-engine-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[basel-engine-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[basel-engine-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8356".to_string()).parse().unwrap_or(8356);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[basel-engine-rs] ready on :{}", port);
-
+    let (exposures, capital) = seed();
+    let state = web::Data::new(AppState { exposures: Mutex::new(exposures), capital: Mutex::new(capital) });
+    println!("Basel III/IV Engine on :8163");
     HttpServer::new(move || {
         App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .app_data(state.clone())
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/basel/exposures", web::get().to(list_exposures))
+            .route("/v1/basel/capital", web::get().to(capital_ratios))
+            .route("/v1/basel/calculate-rwa", web::post().to(calculate_rwa))
+            .route("/v1/basel/pillar3", web::get().to(pillar3))
     })
-    .bind(format!("0.0.0.0:{}", port))?
+    .bind("0.0.0.0:8163")?
     .run()
     .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "basel-engine-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "basel-engine-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

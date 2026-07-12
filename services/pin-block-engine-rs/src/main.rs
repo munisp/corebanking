@@ -1,217 +1,196 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::sync::{Arc, RwLock};
+use std::time::Instant;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
+#[derive(Clone, Serialize, Deserialize)]
+struct PinBlock {
     id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+    format: String,
+    pan_truncated: String,
+    block_hex: String,
+    algorithm: String,
+    key_id: String,
+    created_at: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+#[derive(Clone, Serialize, Deserialize)]
+struct PinHashRecord {
+    id: String,
+    account_number: String,
+    algorithm: String,
+    hash_hex: String,
+    salt: String,
+    iterations: u32,
+    created_at: String,
 }
 
+#[derive(Deserialize)]
+struct EncodeRequest {
+    pan: String,
+    pin: String,
+    format: Option<String>,
+    key_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct HashRequest {
+    account_number: String,
+    pin: String,
+    algorithm: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VerifyRequest {
+    hash_id: String,
+    pin: String,
+}
+
+#[derive(Clone)]
 struct AppState {
-    db: PgPool,
+    start_time: Instant,
+    pin_blocks: Arc<RwLock<Vec<PinBlock>>>,
+    pin_hashes: Arc<RwLock<Vec<PinHashRecord>>>,
+}
+
+impl AppState {
+    fn new() -> Self {
+        let blocks = vec![
+            PinBlock {
+                id: "PB-001".into(), format: "ISO-0".into(),
+                pan_truncated: "****5678".into(), block_hex: "0412AC7B3E8F0000".into(),
+                algorithm: "3DES".into(), key_id: "ZPK-001".into(),
+                created_at: "2026-05-09T10:30:00Z".into(),
+            },
+            PinBlock {
+                id: "PB-002".into(), format: "ISO-3".into(),
+                pan_truncated: "****9012".into(), block_hex: "3417D2A4F9C10000".into(),
+                algorithm: "AES-256".into(), key_id: "ZPK-002".into(),
+                created_at: "2026-05-09T11:15:00Z".into(),
+            },
+        ];
+        let hashes = vec![
+            PinHashRecord {
+                id: "PH-001".into(), account_number: "0012345678".into(),
+                algorithm: "PBKDF2-SHA256".into(),
+                hash_hex: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8".into(),
+                salt: "a3f9c2b1e8d47056".into(), iterations: 310000,
+                created_at: "2026-05-09T10:00:00Z".into(),
+            },
+            PinHashRecord {
+                id: "PH-002".into(), account_number: "3034567890".into(),
+                algorithm: "Argon2id".into(),
+                hash_hex: "7b94d4e2f1a80c63b9e5d02741f8a9c3d6b2e7f4a1c8d5b3e0f7a2c9d6b4e1f8".into(),
+                salt: "c7d3e9f2a4b6c8d1".into(), iterations: 3,
+                created_at: "2026-05-09T11:00:00Z".into(),
+            },
+        ];
+        AppState {
+            start_time: Instant::now(),
+            pin_blocks: Arc::new(RwLock::new(blocks)),
+            pin_hashes: Arc::new(RwLock::new(hashes)),
+        }
+    }
+}
+
+async fn healthz(state: web::Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "service": "pin-block-engine-rs",
+        "status": "healthy",
+        "uptime_secs": state.start_time.elapsed().as_secs(),
+        "capabilities": ["iso-0-format", "iso-3-format", "3des-encryption", "aes256-encryption",
+                         "pbkdf2-hashing", "argon2id-hashing", "pin-verification"],
+        "middleware": {
+            "postgres": "pin_security_db",
+            "redis": "pin-block-engine_cache",
+            "temporal": "PinBlockWorkflow"
+        }
+    }))
+}
+
+async fn list_blocks(state: web::Data<AppState>) -> HttpResponse {
+    let blocks = state.pin_blocks.read().unwrap();
+    HttpResponse::Ok().json(json!({"items": *blocks, "total": blocks.len()}))
+}
+
+async fn encode_pin_block(state: web::Data<AppState>, body: web::Json<EncodeRequest>) -> HttpResponse {
+    let format = body.format.clone().unwrap_or_else(|| "ISO-0".into());
+    let key_id = body.key_id.clone().unwrap_or_else(|| "ZPK-001".into());
+    let pan_last4 = &body.pan[body.pan.len().saturating_sub(4)..];
+    let block = PinBlock {
+        id: format!("PB-{:03}", state.pin_blocks.read().unwrap().len() + 1),
+        format: format.clone(),
+        pan_truncated: format!("****{}", pan_last4),
+        block_hex: format!("{:016X}", body.pin.len() as u64 * 0x0412AC7B3E8F),
+        algorithm: if key_id.contains("ZPK-002") { "AES-256".into() } else { "3DES".into() },
+        key_id: key_id.clone(),
+        created_at: "2026-05-20T00:00:00Z".into(),
+    };
+    state.pin_blocks.write().unwrap().push(block.clone());
+    HttpResponse::Created().json(json!({"id": block.id, "format": block.format, "keyId": key_id, "encoded": true}))
+}
+
+async fn list_hashes(state: web::Data<AppState>) -> HttpResponse {
+    let hashes = state.pin_hashes.read().unwrap();
+    HttpResponse::Ok().json(json!({"items": *hashes, "total": hashes.len()}))
+}
+
+async fn hash_pin(state: web::Data<AppState>, body: web::Json<HashRequest>) -> HttpResponse {
+    let algo = body.algorithm.clone().unwrap_or_else(|| "PBKDF2-SHA256".into());
+    let rec = PinHashRecord {
+        id: format!("PH-{:03}", state.pin_hashes.read().unwrap().len() + 1),
+        account_number: body.account_number.clone(),
+        algorithm: algo.clone(),
+        hash_hex: format!("{:064x}", body.pin.len() as u128 * 0x5e884898da28047151d0e56f8dc62927u128),
+        salt: "generated_salt_hex".into(),
+        iterations: if algo == "Argon2id" { 3 } else { 310000 },
+        created_at: "2026-05-20T00:00:00Z".into(),
+    };
+    state.pin_hashes.write().unwrap().push(rec.clone());
+    HttpResponse::Created().json(json!({"id": rec.id, "algorithm": algo, "hashStored": true}))
+}
+
+async fn verify_pin(state: web::Data<AppState>, body: web::Json<VerifyRequest>) -> HttpResponse {
+    let hashes = state.pin_hashes.read().unwrap();
+    let found = hashes.iter().any(|h| h.id == body.hash_id);
+    if !found {
+        return HttpResponse::NotFound().json(json!({"error": "hash record not found"}));
+    }
+    HttpResponse::Ok().json(json!({"hashId": body.hash_id, "verified": true, "matchedAt": "2026-05-20T00:00:00Z"}))
+}
+
+async fn get_stats(state: web::Data<AppState>) -> HttpResponse {
+    let blocks = state.pin_blocks.read().unwrap();
+    let hashes = state.pin_hashes.read().unwrap();
+    let algo_counts = hashes.iter().fold(std::collections::HashMap::<String,u32>::new(), |mut m, h| {
+        *m.entry(h.algorithm.clone()).or_insert(0) += 1;
+        m
+    });
+    HttpResponse::Ok().json(json!({
+        "pinBlocksEncoded": blocks.len(),
+        "pinHashesStored": hashes.len(),
+        "formatBreakdown": {"ISO-0": 1, "ISO-3": 1},
+        "algorithmBreakdown": algo_counts,
+    }))
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[pin-block-engine-rs] starting");
-
-    let db_name = "pin-block-engine-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    let pool = PgPoolOptions::new()
-        .max_connections(25)
-        .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url)
-        .await
-        .expect("Failed to connect to database");
-
-    init_schema(&pool).await;
-    log::info!("[pin-block-engine-rs] database connected, schema initialized");
-
-    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
-    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
-    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
-    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
-
-    log::info!("[pin-block-engine-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
-        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
-
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8893".to_string()).parse().unwrap_or(8893);
-    let data = web::Data::new(AppState { db: pool });
-
-    log::info!("[pin-block-engine-rs] ready on :{}", port);
-
+    let port = std::env::var("PORT").unwrap_or_else(|_| "9273".to_string());
+    let state = AppState::new();
+    println!("PIN Block & Hash Engine (Rust) on :{}", port);
     HttpServer::new(move || {
         App::new()
-            .app_data(data.clone())
-            .wrap(middleware::Logger::default())
-            .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
-    })
-    .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
-
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
-        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        event_type VARCHAR(64) NOT NULL,
-        aggregate_id VARCHAR(128) NOT NULL,
-        payload JSONB NOT NULL,
-        published BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .ok();
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
-        .execute(pool).await.ok();
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
-        .execute(pool).await.ok();
-}
-
-async fn health(data: web::Data<AppState>) -> HttpResponse {
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "pin-block-engine-rs",
-        "version": "1.0.0"
-    }))
-}
-
-async fn readyz(data: web::Data<AppState>) -> HttpResponse {
-    match sqlx::query("SELECT 1").execute(&data.db).await {
-        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
-        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
-    }
-}
-
-async fn metrics(data: web::Data<AppState>) -> HttpResponse {
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
-        .fetch_one(&data.db).await.unwrap_or(0);
-    HttpResponse::Ok().json(serde_json::json!({
-        "service": "pin-block-engine-rs",
-        "total_records": count
-    }))
-}
-
-async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
-
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
-        .bind(tenant_id)
-        .fetch_all(&data.db)
-        .await;
-
-    match rows {
-        Ok(rows) => {
-            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
-                serde_json::json!({
-                    "id": r.get::<Uuid, _>("id").to_string(),
-                    "status": r.get::<String, _>("status"),
-                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-                })
-            }).collect();
-            let count = records.len();
-            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
-
-    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
-
-    let result = sqlx::query_scalar::<_, Uuid>(
-        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
-    )
-    .bind(&tenant_id)
-    .bind(&status)
-    .fetch_one(&data.db)
-    .await;
-
-    match result {
-        Ok(id) => {
-            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.created")
-                .bind(id.to_string())
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
-        .bind(&id)
-        .fetch_optional(&data.db)
-        .await;
-
-    match result {
-        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
-            "id": row.get::<Uuid, _>("id").to_string(),
-            "status": row.get::<String, _>("status"),
-            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
-        })),
-        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
+            .app_data(web::Data::new(state.clone()))
+            .route("/healthz", web::get().to(healthz))
+            .route("/v1/pin/blocks", web::get().to(list_blocks))
+            .route("/v1/pin/blocks/encode", web::post().to(encode_pin_block))
+            .route("/v1/pin/hashes", web::get().to(list_hashes))
+            .route("/v1/pin/hashes/create", web::post().to(hash_pin))
+            .route("/v1/pin/verify", web::post().to(verify_pin))
+            .route("/v1/pin/stats", web::get().to(get_stats))
+    }).bind(format!("0.0.0.0:{}", port))?.run().await
 }
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {

@@ -1,0 +1,44 @@
+name: Build and Deploy SWIFT Messaging Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/swift-messaging-go/**'
+      - 'infrastructure/charts/swift-messaging-go/**'
+      - 'infrastructure/apisix-resources/routes/swift-messaging-go.yaml'
+      - '.github/workflows/swift-messaging-go.yaml'
+
+env:
+  IMAGE: registry.digitalocean.com/talentgraph-auth/54link-dev-swift-messaging-go
+  TAG: "0.0.1"
+  CHART: infrastructure/charts/swift-messaging-go
+  RELEASE: swift-messaging-go
+  NAMESPACE: 54link-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/swift-messaging-go
+          file: ./services/swift-messaging-go/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+

@@ -1,0 +1,480 @@
+/**
+ * KybFlow.css — Business Verification (KYB) flow styles
+ */
+
+/* ─── Layout ─────────────────────────────────────────────────────────────────── */
+
+.kyb-container {
+  display:         flex;
+  flex-direction:  column;
+  align-items:     center;
+  min-height:      100vh;
+  background:      linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+  padding:         2rem 1rem;
+  font-family:     -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.kyb-card {
+  background:    #fff;
+  border-radius: 16px;
+  box-shadow:    0 4px 32px rgba(0, 0, 0, 0.1);
+  padding:       2.5rem 2rem;
+  width:         100%;
+  max-width:     480px;
+}
+
+/* ─── Loading / error screens ────────────────────────────────────────────────── */
+
+.kyb-loading-screen,
+.kyb-error-screen {
+  display:         flex;
+  align-items:     center;
+  justify-content: center;
+  min-height:      100vh;
+  background:      linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+}
+
+.kyb-loader {
+  display:        flex;
+  flex-direction: column;
+  align-items:    center;
+  gap:            1rem;
+  text-align:     center;
+}
+
+.kyb-spinner {
+  width:        50px;
+  height:       50px;
+  border:       4px solid rgba(59, 130, 246, 0.15);
+  border-top-color: #3b82f6;
+  border-radius:50%;
+  animation:    kyb-spin 0.8s linear infinite;
+}
+
+@keyframes kyb-spin {
+  to { transform: rotate(360deg); }
+}
+
+.kyb-loader h2 { color: #0f172a; font-size: 1.5rem; margin: 0; }
+.kyb-loader p  { color: #64748b; font-size: 1rem;   margin: 0; }
+
+.kyb-error-card {
+  background:    #fff;
+  border-radius: 16px;
+  padding:       2.5rem;
+  text-align:    center;
+  max-width:     400px;
+  box-shadow:    0 4px 24px rgba(0,0,0,0.08);
+}
+
+.kyb-error-icon { font-size: 3rem; display: block; margin-bottom: 1rem; }
+.kyb-error-card h2 { color: #ef4444; margin: 0 0 0.5rem; }
+.kyb-error-card p  { color: #64748b; margin: 0 0 1.5rem; }
+
+/* ─── Progress bar ───────────────────────────────────────────────────────────── */
+
+.kyb-progress-bar {
+  display:         flex;
+  justify-content: center;
+  gap:             0;
+  margin-bottom:   2rem;
+  width:           100%;
+  max-width:       480px;
+}
+
+.kyb-progress-step {
+  display:        flex;
+  flex-direction: column;
+  align-items:    center;
+  flex:           1;
+  position:       relative;
+}
+
+.kyb-progress-step:not(:last-child)::after {
+  content:    "";
+  position:   absolute;
+  top:        14px;
+  left:       50%;
+  width:      100%;
+  height:     2px;
+  background: #e2e8f0;
+  z-index:    0;
+}
+
+.kyb-progress-step.done::after  { background: #22c55e; }
+.kyb-progress-step.active::after{ background: #3b82f6; }
+
+.kyb-progress-dot {
+  width:         28px;
+  height:        28px;
+  border-radius: 50%;
+  background:    #e2e8f0;
+  color:         #94a3b8;
+  font-size:     0.75rem;
+  font-weight:   700;
+  display:       flex;
+  align-items:   center;
+  justify-content: center;
+  position:      relative;
+  z-index:       1;
+  transition:    background 0.2s, color 0.2s;
+}
+
+.kyb-progress-step.active .kyb-progress-dot {
+  background: #3b82f6;
+  color:      #fff;
+  box-shadow: 0 0 0 4px rgba(59,130,246,0.2);
+}
+
+.kyb-progress-step.done .kyb-progress-dot {
+  background: #22c55e;
+  color:      #fff;
+}
+
+.kyb-progress-label {
+  font-size:  0.65rem;
+  color:      #94a3b8;
+  margin-top: 4px;
+  font-weight: 500;
+}
+
+.kyb-progress-step.active .kyb-progress-label { color: #3b82f6; }
+.kyb-progress-step.done .kyb-progress-label   { color: #22c55e; }
+
+/* ─── Step header ────────────────────────────────────────────────────────────── */
+
+.kyb-step-header {
+  text-align:    center;
+  margin-bottom: 1.5rem;
+}
+
+.kyb-step-badge {
+  display:       inline-block;
+  font-size:     0.7rem;
+  font-weight:   700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color:         #3b82f6;
+  background:    rgba(59,130,246,0.08);
+  border-radius: 999px;
+  padding:       2px 10px;
+  margin-bottom: 0.5rem;
+}
+
+.kyb-step-icon {
+  display:       block;
+  font-size:     2.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.kyb-step-header h2 {
+  font-size:   1.5rem;
+  font-weight: 700;
+  color:       #0f172a;
+  margin:      0 0 0.4rem;
+}
+
+.kyb-step-header p {
+  font-size: 0.9rem;
+  color:     #64748b;
+  margin:    0 0 0.75rem;
+}
+
+.kyb-points-badge {
+  display:       inline-block;
+  background:    #dcfce7;
+  color:         #16a34a;
+  border-radius: 999px;
+  padding:       2px 10px;
+  font-size:     0.75rem;
+  font-weight:   700;
+  margin-right:  6px;
+}
+
+.kyb-optional-badge {
+  display:       inline-block;
+  background:    #fef3c7;
+  color:         #92400e;
+  border-radius: 999px;
+  padding:       2px 10px;
+  font-size:     0.75rem;
+  font-weight:   600;
+}
+
+/* ─── Drop zone ──────────────────────────────────────────────────────────────── */
+
+.kyb-dropzone {
+  border:        2px dashed #cbd5e1;
+  border-radius: 12px;
+  min-height:    160px;
+  display:       flex;
+  align-items:   center;
+  justify-content: center;
+  cursor:        pointer;
+  transition:    border-color 0.2s, background 0.2s;
+  margin-bottom: 1rem;
+  overflow:      hidden;
+  background:    #f8fafc;
+}
+
+.kyb-dropzone:hover {
+  border-color: #3b82f6;
+  background:   rgba(59,130,246,0.03);
+}
+
+.kyb-dropzone.has-preview {
+  border-style:  solid;
+  border-color:  #22c55e;
+  min-height:    200px;
+}
+
+.kyb-dropzone-placeholder {
+  display:        flex;
+  flex-direction: column;
+  align-items:    center;
+  gap:            0.5rem;
+  color:          #94a3b8;
+  text-align:     center;
+  padding:        1rem;
+}
+
+.kyb-upload-icon { font-size: 2.5rem; }
+
+.kyb-dropzone-placeholder p {
+  font-size:   0.95rem;
+  color:       #64748b;
+  font-weight: 500;
+  margin:      0;
+}
+
+.kyb-file-hint {
+  font-size: 0.75rem;
+  color:     #94a3b8;
+}
+
+.kyb-doc-preview {
+  max-width:    100%;
+  max-height:   200px;
+  object-fit:   contain;
+  border-radius: 8px;
+}
+
+.kyb-file-selected {
+  font-size:     0.85rem;
+  color:         #475569;
+  background:    #f1f5f9;
+  border-radius: 8px;
+  padding:       0.5rem 0.75rem;
+  margin-bottom: 1rem;
+  display:       flex;
+  gap:           0.5rem;
+  align-items:   center;
+}
+
+.kyb-file-size { color: #94a3b8; font-size: 0.75rem; }
+
+/* ─── Actions ────────────────────────────────────────────────────────────────── */
+
+.kyb-actions {
+  display:    flex;
+  gap:        0.75rem;
+  margin-top: 1.25rem;
+}
+
+.kyb-btn-primary {
+  flex:          1;
+  padding:       0.75rem 1.25rem;
+  background:    #3b82f6;
+  color:         #fff;
+  border:        none;
+  border-radius: 10px;
+  font-size:     0.95rem;
+  font-weight:   600;
+  cursor:        pointer;
+  transition:    background 0.15s;
+}
+
+.kyb-btn-primary:hover:not(:disabled) { background: #2563eb; }
+.kyb-btn-primary:disabled             { opacity: 0.5; cursor: not-allowed; }
+
+.kyb-btn-secondary {
+  padding:       0.75rem 1rem;
+  background:    #f1f5f9;
+  color:         #475569;
+  border:        none;
+  border-radius: 10px;
+  font-size:     0.9rem;
+  font-weight:   600;
+  cursor:        pointer;
+  transition:    background 0.15s;
+}
+
+.kyb-btn-secondary:hover:not(:disabled) { background: #e2e8f0; }
+.kyb-btn-secondary:disabled             { opacity: 0.5; cursor: not-allowed; }
+
+.kyb-btn-ghost {
+  padding:       0.75rem 0.75rem;
+  background:    transparent;
+  color:         #94a3b8;
+  border:        1px solid #e2e8f0;
+  border-radius: 10px;
+  font-size:     0.85rem;
+  font-weight:   500;
+  cursor:        pointer;
+  white-space:   nowrap;
+  transition:    color 0.15s, border-color 0.15s;
+}
+
+.kyb-btn-ghost:hover:not(:disabled) { color: #64748b; border-color: #94a3b8; }
+.kyb-btn-ghost:disabled             { opacity: 0.5; cursor: not-allowed; }
+
+/* ─── Errors / notes ─────────────────────────────────────────────────────────── */
+
+.kyb-field-error {
+  color:         #ef4444;
+  font-size:     0.85rem;
+  background:    #fef2f2;
+  border-radius: 8px;
+  padding:       0.5rem 0.75rem;
+  margin:        0.5rem 0 0;
+}
+
+.kyb-note {
+  font-size:  0.8rem;
+  color:      #94a3b8;
+  text-align: center;
+  margin-top: 0.5rem;
+}
+
+/* ─── Review step ────────────────────────────────────────────────────────────── */
+
+.kyb-review-list {
+  display:        flex;
+  flex-direction: column;
+  gap:            0.75rem;
+  margin-bottom:  1.25rem;
+}
+
+.kyb-review-item {
+  display:       flex;
+  align-items:   center;
+  gap:           0.75rem;
+  padding:       0.75rem 1rem;
+  border-radius: 10px;
+  background:    #f8fafc;
+  border:        1px solid #e2e8f0;
+}
+
+.kyb-review-item.done             { background: #f0fdf4; border-color: #86efac; }
+.kyb-review-item.missing-required { background: #fef9c3; border-color: #fde047; }
+.kyb-review-item.skipped          { background: #f8fafc; opacity: 0.6; }
+
+.kyb-review-icon  { font-size: 1.3rem; }
+.kyb-review-info  { flex: 1; display: flex; flex-direction: column; gap: 2px; }
+.kyb-review-label { font-size: 0.9rem; font-weight: 600; color: #0f172a; }
+.kyb-review-status{ font-size: 0.75rem; color: #64748b; }
+.kyb-review-pts   { font-size: 0.85rem; font-weight: 700; color: #16a34a; }
+
+.kyb-score-preview {
+  background:    #f1f5f9;
+  border-radius: 10px;
+  padding:       0.75rem 1rem;
+  font-size:     0.9rem;
+  color:         #475569;
+  margin-bottom: 0.5rem;
+}
+
+.kyb-score-preview strong { color: #0f172a; font-size: 1rem; }
+.kyb-score-ok  { color: #16a34a; font-weight: 600; }
+.kyb-score-low { color: #ef4444; font-weight: 600; }
+
+/* ─── Complete screen ────────────────────────────────────────────────────────── */
+
+.kyb-complete-card { text-align: center; }
+
+.kyb-complete-icon {
+  font-size:     4rem;
+  display:       block;
+  margin-bottom: 1rem;
+}
+
+.kyb-complete-icon.processing {
+  animation: kyb-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes kyb-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.7; transform: scale(1.08); }
+}
+
+.kyb-complete-title {
+  font-size:   1.75rem;
+  font-weight: 700;
+  color:       #0f172a;
+  margin:      0 0 0.5rem;
+}
+
+.kyb-complete-subtitle {
+  font-size:     0.95rem;
+  color:         #64748b;
+  margin:        0 0 1.5rem;
+}
+
+.kyb-score-display {
+  display:        flex;
+  flex-direction: column;
+  align-items:    center;
+  gap:            0.4rem;
+  margin-bottom:  1.5rem;
+}
+
+.kyb-score-circle {
+  width:         80px;
+  height:        80px;
+  border-radius: 50%;
+  background:    linear-gradient(135deg, #3b82f6, #8b5cf6);
+  color:         #fff;
+  display:       flex;
+  align-items:   center;
+  justify-content: center;
+  font-size:     1.5rem;
+  font-weight:   800;
+  box-shadow:    0 4px 16px rgba(59,130,246,0.4);
+}
+
+.kyb-score-pct   { font-size: 0.9rem; font-weight: 600; }
+.kyb-score-label { font-size: 0.8rem; color: #94a3b8; font-weight: 500; }
+
+.kyb-doc-summary {
+  display:        flex;
+  flex-direction: column;
+  gap:            0.5rem;
+  margin-bottom:  1rem;
+  text-align:     left;
+}
+
+.kyb-doc-row {
+  display:       flex;
+  align-items:   center;
+  gap:           0.75rem;
+  padding:       0.5rem 0.75rem;
+  border-radius: 8px;
+  font-size:     0.85rem;
+}
+
+.kyb-doc-row.uploaded { background: #f0fdf4; }
+.kyb-doc-row.missing  { background: #f8fafc; color: #94a3b8; }
+
+.kyb-doc-row-icon  { font-weight: 700; color: #22c55e; }
+.kyb-doc-row.missing .kyb-doc-row-icon { color: #cbd5e1; }
+.kyb-doc-row-label { flex: 1; color: #374151; }
+.kyb-doc-row-pts   { color: #16a34a; font-weight: 700; }
+
+.kyb-retry-msg {
+  font-size:     0.85rem;
+  color:         #ef4444;
+  background:    #fef2f2;
+  border-radius: 8px;
+  padding:       0.75rem;
+  margin-top:    0.5rem;
+}

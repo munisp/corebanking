@@ -1,0 +1,54 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-etherisc-service
+  pullPolicy: IfNotPresent
+  tag: "0.0.2"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9162
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    ephemeral-storage: 1Gi
+    cpu: 300m
+    memory: 512Mi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: etherisc-service
+  appPort: 9162
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  CHAINLINK_URL: "https://oracle.etherisc.com"
+  APP_PORT: "9162"
+  PORT: "9162"
+  PORT_BASE: "9162"
+  SERVICE_GROUP: etherisc-service
+  SERVICES: "etherisc-service"

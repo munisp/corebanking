@@ -1,6 +1,30 @@
+// BVN/NIN Verification Service — Production Implementation
+//
+// Calls real identity verification APIs for BVN (via NIBSS or a licensed
+// provider such as Prembly/Smile Identity) and NIN (via NIMC or licensed
+// provider).  Results are cached in-memory with a 24-hour TTL to respect
+// upstream rate limits, persisted in PostgreSQL for audit, and published
+// to Dapr pub/sub on success.
+//
+// Port: 8281
+//
+// Required environment variables:
+//   BVN_API_URL        — upstream BVN endpoint (e.g. https://api.prembly.com/identitypass/verification/bvn)
+//   BVN_API_KEY        — x-api-key header for BVN provider
+//   NIN_API_URL        — upstream NIN endpoint
+//   NIN_API_KEY        — x-api-key header for NIN provider
+//   DATABASE_URL       — PostgreSQL DSN (postgresql://user:pass@host/db)
+//   DAPR_URL           — Dapr sidecar URL (default: http://localhost:3500)
+//   DAPR_PUBSUB        — Dapr pub/sub component name (default: bvn-nin-pubsub)
+//   VERIFICATION_CACHE_TTL_HOURS — TTL for cached results (default: 24)
+//
+// If BVN_API_URL or NIN_API_URL are absent, the respective endpoint returns
+// HTTP 503 — never fake data.
+
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -8,503 +32,733 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
+	"strconv"
 	"strings"
-	"syscall"
+	"sync"
 	"time"
 
 	_ "github.com/lib/pq"
-	"crypto"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
-	"math/big"
-	"sync"
 )
 
-var db *sql.DB
+// ── Configuration ─────────────────────────────────────────────────────────────
 
-
-// ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
-
-type jwksCache struct {
-	mu      sync.RWMutex
-	keys    map[string]*rsa.PublicKey
-	updated time.Time
-}
-
-var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
-
-func fetchJWKS(realmURL string) {
-	resp, err := http.Get(realmURL + "/protocol/openid-connect/certs")
-	if err != nil {
-		log.Printf("[middleware] JWKS fetch failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	var jwks struct {
-		Keys []struct {
-			Kid string `json:"kid"`
-			N   string `json:"n"`
-			E   string `json:"e"`
-		} `json:"keys"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		log.Printf("[middleware] JWKS decode failed: %v", err)
-		return
-	}
-	jwtCache.mu.Lock()
-	defer jwtCache.mu.Unlock()
-	for _, k := range jwks.Keys {
-		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
-		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
-		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
-		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
-		jwtCache.keys[k.Kid] = pub
-	}
-	jwtCache.updated = time.Now()
-	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
-}
-
-func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
-	}()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip health endpoints
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
-			return
-		}
-		token := auth[7:]
-		parts := strings.Split(token, ".")
-		if len(parts) != 3 {
-			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode header for kid
-		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-		if err != nil {
-			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
-			return
-		}
-		var header struct { Kid string `json:"kid"` }
-		json.Unmarshal(headerBytes, &header)
-
-		jwtCache.mu.RLock()
-		pub, ok := jwtCache.keys[header.Kid]
-		jwtCache.mu.RUnlock()
-		if !ok {
-			// Try refresh
-			fetchJWKS(realmURL)
-			jwtCache.mu.RLock()
-			pub, ok = jwtCache.keys[header.Kid]
-			jwtCache.mu.RUnlock()
-			if !ok {
-				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
-				return
-			}
-		}
-		// Verify signature (RS256)
-		signingInput := parts[0] + "." + parts[1]
-		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
-		if err != nil {
-			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
-			return
-		}
-		hash := sha256.Sum256([]byte(signingInput))
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
-			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode claims
-		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
-		var claims map[string]interface{}
-		json.Unmarshal(claimsBytes, &claims)
-		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
-			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
-			return
-		}
-		// Pass claims in context
-		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
-
-func startOutboxRelay(ctx context.Context, brokers string, topic string) {
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				relayOutbox(brokers, topic)
-			}
-		}
-	}()
-}
-
-func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
-	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id, eventType, aggID string
-		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
-	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
-}
-
-
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("[bvn-nin-verification-go] starting on :8778")
-
-	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/bvn_nin_verification_go?sslmode=disable")
-	var err error
-	db, err = sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("database connection failed: %v", err)
-	}
-	defer db.Close()
-
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("database ping failed: %v", err)
-	}
-
-	initSchema()
-	log.Printf("[bvn-nin-verification-go] database connected, schema initialized")
-
-	// Middleware clients
-	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
-	redisURL := getEnv("REDIS_URL", "localhost:6379")
-	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
-	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
-
-	log.Printf("[bvn-nin-verification-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
-		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
-
-	mux := http.NewServeMux()
-
-	// Health endpoints
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
-	})
-	mux.HandleFunc("/metrics", metricsHandler)
-
-	// Domain endpoints
-	mux.HandleFunc("/api/v1/service_configs", domainHandler)
-	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
-
-	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8778"),
-		Handler:      loggingMiddleware(corsMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
-
-	log.Printf("[bvn-nin-verification-go] ready on :%s", getEnv("PORT", "8778"))
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Printf("[bvn-nin-verification-go] shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
-	log.Printf("[bvn-nin-verification-go] stopped")
-}
-
-func initSchema() {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-	)`)
-	if err != nil {
-		log.Fatalf("schema init failed: %v", err)
-	}
-
-	// Outbox for event sourcing
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		event_type VARCHAR(64) NOT NULL,
-		aggregate_id VARCHAR(128) NOT NULL,
-		payload JSONB NOT NULL,
-		published BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-	if err != nil {
-		log.Printf("outbox table creation (may already exist): %v", err)
-	}
-
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
-}
-
-func domainHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		listRecords(w, r)
-	case "POST":
-		createRecord(w, r)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-	}
-}
-
-func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/service_configs/"), "/")
-	id := parts[0]
-	if id == "" {
-		http.Error(w, `{"error":"id required"}`, http.StatusBadRequest)
-		return
-	}
-
-	switch r.Method {
-	case "GET":
-		getRecord(w, r, id)
-	case "PUT", "PATCH":
-		updateRecord(w, r, id)
-	case "DELETE":
-		deleteRecord(w, r, id)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-	}
-}
-
-func listRecords(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.Header.Get("X-Tenant-ID")
-	limit := 50
-	offset := 0
-
-	query := `SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
-	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var records []map[string]interface{}
-	for rows.Next() {
-		var id, status string
-		var createdAt time.Time
-		if err := rows.Scan(&id, &status, &createdAt); err != nil {
-			continue
-		}
-		records = append(records, map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": records, "count": len(records)})
-}
-
-func createRecord(w http.ResponseWriter, r *http.Request) {
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-	tenantID := r.Header.Get("X-Tenant-ID")
-	if tenantID == "" {
-		tenantID = "default"
-	}
-	body["tenant_id"] = tenantID
-
-	payload, _ := json.Marshal(body)
-
-	var id string
-	err := db.QueryRowContext(r.Context(),
-		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
-		tenantID).Scan(&id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": "created"})
-}
-
-func getRecord(w http.ResponseWriter, r *http.Request, id string) {
-	var status string
-	var createdAt time.Time
-	err := db.QueryRowContext(r.Context(),
-		`SELECT status, created_at FROM service_configs WHERE id = $1`, id).Scan(&status, &createdAt)
-	if err == sql.ErrNoRows {
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
-}
-
-func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-	status, _ := body["status"].(string)
-	if status == "" {
-		status = "updated"
-	}
-
-	_, err := db.ExecContext(r.Context(),
-		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
-}
-
-func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
-		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "healthy",
-		"service": "bvn-nin-verification-go",
-		"version": "1.0.0",
-	})
-}
-
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if err := db.Ping(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM service_configs`).Scan(&count)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"service":       "bvn-nin-verification-go",
-		"total_records": count,
-	})
-}
-
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
-			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
-		}
-	})
-}
-
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func getEnv(key, fallback string) string {
+func env(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
-	return fallback
+	return def
+}
+
+var (
+	bvnAPIURL    = os.Getenv("BVN_API_URL")
+	bvnAPIKey    = os.Getenv("BVN_API_KEY")
+	ninAPIURL    = os.Getenv("NIN_API_URL")
+	ninAPIKey    = os.Getenv("NIN_API_KEY")
+	databaseURL  = os.Getenv("DATABASE_URL")
+	daprURL      = env("DAPR_URL", "http://localhost:3500")
+	daprPubsub   = env("DAPR_PUBSUB", "bvn-nin-pubsub")
+	cacheTTLHrs  = func() time.Duration {
+		h, _ := strconv.Atoi(env("VERIFICATION_CACHE_TTL_HOURS", "24"))
+		if h <= 0 {
+			h = 24
+		}
+		return time.Duration(h) * time.Hour
+	}()
+)
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+type BVNVerification struct {
+	BVN          string  `json:"bvn"`
+	FirstName    string  `json:"firstName"`
+	MiddleName   string  `json:"middleName"`
+	LastName     string  `json:"lastName"`
+	DOB          string  `json:"dateOfBirth"`
+	Phone        string  `json:"phoneNumber"`
+	Gender       string  `json:"gender"`
+	LGA          string  `json:"lgaOfOrigin"`
+	State        string  `json:"stateOfOrigin"`
+	NINLinked    bool    `json:"ninLinked"`
+	LinkedNIN    string  `json:"linkedNIN"`
+	Verified     bool    `json:"verified"`
+	MatchScore   float64 `json:"nameMatchScore"`
+	VerifiedAt   string  `json:"verifiedAt"`
+	APIProvider  string  `json:"apiProvider"`
+	ResponseTime int     `json:"responseTimeMs"`
+}
+
+type NINVerification struct {
+	NIN           string  `json:"nin"`
+	FirstName     string  `json:"firstName"`
+	MiddleName    string  `json:"middleName"`
+	LastName      string  `json:"lastName"`
+	DOB           string  `json:"dateOfBirth"`
+	Phone         string  `json:"phoneNumber"`
+	Gender        string  `json:"gender"`
+	Address       string  `json:"residentialAddress"`
+	BirthState    string  `json:"birthState"`
+	BVNLinked     bool    `json:"bvnLinked"`
+	LinkedBVN     string  `json:"linkedBVN"`
+	Verified      bool    `json:"verified"`
+	MatchScore    float64 `json:"nameMatchScore"`
+	VerifiedAt    string  `json:"verifiedAt"`
+	APIProvider   string  `json:"apiProvider"`
+	ResponseTime  int     `json:"responseTimeMs"`
+}
+
+type BVNNINLinkage struct {
+	BVN           string   `json:"bvn"`
+	NIN           string   `json:"nin"`
+	CustomerID    string   `json:"customerId"`
+	NameMatch     bool     `json:"namesMatch"`
+	DOBMatch      bool     `json:"dobMatch"`
+	GenderMatch   bool     `json:"genderMatch"`
+	LinkStatus    string   `json:"linkageStatus"`
+	VerifiedAt    string   `json:"verifiedAt"`
+	Discrepancies []string `json:"discrepancies"`
+}
+
+// ── In-memory TTL cache ───────────────────────────────────────────────────────
+
+type cacheEntry struct {
+	value   interface{}
+	expires time.Time
+}
+
+type ttlCache struct {
+	mu      sync.RWMutex
+	entries map[string]cacheEntry
+}
+
+func newTTLCache() *ttlCache {
+	c := &ttlCache{entries: make(map[string]cacheEntry)}
+	go func() {
+		for range time.Tick(30 * time.Minute) {
+			c.evict()
+		}
+	}()
+	return c
+}
+
+func (c *ttlCache) get(key string) (interface{}, bool) {
+	c.mu.RLock()
+	e, ok := c.entries[key]
+	c.mu.RUnlock()
+	if !ok || time.Now().After(e.expires) {
+		return nil, false
+	}
+	return e.value, true
+}
+
+func (c *ttlCache) set(key string, value interface{}, ttl time.Duration) {
+	c.mu.Lock()
+	c.entries[key] = cacheEntry{value: value, expires: time.Now().Add(ttl)}
+	c.mu.Unlock()
+}
+
+func (c *ttlCache) evict() {
+	now := time.Now()
+	c.mu.Lock()
+	for k, e := range c.entries {
+		if now.After(e.expires) {
+			delete(c.entries, k)
+		}
+	}
+	c.mu.Unlock()
+}
+
+var cache = newTTLCache()
+
+// ── PostgreSQL persistence ─────────────────────────────────────────────────────
+
+var db *sql.DB
+
+func initDB() error {
+	if databaseURL == "" {
+		log.Println("WARN: DATABASE_URL not set — verification results will not be persisted")
+		return nil
+	}
+	var err error
+	db, err = sql.Open("postgres", databaseURL)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("ping db: %w", err)
+	}
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS bvn_verifications (
+			id           SERIAL PRIMARY KEY,
+			bvn          TEXT NOT NULL,
+			tenant_id    TEXT NOT NULL,
+			first_name   TEXT,
+			last_name    TEXT,
+			dob          TEXT,
+			verified     BOOLEAN NOT NULL,
+			provider     TEXT NOT NULL,
+			raw_response JSONB,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (bvn, tenant_id)
+		);
+		CREATE TABLE IF NOT EXISTS nin_verifications (
+			id           SERIAL PRIMARY KEY,
+			nin          TEXT NOT NULL,
+			tenant_id    TEXT NOT NULL,
+			first_name   TEXT,
+			last_name    TEXT,
+			dob          TEXT,
+			verified     BOOLEAN NOT NULL,
+			provider     TEXT NOT NULL,
+			raw_response JSONB,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (nin, tenant_id)
+		);
+		CREATE TABLE IF NOT EXISTS bvn_nin_linkages (
+			id          SERIAL PRIMARY KEY,
+			bvn         TEXT NOT NULL,
+			nin         TEXT NOT NULL,
+			tenant_id   TEXT NOT NULL,
+			customer_id TEXT,
+			link_status TEXT NOT NULL,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+			UNIQUE (bvn, nin, tenant_id)
+		);
+	`)
+	return err
+}
+
+func persistBVN(tenantID string, v *BVNVerification, raw []byte) {
+	if db == nil {
+		return
+	}
+	_, err := db.Exec(`
+		INSERT INTO bvn_verifications (bvn, tenant_id, first_name, last_name, dob, verified, provider, raw_response)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT (bvn, tenant_id) DO UPDATE
+		  SET first_name=$3, last_name=$4, dob=$5, verified=$6, provider=$7, raw_response=$8`,
+		v.BVN, tenantID, v.FirstName, v.LastName, v.DOB, v.Verified, v.APIProvider, raw,
+	)
+	if err != nil {
+		log.Printf("WARN: persist BVN %s: %v", v.BVN, err)
+	}
+}
+
+func persistNIN(tenantID string, v *NINVerification, raw []byte) {
+	if db == nil {
+		return
+	}
+	_, err := db.Exec(`
+		INSERT INTO nin_verifications (nin, tenant_id, first_name, last_name, dob, verified, provider, raw_response)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT (nin, tenant_id) DO UPDATE
+		  SET first_name=$3, last_name=$4, dob=$5, verified=$6, provider=$7, raw_response=$8`,
+		v.NIN, tenantID, v.FirstName, v.LastName, v.DOB, v.Verified, v.APIProvider, raw,
+	)
+	if err != nil {
+		log.Printf("WARN: persist NIN %s: %v", v.NIN, err)
+	}
+}
+
+// ── Dapr event publishing ─────────────────────────────────────────────────────
+
+func publishEvent(topic string, payload interface{}) {
+	b, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("WARN: marshal event for topic %s: %v", topic, err)
+		return
+	}
+	url := fmt.Sprintf("%s/v1.0/publish/%s/%s", daprURL, daprPubsub, topic)
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("WARN: publish event topic=%s: %v", topic, err)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		log.Printf("WARN: Dapr publish non-2xx topic=%s status=%d", topic, resp.StatusCode)
+	}
+}
+
+// ── HTTP client ───────────────────────────────────────────────────────────────
+
+var httpClient = &http.Client{
+	Timeout: 15 * time.Second,
+}
+
+// ── NIBSS / BVN provider client ───────────────────────────────────────────────
+
+// callBVNAPI calls the configured BVN verification API.
+// Expected provider response (Prembly-compatible):
+//
+//	{ "status": true, "detail": { "first_name": "...", "last_name": "..., ... } }
+//
+// Adapt the field mapping below to match your specific provider's schema.
+func callBVNAPI(bvn string) (*BVNVerification, []byte, error) {
+	if bvnAPIURL == "" || bvnAPIKey == "" {
+		return nil, nil, fmt.Errorf("BVN_API_URL and BVN_API_KEY are required for BVN verification")
+	}
+
+	payload, _ := json.Marshal(map[string]string{"number": bvn})
+	req, err := http.NewRequest("POST", bvnAPIURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", bvnAPIKey)
+	req.Header.Set("app-id", env("BVN_APP_ID", ""))
+
+	start := time.Now()
+	resp, err := httpClient.Do(req)
+	elapsed := int(time.Since(start).Milliseconds())
+	if err != nil {
+		return nil, nil, fmt.Errorf("upstream BVN API unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return nil, nil, fmt.Errorf("read response: %w", err)
+	}
+	raw := buf.Bytes()
+
+	if resp.StatusCode == 404 {
+		return nil, raw, fmt.Errorf("BVN not found in NIBSS records")
+	}
+	if resp.StatusCode >= 400 {
+		return nil, raw, fmt.Errorf("BVN API error HTTP %d: %.200s", resp.StatusCode, string(raw))
+	}
+
+	// Parse provider response — Prembly-compatible schema.
+	var outer struct {
+		Status  bool            `json:"status"`
+		Detail  json.RawMessage `json:"detail"`
+		Message string          `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &outer); err != nil {
+		return nil, raw, fmt.Errorf("parse BVN response: %w", err)
+	}
+	if !outer.Status {
+		return nil, raw, fmt.Errorf("BVN verification rejected: %s", outer.Message)
+	}
+
+	var detail struct {
+		FirstName  string `json:"first_name"`
+		MiddleName string `json:"middle_name"`
+		LastName   string `json:"last_name"`
+		DOB        string `json:"date_of_birth"`
+		Phone      string `json:"phone_number"`
+		Gender     string `json:"gender"`
+		LGA        string `json:"lga_of_origin"`
+		State      string `json:"state_of_origin"`
+		NINLinked  bool   `json:"nin_linked"`
+		LinkedNIN  string `json:"nin"`
+	}
+	if err := json.Unmarshal(outer.Detail, &detail); err != nil {
+		return nil, raw, fmt.Errorf("parse BVN detail: %w", err)
+	}
+
+	v := &BVNVerification{
+		BVN:          bvn,
+		FirstName:    detail.FirstName,
+		MiddleName:   detail.MiddleName,
+		LastName:     detail.LastName,
+		DOB:          detail.DOB,
+		Phone:        detail.Phone,
+		Gender:       detail.Gender,
+		LGA:          detail.LGA,
+		State:        detail.State,
+		NINLinked:    detail.NINLinked,
+		LinkedNIN:    detail.LinkedNIN,
+		Verified:     true,
+		MatchScore:   1.0,
+		VerifiedAt:   time.Now().UTC().Format(time.RFC3339),
+		APIProvider:  bvnAPIURL,
+		ResponseTime: elapsed,
+	}
+	return v, raw, nil
+}
+
+// ── NIMC / NIN provider client ────────────────────────────────────────────────
+
+func callNINAPI(nin string) (*NINVerification, []byte, error) {
+	if ninAPIURL == "" || ninAPIKey == "" {
+		return nil, nil, fmt.Errorf("NIN_API_URL and NIN_API_KEY are required for NIN verification")
+	}
+
+	payload, _ := json.Marshal(map[string]string{"number": nin})
+	req, err := http.NewRequest("POST", ninAPIURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, nil, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", ninAPIKey)
+	req.Header.Set("app-id", env("NIN_APP_ID", ""))
+
+	start := time.Now()
+	resp, err := httpClient.Do(req)
+	elapsed := int(time.Since(start).Milliseconds())
+	if err != nil {
+		return nil, nil, fmt.Errorf("upstream NIN API unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return nil, nil, fmt.Errorf("read response: %w", err)
+	}
+	raw := buf.Bytes()
+
+	if resp.StatusCode == 404 {
+		return nil, raw, fmt.Errorf("NIN not found in NIMC records")
+	}
+	if resp.StatusCode >= 400 {
+		return nil, raw, fmt.Errorf("NIN API error HTTP %d: %.200s", resp.StatusCode, string(raw))
+	}
+
+	var outer struct {
+		Status  bool            `json:"status"`
+		Detail  json.RawMessage `json:"detail"`
+		Message string          `json:"message"`
+	}
+	if err := json.Unmarshal(raw, &outer); err != nil {
+		return nil, raw, fmt.Errorf("parse NIN response: %w", err)
+	}
+	if !outer.Status {
+		return nil, raw, fmt.Errorf("NIN verification rejected: %s", outer.Message)
+	}
+
+	var detail struct {
+		FirstName  string `json:"first_name"`
+		MiddleName string `json:"middle_name"`
+		LastName   string `json:"last_name"`
+		DOB        string `json:"date_of_birth"`
+		Phone      string `json:"phone_number"`
+		Gender     string `json:"gender"`
+		Address    string `json:"residential_address"`
+		BirthState string `json:"birth_state"`
+		BVNLinked  bool   `json:"bvn_linked"`
+		LinkedBVN  string `json:"bvn"`
+	}
+	if err := json.Unmarshal(outer.Detail, &detail); err != nil {
+		return nil, raw, fmt.Errorf("parse NIN detail: %w", err)
+	}
+
+	v := &NINVerification{
+		NIN:          nin,
+		FirstName:    detail.FirstName,
+		MiddleName:   detail.MiddleName,
+		LastName:     detail.LastName,
+		DOB:          detail.DOB,
+		Phone:        detail.Phone,
+		Gender:       detail.Gender,
+		Address:      detail.Address,
+		BirthState:   detail.BirthState,
+		BVNLinked:    detail.BVNLinked,
+		LinkedBVN:    detail.LinkedBVN,
+		Verified:     true,
+		MatchScore:   1.0,
+		VerifiedAt:   time.Now().UTC().Format(time.RFC3339),
+		APIProvider:  ninAPIURL,
+		ResponseTime: elapsed,
+	}
+	return v, raw, nil
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+func tenantID(r *http.Request) string {
+	if t := r.Header.Get("X-Tenant-ID"); t != "" {
+		return t
+	}
+	return r.Header.Get("x-tenant-id")
+}
+
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, code int, msg string) {
+	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+func handleBVNVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req struct {
+		BVN        string `json:"bvn"`
+		CustomerID string `json:"customerId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.BVN) == "" {
+		writeError(w, http.StatusBadRequest, "bvn is required")
+		return
+	}
+	bvn := strings.TrimSpace(req.BVN)
+	tid := tenantID(r)
+
+	cacheKey := fmt.Sprintf("bvn:%s:%s", tid, bvn)
+	if cached, ok := cache.get(cacheKey); ok {
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+
+	v, raw, err := callBVNAPI(bvn)
+	if err != nil {
+		if strings.Contains(err.Error(), "required") {
+			writeError(w, http.StatusServiceUnavailable, "BVN verification service not configured: "+err.Error())
+		} else if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, err.Error())
+		} else {
+			log.Printf("ERROR: BVN API call bvn=%s: %v", bvn, err)
+			writeError(w, http.StatusBadGateway, "upstream BVN verification failed: "+err.Error())
+		}
+		return
+	}
+
+	cache.set(cacheKey, v, cacheTTLHrs)
+	persistBVN(tid, v, raw)
+	go publishEvent("kyc.bvn-verified", map[string]interface{}{
+		"bvn":        bvn,
+		"tenantId":   tid,
+		"customerId": req.CustomerID,
+		"verifiedAt": v.VerifiedAt,
+	})
+
+	writeJSON(w, http.StatusOK, v)
+}
+
+func handleNINVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req struct {
+		NIN        string `json:"nin"`
+		CustomerID string `json:"customerId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.NIN) == "" {
+		writeError(w, http.StatusBadRequest, "nin is required")
+		return
+	}
+	nin := strings.TrimSpace(req.NIN)
+	tid := tenantID(r)
+
+	cacheKey := fmt.Sprintf("nin:%s:%s", tid, nin)
+	if cached, ok := cache.get(cacheKey); ok {
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+
+	v, raw, err := callNINAPI(nin)
+	if err != nil {
+		if strings.Contains(err.Error(), "required") {
+			writeError(w, http.StatusServiceUnavailable, "NIN verification service not configured: "+err.Error())
+		} else if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, err.Error())
+		} else {
+			log.Printf("ERROR: NIN API call nin=%s: %v", nin, err)
+			writeError(w, http.StatusBadGateway, "upstream NIN verification failed: "+err.Error())
+		}
+		return
+	}
+
+	cache.set(cacheKey, v, cacheTTLHrs)
+	persistNIN(tid, v, raw)
+	go publishEvent("kyc.nin-verified", map[string]interface{}{
+		"nin":        nin,
+		"tenantId":   tid,
+		"customerId": req.CustomerID,
+		"verifiedAt": v.VerifiedAt,
+	})
+
+	writeJSON(w, http.StatusOK, v)
+}
+
+func handleBVNNINLinkage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+	var req struct {
+		BVN        string `json:"bvn"`
+		NIN        string `json:"nin"`
+		CustomerID string `json:"customerId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	bvn := strings.TrimSpace(req.BVN)
+	nin := strings.TrimSpace(req.NIN)
+	if bvn == "" || nin == "" {
+		writeError(w, http.StatusBadRequest, "bvn and nin are required")
+		return
+	}
+	tid := tenantID(r)
+
+	cacheKey := fmt.Sprintf("link:%s:%s:%s", tid, bvn, nin)
+	if cached, ok := cache.get(cacheKey); ok {
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+
+	// Verify both independently and cross-check demographic fields.
+	bvnResult, _, bvnErr := callBVNAPI(bvn)
+	ninResult, _, ninErr := callNINAPI(nin)
+
+	if bvnErr != nil || ninErr != nil {
+		code := http.StatusBadGateway
+		msg := fmt.Sprintf("BVN error: %v | NIN error: %v", bvnErr, ninErr)
+		if strings.Contains(fmt.Sprintf("%v%v", bvnErr, ninErr), "required") {
+			code = http.StatusServiceUnavailable
+		}
+		writeError(w, code, msg)
+		return
+	}
+
+	discrepancies := []string{}
+	nameMatch := strings.EqualFold(bvnResult.LastName, ninResult.LastName) &&
+		strings.EqualFold(bvnResult.FirstName, ninResult.FirstName)
+	dobMatch := bvnResult.DOB == ninResult.DOB
+	genderMatch := strings.EqualFold(bvnResult.Gender, ninResult.Gender)
+
+	if !nameMatch {
+		discrepancies = append(discrepancies, "name_mismatch")
+	}
+	if !dobMatch {
+		discrepancies = append(discrepancies, "dob_mismatch")
+	}
+	if !genderMatch {
+		discrepancies = append(discrepancies, "gender_mismatch")
+	}
+
+	status := "verified"
+	if len(discrepancies) > 0 {
+		status = "discrepancy_detected"
+	}
+
+	linkage := &BVNNINLinkage{
+		BVN:           bvn,
+		NIN:           nin,
+		CustomerID:    req.CustomerID,
+		NameMatch:     nameMatch,
+		DOBMatch:      dobMatch,
+		GenderMatch:   genderMatch,
+		LinkStatus:    status,
+		VerifiedAt:    time.Now().UTC().Format(time.RFC3339),
+		Discrepancies: discrepancies,
+	}
+
+	cache.set(cacheKey, linkage, cacheTTLHrs)
+
+	if db != nil {
+		_, err := db.Exec(`
+			INSERT INTO bvn_nin_linkages (bvn, nin, tenant_id, customer_id, link_status)
+			VALUES ($1,$2,$3,$4,$5)
+			ON CONFLICT (bvn, nin, tenant_id) DO UPDATE SET link_status=$5`,
+			bvn, nin, tid, req.CustomerID, status,
+		)
+		if err != nil {
+			log.Printf("WARN: persist linkage bvn=%s nin=%s: %v", bvn, nin, err)
+		}
+	}
+
+	topic := "kyc.bvn-nin-linked"
+	if len(discrepancies) > 0 {
+		topic = "kyc.verification-failed"
+	}
+	go publishEvent(topic, map[string]interface{}{
+		"bvn":           bvn,
+		"nin":           nin,
+		"tenantId":      tid,
+		"customerId":    req.CustomerID,
+		"linkStatus":    status,
+		"discrepancies": discrepancies,
+	})
+
+	writeJSON(w, http.StatusOK, linkage)
+}
+
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	checks := map[string]string{}
+
+	// DB check
+	if db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := db.PingContext(ctx); err != nil {
+			checks["postgres"] = "unreachable: " + err.Error()
+		} else {
+			checks["postgres"] = "connected"
+		}
+	} else {
+		checks["postgres"] = "not configured"
+	}
+
+	// BVN provider config
+	if bvnAPIURL != "" {
+		checks["bvn_provider"] = "configured"
+	} else {
+		checks["bvn_provider"] = "NOT CONFIGURED — BVN_API_URL missing"
+	}
+
+	// NIN provider config
+	if ninAPIURL != "" {
+		checks["nin_provider"] = "configured"
+	} else {
+		checks["nin_provider"] = "NOT CONFIGURED — NIN_API_URL missing"
+	}
+
+	// Determine overall health
+	healthy := bvnAPIURL != "" && ninAPIURL != ""
+	status := "healthy"
+	code := http.StatusOK
+	if !healthy {
+		status = "degraded"
+		code = http.StatusServiceUnavailable
+	}
+
+	writeJSON(w, code, map[string]interface{}{
+		"service": "bvn-nin-verification-go",
+		"status":  status,
+		"checks":  checks,
+	})
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+
+	if err := initDB(); err != nil {
+		log.Printf("WARN: database init failed: %v — proceeding without persistence", err)
+	}
+
+	if bvnAPIURL == "" {
+		log.Println("WARN: BVN_API_URL not set — BVN verification endpoints will return 503")
+	}
+	if ninAPIURL == "" {
+		log.Println("WARN: NIN_API_URL not set — NIN verification endpoints will return 503")
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/api/bvn/verify", handleBVNVerify)
+	mux.HandleFunc("/api/nin/verify", handleNINVerify)
+	mux.HandleFunc("/api/bvn-nin/check", handleBVNNINLinkage)
+
+	port := env("PORT", "8281")
+	log.Printf("bvn-nin-verification-go listening on :%s", port)
+	if err := http.ListenAndServe(":"+port, mux); err != nil {
+		log.Fatalf("server error: %v", err)
+	}
 }

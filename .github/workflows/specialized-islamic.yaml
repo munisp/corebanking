@@ -1,0 +1,56 @@
+name: Build Specialized Islamic Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/area-yield-index-insurance-py/**'
+      - 'services/diaspora-banking-py/**'
+      - 'services/enaira-cbdc-py/**'
+      - 'services/etherisc-service/**'
+      - 'services/exam-management-py/**'
+      - 'services/insurance-py/**'
+      - 'services/insurance-service/**'
+      - 'services/islamic-banking-py/**'
+      - 'services/islamic-banking-service/**'
+      - 'services/parametric-insurance-iot-rs/**'
+      - 'services/pension-py/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/specialized-islamic.yaml'
+
+env:
+  TAG: "0.0.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=area-yield-index-insurance-py,diaspora-banking-py,enaira-cbdc-py,etherisc-service,exam-management-py,insurance-py,insurance-service,islamic-banking-py,islamic-banking-service,parametric-insurance-iot-rs,pension-py
+            PRIMARY_LANG=go
+            PORT_BASE=9602
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-specialized-islamic:${{ env.TAG }}

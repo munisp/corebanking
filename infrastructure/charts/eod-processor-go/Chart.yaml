@@ -1,0 +1,6 @@
+apiVersion: v2
+name: eod-processor-go
+description: 54link EOD Processor Helm Chart
+type: application
+version: 0.0.1
+appVersion: "1.0.0"

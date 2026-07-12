@@ -2,12 +2,9 @@
 name = "fx-rates-engine"
 version = "0.1.0"
 edition = "2021"
-description = "54Bank FX & Rates Engine — exchange rates, currency conversion, spreads, rate history"
+description = "54link-dev FX & Rates Engine — exchange rates, currency conversion, spreads, rate history"
 
 [dependencies]
-actix-cors = "0.7"
-sha2 = "0.10"
-lazy_static = "1"
 tokio-postgres = { version = "0.7", features = ["default"] }
 actix-web = "4"
 actix-rt = "2"

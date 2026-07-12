@@ -1,0 +1,83 @@
+name: Build Workflow Operations Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/animal-id-traceability-rs/**'
+      - 'services/banking-domain-integration-go/**'
+      - 'services/banking-operations-pipeline-py/**'
+      - 'services/branch-manager-service/**'
+      - 'services/branch-operations-go/**'
+      - 'services/cac-realtime-api-go/**'
+      - 'services/core-banking-go/**'
+      - 'services/credit-bureau-rs/**'
+      - 'services/credit-facility-go/**'
+      - 'services/dispute-management-py/**'
+      - 'services/docling-service/**'
+      - 'services/document-management-py/**'
+      - 'services/document-service/**'
+      - 'services/erpnext-bridge-go/**'
+      - 'services/erpnext-integration-service/**'
+      - 'services/erpnext-sync-py/**'
+      - 'services/fixed-assets-go/**'
+      - 'services/immutable-audit-rs/**'
+      - 'services/inventory-py/**'
+      - 'services/ndpr-compliance-py/**'
+      - 'services/ocr-service/**'
+      - 'services/opensearch-indexer-py/**'
+      - 'services/opensearch-optimizer-py/**'
+      - 'services/pentest-orchestrator-go/**'
+      - 'services/platform-hardening-rs/**'
+      - 'services/platform-security-infra-go/**'
+      - 'services/secrets-rotation-rs/**'
+      - 'services/secrets-vault-go/**'
+      - 'services/security-audit-logger-py/**'
+      - 'services/security-hardening-go/**'
+      - 'services/session-security-rs/**'
+      - 'services/sql-parameterizer-rs/**'
+      - 'services/standing-charges-go/**'
+      - 'services/tax-reporting-py/**'
+      - 'services/teller-operations-go/**'
+      - 'services/typology-detector-rs/**'
+      - 'services/ubo-ownership-graph-rs/**'
+      - 'services/vault-integration-rs/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/workflow-operations.yaml'
+
+env:
+  TAG: "0.0.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=animal-id-traceability-rs,banking-domain-integration-go,banking-operations-pipeline-py,branch-manager-service,branch-operations-go,cac-realtime-api-go,core-banking-go,credit-bureau-rs,credit-facility-go,dispute-management-py,docling-service,document-management-py,document-service,erpnext-bridge-go,erpnext-integration-service,erpnext-sync-py,fixed-assets-go,immutable-audit-rs,inventory-py,ndpr-compliance-py,ocr-service,opensearch-indexer-py,opensearch-optimizer-py,pentest-orchestrator-go,platform-hardening-rs,platform-security-infra-go,secrets-rotation-rs,secrets-vault-go,security-audit-logger-py,security-hardening-go,session-security-rs,sql-parameterizer-rs,standing-charges-go,tax-reporting-py,teller-operations-go,typology-detector-rs,ubo-ownership-graph-rs,vault-integration-rs
+            PRIMARY_LANG=go
+            PORT_BASE=9671
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-workflow-operations:${{ env.TAG }}

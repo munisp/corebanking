@@ -1,0 +1,6 @@
+apiVersion: v2
+name: mojaloop-connector
+description: 54link Mojaloop Connector Consolidated Helm Chart
+type: application
+version: 0.0.8
+appVersion: "1.0.1"

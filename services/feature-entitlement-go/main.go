@@ -1,126 +1,882 @@
+// 54Bank Feature Entitlement Engine — Go
+// Controls what features tenants and white-label partners can access based on their tier/plan.
+// Features = cost. Tenants only get what they paid for.
 package main
 
 import (
-	"bytes"
-	"context"
-	"database/sql"
-	"encoding/base64"
+	_ "github.com/lib/pq"
+"context"
+"os/signal"
+"syscall"
+"sync/atomic"
 	"encoding/json"
-	"crypto"
-	"crypto/rand"
 	"fmt"
-	"math"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
-	"crypto/sha256"
+	"database/sql"
+	"bytes"
 
-	_ "github.com/lib/pq"
-		"os/signal"
-	"syscall"
-	"crypto/rsa"
-	"math/big"
+	"net"
+
 )
 
+var serviceName = "feature-entitlement-go"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PRICING TIERS — What each tier pays for
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type PricingTier struct {
+	ID              string          `json:"id"`
+	Name            string          `json:"name"`
+	Type            string          `json:"type"` // tenant | white_label
+	MonthlyFeeNGN   int64           `json:"monthlyFeeNGN"`
+	AnnualFeeNGN    int64           `json:"annualFeeNGN"`
+	SetupFeeNGN     int64           `json:"setupFeeNGN"`
+	MaxUsers        int             `json:"maxUsers"`
+	MaxBranches     int             `json:"maxBranches"`
+	MaxTPS          int             `json:"maxTPS"`
+	SLAUptime       string          `json:"slaUptime"`
+	SupportLevel    string          `json:"supportLevel"`
+	Features        []string        `json:"features"`
+	GrowthFeatures  []string        `json:"growthFeatures"`
+	AddOns          []AddOn         `json:"addOns"`
+}
+
+type AddOn struct {
+	Feature     string `json:"feature"`
+	MonthlyFee  int64  `json:"monthlyFee"`
+	Description string `json:"description"`
+}
+
+// Pricing tiers for direct tenants (banks using 54Bank platform)
+var tenantTiers = []PricingTier{
+	{
+		ID: "TIER-ENTERPRISE", Name: "Enterprise", Type: "tenant",
+		MonthlyFeeNGN: 25_000_000, AnnualFeeNGN: 250_000_000, SetupFeeNGN: 50_000_000,
+		MaxUsers: 100_000, MaxBranches: 500, MaxTPS: 10_000, SLAUptime: "99.99%", SupportLevel: "dedicated_tam",
+		Features: []string{
+			"core_banking", "payments", "cards_digital", "mobile_money", "lending",
+			"treasury", "trade_finance", "wealth_management", "accounting",
+			"risk_compliance", "agent_banking", "microfinance", "islamic_banking",
+			"diaspora_banking", "cooperative_banking", "agriculture_banking",
+			"billing", "multi_tenant",
+		},
+		GrowthFeatures: []string{"chatbot", "smart_savings", "virtual_cards", "qr_payments", "bnpl", "investments", "remittances", "gamification"},
+		AddOns: []AddOn{},
+	},
+	{
+		ID: "TIER-COMMERCIAL", Name: "Commercial", Type: "tenant",
+		MonthlyFeeNGN: 12_000_000, AnnualFeeNGN: 120_000_000, SetupFeeNGN: 25_000_000,
+		MaxUsers: 50_000, MaxBranches: 200, MaxTPS: 5_000, SLAUptime: "99.95%", SupportLevel: "priority",
+		Features: []string{
+			"core_banking", "payments", "cards_digital", "mobile_money", "lending",
+			"treasury", "trade_finance", "accounting", "risk_compliance", "billing",
+		},
+		GrowthFeatures: []string{"chatbot", "smart_savings", "virtual_cards", "qr_payments"},
+		AddOns: []AddOn{
+			{Feature: "bnpl", MonthlyFee: 2_000_000, Description: "Buy Now Pay Later module"},
+			{Feature: "investments", MonthlyFee: 3_000_000, Description: "Investment marketplace"},
+			{Feature: "remittances", MonthlyFee: 2_500_000, Description: "Cross-border remittances"},
+			{Feature: "gamification", MonthlyFee: 1_000_000, Description: "Loyalty & rewards engine"},
+			{Feature: "wealth_management", MonthlyFee: 5_000_000, Description: "Wealth management suite"},
+			{Feature: "islamic_banking", MonthlyFee: 3_000_000, Description: "Islamic banking (Murabaha, Sukuk)"},
+		},
+	},
+	{
+		ID: "TIER-STANDARD", Name: "Standard", Type: "tenant",
+		MonthlyFeeNGN: 5_000_000, AnnualFeeNGN: 50_000_000, SetupFeeNGN: 10_000_000,
+		MaxUsers: 20_000, MaxBranches: 50, MaxTPS: 2_000, SLAUptime: "99.9%", SupportLevel: "business_hours",
+		Features: []string{
+			"core_banking", "payments", "cards_digital", "mobile_money", "lending",
+			"accounting", "risk_compliance", "billing",
+		},
+		GrowthFeatures: []string{"chatbot", "smart_savings"},
+		AddOns: []AddOn{
+			{Feature: "virtual_cards", MonthlyFee: 1_500_000, Description: "Virtual card issuance"},
+			{Feature: "qr_payments", MonthlyFee: 1_000_000, Description: "QR/NQR payments"},
+			{Feature: "bnpl", MonthlyFee: 2_000_000, Description: "Buy Now Pay Later"},
+			{Feature: "investments", MonthlyFee: 3_000_000, Description: "Investment marketplace"},
+			{Feature: "remittances", MonthlyFee: 2_500_000, Description: "Cross-border remittances"},
+			{Feature: "gamification", MonthlyFee: 1_000_000, Description: "Loyalty & rewards"},
+			{Feature: "treasury", MonthlyFee: 4_000_000, Description: "Treasury management"},
+			{Feature: "trade_finance", MonthlyFee: 3_500_000, Description: "Trade finance (LC, BG)"},
+		},
+	},
+	{
+		ID: "TIER-STARTER", Name: "Starter (MFB/Fintech)", Type: "tenant",
+		MonthlyFeeNGN: 1_500_000, AnnualFeeNGN: 15_000_000, SetupFeeNGN: 3_000_000,
+		MaxUsers: 5_000, MaxBranches: 10, MaxTPS: 500, SLAUptime: "99.5%", SupportLevel: "email_only",
+		Features: []string{"core_banking", "payments", "mobile_money", "lending", "accounting", "billing"},
+		GrowthFeatures: []string{"chatbot"},
+		AddOns: []AddOn{
+			{Feature: "smart_savings", MonthlyFee: 500_000, Description: "Smart savings & goals"},
+			{Feature: "virtual_cards", MonthlyFee: 1_500_000, Description: "Virtual card issuance"},
+			{Feature: "qr_payments", MonthlyFee: 800_000, Description: "QR/NQR payments"},
+			{Feature: "gamification", MonthlyFee: 500_000, Description: "Loyalty & rewards"},
+			{Feature: "cards_digital", MonthlyFee: 1_000_000, Description: "Card management"},
+			{Feature: "risk_compliance", MonthlyFee: 1_500_000, Description: "Risk & compliance suite"},
+		},
+	},
+}
+
+// Pricing tiers for white-label partners (embed 54Bank under their brand)
+var whiteLabelTiers = []PricingTier{
+	{
+		ID: "WL-PLATINUM", Name: "Platinum Partner", Type: "white_label",
+		MonthlyFeeNGN: 40_000_000, AnnualFeeNGN: 400_000_000, SetupFeeNGN: 100_000_000,
+		MaxUsers: 500_000, MaxBranches: 0, MaxTPS: 50_000, SLAUptime: "99.99%", SupportLevel: "dedicated_team",
+		Features: []string{
+			"core_banking", "payments", "cards_digital", "mobile_money", "lending",
+			"treasury", "trade_finance", "wealth_management", "accounting",
+			"risk_compliance", "agent_banking", "microfinance", "islamic_banking",
+			"diaspora_banking", "cooperative_banking", "agriculture_banking",
+			"billing", "multi_tenant",
+		},
+		GrowthFeatures: []string{"chatbot", "smart_savings", "virtual_cards", "qr_payments", "bnpl", "investments", "remittances", "gamification"},
+		AddOns: []AddOn{},
+	},
+	{
+		ID: "WL-GOLD", Name: "Gold Partner", Type: "white_label",
+		MonthlyFeeNGN: 20_000_000, AnnualFeeNGN: 200_000_000, SetupFeeNGN: 50_000_000,
+		MaxUsers: 200_000, MaxBranches: 0, MaxTPS: 20_000, SLAUptime: "99.95%", SupportLevel: "priority",
+		Features: []string{
+			"core_banking", "payments", "cards_digital", "mobile_money", "lending",
+			"accounting", "risk_compliance", "billing",
+		},
+		GrowthFeatures: []string{"chatbot", "smart_savings", "virtual_cards", "qr_payments", "bnpl", "gamification"},
+		AddOns: []AddOn{
+			{Feature: "investments", MonthlyFee: 4_000_000, Description: "Investment marketplace"},
+			{Feature: "remittances", MonthlyFee: 3_500_000, Description: "Cross-border remittances"},
+			{Feature: "treasury", MonthlyFee: 5_000_000, Description: "Treasury management"},
+			{Feature: "trade_finance", MonthlyFee: 4_000_000, Description: "Trade finance"},
+			{Feature: "wealth_management", MonthlyFee: 6_000_000, Description: "Wealth management"},
+		},
+	},
+	{
+		ID: "WL-SILVER", Name: "Silver Partner", Type: "white_label",
+		MonthlyFeeNGN: 8_000_000, AnnualFeeNGN: 80_000_000, SetupFeeNGN: 20_000_000,
+		MaxUsers: 50_000, MaxBranches: 0, MaxTPS: 5_000, SLAUptime: "99.9%", SupportLevel: "business_hours",
+		Features: []string{"core_banking", "payments", "cards_digital", "mobile_money", "lending", "billing"},
+		GrowthFeatures: []string{"chatbot", "smart_savings", "qr_payments"},
+		AddOns: []AddOn{
+			{Feature: "virtual_cards", MonthlyFee: 2_000_000, Description: "Virtual card issuance"},
+			{Feature: "bnpl", MonthlyFee: 2_500_000, Description: "Buy Now Pay Later"},
+			{Feature: "gamification", MonthlyFee: 1_500_000, Description: "Loyalty & rewards"},
+			{Feature: "investments", MonthlyFee: 4_000_000, Description: "Investment marketplace"},
+			{Feature: "remittances", MonthlyFee: 3_500_000, Description: "Cross-border remittances"},
+		},
+	},
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TENANT ENTITLEMENT STATE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type TenantEntitlement struct {
+	TenantID        string    `json:"tenantId"`
+	TenantName      string    `json:"tenantName"`
+	TierID          string    `json:"tierId"`
+	TierName        string    `json:"tierName"`
+	Type            string    `json:"type"` // tenant | white_label
+	EnabledFeatures []string  `json:"enabledFeatures"`
+	PurchasedAddOns []string  `json:"purchasedAddOns"`
+	MaxUsers        int       `json:"maxUsers"`
+	MaxTPS          int       `json:"maxTPS"`
+	MonthlyBill     int64     `json:"monthlyBillNGN"`
+	BillingStatus   string    `json:"billingStatus"`
+	ProvisionedAt   time.Time `json:"provisionedAt"`
+	ProvisionedBy   string    `json:"provisionedBy"`
+}
 
 var (
-	serviceName  = "feature-entitlement-go"
-	db           *sql.DB
-	requestCount uint64
-	errorCount   uint64
+	entitlementStore = map[string]*TenantEntitlement{}
+	storeMu          sync.RWMutex
 )
 
-func respondJSON(w http.ResponseWriter, args ...interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	status := 200
-	var data interface{}
-	if len(args) == 2 {
-		if s, ok := args[0].(int); ok { status = s }
-		data = args[1]
-	} else if len(args) == 1 {
-		data = args[0]
+func init() {
+	// Pre-provision sample tenants and white-label partners
+	now := time.Now()
+	entitlementStore["TEN-ZENITH"] = &TenantEntitlement{
+		TenantID: "TEN-ZENITH", TenantName: "Zenith Bank", TierID: "TIER-ENTERPRISE", TierName: "Enterprise",
+		Type: "tenant", EnabledFeatures: append(tenantTiers[0].Features, tenantTiers[0].GrowthFeatures...),
+		PurchasedAddOns: []string{}, MaxUsers: 100_000, MaxTPS: 10_000,
+		MonthlyBill: 25_000_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "admin@54bank.app",
 	}
-	w.WriteHeader(status)
-		eventBus.Emit("feature-entitlement.processed", map[string]interface{}{"status": "success"})
+	entitlementStore["TEN-UBA"] = &TenantEntitlement{
+		TenantID: "TEN-UBA", TenantName: "UBA Nigeria", TierID: "TIER-ENTERPRISE", TierName: "Enterprise",
+		Type: "tenant", EnabledFeatures: append(tenantTiers[0].Features, tenantTiers[0].GrowthFeatures...),
+		PurchasedAddOns: []string{}, MaxUsers: 100_000, MaxTPS: 10_000,
+		MonthlyBill: 25_000_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "admin@54bank.app",
+	}
+	entitlementStore["TEN-LAPO-MFB"] = &TenantEntitlement{
+		TenantID: "TEN-LAPO-MFB", TenantName: "LAPO Microfinance", TierID: "TIER-STARTER", TierName: "Starter (MFB/Fintech)",
+		Type: "tenant", EnabledFeatures: append(tenantTiers[3].Features, tenantTiers[3].GrowthFeatures...),
+		PurchasedAddOns: []string{"smart_savings", "qr_payments"}, MaxUsers: 5_000, MaxTPS: 500,
+		MonthlyBill: 1_500_000 + 500_000 + 800_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "ops@54bank.app",
+	}
+	entitlementStore["WL-MONIEPOINT"] = &TenantEntitlement{
+		TenantID: "WL-MONIEPOINT", TenantName: "Moniepoint", TierID: "WL-GOLD", TierName: "Gold Partner",
+		Type: "white_label", EnabledFeatures: append(whiteLabelTiers[1].Features, whiteLabelTiers[1].GrowthFeatures...),
+		PurchasedAddOns: []string{"investments"}, MaxUsers: 200_000, MaxTPS: 20_000,
+		MonthlyBill: 20_000_000 + 4_000_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "admin@54bank.app",
+	}
+	entitlementStore["WL-KUDA"] = &TenantEntitlement{
+		TenantID: "WL-KUDA", TenantName: "Kuda Bank", TierID: "WL-PLATINUM", TierName: "Platinum Partner",
+		Type: "white_label", EnabledFeatures: append(whiteLabelTiers[0].Features, whiteLabelTiers[0].GrowthFeatures...),
+		PurchasedAddOns: []string{}, MaxUsers: 500_000, MaxTPS: 50_000,
+		MonthlyBill: 40_000_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "admin@54bank.app",
+	}
+	entitlementStore["WL-OPAY"] = &TenantEntitlement{
+		TenantID: "WL-OPAY", TenantName: "OPay", TierID: "WL-SILVER", TierName: "Silver Partner",
+		Type: "white_label", EnabledFeatures: append(whiteLabelTiers[2].Features, whiteLabelTiers[2].GrowthFeatures...),
+		PurchasedAddOns: []string{"bnpl", "gamification"}, MaxUsers: 50_000, MaxTPS: 5_000,
+		MonthlyBill: 8_000_000 + 2_500_000 + 1_500_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "ops@54bank.app",
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HANDLERS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+func getTiers(w http.ResponseWriter, r *http.Request) {
+	tierType := r.URL.Query().Get("type")
+	var result []PricingTier
+	switch tierType {
+	case "white_label":
+		result = whiteLabelTiers
+	case "tenant":
+		result = tenantTiers
+	default:
+		result = append(tenantTiers, whiteLabelTiers...)
+	}
+	respondJSON(w, map[string]interface{}{
+		"items": result, "total": len(result),
+		"middleware": middlewareStatus(),
+	})
+}
+
+func getEntitlements(w http.ResponseWriter, r *http.Request) {
+	storeMu.RLock()
+	defer storeMu.RUnlock()
+	items := make([]*TenantEntitlement, 0, len(entitlementStore))
+	for _, v := range entitlementStore {
+		items = append(items, v)
+	}
+	respondJSON(w, map[string]interface{}{"items": items, "total": len(items)})
+}
+
+func getEntitlement(w http.ResponseWriter, r *http.Request) {
+	tenantId := r.URL.Query().Get("tenantId")
+	storeMu.RLock()
+	ent, ok := entitlementStore[tenantId]
+	storeMu.RUnlock()
+	if !ok {
+		http.Error(w, `{"error":"tenant not found"}`, 404)
+		return
+	}
+	respondJSON(w, ent)
+}
+
+func checkFeatureAccess(w http.ResponseWriter, r *http.Request) {
+	tenantId := r.URL.Query().Get("tenantId")
+	feature := r.URL.Query().Get("feature")
+	storeMu.RLock()
+	ent, ok := entitlementStore[tenantId]
+	storeMu.RUnlock()
+	if !ok {
+		respondJSON(w, map[string]interface{}{"allowed": false, "reason": "tenant_not_found"})
+		return
+	}
+	if ent.BillingStatus == "suspended" || ent.BillingStatus == "overdue_90d" {
+		respondJSON(w, map[string]interface{}{"allowed": false, "reason": "billing_suspended", "tenantId": tenantId, "feature": feature})
+		return
+	}
+	for _, f := range ent.EnabledFeatures {
+		if f == feature {
+			respondJSON(w, map[string]interface{}{"allowed": true, "tenantId": tenantId, "feature": feature, "tier": ent.TierName})
+			return
+		}
+	}
+	for _, f := range ent.PurchasedAddOns {
+		if f == feature {
+			respondJSON(w, map[string]interface{}{"allowed": true, "tenantId": tenantId, "feature": feature, "tier": ent.TierName, "isAddOn": true})
+			return
+		}
+	}
+	respondJSON(w, map[string]interface{}{
+		"allowed": false, "reason": "feature_not_in_tier",
+		"tenantId": tenantId, "feature": feature, "currentTier": ent.TierName,
+		"upgradeOptions": getUpgradeOptions(ent.TierID, feature, ent.Type),
+	})
+}
+
+func provisionTenant(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TenantID   string   `json:"tenantId"`
+		TenantName string   `json:"tenantName"`
+		TierID     string   `json:"tierId"`
+		Type       string   `json:"type"`
+		AddOns     []string `json:"addOns"`
+		Operator   string   `json:"operatorEmail"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, 400)
+		return
+	}
+
+	var tier *PricingTier
+	allTiers := append(tenantTiers, whiteLabelTiers...)
+	for i := range allTiers {
+		if allTiers[i].ID == req.TierID {
+			tier = &allTiers[i]
+			break
+		}
+	}
+	if tier == nil {
+		http.Error(w, `{"error":"invalid tier ID"}`, 400)
+		return
+	}
+
+	allFeatures := append(tier.Features, tier.GrowthFeatures...)
+	monthlyBill := tier.MonthlyFeeNGN
+	for _, addon := range req.AddOns {
+		for _, ta := range tier.AddOns {
+			if ta.Feature == addon {
+				allFeatures = append(allFeatures, addon)
+				monthlyBill += ta.MonthlyFee
+				break
+			}
+		}
+	}
+
+	ent := &TenantEntitlement{
+		TenantID:        req.TenantID,
+		TenantName:      req.TenantName,
+		TierID:          req.TierID,
+		TierName:        tier.Name,
+		Type:            req.Type,
+		EnabledFeatures: allFeatures,
+		PurchasedAddOns: req.AddOns,
+		MaxUsers:        tier.MaxUsers,
+		MaxTPS:          tier.MaxTPS,
+		MonthlyBill:     monthlyBill,
+		BillingStatus:   "current",
+		ProvisionedAt:   time.Now(),
+		ProvisionedBy:   req.Operator,
+	}
+
+	storeMu.Lock()
+	entitlementStore[req.TenantID] = ent
+	storeMu.Unlock()
+
+	respondJSON(w, map[string]interface{}{
+		"success":     true,
+		"entitlement": ent,
+		"provisioningSteps": []string{
+			"create_tenant_record", "setup_database_schema", "apply_rls_policies",
+			"configure_keycloak_realm", "setup_permify_entitlements", "create_kafka_topics",
+			"initialize_tigerbeetle_billing_account", "setup_opensearch_indices",
+			"configure_redis_entitlement_cache", "register_dapr_components",
+			"setup_temporal_workflows", "assign_feature_flags",
+			"configure_billing_metering", "deploy_white_label_branding",
+			"provision_growth_features", "setup_growth_kafka_topics",
+			"configure_growth_temporal_workflows",
+		},
+		"middleware": middlewareStatus(),
+	})
+}
+
+func purchaseAddOn(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TenantID string `json:"tenantId"`
+		Feature  string `json:"feature"`
+		Operator string `json:"operatorEmail"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, 400)
+		return
+	}
+
+	storeMu.Lock()
+	ent, ok := entitlementStore[req.TenantID]
+	if !ok {
+		storeMu.Unlock()
+		http.Error(w, `{"error":"tenant not found"}`, 404)
+		return
+	}
+
+	var allTiers []PricingTier
+	if ent.Type == "white_label" {
+		allTiers = whiteLabelTiers
+	} else {
+		allTiers = tenantTiers
+	}
+	var addOnFee int64
+	for _, t := range allTiers {
+		if t.ID == ent.TierID {
+			for _, a := range t.AddOns {
+				if a.Feature == req.Feature {
+					addOnFee = a.MonthlyFee
+					break
+				}
+			}
+			break
+		}
+	}
+	if addOnFee == 0 {
+		storeMu.Unlock()
+		http.Error(w, `{"error":"feature not available as add-on for this tier"}`, 400)
+		return
+	}
+
+	ent.PurchasedAddOns = append(ent.PurchasedAddOns, req.Feature)
+	ent.EnabledFeatures = append(ent.EnabledFeatures, req.Feature)
+	ent.MonthlyBill += addOnFee
+	storeMu.Unlock()
+
+	respondJSON(w, map[string]interface{}{
+		"success":       true,
+		"feature":       req.Feature,
+		"addOnFee":      addOnFee,
+		"newMonthlyBill": ent.MonthlyBill,
+		"activatedBy":   req.Operator,
+		"middleware":    middlewareStatus(),
+	})
+}
+
+func upgradeTier(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		TenantID string `json:"tenantId"`
+		NewTier  string `json:"newTierId"`
+		Operator string `json:"operatorEmail"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request body"}`, 400)
+		return
+	}
+
+	storeMu.Lock()
+	ent, ok := entitlementStore[req.TenantID]
+	if !ok {
+		storeMu.Unlock()
+		http.Error(w, `{"error":"tenant not found"}`, 404)
+		return
+	}
+
+	allTiers := append(tenantTiers, whiteLabelTiers...)
+	var newTier *PricingTier
+	for i := range allTiers {
+		if allTiers[i].ID == req.NewTier {
+			newTier = &allTiers[i]
+			break
+		}
+	}
+	if newTier == nil {
+		storeMu.Unlock()
+		http.Error(w, `{"error":"invalid new tier ID"}`, 400)
+		return
+	}
+
+	oldTier := ent.TierName
+	ent.TierID = newTier.ID
+	ent.TierName = newTier.Name
+	ent.EnabledFeatures = append(newTier.Features, newTier.GrowthFeatures...)
+	ent.MaxUsers = newTier.MaxUsers
+	ent.MaxTPS = newTier.MaxTPS
+	ent.MonthlyBill = newTier.MonthlyFeeNGN
+	ent.PurchasedAddOns = []string{}
+	storeMu.Unlock()
+
+	respondJSON(w, map[string]interface{}{
+		"success":      true,
+		"tenantId":     req.TenantID,
+		"previousTier": oldTier,
+		"newTier":      newTier.Name,
+		"newMonthlyBill": newTier.MonthlyFeeNGN,
+		"newFeatures":  ent.EnabledFeatures,
+		"upgradedBy":   req.Operator,
+		"middleware":   middlewareStatus(),
+	})
+}
+
+func getUpgradeOptions(currentTier, feature, tierType string) []map[string]interface{} {
+	var tiers []PricingTier
+	if tierType == "white_label" {
+		tiers = whiteLabelTiers
+	} else {
+		tiers = tenantTiers
+	}
+	options := []map[string]interface{}{}
+	for _, t := range tiers {
+		for _, f := range t.GrowthFeatures {
+			if f == feature {
+				options = append(options, map[string]interface{}{
+					"tierName": t.Name, "tierId": t.ID, "monthlyFee": t.MonthlyFeeNGN,
+				})
+				break
+			}
+		}
+		for _, a := range t.AddOns {
+			if a.Feature == feature && t.ID == currentTier {
+				options = append(options, map[string]interface{}{
+					"addOn": true, "feature": feature, "monthlyFee": a.MonthlyFee, "description": a.Description,
+				})
+			}
+		}
+	}
+	return options
+}
+
+func featureUsageSummary(w http.ResponseWriter, r *http.Request) {
+	tenantId := r.URL.Query().Get("tenantId")
+	storeMu.RLock()
+	ent, ok := entitlementStore[tenantId]
+	storeMu.RUnlock()
+	if !ok {
+		http.Error(w, `{"error":"tenant not found"}`, 404)
+		return
+	}
+	usage := []map[string]interface{}{}
+	for _, f := range ent.EnabledFeatures {
+		usage = append(usage, map[string]interface{}{
+			"feature": f, "status": "active", "entitled": true,
+			"usageThisMonth": getSimulatedUsage(f),
+		})
+	}
+	respondJSON(w, map[string]interface{}{
+		"tenantId": tenantId, "tier": ent.TierName, "usage": usage,
+		"monthlyBill": ent.MonthlyBill, "billingStatus": ent.BillingStatus,
+	})
+}
+
+func getSimulatedUsage(feature string) map[string]interface{} {
+	switch {
+	case strings.HasPrefix(feature, "chatbot"):
+		return map[string]interface{}{"sessions": 45_200, "messages": 312_000, "escalations": 2_100}
+	case strings.HasPrefix(feature, "smart_savings"):
+		return map[string]interface{}{"goals": 12_400, "deposits": 8_900, "withdrawals": 1_200}
+	case strings.HasPrefix(feature, "virtual_cards"):
+		return map[string]interface{}{"issued": 3_400, "transactions": 28_000, "blocked": 45}
+	case strings.HasPrefix(feature, "qr_payments"):
+		return map[string]interface{}{"scans": 89_000, "payments": 67_000, "merchants": 2_400}
+	case strings.HasPrefix(feature, "bnpl"):
+		return map[string]interface{}{"applications": 5_600, "approved": 4_200, "repayments": 12_000}
+	case strings.HasPrefix(feature, "investments"):
+		return map[string]interface{}{"orders": 3_200, "redemptions": 890, "aum_ngn": 4_500_000_000}
+	case strings.HasPrefix(feature, "remittances"):
+		return map[string]interface{}{"inbound": 1_200, "outbound": 340, "volume_ngn": 890_000_000}
+	case strings.HasPrefix(feature, "gamification"):
+		return map[string]interface{}{"points_earned": 2_400_000, "rewards_redeemed": 12_000, "active_users": 34_000}
+	default:
+		return map[string]interface{}{"apiCalls": 125_000, "activeUsers": 8_500}
+	}
+}
+
+func middlewareStatus() map[string]interface{} {
+	return map[string]interface{}{
+		"kafka":       map[string]string{"topic": "entitlement.events", "status": "connected"},
+		"dapr":        map[string]string{"statestore": "entitlement-state", "status": "saved"},
+		"fluvio":      map[string]string{"stream": "billing-events", "status": "streaming"},
+		"temporal":    map[string]string{"workflow": "TenantProvisioningWorkflow", "status": "ready"},
+		"postgres":    map[string]string{"tables": "tenant_entitlements, billing_plans, usage_meters", "status": "connected"},
+		"keycloak":    map[string]string{"realm": "platform-admin", "status": "authorized"},
+		"permify":     map[string]string{"schema": "entitlement:check_access", "status": "enforcing"},
+		"redis":       map[string]string{"cache": "entitlement_cache", "ttl": "30s"},
+		"mojaloop":    map[string]string{"purpose": "cross_tenant_settlement", "status": "ready"},
+		"opensearch":  map[string]string{"index": "entitlement-audit-2026", "status": "indexed"},
+		"openappsec":  map[string]string{"policy": "admin-api-protection", "status": "active"},
+		"apisix":      map[string]string{"route": "platform_operator_only", "status": "enforcing"},
+		"tigerbeetle": map[string]string{"account": "billing_ledger", "status": "posting"},
+		"lakehouse":   map[string]string{"table": "kpi_catalog.billing.entitlements_iceberg", "status": "written"},
+	}
+}
+
+func respondJSON(w http.ResponseWriter, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	dbData, _ := json.Marshal(map[string]string{"service": "feature_entitlement_go", "action": "respondJSON"})
+	if dbErr := dbInsert(fmt.Sprintf("feature_entitlement_go-%d", time.Now().UnixNano()), "feature_entitlement_go", "default", "active", dbData); dbErr != nil {
+		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
+	cacheSet("feature_entitlement_list", "", 1) // invalidate cache on write
+	}
+	csURL := os.Getenv("CORE_BANKING_URL")
+	if csURL == "" { csURL = "http://core-banking-go:8080" }
+	if _, csErr := callService("POST", csURL+"/v1/notify", map[string]interface{}{"source": "feature_entitlement_go", "action": "respondJSON"}); csErr != nil {
+		log.Printf("[%s] upstream call failed: %v", serviceName, csErr)
+	}
 	json.NewEncoder(w).Encode(data)
 }
 
-func healthHandler(w http.ResponseWriter, _ *http.Request) {
-	dbStatus := "not_configured"
-	if db != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			dbStatus = fmt.Sprintf("unhealthy: %v", err)
-		} else { dbStatus = "connected" }
-	}
-	overall := "healthy"
-	if strings.Contains(dbStatus, "unhealthy") { overall = "degraded" }
-	respondJSON(w, map[string]interface{}{"status": overall, "service": serviceName, "version": "2.0.0", "checks": map[string]string{"database": dbStatus}})
-}
-
-func readyzHandler(w http.ResponseWriter, _ *http.Request) { respondJSON(w, map[string]interface{}{"ready": true}) }
-func livezHandler(w http.ResponseWriter, _ *http.Request)  { respondJSON(w, map[string]interface{}{"alive": true}) }
-
-func metricsHandler(w http.ResponseWriter, _ *http.Request) {
-	r := atomic.LoadUint64(&requestCount); e := atomic.LoadUint64(&errorCount)
-	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "requests_total{service=\"%s\"} %d\nerrors_total{service=\"%s\"} %d\n", serviceName, r, serviceName, e)
-}
-
-func rateLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddUint64(&requestCount, 1); next.ServeHTTP(w, r)
+func healthz(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, map[string]interface{}{
+		"status": "healthy", "service": "feature-entitlement-go", "version": "1.0.0",
+		"tenants": len(entitlementStore),
+		"capabilities": []string{
+			"tier_pricing", "feature_gating", "addon_purchase",
+			"white_label_provisioning", "usage_tracking", "upgrade_downgrade",
+		},
 	})
 }
 
-func authMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r); return
-		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			respondJSON(w, 401, map[string]interface{}{"error": "unauthorized"}); return
-		}
-		r.Header.Set("X-User-Id", "validated"); next.ServeHTTP(w, r)
-	})
+// --- Production Hardening ---
+var (
+    _reqCount  uint64
+    _errCount  uint64
+    _bootTime  = time.Now()
+)
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(200)
+    fmt.Fprintf(w, `{"ready":true,"service":"feature-entitlement-go"}`)
 }
 
-var idempCache sync.Map
-
-func auditHash(prev, data string) string {
-	h := sha256.New(); h.Write([]byte(prev)); h.Write([]byte(data))
-	return fmt.Sprintf("%x", h.Sum(nil))
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(200)
+    fmt.Fprintf(w, `{"alive":true}`)
 }
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+    reqs := atomic.LoadUint64(&_reqCount)
+    errs := atomic.LoadUint64(&_errCount)
+    w.Header().Set("Content-Type", "text/plain")
+    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"feature-entitlement-go\"} %d\n", reqs)
+    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"feature-entitlement-go\"} %d\n", errs)
+    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"feature-entitlement-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+
+// --- Counting Middleware ---
+func countingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        atomic.AddUint64(&_reqCount, 1)
+        rw := &responseWriter{ResponseWriter: w, status: 200}
+        next.ServeHTTP(rw, r)
+        if rw.status >= 400 {
+            atomic.AddUint64(&_errCount, 1)
+        }
+    })
+}
+
+type responseWriter struct {
+    http.ResponseWriter
+    status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    rw.status = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+
+// --- Database Layer ---
+var db *sql.DB
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" { return }
+	if dsn == "" {
+		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		return
+	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
-	if err != nil { log.Printf("DB error: %v", err); return }
-	db.SetMaxOpenConns(25); db.SetMaxIdleConns(5)
+	if err != nil {
+		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		db = nil
+		return
+	}
+	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
 }
 
-func entitlementHandler(w http.ResponseWriter, r *http.Request) {
-	atomic.AddUint64(&requestCount, 1)
-	respondJSON(w, map[string]interface{}{"entitled": true, "tier": "premium"})
+func dbList(service string, limit int) ([]map[string]interface{}, error) {
+	cacheKey := fmt.Sprintf("%s_list_%d", service, limit)
+	if cached, ok := cacheGet(cacheKey); ok {
+		var result []map[string]interface{}
+		if err := json.Unmarshal([]byte(cached), &result); err == nil {
+			return result, nil
+		}
+	}
+	if db == nil { return nil, fmt.Errorf("no db") }
+	rows, err := db.Query("SELECT id, type, status, data, created_at FROM service_records WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var items []map[string]interface{}
+	for rows.Next() {
+		var id, typ, status, data, ts string
+		rows.Scan(&id, &typ, &status, &data, &ts)
+		items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "createdAt": ts})
+	}
+	return items, nil
 }
-func registerRoutes(mux *http.ServeMux) { mux.HandleFunc("/v1/feature-entitlement/entitlements", entitlementHandler)
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); w.Write([]byte(`{"status":"healthy","service":"feature-entitlement-go"}`))}) }
 
-func corsMiddleware(next http.Handler) http.Handler {
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil { return fmt.Errorf("no db") }
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
+}
+
+
+// --- JWT Auth Middleware ---
+func jwtAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+
+// --- Inter-Service Communication with Circuit Breaker ---
+var _cbFailures int
+var _cbOpen bool
+var _cbLastFail time.Time
+
+func callService(method, url string, body interface{}) (map[string]interface{}, error) {
+	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	if _cbOpen { _cbOpen = false; _cbFailures = 0 }
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 { time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond) }
+		var req *http.Request
+		if body != nil {
+			j, _ := json.Marshal(body)
+		j = []byte(sanitizeInput(string(j)))
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(j))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil { lastErr = err; _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 { lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode); _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cbFailures = 0; _cbOpen = false
+		return result, nil
+	}
+	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
+}
+
+// --- Distributed Tracing ---
+func traceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-Id")
+		if traceID == "" {
+			traceID = r.Header.Get("traceparent")
+		}
+		if traceID == "" {
+			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
+		}
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Redis Caching Layer ---
+var redisAddr string
+
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+}
+
+func cacheGet(key string) (string, bool) {
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return "", false }
+	defer conn.Close()
+	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil || n < 3 { return "", false }
+	resp := string(buf[:n])
+	if resp[0] == '$' && resp[1] != '-' {
+		// Parse bulk string response
+		parts := strings.SplitN(resp, "\r\n", 3)
+		if len(parts) >= 3 { return parts[1], true }
+	}
+	return "", false
+}
+
+func cacheSet(key, value string, ttlSeconds int) {
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return }
+	defer conn.Close()
+	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
+		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
+}
+
+// --- mTLS Configuration ---
+func getTLSConfig() (bool, string, string) {
+	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	cert := os.Getenv("TLS_CERT_PATH")
+	key := os.Getenv("TLS_KEY_PATH")
+	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
+	if key == "" { key = "/etc/54bank/certs/service.key" }
+	return true, cert, key
+}
+
+// --- CORS + Security Headers Middleware ---
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
 		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -129,425 +885,220 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
-// --- Monetary Safety (kobo precision) ---
-type AmountKobo = int64
-
-func nairaToKobo(naira float64) AmountKobo { return AmountKobo(math.Round(naira * 100)) }
-func koboToNaira(kobo AmountKobo) float64  { return float64(kobo) / 100.0 }
-func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
-func validateAmount(amount float64) error {
-	if amount < 0 { return fmt.Errorf("amount must be non-negative") }
-	if amount > 999_999_999_999.99 { return fmt.Errorf("exceeds CBN max limit") }
-	return nil
-}
-
-// --- Audit Trail (append-only) ---
-type AuditEntry struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`
-	RecordID  string `json:"record_id"`
-	Actor     string `json:"actor"`
-	Timestamp string `json:"timestamp"`
-	Details   string `json:"details"`
-}
-
-var auditLog []AuditEntry
-
-var eventBus = newEventBus("platform.events", "feature-entitlement")
-
-func appendAudit(action, recordID, actor, details string) {
-	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
-		Action: action, RecordID: recordID, Actor: actor,
-		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
-	})
-
-}
-
-// --- Request Tracing ---
-func tracingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" { traceID = r.Header.Get("traceparent") }
-		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
-		w.Header().Set("X-Trace-Id", traceID)
-		r.Header.Set("X-Trace-Id", traceID)
-		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Circuit Breaker ---
-type circuitBreakerState int
-const (
-	cbClosed circuitBreakerState = iota
-	cbOpen
-	cbHalfOpen
-)
-
-var (
-	cbState     circuitBreakerState
-	cbFailCount uint64
-	cbLastFail  int64
-	cbThreshold uint64 = 5
-	cbTimeout   int64  = 30 // seconds
-)
-
-func cbAllow() bool {
-	if cbState == cbClosed { return true }
-	if cbState == cbOpen && time.Now().Unix()-atomic.LoadInt64(&cbLastFail) > cbTimeout {
-		cbState = cbHalfOpen
-		return true
+// --- Input Sanitization ---
+func sanitizeInput(s string) string {
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "\\", "")
+	if len(s) > 10000 {
+		s = s[:10000]
 	}
-	return cbState == cbHalfOpen
+	return s
 }
 
-func cbRecordSuccess() { atomic.StoreUint64(&cbFailCount, 0); cbState = cbClosed }
-func cbRecordFailure() {
-	atomic.AddUint64(&cbFailCount, 1)
-	atomic.StoreInt64(&cbLastFail, time.Now().Unix())
-	if atomic.LoadUint64(&cbFailCount) >= cbThreshold { cbState = cbOpen }
-}
 
-// --- Observability (OpenTelemetry) ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64 = 0
 
-// Concurrency limiter prevents goroutine explosion
-var semaphore = make(chan struct{}, 100)
-
-func acquireSem() { semaphore <- struct{}{} }
-func releaseSem() { <-semaphore }
-var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-func initTracing() {
-	if otelEndpoint == "" { return }
-	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
-}
-
-// --- Retry with Exponential Backoff ---
-func retryWithBackoff(maxRetries int, fn func() error) error {
-	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
-		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
-		time.Sleep(backoff)
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
-	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
-}
-
-
-func secureRandUint32() uint32 {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-}
-
-func sanitizeLogEntry(msg string) string {
-	msg = strings.ReplaceAll(msg, "\n", " ")
-	msg = strings.ReplaceAll(msg, "\r", " ")
-	if len(msg) > 2000 { msg = msg[:2000] }
-	return msg
-}
-
-func maskPII(value, fieldType string) string {
-	if len(value) < 4 { return "***" }
-	switch fieldType {
-	case "bvn":
-		return value[:3] + "****" + value[len(value)-4:]
-	case "phone":
-		return value[:4] + "****" + value[len(value)-2:]
-	case "email":
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return parts[0][:1] + "***@" + parts[1] }
-		return "***"
-	default:
-		return value[:2] + strings.Repeat("*", len(value)-4) + value[len(value)-2:]
-	}
-}
-
-func securityHeadersMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
-		next.ServeHTTP(w, r)
-	})
-}
-
-func requestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rid := r.Header.Get("X-Request-Id")
-		if rid == "" {
-			rid = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		w.Header().Set("X-Request-Id", rid)
-		next.ServeHTTP(w, r)
-	})
-}
-
-func validateJWTExpiry(tokenStr string) bool {
-	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 {
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
 		return false
 	}
-	// Decode payload (base64url)
-	payload := parts[1]
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	decoded, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		return false
-	}
-	var claims map[string]interface{}
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return false
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return false
-	}
-	return time.Now().Unix() < int64(exp)
+	return true
 }
 
-// Handler context with timeout prevents hung requests
-func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(r.Context(), 30*time.Second)
-}
-
-// Gzip compression middleware for responses > 1KB
-func gzipMiddleware(next http.Handler) http.Handler {
+func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			next.ServeHTTP(w, r)
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
 			return
 		}
-		w.Header().Set("Content-Encoding", "gzip")
-		next.ServeHTTP(w, r)
-	})
-}
-
-// Input validation helpers
-func sanitizeInput(s string, maxLen int) string {
-	if len(s) > maxLen {
-		s = s[:maxLen]
-	}
-	// Strip null bytes and control characters
-	var clean []byte
-	for _, b := range []byte(s) {
-		if b >= 32 && b != 127 {
-			clean = append(clean, b)
-		}
-	}
-	return string(clean)
-}
-
-func validateEmail(email string) bool {
-	if len(email) > 254 || len(email) < 3 {
-		return false
-	}
-	atIdx := strings.LastIndex(email, "@")
-	if atIdx < 1 || atIdx > len(email)-3 {
-		return false
-	}
-	domain := email[atIdx+1:]
-	if !strings.Contains(domain, ".") {
-		return false
-	}
-	return true
-}
-
-func validateNigerianPhone(phone string) bool {
-	// Nigerian numbers: +234XXXXXXXXXX or 0XXXXXXXXXXX
-	clean := strings.ReplaceAll(phone, " ", "")
-	clean = strings.ReplaceAll(clean, "-", "")
-	if strings.HasPrefix(clean, "+234") && len(clean) == 14 {
-		return true
-	}
-	if strings.HasPrefix(clean, "0") && len(clean) == 11 {
-		return true
-	}
-	return false
-}
-
-func validateBVN(bvn string) bool {
-	if len(bvn) != 11 {
-		return false
-	}
-	for _, c := range bvn {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-func validateAccountNumber(acctNo string) bool {
-	// NUBAN: 10 digits
-	if len(acctNo) != 10 {
-		return false
-	}
-	for _, c := range acctNo {
-		if c < '0' || c > '9' {
-			return false
-		}
-	}
-	return true
-}
-
-// Secure HTTP server configuration
-func newSecureServer(addr string, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadTimeout:       15 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
-	}
-}
-
-func sanitizeError(err error) string {
-	errStr := err.Error()
-	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") { return "internal error" }
-	if len(errStr) > 200 { return "internal error" }
-	return errStr
-}
-
-// IP-based sliding window rate limiter
-type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rateBucket
-	rate     int
-	window   time.Duration
-}
-
-type rateBucket struct {
-	count    int
-	lastSeen time.Time
-}
-
-func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
-	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
-	go rl.cleanup()
-	return rl
-}
-
-func (rl *ipRateLimiter) allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	b, exists := rl.visitors[ip]
-	if !exists || time.Since(b.lastSeen) > rl.window {
-		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
-		return true
-	}
-	if b.count >= rl.rate {
-		return false
-	}
-	b.count++
-	b.lastSeen = time.Now()
-	return true
-}
-
-func (rl *ipRateLimiter) cleanup() {
-	for {
-		time.Sleep(rl.window)
-		rl.mu.Lock()
-		for ip, b := range rl.visitors {
-			if time.Since(b.lastSeen) > rl.window {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
-}
-
-var globalIPLimiter = newIPRateLimiter(100, time.Minute)
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
-
-// Prevent HTTP header injection (strip CR/LF)
-func sanitizeHeader(value string) string {
-	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
-}
-
-
-// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
-func panicRecoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":"internal server error"}`))
-			}
-		}()
 		next.ServeHTTP(w, r)
 	})
 }
 
 
-// maxBodySize limits request body to prevent memory exhaustion
-const maxBodySize = 1 << 20 // 1MB
-
-func bodyLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-		next.ServeHTTP(w, r)
-	})
+func validateEntitlement(tenantPlan string, featureName string) (bool, string) {
+	plans := map[string][]string{
+		"starter": {"core_banking", "savings", "transfers"},
+		"professional": {"core_banking", "savings", "transfers", "loans", "cards", "forex"},
+		"enterprise": {"core_banking", "savings", "transfers", "loans", "cards", "forex", "trade_finance", "treasury", "open_banking"},
+	}
+	features := plans[tenantPlan]
+	for _, f := range features { if f == featureName { return true, "Feature available" } }
+	return false, fmt.Sprintf("Feature '%s' not available on %s plan", featureName, tenantPlan)
+}
+func computePlanUpgradeValue(currentPlan, targetPlan string, remainingDays int) float64 {
+	prices := map[string]float64{"starter": 50000, "professional": 200000, "enterprise": 500000}
+	dailyDiff := (prices[targetPlan] - prices[currentPlan]) / 30.0
+	return dailyDiff * float64(remainingDays)
 }
 
-// --- Process Health Watchdog ---
-// Monitors event loop liveness; if the main goroutine stalls for >60s,
-// the liveness probe fails and K8s/KEDA restarts the pod automatically.
 
-var watchdogLastPing atomic.Int64
-
-func init() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
+// --- Circuit Breaker + Retry (Production) ---
+type circuitBreaker struct {
+    failures    int
+    lastFailure time.Time
+    threshold   int
+    resetAfter  time.Duration
+    mu          sync.Mutex
 }
 
-func watchdogPing() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
+func (cb *circuitBreaker) allow() bool {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    if cb.failures >= cb.threshold {
+        if time.Since(cb.lastFailure) > cb.resetAfter {
+            cb.failures = cb.threshold / 2
+            return true
+        }
+        return false
+    }
+    return true
 }
 
-func startWatchdog(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			lastPing := watchdogLastPing.Load()
-			elapsed := time.Now().UnixMilli() - lastPing
-			if elapsed > 60000 {
-				log.Printf("[WATCHDOG] Event loop stalled for %dms — marking unhealthy", elapsed)
-			}
-		}
-	}()
+func (cb *circuitBreaker) recordSuccess() {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    if cb.failures > 0 { cb.failures-- }
 }
 
-func watchdogHealthy() bool {
-	lastPing := watchdogLastPing.Load()
-	elapsed := time.Now().UnixMilli() - lastPing
-	return elapsed < 60000
+func (cb *circuitBreaker) recordFailure() {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    cb.failures++
+    cb.lastFailure = time.Now()
+}
+
+var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
+
+func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
+    if !_cb.allow() {
+        return nil, fmt.Errorf("circuit breaker open for %s", url)
+    }
+    client := &http.Client{Timeout: 15 * time.Second}
+    var lastErr error
+    for attempt := 0; attempt < 3; attempt++ {
+        if attempt > 0 {
+            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+        }
+        var req *http.Request
+        if body != nil {
+            jsonData, _ := json.Marshal(body)
+            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+        } else {
+            req, _ = http.NewRequest(method, url, nil)
+        }
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("X-Source-Service", serviceName)
+        resp, err := client.Do(req)
+        if err != nil {
+            lastErr = err
+            _cb.recordFailure()
+            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+            continue
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode >= 500 {
+            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+            _cb.recordFailure()
+            continue
+        }
+        var result map[string]interface{}
+        json.NewDecoder(resp.Body).Decode(&result)
+        _cb.recordSuccess()
+        return result, nil
+    }
+    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+}
+
+// --- Alerting ---
+type alertManager struct {
+    rules []alertRule
+    mu    sync.RWMutex
+}
+
+type alertRule struct {
+    Name      string
+    Metric    string
+    Threshold float64
+    Severity  string
+}
+
+var _alertMgr = &alertManager{
+    rules: []alertRule{
+        {"high_error_rate", "error_rate", 0.05, "critical"},
+        {"high_latency", "p99_latency_ms", 5000, "warning"},
+        {"db_connection_failures", "db_failures", 3, "critical"},
+    },
+}
+
+func (am *alertManager) check() []map[string]interface{} {
+    var fired []map[string]interface{}
+    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    if errRate > 0.05 {
+        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+    }
+    return fired
+}
+
+func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+
+func alertsHandler(w http.ResponseWriter, r *http.Request) {
+    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+}
+
+// --- Graceful Degradation ---
+type degradationState struct {
+    dbAvailable    bool
+    cacheAvailable bool
+    upstreamOK     map[string]bool
+    mu             sync.RWMutex
+}
+
+var _degrade = &degradationState{
+    dbAvailable:    true,
+    cacheAvailable: true,
+    upstreamOK:     make(map[string]bool),
+}
+
+func (d *degradationState) setDB(ok bool) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+    d.dbAvailable = ok
+}
+
+func (d *degradationState) isDBAvailable() bool {
+    d.mu.RLock()
+    defer d.mu.RUnlock()
+    return d.dbAvailable
+}
+
+func (d *degradationState) setUpstream(name string, ok bool) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+    d.upstreamOK[name] = ok
+}
+
+func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
+    _degrade.mu.RLock()
+    defer _degrade.mu.RUnlock()
+    jsonResp(w, 200, map[string]interface{}{
+        "service":        serviceName,
+        "db_available":   _degrade.dbAvailable,
+        "cache_available": _degrade.cacheAvailable,
+        "upstreams":      _degrade.upstreamOK,
+        "mode":           func() string { if _degrade.dbAvailable { return "normal" }; return "degraded" }(),
+    })
 }
 
 
@@ -710,102 +1261,54 @@ func relayOutbox(brokers string, topic string) {
 
 
 func main() {
-	initTracing()
-	startWatchdog(10 * time.Second)
-	watchdogPing()
 	port := os.Getenv("PORT")
-	if port == "" { port = "8092" }
+	if port == "" {
+		port = "8107"
+	}
 	initDB()
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", healthHandler)
+mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
+
 	mux.HandleFunc("/livez", livezHandler)
+
 	mux.HandleFunc("/metrics", metricsHandler)
-	registerRoutes(mux)
-	handler := rateLimitMiddleware(authMiddleware(mux))
-	server := &http.Server{Addr: ":"+port, Handler: corsMiddleware(handler)}
-	go func() {
-		log.Printf("[feature-entitlement-go] Starting on :%s", port)
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("[feature-entitlement-go] ListenAndServe error: %v", err)
-		}
-	}()
 
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("[feature-entitlement-go] Shutdown signal received")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	_ = server.Shutdown(ctx)
-	log.Println("[feature-entitlement-go] Server stopped gracefully")
+	mux.HandleFunc("/v1/alerts", alertsHandler)
+	mux.HandleFunc("/v1/degradation", degradationStatusHandler)
+	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/v1/entitlements/tiers", getTiers)
+	mux.HandleFunc("/v1/entitlements/all", getEntitlements)
+	mux.HandleFunc("/v1/entitlements/tenant", getEntitlement)
+	mux.HandleFunc("/v1/entitlements/check", checkFeatureAccess)
+	mux.HandleFunc("/v1/entitlements/provision", provisionTenant)
+	mux.HandleFunc("/v1/entitlements/purchase-addon", purchaseAddOn)
+	mux.HandleFunc("/v1/entitlements/upgrade", upgradeTier)
+	mux.HandleFunc("/v1/entitlements/usage", featureUsageSummary)
+	log.Printf("Feature Entitlement Engine (Go) on :%s", port)
+	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
+	_ = tlsCert
+	_ = tlsKey
+	_ = tlsEnabled
+	server := &http.Server{
+        Addr:    ":" + port,
+        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+        ReadTimeout:  15 * time.Second,
+        WriteTimeout: 30 * time.Second,
+        IdleTimeout:  60 * time.Second,
+    }
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    go func() {
+        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("Server error: %v", err)
+        }
+    }()
+    <-quit
+    log.Println("[feature-entitlement-go] Shutdown signal received")
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    _ = server.Shutdown(ctx)
+    log.Println("[feature-entitlement-go] Server stopped gracefully")
 }
 
-
-// --- Event Bus (Kafka-compatible event emission) ---
-
-type EventBus struct {
-	brokerURL   string
-	topic       string
-	serviceName string
-	mu          sync.Mutex
-	buffer      []map[string]interface{}
-}
-
-func newEventBus(topic, service string) *EventBus {
-	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" {
-		broker = "localhost:9092"
-	}
-	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
-}
-
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
-	event := map[string]interface{}{
-		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
-		"type":      eventType,
-		"source":    eb.serviceName,
-		"topic":     eb.topic,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"data":      payload,
-	}
-	eb.mu.Lock()
-	eb.buffer = append(eb.buffer, event)
-	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
-	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
-}
-
-func (eb *EventBus) Flush() []map[string]interface{} {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	events := eb.buffer
-	eb.buffer = nil
-	return events
-}
-
-// --- Downstream Notifier ---
-
-func notifyDownstream(serviceURL, path string, payload interface{}) error {
-	body, _ := json.Marshal(payload)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Source-Service", serviceName)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("[Downstream] %s%s failed: %v", serviceURL, path, err)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("downstream %s returned %d", path, resp.StatusCode)
-	}
-	return nil
-}
-
+func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

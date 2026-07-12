@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: business-service-config
+  namespace: banking-platform
+data:
+  ENVIRONMENT: "production"
+  DEBUG: "false"
+  LOG_LEVEL: "info"
+  DATABASE_POOL_SIZE: "20"
+  DATABASE_MAX_OVERFLOW: "40"
+  KAFKA_CONSUMER_GROUP: "business-service-group"
+  KEYCLOAK_REALM: "54link-dev"
+  PERMIFY_PORT: "3476"
+  API_V1_PREFIX: "/api/v1"

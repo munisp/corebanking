@@ -1,510 +1,716 @@
 package main
 
 import (
-	"context"
-	"database/sql"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
-	"time"
-
-	_ "github.com/lib/pq"
-	"crypto"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
-	"math/big"
 	"sync"
+	"time"
 )
 
-var db *sql.DB
+// Permify Authorization Service — fine-grained RBAC/ABAC/ReBAC policy engine
+// Port: 8129
+// Delegates permission checks to real Permify engine.
+// Static policies (dual-control, high-value, etc.) are evaluated as a deny-first
+// layer before the Permify round-trip.
 
+const defaultTenantID = "bpmgd"
 
-// ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
+var (
+	permifyURL string
+	httpClient = &http.Client{Timeout: 5 * time.Second}
+)
 
-type jwksCache struct {
-	mu      sync.RWMutex
-	keys    map[string]*rsa.PublicKey
-	updated time.Time
-}
-
-var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
-
-func fetchJWKS(realmURL string) {
-	resp, err := http.Get(realmURL + "/protocol/openid-connect/certs")
-	if err != nil {
-		log.Printf("[middleware] JWKS fetch failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	var jwks struct {
-		Keys []struct {
-			Kid string `json:"kid"`
-			N   string `json:"n"`
-			E   string `json:"e"`
-		} `json:"keys"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		log.Printf("[middleware] JWKS decode failed: %v", err)
-		return
-	}
-	jwtCache.mu.Lock()
-	defer jwtCache.mu.Unlock()
-	for _, k := range jwks.Keys {
-		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
-		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
-		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
-		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
-		jwtCache.keys[k.Kid] = pub
-	}
-	jwtCache.updated = time.Now()
-	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
-}
-
-func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
-	}()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip health endpoints
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
-			return
-		}
-		token := auth[7:]
-		parts := strings.Split(token, ".")
-		if len(parts) != 3 {
-			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode header for kid
-		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-		if err != nil {
-			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
-			return
-		}
-		var header struct { Kid string `json:"kid"` }
-		json.Unmarshal(headerBytes, &header)
-
-		jwtCache.mu.RLock()
-		pub, ok := jwtCache.keys[header.Kid]
-		jwtCache.mu.RUnlock()
-		if !ok {
-			// Try refresh
-			fetchJWKS(realmURL)
-			jwtCache.mu.RLock()
-			pub, ok = jwtCache.keys[header.Kid]
-			jwtCache.mu.RUnlock()
-			if !ok {
-				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
-				return
-			}
-		}
-		// Verify signature (RS256)
-		signingInput := parts[0] + "." + parts[1]
-		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
-		if err != nil {
-			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
-			return
-		}
-		hash := sha256.Sum256([]byte(signingInput))
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
-			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode claims
-		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
-		var claims map[string]interface{}
-		json.Unmarshal(claimsBytes, &claims)
-		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
-			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
-			return
-		}
-		// Pass claims in context
-		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
-
-func startOutboxRelay(ctx context.Context, brokers string, topic string) {
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				relayOutbox(brokers, topic)
-			}
-		}
-	}()
-}
-
-func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
-	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
-	defer rows.Close()
-
-	var ids []string
-	for rows.Next() {
-		var id, eventType, aggID string
-		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
-	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
-}
-
-
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("[permify-authz-go] starting on :8186")
-
-	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/permify_authz_go?sslmode=disable")
-	var err error
-	db, err = sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("database connection failed: %v", err)
-	}
-	defer db.Close()
-
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("database ping failed: %v", err)
-	}
-
-	initSchema()
-	log.Printf("[permify-authz-go] database connected, schema initialized")
-
-	// Middleware clients
-	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
-	redisURL := getEnv("REDIS_URL", "localhost:6379")
-	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
-	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
-
-	log.Printf("[permify-authz-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
-		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
-
-	mux := http.NewServeMux()
-
-	// Health endpoints
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
-	})
-	mux.HandleFunc("/metrics", metricsHandler)
-
-	// Domain endpoints
-	mux.HandleFunc("/api/v1/service_configs", domainHandler)
-	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
-
-	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8186"),
-		Handler:      loggingMiddleware(corsMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
-
-	log.Printf("[permify-authz-go] ready on :%s", getEnv("PORT", "8186"))
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Printf("[permify-authz-go] shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
-	log.Printf("[permify-authz-go] stopped")
-}
-
-func initSchema() {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-	)`)
-	if err != nil {
-		log.Fatalf("schema init failed: %v", err)
-	}
-
-	// Outbox for event sourcing
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		event_type VARCHAR(64) NOT NULL,
-		aggregate_id VARCHAR(128) NOT NULL,
-		payload JSONB NOT NULL,
-		published BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-	if err != nil {
-		log.Printf("outbox table creation (may already exist): %v", err)
-	}
-
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
-}
-
-func domainHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		listRecords(w, r)
-	case "POST":
-		createRecord(w, r)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+func init() {
+	permifyURL = strings.TrimRight(os.Getenv("PERMIFY_URL"), "/")
+	if permifyURL == "" {
+		permifyURL = "http://permify.banking.svc.cluster.local:3476"
 	}
 }
 
-func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/service_configs/"), "/")
-	id := parts[0]
-	if id == "" {
-		http.Error(w, `{"error":"id required"}`, http.StatusBadRequest)
-		return
-	}
+// ---------------------------------------------------------------------------
+// Static policies — evaluated locally as a deny-first layer
+// ---------------------------------------------------------------------------
 
-	switch r.Method {
-	case "GET":
-		getRecord(w, r, id)
-	case "PUT", "PATCH":
-		updateRecord(w, r, id)
-	case "DELETE":
-		deleteRecord(w, r, id)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+type PolicyRule struct {
+	Entity    string            `json:"entity"`
+	Action    string            `json:"action"`
+	Condition map[string]string `json:"condition,omitempty"`
+	Effect    string            `json:"effect"` // "allow" | "deny"
+}
+
+type Policy struct {
+	ID        string       `json:"id"`
+	Name      string       `json:"name"`
+	Type      string       `json:"type"` // rbac | abac | rebac
+	Rules     []PolicyRule `json:"rules"`
+	Status    string       `json:"status"` // active | inactive
+	CreatedAt string       `json:"createdAt"`
+}
+
+var staticPolicies []Policy
+
+func init() {
+	now := time.Now().UTC().Format(time.RFC3339)
+	staticPolicies = []Policy{
+		{
+			ID: "POL-0001", Name: "dual-control-approval", Type: "rbac", Status: "active", CreatedAt: now,
+			Rules: []PolicyRule{
+				// A user cannot approve a transaction they initiated themselves.
+				{Entity: "transaction", Action: "approve", Effect: "deny",
+					Condition: map[string]string{"initiator": "same_as_approver"}},
+			},
+		},
+		{
+			ID: "POL-0002", Name: "high-value-restriction", Type: "abac", Status: "active", CreatedAt: now,
+			Rules: []PolicyRule{
+				// Tellers cannot create transactions above ₦10M.
+				{Entity: "transaction", Action: "create", Effect: "deny",
+					Condition: map[string]string{"amount": ">10000000", "role": "teller"}},
+			},
+		},
+		{
+			ID: "POL-0003", Name: "branch-scope", Type: "rebac", Status: "active", CreatedAt: now,
+			Rules: []PolicyRule{
+				// Staff cannot update accounts belonging to a different branch.
+				// Caller must pass context: {"branch_different": "true"} when applicable.
+				{Entity: "account", Action: "update", Effect: "deny",
+					Condition: map[string]string{"branch_different": "true"}},
+			},
+		},
+		{
+			ID: "POL-0004", Name: "after-hours-restriction", Type: "abac", Status: "active", CreatedAt: now,
+			Rules: []PolicyRule{
+				// Vault access is denied after 18:00 server time.
+				{Entity: "vault", Action: "access", Effect: "deny",
+					Condition: map[string]string{"time": "after_18:00"}},
+			},
+		},
+		{
+			ID: "POL-0005", Name: "kyc-level-restriction", Type: "abac", Status: "active", CreatedAt: now,
+			Rules: []PolicyRule{
+				// Transfers above ₦50K require KYC level ≥ 2.
+				// Caller must pass context: {"amount": "...", "kyc_level": "..."}.
+				{Entity: "transfer", Action: "create", Effect: "deny",
+					Condition: map[string]string{"amount": ">50000", "kyc_level": "<2"}},
+			},
+		},
 	}
 }
 
-func listRecords(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.Header.Get("X-Tenant-ID")
-	limit := 50
-	offset := 0
-
-	query := `SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
-	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var records []map[string]interface{}
-	for rows.Next() {
-		var id, status string
-		var createdAt time.Time
-		if err := rows.Scan(&id, &status, &createdAt); err != nil {
+// evalStaticDeny returns (true, policyName) if any active deny policy matches.
+func evalStaticDeny(entity, action string, ctx map[string]string) (bool, string) {
+	for _, pol := range staticPolicies {
+		if pol.Status != "active" {
 			continue
 		}
-		records = append(records, map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": records, "count": len(records)})
-}
-
-func createRecord(w http.ResponseWriter, r *http.Request) {
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-	tenantID := r.Header.Get("X-Tenant-ID")
-	if tenantID == "" {
-		tenantID = "default"
-	}
-	body["tenant_id"] = tenantID
-
-	payload, _ := json.Marshal(body)
-
-	var id string
-	err := db.QueryRowContext(r.Context(),
-		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
-		tenantID).Scan(&id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	// Write to outbox for event publishing
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": "created"})
-}
-
-func getRecord(w http.ResponseWriter, r *http.Request, id string) {
-	var status string
-	var createdAt time.Time
-	err := db.QueryRowContext(r.Context(),
-		`SELECT status, created_at FROM service_configs WHERE id = $1`, id).Scan(&status, &createdAt)
-	if err == sql.ErrNoRows {
-		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
-		return
-	}
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
-}
-
-func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-	status, _ := body["status"].(string)
-	if status == "" {
-		status = "updated"
-	}
-
-	_, err := db.ExecContext(r.Context(),
-		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	payload, _ := json.Marshal(body)
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
-}
-
-func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.ExecContext(r.Context(),
-		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-
-	_, _ = db.ExecContext(r.Context(),
-		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
-
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":  "healthy",
-		"service": "permify-authz-go",
-		"version": "1.0.0",
-	})
-}
-
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if err := db.Ping(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM service_configs`).Scan(&count)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"service":       "permify-authz-go",
-		"total_records": count,
-	})
-}
-
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
-			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+		for _, rule := range pol.Rules {
+			if rule.Entity != entity || rule.Action != action || rule.Effect != "deny" {
+				continue
+			}
+			if conditionsMatch(rule.Condition, ctx) {
+				return true, pol.Name
+			}
 		}
+	}
+	return false, ""
+}
+
+func conditionsMatch(conds map[string]string, ctx map[string]string) bool {
+	for k, v := range conds {
+		switch k {
+		case "role":
+			if ctx == nil || ctx["role"] != v {
+				return false
+			}
+		case "initiator":
+			if v == "same_as_approver" {
+				if ctx == nil || ctx["initiator"] == "" || ctx["initiator"] != ctx["approver"] {
+					return false
+				}
+			}
+		case "amount":
+			if ctx == nil || !numericMatch(v, ctx["amount"]) {
+				return false
+			}
+		case "kyc_level":
+			if ctx == nil || !numericMatch(v, ctx["kyc_level"]) {
+				return false
+			}
+		case "branch_different":
+			if ctx == nil || ctx["branch_different"] != v {
+				return false
+			}
+		case "time":
+			if v == "after_18:00" && time.Now().Hour() < 18 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// numericMatch checks whether actualStr satisfies a condition like ">10000000" or "<2".
+func numericMatch(cond, actualStr string) bool {
+	if actualStr == "" {
+		return false
+	}
+	op, threshold := ">", cond
+	if len(cond) > 0 && (cond[0] == '>' || cond[0] == '<') {
+		op = string(cond[0])
+		threshold = cond[1:]
+	}
+	var t, a float64
+	if _, err := fmt.Sscanf(threshold, "%f", &t); err != nil {
+		return false
+	}
+	if _, err := fmt.Sscanf(actualStr, "%f", &a); err != nil {
+		return false
+	}
+	if op == ">" {
+		return a > t
+	}
+	return a < t
+}
+
+// ---------------------------------------------------------------------------
+// Permify client
+// ---------------------------------------------------------------------------
+
+type permifyCheckReq struct {
+	Metadata permifyMeta   `json:"metadata"`
+	Entity   permifyEntity `json:"entity"`
+	Permission string      `json:"permission"`
+	Subject  permifySubject `json:"subject"`
+}
+
+type permifyMeta struct {
+	SchemaVersion string `json:"schema_version"`
+	SnapToken     string `json:"snap_token"`
+	Depth         int    `json:"depth"`
+}
+
+type permifyEntity struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+}
+
+type permifySubject struct {
+	Type string `json:"type"`
+	ID   string `json:"id"`
+}
+
+type permifyCheckResp struct {
+	Can string `json:"can"`
+}
+
+func callPermify(tenantID, userID, entityType, entityID, permission string) (bool, error) {
+	payload := permifyCheckReq{
+		Metadata:   permifyMeta{Depth: 20},
+		Entity:     permifyEntity{Type: entityType, ID: entityID},
+		Permission: permission,
+		Subject:    permifySubject{Type: "user", ID: userID},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return false, err
+	}
+
+	url := fmt.Sprintf("%s/v1/tenants/%s/permissions/check", permifyURL, tenantID)
+	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return false, fmt.Errorf("permify unreachable: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("permify returned %d", resp.StatusCode)
+	}
+
+	var result permifyCheckResp
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+	return result.Can == "CHECK_RESULT_ALLOWED", nil
+}
+
+// ---------------------------------------------------------------------------
+// API types
+// ---------------------------------------------------------------------------
+
+type CheckRequest struct {
+	Subject  string            `json:"subject"`   // "user:{id}" or bare user ID
+	Entity   string            `json:"entity"`    // entity type per v2.perm: "platform", "tenants", etc.
+	EntityID string            `json:"entity_id"` // entity instance ID; defaults to tenant ID
+	Action   string            `json:"action"`    // permission name
+	TenantID string            `json:"tenant_id,omitempty"`
+	Context  map[string]string `json:"context,omitempty"`
+}
+
+type CheckResult struct {
+	Allowed bool   `json:"allowed"`
+	Policy  string `json:"matchedPolicy,omitempty"`
+	Reason  string `json:"reason"`
+	Latency string `json:"latencyMs"`
+}
+
+type BatchCheckRequest struct {
+	UserID   string           `json:"user_id"`
+	TenantID string           `json:"tenant_id,omitempty"`
+	Checks   []BatchCheckItem `json:"checks"`
+}
+
+type BatchCheckItem struct {
+	Entity   string            `json:"entity"`
+	EntityID string            `json:"entity_id,omitempty"`
+	Action   string            `json:"action"`
+	Context  map[string]string `json:"context,omitempty"`
+}
+
+type BatchCheckResult struct {
+	Entity   string `json:"entity"`
+	EntityID string `json:"entity_id"`
+	Action   string `json:"action"`
+	Allowed  bool   `json:"allowed"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+var (
+	mu         sync.Mutex
+	checkCount int64
+	denyCount  int64
+)
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func resolveUserID(subject string) string {
+	return strings.TrimPrefix(subject, "user:")
+}
+
+func resolveTenant(r *http.Request, bodyTenant string) string {
+	if t := r.Header.Get("x-tenant-id"); t != "" {
+		return t
+	}
+	if bodyTenant != "" {
+		return bodyTenant
+	}
+	return defaultTenantID
+}
+
+// ---------------------------------------------------------------------------
+// Role catalog — derived from v2.perm schema; used by the UI to list roles
+// and their permissions without having to parse the Permify schema DSL.
+// ---------------------------------------------------------------------------
+
+type RoleEntry struct {
+	Name        string   `json:"name"`
+	Entity      string   `json:"entity"`      // "platform" | "tenants"
+	Description string   `json:"description"`
+	Permissions []string `json:"permissions"` // permission names this role grants
+}
+
+// roleCatalog is the authoritative list of roles and their permissions.
+// It mirrors v2.perm exactly — update both together when adding new permissions.
+var roleCatalog = []RoleEntry{
+	// ── platform roles ──────────────────────────────────────────────────────
+	{
+		Name: "super_admin", Entity: "platform",
+		Description: "Full platform access — bypasses all permission checks via god_mode",
+		Permissions: []string{"god_mode", "view_all_data", "manage_employees", "manage_tenants", "provide_support", "enable_features", "system_lockdown"},
+	},
+	{
+		Name: "tenant_manager", Entity: "platform",
+		Description: "Manages tenant onboarding and lifecycle",
+		Permissions: []string{"manage_tenants"},
+	},
+	{
+		Name: "operations_manager", Entity: "platform",
+		Description: "Day-to-day platform operations",
+		Permissions: []string{"view_all_data"},
+	},
+	{
+		Name: "risk_manager", Entity: "platform",
+		Description: "Platform-level risk oversight",
+		Permissions: []string{},
+	},
+	{
+		Name: "internal_auditor", Entity: "platform",
+		Description: "Read-only audit access across all platform data",
+		Permissions: []string{"view_all_data"},
+	},
+	{
+		Name: "it_admin", Entity: "platform",
+		Description: "System configuration and staff management",
+		Permissions: []string{"manage_employees", "manage_tenants", "enable_features"},
+	},
+	{
+		Name: "relationship_manager", Entity: "platform",
+		Description: "Manages tenant relationships",
+		Permissions: []string{"manage_tenants"},
+	},
+	{
+		Name: "compliance_officer", Entity: "platform",
+		Description: "Regulatory compliance and system lockdown",
+		Permissions: []string{"system_lockdown"},
+	},
+	{
+		Name: "support_agent", Entity: "platform",
+		Description: "Customer and tenant support",
+		Permissions: []string{"provide_support"},
+	},
+
+	// ── tenant roles ────────────────────────────────────────────────────────
+	{
+		Name: "super_admin", Entity: "tenants",
+		Description: "Full tenant access — bypasses all permission checks via god_mode",
+		Permissions: []string{
+			"god_mode", "view_all_data", "view_branch_data", "manage_employees",
+			"manage_customers", "suspend_or_reactivate_customers", "verify_kyc",
+			"teller_actions", "teller_management", "vault_management",
+			"initiate_transactions", "approve_or_reject", "reverse_transactions",
+			"manage_transaction_limits", "applications", "approve_loans", "manage_loan_limits",
+			"manage_esusu", "islamic_banking", "agric_banking", "lpo_management",
+			"card_issuance", "card_management", "control_cards", "dispute_management",
+			"view_audit_logs", "export_audit_logs", "flag_suspicious_activity", "manage_fraud_cases",
+			"view_analytics", "temporal_access_management",
+			"billing_management", "coa_management", "erp_management",
+			"communication_hub_management", "emergency_override",
+		},
+	},
+	{
+		Name: "branch_manager", Entity: "tenants",
+		Description: "Manages a branch — approvals, tellers, and branch accounts",
+		Permissions: []string{"view_branch_data", "teller_actions", "teller_management", "approve_or_reject"},
+	},
+	{
+		Name: "operations_manager", Entity: "tenants",
+		Description: "Day-to-day banking operations",
+		Permissions: []string{
+			"view_all_data", "manage_customers", "suspend_or_reactivate_customers",
+			"teller_actions", "teller_management", "initiate_transactions", "reverse_transactions",
+			"manage_esusu", "islamic_banking", "agric_banking",
+			"card_issuance", "card_management", "control_cards", "dispute_management",
+			"view_analytics", "communication_hub_management",
+		},
+	},
+	{
+		Name: "risk_manager", Entity: "tenants",
+		Description: "Risk assessment and transaction limit control",
+		Permissions: []string{
+			"approve_or_reject", "manage_transaction_limits", "approve_loans", "manage_loan_limits",
+			"control_cards", "flag_suspicious_activity", "manage_fraud_cases",
+		},
+	},
+	{
+		Name: "internal_auditor", Entity: "tenants",
+		Description: "Read-only audit access",
+		Permissions: []string{"view_all_data", "reverse_transactions", "view_audit_logs", "export_audit_logs"},
+	},
+	{
+		Name: "it_admin", Entity: "tenants",
+		Description: "System and staff administration within the tenant",
+		Permissions: []string{"manage_employees", "temporal_access_management", "erp_management"},
+	},
+	{
+		Name: "relationship_manager", Entity: "tenants",
+		Description: "Customer acquisition and management",
+		Permissions: []string{"manage_customers", "applications"},
+	},
+	{
+		Name: "trade_finance_admin", Entity: "tenants",
+		Description: "Trade finance and LPO operations",
+		Permissions: []string{"lpo_management"},
+	},
+	{
+		Name: "vault_manager", Entity: "tenants",
+		Description: "Vault custody and cash management",
+		Permissions: []string{"vault_management"},
+	},
+	{
+		Name: "treasury_manager", Entity: "tenants",
+		Description: "Treasury, FX, and billing management",
+		Permissions: []string{"vault_management", "approve_or_reject", "billing_management", "coa_management"},
+	},
+	{
+		Name: "loan_officer", Entity: "tenants",
+		Description: "Loan origination and approval",
+		Permissions: []string{"applications", "approve_loans", "islamic_banking", "agric_banking", "lpo_management"},
+	},
+	{
+		Name: "compliance_officer", Entity: "tenants",
+		Description: "Regulatory compliance, KYC, and audit",
+		Permissions: []string{
+			"suspend_or_reactivate_customers", "verify_kyc", "manage_transaction_limits",
+			"approve_loans", "dispute_management", "view_audit_logs",
+			"flag_suspicious_activity", "islamic_banking", "emergency_override",
+		},
+	},
+	{
+		Name: "support_agent", Entity: "tenants",
+		Description: "Customer support and communication",
+		Permissions: []string{"communication_hub_management"},
+	},
+	{
+		Name: "teller", Entity: "tenants",
+		Description: "Counter operations — deposits, withdrawals, and basic transactions",
+		Permissions: []string{"teller_actions", "initiate_transactions"},
+	},
+	{
+		Name: "fraud_analyst", Entity: "tenants",
+		Description: "Fraud monitoring, case management, and suspicious activity reporting",
+		Permissions: []string{"view_audit_logs", "flag_suspicious_activity", "manage_fraud_cases", "view_analytics"},
+	},
+}
+
+func handleRoleCatalog(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Optional ?entity= filter: ?entity=tenants or ?entity=platform
+	entity := r.URL.Query().Get("entity")
+	// Optional ?role= filter: ?role=branch_manager
+	role := r.URL.Query().Get("role")
+
+	result := make([]RoleEntry, 0, len(roleCatalog))
+	for _, r := range roleCatalog {
+		if entity != "" && r.Entity != entity {
+			continue
+		}
+		if role != "" && r.Name != role {
+			continue
+		}
+		result = append(result, r)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"roles": result,
+		"total": len(result),
 	})
 }
 
-func corsMiddleware(next http.Handler) http.Handler {
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+func main() {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8129"
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/v1/authz/check", handleCheck)
+	mux.HandleFunc("/v1/authz/check-batch", handleCheckBatch)
+	mux.HandleFunc("/v1/authz/policies", handlePolicies)
+	mux.HandleFunc("/v1/authz/roles", handleRoleCatalog)
+	mux.HandleFunc("/v1/authz/stats", handleStats)
+
+	log.Printf("permify-authz-go starting on :%s (permify upstream: %s)", port, permifyURL)
+	if err := http.ListenAndServe(":"+port, withCORS(mux)); err != nil {
+		log.Fatalf("server failed: %v", err)
+	}
+}
+
+func healthz(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	permifyOK := false
+	if resp, err := httpClient.Get(permifyURL + "/healthz"); err == nil {
+		permifyOK = resp.StatusCode == http.StatusOK
+		resp.Body.Close()
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service": "permify-authz", "status": "healthy", "port": 8129,
+		"permify": map[string]interface{}{"url": permifyURL, "reachable": permifyOK},
+	})
+}
+
+func handleCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req CheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+	if req.Subject == "" || req.Entity == "" || req.Action == "" {
+		http.Error(w, `{"error":"subject, entity, and action are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	start := time.Now()
+	tenantID := resolveTenant(r, req.TenantID)
+	userID := resolveUserID(req.Subject)
+	entityID := req.EntityID
+	if entityID == "" {
+		entityID = tenantID
+	}
+
+	mu.Lock()
+	checkCount++
+	mu.Unlock()
+
+	// Static deny layer
+	if denied, policyName := evalStaticDeny(req.Entity, req.Action, req.Context); denied {
+		mu.Lock()
+		denyCount++
+		mu.Unlock()
+		json.NewEncoder(w).Encode(CheckResult{
+			Allowed: false, Policy: policyName,
+			Reason:  "denied by static policy: " + policyName,
+			Latency: fmt.Sprintf("%d", time.Since(start).Milliseconds()),
+		})
+		return
+	}
+
+	// Real Permify check
+	allowed, err := callPermify(tenantID, userID, req.Entity, entityID, req.Action)
+	if err != nil {
+		log.Printf("permify error: %v", err)
+		http.Error(w, fmt.Sprintf(`{"error":"permify unavailable: %s"}`, err.Error()), http.StatusBadGateway)
+		return
+	}
+
+	if !allowed {
+		mu.Lock()
+		denyCount++
+		mu.Unlock()
+	}
+
+	reason := "allowed by permify"
+	if !allowed {
+		reason = "denied by permify"
+	}
+	json.NewEncoder(w).Encode(CheckResult{
+		Allowed: allowed, Reason: reason,
+		Latency: fmt.Sprintf("%d", time.Since(start).Milliseconds()),
+	})
+}
+
+func handleCheckBatch(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req BatchCheckRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+	if req.UserID == "" {
+		http.Error(w, `{"error":"user_id is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	tenantID := resolveTenant(r, req.TenantID)
+	results := make([]BatchCheckResult, len(req.Checks))
+
+	type indexed struct {
+		i int
+		r BatchCheckResult
+	}
+	ch := make(chan indexed, len(req.Checks))
+
+	sem := make(chan struct{}, 10)
+	var wg sync.WaitGroup
+
+	for i, item := range req.Checks {
+		wg.Add(1)
+		go func(i int, item BatchCheckItem) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			entityID := item.EntityID
+			if entityID == "" {
+				entityID = tenantID
+			}
+
+			res := BatchCheckResult{Entity: item.Entity, EntityID: entityID, Action: item.Action}
+
+			if denied, policyName := evalStaticDeny(item.Entity, item.Action, item.Context); denied {
+				res.Allowed = false
+				res.Reason = "denied by static policy: " + policyName
+				ch <- indexed{i, res}
+				return
+			}
+
+			allowed, err := callPermify(tenantID, req.UserID, item.Entity, entityID, item.Action)
+			if err != nil {
+				log.Printf("permify batch error [%s#%s]: %v", item.Entity, item.Action, err)
+				res.Allowed = false
+				res.Reason = "permify unavailable"
+			} else {
+				res.Allowed = allowed
+				if allowed {
+					res.Reason = "allowed by permify"
+				} else {
+					res.Reason = "denied by permify"
+				}
+			}
+			ch <- indexed{i, res}
+		}(i, item)
+	}
+
+	wg.Wait()
+	close(ch)
+	for r := range ch {
+		results[r.i] = r.r
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"user_id":   req.UserID,
+		"tenant_id": tenantID,
+		"results":   results,
+	})
+}
+
+func handlePolicies(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"items": staticPolicies, "total": len(staticPolicies)})
+}
+
+func handleStats(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	mu.Lock()
+	checks, denials := checkCount, denyCount
+	mu.Unlock()
+	denyRate := 0.0
+	if checks > 0 {
+		denyRate = float64(denials) / float64(checks) * 100
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"checksPerformed": checks,
+		"denials":         denials,
+		"denyRate":        fmt.Sprintf("%.1f%%", denyRate),
+		"staticPolicies":  len(staticPolicies),
+		"permifyURL":      permifyURL,
+	})
+}
+
+func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
-		if r.Method == "OPTIONS" {
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-tenant-id")
+		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }

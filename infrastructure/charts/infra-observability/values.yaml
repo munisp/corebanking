@@ -1,0 +1,63 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-infra-observability
+  pullPolicy: IfNotPresent
+  tag: "0.0.7"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9451
+    - port: 9452
+    - port: 9453
+    - port: 9454
+    - port: 9455
+    - port: 9456
+    - port: 9457
+    - port: 9458
+    - port: 9459
+    - port: 9460
+    - port: 9461
+    - port: 9462
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: infra-observability
+  appPort: 9455
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9451"
+  PORT_BASE: "9451"
+  SERVICE_GROUP: infra-observability
+  SERVICES: "apm-sentry-py,changelog-generator-py,corporate-monitoring-go,error-telemetry-py,incident-responder-go,kpi-threshold-monitor-rs,ops-dashboard,otel-collector-go,siem-exporter-py,synthetic-monitoring,txn-monitoring-rules-rs,wire-transfer-monitor-rs"

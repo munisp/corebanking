@@ -1,4 +1,4 @@
-module github.com/54bank/cooperative-management-go
+module github.com/54link-dev/cooperative-management-go
 
 go 1.21
 

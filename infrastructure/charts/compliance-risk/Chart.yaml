@@ -1,0 +1,6 @@
+apiVersion: v2
+name: compliance-risk
+description: 54link Compliance Risk Consolidated Helm Chart
+type: application
+version: 0.0.1
+appVersion: "1.0.0"

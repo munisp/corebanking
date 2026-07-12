@@ -1,0 +1,25 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Audit Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- AUDIT TABLE -->
+        <mxCell id="audit" value="Audit&#xa;----------------------&#xa;id (PK, UUID)&#xa;actor_id (varchar)&#xa;event_type (varchar, e.g. POST:/api/v1/loans)&#xa;event_data (JSONB)&#xa;timestamp (TIMESTAMP)&#xa;tenant_id (varchar)&#xa;created_at&#xa;updated_at&#xa;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="200" y="60" width="340" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- Design notes -->
+        <mxCell id="note1" value="Immutable HTTP event log.&#xa;Populated by fire-and-forget&#xa;audit middleware on every&#xa;non-GET request across all services.&#xa;&#xa;event_type format:&#xa;  METHOD:/normalized/path/{id}&#xa;&#xa;actor_id = keycloak sub&#xa;tenant_id = X-Tenant-ID header" style="text;html=1;strokeColor=#82b366;fillColor=#d5e8d4;align=left;verticalAlign=top;spacingLeft=4;overflow=hidden;" vertex="1" parent="1">
+          <mxGeometry x="600" y="60" width="280" height="200" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" edge="1" parent="1" source="audit" target="note1" style="endArrow=none;dashed=1;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

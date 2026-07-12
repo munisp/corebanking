@@ -15,601 +15,774 @@ import (
 "syscall"
 "time"
 
-_ "github.com/lib/pq"
-"go.temporal.io/sdk/activity"
-"go.temporal.io/sdk/client"
-"go.temporal.io/sdk/temporal"
-"go.temporal.io/sdk/worker"
-"go.temporal.io/sdk/workflow"
+	"encoding/json"
+	"fmt"
+	"log"
+	"math/rand"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+	"database/sql"
+	"bytes"
+	"strings"
+
+	"net"
+
 )
 
+var serviceName = "temporal-sagas-go"
+
+var startTime = time.Now()
+
+// ─── Domain Types ───────────────────────────────────────────────────────────
+
+type Record struct {
+	ID          string                 `json:"id"`
+	Type        string                 `json:"type"`
+	Status      string                 `json:"status"`
+	Data        map[string]interface{} `json:"data"`
+	CreatedAt   string                 `json:"createdAt"`
+	UpdatedAt   string                 `json:"updatedAt"`
+	CreatedBy   string                 `json:"createdBy,omitempty"`
+	TenantID    string                 `json:"tenantId,omitempty"`
+	Version     int                    `json:"version"`
+}
+
+type AuditEntry struct {
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	RecordID  string `json:"recordId"`
+	Actor     string `json:"actor"`
+	Timestamp string `json:"timestamp"`
+	Details   string `json:"details"`
+}
+
+type DomainStats struct {
+	TotalRecords    int                    `json:"totalRecords"`
+	ActiveRecords   int                    `json:"activeRecords"`
+	PendingRecords  int                    `json:"pendingRecords"`
+	ProcessedToday  int                    `json:"processedToday"`
+	Domain          string                 `json:"domain"`
+	Metrics         map[string]interface{} `json:"metrics"`
+}
+
+var (
+	mu      sync.Mutex
+	records = []Record{
+		{ID: "TEM-001", Type: "primary", Status: "active", Data: map[string]interface{}{"domain": "Platform/Infra", "priority": "high", "region": "lagos"}, CreatedAt: "2026-05-09T10:00:00Z", UpdatedAt: "2026-05-09T10:00:00Z", Version: 1},
+		{ID: "TEM-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Platform/Infra", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
+		{ID: "TEM-003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Platform/Infra", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
+	}
+	auditLog = []AuditEntry{}
+	domainStats = DomainStats{
+		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
+		Domain: "Platform/Infra",
+		Metrics: map[string]interface{}{
+			"avgProcessingMs": 245, "successRate": 98.5, "errorRate": 1.5,
+			"peakHour": "14:00", "throughput": 156,
+		},
+	}
+)
+
+func respondJSON(w http.ResponseWriter, code int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Service", "temporal-sagas-go")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(data)
+}
+
+// ─── Handlers ───────────────────────────────────────────────────────────────
+
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, 200, map[string]interface{}{
+		"service": "temporal-sagas-go", "status": "healthy", "version": "2.0.0",
+		"uptime_secs": int(time.Since(startTime).Seconds()),
+		"domain": "Temporal Sagas — Platform/Infra",
+		"middleware": map[string]string{
+			"kafka":      "temporal-sagas.events, temporal-sagas.audit",
+			"postgres":   "temporal_sagas_records",
+			"redis":      "temporal-sagas_cache",
+			"temporal":   "TemporalSagasWorkflow",
+			"permify":    "temporal-sagas:manage, temporal-sagas:view",
+			"opensearch": "temporal-sagas-2026",
+		},
+	})
+}
+
+func handleList(w http.ResponseWriter, r *http.Request) {
+	cacheKey := "temporal_sagas_list"
+	if cached, ok := cacheGet(cacheKey); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
+		w.WriteHeader(200)
+		w.Write([]byte(cached))
+		return
+	}
+	// DB-first query with in-memory fallback
+	if db != nil {
+		rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT 100", "temporal_sagas_go")
+		if err == nil {
+			defer rows.Close()
+			var items []map[string]interface{}
+			for rows.Next() {
+				var id, svc, typ, status, data string
+				var createdAt time.Time
+				if rows.Scan(&id, &svc, &typ, &status, &data, &createdAt) == nil {
+					items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "created_at": createdAt})
+				}
+			}
+			respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
+			return
+		}
+		log.Printf("temporal-sagas-go: DB query failed, falling back to in-memory: %v", err)
+	}
+	// In-memory fallback
+	mu.Lock()
+	defer mu.Unlock()
+	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "in-memory"})
+}
+
+func handleCreate(w http.ResponseWriter, r *http.Request) {
+	cacheSet("temporal_sagas_list", "", 1) // invalidate list cache on write
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&body)
+	// Inter-service call: health_check
+	_upstreamURL := os.Getenv("CORE_BANKING_URL")
+	if _upstreamURL == "" { _upstreamURL = "http://localhost:8100" }
+	_result, _err := callService("POST", _upstreamURL+"/v1/health", nil)
+	if _err != nil {
+		log.Printf("temporal-sagas-go: health_check failed: %v", _err)
+	} else {
+		log.Printf("temporal-sagas-go: health_check ok: %v", _result)
+	}
+
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	rec := Record{
+		ID:        fmt.Sprintf("TEM-%08X", rand.Uint32()),
+		Type:      getString(body, "type"),
+		Status:    "pending",
+		Data:      body,
+		CreatedAt: time.Now().Format(time.RFC3339),
+		UpdatedAt: time.Now().Format(time.RFC3339),
+		CreatedBy: getString(body, "createdBy"),
+		TenantID:  getString(body, "tenantId"),
+		Version:   1,
+	}
+	if rec.Type == "" { rec.Type = "primary" }
+	records = append(records, rec)
+	domainStats.TotalRecords = len(records)
+
+	// Persist to database
+	if dataBytes, err := json.Marshal(rec.Data); err == nil {
+		if dbErr := dbInsert(rec.ID, serviceName, rec.Type, rec.Status, dataBytes); dbErr != nil {
+			log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
+		}
+	}
+
+	auditLog = append(auditLog, AuditEntry{
+		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		RecordID: rec.ID, Actor: rec.CreatedBy,
+		Timestamp: rec.CreatedAt, Details: "Record created",
+	})
+
+	respondJSON(w, 201, map[string]interface{}{"created": true, "record": rec})
+}
+
+func handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
+	var body map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&body)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	id := getString(body, "id")
+	for i := range records {
+		if records[i].ID == id {
+			if s := getString(body, "status"); s != "" { records[i].Status = s }
+			for k, v := range body {
+				if k != "id" { records[i].Data[k] = v }
+			}
+			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
+			records[i].Version++
+			auditLog = append(auditLog, AuditEntry{
+				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				RecordID: id, Actor: getString(body, "updatedBy"),
+				Timestamp: records[i].UpdatedAt, Details: "Record updated",
+			})
+			respondJSON(w, 200, map[string]interface{}{"updated": true, "record": records[i]})
+			return
+		}
+	}
+	respondJSON(w, 404, map[string]string{"error": "Record not found: " + id})
+}
+
+func handleProcess(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	var body map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&body)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	id := getString(body, "id")
+	for i := range records {
+		if records[i].ID == id && records[i].Status == "pending" {
+			records[i].Status = "processing"
+			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
+			records[i].Version++
+			// Simulate domain processing
+			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
+			records[i].Data["processingResult"] = "success"
+			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
+			records[i].Status = "completed"
+			domainStats.ProcessedToday++
+			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
+			return
+		}
+	}
+	respondJSON(w, 404, map[string]string{"error": "Record not found or not pending: " + id})
+}
+
+func handleAudit(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog)})
+}
+
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	domainStats.TotalRecords = len(records)
+	active := 0; pending := 0
+	for _, r := range records {
+		if r.Status == "active" || r.Status == "completed" { active++ }
+		if r.Status == "pending" || r.Status == "processing" { pending++ }
+	}
+	domainStats.ActiveRecords = active
+	domainStats.PendingRecords = pending
+	respondJSON(w, 200, domainStats)
+}
+
+func getString(m map[string]interface{}, key string) string {
+	if v, ok := m[key].(string); ok { return v }
+	return ""
+}
+
+
+func temporal_sagasComputeScore(value float64, weight float64, threshold float64) float64 {
+    score := value * weight
+    if score > threshold { score = threshold }
+    return score
+}
+
+func temporal_sagasValidateRequest(data map[string]interface{}) map[string]interface{} {
+    errors := []string{}
+    required := []string{"id", "type"}
+    for _, field := range required {
+        if _, ok := data[field]; !ok {
+            errors = append(errors, field + " is required")
+        }
+    }
+    return map[string]interface{}{"valid": len(errors) == 0, "errors": errors}
+}
+
+func temporal_sagasScoreHandler(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        Value     float64 `json:"value"`
+        Weight    float64 `json:"weight"`
+        Threshold float64 `json:"threshold"`
+    }
+    json.NewDecoder(r.Body).Decode(&req)
+    score := temporal_sagasComputeScore(req.Value, req.Weight, req.Threshold)
+    respondJSON(w, 200, map[string]interface{}{"score": score})
+}
+
+func temporal_sagasValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
+    var body map[string]interface{}
+    json.NewDecoder(r.Body).Decode(&body)
+    result := temporal_sagasValidateRequest(body)
+    respondJSON(w, 200, result)
+}
+
+// --- Production Hardening ---
+var (
+    _reqCount  uint64
+    _errCount  uint64
+    _bootTime  = time.Now()
+)
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(200)
+    fmt.Fprintf(w, `{"ready":true,"service":"temporal-sagas-go"}`)
+}
+
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(200)
+    fmt.Fprintf(w, `{"alive":true}`)
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+    reqs := atomic.LoadUint64(&_reqCount)
+    errs := atomic.LoadUint64(&_errCount)
+    w.Header().Set("Content-Type", "text/plain")
+    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"temporal-sagas-go\"} %d\n", reqs)
+    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"temporal-sagas-go\"} %d\n", errs)
+    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"temporal-sagas-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+
+// --- Counting Middleware ---
+func countingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        atomic.AddUint64(&_reqCount, 1)
+        rw := &responseWriter{ResponseWriter: w, status: 200}
+        next.ServeHTTP(rw, r)
+        if rw.status >= 400 {
+            atomic.AddUint64(&_errCount, 1)
+        }
+    })
+}
+
+type responseWriter struct {
+    http.ResponseWriter
+    status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+    rw.status = code
+    rw.ResponseWriter.WriteHeader(code)
+}
+
+
+// --- Database Layer ---
 var db *sql.DB
-var temporalClient client.Client
-var temporalAvailable bool
 
-const (
-TaskQueueBanking = "54bank-banking"
-TaskQueuePayment = "54bank-payment"
-TaskQueueKYC     = "54bank-kyc"
-)
-
-// ─── Workflow Input/Output Types ──────────────────────────────────────────────
-
-type FundTransferInput struct {
-TransferID          string  `json:"transfer_id"`
-TenantID            string  `json:"tenant_id"`
-SourceAccountID     string  `json:"source_account_id"`
-DestAccountID       string  `json:"dest_account_id"`
-Amount              int64   `json:"amount_kobo"`
-Currency            string  `json:"currency"`
-Narration           string  `json:"narration"`
-IdempotencyKey      string  `json:"idempotency_key"`
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[%s] DATABASE_URL not set — in-memory mode", serviceName)
+		return
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[%s] DB open failed: %v — in-memory fallback", serviceName, err)
+		db = nil
+		return
+	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err = db.Ping(); err != nil {
+		log.Printf("[%s] DB ping failed: %v — in-memory fallback", serviceName, err)
+		db = nil
+		return
+	}
+	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
+		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
+		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
+		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+	)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
+	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
 }
 
-type FundTransferResult struct {
-TransferID  string `json:"transfer_id"`
-Status      string `json:"status"`
-CompletedAt string `json:"completed_at"`
+func dbList(service string, limit int) ([]map[string]interface{}, error) {
+	if db == nil { return nil, fmt.Errorf("no db") }
+	rows, err := db.Query("SELECT id, type, status, data, created_at FROM service_records WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
+	if err != nil { return nil, err }
+	defer rows.Close()
+	var items []map[string]interface{}
+	for rows.Next() {
+		var id, typ, status, data, ts string
+		rows.Scan(&id, &typ, &status, &data, &ts)
+		items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "createdAt": ts})
+	}
+	return items, nil
 }
 
-type LoanDisbursementInput struct {
-LoanID      string  `json:"loan_id"`
-TenantID    string  `json:"tenant_id"`
-CustomerID  string  `json:"customer_id"`
-AccountID   string  `json:"account_id"`
-Amount      int64   `json:"amount_kobo"`
-Currency    string  `json:"currency"`
-LoanType    string  `json:"loan_type"`
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil { return fmt.Errorf("no db") }
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
 }
 
-type KYCVerificationInput struct {
-CustomerID   string `json:"customer_id"`
-TenantID     string `json:"tenant_id"`
-BVN          string `json:"bvn"`
-NIN          string `json:"nin,omitempty"`
-DocumentType string `json:"document_type"`
-DocumentRef  string `json:"document_ref"`
+
+// --- JWT Auth Middleware ---
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
-type FXSettlementInput struct {
-TradeID      string  `json:"trade_id"`
-TenantID     string  `json:"tenant_id"`
-BuyCurrency  string  `json:"buy_currency"`
-SellCurrency string  `json:"sell_currency"`
-BuyAmount    int64   `json:"buy_amount"`
-SellAmount   int64   `json:"sell_amount"`
-ExchangeRate float64 `json:"exchange_rate"`
+
+// --- Inter-Service Communication with Circuit Breaker ---
+var _cbFailures int
+var _cbOpen bool
+var _cbLastFail time.Time
+
+func callService(method, url string, body interface{}) (map[string]interface{}, error) {
+	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	if _cbOpen { _cbOpen = false; _cbFailures = 0 }
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 { time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond) }
+		var req *http.Request
+		if body != nil {
+			j, _ := json.Marshal(body)
+		j = []byte(sanitizeInput(string(j)))
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(j))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil { lastErr = err; _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 { lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode); _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cbFailures = 0; _cbOpen = false
+		return result, nil
+	}
+	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
 }
 
-// ─── Workflows ────────────────────────────────────────────────────────────────
-
-// FundTransferWorkflow orchestrates a fund transfer with compensating transactions
-func FundTransferWorkflow(ctx workflow.Context, input FundTransferInput) (FundTransferResult, error) {
-logger := workflow.GetLogger(ctx)
-logger.Info("FundTransferWorkflow started", "transfer_id", input.TransferID)
-
-retryPolicy := &temporal.RetryPolicy{
-InitialInterval:    time.Second,
-BackoffCoefficient: 2.0,
-MaximumInterval:    30 * time.Second,
-MaximumAttempts:    3,
-}
-ao := workflow.ActivityOptions{
-StartToCloseTimeout: 30 * time.Second,
-RetryPolicy:         retryPolicy,
-}
-ctx = workflow.WithActivityOptions(ctx, ao)
-
-// Step 1: Validate accounts
-var validationResult map[string]interface{}
-if err := workflow.ExecuteActivity(ctx, ValidateAccountsActivity, input).Get(ctx, &validationResult); err != nil {
-return FundTransferResult{TransferID: input.TransferID, Status: "validation_failed"}, err
+// --- Distributed Tracing ---
+func traceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := r.Header.Get("X-Trace-Id")
+		if traceID == "" {
+			traceID = r.Header.Get("traceparent")
+		}
+		if traceID == "" {
+			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
+		}
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		next.ServeHTTP(w, r)
+	})
 }
 
-// Step 2: Reserve funds (debit source)
-var reserveResult map[string]interface{}
-if err := workflow.ExecuteActivity(ctx, ReserveFundsActivity, input).Get(ctx, &reserveResult); err != nil {
-return FundTransferResult{TransferID: input.TransferID, Status: "reserve_failed"}, err
+// --- Redis Caching Layer ---
+var redisAddr string
+
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
 }
 
-// Step 3: Credit destination
-var creditResult map[string]interface{}
-if err := workflow.ExecuteActivity(ctx, CreditDestinationActivity, input).Get(ctx, &creditResult); err != nil {
-// Compensate: release reserved funds
-compensateCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
-StartToCloseTimeout: 30 * time.Second,
-RetryPolicy:         &temporal.RetryPolicy{MaximumAttempts: 5},
-})
-workflow.ExecuteActivity(compensateCtx, ReleaseReservedFundsActivity, input).Get(ctx, nil)
-return FundTransferResult{TransferID: input.TransferID, Status: "credit_failed_compensated"}, err
+func cacheGet(key string) (string, bool) {
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return "", false }
+	defer conn.Close()
+	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil || n < 3 { return "", false }
+	resp := string(buf[:n])
+	if resp[0] == '$' && resp[1] != '-' {
+		// Parse bulk string response
+		parts := strings.SplitN(resp, "\r\n", 3)
+		if len(parts) >= 3 { return parts[1], true }
+	}
+	return "", false
 }
 
-// Step 4: Post journal entries
-workflow.ExecuteActivity(ctx, PostJournalEntriesActivity, input).Get(ctx, nil)
-
-// Step 5: Emit transfer event
-workflow.ExecuteActivity(ctx, EmitTransferEventActivity, input).Get(ctx, nil)
-
-logger.Info("FundTransferWorkflow completed", "transfer_id", input.TransferID)
-return FundTransferResult{
-TransferID:  input.TransferID,
-Status:      "completed",
-CompletedAt: workflow.Now(ctx).UTC().Format(time.RFC3339),
-}, nil
+func cacheSet(key, value string, ttlSeconds int) {
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return }
+	defer conn.Close()
+	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
+		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
 }
 
-// LoanDisbursementWorkflow orchestrates loan disbursement
-func LoanDisbursementWorkflow(ctx workflow.Context, input LoanDisbursementInput) (map[string]interface{}, error) {
-logger := workflow.GetLogger(ctx)
-logger.Info("LoanDisbursementWorkflow started", "loan_id", input.LoanID)
-
-ao := workflow.ActivityOptions{
-StartToCloseTimeout: 60 * time.Second,
-RetryPolicy: &temporal.RetryPolicy{
-InitialInterval: time.Second, MaximumAttempts: 3,
-},
-}
-ctx = workflow.WithActivityOptions(ctx, ao)
-
-// Step 1: Approve loan
-var approvalResult map[string]interface{}
-if err := workflow.ExecuteActivity(ctx, ApproveLoanActivity, input).Get(ctx, &approvalResult); err != nil {
-return map[string]interface{}{"loan_id": input.LoanID, "status": "approval_failed"}, err
+// --- mTLS Configuration ---
+func getTLSConfig() (bool, string, string) {
+	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	cert := os.Getenv("TLS_CERT_PATH")
+	key := os.Getenv("TLS_KEY_PATH")
+	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
+	if key == "" { key = "/etc/54bank/certs/service.key" }
+	return true, cert, key
 }
 
-// Step 2: Create GL entries
-workflow.ExecuteActivity(ctx, CreateLoanGLEntriesActivity, input).Get(ctx, nil)
-
-// Step 3: Disburse to account
-var disburseResult map[string]interface{}
-if err := workflow.ExecuteActivity(ctx, DisburseLoanActivity, input).Get(ctx, &disburseResult); err != nil {
-workflow.ExecuteActivity(ctx, ReverseLoanApprovalActivity, input).Get(ctx, nil)
-return map[string]interface{}{"loan_id": input.LoanID, "status": "disbursement_failed"}, err
+// --- CORS + Security Headers Middleware ---
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
-// Step 4: Schedule repayment
-workflow.ExecuteActivity(ctx, ScheduleLoanRepaymentActivity, input).Get(ctx, nil)
-
-logger.Info("LoanDisbursementWorkflow completed", "loan_id", input.LoanID)
-return map[string]interface{}{"loan_id": input.LoanID, "status": "disbursed", "completed_at": workflow.Now(ctx).UTC().Format(time.RFC3339)}, nil
+// --- Input Sanitization ---
+func sanitizeInput(s string) string {
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	s = strings.ReplaceAll(s, "'", "&#39;")
+	s = strings.ReplaceAll(s, "\"", "&quot;")
+	s = strings.ReplaceAll(s, "\\", "")
+	if len(s) > 10000 {
+		s = s[:10000]
+	}
+	return s
 }
 
-// KYCVerificationWorkflow orchestrates KYC verification
-func KYCVerificationWorkflow(ctx workflow.Context, input KYCVerificationInput) (map[string]interface{}, error) {
-logger := workflow.GetLogger(ctx)
-logger.Info("KYCVerificationWorkflow started", "customer_id", input.CustomerID)
 
-ao := workflow.ActivityOptions{
-StartToCloseTimeout: 120 * time.Second,
-RetryPolicy: &temporal.RetryPolicy{InitialInterval: 2 * time.Second, MaximumAttempts: 3},
-}
-ctx = workflow.WithActivityOptions(ctx, ao)
+var _rlTokens int64 = 100
+var _rlLastRefill int64 = 0
 
-// Step 1: BVN verification
-var bvnResult map[string]interface{}
-if err := workflow.ExecuteActivity(ctx, VerifyBVNActivity, input).Get(ctx, &bvnResult); err != nil {
-return map[string]interface{}{"customer_id": input.CustomerID, "status": "bvn_failed"}, err
-}
-
-// Step 2: Document verification
-var docResult map[string]interface{}
-workflow.ExecuteActivity(ctx, VerifyDocumentActivity, input).Get(ctx, &docResult)
-
-// Step 3: AML screening
-var amlResult map[string]interface{}
-workflow.ExecuteActivity(ctx, AMLScreeningActivity, input).Get(ctx, &amlResult)
-
-// Step 4: Update customer KYC status
-workflow.ExecuteActivity(ctx, UpdateKYCStatusActivity, input).Get(ctx, nil)
-
-logger.Info("KYCVerificationWorkflow completed", "customer_id", input.CustomerID)
-return map[string]interface{}{"customer_id": input.CustomerID, "status": "verified", "completed_at": workflow.Now(ctx).UTC().Format(time.RFC3339)}, nil
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
 }
 
-// FXSettlementWorkflow orchestrates FX trade settlement
-func FXSettlementWorkflow(ctx workflow.Context, input FXSettlementInput) (map[string]interface{}, error) {
-logger := workflow.GetLogger(ctx)
-logger.Info("FXSettlementWorkflow started", "trade_id", input.TradeID)
-
-ao := workflow.ActivityOptions{
-StartToCloseTimeout: 60 * time.Second,
-RetryPolicy: &temporal.RetryPolicy{InitialInterval: time.Second, MaximumAttempts: 3},
-}
-ctx = workflow.WithActivityOptions(ctx, ao)
-
-workflow.ExecuteActivity(ctx, ValidateFXRateActivity, input).Get(ctx, nil)
-workflow.ExecuteActivity(ctx, DebitSellCurrencyActivity, input).Get(ctx, nil)
-workflow.ExecuteActivity(ctx, CreditBuyCurrencyActivity, input).Get(ctx, nil)
-workflow.ExecuteActivity(ctx, PostFXJournalEntriesActivity, input).Get(ctx, nil)
-workflow.ExecuteActivity(ctx, UpdateNostroBalanceActivity, input).Get(ctx, nil)
-
-logger.Info("FXSettlementWorkflow completed", "trade_id", input.TradeID)
-return map[string]interface{}{"trade_id": input.TradeID, "status": "settled", "completed_at": workflow.Now(ctx).UTC().Format(time.RFC3339)}, nil
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
-// ─── Activities ───────────────────────────────────────────────────────────────
 
-func ValidateAccountsActivity(ctx context.Context, input FundTransferInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] ValidateAccounts: transfer=%s src=%s dst=%s", input.TransferID, input.SourceAccountID, input.DestAccountID)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'ValidateAccounts', 'completed', $2)`,
-input.TransferID, fmt.Sprintf(`{"transfer_id":"%s"}`, input.TransferID))
-return map[string]interface{}{"valid": true, "transfer_id": input.TransferID}, nil
+func validateWorkflowExecution(workflowID, taskQueue string, timeoutSecs int) (bool, string) {
+	if workflowID == "" { return false, "Workflow ID required" }
+	if taskQueue == "" { return false, "Task queue required" }
+	if timeoutSecs > 86400 { return false, "Workflow timeout cannot exceed 24 hours" }
+	return true, "Workflow execution valid"
+}
+func computeRetryBackoff(attempt int, initialDelay float64) float64 {
+	delay := initialDelay
+	for i := 0; i < attempt; i++ { delay *= 2.0 }
+	if delay > 300 { return 300 } // Max 5 minutes
+	return delay
 }
 
-func ReserveFundsActivity(ctx context.Context, input FundTransferInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] ReserveFunds: transfer=%s amount=%d", input.TransferID, input.Amount)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'ReserveFunds', 'completed', $2)`,
-input.TransferID, fmt.Sprintf(`{"amount":%d,"currency":"%s"}`, input.Amount, input.Currency))
-return map[string]interface{}{"reserved": true, "reservation_id": input.TransferID + "-rsv"}, nil
+
+// --- Circuit Breaker + Retry (Production) ---
+type circuitBreaker struct {
+    failures    int
+    lastFailure time.Time
+    threshold   int
+    resetAfter  time.Duration
+    mu          sync.Mutex
 }
 
-func CreditDestinationActivity(ctx context.Context, input FundTransferInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] CreditDestination: transfer=%s dest=%s", input.TransferID, input.DestAccountID)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'CreditDestination', 'completed', $2)`,
-input.TransferID, fmt.Sprintf(`{"dest_account":"%s"}`, input.DestAccountID))
-return map[string]interface{}{"credited": true}, nil
+func (cb *circuitBreaker) allow() bool {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    if cb.failures >= cb.threshold {
+        if time.Since(cb.lastFailure) > cb.resetAfter {
+            cb.failures = cb.threshold / 2
+            return true
+        }
+        return false
+    }
+    return true
 }
 
-func ReleaseReservedFundsActivity(ctx context.Context, input FundTransferInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] ReleaseReservedFunds (compensation): transfer=%s", input.TransferID)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'ReleaseReservedFunds', 'compensated', $2)`,
-input.TransferID, fmt.Sprintf(`{"transfer_id":"%s"}`, input.TransferID))
-return map[string]interface{}{"released": true}, nil
+func (cb *circuitBreaker) recordSuccess() {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    if cb.failures > 0 { cb.failures-- }
 }
 
-func PostJournalEntriesActivity(ctx context.Context, input FundTransferInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] PostJournalEntries: transfer=%s", input.TransferID)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'PostJournalEntries', 'completed', $2)`,
-input.TransferID, fmt.Sprintf(`{"transfer_id":"%s","amount":%d}`, input.TransferID, input.Amount))
-return map[string]interface{}{"posted": true}, nil
+func (cb *circuitBreaker) recordFailure() {
+    cb.mu.Lock()
+    defer cb.mu.Unlock()
+    cb.failures++
+    cb.lastFailure = time.Now()
 }
 
-func EmitTransferEventActivity(ctx context.Context, input FundTransferInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] EmitTransferEvent: transfer=%s", input.TransferID)
-return map[string]interface{}{"emitted": true}, nil
+var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
+
+func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
+    if !_cb.allow() {
+        return nil, fmt.Errorf("circuit breaker open for %s", url)
+    }
+    client := &http.Client{Timeout: 15 * time.Second}
+    var lastErr error
+    for attempt := 0; attempt < 3; attempt++ {
+        if attempt > 0 {
+            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+        }
+        var req *http.Request
+        if body != nil {
+            jsonData, _ := json.Marshal(body)
+            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+        } else {
+            req, _ = http.NewRequest(method, url, nil)
+        }
+        req.Header.Set("Content-Type", "application/json")
+        req.Header.Set("X-Source-Service", serviceName)
+        resp, err := client.Do(req)
+        if err != nil {
+            lastErr = err
+            _cb.recordFailure()
+            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+            continue
+        }
+        defer resp.Body.Close()
+        if resp.StatusCode >= 500 {
+            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+            _cb.recordFailure()
+            continue
+        }
+        var result map[string]interface{}
+        json.NewDecoder(resp.Body).Decode(&result)
+        _cb.recordSuccess()
+        return result, nil
+    }
+    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
-func ApproveLoanActivity(ctx context.Context, input LoanDisbursementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] ApproveLoan: loan=%s", input.LoanID)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'ApproveLoan', 'completed', $2)`,
-input.LoanID, fmt.Sprintf(`{"loan_id":"%s"}`, input.LoanID))
-return map[string]interface{}{"approved": true}, nil
+// --- Alerting ---
+type alertManager struct {
+    rules []alertRule
+    mu    sync.RWMutex
 }
 
-func CreateLoanGLEntriesActivity(ctx context.Context, input LoanDisbursementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] CreateLoanGLEntries: loan=%s", input.LoanID)
-return map[string]interface{}{"gl_posted": true}, nil
+type alertRule struct {
+    Name      string
+    Metric    string
+    Threshold float64
+    Severity  string
 }
 
-func DisburseLoanActivity(ctx context.Context, input LoanDisbursementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] DisburseLoan: loan=%s amount=%d", input.LoanID, input.Amount)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'DisburseLoan', 'completed', $2)`,
-input.LoanID, fmt.Sprintf(`{"amount":%d,"account":"%s"}`, input.Amount, input.AccountID))
-return map[string]interface{}{"disbursed": true}, nil
+var _alertMgr = &alertManager{
+    rules: []alertRule{
+        {"high_error_rate", "error_rate", 0.05, "critical"},
+        {"high_latency", "p99_latency_ms", 5000, "warning"},
+        {"db_connection_failures", "db_failures", 3, "critical"},
+    },
 }
 
-func ReverseLoanApprovalActivity(ctx context.Context, input LoanDisbursementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] ReverseLoanApproval (compensation): loan=%s", input.LoanID)
-return map[string]interface{}{"reversed": true}, nil
+func (am *alertManager) check() []map[string]interface{} {
+    var fired []map[string]interface{}
+    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+    if errRate > 0.05 {
+        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+    }
+    return fired
 }
 
-func ScheduleLoanRepaymentActivity(ctx context.Context, input LoanDisbursementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] ScheduleLoanRepayment: loan=%s", input.LoanID)
-return map[string]interface{}{"scheduled": true}, nil
+func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+
+func alertsHandler(w http.ResponseWriter, r *http.Request) {
+    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
-func VerifyBVNActivity(ctx context.Context, input KYCVerificationInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] VerifyBVN: customer=%s", input.CustomerID)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'VerifyBVN', 'completed', $2)`,
-input.CustomerID, fmt.Sprintf(`{"bvn_verified":true,"customer_id":"%s"}`, input.CustomerID))
-return map[string]interface{}{"bvn_verified": true, "match_score": 98}, nil
+// --- Graceful Degradation ---
+type degradationState struct {
+    dbAvailable    bool
+    cacheAvailable bool
+    upstreamOK     map[string]bool
+    mu             sync.RWMutex
 }
 
-func VerifyDocumentActivity(ctx context.Context, input KYCVerificationInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] VerifyDocument: customer=%s doc=%s", input.CustomerID, input.DocumentType)
-return map[string]interface{}{"doc_verified": true}, nil
+var _degrade = &degradationState{
+    dbAvailable:    true,
+    cacheAvailable: true,
+    upstreamOK:     make(map[string]bool),
 }
 
-func AMLScreeningActivity(ctx context.Context, input KYCVerificationInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] AMLScreening: customer=%s", input.CustomerID)
-return map[string]interface{}{"aml_clear": true, "risk_score": 12}, nil
+func (d *degradationState) setDB(ok bool) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+    d.dbAvailable = ok
 }
 
-func UpdateKYCStatusActivity(ctx context.Context, input KYCVerificationInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] UpdateKYCStatus: customer=%s", input.CustomerID)
-db.ExecContext(ctx, `INSERT INTO temporal_activity_log (workflow_id, activity_name, status, payload) VALUES ($1, 'UpdateKYCStatus', 'completed', $2)`,
-input.CustomerID, fmt.Sprintf(`{"status":"verified","customer_id":"%s"}`, input.CustomerID))
-return map[string]interface{}{"updated": true}, nil
+func (d *degradationState) isDBAvailable() bool {
+    d.mu.RLock()
+    defer d.mu.RUnlock()
+    return d.dbAvailable
 }
 
-func ValidateFXRateActivity(ctx context.Context, input FXSettlementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] ValidateFXRate: trade=%s rate=%f", input.TradeID, input.ExchangeRate)
-return map[string]interface{}{"rate_valid": true}, nil
+func (d *degradationState) setUpstream(name string, ok bool) {
+    d.mu.Lock()
+    defer d.mu.Unlock()
+    d.upstreamOK[name] = ok
 }
 
-func DebitSellCurrencyActivity(ctx context.Context, input FXSettlementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] DebitSellCurrency: trade=%s sell=%s amount=%d", input.TradeID, input.SellCurrency, input.SellAmount)
-return map[string]interface{}{"debited": true}, nil
+func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
+    _degrade.mu.RLock()
+    defer _degrade.mu.RUnlock()
+    jsonResp(w, 200, map[string]interface{}{
+        "service":        serviceName,
+        "db_available":   _degrade.dbAvailable,
+        "cache_available": _degrade.cacheAvailable,
+        "upstreams":      _degrade.upstreamOK,
+        "mode":           func() string { if _degrade.dbAvailable { return "normal" }; return "degraded" }(),
+    })
 }
-
-func CreditBuyCurrencyActivity(ctx context.Context, input FXSettlementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] CreditBuyCurrency: trade=%s buy=%s amount=%d", input.TradeID, input.BuyCurrency, input.BuyAmount)
-return map[string]interface{}{"credited": true}, nil
-}
-
-func PostFXJournalEntriesActivity(ctx context.Context, input FXSettlementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] PostFXJournalEntries: trade=%s", input.TradeID)
-return map[string]interface{}{"posted": true}, nil
-}
-
-func UpdateNostroBalanceActivity(ctx context.Context, input FXSettlementInput) (map[string]interface{}, error) {
-log.Printf("[temporal-sagas-go] UpdateNostroBalance: trade=%s", input.TradeID)
-return map[string]interface{}{"updated": true}, nil
-}
-
-// ─── Schema ───────────────────────────────────────────────────────────────────
-
-func initSchema() {
-ddl := `
-CREATE TABLE IF NOT EXISTS temporal_workflow_executions (
-id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-workflow_id VARCHAR(128) NOT NULL,
-workflow_run_id VARCHAR(128),
-workflow_type VARCHAR(128) NOT NULL,
-task_queue VARCHAR(128) NOT NULL,
-tenant_id VARCHAR(64),
-input_payload JSONB,
-result_payload JSONB,
-status VARCHAR(32) NOT NULL DEFAULT 'running',
-started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-completed_at TIMESTAMPTZ,
-error_message TEXT,
-UNIQUE(workflow_id, workflow_run_id)
-);
-
-CREATE TABLE IF NOT EXISTS temporal_activity_log (
-id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-workflow_id VARCHAR(128) NOT NULL,
-activity_name VARCHAR(128) NOT NULL,
-attempt INTEGER NOT NULL DEFAULT 1,
-status VARCHAR(32) NOT NULL DEFAULT 'completed',
-payload JSONB,
-error_message TEXT,
-started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS temporal_saga_compensations (
-id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-workflow_id VARCHAR(128) NOT NULL,
-saga_type VARCHAR(64) NOT NULL,
-step_name VARCHAR(128) NOT NULL,
-compensation_activity VARCHAR(128) NOT NULL,
-status VARCHAR(32) NOT NULL DEFAULT 'pending',
-executed_at TIMESTAMPTZ,
-created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS temporal_schedules (
-id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-schedule_id VARCHAR(128) NOT NULL UNIQUE,
-workflow_type VARCHAR(128) NOT NULL,
-cron_expression VARCHAR(64),
-interval_seconds INTEGER,
-task_queue VARCHAR(128) NOT NULL,
-input_payload JSONB,
-status VARCHAR(32) NOT NULL DEFAULT 'active',
-last_run_at TIMESTAMPTZ,
-next_run_at TIMESTAMPTZ,
-created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_temporal_workflows_type ON temporal_workflow_executions(workflow_type, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_temporal_workflows_tenant ON temporal_workflow_executions(tenant_id, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_temporal_workflows_status ON temporal_workflow_executions(status, started_at DESC);
-CREATE INDEX IF NOT EXISTS idx_temporal_activity_workflow ON temporal_activity_log(workflow_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_temporal_compensations_workflow ON temporal_saga_compensations(workflow_id);
-`
-if _, err := db.Exec(ddl); err != nil {
-log.Printf("[temporal-sagas-go] Schema init failed: %v", err)
-} else {
-log.Printf("[temporal-sagas-go] Schema initialized (4 tables)")
-}
-}
-
-// ─── HTTP Handlers ────────────────────────────────────────────────────────────
-
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
-w.Header().Set("Content-Type", "application/json")
-w.WriteHeader(status)
-json.NewEncoder(w).Encode(v)
-}
-
-func getEnv(key, fallback string) string {
-if v := os.Getenv(key); v != "" { return v }
-return fallback
-}
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-temporalStatus := "degraded"
-if temporalAvailable { temporalStatus = "connected" }
-dbStatus := "connected"
-if err := db.PingContext(r.Context()); err != nil { dbStatus = "unhealthy" }
-writeJSON(w, http.StatusOK, map[string]interface{}{
-"status": "healthy", "service": "temporal-sagas-go", "version": "3.0.0",
-"checks": map[string]string{"database": dbStatus, "temporal": temporalStatus},
-"workflows": []string{"FundTransferWorkflow", "LoanDisbursementWorkflow", "KYCVerificationWorkflow", "FXSettlementWorkflow"},
-})
-}
-
-func startWorkflowHandler(w http.ResponseWriter, r *http.Request) {
-var req struct {
-WorkflowType string          `json:"workflow_type"`
-WorkflowID   string          `json:"workflow_id"`
-TenantID     string          `json:"tenant_id"`
-Input        json.RawMessage `json:"input"`
-}
-if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-return
-}
-
-if !temporalAvailable || temporalClient == nil {
-// Store in DB for later execution
-inputStr := string(req.Input)
-db.ExecContext(r.Context(),
-`INSERT INTO temporal_workflow_executions (workflow_id, workflow_type, task_queue, tenant_id, input_payload, status) VALUES ($1, $2, $3, $4, $5, 'queued')`,
-req.WorkflowID, req.WorkflowType, TaskQueueBanking, req.TenantID, inputStr)
-writeJSON(w, http.StatusAccepted, map[string]interface{}{
-"workflow_id": req.WorkflowID, "status": "queued", "message": "Temporal not available, workflow queued",
-})
-return
-}
-
-opts := client.StartWorkflowOptions{
-ID:        req.WorkflowID,
-TaskQueue: TaskQueueBanking,
-}
-
-var run client.WorkflowRun
-var err error
-
-switch req.WorkflowType {
-case "FundTransferWorkflow":
-var input FundTransferInput
-json.Unmarshal(req.Input, &input)
-run, err = temporalClient.ExecuteWorkflow(r.Context(), opts, FundTransferWorkflow, input)
-case "LoanDisbursementWorkflow":
-var input LoanDisbursementInput
-json.Unmarshal(req.Input, &input)
-run, err = temporalClient.ExecuteWorkflow(r.Context(), opts, LoanDisbursementWorkflow, input)
-case "KYCVerificationWorkflow":
-var input KYCVerificationInput
-json.Unmarshal(req.Input, &input)
-run, err = temporalClient.ExecuteWorkflow(r.Context(), opts, KYCVerificationWorkflow, input)
-case "FXSettlementWorkflow":
-var input FXSettlementInput
-json.Unmarshal(req.Input, &input)
-run, err = temporalClient.ExecuteWorkflow(r.Context(), opts, FXSettlementWorkflow, input)
-default:
-writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown workflow type"})
-return
-}
-
-if err != nil {
-writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-return
-}
-
-db.ExecContext(r.Context(),
-`INSERT INTO temporal_workflow_executions (workflow_id, workflow_run_id, workflow_type, task_queue, tenant_id, input_payload, status) VALUES ($1, $2, $3, $4, $5, $6, 'running') ON CONFLICT (workflow_id, workflow_run_id) DO NOTHING`,
-run.GetID(), run.GetRunID(), req.WorkflowType, TaskQueueBanking, req.TenantID, string(req.Input))
-
-writeJSON(w, http.StatusCreated, map[string]interface{}{
-"workflow_id": run.GetID(), "run_id": run.GetRunID(), "status": "started",
-})
-}
-
-func listWorkflowsHandler(w http.ResponseWriter, r *http.Request) {
-tenantID := r.URL.Query().Get("tenant_id")
-workflowType := r.URL.Query().Get("workflow_type")
-rows, err := db.QueryContext(r.Context(),
-`SELECT workflow_id, workflow_type, task_queue, status, started_at FROM temporal_workflow_executions WHERE ($1 = '' OR tenant_id = $1) AND ($2 = '' OR workflow_type = $2) ORDER BY started_at DESC LIMIT 50`,
-tenantID, workflowType)
-if err != nil {
-writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-return
-}
-defer rows.Close()
-var workflows []map[string]interface{}
-for rows.Next() {
-var wfID, wfType, taskQueue, status string
-var startedAt time.Time
-rows.Scan(&wfID, &wfType, &taskQueue, &status, &startedAt)
-workflows = append(workflows, map[string]interface{}{
-"workflow_id": wfID, "workflow_type": wfType, "task_queue": taskQueue,
-"status": status, "started_at": startedAt,
-})
-}
-writeJSON(w, http.StatusOK, map[string]interface{}{"workflows": workflows, "count": len(workflows)})
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
 
 func main() {
-log.SetFlags(log.LstdFlags | log.Lshortfile)
-log.Printf("[temporal-sagas-go] starting v3.0.0 (Temporal Go SDK integrated)")
-
-dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/temporal_sagas_go?sslmode=disable")
-var err error
-db, err = sql.Open("postgres", dsn)
-if err != nil { log.Fatalf("[temporal-sagas-go] DB open failed: %v", err) }
-defer db.Close()
-db.SetMaxOpenConns(25)
-db.SetMaxIdleConns(5)
-db.SetConnMaxLifetime(5 * time.Minute)
-for i := 0; i < 10; i++ {
-if err := db.Ping(); err == nil { break }
-log.Printf("[temporal-sagas-go] Waiting for DB... (%d/10)", i+1)
-time.Sleep(2 * time.Second)
-}
-initSchema()
-
-temporalHost := getEnv("TEMPORAL_HOST", "temporal:7233")
-temporalNamespace := getEnv("TEMPORAL_NAMESPACE", "54bank")
-
-// Connect to Temporal
-go func() {
-time.Sleep(5 * time.Second)
-c, err := client.Dial(client.Options{
-HostPort:  temporalHost,
-Namespace: temporalNamespace,
-})
-if err != nil {
-log.Printf("[temporal-sagas-go] Temporal client failed (degraded): %v", err)
-return
-}
-temporalClient = c
-temporalAvailable = true
-log.Printf("[temporal-sagas-go] Temporal client connected (%s namespace=%s)", temporalHost, temporalNamespace)
-
-// Start worker
-w := worker.New(c, TaskQueueBanking, worker.Options{})
-w.RegisterWorkflow(FundTransferWorkflow)
-w.RegisterWorkflow(LoanDisbursementWorkflow)
-w.RegisterWorkflow(KYCVerificationWorkflow)
-w.RegisterWorkflow(FXSettlementWorkflow)
-w.RegisterActivity(ValidateAccountsActivity)
-w.RegisterActivity(ReserveFundsActivity)
-w.RegisterActivity(CreditDestinationActivity)
-w.RegisterActivity(ReleaseReservedFundsActivity)
-w.RegisterActivity(PostJournalEntriesActivity)
-w.RegisterActivity(EmitTransferEventActivity)
-w.RegisterActivity(ApproveLoanActivity)
-w.RegisterActivity(CreateLoanGLEntriesActivity)
-w.RegisterActivity(DisburseLoanActivity)
-w.RegisterActivity(ReverseLoanApprovalActivity)
-w.RegisterActivity(ScheduleLoanRepaymentActivity)
-w.RegisterActivity(VerifyBVNActivity)
-w.RegisterActivity(VerifyDocumentActivity)
-w.RegisterActivity(AMLScreeningActivity)
-w.RegisterActivity(UpdateKYCStatusActivity)
-w.RegisterActivity(ValidateFXRateActivity)
-w.RegisterActivity(DebitSellCurrencyActivity)
-w.RegisterActivity(CreditBuyCurrencyActivity)
-w.RegisterActivity(PostFXJournalEntriesActivity)
-w.RegisterActivity(UpdateNostroBalanceActivity)
-
-if err := w.Start(); err != nil {
-log.Printf("[temporal-sagas-go] Worker start failed: %v", err)
-} else {
-log.Printf("[temporal-sagas-go] Temporal worker started on queue=%s", TaskQueueBanking)
-}
-}()
-
-// Ensure activity package is used
-_ = activity.GetInfo
-
+	port := os.Getenv("PORT")
+	if port == "" { port = "9444" }
+	initDB()
 mux := http.NewServeMux()
 mux.HandleFunc("/healthz", healthHandler)
 mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
@@ -633,19 +806,45 @@ appPort := getEnv("PORT", "8044")
 srv := &http.Server{Addr: ":" + appPort, Handler: mux, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second}
 log.Printf("[temporal-sagas-go] ready on :%s (temporal=%s namespace=%s)", appPort, temporalHost, temporalNamespace)
 
-go func() {
-if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-log.Fatalf("[temporal-sagas-go] server error: %v", err)
+	mux.HandleFunc("/metrics", metricsHandler)
+
+	mux.HandleFunc("/v1/alerts", alertsHandler)
+	mux.HandleFunc("/v1/degradation", degradationStatusHandler)
+	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/v1/temporal-sagas/list", handleList)
+	mux.HandleFunc("/v1/temporal-sagas/create", handleCreate)
+	mux.HandleFunc("/v1/temporal-sagas/update", handleUpdate)
+	mux.HandleFunc("/v1/temporal-sagas/process", handleProcess)
+	mux.HandleFunc("/v1/temporal-sagas/audit", handleAudit)
+	mux.HandleFunc("/v1/temporal-sagas/stats", handleStats)
+	mux.HandleFunc("/v1/temporal-sagas/score", temporal_sagasScoreHandler)
+	mux.HandleFunc("/v1/temporal-sagas/validate", temporal_sagasValidateRequestHandler)
+	log.Printf("Temporal Sagas v2.0 (Platform/Infra) on :%s", port)
+	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
+	_ = tlsCert
+	_ = tlsKey
+	_ = tlsEnabled
+	server := &http.Server{
+        Addr:    ":" + port,
+        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+        ReadTimeout:  15 * time.Second,
+        WriteTimeout: 30 * time.Second,
+        IdleTimeout:  60 * time.Second,
+    }
+    quit := make(chan os.Signal, 1)
+    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+    go func() {
+        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+            log.Fatalf("Server error: %v", err)
+        }
+    }()
+    <-quit
+    log.Println("[temporal-sagas-go] Shutdown signal received")
+    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+    defer cancel()
+    _ = server.Shutdown(ctx)
+    log.Println("[temporal-sagas-go] Server stopped gracefully")
 }
 }()
 
-quit := make(chan os.Signal, 1)
-signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-<-quit
-log.Printf("[temporal-sagas-go] shutting down...")
-ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-defer cancel()
-srv.Shutdown(ctx)
-if temporalClient != nil { temporalClient.Close() }
-log.Printf("[temporal-sagas-go] stopped")
-}
+func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

@@ -1,0 +1,8 @@
+/node_modules
+/logs
+/dist
+
+.env
+.env.local
+.env.production
+infrastructure/charts/*/values.yaml
