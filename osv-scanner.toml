@@ -1,0 +1,38 @@
+# OSV-Scanner configuration for munisp/corebanking
+# https://google.github.io/osv-scanner/configuration/
+
+[scan]
+# Scan all lockfiles and manifests recursively
+recursive = true
+
+# Include these file patterns
+include = [
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "requirements.txt",
+  "requirements*.txt",
+  "Cargo.lock",
+  "go.sum",
+  "poetry.lock",
+  "Pipfile.lock",
+]
+
+# Exclude test fixtures and vendored code
+exclude = [
+  "**/node_modules/**",
+  "**/target/**",
+  "**/.git/**",
+  "**/vendor/**",
+  "**/testdata/**",
+]
+
+[[IgnoredVulns]]
+# Ignore dev-only test utilities that are not deployed
+id = "GHSA-example-devonly"
+reason = "Only used in test environment, not deployed to production"
+
+[output]
+# Fail on CRITICAL and HIGH severity
+fail-on-vuln = true
+min-severity = "HIGH"

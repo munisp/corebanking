@@ -5,10 +5,10 @@ edition = "2021"
 description = "54link-dev Collateral Valuation Engine — property, vehicle, securities, forced sale value, haircuts"
 
 [dependencies]
-actix-web = "4"
-actix-rt = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tokio = { version = "1", features = ["full"] }
+actix-web = "4.9.0"
+actix-rt = "2.10.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tokio = { version = "1.43.1", features = ["full"] }
