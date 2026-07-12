@@ -3,81 +3,27 @@ use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-// qdrant-vector-store-rs — Qdrant vector database service
-// Semantic embeddings for banking documents, regulations, entities.
-// Powers similarity search, regulatory document retrieval,
-// entity deduplication, and RAG for LangChain agents.
-
-// ─── QDRANT CLIENT ───────────────────────────────────────────────────────────
-
-struct QdrantClient {
-    base_url: String,
-    collection_prefix: String,
-}
-
-impl QdrantClient {
-    fn new() -> Self {
-        let base_url = env::var("QDRANT_URL").unwrap_or_else(|_| "http://qdrant:6333".to_string());
-        QdrantClient {
-            base_url,
-            collection_prefix: "bank54".to_string(),
-        }
-    }
-
-    fn create_collection(&self, name: &str, vector_size: u32) -> Result<serde_json::Value, String> {
-        let url = format!("{}/collections/{}", self.base_url, name);
-        let body = json!({
-            "vectors": {"size": vector_size, "distance": "Cosine"},
-            "optimizers_config": {"default_segment_number": 2},
-            "replication_factor": 1
-        });
-        eprintln!("[qdrant] creating collection: {} (dim={})", name, vector_size);
-        Ok(json!({"status": "created", "collection": name, "vectorSize": vector_size}))
-    }
-
-    fn upsert_points(&self, collection: &str, points: &[VectorPoint]) -> Result<usize, String> {
-        eprintln!("[qdrant] upserting {} points to {}", points.len(), collection);
-        Ok(points.len())
-    }
-
-    fn search(&self, collection: &str, vector: &[f32], limit: u32, filter: Option<&serde_json::Value>) -> Result<Vec<SearchResult>, String> {
-        eprintln!("[qdrant] searching {} (limit={}, has_filter={})", collection, limit, filter.is_some());
-        Ok(Vec::new())
-    }
-
-    fn delete_collection(&self, name: &str) -> Result<(), String> {
-        eprintln!("[qdrant] deleting collection: {}", name);
-        Ok(())
-    }
-}
-
-// ─── VECTOR MODELS ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct VectorPoint {
-    pub id: String,
-    pub vector: Vec<f32>,
-    pub payload: serde_json::Value,
-}
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct SearchResult {
-    pub id: String,
-    pub score: f32,
-    pub payload: serde_json::Value,
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct SearchRequest {
-    pub vector: Vec<f32>,
-    pub collection: String,
-    pub limit: Option<u32>,
-    pub filter: Option<serde_json::Value>,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -182,11 +128,7 @@ fn cbn_reporting_threshold_ngn() -> f64 { 5_000_000.0 }
 // ─── APP STATE ───────────────────────────────────────────────────────────────
 
 struct AppState {
-    qdrant: QdrantClient,
-    collections: Mutex<Vec<CollectionConfig>>,
-    points: Mutex<std::collections::HashMap<String, Vec<VectorPoint>>>,
-    db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -548,32 +490,25 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080);
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[qdrant-vector-store-rs] starting");
 
-    let db_url = env::var("DATABASE_URL").ok();
-    let db_client = if let Some(ref url) = db_url {
-        match tokio_postgres::connect(url, tokio_postgres::NoTls).await {
-            Ok((client, connection)) => {
-                tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB error: {}", e); } });
-                Some(std::sync::Arc::new(client))
-            }
-            Err(e) => { eprintln!("DB connect failed: {}", e); None }
-        }
-    } else { None };
+    let db_name = "qdrant-vector-store-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
 
-    let state = web::Data::new(AppState {
-        qdrant: QdrantClient::new(),
-        collections: Mutex::new(Vec::new()),
-        points: Mutex::new(std::collections::HashMap::new()),
-        db_url,
-        db_client,
-    });
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
 
-    println!("qdrant-vector-store-rs listening on port {}", port);
+    init_schema(&pool).await;
+    log::info!("[qdrant-vector-store-rs] database connected, schema initialized");
 
     start_grpc_server("qdrant-vector-store-rs", 10443);
     HttpServer::new(move || {
-        let trace_id = format!("trace-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         App::new()
             .app_data(state.clone())
             .wrap(actix_web::middleware::DefaultHeaders::new()
@@ -595,12 +530,11 @@ async fn main() -> std::io::Result<()> {
             .route("/ready", web::get().to(readyz))
             .route("/live", web::get().to(livez))
             .route("/metrics", web::get().to(metrics))
-            // Vector Store API
-            .route("/v1/vectors/init", web::post().to(init_collections))
-            .route("/v1/vectors/upsert", web::post().to(upsert_vectors))
-            .route("/v1/vectors/search", web::post().to(semantic_search))
-            .route("/v1/vectors/embed", web::post().to(embed_text))
-            .route("/v1/vectors/regulations", web::post().to(search_regulations))
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
@@ -620,4 +554,46 @@ mod tests {
     fn test_rate_limiter() {
         assert!(rl_allow());
     }
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

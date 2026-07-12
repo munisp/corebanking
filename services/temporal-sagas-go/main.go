@@ -1,15 +1,19 @@
-// 54Bank Temporal Sagas — Go
-// Domain: Platform/Infra
-// Full domain-specific implementation with business logic
-// Middleware: Kafka, Postgres, Redis, Temporal, Permify, OpenSearch
+// temporal-sagas-go — Temporal.io Saga Orchestration for 54Bank
+// Implements: fund transfer saga, loan disbursement saga, KYC saga, FX settlement saga
+// Uses Temporal Go SDK for durable workflow execution and activity scheduling
 package main
 
 import (
-	_ "github.com/lib/pq"
 "context"
+"database/sql"
+"encoding/json"
+"fmt"
+"log"
+"net/http"
+"os"
 "os/signal"
 "syscall"
-"sync/atomic"
+"time"
 
 	"encoding/json"
 	"fmt"
@@ -780,9 +784,27 @@ func main() {
 	if port == "" { port = "9444" }
 	initDB()
 mux := http.NewServeMux()
-	mux.HandleFunc("/readyz", readyzHandler)
+mux.HandleFunc("/healthz", healthHandler)
+mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+})
+mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
+})
+mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+var total, running, completed int64
+db.QueryRow("SELECT COUNT(*) FROM temporal_workflow_executions").Scan(&total)
+db.QueryRow("SELECT COUNT(*) FROM temporal_workflow_executions WHERE status='running'").Scan(&running)
+db.QueryRow("SELECT COUNT(*) FROM temporal_workflow_executions WHERE status='completed'").Scan(&completed)
+fmt.Fprintf(w, "temporal_workflows_total %d\ntemporal_workflows_running %d\ntemporal_workflows_completed %d\n", total, running, completed)
+})
+mux.HandleFunc("/api/v1/workflows", func(w http.ResponseWriter, r *http.Request) {
+if r.Method == http.MethodPost { startWorkflowHandler(w, r) } else { listWorkflowsHandler(w, r) }
+})
 
-	mux.HandleFunc("/livez", livezHandler)
+appPort := getEnv("PORT", "8044")
+srv := &http.Server{Addr: ":" + appPort, Handler: mux, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second}
+log.Printf("[temporal-sagas-go] ready on :%s (temporal=%s namespace=%s)", appPort, temporalHost, temporalNamespace)
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
@@ -823,5 +845,6 @@ mux := http.NewServeMux()
     _ = server.Shutdown(ctx)
     log.Println("[temporal-sagas-go] Server stopped gracefully")
 }
+}()
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

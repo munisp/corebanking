@@ -3,12 +3,28 @@ use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// bulk-payments-rs — Bulk payment processing engine (NIBSS, NIP)
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 struct AppState {
     records: Mutex<Vec<serde_json::Value>>,
@@ -451,8 +467,13 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/bulk-payments/{id}/approve", web::post().to(batch_status))
             .route("/v1/bulk-payments/{id}/cancel", web::post().to(batch_status))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/payments", web::get().to(list_records))
+            .route("/api/v1/payments", web::post().to(create_record))
+            .route("/api/v1/payments/{id}", web::get().to(get_record))
+            .route("/api/v1/payments/{id}", web::put().to(update_record))
+            .route("/api/v1/payments/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -460,6 +481,30 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS payments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    reference VARCHAR(64) NOT NULL UNIQUE,
+    payment_type VARCHAR(32) NOT NULL,
+    source_account VARCHAR(20) NOT NULL,
+    destination_account VARCHAR(20) NOT NULL,
+    destination_bank VARCHAR(10),
+    amount_kobo BIGINT NOT NULL CHECK (amount_kobo > 0),
+    fee_kobo BIGINT NOT NULL DEFAULT 0,
+    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+    status VARCHAR(20) NOT NULL DEFAULT 'initiated',
+    channel VARCHAR(32) NOT NULL,
+    session_id VARCHAR(64),
+    narration TEXT,
+    beneficiary_name VARCHAR(100),
+    tenant_id UUID NOT NULL,
+    initiated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create payments table");
 
 #[cfg(test)]
 mod tests {
@@ -476,4 +521,46 @@ mod tests {
 
     #[test]
     fn test_nibss_fee() { let r = nibss_fee(10000.0); assert!(r >= 0.0); }
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE payments SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("payments.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE payments SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("payments.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

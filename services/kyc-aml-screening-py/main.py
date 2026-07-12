@@ -58,77 +58,210 @@ def sanitize(val):
 _db_pool = None
 
 def get_db():
-    global _db_pool
-    if _db_pool is not None:
-        return _db_pool
-    dsn = os.environ.get("DATABASE_URL")
-    if not dsn:
-        return None
-    try:
-        import psycopg2
-        from psycopg2.pool import SimpleConnectionPool
-        _db_pool = SimpleConnectionPool(2, 10, dsn)
-        conn = _db_pool.getconn()
-        cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
+    global db_conn
+    if db_conn is None or db_conn.closed:
+        db_conn = psycopg2.connect(DATABASE_URL)
+        db_conn.autocommit = True
+    return db_conn
+
+
+def init_schema():
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS kyc_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id UUID NOT NULL,
+    verification_type VARCHAR(32) NOT NULL,
+    document_type VARCHAR(32),
+    document_number VARCHAR(64),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    risk_score INT DEFAULT 0,
+    risk_level VARCHAR(20) DEFAULT 'low',
+    bvn VARCHAR(11),
+    nin VARCHAR(11),
+    verified_name VARCHAR(200),
+    date_of_birth DATE,
+    address TEXT,
+    lga VARCHAR(100),
+    state VARCHAR(50),
+    country VARCHAR(3) DEFAULT 'NGA',
+    selfie_match_score REAL,
+    document_match_score REAL,
+    pep_check BOOLEAN DEFAULT FALSE,
+    sanctions_check BOOLEAN DEFAULT FALSE,
+    adverse_media_check BOOLEAN DEFAULT FALSE,
+    reviewer_id UUID,
+    reviewed_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-        conn.commit()
-        _db_pool.putconn(conn)
-        return _db_pool
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e}", file=sys.stderr)
-        _db_pool = None
-        return None
 
-def db_insert(record_id, data):
-    pool = get_db()
-    if pool is None:
-        return False
-    try:
-        conn = pool.getconn()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s, %s, %s, %s, %s)",
-            (record_id, SERVICE_NAME, "default", "active", json.dumps(data))
-        )
-        conn.commit()
-        pool.putconn(conn)
-        return True
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_insert failed: {e}", file=sys.stderr)
-        return False
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-def db_query(service_filter=None):
-    pool = get_db()
-    if pool is None:
-        return None
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_tenant ON kyc_records(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_status ON kyc_records(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_created ON kyc_records(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_schema()
+    logger.info(f"[kyc-aml-screening-py] ready on :%d", PORT)
+    logger.info(f"[kyc-aml-screening-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
+    if db_conn:
+        db_conn.close()
+
+
+app = FastAPI(title="kyc-aml-screening-py", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "kyc-aml-screening-py", "version": "1.0.0"}
+
+
+@app.get("/readyz")
+def readyz():
     try:
-        conn = pool.getconn()
-        cur = conn.cursor()
-        if service_filter:
-            cur.execute("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = %s ORDER BY created_at DESC LIMIT 50", (service_filter,))
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM kyc_records")
+            count = cur.fetchone()[0]
+        return {"service": "kyc-aml-screening-py", "total_records": count}
+    except Exception:
+        return {"service": "kyc-aml-screening-py", "total_records": 0}
+
+
+@app.get("/api/v1/kyc_records")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if x_tenant_id:
+            cur.execute(
+                "SELECT id, status, created_at FROM kyc_records WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
+                (x_tenant_id,)
+            )
         else:
-            cur.execute("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = %s ORDER BY created_at DESC LIMIT 50", (SERVICE_NAME,))
+            cur.execute("SELECT id, status, created_at FROM kyc_records ORDER BY created_at DESC LIMIT 50")
         rows = cur.fetchall()
-        pool.putconn(conn)
-        return [{"id": r[0], "service": r[1], "type": r[2], "status": r[3], "data": r[4], "created_at": str(r[5])} for r in rows]
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_query failed: {e}", file=sys.stderr)
-        return None
 
-# --- JWT Auth ---
-def validate_jwt(headers):
-    auth = headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return False, "Missing Bearer token"
-    token = auth[7:]
-    parts = token.split(".")
-    if len(parts) != 3:
-        return False, "Invalid token format"
-    return True, None
+    records = [
+        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
+        for r in rows
+    ]
+    return {"data": records, "count": len(records)}
+
+
+@app.post("/api/v1/kyc_records", status_code=201)
+def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
+    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
+    status = body.status or "active"
+    record_id = str(uuid.uuid4())
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO kyc_records (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
+            (record_id, tenant_id, status)
+        )
+        # Outbox event
+        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("kyc_records.created", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": "created"}
+
+
+@app.get("/api/v1/kyc_records/{record_id}")
+def get_record(record_id: str):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, status, created_at FROM kyc_records WHERE id = %s::uuid", (record_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
+
+
+@app.put("/api/v1/kyc_records/{record_id}")
+def update_record(record_id: str, body: UpdateRequest):
+    status = body.status or "updated"
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE kyc_records SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
+            (status, record_id)
+        )
+        payload = json.dumps({"id": record_id, "status": status})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("kyc_records.updated", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": status}
+
+
+@app.delete("/api/v1/kyc_records/{record_id}", status_code=204)
+def delete_record(record_id: str):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
+        payload = json.dumps({"id": record_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("kyc_records.deleted", record_id, payload)
+        )
+    conn.commit()
 
 # --- Security Headers ---
 def add_security_headers(handler):
@@ -563,15 +696,5 @@ def sanitize_input(s):
     return s[:10000] if len(s) > 10000 else s
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-    init_tracing()
-    get_db()
-    _server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting"}), file=sys.stderr)
-    _threading.Thread(target=start_grpc_server, args=("kyc-aml-screening-py", 9200), daemon=True).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    print(f"[{SERVICE_NAME}] Server stopped gracefully", file=sys.stderr)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

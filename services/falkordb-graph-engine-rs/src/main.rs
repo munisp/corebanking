@@ -3,166 +3,31 @@ use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-// falkordb-graph-engine-rs — FalkorDB (Redis-compatible graph DB) service
-// High-performance graph queries, real-time entity resolution,
-// transaction network analysis, AML pattern detection.
-// Uses FalkorDB Cypher dialect over Redis protocol.
-
-// ─── FALKORDB CLIENT ─────────────────────────────────────────────────────────
-
-struct FalkorDBClient {
-    redis_url: String,
-    graph_name: String,
-}
-
-impl FalkorDBClient {
-    fn new() -> Self {
-        let redis_url = env::var("FALKORDB_URL").unwrap_or_else(|_| "redis://falkordb:6379".to_string());
-        let graph_name = env::var("FALKORDB_GRAPH").unwrap_or_else(|_| "bank54_graph".to_string());
-        FalkorDBClient { redis_url, graph_name }
-    }
-
-    fn execute_query(&self, cypher: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-        // FalkorDB uses GRAPH.QUERY command over Redis protocol
-        // In production, this would use redis crate with GRAPH.QUERY <graph_name> <cypher>
-        eprintln!("[falkordb] executing: {} with params: {}", &cypher[..cypher.len().min(100)], params);
-        Ok(json!({"executed": true, "query": cypher, "engine": "falkordb"}))
-    }
-}
-
-// ─── GRAPH MODELS ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct EntityNode {
-    pub entity_id: String,
-    pub entity_type: String,      // "customer", "account", "transaction", "loan"
-    pub name: String,
-    pub risk_score: Option<f64>,
-    pub properties: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct GraphEdge {
-    pub from_id: String,
-    pub to_id: String,
-    pub edge_type: String,        // "TRANSACTED_WITH", "OWNS", "CONTROLS", "GUARANTEES"
-    pub weight: Option<f64>,
-    pub properties: serde_json::Value,
-}
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct GraphQuery {
-    pub cypher: String,
-    pub params: Option<serde_json::Value>,
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PathQuery {
-    pub source_id: String,
-    pub target_id: String,
-    pub max_hops: Option<u32>,
-    pub edge_types: Option<Vec<String>>,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-struct CommunityDetectionRequest {
-    pub algorithm: String,         // "louvain", "label_propagation", "weakly_connected"
-    pub min_community_size: Option<u32>,
-}
-
-// ─── DOMAIN FUNCTIONS ────────────────────────────────────────────────────────
-
-fn compute_entity_centrality(connections: &[GraphEdge]) -> f64 {
-    // Degree centrality: number of unique connections
-    let unique_targets: std::collections::HashSet<&str> = connections.iter()
-        .map(|e| e.to_id.as_str())
-        .collect();
-    unique_targets.len() as f64
-}
-
-fn detect_circular_transactions(edges: &[GraphEdge]) -> Vec<Vec<String>> {
-    // Find cycles in transaction graph (potential round-tripping)
-    let mut adjacency: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for edge in edges {
-        adjacency.entry(edge.from_id.as_str()).or_default().push(edge.to_id.as_str());
-    }
-    let mut cycles: Vec<Vec<String>> = Vec::new();
-    for (start, targets) in &adjacency {
-        for target in targets {
-            if let Some(back_targets) = adjacency.get(target) {
-                if back_targets.contains(start) {
-                    cycles.push(vec![start.to_string(), target.to_string(), start.to_string()]);
-                }
-            }
-        }
-    }
-    cycles
-}
-
-fn compute_transaction_velocity(edges: &[GraphEdge], window_seconds: u64) -> f64 {
-    // Transactions per second within window
-    if edges.is_empty() { return 0.0; }
-    edges.len() as f64 / (window_seconds as f64).max(1.0)
-}
-
-fn classify_entity_risk(
-    is_pep: bool,
-    is_sanctioned: bool,
-    high_risk_country: bool,
-    circular_txns: usize,
-    centrality: f64,
-) -> (f64, String) {
-    let mut score = 0.0f64;
-    if is_pep { score += 25.0; }
-    if is_sanctioned { score += 40.0; }
-    if high_risk_country { score += 20.0; }
-    if circular_txns > 0 { score += 15.0; }
-    if centrality > 50.0 { score += 10.0; }
-    let level = if score >= 70.0 { "critical" } else if score >= 50.0 { "high" } else if score >= 30.0 { "medium" } else { "low" };
-    (score.min(100.0), level.to_string())
-}
-
-fn falkordb_seed_coa_query() -> Vec<String> {
-    vec![
-        // FIBO-aligned COA nodes in FalkorDB Cypher
-        "CREATE (:GLAccount:Asset {code: '1001', name: 'Cash in Vault', subcategory: 'cash', currency: 'NGN', fiboClass: 'bank54:CashInVault'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1005', name: 'CRR', subcategory: 'cash_cbn', currency: 'NGN', fiboClass: 'bank54:CashReserveRequirement'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1201', name: 'Treasury Bills', subcategory: 'investments_govt', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1301', name: 'Overdrafts - Corporate', subcategory: 'loans_corporate', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1302', name: 'Term Loans - Corporate', subcategory: 'loans_corporate', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1306', name: 'SME Loans', subcategory: 'loans_sme', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1307', name: 'Agricultural Loans (ABP)', subcategory: 'loans_agric', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1355', name: 'IFRS 9 ECL Stage 1', subcategory: 'provision_ecl', ifrs9Stage: 1})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1356', name: 'IFRS 9 ECL Stage 2', subcategory: 'provision_ecl', ifrs9Stage: 2})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1357', name: 'IFRS 9 ECL Stage 3', subcategory: 'provision_ecl', ifrs9Stage: 3})".to_string(),
-        "CREATE (:GLAccount:Liability {code: '2101', name: 'Demand Deposits', subcategory: 'deposits_demand', currency: 'NGN', ndicInsured: true})".to_string(),
-        "CREATE (:GLAccount:Liability {code: '2102', name: 'Savings Deposits', subcategory: 'deposits_savings', currency: 'NGN', ndicInsured: true})".to_string(),
-        "CREATE (:GLAccount:Equity {code: '3002', name: 'Share Capital', subcategory: 'share_capital', baselTier: 'CET1'})".to_string(),
-        "CREATE (:GLAccount:Equity {code: '3004', name: 'Statutory Reserve', subcategory: 'reserves', baselTier: 'CET1'})".to_string(),
-        "CREATE (:GLAccount:Revenue {code: '4101', name: 'Interest on Loans - Corporate', subcategory: 'interest_loans'})".to_string(),
-        "CREATE (:GLAccount:Expense {code: '5101', name: 'Interest on Deposits - Savings', subcategory: 'interest_deposits'})".to_string(),
-        // Regulatory nodes
-        "CREATE (:Regulation {id: 'CAR', name: 'Capital Adequacy Ratio', minimum: 0.15, regulator: 'CBN'})".to_string(),
-        "CREATE (:Regulation {id: 'CRR', name: 'Cash Reserve Requirement', rate: 0.325, regulator: 'CBN'})".to_string(),
-        "CREATE (:Regulation {id: 'LCR', name: 'Liquidity Coverage Ratio', minimum: 1.0, regulator: 'CBN'})".to_string(),
-    ]
-}
-
-fn cbn_reporting_threshold_ngn() -> f64 { 5_000_000.0 }
-
-// ─── APP STATE ───────────────────────────────────────────────────────────────
 
 struct AppState {
-    falkordb: FalkorDBClient,
-    entities: Mutex<Vec<EntityNode>>,
-    edges: Mutex<Vec<GraphEdge>>,
-    db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 // ─── SECURITY / RATE LIMITING / OBSERVABILITY ────────────────────────────────
@@ -567,32 +432,25 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080);
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[falkordb-graph-engine-rs] starting");
 
-    let db_url = env::var("DATABASE_URL").ok();
-    let db_client = if let Some(ref url) = db_url {
-        match tokio_postgres::connect(url, tokio_postgres::NoTls).await {
-            Ok((client, connection)) => {
-                tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB error: {}", e); } });
-                Some(std::sync::Arc::new(client))
-            }
-            Err(e) => { eprintln!("DB connect failed: {}", e); None }
-        }
-    } else { None };
+    let db_name = "falkordb-graph-engine-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
 
-    let state = web::Data::new(AppState {
-        falkordb: FalkorDBClient::new(),
-        entities: Mutex::new(Vec::new()),
-        edges: Mutex::new(Vec::new()),
-        db_url,
-        db_client,
-    });
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
 
-    println!("falkordb-graph-engine-rs listening on port {}", port);
+    init_schema(&pool).await;
+    log::info!("[falkordb-graph-engine-rs] database connected, schema initialized");
 
     start_grpc_server("falkordb-graph-engine-rs", 10458);
     HttpServer::new(move || {
-        let trace_id = format!("trace-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         App::new()
             .app_data(state.clone())
             .wrap(actix_web::middleware::DefaultHeaders::new()
@@ -610,21 +468,14 @@ async fn main() -> std::io::Result<()> {
             })
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
-            .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
-            // Graph API
-            .route("/v1/graph/seed", web::post().to(seed_graph))
-            .route("/v1/graph/query", web::post().to(query_graph))
-            .route("/v1/graph/entity", web::post().to(create_entity))
-            .route("/v1/graph/edge", web::post().to(create_edge))
-            .route("/v1/graph/path", web::post().to(find_path))
-            // Analytics
-            .route("/v1/graph/circular", web::get().to(detect_circular))
-            .route("/v1/graph/centrality", web::get().to(entity_centrality))
-            .route("/v1/graph/velocity", web::get().to(transaction_velocity))
-            .route("/v1/graph/risk", web::post().to(risk_classification))
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
@@ -644,4 +495,46 @@ mod tests {
     fn test_rate_limiter() {
         assert!(rl_allow());
     }
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

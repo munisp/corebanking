@@ -8,62 +8,27 @@
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
-use std::time::Instant;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use std::env;
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// ─── Domain Types ───────────────────────────────────────────────────────────
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ReconJob {
-    job_id: String,
-    channel: String,
-    business_date: String,
-    status: String,
-    source_count: u64,
-    target_count: u64,
-    matched: u64,
-    unmatched_source: u64,
-    unmatched_target: u64,
-    exceptions: u64,
-    match_rate_pct: f64,
-    started_at: String,
-    completed_at: Option<String>,
-    duration_ms: Option<u64>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ReconException {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    job_id: String,
-    exception_type: String,
-    source_ref: String,
-    target_ref: Option<String>,
-    source_amount: f64,
-    target_amount: Option<f64>,
-    difference: Option<f64>,
-    channel: String,
     status: String,
-    assigned_to: Option<String>,
-    resolution: Option<String>,
-    created_at: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Deserialize)]
-struct RunReconRequest {
-    channel: Option<String>,
-    business_date: Option<String>,
-    source_file: Option<String>,
-    target_file: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ResolveRequest {
-    exception_id: String,
-    resolution: String,
-    resolved_by: String,
-    notes: Option<String>,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
@@ -697,4 +662,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

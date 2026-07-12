@@ -3,35 +3,31 @@ use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct InterestCalcRequest {
-    pub principal: f64,
-    pub rate_percent: f64,
-    pub tenor_days: u32,
-    pub day_count_convention: Option<String>,
-    pub compounding: Option<String>,
-    pub accrual_start: Option<String>,
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct AccrualSchedule {
-    pub account_id: String,
-    pub principal: f64,
-    pub rate: f64,
-    pub start_date: String,
-    pub end_date: String,
-    pub frequency: String,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
-    db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 
@@ -485,13 +481,14 @@ async fn main() -> std::io::Result<()> {
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
-            .route("/v1/interest/calculate", web::post().to(calculate_interest))
-            .route("/v1/interest/accrual-schedule", web::post().to(accrual_schedule))
-            .route("/v1/interest/effective-rate", web::post().to(effective_rate))
-            .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -499,6 +496,24 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
 
 #[cfg(test)]
 mod tests {
@@ -524,4 +539,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

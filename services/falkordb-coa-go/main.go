@@ -19,6 +19,9 @@ import (
 	"time"
 	
 	_ "github.com/lib/pq"
+	"crypto/rsa"
+	"crypto/sha256"
+	"math/big"
 )
 
 var serviceName = "falkordb-coa-go"

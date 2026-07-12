@@ -1,7 +1,3 @@
-// 54Bank Kafka Broker — Go
-// Domain: Infrastructure/Data
-// Full domain-specific implementation with business logic
-// Middleware: Kafka, Postgres, Redis, Temporal, Permify, OpenSearch
 package main
 
 import (
@@ -17,11 +13,10 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"sync"
-	"time"
-	"database/sql"
-	"bytes"
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 	"net"
 
@@ -372,6 +367,8 @@ func initDB() {
 		db = nil
 		return
 	}
+	defer db.Close()
+
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -380,95 +377,181 @@ func initDB() {
 		db = nil
 		return
 	}
-	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
-	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
-		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
-		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
-	)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
-	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
-}
 
-func dbList(service string, limit int) ([]map[string]interface{}, error) {
-	if db == nil { return nil, fmt.Errorf("no db") }
-	rows, err := db.Query("SELECT id, type, status, data, created_at FROM service_records WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
-	if err != nil { return nil, err }
-	defer rows.Close()
-	var items []map[string]interface{}
-	for rows.Next() {
-		var id, typ, status, data, ts string
-		rows.Scan(&id, &typ, &status, &data, &ts)
-		items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "createdAt": ts})
+	switch r.Method {
+	case "GET":
+		getRecord(w, r, id)
+	case "PUT", "PATCH":
+		updateRecord(w, r, id)
+	case "DELETE":
+		deleteRecord(w, r, id)
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 	}
-	return items, nil
 }
 
-func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil { return fmt.Errorf("no db") }
-	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
-	return err
+func listRecords(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	limit := 50
+	offset := 0
+
+	query := `SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var records []map[string]interface{}
+	for rows.Next() {
+		var id, status string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &status, &createdAt); err != nil {
+			continue
+		}
+		records = append(records, map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"data": records, "count": len(records)})
 }
 
+func createRecord(w http.ResponseWriter, r *http.Request) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
 
-// --- JWT Auth Middleware ---
-func jwtAuthMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		p := r.URL.Path
-		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-			return
-		}
-		next.ServeHTTP(w, r)
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		tenantID = "default"
+	}
+	body["tenant_id"] = tenantID
+
+	payload, _ := json.Marshal(body)
+
+	var id string
+	err := db.QueryRowContext(r.Context(),
+		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
+		tenantID).Scan(&id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	// Write to outbox for event publishing
+	_, _ = db.ExecContext(r.Context(),
+		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
+		"service_configs.created", id, string(payload))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": "created"})
+}
+
+func getRecord(w http.ResponseWriter, r *http.Request, id string) {
+	var status string
+	var createdAt time.Time
+	err := db.QueryRowContext(r.Context(),
+		`SELECT status, created_at FROM service_configs WHERE id = $1`, id).Scan(&status, &createdAt)
+	if err == sql.ErrNoRows {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
+}
+
+func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	status, _ := body["status"].(string)
+	if status == "" {
+		status = "updated"
+	}
+
+	_, err := db.ExecContext(r.Context(),
+		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	payload, _ := json.Marshal(body)
+	_, _ = db.ExecContext(r.Context(),
+		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
+		"service_configs.updated", id, string(payload))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
+}
+
+func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
+	_, err := db.ExecContext(r.Context(),
+		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = db.ExecContext(r.Context(),
+		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
+		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "healthy",
+		"service": "kafka-broker-go",
+		"version": "1.0.0",
 	})
 }
 
-
-// --- Inter-Service Communication with Circuit Breaker ---
-var _cbFailures int
-var _cbOpen bool
-var _cbLastFail time.Time
-
-func callService(method, url string, body interface{}) (map[string]interface{}, error) {
-	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
-		return nil, fmt.Errorf("circuit breaker open for %s", url)
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if err := db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		return
 	}
-	if _cbOpen { _cbOpen = false; _cbFailures = 0 }
-	client := &http.Client{Timeout: 15 * time.Second}
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 { time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond) }
-		var req *http.Request
-		if body != nil {
-			j, _ := json.Marshal(body)
-		j = []byte(sanitizeInput(string(j)))
-			req, _ = http.NewRequest(method, url, bytes.NewBuffer(j))
-		} else {
-			req, _ = http.NewRequest(method, url, nil)
-		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
-		if err != nil { lastErr = err; _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
-		defer resp.Body.Close()
-		if resp.StatusCode >= 500 { lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode); _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
-		var result map[string]interface{}
-		json.NewDecoder(resp.Body).Decode(&result)
-		_cbFailures = 0; _cbOpen = false
-		return result, nil
-	}
-	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
 
-// --- Distributed Tracing ---
-func traceMiddleware(next http.Handler) http.Handler {
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	var count int
+	db.QueryRow(`SELECT COUNT(*) FROM service_configs`).Scan(&count)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service":       "kafka-broker-go",
+		"total_records": count,
+	})
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
+			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+		}
+	})
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		traceID := r.Header.Get("X-Trace-Id")
 		if traceID == "" {
@@ -560,15 +643,9 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- Input Sanitization ---
-func sanitizeInput(s string) string {
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "'", "&#39;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "\\", "")
-	if len(s) > 10000 {
-		s = s[:10000]
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
 	return s
 }

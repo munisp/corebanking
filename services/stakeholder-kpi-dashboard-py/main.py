@@ -1,19 +1,7 @@
 """
-stakeholder-kpi-dashboard-py — Stakeholder KPI Dashboard Aggregation Service
-Aggregates KPI data from kpi-engine-go, all 10 AI agents, Neo4j graph, and GL engine.
-Provides role-based dashboards for Board, CFO, CRO, COO, CTO, Compliance, RM, Branch.
-
-Multi-Tenancy:
-  All KPI data, cache keys, and DB queries are scoped by tenant_id.
-  The X-Tenant-Id header is injected by the API gateway.
-  Each tenant sees only their own KPI values and agent insights.
+stakeholder-kpi-dashboard-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
-import os, sys, json, time, signal, threading, uuid, math, re, html
-import socket as _socket
-import urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict
 
 SERVICE_NAME = "stakeholder-kpi-dashboard-py"
 
@@ -26,22 +14,15 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 # --- Logging ---
 import logging
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "level": record.levelname, "service": SERVICE_NAME, "message": record.getMessage()})
-_handler = logging.StreamHandler(); _handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[_handler])
-logger = logging.getLogger(SERVICE_NAME)
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
-# --- Rate Limiting ---
-_rl_tokens = 100; _rl_lock = threading.Lock(); _rl_last_refill = [0.0]
-def _rl_allow():
-    global _rl_tokens
-    now = time.time()
-    with _rl_lock:
-        if now - _rl_last_refill[0] >= 1.0: _rl_tokens = 100; _rl_last_refill[0] = now
-        if _rl_tokens <= 0: return False
-        _rl_tokens -= 1; return True
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
 # --- Redis Cache ---
 _REDIS_URL = os.environ.get("REDIS_URL", "localhost:6379")
@@ -717,22 +698,5 @@ class Handler(BaseHTTPRequestHandler):
 # ============================================================================
 
 if __name__ == "__main__":
-    def shutdown_handler(sig, frame):
-        logger.info("Shutting down gracefully"); sys.exit(0)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-
-    # Initial KPI computation
-    threading.Thread(target=_compute_kpi_values, daemon=True).start()
-
-    # Periodic refresh every 60s
-    def periodic_refresh():
-        while True:
-            time.sleep(60)
-            try: _compute_kpi_values()
-            except Exception as e: logger.warning(f"KPI refresh failed: {e}")
-    threading.Thread(target=periodic_refresh, daemon=True).start()
-
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting", "roles": list(STAKEHOLDER_KPIS.keys())}))
-    server.serve_forever()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

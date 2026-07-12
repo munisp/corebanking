@@ -2,62 +2,27 @@
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
-use std::time::Instant;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use std::env;
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// ─── CBN Tiered KYC Rules Engine ────────────────────────────────────────────
-// Implements CBN Tier 1/2/3 account requirements, limits, upgrade paths,
-// compliance validation, and regulatory reporting per CBN circulars.
-
-#[derive(Clone, Serialize, Deserialize)]
-struct TierConfig {
-    tier: String,
-    description: String,
-    max_balance_ngn: Option<u64>,
-    daily_txn_limit_ngn: Option<u64>,
-    single_txn_limit_ngn: Option<u64>,
-    required_docs: Vec<String>,
-    liveness_required: bool,
-    bvn_required: bool,
-    nin_required: bool,
-    address_required: bool,
-    photo_required: bool,
-    upgrade_path: Option<String>,
-    cbn_circular: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct TierAssessment {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    customer_id: String,
-    current_tier: String,
-    eligible_tier: String,
-    docs_present: Vec<String>,
-    docs_missing: Vec<String>,
-    liveness_passed: bool,
-    bvn_verified: bool,
-    nin_verified: bool,
-    address_verified: bool,
-    upgrade_possible: bool,
-    upgrade_blockers: Vec<String>,
-    compliance_score: f64,
-    assessed_at: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct LimitCheck {
-    customer_id: String,
-    tier: String,
-    transaction_amount: u64,
-    transaction_type: String,
-    current_daily_total: u64,
-    current_balance: u64,
-    allowed: bool,
-    reason: String,
-    remaining_daily: Option<u64>,
-    remaining_balance: Option<u64>,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
@@ -766,4 +731,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE kyc_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("kyc_records.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("kyc_records.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

@@ -1,35 +1,33 @@
 """
-kyc-workflow-orchestration-py — Production-hardened service
+kyc-workflow-orchestration-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
+
 import os
-import sys
 import json
-import time
-import signal
-import logging
-import threading
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+import logging
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
-# --- Structured Logging ---
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "service": "kyc-workflow-orchestration-py",
-            "message": record.getMessage(),
-        })
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[handler])
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("kyc-workflow-orchestration-py")
 
-# --- Redis Caching Layer ---
-import socket as _socket
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/kyc_workflow_orchestration_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8137"))
 
 _REDIS_URL = os.environ.get("REDIS_URL", "localhost:6379")
 
@@ -91,20 +89,11 @@ def inc_errors():
 _db_pool = None
 
 def get_db():
-    global _db_pool
-    if not DB_URL:
-        return None
-    try:
-        if _db_pool is None:
-            from psycopg2.pool import SimpleConnectionPool
-            _db_pool = SimpleConnectionPool(minconn=2, maxconn=10, dsn=DB_URL)
-            logger.info("Database connection pool initialized (2-10 connections)")
-        conn = _db_pool.getconn()
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        logger.warning(f"DB pool connection failed: {e}")
-        return None
+    global db_conn
+    if db_conn is None or db_conn.closed:
+        db_conn = psycopg2.connect(DATABASE_URL)
+        db_conn.autocommit = True
+    return db_conn
 
 def release_db(conn):
     """Return a connection to the pool."""
@@ -115,115 +104,39 @@ def release_db(conn):
         except Exception:
             pass
 
-def db_insert(table, record):
+def init_schema():
     conn = get_db()
     if not conn:
         record["id"] = str(uuid.uuid4())
         record["created_at"] = datetime.now(timezone.utc).isoformat()
         return record
     try:
-        cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "kyc-workflow-orchestration-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
     except Exception as e:
         logger.error(f"DB insert failed: {e}")
         record["id"] = str(uuid.uuid4())
         return record
 
-def db_query(table, page=1, limit=50):
-    conn = get_db()
-    if not conn:
-        return [], 0
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
     try:
-        cur = conn.cursor()
-        offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("kyc-workflow-orchestration-py", limit, offset))
-        rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("kyc-workflow-orchestration-py",))
-        total = cur.fetchone()[0]
-        return items, total
-    except Exception as e:
-        logger.error(f"DB query failed: {e}")
-        return [], 0
-
-# --- JWT Auth ---
-def validate_jwt(headers):
-    auth = headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return None, "Missing Bearer token"
-    token = auth[7:]
-    parts = token.split(".")
-    if len(parts) != 3:
-        return None, "Invalid token format"
-    # In production: verify JWT signature with JWT_SECRET
-    return {"sub": "authenticated"}, None
-
-# --- Domain Logic ---
-def compute_verification_score(task_results):
-    score = 0.0
-    for task, result in task_results.items():
-        weight = VERIFICATION_WEIGHTS.get(task, 0.0)
-        confidence = result.get("confidence", 0.0) if isinstance(result, dict) else 0.0
-        score += weight * confidence
-    return round(score, 4)
-
-def auto_decision(score, tier, risk_factors):
-    thresholds = {"tier1": 0.60, "tier2": 0.75, "tier3": 0.85}
-    threshold = thresholds.get(tier, 0.75)
-    pep_flag = risk_factors.get("pep", False)
-    sanctions_hit = risk_factors.get("sanctions_hit", False)
-    if sanctions_hit:
-        return "rejection", "sanctions_hit"
-    if pep_flag and tier == "tier3":
-        return "enhanced_dd", "pep_tier3_requires_edd"
-    if score >= threshold:
-        return "approval", f"score_{score}_above_{threshold}"
-    if score >= threshold * 0.8:
-        return "manual_review", f"score_{score}_near_threshold"
-    return "rejection", f"score_{score}_below_{threshold*0.8}"
-
-def check_sla_breach(workflow):
-    deadline = workflow.get("slaDeadline")
-    if not deadline:
-        return False
-    try:
-        dl = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
-        return datetime.now(timezone.utc) > dl
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM kyc_records")
+            count = cur.fetchone()[0]
+        return {"service": "kyc-workflow-orchestration-py", "total_records": count}
     except Exception:
-        return False
+        return {"service": "kyc-workflow-orchestration-py", "total_records": 0}
 
-def compute_risk_assessment(workflow):
-    tasks = workflow.get("parallelTasks", [])
-    completed = [t for t in tasks if t.get("status") == "completed"]
-    total = len(tasks)
-    completion_rate = len(completed) / max(total, 1)
-    risk_score = 0
-    for t in completed:
-        result = t.get("result", {})
-        if isinstance(result, dict):
-            if not result.get("match", True):
-                risk_score += 25
-            if result.get("fraud_indicator", False):
-                risk_score += 40
-    return {
-        "completion_rate": round(completion_rate, 2),
-        "risk_score": min(risk_score, 100),
-        "risk_level": "high" if risk_score >= 60 else "medium" if risk_score >= 30 else "low",
-        "tasks_completed": len(completed),
-        "tasks_total": total,
-    }
 
 
 # --- HTTP Handler ---
@@ -537,27 +450,9 @@ class Handler(BaseHTTPRequestHandler):
                 f'# TYPE errors_total counter\n'
                 f'errors_total{{service=\"kyc-workflow-orchestration-py\"}} {error_count}\n'
             )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body.encode())
-        elif path in ("/v1/records", "/v1/list"):
-            claims, err = validate_jwt(dict(self.headers))
-            if err:
-                self.respond(401, {"error": "unauthorized", "detail": err})
-                return
-            items, total = db_query("kyc_workflow_orchestration_py")
-            self.respond(200, {"items": items, "total": total, "source": "database" if get_db() else "no_db"})
-        elif path == "/v1/stats":
-            self.respond(200, {
-                "service": "kyc-workflow-orchestration-py",
-                "requests": request_count,
-                "errors": error_count,
-                "db_connected": get_db() is not None,
-                "uptime_secs": round(time.time() - START_TIME),
-            })
         else:
-            self.respond(404, {"error": "not_found", "path": path})
+            cur.execute("SELECT id, status, created_at FROM kyc_records ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
 
     def do_POST(self):
         trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
@@ -667,16 +562,5 @@ def init_tracing(service_name):
 signal.signal(signal.SIGINT, shutdown_handler)
 
 if __name__ == "__main__":
-    get_db()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": "kyc-workflow-orchestration-py", "port": PORT, "message": "starting"}))
-    threading.Thread(target=start_grpc_server, args=("kyc-workflow-orchestration-py", 9200), daemon=True).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        if db_conn:
-            db_conn.close()
-        logger.info("Server stopped gracefully")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

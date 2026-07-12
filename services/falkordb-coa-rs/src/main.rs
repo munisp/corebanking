@@ -3,22 +3,31 @@ use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// falkordb-coa-rs
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
 
-static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
-static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
-static RL_TOKENS: AtomicU64 = AtomicU64::new(100);
-static RL_LAST: AtomicU64 = AtomicU64::new(0);
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 struct AppState {
-    records: Mutex<Vec<serde_json::Value>>,
-    db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 fn sanitize_input(s: &str) -> String { s.replace("<script>", "").replace("</script>", "").replace("javascript:", "").chars().take(10240).collect() }
@@ -296,17 +305,8 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8080);
-    let db_url = env::var("DATABASE_URL").ok();
-    let db_client = if let Some(ref url) = db_url {
-        match tokio_postgres::connect(url, tokio_postgres::NoTls).await {
-            Ok((client, connection)) => {
-                tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB error: {}", e); } });
-                Some(std::sync::Arc::new(client))
-            }
-            Err(e) => { eprintln!("DB connect failed: {}", e); None }
-        }
-    } else { None };
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[falkordb-coa-rs] starting");
 
     let state = web::Data::new(AppState { records: Mutex::new(Vec::new()), db_url, db_client });
     println!("falkordb-coa-rs listening on port {}", port);
@@ -323,13 +323,14 @@ async fn main() -> std::io::Result<()> {
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
-            .route("/readyz", web::get().to(ready))
-            .route("/livez", web::get().to(live))
+            .route("/readyz", web::get().to(readyz))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
-            .route("/v1/graph/query", web::post().to(graph_query))
-            .route("/v1/graph/funding-flows", web::get().to(funding_flows))
-            .route("/v1/graph/concentration-risk", web::get().to(concentration_risk))
-            .route("/v1/create", web::post().to(create_record))
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?.run().await
 }
@@ -347,4 +348,46 @@ mod tests {
     fn test_rate_limiter() {
         assert!(rl_allow());
     }
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

@@ -7,102 +7,27 @@
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// ─── DATA MODELS ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct EFASSFormLine {
-    mbr_form: String,
-    mbr_line: i32,
-    line_name: String,
-    report_category: String,
-    amount: f64,
-    cbn_code: String,
-    gl_codes: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct EFASSReport {
-    report_id: String,
-    bank_code: String,
-    bank_name: String,
-    period: String,
-    generated_at: String,
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
     status: String,
-    forms: Vec<EFASSFormLine>,
-    totals: ReportTotals,
-    validation: ValidationResult,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ReportTotals {
-    total_assets: f64,
-    total_liabilities: f64,
-    total_equity: f64,
-    total_income: f64,
-    total_expenses: f64,
-    net_profit: f64,
-    car: f64,
-    liquidity_ratio: f64,
-    npl_ratio: f64,
-    cost_to_income: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ValidationResult {
-    is_valid: bool,
-    total_checks: i32,
-    passed: i32,
-    failed: i32,
-    warnings: Vec<String>,
-    errors: Vec<String>,
-    balance_sheet_balances: bool,
-    car_compliant: bool,
-    liquidity_compliant: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct CBNReturn {
-    code: String,
-    name: String,
-    regulator: String,
-    frequency: String,
-    due_day: i32,
-    gl_source: String,
-    computation: String,
-    status: String,
-    last_filed: String,
-    next_due: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct MiddlewareStatus {
-    kafka: ConnectionInfo,
-    dapr: ConnectionInfo,
-    fluvio: ConnectionInfo,
-    temporal: ConnectionInfo,
-    postgres: ConnectionInfo,
-    keycloak: ConnectionInfo,
-    permify: ConnectionInfo,
-    redis: ConnectionInfo,
-    mojaloop: ConnectionInfo,
-    opensearch: ConnectionInfo,
-    openappsec: ConnectionInfo,
-    apisix: ConnectionInfo,
-    tigerbeetle: ConnectionInfo,
-    lakehouse: ConnectionInfo,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct ConnectionInfo {
-    status: String,
-    endpoint: String,
-    purpose: String,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
@@ -724,19 +649,18 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 }
 
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8091".to_string()).parse().unwrap_or(8091);
-    let db_url = env::var("DATABASE_URL").ok();
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[efass-generator-rs] starting");
 
-    println!("eFASS Generator (Rust) listening on :{} — 14 middleware connected", port);
+    let db_name = "efass-generator-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
 
     let data = web::Data::new(AppState {
         db_url,
         reports: Mutex::new(Vec::new()),
     });
 
-        let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
-        start_grpc_server("efass-generator-rs", 10353);
     HttpServer::new(move || {
         App::new()
                 .wrap(
@@ -765,22 +689,16 @@ async fn main() -> std::io::Result<()> {
                 }
             })
             .app_data(data.clone())
-            .wrap(actix_web::middleware::DefaultHeaders::new()
-                .add(("X-Content-Type-Options", "nosniff"))
-                .add(("X-Frame-Options", "DENY"))
-                .add(("X-XSS-Protection", "1; mode=block"))
-                .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-                .add(("Content-Security-Policy", "default-src 'self'"))
-                .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
-            .route("/v1/degradation", web::get().to(degradation_status))
+            .wrap(middleware::Logger::default())
             .route("/healthz", web::get().to(health))
-            .route("/v1/efass/generate", web::get().to(generate_efass))
-            .route("/v1/efass/validate", web::get().to(validate_report_endpoint))
-            .route("/v1/efass/cbn-returns", web::get().to(list_cbn_returns))
-            .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -788,6 +706,24 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
 
 #[cfg(test)]
 mod tests {
@@ -840,4 +776,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

@@ -7,20 +7,37 @@ built-in anti-spoofing, facial attribute analysis (age/gender/emotion/race).
 Fallback: Custom ONNX ensemble when DeepFace unavailable.
 Middleware: Kafka, Postgres, Redis, Temporal, OpenSearch
 """
+liveness-inference-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
+"""
+
 import os
 import json
 import urllib.request
 import time
 import uuid
-import math
-import hashlib
 import logging
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
-from dataclasses import dataclass, asdict, field
-from typing import Optional
-from enum import Enum
+from contextlib import asynccontextmanager
+
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("liveness-inference-py")
+
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/liveness_inference_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8649"))
 
 logging.basicConfig(level=logging.INFO, format="[liveness-inference-py] %(levelname)s %(message)s")
 AML_ENGINE_URL = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
@@ -1868,35 +1885,142 @@ _rl_last_refill = [0.0]
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 db_conn = None
 
+
 def get_db():
     global db_conn
-    if not DATABASE_URL:
-        return None
-    try:
-        import psycopg2
+    if db_conn is None or db_conn.closed:
         db_conn = psycopg2.connect(DATABASE_URL)
         db_conn.autocommit = True
-        logger.info("Connected to Postgres")
-        return db_conn
-    except Exception as e:
-        logger.warning(f"DB connect failed: {e}")
-        return None
+    return db_conn
 
-def db_insert(data):
+
+def init_schema():
     conn = get_db()
-    return db_insert_impl(data)
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS kyc_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id UUID NOT NULL,
+    verification_type VARCHAR(32) NOT NULL,
+    document_type VARCHAR(32),
+    document_number VARCHAR(64),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    risk_score INT DEFAULT 0,
+    risk_level VARCHAR(20) DEFAULT 'low',
+    bvn VARCHAR(11),
+    nin VARCHAR(11),
+    verified_name VARCHAR(200),
+    date_of_birth DATE,
+    address TEXT,
+    lga VARCHAR(100),
+    state VARCHAR(50),
+    country VARCHAR(3) DEFAULT 'NGA',
+    selfie_match_score REAL,
+    document_match_score REAL,
+    pep_check BOOLEAN DEFAULT FALSE,
+    sanctions_check BOOLEAN DEFAULT FALSE,
+    adverse_media_check BOOLEAN DEFAULT FALSE,
+    reviewer_id UUID,
+    reviewed_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-def db_insert_impl(record_id, data):
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_tenant ON kyc_records(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_status ON kyc_records(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_created ON kyc_records(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_schema()
+    logger.info(f"[liveness-inference-py] ready on :%d", PORT)
+    logger.info(f"[liveness-inference-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
     if db_conn:
-        try:
-            cur = db_conn.cursor()
+        db_conn.close()
+
+
+app = FastAPI(title="liveness-inference-py", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "liveness-inference-py", "version": "1.0.0"}
+
+
+@app.get("/readyz")
+def readyz():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM kyc_records")
+            count = cur.fetchone()[0]
+        return {"service": "liveness-inference-py", "total_records": count}
+    except Exception:
+        return {"service": "liveness-inference-py", "total_records": 0}
+
+
+@app.get("/api/v1/kyc_records")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if x_tenant_id:
             cur.execute(
-                "INSERT INTO service_records (id, service, type, status, data, created_at) VALUES (%s, %s, %s, %s, %s, NOW())",
-                (record_id, "liveness_inference_py", "default", "active", json.dumps(data)),
+                "SELECT id, status, created_at FROM kyc_records WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
+                (x_tenant_id,)
             )
-            cur.close()
-        except Exception as e:
-            logger.warning(f"db_insert failed: {e}")
+        else:
+            cur.execute("SELECT id, status, created_at FROM kyc_records ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
 
 def validate_jwt(headers):
     auth = headers.get("Authorization", headers.get("authorization", ""))

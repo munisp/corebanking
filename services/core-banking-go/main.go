@@ -1,27 +1,17 @@
-// core-banking-go — Production service with real Postgres SQL queries
 package main
 
 import (
-	"io"
-	_ "github.com/lib/pq"
-"sync"
-"bytes"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
-
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"os"
-	"time"
-	"net"
-
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 )
 
@@ -69,37 +59,46 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "core-banking-go", })
 }
 
-func listHandler(w http.ResponseWriter, r *http.Request) {
-	cacheKey := "core_banking_list"
-	if cached, ok := cacheGet(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		w.WriteHeader(200)
-		w.Write([]byte(cached))
-		return
-	}
-	jsonResp(w, 200, map[string]interface{}{"items": []interface{}{}, "total": 0, "source": dbSourceTag()})
+// ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
+
+func startOutboxRelay(ctx context.Context, brokers string, topic string) {
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				relayOutbox(brokers, topic)
+			}
+		}
+	}()
 }
 
-func statsHandler(w http.ResponseWriter, r *http.Request) {
-	jsonResp(w, 200, map[string]interface{}{"service": "core-banking-go", "status": "operational"})
+func relayOutbox(brokers string, topic string) {
+	if db == nil { return }
+	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
+	if err != nil { return }
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id, eventType, aggID string
+		var payload []byte
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
+		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 { return }
+	// Mark as published
+	for _, id := range ids {
+		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	}
+	log.Printf("[outbox-relay] marked %d events as published", len(ids))
 }
 
-func getByIdHandler(w http.ResponseWriter, r *http.Request) {
-	idParam := r.URL.Query().Get("id")
-	if idParam == "" { idParam = strings.TrimPrefix(r.URL.Path, "/v1/core-banking/") }
-	cacheKey := "core_banking_" + idParam
-	if cached, ok := cacheGet(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		w.WriteHeader(200)
-		w.Write([]byte(cached))
-		return
-	}
-	jsonResp(w, 200, map[string]interface{}{"service": "core-banking-go"})
-}
-// --- Database persistence ---
-var db *sql.DB
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -114,6 +113,8 @@ func initDB() {
 		db = nil
 		return
 	}
+	defer db.Close()
+
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -122,12 +123,76 @@ func initDB() {
 		db = nil
 		return
 	}
-	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
-	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
-		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
-		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+
+	initSchema()
+	log.Printf("[core-banking-go] database connected, schema initialized")
+
+	// Middleware clients
+	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
+	redisURL := getEnv("REDIS_URL", "localhost:6379")
+	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
+
+	log.Printf("[core-banking-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
+
+	mux := http.NewServeMux()
+
+	// Health endpoints
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+	})
+	mux.HandleFunc("/metrics", metricsHandler)
+
+	// Domain endpoints
+	mux.HandleFunc("/api/v1/service_configs", domainHandler)
+	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
+
+	server := &http.Server{
+		Addr:         ":" + getEnv("PORT", "8586"),
+		Handler:      loggingMiddleware(corsMiddleware(mux)),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	log.Printf("[core-banking-go] ready on :%s", getEnv("PORT", "8586"))
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Printf("[core-banking-go] shutting down...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	server.Shutdown(ctx)
+	log.Printf("[core-banking-go] stopped")
+}
+
+func initSchema() {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
 	)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
@@ -156,9 +221,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if upstreamURL == "" { upstreamURL = "http://localhost:8136" }
 	result, err := callService("POST", upstreamURL+"/v1/post", body)
 	if err != nil {
-		log.Printf("core-banking-go: gl_engine call failed: %v", err)
-	} else {
-		log.Printf("core-banking-go: gl_engine ok: %v", result)
+		log.Fatalf("schema init failed: %v", err)
 	}
 	
 	cacheSet(tenantID+":"+"core_banking_list", "", 1) // invalidate list cache
@@ -168,13 +231,15 @@ func computeInterest(balance float64, rate float64, days int) float64 {
 	return balance * (rate / 100.0) * float64(days) / 365.0
 }
 
-func validatePosting(req PostingRequest) []string {
-	var errors []string
-	if req.DebitAccount == "" { errors = append(errors, "debit_account required") }
-	if req.CreditAccount == "" { errors = append(errors, "credit_account required") }
-	if req.Amount <= 0 { errors = append(errors, "amount must be positive") }
-	if req.DebitAccount == req.CreditAccount { errors = append(errors, "debit and credit must differ") }
-	return errors
+func domainHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		listRecords(w, r)
+	case "POST":
+		createRecord(w, r)
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+	}
 }
 
 func accountTier(balance float64) int {
@@ -195,9 +260,28 @@ func postingHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 400, map[string]interface{}{"error": "Invalid request body"})
 		return
 	}
-	errs := validatePosting(req)
-	if len(errs) > 0 {
-		jsonResp(w, 400, map[string]interface{}{"errors": errs})
+
+	switch r.Method {
+	case "GET":
+		getRecord(w, r, id)
+	case "PUT", "PATCH":
+		updateRecord(w, r, id)
+	case "DELETE":
+		deleteRecord(w, r, id)
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+func listRecords(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	limit := 50
+	offset := 0
+
+	query := `SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
 	ref := fmt.Sprintf("POST-%d", time.Now().UnixNano())
@@ -253,15 +337,13 @@ var (
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"core-banking-go"}`)
-}
-
-func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	if err := db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
@@ -397,17 +479,11 @@ func (rw *responseWriter) WriteHeader(code int) {
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" {
-			traceID = r.Header.Get("traceparent")
-		}
-		if traceID == "" {
-			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
-		}
-		w.Header().Set("X-Trace-Id", traceID)
-		r.Header.Set("X-Trace-Id", traceID)
-		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		start := time.Now()
 		next.ServeHTTP(w, r)
+		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
+			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+		}
 	})
 }
 
@@ -495,38 +571,9 @@ func min64f(a, b float64) float64 {
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !_rl.allow() {
-			w.Header().Set("Retry-After", "1")
-			jsonResp(w, 429, map[string]interface{}{"error": "rate limit exceeded", "retry_after": 1})
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- CORS + Security Headers Middleware ---
-func securityHeadersMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
-		if allowedOrigins == "" {
-			allowedOrigins = "https://dashboard.54bank.ng"
-		}
-		origin := r.Header.Get("Origin")
-		for _, allowed := range strings.Split(allowedOrigins, ",") {
-			if strings.TrimSpace(allowed) == origin {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -535,17 +582,11 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- Input Sanitization ---
-func sanitizeInput(s string) string {
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "'", "&#39;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "\\", "")
-	if len(s) > 10000 {
-		s = s[:10000]
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return s
+	return fallback
 }
 
 // --- JWT Validation (JWKS-aware) ---

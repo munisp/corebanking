@@ -3,17 +3,31 @@ use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// credit-bureau-rs — Credit bureau integration (CRC, FirstCentral, CreditRegistry)
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 struct AppState {
-    records: Mutex<Vec<serde_json::Value>>,
-    db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 fn credit_score_band(score: u32) -> &'static str {
@@ -432,25 +446,8 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8190);
-    let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
-        match init_db(&url).await {
-            Some(c) => { println!("credit-bureau-rs: connected to Postgres"); Some(std::sync::Arc::new(c)) }
-            None => None,
-        }
-    } else { None };
-    let state = web::Data::new(AppState {
-        records: Mutex::new(Vec::new()),
-        db_url: std::env::var("DATABASE_URL").ok(),
-        db_client,
-    });
-    println!("credit-bureau-rs on port {}", port);
-    
-    // Start gRPC server for inter-service calls
-    let grpc_svc_name = "credit-bureau-rs".to_string();
-    tokio::spawn(async move {
-        grpc_service::start_grpc_server(&grpc_svc_name, 9104).await;
-    });
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[credit-bureau-rs] starting");
 
 HttpServer::new(move || {
         App::new()
@@ -489,13 +486,14 @@ HttpServer::new(move || {
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
-            .route("/v1/query_bureau", web::post().to(query_bureau))
-            .route("/v1/records", web::get().to(list_records))
-            .route("/v1/stats", web::get().to(stats))
-            .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/loans", web::get().to(list_records))
+            .route("/api/v1/loans", web::post().to(create_record))
+            .route("/api/v1/loans/{id}", web::get().to(get_record))
+            .route("/api/v1/loans/{id}", web::put().to(update_record))
+            .route("/api/v1/loans/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -503,6 +501,32 @@ HttpServer::new(move || {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS loans (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    loan_number VARCHAR(20) NOT NULL UNIQUE,
+    customer_id UUID NOT NULL,
+    account_id UUID NOT NULL,
+    product_id UUID NOT NULL,
+    principal_kobo BIGINT NOT NULL CHECK (principal_kobo > 0),
+    interest_rate_bps INT NOT NULL,
+    tenor_days INT NOT NULL,
+    disbursed_amount_kobo BIGINT,
+    outstanding_kobo BIGINT DEFAULT 0,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    purpose TEXT,
+    collateral_type VARCHAR(32),
+    collateral_value_kobo BIGINT,
+    disbursed_at TIMESTAMPTZ,
+    maturity_date DATE,
+    next_repayment_date DATE,
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create loans table");
 
 #[cfg(test)]
 mod tests {
@@ -525,4 +549,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE loans SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("loans.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE loans SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("loans.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

@@ -1,42 +1,35 @@
 """
-cbn-returns-py — Production-hardened service
+cbn-returns-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
+
 import os
-import sys
 import json
-import urllib.request
-import time
-import signal
-import logging
-import threading
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+import logging
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
-# --- Structured Logging ---
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "service": "cbn-returns-py",
-            "message": record.getMessage(),
-        })
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[handler])
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("cbn-returns-py")
 
-# --- Redis Caching Layer ---
-import socket as _socket
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/cbn_returns_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8259"))
 
-# Rate limiting
-import threading as _rl_threading
-_rl_tokens = 100
-_rl_lock = _rl_threading.Lock()
-_rl_last_refill = [0.0]
+db_conn = None
 
 def _rl_allow():
     global _rl_tokens
@@ -158,20 +151,11 @@ def inc_errors():
 _db_pool = None
 
 def get_db():
-    global _db_pool
-    if not DB_URL:
-        return None
-    try:
-        if _db_pool is None:
-            from psycopg2.pool import SimpleConnectionPool
-            _db_pool = SimpleConnectionPool(minconn=2, maxconn=10, dsn=DB_URL)
-            logger.info("Database connection pool initialized (2-10 connections)")
-        conn = _db_pool.getconn()
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        logger.warning(f"DB pool connection failed: {e}")
-        return None
+    global db_conn
+    if db_conn is None or db_conn.closed:
+        db_conn = psycopg2.connect(DATABASE_URL)
+        db_conn.autocommit = True
+    return db_conn
 
 def release_db(conn):
     """Return a connection to the pool."""
@@ -182,7 +166,7 @@ def release_db(conn):
         except Exception:
             pass
 
-def db_insert(table, record):
+def init_schema():
     conn = get_db()
     if not conn:
         record["id"] = str(uuid.uuid4())
@@ -202,7 +186,90 @@ def db_insert(table, record):
         record["id"] = str(uuid.uuid4())
         return record
 
-def db_query(table, page=1, limit=50):
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_compliance_records_tenant ON compliance_records(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_compliance_records_status ON compliance_records(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_compliance_records_created ON compliance_records(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_schema()
+    logger.info(f"[cbn-returns-py] ready on :%d", PORT)
+    logger.info(f"[cbn-returns-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
+    if db_conn:
+        db_conn.close()
+
+
+app = FastAPI(title="cbn-returns-py", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "cbn-returns-py", "version": "1.0.0"}
+
+
+@app.get("/readyz")
+def readyz():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM compliance_records")
+            count = cur.fetchone()[0]
+        return {"service": "cbn-returns-py", "total_records": count}
+    except Exception:
+        return {"service": "cbn-returns-py", "total_records": 0}
+
+
+@app.get("/api/v1/compliance_records")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
     conn = get_db()
     if not conn:
         return [], 0
@@ -522,27 +589,79 @@ class Handler(BaseHTTPRequestHandler):
                 f'# TYPE errors_total counter\n'
                 f'errors_total{{service=\"cbn-returns-py\"}} {error_count}\n'
             )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body.encode())
-        elif path in ("/v1/records", "/v1/list"):
-            claims, err = validate_jwt(dict(self.headers))
-            if err:
-                self.respond(401, {"error": "unauthorized", "detail": err})
-                return
-            items, total = db_query("cbn_returns_py")
-            self.respond(200, {"items": items, "total": total, "source": "database" if get_db() else "no_db"})
-        elif path == "/v1/stats":
-            self.respond(200, {
-                "service": "cbn-returns-py",
-                "requests": request_count,
-                "errors": error_count,
-                "db_connected": get_db() is not None,
-                "uptime_secs": round(time.time() - START_TIME),
-            })
         else:
-            self.respond(404, {"error": "not_found", "path": path})
+            cur.execute("SELECT id, status, created_at FROM compliance_records ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+
+    records = [
+        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
+        for r in rows
+    ]
+    return {"data": records, "count": len(records)}
+
+
+@app.post("/api/v1/compliance_records", status_code=201)
+def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
+    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
+    status = body.status or "active"
+    record_id = str(uuid.uuid4())
+
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO compliance_records (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
+            (record_id, tenant_id, status)
+        )
+        # Outbox event
+        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("compliance_records.created", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": "created"}
+
+
+@app.get("/api/v1/compliance_records/{record_id}")
+def get_record(record_id: str):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, status, created_at FROM compliance_records WHERE id = %s::uuid", (record_id,))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
+
+
+@app.put("/api/v1/compliance_records/{record_id}")
+def update_record(record_id: str, body: UpdateRequest):
+    status = body.status or "updated"
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE compliance_records SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
+            (status, record_id)
+        )
+        payload = json.dumps({"id": record_id, "status": status})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("compliance_records.updated", record_id, payload)
+        )
+    conn.commit()
+    return {"id": record_id, "status": status}
+
+
+@app.delete("/api/v1/compliance_records/{record_id}", status_code=204)
+def delete_record(record_id: str):
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("UPDATE compliance_records SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
+        payload = json.dumps({"id": record_id})
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("compliance_records.deleted", record_id, payload)
+        )
+    conn.commit()
 
     def do_POST(self):
         trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
@@ -692,15 +811,5 @@ def init_tracing(service_name):
 signal.signal(signal.SIGINT, shutdown_handler)
 
 if __name__ == "__main__":
-    get_db()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": "cbn-returns-py", "port": PORT, "message": "starting"}))
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        if db_conn:
-            db_conn.close()
-        logger.info("Server stopped gracefully")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

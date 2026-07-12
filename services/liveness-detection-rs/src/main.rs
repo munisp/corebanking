@@ -1,115 +1,26 @@
-#![allow(unused)]
-use actix_web::dev::Service;
-use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};
+use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Mutex;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-// ─── Domain Types ───────────────────────────────────────────────────────────
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum SpoofType {
-    PrintedPhoto,
-    ScreenReplay,
-    PaperMask,
-    ThreeDMask,
-    Deepfake,
-    HighQualityPhoto,
-    None,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct MethodScore {
-    method: String,
-    score: f64,
-    weight: f64,
-    passed: bool,
-    threshold: f64,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct AntiSpoofScore {
-    is_spoof: bool,
-    spoof_type: String,
-    overall_confidence: f64,
-    texture_lbp: f64,
-    monocular_depth: f64,
-    frequency_fft: f64,
-    edge_boundary: f64,
-    moire_detected: bool,
-    reflection_anomaly: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct LivenessCheck {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    customer_id: String,
-    session_id: String,
-    is_live: bool,
-    overall_score: f64,
-    confidence_score: f64,
-    verdict: String,
-    method_scores: Vec<MethodScore>,
-    anti_spoof: AntiSpoofScore,
-    deepfake_probability: f64,
-    face_detected: bool,
-    face_quality: f64,
-    head_pose_valid: bool,
-    device_platform: String,
-    processing_time_ms: f64,
-    challenge_type: Option<String>,
-    challenges_passed: u32,
-    challenges_total: u32,
-    timestamp: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct FaceMatch {
-    id: String,
-    customer_id: String,
-    matched: bool,
-    similarity_score: f64,
-    embedding_distance: f64,
-    face1_quality: f64,
-    face2_quality: f64,
-    age_estimation: u32,
-    gender_estimation: String,
-    processing_time_ms: f64,
-    timestamp: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ScoringConfig {
-    passive_3d_weight: f64,
-    texture_weight: f64,
-    depth_weight: f64,
-    frequency_weight: f64,
-    deepfake_weight: f64,
-    liveness_threshold: f64,
-    face_match_threshold: f64,
-    anti_spoof_threshold: f64,
-    deepfake_threshold: f64,
-    ibeta_level: u8,
-}
-
-impl Default for ScoringConfig {
-    fn default() -> Self {
-        Self {
-            passive_3d_weight: 0.30,
-            texture_weight: 0.20,
-            depth_weight: 0.20,
-            frequency_weight: 0.15,
-            deepfake_weight: 0.15,
-            liveness_threshold: 0.75,
-            face_match_threshold: 0.68,
-            anti_spoof_threshold: 0.50,
-            deepfake_threshold: 0.40,
-            ibeta_level: 2,
-        }
-    }
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
@@ -1114,4 +1025,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE kyc_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("kyc_records.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("kyc_records.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

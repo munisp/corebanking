@@ -5,12 +5,13 @@ Production-hardened: JWT, rate limiting, security headers, DB persistence,
 graceful shutdown, health probes, Prometheus metrics, distributed tracing,
 inter-service wiring, connection pooling, input sanitization.
 """
-import os, sys, json, time, signal, threading, hashlib, re, html
-import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
 
-SERVICE_NAME = "microfinance-py"
+import os
+import json
+import uuid
+import logging
+from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
@@ -19,43 +20,20 @@ TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54link-dev/certs/service.key
 TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54link-dev/certs/ca.crt")
 PORT = int(os.environ.get("PORT", 9523))
 
-# --- Observability ---
-_request_count = 0
-_start_time = time.time()
-_trace_header = "X-Trace-Id"
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("microfinance-py")
 
-# --- Rate Limiting (token bucket) ---
-_rl_tokens = 100.0
-_rl_max = 100.0
-_rl_rate = 100.0
-_rl_last = time.time()
-_rl_lock = threading.Lock()
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/microfinance_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8371"))
 
-def _rl_allow():
-    global _rl_tokens, _rl_last
-    with _rl_lock:
-        now = time.time()
-        _rl_tokens = min(_rl_max, _rl_tokens + (now - _rl_last) * _rl_rate)
-        _rl_last = now
-        if _rl_tokens >= 1.0:
-            _rl_tokens -= 1.0
-            return True
-        return False
+db_conn = None
 
-# --- Input Sanitization ---
-MAX_INPUT_SIZE = 10240
-
-def sanitize(val):
-    if isinstance(val, str):
-        return html.escape(val)[:4096]
-    if isinstance(val, dict):
-        return {sanitize(k): sanitize(v) for k, v in val.items()}
-    if isinstance(val, list):
-        return [sanitize(v) for v in val[:100]]
-    return val
-
-# --- Database ---
-_db_pool = None
 
 _db_last_attempt = 0
 _DB_RETRY_INTERVAL = 30  # seconds between reconnect attempts
@@ -111,41 +89,100 @@ def get_db():
         _db_pool = None
         return None
 
-def db_insert(record_id, data):
-    pool = get_db()
-    if pool is None:
-        return False
-    try:
-        conn = pool.getconn()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s, %s, %s, %s, %s)",
-            (record_id, SERVICE_NAME, "default", "active", json.dumps(data))
-        )
-        conn.commit()
-        pool.putconn(conn)
-        return True
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_insert failed: {e}", file=sys.stderr)
-        return False
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
 
-def db_query(service_filter=None):
-    pool = get_db()
-    if pool is None:
-        return None
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_schema()
+    logger.info(f"[microfinance-py] ready on :%d", PORT)
+    logger.info(f"[microfinance-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
+    if db_conn:
+        db_conn.close()
+
+
+app = FastAPI(title="microfinance-py", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "microfinance-py", "version": "1.0.0"}
+
+
+@app.get("/readyz")
+def readyz():
     try:
-        conn = pool.getconn()
-        cur = conn.cursor()
-        if service_filter:
-            cur.execute("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = %s ORDER BY created_at DESC LIMIT 50", (service_filter,))
-        else:
-            cur.execute("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = %s ORDER BY created_at DESC LIMIT 50", (SERVICE_NAME,))
-        rows = cur.fetchall()
-        pool.putconn(conn)
-        return [{"id": r[0], "service": r[1], "type": r[2], "status": r[3], "data": r[4], "created_at": str(r[5])} for r in rows]
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
     except Exception as e:
-        print(f"[{SERVICE_NAME}] db_query failed: {e}", file=sys.stderr)
-        return None
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM service_configs")
+            count = cur.fetchone()[0]
+        return {"service": "microfinance-py", "total_records": count}
+    except Exception:
+        return {"service": "microfinance-py", "total_records": 0}
+
+
+@app.get("/api/v1/service_configs")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        if x_tenant_id:
+            cur.execute(
+                "SELECT id, status, created_at FROM service_configs WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
+                (x_tenant_id,)
+            )
+        else:
+            cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
 
 def query_groups(tenant_id=None):
     pool = get_db()
@@ -609,14 +646,5 @@ def sanitize_input(s):
     return s[:10000] if len(s) > 10000 else s
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-    init_tracing()
-    get_db()
-    _server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting"}), file=sys.stderr)
-    try:
-        _server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    print(f"[{SERVICE_NAME}] Server stopped gracefully", file=sys.stderr)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

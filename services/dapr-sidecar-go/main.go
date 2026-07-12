@@ -1,15 +1,21 @@
-// 54Bank Dapr Sidecar — Go
-// Domain: Infrastructure/Ops
-// Full domain-specific implementation with business logic
-// Middleware: Kafka, Postgres, Redis, Temporal, Permify, OpenSearch
+// dapr-sidecar-go — Dapr Distributed Application Runtime integration for 54Bank
+// Implements: pub/sub event routing, state store, service invocation, distributed locking
+// Middleware: Keycloak JWT, PostgreSQL audit, Dapr Go SDK
 package main
 
 import (
-	_ "github.com/lib/pq"
+"bytes"
 "context"
+"database/sql"
+"encoding/json"
+"fmt"
+"log"
+"net/http"
+"os"
 "os/signal"
+"strings"
 "syscall"
-"sync/atomic"
+"time"
 
 	"encoding/json"
 	"fmt"
@@ -360,6 +366,8 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 // --- Database Layer ---
 var db *sql.DB
+var daprClient dapr.Client
+var daprAvailable bool
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -821,5 +829,28 @@ mux := http.NewServeMux()
     _ = server.Shutdown(ctx)
     log.Println("[dapr-sidecar-go] Server stopped gracefully")
 }
+writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
+})
+mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
+})
+mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+var evtCount, stateCount int64
+db.QueryRow("SELECT COUNT(*) FROM dapr_published_events").Scan(&evtCount)
+db.QueryRow("SELECT COUNT(*) FROM dapr_state_operations").Scan(&stateCount)
+fmt.Fprintf(w, "dapr_events_published_total %d\ndapr_state_operations_total %d\n", evtCount, stateCount)
+})
+mux.HandleFunc("/dapr/subscribe", subscribeEndpoint)
+mux.HandleFunc("/dapr/subscribe/transactions", handleSubscribedEvent("banking.transactions"))
+mux.HandleFunc("/dapr/subscribe/payments", handleSubscribedEvent("banking.payments.raw"))
+mux.HandleFunc("/dapr/subscribe/kyc", handleSubscribedEvent("banking.kyc.events"))
+mux.HandleFunc("/dapr/subscribe/aml", handleSubscribedEvent("banking.aml.alerts"))
+mux.HandleFunc("/dapr/subscribe/notifications", handleSubscribedEvent("banking.notifications"))
+mux.HandleFunc("/api/v1/publish", publishHandler)
+mux.HandleFunc("/api/v1/state/", func(w http.ResponseWriter, r *http.Request) {
+if r.Method == http.MethodPost { saveStateHandler(w, r) } else { getStateHandler(w, r) }
+})
+mux.HandleFunc("/api/v1/invoke", invokeHandler)
+mux.HandleFunc("/api/v1/subscriptions", subscriptionsHandler)
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

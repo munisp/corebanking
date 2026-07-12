@@ -7,12 +7,23 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// GAP 21: MAKER-CHECKER → GL EXECUTION BRIDGE
-// Approved transactions trigger actual GL posting (approval = execution trigger)
-// ═══════════════════════════════════════════════════════════════════════════════
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
 
-use std::sync::{Mutex, Arc};
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 struct AppState {
     records: Mutex<Vec<serde_json::Value>>,
@@ -619,12 +630,38 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8099".into());
-    println!("Operations Control GL (Rust) on :{} — Gaps 21-23, 14 middleware", port);
-        let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
-        start_grpc_server("operations-control-gl-rs", 10458);
-    HttpServer::new(|| {
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[operations-control-gl-rs] starting");
+
+    let db_name = "operations-control-gl-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    init_schema(&pool).await;
+    log::info!("[operations-control-gl-rs] database connected, schema initialized");
+
+    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
+    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
+    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
+    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
+
+    log::info!("[operations-control-gl-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
+        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
+
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8406".to_string()).parse().unwrap_or(8406);
+    let data = web::Data::new(AppState { db: pool });
+
+    log::info!("[operations-control-gl-rs] ready on :{}", port);
+
+    HttpServer::new(move || {
         App::new()
                 .wrap(
                     actix_web::middleware::DefaultHeaders::new()
@@ -665,8 +702,13 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/products/gl-mapping", web::get().to(product_gl_mapping))
             .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .shutdown_timeout(30)
@@ -674,6 +716,24 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
 
 #[cfg(test)]
 mod tests {
@@ -728,4 +788,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

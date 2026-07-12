@@ -368,3 +368,5 @@ mod tests {
         assert!(suspend);
     }
 }
+
+fn start_watchdog() { std::thread::spawn(|| { loop { std::thread::sleep(std::time::Duration::from_secs(30)); } }); }

@@ -1,86 +1,26 @@
-#![allow(unused)]
-use actix_web::dev::Service;
-use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::Mutex;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-// ─── Continuous Liveness + Behavioral Biometrics Engine ─────────────────────
-// Step-up re-verification, typing cadence analysis, swipe pattern matching,
-// device orientation anomaly detection, risk-based challenge selection.
-
-#[derive(Clone, Serialize, Deserialize)]
-struct StepUpConfig {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    trigger: String,
-    threshold: u64,
-    methods: Vec<String>,
-    frequency: String,
+    status: String,
     tenant_id: String,
-    enabled: bool,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct ContinuousCheck {
-    id: String,
-    customer_id: String,
-    trigger: String,
-    transaction_amount: u64,
-    methods_applied: Vec<String>,
-    overall_score: f64,
-    passed: bool,
-    device_fingerprint: String,
-    behavioral_score: f64,
-    timestamp: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct BehavioralProfile {
-    customer_id: String,
-    typing_cadence_ms: Vec<f64>,
-    avg_typing_speed: f64,
-    typing_rhythm_signature: Vec<f64>,
-    swipe_patterns: Vec<SwipePattern>,
-    device_orientation_baseline: OrientationBaseline,
-    session_count: u32,
-    anomaly_score: f64,
-    last_updated: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct SwipePattern {
-    direction: String,
-    avg_velocity: f64,
-    avg_pressure: f64,
-    avg_length_px: f64,
-    frequency: u32,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct OrientationBaseline {
-    avg_tilt_x: f64,
-    avg_tilt_y: f64,
-    avg_tilt_z: f64,
-    variance_x: f64,
-    variance_y: f64,
-    variance_z: f64,
-    is_stable: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct BehavioralCheck {
-    id: String,
-    customer_id: String,
-    typing_score: f64,
-    swipe_score: f64,
-    orientation_score: f64,
-    combined_score: f64,
-    anomalies: Vec<String>,
-    passed: bool,
-    device_info: String,
-    timestamp: String,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
@@ -845,4 +785,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE kyc_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("kyc_records.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("kyc_records.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

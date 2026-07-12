@@ -7,63 +7,27 @@ mod middleware_integration;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use std::env;
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-#[derive(Clone)]
-struct AppState {
-    start_time: Instant,
-    db_url: String,
-    service_name: String,
-    alerts: Arc<RwLock<Vec<KpiAlert>>>,
-    thresholds: Arc<RwLock<Vec<ThresholdRule>>>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct ThresholdRule {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    role: String,
-    metric_id: String,
-    metric_name: String,
-    condition: String,       // "gt", "lt", "gte", "lte", "eq"
-    threshold_value: f64,
-    severity: String,        // "critical", "warning", "info"
-    action: String,          // "kafka_publish", "email", "sms", "webhook"
-    enabled: bool,
-    cooldown_minutes: i32,   // min time between re-alerts
-    last_triggered: Option<String>,
-    description: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct KpiAlert {
-    id: String,
-    rule_id: String,
-    role: String,
-    metric_id: String,
-    metric_name: String,
-    current_value: f64,
-    threshold_value: f64,
-    severity: String,
-    status: String,         // "active", "acknowledged", "resolved"
-    triggered_at: String,
-    acknowledged_at: Option<String>,
-    resolved_at: Option<String>,
-    message: String,
-    action_taken: String,
-}
-
-#[derive(Deserialize)]
-struct ListParams {
-    page: Option<usize>,
-    limit: Option<usize>,
-    role: Option<String>,
-    severity: Option<String>,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
     status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 
@@ -716,8 +680,13 @@ async fn main() -> std::io::Result<()> {
             .route("/api/kpi/alerts/summary", web::get().to(dashboard_summary))
             .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/audit_events", web::get().to(list_records))
+            .route("/api/v1/audit_events", web::post().to(create_record))
+            .route("/api/v1/audit_events/{id}", web::get().to(get_record))
+            .route("/api/v1/audit_events/{id}", web::put().to(update_record))
+            .route("/api/v1/audit_events/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -725,6 +694,26 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS audit_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_type VARCHAR(64) NOT NULL,
+    actor_id UUID NOT NULL,
+    actor_type VARCHAR(20) NOT NULL,
+    resource_type VARCHAR(64) NOT NULL,
+    resource_id VARCHAR(128) NOT NULL,
+    action VARCHAR(32) NOT NULL,
+    outcome VARCHAR(20) NOT NULL DEFAULT 'success',
+    ip_address INET,
+    user_agent TEXT,
+    changes JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create audit_events table");
 
 #[cfg(test)]
 mod tests {
@@ -779,4 +768,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE audit_events SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("audit_events.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE audit_events SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("audit_events.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

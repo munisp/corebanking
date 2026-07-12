@@ -1,36 +1,35 @@
 """
-epr-kgqa-py — Production-hardened service
+epr-kgqa-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
-import os, sys, json, time, signal, logging, threading, uuid, math
-import socket as _socket
-import urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+
+import os
+import json
+import uuid
+import logging
 from datetime import datetime, timezone
-from collections import defaultdict, deque
+from contextlib import asynccontextmanager
 
-SERVICE_NAME = "epr-kgqa-py"
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "level": record.levelname, "service": SERVICE_NAME, "message": record.getMessage()})
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("epr-kgqa-py")
 
-_handler = logging.StreamHandler()
-_handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[_handler])
-logger = logging.getLogger(SERVICE_NAME)
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/epr_kgqa_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8093"))
 
-import threading as _rl_threading
-_rl_tokens = 100
-_rl_lock = _rl_threading.Lock()
-_rl_last_refill = [0.0]
-def _rl_allow():
-    global _rl_tokens
-    now = time.time()
-    with _rl_lock:
-        if now - _rl_last_refill[0] >= 1.0: _rl_tokens = 100; _rl_last_refill[0] = now
-        if _rl_tokens <= 0: return False
-        _rl_tokens -= 1; return True
+db_conn = None
 
 _REDIS_URL = os.environ.get("REDIS_URL", "localhost:6379")
 def cache_get(key):
@@ -74,7 +73,7 @@ def call_service(method, url, data=None):
         req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method=method)
         with urllib.request.urlopen(req, timeout=5) as resp: return json.loads(resp.read().decode())
     except Exception as e:
-        logger.warning(f"call_service failed: {e}"); return None
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
 
 
 # --- mTLS Configuration ---
@@ -396,10 +395,5 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(201, {"created": True})
 
 if __name__ == "__main__":
-    def shutdown_handler(sig, frame):
-        logger.info("Shutting down gracefully"); sys.exit(0)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting"}))
-    server.serve_forever()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

@@ -8,12 +8,23 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// ENHANCEMENT 3: eNaira / CBDC INTEGRATION
-// CBN's digital currency — wallet bridge + merchant acceptance
-// ═══════════════════════════════════════════════════════════════════════════════
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
 
-use std::sync::{Mutex, Arc};
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 struct AppState {
     records: Mutex<Vec<serde_json::Value>>,
@@ -494,12 +505,38 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port = std::env::var("PORT").unwrap_or_else(|_| "8103".into());
-    println!("AI Fraud & eNaira CBDC (Rust) on :{} — Enhancements 3, 4", port);
-        let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
-        start_grpc_server("ai-fraud-scoring-rs", 10346);
-    HttpServer::new(|| {
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[ai-fraud-scoring-rs] starting");
+
+    let db_name = "ai-fraud-scoring-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    init_schema(&pool).await;
+    log::info!("[ai-fraud-scoring-rs] database connected, schema initialized");
+
+    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
+    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
+    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
+    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
+
+    log::info!("[ai-fraud-scoring-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
+        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
+
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8618".to_string()).parse().unwrap_or(8618);
+    let data = web::Data::new(AppState { db: pool });
+
+    log::info!("[ai-fraud-scoring-rs] ready on :{}", port);
+
+    HttpServer::new(move || {
         App::new()
                 .wrap(
                     actix_web::middleware::DefaultHeaders::new()
@@ -539,8 +576,13 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/fraud/detection", web::get().to(fraud_detection_ml))
             .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/fraud_alerts", web::get().to(list_records))
+            .route("/api/v1/fraud_alerts", web::post().to(create_record))
+            .route("/api/v1/fraud_alerts/{id}", web::get().to(get_record))
+            .route("/api/v1/fraud_alerts/{id}", web::put().to(update_record))
+            .route("/api/v1/fraud_alerts/{id}", web::delete().to(delete_record))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .shutdown_timeout(30)
@@ -548,6 +590,29 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS fraud_alerts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    alert_type VARCHAR(64) NOT NULL,
+    severity VARCHAR(20) NOT NULL DEFAULT 'medium',
+    entity_type VARCHAR(20) NOT NULL,
+    entity_id UUID NOT NULL,
+    transaction_id UUID,
+    rule_id VARCHAR(64),
+    score REAL NOT NULL DEFAULT 0.0,
+    threshold REAL NOT NULL DEFAULT 0.7,
+    status VARCHAR(20) NOT NULL DEFAULT 'open',
+    description TEXT,
+    evidence JSONB DEFAULT '{}',
+    assigned_to UUID,
+    resolved_at TIMESTAMPTZ,
+    resolution VARCHAR(32),
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create fraud_alerts table");
 
 #[cfg(test)]
 mod tests {
@@ -595,4 +660,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE fraud_alerts SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("fraud_alerts.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE fraud_alerts SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("fraud_alerts.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

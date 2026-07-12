@@ -2,48 +2,27 @@
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
-use std::time::Instant;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use std::env;
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// ─── Domain Types ───────────────────────────────────────────────────────────
-
-#[derive(Clone, Serialize, Deserialize)]
-struct FaceMatchResult {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    customer_id: String,
-    matched: bool,
-    similarity_score: f64,
-    embedding_distance: f64,
-    face1_quality: f64,
-    face2_quality: f64,
-    age_estimation: u32,
-    gender_estimation: String,
-    glasses_detected: bool,
-    mask_detected: bool,
-    head_pose_diff: f64,
-    purpose: String,
-    processing_time_ms: f64,
-    timestamp: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Serialize, Default)]
-struct MatchStats {
-    total_matches: u64,
-    successful_matches: u64,
-    failed_matches: u64,
-    match_rate: f64,
-    avg_similarity: f64,
-    avg_processing_ms: f64,
-    purpose_breakdown: PurposeBreakdown,
-}
-
-#[derive(Clone, Serialize, Default)]
-struct PurposeBreakdown {
-    kyc_onboarding: u64,
-    transaction_auth: u64,
-    periodic_reverify: u64,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
@@ -679,4 +658,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

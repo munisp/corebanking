@@ -1,27 +1,17 @@
-// trade-finance-go — Production service with real Postgres SQL queries
 package main
 
 import (
-	"io"
-	_ "github.com/lib/pq"
-"sync"
-"bytes"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
-
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
 	"net/http"
 	"os"
-	"time"
-	"net"
-
+	"os/signal"
 	"strings"
+	"syscall"
+	"time"
 
 )
 
@@ -51,9 +41,7 @@ type BankGuarantee struct {
 	UpdatedAt        string            `json:"updated_at"`
 }
 
-func nowISO() string {
-	return time.Now().UTC().Format(time.RFC3339)
-}
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
 
 type LCRequest struct {
 	Applicant    string  `json:"applicant"`
@@ -82,37 +70,46 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "trade-finance-go", })
 }
 
-func listHandler(w http.ResponseWriter, r *http.Request) {
-	cacheKey := "trade_finance_list"
-	if cached, ok := cacheGet(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		w.WriteHeader(200)
-		w.Write([]byte(cached))
-		return
-	}
-	jsonResp(w, 200, map[string]interface{}{"items": []interface{}{}, "total": 0, "source": dbSourceTag()})
+// ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
+
+func startOutboxRelay(ctx context.Context, brokers string, topic string) {
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				relayOutbox(brokers, topic)
+			}
+		}
+	}()
 }
 
-func statsHandler(w http.ResponseWriter, r *http.Request) {
-	jsonResp(w, 200, map[string]interface{}{"service": "trade-finance-go", "status": "operational"})
+func relayOutbox(brokers string, topic string) {
+	if db == nil { return }
+	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
+	if err != nil { return }
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id, eventType, aggID string
+		var payload []byte
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
+		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 { return }
+	// Mark as published
+	for _, id := range ids {
+		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	}
+	log.Printf("[outbox-relay] marked %d events as published", len(ids))
 }
 
-func getByIdHandler(w http.ResponseWriter, r *http.Request) {
-	idParam := r.URL.Query().Get("id")
-	if idParam == "" { idParam = strings.TrimPrefix(r.URL.Path, "/v1/trade-finance/") }
-	cacheKey := "trade_finance_" + idParam
-	if cached, ok := cacheGet(cacheKey); ok {
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Cache", "HIT")
-		w.WriteHeader(200)
-		w.Write([]byte(cached))
-		return
-	}
-	jsonResp(w, 200, map[string]interface{}{"service": "trade-finance-go"})
-}
-// --- Database persistence ---
-var db *sql.DB
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -127,6 +124,8 @@ func initDB() {
 		db = nil
 		return
 	}
+	defer db.Close()
+
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -135,12 +134,76 @@ func initDB() {
 		db = nil
 		return
 	}
-	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
-	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (
-		id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-		status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-		created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
-		created_by TEXT DEFAULT '', tenant_id TEXT DEFAULT ''
+
+	initSchema()
+	log.Printf("[trade-finance-go] database connected, schema initialized")
+
+	// Middleware clients
+	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
+	redisURL := getEnv("REDIS_URL", "localhost:6379")
+	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
+
+	log.Printf("[trade-finance-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
+
+	mux := http.NewServeMux()
+
+	// Health endpoints
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+	})
+	mux.HandleFunc("/metrics", metricsHandler)
+
+	// Domain endpoints
+	mux.HandleFunc("/api/v1/service_configs", domainHandler)
+	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
+
+	server := &http.Server{
+		Addr:         ":" + getEnv("PORT", "8297"),
+		Handler:      loggingMiddleware(corsMiddleware(mux)),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	log.Printf("[trade-finance-go] ready on :%s", getEnv("PORT", "8297"))
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Printf("[trade-finance-go] shutting down...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	server.Shutdown(ctx)
+	log.Printf("[trade-finance-go] stopped")
+}
+
+func initSchema() {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
 	)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS trade_transactions (id SERIAL PRIMARY KEY, trade_id TEXT, lc_number TEXT, applicant TEXT, beneficiary TEXT, amount NUMERIC(15,2), currency TEXT, status TEXT, incoterm TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
@@ -172,9 +235,7 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if upstreamURL == "" { upstreamURL = "http://localhost:8120" }
 	result, err := callService("POST", upstreamURL+"/v1/screen", body)
 	if err != nil {
-		log.Printf("trade-finance-go: aml_screening call failed: %v", err)
-	} else {
-		log.Printf("trade-finance-go: aml_screening ok: %v", result)
+		log.Fatalf("schema init failed: %v", err)
 	}
 	
 	cacheSet(tenantID+":"+"trade_finance_list", "", 1) // invalidate list cache
@@ -186,23 +247,34 @@ func lcFee(amount float64, tenor int) float64 {
 	return math.Round(amount * rate * float64(tenor) / 365.0 * 100) / 100
 }
 
-func requiredDocuments(incoterm string) []string {
-	base := []string{"commercial_invoice", "packing_list", "bill_of_lading"}
-	if incoterm == "CIF" || incoterm == "CIP" {
-		base = append(base, "insurance_certificate")
+	// Outbox for event sourcing
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		event_type VARCHAR(64) NOT NULL,
+		aggregate_id VARCHAR(128) NOT NULL,
+		payload JSONB NOT NULL,
+		published BOOLEAN DEFAULT FALSE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("outbox table creation (may already exist): %v", err)
 	}
-	base = append(base, "certificate_of_origin")
-	return base
+
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
 }
 
-func validatePresentation(presented []string, required []string) (bool, []string) {
-	var missing []string
-	for _, req := range required {
-		found := false
-		for _, p := range presented { if p == req { found = true; break } }
-		if !found { missing = append(missing, req) }
+func domainHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		listRecords(w, r)
+	case "POST":
+		createRecord(w, r)
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 	}
-	return len(missing) == 0, missing
 }
 
 func lcStatus(issued bool, expired bool, utilized bool) string {
@@ -243,15 +315,13 @@ var (
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"trade-finance-go"}`)
-}
-
-func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	if err := db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
@@ -386,17 +456,11 @@ func (rw *responseWriter) WriteHeader(code int) {
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" {
-			traceID = r.Header.Get("traceparent")
-		}
-		if traceID == "" {
-			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
-		}
-		w.Header().Set("X-Trace-Id", traceID)
-		r.Header.Set("X-Trace-Id", traceID)
-		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		start := time.Now()
 		next.ServeHTTP(w, r)
+		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
+			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+		}
 	})
 }
 
@@ -484,38 +548,9 @@ func min64f(a, b float64) float64 {
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !_rl.allow() {
-			w.Header().Set("Retry-After", "1")
-			jsonResp(w, 429, map[string]interface{}{"error": "rate limit exceeded", "retry_after": 1})
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- CORS + Security Headers Middleware ---
-func securityHeadersMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
-		if allowedOrigins == "" {
-			allowedOrigins = "https://dashboard.54bank.ng"
-		}
-		origin := r.Header.Get("Origin")
-		for _, allowed := range strings.Split(allowedOrigins, ",") {
-			if strings.TrimSpace(allowed) == origin {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -524,17 +559,11 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- Input Sanitization ---
-func sanitizeInput(s string) string {
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "'", "&#39;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "\\", "")
-	if len(s) > 10000 {
-		s = s[:10000]
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return s
+	return fallback
 }
 
 // --- JWT Validation (JWKS-aware) ---

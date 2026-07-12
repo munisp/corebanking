@@ -3,37 +3,31 @@ use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct AccountingRule {
-    pub rule_id: Option<String>,
-    pub rule_name: String,
-    pub event_type: String,
-    pub debit_account: String,
-    pub credit_account: String,
-    pub amount_formula: String,
-    pub currency: Option<String>,
-    pub active: Option<bool>,
-    pub priority: Option<i32>,
-}
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct RuleEvalRequest {
-    pub event_type: String,
-    pub amount: f64,
-    pub currency: String,
-    pub metadata: Option<serde_json::Value>,
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
-    rules: Mutex<Vec<AccountingRule>>,
-    db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 
@@ -475,13 +469,14 @@ async fn main() -> std::io::Result<()> {
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
-            .route("/v1/rules/evaluate", web::post().to(evaluate_rules))
-            .route("/v1/rules/validate", web::post().to(validate_rule_handler))
-            .route("/v1/rules/by-event/{event_type}", web::get().to(rules_by_event))
-            .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/accounts", web::get().to(list_records))
+            .route("/api/v1/accounts", web::post().to(create_record))
+            .route("/api/v1/accounts/{id}", web::get().to(get_record))
+            .route("/api/v1/accounts/{id}", web::put().to(update_record))
+            .route("/api/v1/accounts/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -489,6 +484,27 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS accounts (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_number VARCHAR(20) NOT NULL UNIQUE,
+    customer_id UUID NOT NULL,
+    account_type VARCHAR(32) NOT NULL,
+    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
+    balance_kobo BIGINT NOT NULL DEFAULT 0,
+    available_balance_kobo BIGINT NOT NULL DEFAULT 0,
+    tier VARCHAR(10) NOT NULL DEFAULT '1',
+    bvn VARCHAR(11),
+    tenant_id UUID NOT NULL,
+    opened_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create accounts table");
 
 #[cfg(test)]
 mod tests {
@@ -511,4 +527,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE accounts SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("accounts.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE accounts SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("accounts.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

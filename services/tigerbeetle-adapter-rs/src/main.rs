@@ -437,6 +437,8 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/tb_operation", web::post().to(tb_operation))
             .route("/v1/records", web::get().to(list_records))
             .route("/v1/stats", web::get().to(stats))
+            .route("/v1/tb_user_data", web::post().to(tb_user_data_handler))
+            .route("/v1/tb_account_flags", web::post().to(tb_account_flags_handler))
             .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(livez))

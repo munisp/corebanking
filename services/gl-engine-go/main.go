@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"time"
@@ -69,6 +70,7 @@ type JournalEntry struct {
 	Currency       string    `json:"currency"`
 	Narration      string    `json:"narration"`
 	TransactionRef string    `json:"transactionRef"`
+	IdempotencyKey string    `json:"idempotency_key,omitempty"`
 	BatchID        *string   `json:"batchId"`
 	PostingDate    time.Time `json:"postingDate"`
 	ValueDate      time.Time `json:"valueDate"`
@@ -302,7 +304,28 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Publish to Kafka
+	// Outbox: guaranteed event delivery for journal postings
+	outboxEvent := map[string]interface{}{
+		"event":      "journal.posted",
+		"entry_id":   entryID,
+		"gl_code":    req.GLAccountCode,
+		"type":       req.Type,
+		"amount":     req.Amount,
+		"currency":   req.Currency,
+		"tenant_id":  req.TenantID,
+		"account_id": req.AccountID,
+		"timestamp":  now.Format(time.RFC3339),
+	}
+	outboxID := fmt.Sprintf("OBX-%s", entryID)
+	if app.db != nil {
+		outboxPayload, _ := json.Marshal(outboxEvent)
+		app.db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
+			VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+			ON CONFLICT (idempotency_key) DO NOTHING`,
+			outboxID, "gl.journal.posted", entryID, outboxPayload, req.TransactionRef, now)
+	}
+	log.Printf("[outbox] journal entry %s queued for Kafka delivery", entryID)
+
 	kafkaEvent := map[string]interface{}{
 		"event":       "journal.posted",
 		"entryId":     entryID,
@@ -323,6 +346,7 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 201, map[string]interface{}{
 		"entry":      entry,
 		"kafka":      kafkaEvent,
+		"outbox":      map[string]string{"id": outboxID, "status": "pending", "topic": "gl.journal.posted"},
 		"tigerbeetle": map[string]string{"status": "synced", "transferId": entryID},
 		"opensearch":  map[string]string{"status": "indexed", "index": "gl-journal-2026"},
 		"lakehouse":   map[string]string{"status": "appended", "table": "gl_journal_iceberg"},

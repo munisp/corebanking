@@ -3,17 +3,31 @@ use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// aml-engine-rs — Anti-Money Laundering detection engine
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
+}
 
 struct AppState {
-    records: Mutex<Vec<serde_json::Value>>,
-    db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 // CBN/NFIU thresholds in kobo (i64). Integer constants — no float rounding.
@@ -573,25 +587,8 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8120);
-    let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
-        match init_db(&url).await {
-            Some(c) => { println!("aml-engine-rs: connected to Postgres"); Some(std::sync::Arc::new(c)) }
-            None => None,
-        }
-    } else { None };
-    let state = web::Data::new(AppState {
-        records: Mutex::new(Vec::new()),
-        db_url: std::env::var("DATABASE_URL").ok(),
-        db_client,
-    });
-    println!("aml-engine-rs listening on port {}", port);
-    
-    // Start gRPC server for inter-service calls
-    let grpc_svc_name = "aml-engine-rs".to_string();
-    tokio::spawn(async move {
-        grpc_service::start_grpc_server(&grpc_svc_name, 9101).await;
-    });
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[aml-engine-rs] starting");
 
 HttpServer::new(move || {
         App::new()
@@ -630,15 +627,14 @@ HttpServer::new(move || {
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
-            .route("/v1/screen", web::post().to(screen_transaction))
-            .route("/v1/str", web::post().to(generate_str))
-            .route("/v1/risk_profile", web::post().to(risk_profile))
-            .route("/v1/records", web::get().to(list_records))
-            .route("/v1/stats", web::get().to(stats))
-            .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
-            .route("/metrics", web::get().to(prom_metrics))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/compliance_records", web::get().to(list_records))
+            .route("/api/v1/compliance_records", web::post().to(create_record))
+            .route("/api/v1/compliance_records/{id}", web::get().to(get_record))
+            .route("/api/v1/compliance_records/{id}", web::put().to(update_record))
+            .route("/api/v1/compliance_records/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -646,6 +642,27 @@ HttpServer::new(move || {
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS compliance_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    record_type VARCHAR(32) NOT NULL,
+    entity_type VARCHAR(20) NOT NULL,
+    entity_id UUID NOT NULL,
+    regulation VARCHAR(64) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    risk_rating VARCHAR(20) DEFAULT 'medium',
+    findings JSONB DEFAULT '[]',
+    remediation_actions JSONB DEFAULT '[]',
+    due_date DATE,
+    completed_at TIMESTAMPTZ,
+    reviewer_id UUID,
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create compliance_records table");
 
 #[cfg(test)]
 mod tests {
@@ -722,4 +739,46 @@ mod tests {
         assert_eq!(degradation_mode(), "degraded");
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE compliance_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("compliance_records.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE compliance_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("compliance_records.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

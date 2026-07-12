@@ -8,63 +8,27 @@
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
-use std::time::Instant;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use std::env;
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
-// ─── Domain Types ───────────────────────────────────────────────────────────
-
-#[derive(Clone, Serialize, Deserialize)]
-struct SettlementRecon {
-    recon_id: String,
-    business_date: String,
-    recon_type: String,
-    gl_balance: f64,
-    external_balance: f64,
-    difference: f64,
-    status: String,
-    items_reconciled: u64,
-    items_outstanding: u64,
-    auto_matched: u64,
-    manual_review: u64,
-    reconciled_at: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct NostroPosition {
-    account_id: String,
-    bank_name: String,
-    currency: String,
-    gl_code: String,
-    book_balance: f64,
-    statement_balance: f64,
-    uncleared_credits: f64,
-    uncleared_debits: f64,
-    reconciled_balance: f64,
-    difference: f64,
-    status: String,
-    last_statement_date: String,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct SuspenseItem {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    gl_code: String,
-    gl_name: String,
-    amount: f64,
-    aging_days: u32,
-    source: String,
-    reason: String,
     status: String,
-    assigned_to: Option<String>,
-    created_at: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Deserialize)]
-struct RunSettlementReconRequest {
-    recon_type: Option<String>,
-    business_date: Option<String>,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
@@ -643,4 +607,46 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE settlements SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("settlements.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE settlements SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("settlements.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

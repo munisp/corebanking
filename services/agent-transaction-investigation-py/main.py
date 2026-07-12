@@ -1,25 +1,33 @@
 """
-agent-transaction-investigation-py — Intelligent Transaction Investigation Agent — traces transactions across GL, AML, payments graph
-Agentic AI service using ReAct pattern with tool orchestration.
+agent-transaction-investigation-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
-import os, sys, json, time, signal, logging, threading, uuid, math, re
-import socket as _socket
-import urllib.request
-from http.server import HTTPServer, BaseHTTPRequestHandler
+
+import os
+import json
+import uuid
+import logging
 from datetime import datetime, timezone
-from collections import defaultdict
+from contextlib import asynccontextmanager
 
-SERVICE_NAME = "agent-transaction-investigation-py"
-AGENT_TOOLS = ["neo4j_graph", "gl_engine", "aml_engine", "falkordb", "qdrant_search"]
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "level": record.levelname, "service": SERVICE_NAME, "message": record.getMessage()})
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("agent-transaction-investigation-py")
 
-_handler = logging.StreamHandler()
-_handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[_handler])
-logger = logging.getLogger(SERVICE_NAME)
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/agent_transaction_investigation_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8182"))
 
 import threading as _rl_threading
 _rl_tokens = 100
@@ -523,10 +531,5 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(404, {"error": "not_found"})
 
 if __name__ == "__main__":
-    def shutdown_handler(sig, frame):
-        logger.info("Shutting down gracefully"); sys.exit(0)
-    signal.signal(signal.SIGTERM, shutdown_handler)
-    signal.signal(signal.SIGINT, shutdown_handler)
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting", "tools": AGENT_TOOLS}))
-    server.serve_forever()
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

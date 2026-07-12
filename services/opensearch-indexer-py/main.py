@@ -8,6 +8,7 @@ Subscribes to:
 
 Published by payment-processing-service using TransactionEventSchema.
 """
+
 import os
 import logging
 from datetime import datetime, timezone
