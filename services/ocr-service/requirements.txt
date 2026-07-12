@@ -4,43 +4,43 @@ docling
 docling-core
 
 # DeepSeek OCR integration
-openai
-pillow
+openai==1.59.0
+pillow==11.3.0
 pytesseract
 
 # Web framework
-fastapi
-uvicorn[standard]
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
 python-multipart
 
 # Data validation
-pydantic
+pydantic==2.11.5
 pydantic-settings
 
 # Database and caching
-sqlalchemy
-redis
+sqlalchemy==2.0.41
+redis==5.2.1
 asyncpg
 
 # Document processing utilities
 python-magic
-pypdf
+pypdf==5.4.0
 python-docx
-openpyxl
+openpyxl==3.1.5
 beautifulsoup4
-lxml
+lxml==5.4.0
 
 # ML and AI integration
-langchain
+langchain==0.3.25
 langchain-community
 llama-index
 
 # Monitoring and logging
 prometheus-client
-structlog
+structlog==24.4.0
 
 # Utilities
-httpx
+httpx==0.28.1
 aiofiles
 python-jose[cryptography]
-passlib[bcrypt]
+passlib[bcrypt]==1.7.4

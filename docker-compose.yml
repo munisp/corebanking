@@ -27,9 +27,9 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.6-alpine  # CVE-2025-49844 fix: Lua use-after-free RCE (CVSS 10.0)
     ports: ["6379:6379"]
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --protected-mode yes --lua-time-limit 5000 --rename-command EVAL "" --rename-command EVALSHA ""
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -37,7 +37,7 @@ services:
       retries: 5
 
   kafka:
-    image: confluentinc/cp-kafka:7.6.0
+    image: confluentinc/cp-kafka:7.6.5  # mina-core, jinja2, jetty, netty CVE fixes
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
@@ -56,7 +56,7 @@ services:
       retries: 5
 
   opensearch:
-    image: opensearchproject/opensearch:2.12.0
+    image: opensearchproject/opensearch:2.19.0  # CVE-2024-32007 and HIGH/MEDIUM CVE fixes
     environment:
       - discovery.type=single-node
       - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
@@ -85,7 +85,7 @@ services:
 
   # Keycloak — Identity & access management (OIDC/OAuth2)
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0
+    image: quay.io/keycloak/keycloak:24.0.9  # CVE-2024-10451, CVE-2024-1132, CVE-2025-13881 fixes
     command: start-dev
     environment:
       KC_HEALTH_ENABLED: "true"
@@ -123,7 +123,7 @@ services:
 
   # APISIX — API Gateway with dynamic routing, rate limiting, TLS
   apisix:
-    image: apache/apisix:3.9.1-debian
+    image: apache/apisix:3.11.0-debian  # CVE-2024-32638, CVE-2026-39999 fixes
     ports: ["9080:9080", "9443:9443", "9180:9180"]
     volumes:
       - ./config/apisix.yml:/usr/local/apisix/conf/apisix.yaml:ro
@@ -159,7 +159,7 @@ services:
 
   # Temporal — Durable workflow orchestration server
   temporal:
-    image: temporalio/auto-setup:1.24.2
+    image: temporalio/auto-setup:1.30.3  # CVE-2026-33186 fix: gRPC auth bypass (CRITICAL)
     ports: ["7233:7233"]
     environment:
       DB: postgresql
@@ -180,7 +180,7 @@ services:
 
   # Temporal UI — Web interface for workflow visibility
   temporal-ui:
-    image: temporalio/ui:2.26.2
+    image: temporalio/ui:2.44.0  # CVE-2026-34986, CVE-2026-33186 fixes
     ports: ["8088:8080"]
     environment:
       TEMPORAL_ADDRESS: "temporal:7233"
