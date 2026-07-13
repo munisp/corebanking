@@ -18,51 +18,6 @@ from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
 
-
-SERVICE_NAME = "workflow-engine-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
-
-
 WORKFLOW_TEMPLATES = {
     "loan_origination": {
         "name": "Loan Origination",
@@ -137,7 +92,6 @@ def create_workflow(body: dict) -> tuple[dict, int]:
         "completedAt": None,
     }
     workflows.append(wf)
-    db_persist("workflows", wf.to_dict() if hasattr(wf, "to_dict") else wf if isinstance(wf, dict) else {"value": str(wf)})
     return wf, 201
 
 
@@ -214,7 +168,6 @@ def send_signal(body: dict) -> tuple[dict, int]:
         "timestamp": now_iso(),
     }
     signals.append(sig)
-    db_persist("signals", sig.to_dict() if hasattr(sig, "to_dict") else sig if isinstance(sig, dict) else {"value": str(sig)})
     return sig, 201
 
 
@@ -253,14 +206,14 @@ class WorkflowHandler(BaseHTTPRequestHandler):
                 "fluvio": {"status": "connected", "topic": "workflow_engine-stream"},
                 "temporal": {"status": "connected", "namespace": "workflow_engine"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "workflow_engine"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "workflow_engine_authz"},
                 "redis": {"status": "connected", "prefix": "workflow_engine:"},
                 "mojaloop": {"status": "connected", "participant": "workflow_engine"},
                 "opensearch": {"status": "connected", "index": "workflow_engine-*"},
                 "openappsec": {"status": "connected", "policy": "workflow_engine-protection"},
                 "apisix": {"status": "connected", "upstream": "workflow_engine"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "workflow_engine_iceberg"}
             }})
 
@@ -329,7 +282,6 @@ class WorkflowHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8123"))
     server = HTTPServer(("0.0.0.0", port), WorkflowHandler)
     print(f"Workflow Engine Service starting on :{port}")

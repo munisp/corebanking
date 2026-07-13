@@ -1,0 +1,42 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Insurance Service DB Architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- INSURANCE POLICIES -->
+        <mxCell id="policies" value="insurance_policies&#xa;----------------------&#xa;id (PK, serial)&#xa;policy_id (varchar, unique)&#xa;customer_id (varchar, indexed)&#xa;tenant_id (varchar)&#xa;policy_type (varchar: life/health/auto/property)&#xa;policy_number (varchar, unique)&#xa;coverage_amount (decimal(15,2))&#xa;premium_amount (decimal(15,2))&#xa;duration_months (int)&#xa;start_date (date)&#xa;end_date (date)&#xa;status (varchar: draft/active/expired/cancelled)&#xa;beneficiaries (JSONB)&#xa;additional_info (JSONB)&#xa;underwriting_score (int)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="360" as="geometry"/>
+        </mxCell>
+
+        <!-- INSURANCE CLAIMS -->
+        <mxCell id="claims" value="insurance_claims&#xa;----------------------&#xa;id (PK, serial)&#xa;claim_id (varchar, unique)&#xa;policy_id (FK -> insurance_policies.policy_id)&#xa;tenant_id (varchar)&#xa;claim_amount (decimal(15,2))&#xa;approved_amount (decimal, nullable)&#xa;incident_date (date)&#xa;incident_description (text)&#xa;supporting_documents (JSONB)&#xa;status (varchar: submitted/under_review/approved/rejected/paid)&#xa;reviewed_by (varchar, nullable)&#xa;reviewed_at (timestamp)&#xa;paid_at (timestamp)&#xa;rejection_reason (text)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="300" height="360" as="geometry"/>
+        </mxCell>
+
+        <!-- PREMIUM PAYMENTS -->
+        <mxCell id="premium_payments" value="premium_payments&#xa;----------------------&#xa;id (PK, serial)&#xa;payment_id (varchar, unique)&#xa;policy_id (FK -> insurance_policies.policy_id)&#xa;tenant_id (varchar)&#xa;amount (decimal(15,2))&#xa;payment_date (date)&#xa;payment_method (varchar)&#xa;status (varchar: completed/failed)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="460" width="300" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- UNDERWRITING ASSESSMENTS -->
+        <mxCell id="underwriting" value="underwriting_assessments&#xa;----------------------&#xa;id (PK, serial)&#xa;assessment_id (varchar, unique)&#xa;policy_id (FK -> insurance_policies.policy_id)&#xa;tenant_id (varchar)&#xa;risk_factors (JSONB)&#xa;risk_score (int)&#xa;risk_level (varchar: low/medium/high)&#xa;premium_adjustment (decimal)&#xa;assessed_by (varchar)&#xa;assessed_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="400" y="460" width="300" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="policies" target="claims" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="policies" target="premium_payments" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="policies" target="underwriting" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

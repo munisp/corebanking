@@ -1,0 +1,94 @@
+# 54Bank Kubernetes Network Policies
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 54bank-default-deny
+  namespace: 54bank
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 54bank-api-ingress
+  namespace: 54bank
+spec:
+  podSelector:
+    matchLabels:
+      app: 54bank-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 54bank-db-access
+  namespace: 54bank
+spec:
+  podSelector:
+    matchLabels:
+      tier: database
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: 54bank-api
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 54bank-redis-access
+  namespace: 54bank
+spec:
+  podSelector:
+    matchLabels:
+      tier: cache
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: 54bank-api
+      ports:
+        - protocol: TCP
+          port: 6379
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: 54bank-kafka-access
+  namespace: 54bank
+spec:
+  podSelector:
+    matchLabels:
+      tier: messaging
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: 54bank-api
+        - podSelector:
+            matchLabels:
+              tier: worker
+      ports:
+        - protocol: TCP
+          port: 9092

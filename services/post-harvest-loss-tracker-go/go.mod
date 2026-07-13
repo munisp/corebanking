@@ -1,4 +1,4 @@
-module github.com/54bank/post-harvest-loss-tracker-go
+module github.com/54link-dev/post-harvest-loss-tracker-go
 
 go 1.21
 

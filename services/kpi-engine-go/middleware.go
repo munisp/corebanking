@@ -358,7 +358,7 @@ func middlewareStatusHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	
-	respondJSON(w, 200, map[string]interface{}{
+	jsonResp(w, 200, map[string]interface{}{
 		"middleware":         statuses,
 		"total":             len(statuses),
 		"connected":         connected,

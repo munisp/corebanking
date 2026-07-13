@@ -1,0 +1,55 @@
+name: Build Trade Fx Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/exchange-rate-service/**'
+      - 'services/fx-rates-engine-rs/**'
+      - 'services/fx-service/**'
+      - 'services/iso20022-hub-rs/**'
+      - 'services/remittance-go/**'
+      - 'services/swift-iso20022-rs/**'
+      - 'services/swift-messaging-go/**'
+      - 'services/trade-finance-gl-go/**'
+      - 'services/trade-finance-go/**'
+      - 'services/trade-finance-service/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/trade-fx.yaml'
+
+env:
+  TAG: "0.0.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=exchange-rate-service,fx-rates-engine-rs,fx-service,iso20022-hub-rs,remittance-go,swift-iso20022-rs,swift-messaging-go,trade-finance-gl-go,trade-finance-go,trade-finance-service
+            PRIMARY_LANG=go
+            PORT_BASE=9615
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-trade-fx:${{ env.TAG }}

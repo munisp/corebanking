@@ -11,6 +11,8 @@ import (
 // B3: Trade Finance Enhancements
 // SWIFT MT messaging, syndicated LCs, trade insurance, documentary collections
 
+func nowISO() string { return time.Now().UTC().Format(time.RFC3339) }
+
 type SWIFTMessage struct {
 	ID          string    `json:"id"`
 	MessageType string    `json:"messageType"` // MT700, MT710, MT720, MT799
@@ -60,6 +62,22 @@ type DocumentaryCollection struct {
 	Currency      string  `json:"currency"`
 	Documents     []string `json:"documents"`
 	Status        string  `json:"status"` // presented, accepted, paid, refused
+}
+
+type BankGuarantee struct {
+	ID              string   `json:"id"`
+	GuaranteeType   string   `json:"guaranteeType"`
+	ApplicantName   string   `json:"applicantName"`
+	BeneficiaryName string   `json:"beneficiaryName"`
+	Amount          float64  `json:"amount"`
+	Currency        string   `json:"currency"`
+	ExpiryDate      string   `json:"expiryDate"`
+	Status          string   `json:"status"`
+	CreatedAt       string   `json:"createdAt"`
+	UpdatedAt       string   `json:"updatedAt"`
+	CommissionRate  float64  `json:"commissionRate"`
+	CommissionAmount float64 `json:"commissionAmount"`
+	Middleware      []string `json:"middleware"`
 }
 
 type GuaranteeClaim struct {

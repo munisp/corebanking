@@ -1,24 +1,40 @@
 import { defineConfig } from "vitest/config";
 import path from "path";
 
-const templateRoot = path.resolve(import.meta.dirname);
-
 export default defineConfig({
-  root: templateRoot,
   resolve: {
     alias: {
-      "@": path.resolve(templateRoot, "client", "src"),
-      "@shared": path.resolve(templateRoot, "shared"),
-      "@assets": path.resolve(templateRoot, "attached_assets"),
+      "@shared": path.resolve(__dirname, "shared"),
+      "@server": path.resolve(__dirname, "infrastructure/new/server"),
+      "@db": path.resolve(__dirname, "infrastructure/new/drizzle"),
     },
   },
   test: {
-    coverage: {
-      provider: 'v8',
-      reporter: ['text', 'json-summary', 'html'],
-      exclude: ['node_modules/', 'client/', 'e2e/', 'services/'],
-    },
+    globals: true,
     environment: "node",
-    include: ["server/**/*.test.ts", "server/**/*.spec.ts"],
+    include: [
+      "infrastructure/new/server/__tests__/**/*.test.ts",
+      "infrastructure/new/server/**/*.test.ts",
+    ],
+    exclude: [
+      "node_modules/**",
+      // E2E tests require a running server + Playwright browser — run separately with `npm run test:e2e`
+      "infrastructure/new/e2e/**/*.spec.ts",
+      // Runtime integration test requires live DB connection
+      "infrastructure/new/server/platform.runtime.test.ts",
+    ],
+    testTimeout: 30000,
+    hookTimeout: 30000,
+    reporters: ["verbose"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "json", "html"],
+      include: ["infrastructure/new/server/**/*.ts"],
+      exclude: [
+        "infrastructure/new/server/__tests__/**",
+        "infrastructure/new/server/**/*.test.ts",
+        "infrastructure/new/server/_core/**",
+      ],
+    },
   },
 });

@@ -1,0 +1,52 @@
+name: Build Specialized Engagement Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/component-memoizer-py/**'
+      - 'services/gamification-service/**'
+      - 'services/growth-features-go/**'
+      - 'services/optimistic-ui-engine-go/**'
+      - 'services/skeleton-loading-rs/**'
+      - 'services/sorted-set-ranking-go/**'
+      - 'services/virtual-scroll-engine-rs/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/specialized-engagement.yaml'
+
+env:
+  TAG: "0.0.3"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=component-memoizer-py,gamification-service,growth-features-go,optimistic-ui-engine-go,skeleton-loading-rs,sorted-set-ranking-go,virtual-scroll-engine-rs
+            PRIMARY_LANG=go
+            PORT_BASE=9593
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-specialized-engagement:${{ env.TAG }}

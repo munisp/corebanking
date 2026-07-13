@@ -1,14 +1,16 @@
-FROM rust:1.75-slim AS builder
+FROM rust:1.88-slim AS builder
 WORKDIR /app
-COPY Cargo.toml ./
-RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release && rm -rf src
-COPY src/ src/
-RUN touch src/main.rs && cargo build --release
+COPY Cargo.toml Cargo.lock* ./
+RUN mkdir src && echo 'fn main(){}' > src/main.rs && cargo build --release 2>/dev/null; rm -rf src
+COPY . .
+RUN cargo build --release
 
-FROM debian:bookworm-slim
-RUN useradd -m -u 1001 appuser
-COPY --from=builder /app/target/release/clickjack-defender-rs /usr/local/bin/service
+FROM rust:1.88-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates wget && rm -rf /var/lib/apt/lists/*
+RUN useradd -m appuser
+WORKDIR /app
+COPY --from=builder /app/target/release/clickjack-defender-rs /app/service
 USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD curl -sf http://localhost:8532/healthz || exit 1
-EXPOSE 8532
-CMD ["service"]
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:${PORT:-8210}/healthz || exit 1
+EXPOSE 8210
+ENTRYPOINT ["./service"]

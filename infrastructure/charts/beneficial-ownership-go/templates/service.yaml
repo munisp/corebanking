@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "beneficial-ownership-go.fullname" . }}
+  labels:
+    {{- include "beneficial-ownership-go.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "beneficial-ownership-go.selectorLabels" . | nindent 4 }}

@@ -1,0 +1,46 @@
+# Docling Service Dependencies
+# Core document processing
+docling
+docling-core
+
+# DeepSeek OCR integration
+openai==1.59.0
+pillow==11.3.0
+pytesseract
+
+# Web framework
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+python-multipart
+
+# Data validation
+pydantic==2.11.5
+pydantic-settings
+
+# Database and caching
+sqlalchemy==2.0.41
+redis==5.2.1
+asyncpg
+
+# Document processing utilities
+python-magic
+pypdf==5.4.0
+python-docx
+openpyxl==3.1.5
+beautifulsoup4
+lxml==5.4.0
+
+# ML and AI integration
+langchain==0.3.25
+langchain-community
+llama-index
+
+# Monitoring and logging
+prometheus-client
+structlog==24.4.0
+
+# Utilities
+httpx==0.28.1
+aiofiles
+python-jose[cryptography]
+passlib[bcrypt]==1.7.4

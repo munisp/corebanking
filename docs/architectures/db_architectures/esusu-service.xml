@@ -1,0 +1,48 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Esusu Service DB Architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ESUSU GROUPS -->
+        <mxCell id="esusu_groups" value="esusu_groups&#xa;----------------------&#xa;id (PK, varchar(36))&#xa;tenant_id (varchar, indexed)&#xa;name (varchar)&#xa;description (text)&#xa;created_by (varchar)&#xa;admin_id (varchar)&#xa;contribution_amount (decimal(15,2))&#xa;currency (varchar, default NGN)&#xa;frequency (varchar: daily/weekly/monthly)&#xa;max_members (int)&#xa;current_cycle (int, default 0)&#xa;total_cycles (int)&#xa;status (varchar: active/paused/completed)&#xa;start_date (timestamp)&#xa;next_payout_date (timestamp)&#xa;payout_order (JSONB array)&#xa;rules (JSONB)&#xa;ai_metrics (JSONB)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="420" as="geometry"/>
+        </mxCell>
+
+        <!-- ESUSU MEMBERS -->
+        <mxCell id="esusu_members" value="esusu_members&#xa;----------------------&#xa;id (PK, varchar(36))&#xa;tenant_id (varchar, indexed)&#xa;user_id (varchar, indexed)&#xa;group_id (FK -> esusu_groups.id)&#xa;name (varchar)&#xa;phone (varchar)&#xa;email (varchar)&#xa;role (varchar: admin/member)&#xa;joined_at (timestamp)&#xa;position (int)&#xa;has_received_payout (bool)&#xa;payout_received_date (timestamp)&#xa;total_contributed (decimal)&#xa;missed_contributions (int)&#xa;late_contributions (int)&#xa;status (varchar: active/suspended)&#xa;risk_score (decimal)&#xa;credit_score (decimal)&#xa;ai_profile (JSONB)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="300" height="440" as="geometry"/>
+        </mxCell>
+
+        <!-- CONTRIBUTIONS -->
+        <mxCell id="contributions" value="esusu_contributions&#xa;----------------------&#xa;id (PK, varchar(36))&#xa;group_id (FK -> esusu_groups.id)&#xa;member_id (FK -> esusu_members.id)&#xa;cycle_number (int, indexed)&#xa;amount (decimal(15,2))&#xa;expected_date (timestamp)&#xa;actual_date (timestamp)&#xa;status (varchar: pending/paid/late/missed)&#xa;payment_method (varchar)&#xa;reference (varchar)&#xa;is_late (bool)&#xa;days_late (int)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="760" y="40" width="280" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- PAYOUTS -->
+        <mxCell id="payouts" value="esusu_payouts&#xa;----------------------&#xa;id (PK, varchar(36))&#xa;group_id (FK -> esusu_groups.id)&#xa;recipient_id (FK -> esusu_members.id)&#xa;cycle_number (int, indexed)&#xa;amount (decimal(15,2))&#xa;status (varchar: scheduled/processed/failed)&#xa;scheduled_for (timestamp)&#xa;processed_at (timestamp)&#xa;reference (varchar)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="760" y="380" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="esusu_groups" target="esusu_members" style="endArrow=block;strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="esusu_groups" target="contributions" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="esusu_members" target="contributions" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="esusu_groups" target="payouts" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="esusu_members" target="payouts" style="endArrow=block;dashed=1;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

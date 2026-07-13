@@ -1,4 +1,4 @@
-module github.com/54bank/cbn-agsmeis-go
+module github.com/54link-dev/cbn-agsmeis-go
 
 go 1.21
 

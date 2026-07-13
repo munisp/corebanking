@@ -1,5 +1,9 @@
-# Trivy vulnerability scanner ignore list
-# https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/
-
-# Ignored vulnerabilities (document reason for each):
-# None currently — all HIGH/CRITICAL should be addressed
+# Trivy ignore file for munisp/corebanking
+# Format: CVE-ID  # reason  (expiry: YYYY-MM-DD)
+#
+# Add CVEs here ONLY after documented risk acceptance with a time-bound expiry.
+# All entries MUST include a reason and expiry date.
+# Entries without an expiry date will be rejected in code review.
+#
+# Example (DO NOT uncomment without proper risk acceptance):
+# CVE-2024-XXXXX  # Risk accepted: only affects dev tooling, not deployed. Expiry: 2025-12-31

@@ -1,11 +1,7 @@
-// 54Bank Liveness Orchestrator — Go
-// Active liveness session management, challenge orchestration, Kafka event publishing,
-// database persistence, integration with inference (Python :8230) and scoring (Rust :8226).
-// Middleware: All 14 (Kafka, Postgres, Redis, Temporal, TigerBeetle, Permify, OpenSearch, etc.)
 package main
 
 import (
-	_ "github.com/lib/pq"
+	"context"
 	"database/sql"
 "context"
 "os/signal"
@@ -15,32 +11,18 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
-	"sync"
-	"time"
-	"net"
-
+	"os/signal"
 	"strings"
-	"regexp"
 )
 
 var db *sql.DB
 
-
-// Concurrency limiter prevents goroutine explosion
-var semaphore = make(chan struct{}, 100)
-
-func acquireSem() { semaphore <- struct{}{} }
-func releaseSem() { <-semaphore }
 var serviceName = "liveness-orchestrator-go"
-
-var eventBus = newEventBus("platform.events", "liveness-orchestrator")
 
 // Inference engine URL (liveness-inference-py)
 var inferenceURL = getEnv("INFERENCE_URL", "http://localhost:8230")
@@ -59,247 +41,33 @@ func callMotionAnalysis(referenceFrame string, actionFrames []string, challengeT
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Post(inferenceURL+"/v1/motion/analyze", "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		return nil, fmt.Errorf("motion analysis engine unreachable: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("invalid motion analysis response: %w", err)
-	}
-	return result, nil
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-// NoiseAssessment mirrors the Python service response
-type NoiseAssessment struct {
-	NoiseLevel          float64 `json:"noise_level"`
-	NoiseCategory       string  `json:"noise_category"`
-	EstimatedSNR        float64 `json:"estimated_snr_db"`
-	BlurScore           float64 `json:"blur_score"`
-	ExposureScore       float64 `json:"exposure_score"`
-	Usable              bool    `json:"usable"`
-	ThresholdAdjustment float64 `json:"threshold_adjustment"`
-	RecommendedAction   string  `json:"recommended_action"`
-}
-
-// InferenceLivenessResponse from liveness-inference-py /v1/liveness/check
-type InferenceLivenessResponse struct {
-	ID                       string                 `json:"id"`
-	IsLive                   bool                   `json:"is_live"`
-	OverallScore             float64                `json:"overall_score"`
-	Verdict                  string                 `json:"verdict"`
-	Error                    string                 `json:"error,omitempty"`
-	NoiseAssessment          *NoiseAssessment       `json:"noise_assessment,omitempty"`
-	NoiseCompensationApplied bool                   `json:"noise_compensation_applied"`
-	MultiFrame               map[string]interface{} `json:"multi_frame,omitempty"`
-	ModeFallback             *string                `json:"mode_fallback,omitempty"`
-	UserGuidance             string                 `json:"user_guidance,omitempty"`
-	MethodScores             map[string]float64     `json:"method_scores,omitempty"`
-	ProcessingTimeMs         float64                `json:"processing_time_ms"`
-}
-
-// callInferenceEngine calls the Python liveness inference service
-func callInferenceEngine(frameBase64 string, sessionID string, devicePlatform string, deviceModel string) (*InferenceLivenessResponse, error) {
-	payload := map[string]interface{}{
-		"image":          frameBase64,
-		"sessionId":      sessionID,
-		"devicePlatform": devicePlatform,
-		"deviceModel":    deviceModel,
-		"methods":        []string{"passive_3d", "texture_analysis", "depth_estimation", "frequency_analysis", "deepfake_detector"},
-	}
-	jsonData, _ := json.Marshal(payload)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post(inferenceURL+"/v1/liveness/check", "application/json", bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("inference engine unreachable: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-
-	var result InferenceLivenessResponse
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("invalid inference response: %w", err)
-	}
-	return &result, nil
-}
-
-// ─── Domain Types ───────────────────────────────────────────────────────────
-
-type ChallengeType string
-
-const (
-	ChallengeBlink    ChallengeType = "blink"
-	ChallengeSmile    ChallengeType = "smile"
-	ChallengeHeadLeft ChallengeType = "head_turn_left"
-	ChallengeHeadRight ChallengeType = "head_turn_right"
-	ChallengeNod      ChallengeType = "nod"
-	ChallengeRandomPose ChallengeType = "random_pose"
-)
-
-type SessionStatus string
-
-const (
-	StatusPending    SessionStatus = "pending"
-	StatusInProgress SessionStatus = "in_progress"
-	StatusCompleted  SessionStatus = "completed"
-	StatusFailed     SessionStatus = "failed"
-	StatusExpired    SessionStatus = "expired"
-)
-
-type LivenessSession struct {
-	ID              string        `json:"id"`
-	CustomerID      string        `json:"customerId"`
-	TenantID        string        `json:"tenantId"`
-	Status          SessionStatus `json:"status"`
-	Mode            string        `json:"mode"` // passive, active, hybrid
-	Challenges      []Challenge   `json:"challenges"`
-	ChallengesTotal int           `json:"challengesTotal"`
-	ChallengesPassed int          `json:"challengesPassed"`
-	OverallScore    float64       `json:"overallScore"`
-	IsLive          bool          `json:"isLive"`
-	Verdict         string        `json:"verdict"`
-	DevicePlatform  string        `json:"devicePlatform"`
-	DeviceModel     string        `json:"deviceModel"`
-	IPAddress       string        `json:"ipAddress"`
-	StartedAt       string        `json:"startedAt"`
-	CompletedAt     string        `json:"completedAt,omitempty"`
-	ExpiresAt       string        `json:"expiresAt"`
-	Attempts        int           `json:"attempts"`
-	MaxAttempts     int           `json:"maxAttempts"`
-	AntiSpoof       *AntiSpoofResult `json:"antiSpoof,omitempty"`
-	FaceQuality     float64       `json:"faceQuality"`
-	KafkaEventID    string        `json:"kafkaEventId"`
-}
-
-type Challenge struct {
-	ID          string        `json:"id"`
-	Type        ChallengeType `json:"type"`
-	Instruction string        `json:"instruction"`
-	Status      string        `json:"status"` // pending, passed, failed, skipped
-	Score       float64       `json:"score"`
-	Attempts    int           `json:"attempts"`
-	TimeoutSecs int           `json:"timeoutSecs"`
-	StartedAt   string        `json:"startedAt,omitempty"`
-	CompletedAt string        `json:"completedAt,omitempty"`
-}
-
-type AntiSpoofResult struct {
-	IsSpoof          bool    `json:"isSpoof"`
-	SpoofType        string  `json:"spoofType"`
-	Confidence       float64 `json:"confidence"`
-	TextureScore     float64 `json:"textureScore"`
-	DepthScore       float64 `json:"depthScore"`
-	FrequencyScore   float64 `json:"frequencyScore"`
-	MoireDetected    bool    `json:"moireDetected"`
-	DeepfakeProbability float64 `json:"deepfakeProbability"`
-}
-
-type LivenessEvent struct {
-	EventID     string `json:"eventId"`
-	EventType   string `json:"eventType"`
-	SessionID   string `json:"sessionId"`
-	CustomerID  string `json:"customerId"`
-	TenantID    string `json:"tenantId"`
-	Timestamp   string `json:"timestamp"`
-	Payload     interface{} `json:"payload"`
-	KafkaTopic  string `json:"kafkaTopic"`
-	KafkaPartition int `json:"kafkaPartition"`
-}
-
-type FaceMatchRequest struct {
-	CustomerID string `json:"customerId"`
-	Image1     string `json:"image1"`
-	Image2     string `json:"image2"`
-	Purpose    string `json:"purpose"` // kyc_onboarding, transaction_auth, periodic_reverify
-}
-
-type FaceMatchResponse struct {
-	ID              string  `json:"id"`
-	Matched         bool    `json:"matched"`
-	SimilarityScore float64 `json:"similarityScore"`
-	Confidence      float64 `json:"confidence"`
-	ProcessingMs    float64 `json:"processingTimeMs"`
-}
-
-// ─── Session Store (production: Postgres + Redis cache) ─────────────────────
-
-var (
-	sessions      = make(map[string]*LivenessSession)
-	events        = make([]LivenessEvent, 0)
-	faceMatches   = make([]FaceMatchResponse, 0)
-	mu            sync.RWMutex
-	stats         = struct {
-		TotalSessions    int64 `json:"totalSessions"`
-		ActiveSessions   int64 `json:"activeSessions"`
-		CompletedLive    int64 `json:"completedLive"`
-		CompletedSpoof   int64 `json:"completedSpoof"`
-		TotalChallenges  int64 `json:"totalChallenges"`
-		ChallengesPassed int64 `json:"challengesPassed"`
-		TotalFaceMatches int64 `json:"totalFaceMatches"`
-		AvgSessionMs     float64 `json:"avgSessionMs"`
-		EventsPublished  int64 `json:"eventsPublished"`
-	}{}
-)
-
-// ─── Handlers ───────────────────────────────────────────────────────────────
-
-func handleHealthz(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, 200, map[string]interface{}{
-		"service": "liveness-orchestrator-go",
-		"status":  "healthy",
-		"version": "1.0.0",
-		"capabilities": []string{
-			"session_management", "active_liveness_challenges",
-			"passive_liveness_orchestration", "hybrid_mode",
-			"kafka_event_publishing", "database_persistence",
-			"face_match_orchestration", "anti_spoof_orchestration",
-			"challenge_randomization", "session_expiry",
-		},
-		"challenge_types": []string{"blink", "smile", "head_turn_left", "head_turn_right", "nod", "random_pose"},
-		"modes": []string{"passive", "active", "hybrid"},
-		"integrations": map[string]string{
-			"inference_engine": "liveness-inference-py:8230",
-			"scoring_engine":   "liveness-detection-rs:8226",
-			"face_match":       "face-match-rs:8227",
-		},
-		"middleware": map[string]string{
-			"kafka":       "liveness.sessions, liveness.challenges, liveness.face-match, liveness.audit",
-			"postgres":    "liveness_sessions, liveness_challenges, liveness_events, face_match_results",
-			"redis":       "session_cache (TTL 5min), challenge_state (TTL 60s)",
-			"temporal":    "LivenessSessionWorkflow, ChallengeOrchestrationWorkflow",
-			"opensearch":  "liveness-sessions-2026",
-			"permify":     "liveness:check, liveness:admin",
-		},
-	})
-}
-
-func handleCreateSession(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
 	}
-	var body struct {
-		CustomerID     string `json:"customerId"`
-		TenantID       string `json:"tenantId"`
-		Mode           string `json:"mode"`
-		DevicePlatform string `json:"devicePlatform"`
-		DeviceModel    string `json:"deviceModel"`
-		ChallengeCount int    `json:"challengeCount"`
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
 		return
 	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 { continue }
+		var eInt int
+		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+		jwtCache.keys[k.Kid] = pub
+	}
+	json.NewDecoder(r.Body).Decode(&body)
 
 	if body.Mode == "" {
 		body.Mode = "hybrid"
@@ -342,9 +110,8 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	dbData, _ := json.Marshal(map[string]string{"service": "liveness_orchestrator_go", "action": "create"})
 	if dbErr := dbInsert(fmt.Sprintf("liveness_orchestrator_go-%d", time.Now().UnixNano()), "liveness_orchestrator_go", "default", "active", dbData); dbErr != nil {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-	cacheInvalidate("liveness_orchestrator_list")
+	cacheSet("liveness_orchestrator_list", "", 1) // invalidate cache on write
 	}
-		eventBus.Emit("liveness-orchestrator.processed", map[string]interface{}{"status": "success"})
 	respondJSON(w, 201, session)
 }
 
@@ -359,11 +126,7 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 		FrameBase64  string `json:"frameBase64"`
 		FrameIndex   int    `json:"frameIndex"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&body)
 
 	mu.Lock()
 	session, exists := sessions[body.SessionID]
@@ -428,57 +191,39 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		score = inferenceResult.OverallScore
-	} else {
-		score = inferenceResult.OverallScore
-		noiseInfo = inferenceResult.NoiseAssessment
-		userGuidance = inferenceResult.UserGuidance
-		if inferenceResult.ModeFallback != nil {
-			modeFallback = *inferenceResult.ModeFallback
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			return
 		}
-	}
-
-	// Adaptive pass threshold based on noise level
-	passThreshold := 0.75
-	if noiseInfo != nil {
-		passThreshold -= noiseInfo.ThresholdAdjustment
-		if passThreshold < 0.55 {
-			passThreshold = 0.55 // never go below security floor
+		token := auth[7:]
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			return
 		}
-	}
-	passed := score >= passThreshold
-
-	if passed {
-		challenge.Status = "passed"
-		challenge.Score = score
-		challenge.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-		session.ChallengesPassed++
-		stats.ChallengesPassed++
-	} else {
-		challenge.Status = "failed"
-		challenge.Score = score
-	}
-
-	// Check if all challenges are done
-	allDone := true
-	for _, ch := range session.Challenges {
-		if ch.Status == "pending" {
-			allDone = false
-			break
+		// Decode header for kid
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
 		}
-	}
+		var header struct { Kid string `json:"kid"` }
+		json.Unmarshal(headerBytes, &header)
 
-	if allDone {
-		session.OverallScore = calculateOverallScore(session)
-		session.IsLive = session.OverallScore >= 0.75 && session.ChallengesPassed >= session.ChallengesTotal/2+1
-		if session.IsLive {
-			session.Verdict = "LIVE"
-			session.Status = StatusCompleted
-			stats.CompletedLive++
-		} else {
-			session.Verdict = "SPOOF"
-			session.Status = StatusFailed
-			stats.CompletedSpoof++
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			// Try refresh
+			fetchJWKS(realmURL)
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
 		}
 		session.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 		stats.ActiveSessions--
@@ -520,11 +265,7 @@ func handlePassiveLiveness(w http.ResponseWriter, r *http.Request) {
 		ImageBase64    string `json:"imageBase64"`
 		DevicePlatform string `json:"devicePlatform"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&body)
 
 	sessionID := generateID("PLV")
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -596,11 +337,7 @@ func handleFaceMatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body FaceMatchRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&body)
 
 	// In production: calls liveness-inference-py POST /v1/face-match
 	matchID := generateID("FM")
@@ -626,8 +363,6 @@ func handleFaceMatch(w http.ResponseWriter, r *http.Request) {
 	publishEvent("face_match_completed", matchID, body.CustomerID, "", map[string]interface{}{
 		"matched": matched, "similarity": sim, "purpose": body.Purpose,
 	})
-
-	respondJSON(w, 200, result)
 }
 
 // handleSubmitChallenge handles multi-frame active liveness challenge submission.
@@ -646,306 +381,261 @@ func handleSubmitChallenge(w http.ResponseWriter, r *http.Request) {
 		DevicePlatform string   `json:"devicePlatform"`
 		DeviceModel    string   `json:"deviceModel"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&body); err != nil {
-		log.Printf("[%s] JSON decode error: %v", serviceName, err)
-		respondJSON(w, 400, map[string]interface{}{"error": "invalid_json", "detail": err.Error()})
-		return
-	}
+	json.NewDecoder(r.Body).Decode(&body)
 
-	mu.Lock()
-	session, exists := sessions[body.SessionID]
-	if !exists {
-		mu.Unlock()
-		respondJSON(w, 404, map[string]string{"error": "Session not found"})
-		return
-	}
-
-	session.Status = StatusInProgress
-
-	var challenge *Challenge
-	for i := range session.Challenges {
-		if session.Challenges[i].ID == body.ChallengeID {
-			challenge = &session.Challenges[i]
-			break
-		}
-	}
-
-	if challenge == nil {
-		mu.Unlock()
-		respondJSON(w, 404, map[string]string{"error": "Challenge not found"})
-		return
-	}
-
-	challenge.Attempts++
-	challenge.StartedAt = time.Now().UTC().Format(time.RFC3339)
-	mu.Unlock()
-
-	// Call motion analysis endpoint (this does landmark extraction + pose comparison)
-	motionResult, motionErr := callMotionAnalysis(
-		body.ReferenceFrame, body.ActionFrames, body.ChallengeType,
-		session.DevicePlatform, session.DeviceModel,
-	)
-
-	var motionScore float64
-	var motionDetected bool
-	var challengePassed bool
-	var userGuidance string
-	var noiseAssessment interface{}
-
-	if motionErr != nil {
-		log.Printf("[WARN] motion analysis error: %v — using single-frame fallback", motionErr)
-		// Fallback to single-frame liveness check on reference
-		inferenceResult, _ := callInferenceEngine(body.ReferenceFrame, body.SessionID, session.DevicePlatform, session.DeviceModel)
-		if inferenceResult != nil {
-			motionScore = inferenceResult.OverallScore
-			challengePassed = motionScore >= 0.70
-			motionDetected = true
-			noiseAssessment = inferenceResult.NoiseAssessment
-		} else {
-			motionScore = 0.5
-			challengePassed = false
-		}
-	} else {
-		// Extract motion analysis results
-		if v, ok := motionResult["motion_score"].(float64); ok {
-			motionScore = v
-		}
-		if v, ok := motionResult["motion_detected"].(bool); ok {
-			motionDetected = v
-		}
-		if v, ok := motionResult["challenge_passed"].(bool); ok {
-			challengePassed = v
-		}
-		noiseAssessment = motionResult["noise_assessment"]
-
-		// Generate user guidance based on motion analysis
-		if !motionDetected {
-			switch body.ChallengeType {
-			case "head_turn_left":
-				userGuidance = "Please turn your head slowly to the left"
-			case "head_turn_right":
-				userGuidance = "Please turn your head slowly to the right"
-			case "blink":
-				userGuidance = "Please blink naturally — close and open your eyes"
-			case "smile":
-				userGuidance = "Please smile naturally"
-			case "nod":
-				userGuidance = "Please nod your head up and down slowly"
-			default:
-				userGuidance = "Please perform the motion more clearly"
+func startOutboxRelay(ctx context.Context, brokers string, topic string) {
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				relayOutbox(brokers, topic)
 			}
 		}
-	}
-
-	// Adaptive pass threshold based on noise
-	passThreshold := 0.45
-	if noiseMap, ok := noiseAssessment.(map[string]interface{}); ok {
-		if adj, ok := noiseMap["threshold_adjustment"].(float64); ok {
-			passThreshold -= adj
-			if passThreshold < 0.30 {
-				passThreshold = 0.30
-			}
-		}
-	}
-
-	mu.Lock()
-	if challengePassed && motionScore >= passThreshold {
-		challenge.Status = "passed"
-		challenge.Score = motionScore
-		challenge.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-		session.ChallengesPassed++
-		stats.ChallengesPassed++
-	} else {
-		challenge.Status = "failed"
-		challenge.Score = motionScore
-	}
-
-	// Check if all challenges are done
-	allDone := true
-	for _, ch := range session.Challenges {
-		if ch.Status == "pending" {
-			allDone = false
-			break
-		}
-	}
-
-	if allDone {
-		session.OverallScore = calculateOverallScore(session)
-		session.IsLive = session.OverallScore >= 0.50 && session.ChallengesPassed >= session.ChallengesTotal/2+1
-		if session.IsLive {
-			session.Verdict = "LIVE"
-			session.Status = StatusCompleted
-			stats.CompletedLive++
-		} else {
-			session.Verdict = "SPOOF"
-			session.Status = StatusFailed
-			stats.CompletedSpoof++
-		}
-		session.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-		stats.ActiveSessions--
-		publishEvent("session_completed", session.ID, session.CustomerID, session.TenantID, map[string]interface{}{
-			"verdict": session.Verdict, "score": session.OverallScore,
-		})
-	}
-	mu.Unlock()
-
-	responsePayload := map[string]interface{}{
-		"challengeId":      challenge.ID,
-		"challengeStatus":  challenge.Status,
-		"motionDetected":   motionDetected,
-		"motionScore":      motionScore,
-		"score":            challenge.Score,
-		"sessionStatus":    session.Status,
-		"overallScore":     session.OverallScore,
-		"isLive":           session.IsLive,
-		"verdict":          session.Verdict,
-		"passThreshold":    passThreshold,
-	}
-	if userGuidance != "" {
-		responsePayload["userGuidance"] = userGuidance
-	}
-	if noiseAssessment != nil {
-		responsePayload["noiseAssessment"] = noiseAssessment
-	}
-	respondJSON(w, 200, responsePayload)
+	}()
 }
 
-func handleGetSession(w http.ResponseWriter, r *http.Request) {
-	sessionID := r.URL.Path[len("/v1/sessions/"):]
-	mu.RLock()
-	session, exists := sessions[sessionID]
-	mu.RUnlock()
-	if !exists {
-		respondJSON(w, 404, map[string]string{"error": "Session not found"})
+func relayOutbox(brokers string, topic string) {
+	if db == nil { return }
+	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
+	if err != nil { return }
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id, eventType, aggID string
+		var payload []byte
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
+		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 { return }
+	// Mark as published
+	for _, id := range ids {
+		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	}
+	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+}
+
+
+func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Printf("[liveness-orchestrator-go] starting on :8006")
+
+	// PostgreSQL connection
+	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/liveness_orchestrator_go?sslmode=disable")
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Fatalf("database connection failed: %v", err)
+	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		log.Fatalf("database ping failed: %v", err)
+	}
+
+	initSchema()
+	log.Printf("[liveness-orchestrator-go] database connected, schema initialized")
+
+	// Middleware clients
+	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
+	redisURL := getEnv("REDIS_URL", "localhost:6379")
+	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
+
+	log.Printf("[liveness-orchestrator-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
+
+	mux := http.NewServeMux()
+
+	// Health endpoints
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+	})
+	mux.HandleFunc("/metrics", metricsHandler)
+
+	// Domain endpoints
+	mux.HandleFunc("/api/v1/kyc_records", domainHandler)
+	mux.HandleFunc("/api/v1/kyc_records/", domainDetailHandler)
+
+	server := &http.Server{
+		Addr:         ":" + getEnv("PORT", "8006"),
+		Handler:      loggingMiddleware(corsMiddleware(mux)),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	log.Printf("[liveness-orchestrator-go] ready on :%s", getEnv("PORT", "8006"))
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	log.Printf("[liveness-orchestrator-go] shutting down...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	server.Shutdown(ctx)
+	log.Printf("[liveness-orchestrator-go] stopped")
+}
+
+func initSchema() {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS kyc_records (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id UUID NOT NULL,
+    verification_type VARCHAR(32) NOT NULL,
+    document_type VARCHAR(32),
+    document_number VARCHAR(64),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    risk_score INT DEFAULT 0,
+    risk_level VARCHAR(20) DEFAULT 'low',
+    bvn VARCHAR(11),
+    nin VARCHAR(11),
+    verified_name VARCHAR(200),
+    date_of_birth DATE,
+    address TEXT,
+    lga VARCHAR(100),
+    state VARCHAR(50),
+    country VARCHAR(3) DEFAULT 'NGA',
+    selfie_match_score REAL,
+    document_match_score REAL,
+    pep_check BOOLEAN DEFAULT FALSE,
+    sanctions_check BOOLEAN DEFAULT FALSE,
+    adverse_media_check BOOLEAN DEFAULT FALSE,
+    reviewer_id UUID,
+    reviewed_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Fatalf("schema init failed: %v", err)
+	}
+
+	// Outbox for event sourcing
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		event_type VARCHAR(64) NOT NULL,
+		aggregate_id VARCHAR(128) NOT NULL,
+		payload JSONB NOT NULL,
+		published BOOLEAN DEFAULT FALSE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("outbox table creation (may already exist): %v", err)
+	}
+
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_kyc_records_tenant ON kyc_records(tenant_id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_kyc_records_status ON kyc_records(status)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_kyc_records_created ON kyc_records(created_at DESC)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
+}
+
+func domainHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case "GET":
+		listRecords(w, r)
+	case "POST":
+		createRecord(w, r)
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/kyc_records/"), "/")
+	id := parts[0]
+	if id == "" {
+		http.Error(w, `{"error":"id required"}`, http.StatusBadRequest)
 		return
 	}
-	respondJSON(w, 200, session)
-}
 
-func handleListSessions(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	result := make([]*LivenessSession, 0, len(sessions))
-	for _, s := range sessions {
-		result = append(result, s)
+	switch r.Method {
+	case "GET":
+		getRecord(w, r, id)
+	case "PUT", "PATCH":
+		updateRecord(w, r, id)
+	case "DELETE":
+		deleteRecord(w, r, id)
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 	}
-	mu.RUnlock()
-	respondJSON(w, 200, map[string]interface{}{"sessions": result, "total": len(result)})
 }
 
-func handleGetEvents(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	respondJSON(w, 200, map[string]interface{}{"events": events, "total": len(events)})
-	mu.RUnlock()
-}
+func listRecords(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	limit := 50
+	offset := 0
 
-func handleGetStats(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	respondJSON(w, 200, stats)
-	mu.RUnlock()
-}
+	query := `SELECT id, status, created_at FROM kyc_records WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
 
-func handleGetFaceMatches(w http.ResponseWriter, r *http.Request) {
-	mu.RLock()
-	respondJSON(w, 200, map[string]interface{}{"matches": faceMatches, "total": len(faceMatches)})
-	mu.RUnlock()
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-func generateChallenges(count int) []Challenge {
-	types := []struct {
-		t    ChallengeType
-		inst string
-	}{
-		{ChallengeBlink, "Please blink naturally"},
-		{ChallengeSmile, "Please smile"},
-		{ChallengeHeadLeft, "Please turn your head slowly to the left"},
-		{ChallengeHeadRight, "Please turn your head slowly to the right"},
-		{ChallengeNod, "Please nod your head up and down"},
-		{ChallengeRandomPose, "Please follow the on-screen target"},
+	var records []map[string]interface{}
+	for rows.Next() {
+		var id, status string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &status, &createdAt); err != nil {
+			continue
+		}
+		records = append(records, map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
 	}
 
-	challenges := make([]Challenge, 0, count)
-	for i := 0; i < count && i < len(types); i++ {
-		challenges = append(challenges, Challenge{
-			ID:          generateID("CH"),
-			Type:        types[i].t,
-			Instruction: types[i].inst,
-			Status:      "pending",
-			TimeoutSecs: 10,
-		})
-	}
-	return challenges
-}
-
-func calculateOverallScore(session *LivenessSession) float64 {
-	if len(session.Challenges) == 0 {
-		return 0
-	}
-	total := 0.0
-	for _, ch := range session.Challenges {
-		total += ch.Score
-	}
-	return total / float64(len(session.Challenges))
-}
-
-func publishEvent(eventType, sessionID, customerID, tenantID string, payload interface{}) string {
-	eventID := generateID("EVT")
-	event := LivenessEvent{
-		EventID:    eventID,
-		EventType:  eventType,
-		SessionID:  sessionID,
-		CustomerID: customerID,
-		TenantID:   tenantID,
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-		Payload:    payload,
-		KafkaTopic: "liveness.sessions",
-		KafkaPartition: 0,
-	}
-	mu.Lock()
-	events = append(events, event)
-	stats.EventsPublished++
-	mu.Unlock()
-	// In production: kafka.Produce("liveness.sessions", event)
-	return eventID
-}
-
-func generateID(prefix string) string {
-	b := make([]byte, 4)
-	rand.Read(b)
-	return fmt.Sprintf("%s-%s", prefix, hex.EncodeToString(b))
-}
-
-func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(data)
+	json.NewEncoder(w).Encode(map[string]interface{}{"data": records, "count": len(records)})
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+func createRecord(w http.ResponseWriter, r *http.Request) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
 
 // --- Production Hardening ---
 var (
-    requestCount  uint64
-    errorCount  uint64
+    _reqCount  uint64
+    _errCount  uint64
     _bootTime  = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"liveness-orchestrator-go"}`)
-}
-
-func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	if err := db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&requestCount)
-    errs := atomic.LoadUint64(&errorCount)
+    reqs := atomic.LoadUint64(&_reqCount)
+    errs := atomic.LoadUint64(&_errCount)
     w.Header().Set("Content-Type", "text/plain")
     fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"liveness-orchestrator-go\"} %d\n", reqs)
     fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"liveness-orchestrator-go\"} %d\n", errs)
@@ -956,11 +646,11 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&requestCount, 1)
+        atomic.AddUint64(&_reqCount, 1)
         rw := &responseWriter{ResponseWriter: w, status: 200}
         next.ServeHTTP(rw, r)
         if rw.status >= 400 {
-            atomic.AddUint64(&errorCount, 1)
+            atomic.AddUint64(&_errCount, 1)
         }
     })
 }
@@ -979,181 +669,48 @@ func (rw *responseWriter) WriteHeader(code int) {
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" {
-			traceID = r.Header.Get("traceparent")
-		}
-		if traceID == "" {
-			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
-		}
-		w.Header().Set("X-Trace-Id", traceID)
-		r.Header.Set("X-Trace-Id", traceID)
-		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		start := time.Now()
 		next.ServeHTTP(w, r)
+		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
+			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+		}
 	})
 }
 
 // --- Redis Caching Layer ---
-// --- Production Cache (connection-pooled, multi-level, with metrics) ---
-var _cachePool *cachePool
-var _l1Cache sync.Map // L1 in-process cache
-var _cacheHits atomic.Uint64
-var _cacheMisses atomic.Uint64
-var _cacheStampedes atomic.Uint64
+var redisAddr string
 
-type cachePool struct {
-	pool     chan net.Conn
-	host     string
-	port     string
-	password string
-	db       string
-}
-
-type l1CacheEntry struct {
-	Value  string
-	Expiry time.Time
-}
-
-func initCachePool() {
-	url := os.Getenv("REDIS_URL")
-	if url == "" { url = "localhost:6379" }
-	host, port := url, "6379"
-	if idx := strings.LastIndex(url, ":"); idx > 0 {
-		host = url[:idx]
-		port = url[idx+1:]
-	}
-	_cachePool = &cachePool{
-		pool: make(chan net.Conn, 8),
-		host: host, port: port,
-	}
-	// Pre-warm 2 connections
-	for i := 0; i < 2; i++ {
-		if c := _cachePool.dial(); c != nil {
-			_cachePool.pool <- c
-		}
-	}
-}
-
-func (p *cachePool) dial() net.Conn {
-	addr := net.JoinHostPort(p.host, p.port)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil { return nil }
-	conn.SetDeadline(time.Now().Add(3 * time.Second))
-	fmt.Fprintf(conn, "*1\r\n$4\r\nPING\r\n")
-	buf := make([]byte, 64)
-	n, _ := conn.Read(buf)
-	if n > 0 && buf[0] == '+' { return conn }
-	conn.Close()
-	return nil
-}
-
-func (p *cachePool) get() net.Conn {
-	select {
-	case c := <-p.pool:
-		c.SetDeadline(time.Now().Add(2 * time.Second))
-		fmt.Fprintf(c, "*1\r\n$4\r\nPING\r\n")
-		buf := make([]byte, 64)
-		n, err := c.Read(buf)
-		if err == nil && n > 0 && buf[0] == '+' { return c }
-		c.Close()
-		return p.dial()
-	default:
-		return p.dial()
-	}
-}
-
-func (p *cachePool) put(c net.Conn) {
-	if c == nil { return }
-	select {
-	case p.pool <- c:
-	default:
-		c.Close()
+func init() {
+	redisAddr = os.Getenv("REDIS_URL")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
 	}
 }
 
 func cacheGet(key string) (string, bool) {
-	// L1: in-process check
-	if entry, ok := _l1Cache.Load(key); ok {
-		e := entry.(l1CacheEntry)
-		if time.Now().Before(e.Expiry) {
-			_cacheHits.Add(1)
-			return e.Value, true
-		}
-		_l1Cache.Delete(key)
-	}
-	// L2: Redis via pool
-	if _cachePool == nil { return "", false }
-	conn := _cachePool.get()
-	if conn == nil { _cacheMisses.Add(1); return "", false }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return "", false }
+	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 8192)
+	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { _cacheMisses.Add(1); return "", false }
+	if err != nil || n < 3 { return "", false }
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
+		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 {
-			_cacheHits.Add(1)
-			// Promote to L1 (10s TTL)
-			_l1Cache.Store(key, l1CacheEntry{Value: parts[1], Expiry: time.Now().Add(10 * time.Second)})
-			return parts[1], true
-		}
+		if len(parts) >= 3 { return parts[1], true }
 	}
-	_cacheMisses.Add(1)
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
-	// L1 store
-	_l1Cache.Store(key, l1CacheEntry{Value: value, Expiry: time.Now().Add(time.Duration(ttlSeconds) * time.Second)})
-	// L2: Redis via pool
-	if _cachePool == nil { return }
-	conn := _cachePool.get()
-	if conn == nil { return }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	ttlStr := fmt.Sprintf("%d", ttlSeconds)
-	fmt.Fprintf(conn, "*6\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%s\r\n$2\r\nNX\r\n",
-		len(key), key, len(value), value, len(ttlStr), ttlStr)
-	buf := make([]byte, 256)
-	conn.Read(buf)
+	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
+	if err != nil { return }
+	defer conn.Close()
+	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
+		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
 }
-
-func cacheInvalidate(key string) {
-	_l1Cache.Delete(key)
-	if _cachePool == nil { return }
-	conn := _cachePool.get()
-	if conn == nil { return }
-	defer _cachePool.put(conn)
-	conn.SetDeadline(time.Now().Add(2 * time.Second))
-	fmt.Fprintf(conn, "*2\r\n$3\r\nDEL\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 64)
-	conn.Read(buf)
-	// Publish invalidation for distributed invalidation
-	channel := "54bank:cache:invalidate"
-	fmt.Fprintf(conn, "*3\r\n$7\r\nPUBLISH\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
-		len(channel), channel, len(key), key)
-	conn.Read(buf)
-}
-
-func cacheMetricsHandler(w http.ResponseWriter, r *http.Request) {
-	hits := _cacheHits.Load()
-	misses := _cacheMisses.Load()
-	total := hits + misses
-	hitRate := 0.0
-	if total > 0 { hitRate = float64(hits) / float64(total) * 100 }
-	l1Size := 0
-	_l1Cache.Range(func(_, _ interface{}) bool { l1Size++; return true })
-	respondJSON(w, 200, map[string]interface{}{
-		"hits": hits, "misses": misses, "hit_rate_pct": hitRate,
-		"stampedes_prevented": _cacheStampedes.Load(),
-		"l1_size": l1Size,
-		"pool_connected": _cachePool != nil,
-	})
-}
-
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
@@ -1168,26 +725,9 @@ func getTLSConfig() (bool, string, string) {
 // --- CORS + Security Headers Middleware ---
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
-		if allowedOrigins == "" {
-			allowedOrigins = "https://dashboard.54bank.ng"
-		}
-		origin := r.Header.Get("Origin")
-		for _, allowed := range strings.Split(allowedOrigins, ",") {
-			if strings.TrimSpace(allowed) == origin {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				break
-			}
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -1196,17 +736,11 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- Input Sanitization ---
-func sanitizeInput(s string) string {
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "'", "&#39;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "\\", "")
-	if len(s) > 10000 {
-		s = s[:10000]
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
 	}
-	return s
+	return fallback
 }
 
 
@@ -1297,6 +831,9 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
         r.Header.Set("X-User-Id", "validated")
         next.ServeHTTP(w, r)
     })
+}
+		next.ServeHTTP(w, r)
+	})
 }
 
 
@@ -1413,7 +950,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
+    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -1423,712 +960,10 @@ func (am *alertManager) check() []map[string]interface{} {
 func max64(a, b uint64) uint64 { if a > b { return a }; return b }
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    respondJSON(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
-}
-
-
-// ── Deep Domain Logic: Compliance ───────────────────────────────────────────
-
-type AmountKobo int64
-func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
-func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
-
-// CTR (Currency Transaction Report) — NFIU requirement
-type CTRReport struct {
-	ReportID       string     `json:"report_id"`
-	CustomerID     string     `json:"customer_id"`
-	TransactionID  string     `json:"transaction_id"`
-	AmountKobo     AmountKobo `json:"amount_kobo"`
-	Type           string     `json:"type"` // cash_deposit, cash_withdrawal, transfer
-	Threshold      string     `json:"threshold"`
-	FiledAt        string     `json:"filed_at"`
-	Status         string     `json:"status"` // pending, filed, acknowledged
-}
-
-func generateCTR(customerID, txnID string, amountKobo AmountKobo, txnType string) *CTRReport {
-	threshold := ""
-	if txnType == "cash_deposit" || txnType == "cash_withdrawal" {
-		if amountKobo >= nairaToKobo(5000000) { threshold = "NFIU_CASH_5M" }
-	} else {
-		if amountKobo >= nairaToKobo(10000000) { threshold = "NFIU_TRANSFER_10M" }
-	}
-	if threshold == "" { return nil }
-	return &CTRReport{
-		ReportID: fmt.Sprintf("CTR-%d", time.Now().UnixMilli()),
-		CustomerID: customerID, TransactionID: txnID,
-		AmountKobo: amountKobo, Type: txnType,
-		Threshold: threshold, FiledAt: time.Now().Format(time.RFC3339),
-		Status: "pending",
-	}
-}
-
-// STR (Suspicious Transaction Report) generation
-type STRReport struct {
-	ReportID    string `json:"report_id"`
-	CustomerID  string `json:"customer_id"`
-	Reason      string `json:"reason"`
-	RiskScore   float64 `json:"risk_score"`
-	Indicators  []string `json:"indicators"`
-	Narrative   string `json:"narrative"`
-	FiledAt     string `json:"filed_at"`
-}
-
-func generateSTR(customerID string, riskScore float64, indicators []string) *STRReport {
-	if riskScore < 70 { return nil } // Only file if high risk
-	return &STRReport{
-		ReportID:   fmt.Sprintf("STR-%d", time.Now().UnixMilli()),
-		CustomerID: customerID,
-		Reason:     "automated_detection",
-		RiskScore:  riskScore,
-		Indicators: indicators,
-		Narrative:  fmt.Sprintf("Automated STR: %d risk indicators detected, score %.1f", len(indicators), riskScore),
-		FiledAt:    time.Now().Format(time.RFC3339),
-	}
-}
-
-// AML Risk Scoring — multi-factor
-func computeAMLRiskScoreDeep(
-	txnAmountKobo AmountKobo, isPEP bool, isHighRiskCountry bool,
-	cashIntensive bool, isStructuring bool, hasAdverseMedia bool,
-	customerAge int, accountAgeMonths int,
-) (float64, []string) {
-	score := 0.0
-	var indicators []string
-
-	if isPEP { score += 30; indicators = append(indicators, "PEP_STATUS") }
-	if isHighRiskCountry { score += 25; indicators = append(indicators, "HIGH_RISK_JURISDICTION") }
-	if cashIntensive { score += 15; indicators = append(indicators, "CASH_INTENSIVE") }
-	if isStructuring { score += 35; indicators = append(indicators, "STRUCTURING_DETECTED") }
-	if hasAdverseMedia { score += 20; indicators = append(indicators, "ADVERSE_MEDIA") }
-	if txnAmountKobo > nairaToKobo(10000000) { score += 10; indicators = append(indicators, "HIGH_VALUE_TXN") }
-	if accountAgeMonths < 3 { score += 10; indicators = append(indicators, "NEW_ACCOUNT") }
-	if customerAge < 25 && txnAmountKobo > nairaToKobo(5000000) { score += 15; indicators = append(indicators, "YOUNG_HIGH_VALUE") }
-
-	if score > 100 { score = 100 }
-	return score, indicators
-}
-
-// Sanctions screening
-var sanctionedCountries = map[string]bool{
-	"KP": true, "IR": true, "SY": true, "CU": true, "VE": true,
-	"MM": true, "BY": true, "ZW": true, "SD": true,
-}
-
-func checkSanctions(countryCode string) (bool, string) {
-	if sanctionedCountries[countryCode] {
-		return true, fmt.Sprintf("country %s is on sanctions list — transaction blocked", countryCode)
-	}
-	return false, ""
-}
-
-// PEP (Politically Exposed Person) enhanced due diligence
-func computePEPRiskLevel(pepCategory string, relationshipType string) string {
-	switch pepCategory {
-	case "head_of_state", "minister", "governor":
-		return "very_high"
-	case "senator", "representative", "judge":
-		return "high"
-	case "director_general", "commissioner":
-		return "medium"
-	case "family_member", "close_associate":
-		if relationshipType == "immediate_family" { return "high" }
-		return "medium"
-	default:
-		return "standard"
-	}
-}
-
-// Transaction monitoring — pattern detection
-func detectStructuring(transactions []map[string]interface{}, windowHours int) bool {
-	// Check for multiple transactions just below ₦5M threshold
-	count := 0
-	for _, txn := range transactions {
-		if amt, ok := txn["amount_kobo"].(int64); ok {
-			if AmountKobo(amt) >= nairaToKobo(4000000) && AmountKobo(amt) < nairaToKobo(5000000) {
-				count++
-			}
-		}
-	}
-	return count >= 3 // 3+ just-below-threshold = structuring
-}
-
-// OFAC/UN Sanctions name matching (fuzzy)
-func nameSimilarity(name1, name2 string) float64 {
-	n1 := strings.ToLower(strings.TrimSpace(name1))
-	n2 := strings.ToLower(strings.TrimSpace(name2))
-	if n1 == n2 { return 100.0 }
-	// Simple Jaccard similarity on character bigrams
-	bigrams1 := make(map[string]bool)
-	bigrams2 := make(map[string]bool)
-	for i := 0; i < len(n1)-1; i++ { bigrams1[n1[i:i+2]] = true }
-	for i := 0; i < len(n2)-1; i++ { bigrams2[n2[i:i+2]] = true }
-	intersection := 0
-	for bg := range bigrams1 { if bigrams2[bg] { intersection++ } }
-	union := len(bigrams1) + len(bigrams2) - intersection
-	if union == 0 { return 0 }
-	return float64(intersection) / float64(union) * 100.0
-}
-
-
-// ── State Machine, Reversal & Enhanced Validation ───────────────────────────
-
-// Processing state machine
-type ProcessingState string
-const (
-	ProcPending    ProcessingState = "pending"
-	ProcIngesting  ProcessingState = "ingesting"
-	ProcProcessing ProcessingState = "processing"
-	ProcCompleted  ProcessingState = "completed"
-	ProcFailed     ProcessingState = "failed"
-	ProcRetrying   ProcessingState = "retrying"
-	ProcCancelled  ProcessingState = "cancelled"
-)
-
-var validProcTransitions = map[ProcessingState][]ProcessingState{
-	ProcPending:    {ProcIngesting, ProcCancelled},
-	ProcIngesting:  {ProcProcessing, ProcFailed},
-	ProcProcessing: {ProcCompleted, ProcFailed},
-	ProcFailed:     {ProcRetrying, ProcCancelled},
-	ProcRetrying:   {ProcIngesting, ProcFailed, ProcCancelled},
-}
-
-func canTransitionProc(from, to ProcessingState) bool {
-	allowed := validProcTransitions[from]
-	for _, s := range allowed { if s == to { return true } }
-	return false
-}
-
-func transitionProcessing(entityID string, from, to ProcessingState) error {
-	if !canTransitionProc(from, to) {
-		return fmt.Errorf("invalid transition: %s → %s for %s", from, to, entityID)
-	}
-	log.Printf("[state-machine] %s: %s → %s", entityID, from, to)
-	return nil
-}
-
-// Reversal / compensation for processed records
-func computeProcessingReversal(batchID string, recordCount int, reason string) map[string]interface{} {
-	return map[string]interface{}{
-		"reversal_id":   fmt.Sprintf("PREV-%s-%d", batchID, time.Now().UnixMilli()),
-		"batch_id":      batchID,
-		"record_count":  recordCount,
-		"reason":        reason,
-		"status":        "reversed",
-		"reversed_at":   time.Now().Format(time.RFC3339),
-	}
-}
-
-// Comprehensive validation with error accumulation
-func validateProcessingInput(batchID, source string, recordCount int, schema string) (bool, []string) {
-	var errors []string
-	if batchID == "" { errors = append(errors, "batch ID required") }
-	if source == "" { errors = append(errors, "data source required") }
-	if recordCount <= 0 { errors = append(errors, "record count must be positive") }
-	if recordCount > 1000000 { errors = append(errors, "record count exceeds 1M batch limit") }
-	if schema == "" { errors = append(errors, "schema identifier required") }
-	// Validate batch ID format
-	if len(batchID) > 64 { errors = append(errors, "batch ID exceeds 64 character limit") }
-	return len(errors) == 0, errors
-}
-
-func validateSchemaInput(schemaName, version, format string, fields int) (bool, []string) {
-	var errors []string
-	if schemaName == "" { errors = append(errors, "schema name required") }
-	if version == "" { errors = append(errors, "schema version required") }
-	if format != "avro" && format != "json" && format != "protobuf" {
-		errors = append(errors, "schema format must be avro, json, or protobuf")
-	}
-	if fields <= 0 { errors = append(errors, "schema must have at least one field") }
-	if fields > 500 { errors = append(errors, "schema exceeds 500 field limit") }
-	return len(errors) == 0, errors
-}
-
-// Nigerian banking context for data processing
-func validateNIBSSBatchHeader(bankCode, sessionDate string, recordCount int) (bool, []string) {
-	var errors []string
-	if len(bankCode) != 3 { errors = append(errors, "NIBSS bank code must be 3 digits") }
-	if len(sessionDate) != 8 { errors = append(errors, "session date must be YYYYMMDD format") }
-	if recordCount <= 0 { errors = append(errors, "batch must contain at least 1 record") }
-	// Validate bank code is numeric
-	for _, c := range bankCode {
-		if c < '0' || c > '9' { errors = append(errors, "bank code must be numeric"); break }
-	}
-	return len(errors) == 0, errors
-}
-
-// NFIU compliance for batch processing
-func checkNFIUBatch(totalAmountKobo int64, txnType string) (bool, string) {
-	naira := float64(totalAmountKobo) / 100.0
-	if txnType == "cash" && naira >= 5000000 {
-		return true, "NFIU: Batch cash total ≥₦5M requires CTR"
-	}
-	if txnType == "transfer" && naira >= 10000000 {
-		return true, "NFIU: Batch transfer total ≥₦10M requires CTR"
-	}
-	return false, ""
-}
-
-
-func ensureDB() {
-	if db == nil {
-		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
-	}
-}
-
-
-// --- PII Masking (NDPR Compliance) ---
-func maskPII(value, fieldType string) string {
-	if len(value) == 0 { return "***" }
-	switch fieldType {
-	case "bvn", "nin":
-		if len(value) >= 4 { return "***" + value[len(value)-4:] }
-		return "***"
-	case "phone":
-		if len(value) >= 4 { return "+234***" + value[len(value)-4:] }
-		return "+234***"
-	case "email":
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return string(parts[0][0]) + "***@" + parts[1] }
-		return "***@***"
-	case "account":
-		if len(value) >= 4 { return "****" + value[len(value)-4:] }
-		return "****"
-	default:
-		if len(value) > 4 { return value[:1] + "***" + value[len(value)-1:] }
-		return "***"
-	}
-}
-
-func sanitizeLogEntry(msg string) string {
-	// Mask BVN patterns (11 digits)
-	re1 := regexp.MustCompile(`\b[0-9]{11}\b`)
-	msg = re1.ReplaceAllStringFunc(msg, func(s string) string { return "***" + s[len(s)-4:] })
-	// Mask account numbers (10 digits)
-	re2 := regexp.MustCompile(`\b[0-9]{10}\b`)
-	msg = re2.ReplaceAllStringFunc(msg, func(s string) string { return "****" + s[len(s)-4:] })
-	// Mask email
-	re3 := regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
-	msg = re3.ReplaceAllString(msg, "***@***")
-	return msg
-}
-
-
-// --- Dead Letter Queue Handler ---
-type DLQMessage struct {
-	OriginalTopic string                 `json:"original_topic"`
-	ConsumerGroup string                 `json:"consumer_group"`
-	MessageKey    string                 `json:"message_key"`
-	MessageValue  map[string]interface{} `json:"message_value"`
-	ErrorMessage  string                 `json:"error_message"`
-	RetryCount    int                    `json:"retry_count"`
-	MaxRetries    int                    `json:"max_retries"`
-	CreatedAt     string                 `json:"created_at"`
-}
-
-var dlqMessages []DLQMessage
-var dlqMu sync.Mutex
-
-func publishToDLQ(topic, consumerGroup, key string, value map[string]interface{}, err error, retryCount int) {
-	dlqMu.Lock()
-	defer dlqMu.Unlock()
-	msg := DLQMessage{
-		OriginalTopic: topic,
-		ConsumerGroup: consumerGroup,
-		MessageKey:    key,
-		MessageValue:  value,
-		ErrorMessage:  err.Error(),
-		RetryCount:    retryCount,
-		MaxRetries:    3,
-		CreatedAt:     time.Now().UTC().Format(time.RFC3339),
-	}
-	dlqMessages = append(dlqMessages, msg)
-	log.Printf("[DLQ] Message sent to DLQ: topic=%s key=%s error=%s retries=%d", topic, key, err.Error(), retryCount)
-}
-
-func handleDLQList(w http.ResponseWriter, r *http.Request) {
-	dlqMu.Lock()
-	defer dlqMu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{
-		"dlq_messages": dlqMessages,
-		"count":        len(dlqMessages),
-	})
-}
-
-func handleDLQReplay(w http.ResponseWriter, r *http.Request) {
-	dlqMu.Lock()
-	defer dlqMu.Unlock()
-	if len(dlqMessages) == 0 {
-		respondJSON(w, 200, map[string]interface{}{"status": "empty", "replayed": 0})
-		return
-	}
-	replayed := 0
-	var remaining []DLQMessage
-	for _, msg := range dlqMessages {
-		if msg.RetryCount < msg.MaxRetries {
-			log.Printf("[DLQ] Replaying: topic=%s key=%s attempt=%d", msg.OriginalTopic, msg.MessageKey, msg.RetryCount+1)
-			replayed++
-		} else {
-			remaining = append(remaining, msg)
-		}
-	}
-	dlqMessages = remaining
-	respondJSON(w, 200, map[string]interface{}{"status": "replayed", "replayed": replayed, "remaining": len(remaining)})
-}
-
-
-// ─── Idempotency Middleware ─────────────────────────────────────────────────
-var idempotencyCache = struct {
-	sync.RWMutex
-	entries map[string]idempotencyEntry
-}{entries: make(map[string]idempotencyEntry)}
-
-type idempotencyEntry struct {
-	response   []byte
-	statusCode int
-	createdAt  time.Time
-}
-
-func idempotencyMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" && r.Method != "PUT" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		key := r.Header.Get("Idempotency-Key")
-		if key == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		idempotencyCache.RLock()
-		if entry, ok := idempotencyCache.entries[key]; ok {
-			idempotencyCache.RUnlock()
-			w.Header().Set("X-Idempotency-Replayed", "true")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(entry.statusCode)
-			w.Write(entry.response)
-			return
-		}
-		idempotencyCache.RUnlock()
-		rec := &idempotencyRecorder{ResponseWriter: w, statusCode: 200}
-		next.ServeHTTP(rec, r)
-		idempotencyCache.Lock()
-		idempotencyCache.entries[key] = idempotencyEntry{response: rec.body, statusCode: rec.statusCode, createdAt: time.Now()}
-		idempotencyCache.Unlock()
-		// Cleanup old entries (>24h) in background
-		go func() {
-			idempotencyCache.Lock()
-			defer idempotencyCache.Unlock()
-			for k, v := range idempotencyCache.entries {
-				if time.Since(v.createdAt) > 24*time.Hour { delete(idempotencyCache.entries, k) }
-			}
-		}()
-	})
-}
-
-type idempotencyRecorder struct {
-	http.ResponseWriter
-	statusCode int
-	body       []byte
-}
-
-func (r *idempotencyRecorder) WriteHeader(code int) { r.statusCode = code; r.ResponseWriter.WriteHeader(code) }
-func (r *idempotencyRecorder) Write(b []byte) (int, error) { r.body = append(r.body, b...); return r.ResponseWriter.Write(b) }
-
-
-// ─── Transaction Atomicity ──────────────────────────────────────────────────
-// All multi-step write operations wrapped in DB transactions.
-func dbExecAtomic(queries []string, params [][]interface{}) error {
-	if db == nil { return fmt.Errorf("DB not available") }
-	tx, err := db.Begin()
-	if err != nil { return fmt.Errorf("BEGIN failed: %v", err) }
-	for i, q := range queries {
-		var args []interface{}
-		if i < len(params) { args = params[i] }
-		if _, err := tx.Exec(q, args...); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("step %d failed: %v", i+1, err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("COMMIT failed: %v", err)
-	}
-	return nil
-}
-
-
-// --- Audit Trail (append-only) ---
-type AuditEntry struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`
-	RecordID  string `json:"record_id"`
-	Actor     string `json:"actor"`
-	Timestamp string `json:"timestamp"`
-	Details   string `json:"details"`
-}
-
-var auditLog []AuditEntry
-
-func appendAudit(action, recordID, actor, details string) {
-	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
-		Action: action, RecordID: recordID, Actor: actor,
-		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
-	})
-
-}
-
-// --- Observability (OpenTelemetry) ---
-var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-func initTracing() {
-	if otelEndpoint == "" { return }
-	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
-}
-
-
-func secureRandUint32() uint32 {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-}
-
-// --- Retry with Exponential Backoff ---
-func retryWithBackoff(maxRetries int, fn func() error) error {
-	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
-		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
-		time.Sleep(backoff)
-	}
-	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
-}
-
-func requestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rid := r.Header.Get("X-Request-Id")
-		if rid == "" {
-			rid = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		w.Header().Set("X-Request-Id", rid)
-		next.ServeHTTP(w, r)
-	})
-}
-
-func validateOrigin(origin string) bool {
-	if origin == "" || origin == "*" {
-		return false // reject wildcards
-	}
-	// Only allow HTTPS origins in production
-	if strings.HasPrefix(origin, "https://") || strings.HasPrefix(origin, "http://localhost") {
-		return true
-	}
-	return false
-}
-
-func validateJWTExpiry(tokenStr string) bool {
-	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	// Decode payload (base64url)
-	payload := parts[1]
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	decoded, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		return false
-	}
-	var claims map[string]interface{}
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return false
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return false
-	}
-	return time.Now().Unix() < int64(exp)
-}
-
-// Handler context with timeout prevents hung requests
-func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(r.Context(), 30*time.Second)
-}
-
-// Secure HTTP server configuration
-func newSecureServer(addr string, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadTimeout:       15 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
-	}
-}
-
-// Sanitize errors before sending to clients (prevent info leakage)
-func sanitizeError(err error) string {
-	errStr := err.Error()
-	// Strip file paths, stack traces, internal IPs
-	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") {
-		return "internal error"
-	}
-	if len(errStr) > 200 {
-		return "internal error"
-	}
-	return errStr
-}
-
-// IP-based sliding window rate limiter
-type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rateBucket
-	rate     int
-	window   time.Duration
-}
-
-type rateBucket struct {
-	count    int
-	lastSeen time.Time
-}
-
-func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
-	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
-	go rl.cleanup()
-	return rl
-}
-
-func (rl *ipRateLimiter) allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	b, exists := rl.visitors[ip]
-	if !exists || time.Since(b.lastSeen) > rl.window {
-		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
-		return true
-	}
-	if b.count >= rl.rate {
-		return false
-	}
-	b.count++
-	b.lastSeen = time.Now()
-	return true
-}
-
-func (rl *ipRateLimiter) cleanup() {
-	for {
-		time.Sleep(rl.window)
-		rl.mu.Lock()
-		for ip, b := range rl.visitors {
-			if time.Since(b.lastSeen) > rl.window {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
-}
-
-var globalIPLimiter = newIPRateLimiter(100, time.Minute)
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
-
-// Prevent HTTP header injection (strip CR/LF)
-func sanitizeHeader(value string) string {
-	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
-}
-
-func validateBVN(bvn string) bool {
-	if len(bvn) != 11 { return false }
-	for _, c := range bvn { if c < '0' || c > '9' { return false } }
-	return true
-}
-
-func validateAccountNumber(acctNo string) bool {
-	if len(acctNo) != 10 { return false }
-	for _, c := range acctNo { if c < '0' || c > '9' { return false } }
-	return true
-}
-
-func validateNigerianPhone(phone string) bool {
-	clean := strings.ReplaceAll(strings.ReplaceAll(phone, " ", ""), "-", "")
-	if strings.HasPrefix(clean, "+234") && len(clean) == 14 { return true }
-	if strings.HasPrefix(clean, "0") && len(clean) == 11 { return true }
-	return false
-}
-
-func validateAmountKobo(amount int64) bool {
-	return amount > 0 && amount <= 500000000000
-}
-
-
-// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
-func panicRecoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":"internal server error"}`))
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Process Health Watchdog ---
-// Monitors event loop liveness; if the main goroutine stalls for >60s,
-// the liveness probe fails and K8s/KEDA restarts the pod automatically.
-
-var watchdogLastPing atomic.Int64
-
-func init() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
-}
-
-func watchdogPing() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
-}
-
-func startWatchdog(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			lastPing := watchdogLastPing.Load()
-			elapsed := time.Now().UnixMilli() - lastPing
-			if elapsed > 60000 {
-				log.Printf("[WATCHDOG] Event loop stalled for %dms — marking unhealthy", elapsed)
-			}
-		}
-	}()
-}
-
-func watchdogHealthy() bool {
-	lastPing := watchdogLastPing.Load()
-	elapsed := time.Now().UnixMilli() - lastPing
-	return elapsed < 60000
+    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 func main() {
-	initTracing()
-	startWatchdog(10 * time.Second)
-	watchdogPing()
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL != "" {
@@ -2156,8 +991,6 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	mux.HandleFunc("/v1/alerts", alertsHandler)
-	mux.HandleFunc("/dlq", handleDLQList)
-	mux.HandleFunc("/dlq/replay", handleDLQReplay)
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
@@ -2184,7 +1017,7 @@ func main() {
 	_ = tlsEnabled
 	server := &http.Server{
         Addr:    ":" + port,
-        Handler: panicRecoveryMiddleware(rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux)))))),
+        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
         ReadTimeout:  15 * time.Second,
         WriteTimeout: 30 * time.Second,
         IdleTimeout:  60 * time.Second,
@@ -2204,69 +1037,4 @@ func main() {
     log.Println("[liveness-orchestrator-go] Server stopped gracefully")
 }
 
-// --- Event Bus (Kafka-compatible event emission) ---
-
-type EventBus struct {
-	brokerURL   string
-	topic       string
-	serviceName string
-	mu          sync.Mutex
-	buffer      []map[string]interface{}
-}
-
-func newEventBus(topic, service string) *EventBus {
-	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" {
-		broker = "localhost:9092"
-	}
-	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
-}
-
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
-	event := map[string]interface{}{
-		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
-		"type":      eventType,
-		"source":    eb.serviceName,
-		"topic":     eb.topic,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"data":      payload,
-	}
-	eb.mu.Lock()
-	eb.buffer = append(eb.buffer, event)
-	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
-	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
-}
-
-func (eb *EventBus) Flush() []map[string]interface{} {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	events := eb.buffer
-	eb.buffer = nil
-	return events
-}
-
-// --- Downstream Notifier ---
-
-func notifyDownstream(serviceURL, path string, payload interface{}) error {
-	body, _ := json.Marshal(payload)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Source-Service", serviceName)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("[Downstream] %s%s failed: %v", serviceURL, path, err)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("downstream %s returned %d", path, resp.StatusCode)
-	}
-	return nil
-}
-
+func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

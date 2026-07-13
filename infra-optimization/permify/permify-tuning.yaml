@@ -1,0 +1,113 @@
+# 54Bank Permify Tuning — Millions TPS Authorization Checks
+# Permify 1.x production configuration for ReBAC
+
+server:
+  rate_limit: 100000  # Per-second rate limit
+  grpc:
+    port: 3478
+    tls:
+      enabled: true
+  http:
+    enabled: true
+    port: 3476
+    tls:
+      enabled: true
+
+logger:
+  level: warn  # Reduce log noise at high TPS
+
+profiler:
+  enabled: true
+  port: 6060
+
+# --- Database (PostgreSQL) ---
+database:
+  engine: postgres
+  uri: "postgres://permify:CHANGE_ME@postgres-primary:5432/permify?sslmode=require"
+  max_open_connections: 100
+  max_idle_connections: 50
+  max_connection_lifetime: "1h"
+  max_connection_idle_time: "5m"
+  max_data_per_write: 1000
+  max_retries: 3
+
+  # Garbage collection
+  garbage_collection:
+    enabled: true
+    interval: "3m"
+    timeout: "3m"
+    window: "720h"  # 30 days
+
+# --- Cache (Critical for high TPS) ---
+cache:
+  # Schema cache
+  schema:
+    enabled: true
+    number_of_counters: 10000
+    max_cost: "128mb"
+
+  # Permission check cache
+  permission:
+    enabled: true
+    number_of_counters: 100000
+    max_cost: "512mb"
+
+  # Relationship cache
+  relationship:
+    enabled: true
+    number_of_counters: 100000
+    max_cost: "256mb"
+
+# --- Distributed (for multi-node) ---
+distributed:
+  enabled: true
+  address: "permify-node:5053"
+  port: "5053"
+
+# --- Service Configuration ---
+service:
+  # Concurrent permission checks
+  permission:
+    concurrency_limit: 1000
+    bulk_limit: 100
+
+  # Schema management
+  schema:
+    cache: true
+
+  # Watch service for real-time updates
+  watch:
+    enabled: true
+
+# --- 54Bank Authorization Model ---
+# Example Permify schema for banking:
+#
+# entity user {}
+#
+# entity account {
+#   relation owner @user
+#   relation joint_holder @user
+#   relation banker @user
+#
+#   permission view = owner or joint_holder or banker
+#   permission transact = owner or joint_holder
+#   permission close = owner
+#   permission audit = banker
+# }
+#
+# entity branch {
+#   relation manager @user
+#   relation officer @user
+#
+#   permission approve_loan = manager
+#   permission process_kyc = manager or officer
+# }
+#
+# entity organization {
+#   relation admin @user
+#   relation compliance_officer @user
+#
+#   permission manage_users = admin
+#   permission view_reports = admin or compliance_officer
+#   permission freeze_account = admin or compliance_officer
+# }

@@ -1,0 +1,107 @@
+# 54Bank Temporal Server Tuning — Millions TPS
+# Temporal 1.24+ production configuration
+
+global:
+  membership:
+    maxJoinDuration: 30s
+  
+  metrics:
+    prometheus:
+      timerType: histogram
+      listenAddress: "0.0.0.0:9090"
+
+persistence:
+  defaultStore: postgres-default
+  visibilityStore: postgres-visibility
+  numHistoryShards: 4096  # Critical for throughput — higher = more parallelism
+
+  datastores:
+    postgres-default:
+      sql:
+        pluginName: "postgres12"
+        databaseName: "temporal"
+        connectAddr: "postgres-primary:5432"
+        maxConns: 100
+        maxIdleConns: 50
+        maxConnLifetime: "1h"
+        connectTimeout: "10s"
+    
+    postgres-visibility:
+      sql:
+        pluginName: "postgres12"
+        databaseName: "temporal_visibility"
+        connectAddr: "postgres-primary:5432"
+        maxConns: 50
+        maxIdleConns: 25
+        maxConnLifetime: "1h"
+
+services:
+  frontend:
+    rpc:
+      grpcPort: 7233
+      membershipPort: 6933
+      bindOnIP: "0.0.0.0"
+      maxMessageSize: 4194304  # 4MB
+    
+    # Rate limiting
+    rps: 10000
+    namespaceRPS: 5000
+    
+    # History size limits
+    historyMaxPageSize: 1000
+    
+  history:
+    rpc:
+      grpcPort: 7234
+      membershipPort: 6934
+      bindOnIP: "0.0.0.0"
+    
+    # Throughput tuning
+    rps: 20000
+    
+    # Task processing
+    transferProcessorMaxPollRPS: 5000
+    timerProcessorMaxPollRPS: 5000
+    
+    # Cache
+    historyCacheMaxSize: 131072
+    historyCacheTTL: "1h"
+    
+    # Activity
+    activityScheduleToStartTimeout: "10s"
+    
+  matching:
+    rpc:
+      grpcPort: 7235
+      membershipPort: 6935
+      bindOnIP: "0.0.0.0"
+    
+    # Task queue throughput
+    rps: 20000
+    
+    # Forwarder settings
+    forwarderMaxOutstandingPolls: 20
+    forwarderMaxOutstandingTasks: 20
+    forwarderMaxRatePerSecond: 10000
+    forwarderMaxChildrenPerNode: 20
+    
+  worker:
+    rpc:
+      grpcPort: 7239
+      membershipPort: 6939
+      bindOnIP: "0.0.0.0"
+
+# --- Worker Tuning (Go/Python SDK) ---
+# Go SDK worker options:
+#   MaxConcurrentActivityExecutionSize: 1000
+#   MaxConcurrentWorkflowTaskExecutionSize: 1000
+#   MaxConcurrentActivityTaskPollers: 20
+#   MaxConcurrentWorkflowTaskPollers: 20
+#   WorkerActivitiesPerSecond: 100000
+#   TaskQueueActivitiesPerSecond: 100000
+#   StickyScheduleToStartTimeout: 5s
+#
+# Python SDK worker options:
+#   max_concurrent_activities: 500
+#   max_concurrent_workflow_tasks: 500
+#   max_activities_per_second: 50000

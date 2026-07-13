@@ -1,0 +1,59 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-verification-service
+  pullPolicy: IfNotPresent
+  tag: "2.0.8"
+nameOverride: ""
+fullnameOverride: "verification-service"
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+service:
+  type: ClusterIP
+  port: 8383
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 1Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+nodeSelector: {}
+tolerations: []
+dapr:
+  appId: verification-service
+  appPort: 8383
+  enabled: true
+  enableMetrics: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 50m
+  cpu-limit: 150m
+  memory-request: 128Mi
+  memory-limit: 512Mi
+secrets:
+  APP_PORT: "8383"
+  DB_DATABASE: link_core_banking
+  DB_DATABASE_TYPE: postgres
+  DB_SSL_ENABLED: "true"
+  TEMPORAL_TASK_QUEUE: "verification-task-queue"
+  KYC_FLOW_BASE_URL: "https://kyc.54link-dev.upi.dev"
+  KYB_COLLECTION_FLOW_BASE_URL: "http://verification-service.54link-dev.svc.cluster.local:8383"
+  KYC_FLOW_API_KEY: "placeholder"
+  KYB_CALLBACK_URL: "http://verification-service.54link-dev.svc.cluster.local:8383/kyb/callback"
+  BALLERINE_API_URL: "https://api.ballerine.com"
+  BALLERINE_API_KEY: "placeholder"
+  DEFAULT_KYB_WORKFLOW_ID: "placeholder"
+  SHIELD_VERIFICATION_BASE_URL: "https://shield.verification.com"
+  SHIELD_API_URL: "https://shield.verification.com"
+  SHIELD_VERIFICATION_API_KEY: "placeholder"
+  DEFAULT_CLIENT_ID: "54link-orchestrator"
+  DEFAULT_CLIENT_SECRET: "54link-orchestrator-secret"

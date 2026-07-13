@@ -781,8 +781,8 @@ export function buildBillingDashboard(args: {
 export const defaultBillingAccounts: BillingAccount[] = [
   {
     id: "BAC-001",
-    tenantId: "54bank-platform-prod",
-    accountName: "54Bank Platform Commercial Account",
+    tenantId: "54link-dev-platform-prod",
+    accountName: "54link-dev Platform Commercial Account",
     billingModel: "hybrid",
     currency: "NGN",
     status: "active",
@@ -798,7 +798,7 @@ export const defaultBillingRateCards: BillingRateCard[] = [
   {
     id: "BRC-001",
     billingAccountId: "BAC-001",
-    name: "54Bank Platform Enterprise Hybrid v1",
+    name: "54link-dev Platform Enterprise Hybrid v1",
     version: 1,
     status: "active",
     effectiveFrom: "2026-01-01T00:00:00.000Z",
@@ -864,8 +864,8 @@ export const defaultBillingRateCardLines: BillingRateCardLine[] = [
 export const defaultBillingUsageEvents: BillingUsageEvent[] = [
   {
     id: "BUE-001",
-    idempotencyKey: "tenant-54bank-active-customer-2026-05-01",
-    tenantId: "54bank-platform-prod",
+    idempotencyKey: "tenant-54link-dev-active-customer-2026-05-01",
+    tenantId: "54link-dev-platform-prod",
     billingAccountId: "BAC-001",
     sourceService: "customer-service",
     sourceEventType: "customer.activated",
@@ -881,8 +881,8 @@ export const defaultBillingUsageEvents: BillingUsageEvent[] = [
   },
   {
     id: "BUE-002",
-    idempotencyKey: "tenant-54bank-seats-2026-05-02",
-    tenantId: "54bank-platform-prod",
+    idempotencyKey: "tenant-54link-dev-seats-2026-05-02",
+    tenantId: "54link-dev-platform-prod",
     billingAccountId: "BAC-001",
     sourceService: "tenant-service",
     sourceEventType: "seat.assigned",
@@ -898,8 +898,8 @@ export const defaultBillingUsageEvents: BillingUsageEvent[] = [
   },
   {
     id: "BUE-003",
-    idempotencyKey: "tenant-54bank-transfer-volume-2026-05-03",
-    tenantId: "54bank-platform-prod",
+    idempotencyKey: "tenant-54link-dev-transfer-volume-2026-05-03",
+    tenantId: "54link-dev-platform-prod",
     billingAccountId: "BAC-001",
     sourceService: "payment-service",
     sourceEventType: "transfer.posted",
@@ -919,7 +919,7 @@ export const defaultBillingContractOverrides: BillingContractOverride[] = [
   {
     id: "BCO-001",
     billingAccountId: "BAC-001",
-    tenantId: "54bank-platform-prod",
+    tenantId: "54link-dev-platform-prod",
     overrideType: "unit_price",
     meterKey: "transfer_posted",
     productKey: "payments",
@@ -932,7 +932,7 @@ export const defaultBillingContractOverrides: BillingContractOverride[] = [
   {
     id: "BCO-002",
     billingAccountId: "BAC-001",
-    tenantId: "54bank-platform-prod",
+    tenantId: "54link-dev-platform-prod",
     overrideType: "minimum_commit",
     valueNumber: 8_500_000,
     effectiveFrom: "2026-05-01T00:00:00.000Z",
@@ -946,7 +946,7 @@ export const defaultBillingDiscountRules: BillingDiscountRule[] = [
   {
     id: "BDR-001",
     billingAccountId: "BAC-001",
-    tenantId: "54bank-platform-prod",
+    tenantId: "54link-dev-platform-prod",
     name: "Launch adoption discount",
     discountType: "percentage",
     percentage: 7.5,
@@ -960,7 +960,7 @@ export const defaultBillingRevenueShareRules: BillingRevenueShareRule[] = [
   {
     id: "BSR-001",
     billingAccountId: "BAC-001",
-    tenantId: "54bank-platform-prod",
+    tenantId: "54link-dev-platform-prod",
     name: "Partner bank usage share",
     target: "partner_bank",
     percentage: 12.5,

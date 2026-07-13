@@ -1,0 +1,6 @@
+apiVersion: v2
+name: insurance-service
+description: 54link Insurance Service Helm Chart
+type: application
+version: 0.0.3
+appVersion: "1.0.0"

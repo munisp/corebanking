@@ -1,0 +1,73 @@
+name: Build Specialized Agri Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/acgsf-guarantee-go/**'
+      - 'services/agri-esg-impact-py/**'
+      - 'services/agri-evoucher-go/**'
+      - 'services/agri-input-marketplace-go/**'
+      - 'services/agri-iot-sensor-rs/**'
+      - 'services/agri-logistics-go/**'
+      - 'services/agri-reinsurance-go/**'
+      - 'services/agricultural-service/**'
+      - 'services/agriculture-banking-rs/**'
+      - 'services/carbon-service/**'
+      - 'services/cooperative-financials-py/**'
+      - 'services/cooperative-management-go/**'
+      - 'services/cooperative-meetings-go/**'
+      - 'services/crossborder-agri-trade-rs/**'
+      - 'services/esusu-groups-go/**'
+      - 'services/esusu-service/**'
+      - 'services/farm-boundary-mapping-rs/**'
+      - 'services/fisheries-aquaculture-go/**'
+      - 'services/livestock-finance-rs/**'
+      - 'services/livestock-insurance-rs/**'
+      - 'services/livestock-management-rs/**'
+      - 'services/multi-peril-crop-insurance-rs/**'
+      - 'services/nirsal-agro-geocoop-go/**'
+      - 'services/nirsal-credit-guarantee-go/**'
+      - 'services/post-harvest-loss-tracker-go/**'
+      - 'services/quality-certification-go/**'
+      - 'services/satellite-crop-monitor-rs/**'
+      - 'services/warehouse-management-go/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/specialized-agri.yaml'
+
+env:
+  TAG: "0.0.1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=acgsf-guarantee-go,agri-esg-impact-py,agri-evoucher-go,agri-input-marketplace-go,agri-iot-sensor-rs,agri-logistics-go,agri-reinsurance-go,agricultural-service,agriculture-banking-rs,carbon-service,cooperative-financials-py,cooperative-management-go,cooperative-meetings-go,crossborder-agri-trade-rs,esusu-groups-go,esusu-service,farm-boundary-mapping-rs,fisheries-aquaculture-go,livestock-finance-rs,livestock-insurance-rs,livestock-management-rs,multi-peril-crop-insurance-rs,nirsal-agro-geocoop-go,nirsal-credit-guarantee-go,post-harvest-loss-tracker-go,quality-certification-go,satellite-crop-monitor-rs,warehouse-management-go
+            PRIMARY_LANG=go
+            PORT_BASE=9563
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-specialized-agri:${{ env.TAG }}

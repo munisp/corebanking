@@ -1,0 +1,62 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-infra-caching
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9387
+    - port: 9388
+    - port: 9389
+    - port: 9390
+    - port: 9391
+    - port: 9392
+    - port: 9393
+    - port: 9394
+    - port: 9395
+    - port: 9396
+    - port: 9397
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: infra-caching
+  appPort: 9389
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9387"
+  PORT_BASE: "9387"
+  SERVICE_GROUP: infra-caching
+  SERVICES: "bloom-filter-cache-rs,cache-invalidation-rs,cdn-edge-cache-go,hot-data-cache-rs,prepared-stmt-cache-go,query-cache-engine-rs,redis-cache-middleware-rs,redis-cache-rs,redis-session-store-go,sw-api-cache-go"

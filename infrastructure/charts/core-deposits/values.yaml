@@ -1,0 +1,58 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-core-deposits
+  pullPolicy: IfNotPresent
+  tag: "0.0.4"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9301
+    - port: 9302
+    - port: 9303
+    - port: 9304
+    - port: 9305
+    - port: 9306
+    - port: 9307
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: core-deposits
+  appPort: 9306
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9301"
+  PORT_BASE: "9301"
+  SERVICE_GROUP: core-deposits
+  SERVICES: "agri-savings-cycles-go,interest-accrual-engine-go,interest-computation-rs,interest-rate-engine-go,safe-deposit-go,savings-products-go,savings-service"

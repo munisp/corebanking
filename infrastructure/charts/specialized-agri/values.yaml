@@ -1,0 +1,79 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-specialized-agri
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9563
+    - port: 9564
+    - port: 9565
+    - port: 9566
+    - port: 9567
+    - port: 9568
+    - port: 9569
+    - port: 9570
+    - port: 9571
+    - port: 9572
+    - port: 9573
+    - port: 9574
+    - port: 9575
+    - port: 9576
+    - port: 9577
+    - port: 9578
+    - port: 9579
+    - port: 9580
+    - port: 9581
+    - port: 9582
+    - port: 9583
+    - port: 9584
+    - port: 9585
+    - port: 9586
+    - port: 9587
+    - port: 9588
+    - port: 9589
+    - port: 9590
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: specialized-agri
+  appPort: 9590
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9563"
+  PORT_BASE: "9563"
+  SERVICE_GROUP: specialized-agri
+  SERVICES: "acgsf-guarantee-go,agri-esg-impact-py,agri-evoucher-go,agri-input-marketplace-go,agri-iot-sensor-rs,agri-logistics-go,agri-reinsurance-go,agricultural-service,agriculture-banking-rs,carbon-service,cooperative-financials-py,cooperative-management-go,cooperative-meetings-go,crossborder-agri-trade-rs,esusu-groups-go,esusu-service,farm-boundary-mapping-rs,fisheries-aquaculture-go,livestock-finance-rs,livestock-insurance-rs,livestock-management-rs,multi-peril-crop-insurance-rs,nirsal-agro-geocoop-go,nirsal-credit-guarantee-go,post-harvest-loss-tracker-go,quality-certification-go,satellite-crop-monitor-rs,warehouse-management-go"

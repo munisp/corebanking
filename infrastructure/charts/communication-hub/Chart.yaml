@@ -1,0 +1,6 @@
+apiVersion: v2
+name: communication-hub
+description: 54link Communication Hub Helm Chart
+type: application
+version: 0.0.2
+appVersion: "1.0.0"

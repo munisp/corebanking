@@ -1,0 +1,1183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mxfile host="app.diagrams.net" version="21.0.0">
+  <diagram name="54Link - All Services DB Architecture">
+    <mxGraphModel dx="2000" dy="1500" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="7950" pageHeight="13000" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="hdr_10001" value="Account Service" style="text;html=1;strokeColor=none;fillColor=#1e3a5f;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="0" y="0" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10002" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1e3a5f;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="0" y="70" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="acct_bank" value="Bank&#10;----------------------&#10;code (PK, int)&#10;name (varchar)&#10;tenant_id (varchar, unique)&#10;ledger_id (varchar)&#10;status (enum: active/inactive)&#10;logo (varchar, nullable)&#10;created_at&#10;updated_at&#10;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="30" y="100" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="acct_account" value="Account&#10;----------------------&#10;id (PK, int, TigerBeetle ID)&#10;name (varchar)&#10;keycloak_id (varchar)&#10;tenant_id (varchar)&#10;ledger_id (varchar)&#10;account_number (varchar, unique)&#10;balance (varchar)&#10;pin (varchar, nullable)&#10;status (enum: active/inactive/frozen)&#10;account_type (enum: primary/savings/...)&#10;account_currency (enum: NGN/USD/...)&#10;created_at&#10;updated_at&#10;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="390" y="100" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="acct_e1" edge="1" parent="1" source="acct_bank" target="acct_account" style="endArrow=block;dashed=1;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="60" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10003" value="Admin Service" style="text;html=1;strokeColor=none;fillColor=#2d6a4f;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="1650" y="0" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10004" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#2d6a4f;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="1650" y="70" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="adm_admin" value="Admin&#10;----------------------&#10;id (PK, int)&#10;first_name (varchar)&#10;last_name (varchar)&#10;email (varchar, unique)&#10;phone (varchar)&#10;uin (varchar)&#10;tenant_id (varchar)&#10;keycloak_id (varchar)&#10;kyc_url (varchar, nullable)&#10;access_level (varchar: super_admin | branch_manager |&#10;  operations_manager | risk_manager |&#10;  internal_auditor | it_admin |&#10;  relationship_manager | compliance_officer |&#10;  support_agent | ...)&#10;is_verified (bool)&#10;is_suspended (bool)&#10;created_at&#10;updated_at&#10;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="100" width="340" height="360" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="adm_note1" value="Platform Roles (54link admins):&#10;super_admin, tenant_manager,&#10;operations_manager, risk_manager,&#10;internal_auditor, it_admin,&#10;relationship_manager, compliance_officer,&#10;support_agent&#10;&#10;Tenant Roles (bank staff):&#10;super_admin, branch_manager,&#10;vault_manager, treasury_manager,&#10;loan_officer, trade_finance_admin, ..." style="text;html=1;strokeColor=#d6b656;fillColor=#fff2cc;align=left;verticalAlign=top;spacingLeft=4;spacingRight=4;overflow=hidden;rotatable=0;" vertex="1" parent="1">
+          <mxGeometry x="2080" y="100" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        <mxCell id="adm_e1" edge="1" parent="1" source="adm_admin" target="adm_note1" style="endArrow=none;dashed=1;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="1480" y="40" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10005" value="Agricultural Service" style="text;html=1;strokeColor=none;fillColor=#6b2737;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="3300" y="0" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10006" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#6b2737;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="3300" y="70" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="agri_farmers" value="farmers&#10;----------------------&#10;id (PK, serial)&#10;farmer_id (varchar, unique)&#10;tenant_id (varchar, indexed)&#10;full_name (varchar)&#10;phone_number (varchar)&#10;bvn (varchar(11))&#10;farm_location (varchar)&#10;farm_size (decimal(10,2), hectares)&#10;years_experience (int)&#10;credit_score (int, default 0)&#10;status (varchar: active/inactive/blacklisted)&#10;kyc_verified (bool)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="100" width="280" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_farms" value="farms&#10;----------------------&#10;id (PK, serial)&#10;farm_id (varchar, unique)&#10;tenant_id (varchar, indexed)&#10;farmer_id (FK -&gt; farmers.farmer_id)&#10;location (varchar)&#10;size (decimal(10,2), ha)&#10;soil_type (varchar)&#10;irrigation_type (varchar)&#10;land_title_number (varchar)&#10;land_value (decimal)&#10;current_crop (varchar)&#10;planting_date (date)&#10;status (varchar: pending/verified/active)&#10;verified_by / verified_at&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="3670" y="100" width="280" height="340" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_agri_loans" value="agricultural_loans&#10;----------------------&#10;id (PK, serial)&#10;loan_id (varchar, unique)&#10;tenant_id (varchar)&#10;farmer_id (FK -&gt; farmers)&#10;farm_id (FK -&gt; farms)&#10;loan_amount (decimal(15,2))&#10;crop_type (varchar)&#10;planting_date / expected_harvest_date (date)&#10;interest_rate (decimal)&#10;grace_period (int, days)&#10;collateral_type / collateral_value&#10;insurance_policy (varchar)&#10;status (varchar: pending/approved/disbursed/repaid/defaulted)&#10;disbursed_at / maturity_date&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="4010" y="100" width="280" height="380" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_loan_repayments" value="loan_repayments&#10;----------------------&#10;id (PK, serial)&#10;repayment_id (varchar, unique)&#10;loan_id (FK -&gt; agricultural_loans)&#10;amount (decimal(15,2))&#10;payment_date (timestamp)&#10;payment_method (varchar)&#10;transaction_ref (varchar)&#10;status (varchar: completed/failed)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="4010" y="520" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_weather_data" value="weather_data&#10;----------------------&#10;id (PK, serial)&#10;location (varchar, indexed)&#10;recorded_at (timestamp)&#10;temperature / humidity / rainfall&#10;wind_speed (decimal)&#10;weather_condition (varchar)&#10;forecast_data (JSONB)&#10;source (varchar: API/manual)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="460" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_crop_prices" value="crop_prices&#10;----------------------&#10;id (PK, serial)&#10;crop_type (varchar, indexed)&#10;market_location (varchar)&#10;price_per_kg (decimal)&#10;currency (varchar)&#10;price_date (date, indexed)&#10;source (varchar)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="720" width="280" height="200" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_agtech_devices" value="agtech_devices&#10;----------------------&#10;id (PK, serial)&#10;device_id (varchar, unique)&#10;tenant_id / farmer_id / farm_id (FK)&#10;device_type (varchar: soil_sensor/weather_station/...)&#10;manufacturer / model / serial_number&#10;status (varchar: active/offline/maintenance)&#10;battery_level (int)&#10;last_reading_at (timestamp)&#10;firmware_version (varchar)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="3670" y="480" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_device_readings" value="device_readings&#10;----------------------&#10;id (PK, serial)&#10;device_id (FK -&gt; agtech_devices)&#10;farm_id (FK -&gt; farms)&#10;reading_type (varchar)&#10;value (decimal)&#10;unit (varchar)&#10;recorded_at (timestamp, indexed)&#10;raw_data (JSONB)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="3670" y="800" width="280" height="200" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_manufacturers" value="agtech_manufacturers&#10;----------------------&#10;id (PK, serial)&#10;manufacturer_id (varchar, unique)&#10;name (varchar)&#10;country (varchar)&#10;contact_email / contact_phone&#10;website (varchar)&#10;is_approved (bool)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="4010" y="780" width="280" height="200" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="agri_e1" edge="1" parent="1" source="agri_farmers" target="agri_farms" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="60" />
+        </mxCell>
+        
+        <mxCell id="agri_e2" edge="1" parent="1" source="agri_farmers" target="agri_agri_loans" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="60" />
+        </mxCell>
+        
+        <mxCell id="agri_e3" edge="1" parent="1" source="agri_farms" target="agri_agri_loans" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="60" />
+        </mxCell>
+        
+        <mxCell id="agri_e4" edge="1" parent="1" source="agri_agri_loans" target="agri_loan_repayments" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="60" />
+        </mxCell>
+        
+        <mxCell id="agri_e5" edge="1" parent="1" source="agri_farms" target="agri_agtech_devices" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="60" />
+        </mxCell>
+        
+        <mxCell id="agri_e6" edge="1" parent="1" source="agri_agtech_devices" target="agri_device_readings" style="endArrow=block;strokeColor=#666666;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="60" />
+        </mxCell>
+        
+        <mxCell id="agri_e7" edge="1" parent="1" source="agri_manufacturers" target="agri_agtech_devices" style="endArrow=block;dashed=1;strokeColor=#666666;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="60" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10007" value="Audit Service" style="text;html=1;strokeColor=none;fillColor=#4a235a;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="4950" y="0" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10008" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4a235a;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="4950" y="70" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="audit_audit" value="Audit&#10;----------------------&#10;id (PK, UUID)&#10;actor_id (varchar)&#10;event_type (varchar, e.g. POST:/api/v1/loans)&#10;event_data (JSONB)&#10;timestamp (TIMESTAMP)&#10;tenant_id (varchar)&#10;created_at&#10;updated_at&#10;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="100" width="340" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="audit_note1" value="Immutable HTTP event log.&#10;Populated by fire-and-forget&#10;audit middleware on every&#10;non-GET request across all services.&#10;&#10;event_type format:&#10;  METHOD:/normalized/path/{id}&#10;&#10;actor_id = keycloak sub&#10;tenant_id = X-Tenant-ID header" style="text;html=1;strokeColor=#82b366;fillColor=#d5e8d4;align=left;verticalAlign=top;spacingLeft=4;overflow=hidden;" vertex="1" parent="1">
+          <mxGeometry x="5380" y="100" width="280" height="200" as="geometry" />
+        </mxCell>
+
+        
+        <mxCell id="audit_e1" edge="1" parent="1" source="audit_audit" target="audit_note1" style="endArrow=none;dashed=1;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="4780" y="40" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10009" value="Auth Service" style="text;html=1;strokeColor=none;fillColor=#7d3c00;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="6600" y="0" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10010" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#7d3c00;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="6600" y="70" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="auth_auth" value="Auth&#10;----------------------&#10;id (PK, int)&#10;email (varchar, unique)&#10;user_role (enum: user/admin)&#10;keycloak_id (varchar, unique)&#10;tenant_id (varchar)&#10;api_key (varchar, unique)&#10;api_secret (varchar, unique)&#10;created_at&#10;updated_at&#10;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="100" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="auth_trusted_devices" value="TrustedDevice&#10;----------------------&#10;id (PK, int)&#10;device_id (varchar, indexed)&#10;device_ip (varchar)&#10;user_agent (varchar)&#10;tenant_id (varchar)&#10;user_email (varchar)&#10;keycloak_id (varchar, indexed)&#10;created_at&#10;updated_at&#10;deleted_at&#10;&#10;UNIQUE(device_id, keycloak_id, tenant_id)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="6990" y="100" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="auth_e1" edge="1" parent="1" source="auth_auth" target="auth_trusted_devices" style="endArrow=block;dashed=1;strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" x="6570" y="40" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10011" value="Branch Manager Service" style="text;html=1;strokeColor=none;fillColor=#1a5276;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="0" y="1900" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10012" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1a5276;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="0" y="1970" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="bm_branch" value="Branch&#10;----------------------&#10;branch_id (PK, varchar)&#10;tenant_id (varchar)&#10;branch_name / branch_code (varchar)&#10;branch_type (varchar: full/mini/agency/digital)&#10;address / city / state / lga (varchar)&#10;phone / email (varchar)&#10;manager_id (FK -&gt; BranchStaff)&#10;status (varchar: active/inactive/suspended)&#10;opening_time / closing_time (time)&#10;working_days (JSONB array)&#10;cash_limit / daily_transaction_limit (bigint)&#10;coordinates lat/lng (float)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="350" y="2000" width="300" height="360" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="bm_branch_staff" value="BranchStaff&#10;----------------------&#10;staff_id (PK, varchar)&#10;branch_id (FK -&gt; Branch)&#10;tenant_id (varchar)&#10;employee_id (varchar)&#10;first_name / last_name (varchar)&#10;email / phone (varchar)&#10;role (varchar: teller/officer/supervisor/manager)&#10;department (varchar)&#10;status (varchar: active/on_leave/suspended)&#10;permissions (JSONB)&#10;hire_date (date)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="30" y="2000" width="280" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="bm_schedules" value="StaffSchedule&#10;----------------------&#10;schedule_id (PK, varchar)&#10;branch_id (FK -&gt; Branch)&#10;staff_id (FK -&gt; BranchStaff)&#10;shift_type (varchar: morning/afternoon/night)&#10;shift_date (date)&#10;start_time / end_time (time)&#10;status (varchar: scheduled/completed/absent)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="30" y="2360" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="bm_leave_requests" value="LeaveRequest&#10;----------------------&#10;leave_id (PK, varchar)&#10;staff_id (FK -&gt; BranchStaff)&#10;branch_id (FK)&#10;tenant_id (varchar)&#10;leave_type (varchar: annual/sick/maternity/emergency)&#10;start_date / end_date (date)&#10;reason (text)&#10;status (varchar: pending/approved/rejected)&#10;approved_by / approved_at&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="30" y="2640" width="280" height="260" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="bm_targets" value="BranchTarget&#10;----------------------&#10;target_id (PK, varchar)&#10;branch_id (FK -&gt; Branch)&#10;tenant_id (varchar)&#10;period_type (varchar: monthly/quarterly/annual)&#10;period_start / period_end (date)&#10;target_type (varchar: deposits/loans/accounts/revenue)&#10;target_value (bigint)&#10;achieved_value (bigint)&#10;status (varchar: active/achieved/missed)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="710" y="2000" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="bm_cash_management" value="CashManagement&#10;----------------------&#10;cash_id (PK, varchar)&#10;branch_id (FK -&gt; Branch)&#10;tenant_id (varchar)&#10;request_type (varchar: replenishment/transfer/vault)&#10;amount (bigint)&#10;currency (varchar)&#10;from_branch_id / to_branch_id (varchar)&#10;authorized_by / approved_by (varchar)&#10;status (varchar: pending/approved/completed/rejected)&#10;reason (text)&#10;created_at / completed_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="710" y="2320" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="bm_incidents" value="BranchIncident&#10;----------------------&#10;incident_id (PK, varchar)&#10;branch_id (FK -&gt; Branch)&#10;tenant_id (varchar)&#10;incident_type (varchar: security/operational/compliance/...)&#10;severity (varchar: low/medium/high/critical)&#10;title / description (text)&#10;reported_by (varchar)&#10;status (varchar: open/investigating/resolved/closed)&#10;resolved_by / resolved_at&#10;resolution_notes (text)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="350" y="2400" width="300" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="bm_e1" edge="1" parent="1" source="bm_branch" target="bm_branch_staff" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="1960" />
+        </mxCell>
+        
+        <mxCell id="bm_e2" edge="1" parent="1" source="bm_branch_staff" target="bm_schedules" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="1960" />
+        </mxCell>
+        
+        <mxCell id="bm_e3" edge="1" parent="1" source="bm_branch_staff" target="bm_leave_requests" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="1960" />
+        </mxCell>
+        
+        <mxCell id="bm_e4" edge="1" parent="1" source="bm_branch" target="bm_targets" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="1960" />
+        </mxCell>
+        
+        <mxCell id="bm_e5" edge="1" parent="1" source="bm_branch" target="bm_cash_management" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="1960" />
+        </mxCell>
+        
+        <mxCell id="bm_e6" edge="1" parent="1" source="bm_branch" target="bm_incidents" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="1960" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10013" value="Card Service" style="text;html=1;strokeColor=none;fillColor=#145a32;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="1650" y="1900" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10014" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#145a32;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="1650" y="1970" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="card_cards" value="cards&#10;----------------------&#10;id (PK, serial)&#10;tenant_id (varchar)&#10;card_id (varchar, unique)&#10;card_number (varchar(16), unique)&#10;card_type (varchar: debit/credit/prepaid)&#10;customer_id (varchar, indexed)&#10;account_id (varchar)&#10;name_on_card (varchar)&#10;expiry_date (date)&#10;cvv (varchar(3))&#10;pin_hash (varchar, nullable)&#10;status (varchar: active/blocked/expired)&#10;daily_limit (decimal, default 500000)&#10;monthly_limit (decimal, default 5000000)&#10;daily_spent (decimal, default 0)&#10;monthly_spent (decimal, default 0)&#10;created_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="2000" width="320" height="380" as="geometry" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10015" value="Chart Of Accounts Service" style="text;html=1;strokeColor=none;fillColor=#6e2c00;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="3300" y="1900" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10016" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#6e2c00;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="3300" y="1970" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="coa_coa_accounts" value="coa_accounts&#10;----------------------&#10;id (PK, UUID)&#10;tenant_id (varchar, indexed)&#10;code (varchar, indexed)&#10;name (varchar)&#10;account_type (varchar: asset/liability/equity/revenue/expense)&#10;category (varchar)&#10;sub_category (varchar)&#10;parent_id (FK -&gt; coa_accounts.id, self-ref)&#10;normal_balance (varchar: debit/credit)&#10;level (int)&#10;is_active (bool)&#10;is_system_account (bool)&#10;currency (varchar)&#10;description (text)&#10;tb_account_id (varchar, nullable - TigerBeetle)&#10;created_at / updated_at&#10;UNIQUE(tenant_id, code)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="3650" y="2000" width="300" height="380" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="coa_journal_entries" value="journal_entries&#10;----------------------&#10;id (PK, UUID)&#10;tenant_id (varchar, indexed)&#10;date (date, indexed)&#10;description (varchar)&#10;reference (varchar)&#10;entry_type (varchar: manual/system/adjustment)&#10;period_id (FK -&gt; accounting_periods)&#10;posted_by (varchar)&#10;status (varchar: draft/posted/reversed)&#10;reversal_of_id (FK -&gt; journal_entries, nullable)&#10;total_debit / total_credit (bigint)&#10;metadata (JSONB)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="2000" width="280" height="340" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="coa_journal_entry_lines" value="journal_entry_lines&#10;----------------------&#10;id (PK, UUID)&#10;entry_id (FK -&gt; journal_entries.id)&#10;account_id (FK -&gt; coa_accounts.id)&#10;description (varchar)&#10;debit_amount (bigint)&#10;credit_amount (bigint)&#10;currency (varchar)&#10;line_number (int)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="2380" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="coa_accounting_periods" value="accounting_periods&#10;----------------------&#10;id (PK, UUID)&#10;tenant_id (varchar, indexed)&#10;name (varchar)&#10;period_type (varchar: monthly/quarterly/annual)&#10;start_date / end_date (date)&#10;status (varchar: open/closed/locked)&#10;closed_by / closed_at&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="4010" y="2000" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="coa_approval_workflows" value="approval_workflows&#10;----------------------&#10;id (PK, UUID)&#10;tenant_id (varchar)&#10;workflow_name (varchar)&#10;entity_type (varchar: journal_entry/account)&#10;approval_type (varchar: sequential/parallel)&#10;is_active (bool)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="4010" y="2280" width="280" height="180" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="coa_approval_requests" value="approval_requests&#10;----------------------&#10;id (PK, UUID)&#10;workflow_id (FK -&gt; approval_workflows)&#10;tenant_id (varchar)&#10;entity_id (varchar)&#10;entity_type (varchar)&#10;requested_by (varchar)&#10;status (varchar: pending/approved/rejected)&#10;current_step (int)&#10;metadata (JSONB)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="3650" y="2420" width="280" height="260" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="coa_account_templates" value="account_templates&#10;----------------------&#10;id (PK, UUID)&#10;template_name (varchar)&#10;description (text)&#10;industry (varchar: banking/microfinance/...)&#10;accounts (JSONB array)&#10;is_system (bool)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="4010" y="2500" width="280" height="180" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="coa_audit_log" value="audit_log&#10;----------------------&#10;id (PK, UUID)&#10;tenant_id (varchar, indexed)&#10;entity_type / entity_id (varchar)&#10;action (varchar)&#10;performed_by (varchar)&#10;changes (JSONB)&#10;ip_address (varchar)&#10;performed_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="2640" width="280" height="200" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="coa_e1" edge="1" parent="1" source="coa_coa_accounts" target="coa_coa_accounts" style="endArrow=block;dashed=1;strokeColor=#6c8ebf;exitX=1;exitY=0.5;entryX=1;entryY=0.25;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="1960"><Array as="points"><mxPoint x="720" y="130" /><mxPoint x="720" y="190" /></Array></mxGeometry>
+        </mxCell>
+        
+        <mxCell id="coa_e2" edge="1" parent="1" source="coa_journal_entries" target="coa_journal_entry_lines" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="1960" />
+        </mxCell>
+        
+        <mxCell id="coa_e3" edge="1" parent="1" source="coa_journal_entry_lines" target="coa_coa_accounts" style="endArrow=block;strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="1960" />
+        </mxCell>
+        
+        <mxCell id="coa_e4" edge="1" parent="1" source="coa_accounting_periods" target="coa_journal_entries" style="endArrow=block;dashed=1;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="1960" />
+        </mxCell>
+        
+        <mxCell id="coa_e5" edge="1" parent="1" source="coa_approval_workflows" target="coa_approval_requests" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="1960" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10017" value="Compliance Service" style="text;html=1;strokeColor=none;fillColor=#4a235a;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="4950" y="1900" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10018" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4a235a;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="4950" y="1970" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="comp_reg_reports" value="regulatory_reports&#10;----------------------&#10;id (PK, serial)&#10;report_id (varchar, unique)&#10;tenant_id (varchar, indexed)&#10;report_type (varchar, indexed)&#10;period_start (timestamptz)&#10;period_end (timestamptz)&#10;parameters (JSONB)&#10;report_data (JSONB)&#10;file_url (varchar)&#10;status (varchar: pending/generated/submitted)&#10;generated_at (timestamptz)&#10;submitted_at (timestamptz)&#10;submission_reference (varchar)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="2000" width="280" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="comp_compliance_alerts" value="compliance_alerts&#10;----------------------&#10;id (PK, serial)&#10;alert_id (varchar, unique)&#10;tenant_id (varchar)&#10;alert_type (varchar)&#10;severity (varchar: low/medium/high/critical)&#10;entity_type (varchar)&#10;entity_id (varchar)&#10;description (text)&#10;metadata (JSONB)&#10;status (varchar: open/in_review/resolved)&#10;assigned_to (varchar)&#10;resolved_at (timestamptz)&#10;resolution_notes (text)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="5320" y="2000" width="280" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="comp_sar_filings" value="sar_filings&#10;----------------------&#10;id (PK, serial)&#10;sar_id (varchar, unique)&#10;tenant_id (varchar)&#10;subject_name (varchar)&#10;subject_type (varchar)&#10;subject_id (varchar)&#10;suspicious_activity_type (varchar)&#10;activity_description (text)&#10;transaction_ids (JSONB)&#10;total_amount (decimal)&#10;currency (varchar, default NGN)&#10;filing_reason (text)&#10;supporting_documents (JSONB)&#10;status (varchar: draft/filed/accepted)&#10;filed_at / filing_reference&#10;created_by / reviewed_by&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="5660" y="2000" width="280" height="380" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="comp_monitoring_rules" value="transaction_monitoring_rules&#10;----------------------&#10;id (PK, serial)&#10;rule_id (varchar, unique)&#10;tenant_id (varchar, indexed)&#10;rule_name (varchar)&#10;rule_type (varchar)&#10;conditions (JSONB)&#10;alert_severity (varchar)&#10;is_active (bool, indexed)&#10;triggered_count (int)&#10;last_triggered_at (timestamptz)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="2360" width="280" height="260" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="comp_sanctions" value="sanctions_screening&#10;----------------------&#10;id (PK, serial)&#10;screening_id (varchar, unique)&#10;tenant_id (varchar)&#10;entity_type (varchar)&#10;entity_id (varchar, indexed)&#10;entity_name (varchar)&#10;screening_result (varchar: clear/match/review)&#10;match_score (decimal)&#10;matched_lists (JSONB)&#10;screening_provider (varchar)&#10;screened_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="5320" y="2380" width="280" height="260" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="comp_aml_risk" value="aml_risk_assessments&#10;----------------------&#10;id (PK, serial)&#10;assessment_id (varchar, unique)&#10;tenant_id (varchar)&#10;entity_type (varchar)&#10;entity_id (varchar, indexed)&#10;risk_level (varchar: low/medium/high)&#10;risk_score (int)&#10;risk_factors (JSONB)&#10;assessment_date" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="5660" y="2440" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="comp_e1" edge="1" parent="1" source="comp_monitoring_rules" target="comp_compliance_alerts" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="1960" />
+        </mxCell>
+        
+        <mxCell id="comp_e2" edge="1" parent="1" source="comp_sanctions" target="comp_aml_risk" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="1960" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10019" value="Dispute Service" style="text;html=1;strokeColor=none;fillColor=#1b4332;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="6600" y="1900" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10020" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1b4332;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="6600" y="1970" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="disp_disputes" value="disputes&#10;----------------------&#10;id (PK, serial)&#10;dispute_id (varchar, unique)&#10;customer_id (varchar, indexed)&#10;transaction_id (varchar)&#10;dispute_type (varchar)&#10;tenant_id (varchar)&#10;amount (decimal(15,2))&#10;description (text)&#10;status (varchar: open/in_review/resolved/closed)&#10;resolution (text, nullable)&#10;created_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="2000" width="320" height="260" as="geometry" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10021" value="Employee Service" style="text;html=1;strokeColor=none;fillColor=#1e3a5f;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="0" y="3800" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10022" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1e3a5f;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="0" y="3870" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="emp_employees" value="employees&#10;----------------------&#10;employee_id (PK, UUID)&#10;bank_id (text, indexed, RLS key)&#10;branch_id (text)&#10;employee_number (text)&#10;email (text)&#10;first_name / last_name (text)&#10;phone (text)&#10;role (text: teller/manager/officer/...)&#10;department (text)&#10;status (text: active/inactive/suspended/terminated)&#10;hire_date (date)&#10;created_at / updated_at (timestamptz)&#10;&#10;Row-Level Security: bank_id = session context" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="30" y="3900" width="340" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="emp_note1" value="Emits EmployeeEvent to Kafka:&#10;  - employee.onboarded&#10;  - employee.updated&#10;  - employee.suspended&#10;  - employee.terminated&#10;&#10;Row-Level Security enforced at DB level.&#10;bank_id policy restricts cross-tenant access." style="text;html=1;strokeColor=#d6b656;fillColor=#fff2cc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="430" y="3900" width="260" height="180" as="geometry" />
+        </mxCell>
+
+        
+        <mxCell id="emp_e1" edge="1" parent="1" source="emp_employees" target="emp_note1" style="endArrow=none;dashed=1;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="-150" y="3860" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10023" value="Esusu Service" style="text;html=1;strokeColor=none;fillColor=#2d6a4f;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="1650" y="3800" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10024" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#2d6a4f;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="1650" y="3870" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="esusu_esusu_groups" value="esusu_groups&#10;----------------------&#10;id (PK, varchar(36))&#10;tenant_id (varchar, indexed)&#10;name (varchar)&#10;description (text)&#10;created_by (varchar)&#10;admin_id (varchar)&#10;contribution_amount (decimal(15,2))&#10;currency (varchar, default NGN)&#10;frequency (varchar: daily/weekly/monthly)&#10;max_members (int)&#10;current_cycle (int, default 0)&#10;total_cycles (int)&#10;status (varchar: active/paused/completed)&#10;start_date (timestamp)&#10;next_payout_date (timestamp)&#10;payout_order (JSONB array)&#10;rules (JSONB)&#10;ai_metrics (JSONB)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="3900" width="300" height="420" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="esusu_esusu_members" value="esusu_members&#10;----------------------&#10;id (PK, varchar(36))&#10;tenant_id (varchar, indexed)&#10;user_id (varchar, indexed)&#10;group_id (FK -&gt; esusu_groups.id)&#10;name (varchar)&#10;phone (varchar)&#10;email (varchar)&#10;role (varchar: admin/member)&#10;joined_at (timestamp)&#10;position (int)&#10;has_received_payout (bool)&#10;payout_received_date (timestamp)&#10;total_contributed (decimal)&#10;missed_contributions (int)&#10;late_contributions (int)&#10;status (varchar: active/suspended)&#10;risk_score (decimal)&#10;credit_score (decimal)&#10;ai_profile (JSONB)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="2040" y="3900" width="300" height="440" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="esusu_contributions" value="esusu_contributions&#10;----------------------&#10;id (PK, varchar(36))&#10;group_id (FK -&gt; esusu_groups.id)&#10;member_id (FK -&gt; esusu_members.id)&#10;cycle_number (int, indexed)&#10;amount (decimal(15,2))&#10;expected_date (timestamp)&#10;actual_date (timestamp)&#10;status (varchar: pending/paid/late/missed)&#10;payment_method (varchar)&#10;reference (varchar)&#10;is_late (bool)&#10;days_late (int)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="2400" y="3900" width="280" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="esusu_payouts" value="esusu_payouts&#10;----------------------&#10;id (PK, varchar(36))&#10;group_id (FK -&gt; esusu_groups.id)&#10;recipient_id (FK -&gt; esusu_members.id)&#10;cycle_number (int, indexed)&#10;amount (decimal(15,2))&#10;status (varchar: scheduled/processed/failed)&#10;scheduled_for (timestamp)&#10;processed_at (timestamp)&#10;reference (varchar)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="2400" y="4240" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="esusu_e1" edge="1" parent="1" source="esusu_esusu_groups" target="esusu_esusu_members" style="endArrow=block;strokeColor=#6c8ebf;">
+          <mxGeometry relative="1" as="geometry" x="1640" y="3860" />
+        </mxCell>
+        
+        <mxCell id="esusu_e2" edge="1" parent="1" source="esusu_esusu_groups" target="esusu_contributions" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="1640" y="3860" />
+        </mxCell>
+        
+        <mxCell id="esusu_e3" edge="1" parent="1" source="esusu_esusu_members" target="esusu_contributions" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="1640" y="3860" />
+        </mxCell>
+        
+        <mxCell id="esusu_e4" edge="1" parent="1" source="esusu_esusu_groups" target="esusu_payouts" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="1640" y="3860" />
+        </mxCell>
+        
+        <mxCell id="esusu_e5" edge="1" parent="1" source="esusu_esusu_members" target="esusu_payouts" style="endArrow=block;dashed=1;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="1640" y="3860" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10025" value="Fraud Service" style="text;html=1;strokeColor=none;fillColor=#6b2737;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="3300" y="3800" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10026" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#6b2737;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="3300" y="3870" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="fraud_fraud_checks" value="fraud_checks&#10;----------------------&#10;id (PK, serial)&#10;check_id (varchar, unique)&#10;transaction_id (varchar)&#10;customer_id (varchar)&#10;tenant_id (varchar)&#10;fraud_score (int)&#10;risk_level (varchar: low/medium/high/critical)&#10;fraud_indicators (JSONB)&#10;recommended_action (varchar: allow/review/block)&#10;final_decision (varchar, nullable)&#10;decided_by (varchar, nullable)&#10;check_duration_ms (int)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="3900" width="280" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="fraud_fraud_rules" value="fraud_rules&#10;----------------------&#10;id (PK, serial)&#10;rule_id (varchar, unique)&#10;tenant_id (varchar)&#10;rule_name (varchar)&#10;rule_type (varchar)&#10;conditions (JSONB)&#10;risk_level (varchar)&#10;action (varchar: allow/flag/block)&#10;is_active (bool)&#10;triggered_count (int)&#10;last_triggered_at (timestamp)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="3670" y="3900" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="fraud_device_fingerprints" value="device_fingerprints&#10;----------------------&#10;id (PK, serial)&#10;fingerprint_id (varchar, unique)&#10;customer_id (varchar)&#10;device_id (varchar)&#10;device_type (varchar)&#10;os / browser (varchar)&#10;ip_address (varchar)&#10;location (JSONB)&#10;is_trusted (bool)&#10;first_seen (timestamp)&#10;last_seen (timestamp)&#10;usage_count (int)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="4010" y="3900" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="fraud_fraud_patterns" value="fraud_patterns&#10;----------------------&#10;id (PK, serial)&#10;pattern_id (varchar, unique)&#10;pattern_name (varchar)&#10;pattern_type (varchar)&#10;pattern_definition (JSONB)&#10;severity (varchar)&#10;detection_count (int)&#10;is_active (bool)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="4260" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="fraud_fraud_alerts" value="fraud_alerts&#10;----------------------&#10;id (PK, serial)&#10;alert_id (varchar, unique)&#10;tenant_id (varchar)&#10;customer_id (varchar)&#10;alert_type (varchar)&#10;severity (varchar)&#10;description (text)&#10;related_entities (JSONB)&#10;status (varchar: open/in_review/resolved)&#10;assigned_to (varchar)&#10;resolved_at (timestamp)&#10;resolution_notes (text)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="3670" y="4240" width="280" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="fraud_e1" edge="1" parent="1" source="fraud_fraud_rules" target="fraud_fraud_checks" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="3860" />
+        </mxCell>
+        
+        <mxCell id="fraud_e2" edge="1" parent="1" source="fraud_fraud_patterns" target="fraud_fraud_alerts" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="3860" />
+        </mxCell>
+        
+        <mxCell id="fraud_e3" edge="1" parent="1" source="fraud_fraud_checks" target="fraud_fraud_alerts" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="3860" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10027" value="Fx Service" style="text;html=1;strokeColor=none;fillColor=#4a235a;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="4950" y="3800" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10028" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4a235a;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="4950" y="3870" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="fx_fx_rates" value="fx_rates&#10;----------------------&#10;id (PK, serial)&#10;tenant_id (varchar)&#10;from_currency (varchar(3))&#10;to_currency (varchar(3))&#10;rate (decimal(15,6))&#10;source (varchar: CBN/Reuters/Bloomberg)&#10;strategy (varchar: best/average/weighted)&#10;provider_rates (JSONB)&#10;created_at (timestamp)&#10;INDEX: (tenant_id, from_currency, to_currency, created_at DESC)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="3900" width="300" height="260" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="fx_fx_transactions" value="fx_transactions&#10;----------------------&#10;id (PK, serial)&#10;transaction_id (varchar, unique)&#10;tenant_id (varchar)&#10;customer_id (varchar)&#10;from_currency (varchar(3))&#10;to_currency (varchar(3))&#10;from_amount (decimal(15,2))&#10;to_amount (decimal(15,2))&#10;exchange_rate (decimal(15,6))&#10;base_rate (decimal(15,6))&#10;rate_source (varchar)&#10;strategy (varchar)&#10;purpose (varchar)&#10;margin_applied (decimal)&#10;initiated_by (varchar)&#10;status (varchar: completed/failed/reversed)&#10;idempotency_key (varchar, unique per tenant)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="5340" y="3900" width="300" height="400" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="fx_fx_workflow_events" value="fx_workflow_events&#10;----------------------&#10;id (PK, serial)&#10;transaction_id (FK -&gt; fx_transactions)&#10;tenant_id (varchar, indexed)&#10;event_type (varchar: initiated/approved/executed/settled)&#10;actor (varchar)&#10;details (JSONB)&#10;created_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="4220" width="300" height="200" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="fx_e1" edge="1" parent="1" source="fx_fx_rates" target="fx_fx_transactions" style="endArrow=block;dashed=1;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="3860" />
+        </mxCell>
+        
+        <mxCell id="fx_e2" edge="1" parent="1" source="fx_fx_transactions" target="fx_fx_workflow_events" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="3860" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10029" value="Insurance Service" style="text;html=1;strokeColor=none;fillColor=#7d3c00;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="6600" y="3800" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10030" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#7d3c00;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="6600" y="3870" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="ins_policies" value="insurance_policies&#10;----------------------&#10;id (PK, serial)&#10;policy_id (varchar, unique)&#10;customer_id (varchar, indexed)&#10;tenant_id (varchar)&#10;policy_type (varchar: life/health/auto/property)&#10;policy_number (varchar, unique)&#10;coverage_amount (decimal(15,2))&#10;premium_amount (decimal(15,2))&#10;duration_months (int)&#10;start_date (date)&#10;end_date (date)&#10;status (varchar: draft/active/expired/cancelled)&#10;beneficiaries (JSONB)&#10;additional_info (JSONB)&#10;underwriting_score (int)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="3900" width="300" height="360" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ins_claims" value="insurance_claims&#10;----------------------&#10;id (PK, serial)&#10;claim_id (varchar, unique)&#10;policy_id (FK -&gt; insurance_policies.policy_id)&#10;tenant_id (varchar)&#10;claim_amount (decimal(15,2))&#10;approved_amount (decimal, nullable)&#10;incident_date (date)&#10;incident_description (text)&#10;supporting_documents (JSONB)&#10;status (varchar: submitted/under_review/approved/rejected/paid)&#10;reviewed_by (varchar, nullable)&#10;reviewed_at (timestamp)&#10;paid_at (timestamp)&#10;rejection_reason (text)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="6990" y="3900" width="300" height="360" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ins_premium_payments" value="premium_payments&#10;----------------------&#10;id (PK, serial)&#10;payment_id (varchar, unique)&#10;policy_id (FK -&gt; insurance_policies.policy_id)&#10;tenant_id (varchar)&#10;amount (decimal(15,2))&#10;payment_date (date)&#10;payment_method (varchar)&#10;status (varchar: completed/failed)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="4320" width="300" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ins_underwriting" value="underwriting_assessments&#10;----------------------&#10;id (PK, serial)&#10;assessment_id (varchar, unique)&#10;policy_id (FK -&gt; insurance_policies.policy_id)&#10;tenant_id (varchar)&#10;risk_factors (JSONB)&#10;risk_score (int)&#10;risk_level (varchar: low/medium/high)&#10;premium_adjustment (decimal)&#10;assessed_by (varchar)&#10;assessed_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="6990" y="4320" width="300" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ins_e1" edge="1" parent="1" source="ins_policies" target="ins_claims" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="3860" />
+        </mxCell>
+        
+        <mxCell id="ins_e2" edge="1" parent="1" source="ins_policies" target="ins_premium_payments" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="3860" />
+        </mxCell>
+        
+        <mxCell id="ins_e3" edge="1" parent="1" source="ins_policies" target="ins_underwriting" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="3860" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10031" value="Internal Auditor Service" style="text;html=1;strokeColor=none;fillColor=#1a5276;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="0" y="5700" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10032" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1a5276;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="0" y="5770" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="ia_note_storage" value="Storage model: In-memory (formal audit lifecycle).&#10;This is the internal audit engagement system&#10;(separate from the audit-service HTTP event log).&#10;State persisted to Lakehouse/Kafka." style="text;html=1;strokeColor=#d6b656;fillColor=#fff2cc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="30" y="5800" width="320" height="100" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ia_audit_plan" value="AuditPlan&#10;----------------------&#10;plan_id (varchar)&#10;tenant_id (varchar)&#10;plan_year (int)&#10;plan_name (varchar)&#10;objectives ([]string)&#10;scope (varchar)&#10;risk_based (bool)&#10;status (varchar: draft/approved/active/closed)&#10;prepared_by / approved_by (varchar)&#10;approval_date (timestamp)&#10;engagements ([]AuditEngagement)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="30" y="5960" width="300" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ia_audit_engagement" value="AuditEngagement&#10;----------------------&#10;engagement_id (varchar)&#10;plan_id (FK -&gt; AuditPlan)&#10;tenant_id (varchar)&#10;title / scope (varchar)&#10;audit_type (varchar: financial/operational/compliance/IT)&#10;status (varchar: planning/fieldwork/reporting/closed)&#10;lead_auditor_id / auditor_ids ([]varchar)&#10;auditee_department (varchar)&#10;planned_start / planned_end (date)&#10;actual_start / actual_end (date)&#10;risk_rating (varchar: low/medium/high/critical)&#10;objectives / methodology (text)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="390" y="5960" width="300" height="360" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ia_audit_findings" value="AuditFinding&#10;----------------------&#10;finding_id (varchar)&#10;engagement_id (FK -&gt; AuditEngagement)&#10;tenant_id (varchar)&#10;title / description (text)&#10;finding_type (varchar: control_deficiency/fraud/policy_violation)&#10;risk_rating (varchar: low/medium/high/critical)&#10;root_cause / impact (text)&#10;recommendation (text)&#10;management_response (text)&#10;action_plan / action_owner (varchar)&#10;due_date (date)&#10;status (varchar: open/in_progress/closed/overdue)&#10;closed_at / created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="750" y="5960" width="300" height="380" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ia_control_tests" value="ControlTest&#10;----------------------&#10;test_id (varchar)&#10;engagement_id (FK -&gt; AuditEngagement)&#10;tenant_id (varchar)&#10;control_name / control_objective (varchar)&#10;control_type (varchar: preventive/detective/corrective)&#10;test_procedure (text)&#10;sample_size (int)&#10;status (varchar: not_started/in_progress/completed)&#10;result (varchar: effective/ineffective/partially_effective)&#10;exceptions_found (int)&#10;tested_by / tested_at&#10;evidence_refs ([]varchar)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="30" y="6320" width="300" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ia_audit_reports" value="AuditReport&#10;----------------------&#10;report_id (varchar)&#10;engagement_id (FK -&gt; AuditEngagement)&#10;tenant_id (varchar)&#10;report_type (varchar: interim/final/follow_up)&#10;executive_summary (text)&#10;overall_rating (varchar)&#10;total_findings (int)&#10;critical/high/medium/low_findings (int)&#10;status (varchar: draft/issued/acknowledged)&#10;issued_by / issued_at&#10;acknowledged_by / acknowledged_at&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="390" y="6360" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ia_followups" value="FollowUp&#10;----------------------&#10;followup_id (varchar)&#10;finding_id (FK -&gt; AuditFinding)&#10;tenant_id (varchar)&#10;followup_date (date)&#10;status (varchar: open/closed/overdue)&#10;comments (text)&#10;evidence_refs ([]varchar)&#10;reviewed_by / reviewed_at&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="750" y="6380" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="ia_e1" edge="1" parent="1" source="ia_audit_plan" target="ia_audit_engagement" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="5760" />
+        </mxCell>
+        
+        <mxCell id="ia_e2" edge="1" parent="1" source="ia_audit_engagement" target="ia_audit_findings" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="5760" />
+        </mxCell>
+        
+        <mxCell id="ia_e3" edge="1" parent="1" source="ia_audit_engagement" target="ia_control_tests" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="5760" />
+        </mxCell>
+        
+        <mxCell id="ia_e4" edge="1" parent="1" source="ia_audit_engagement" target="ia_audit_reports" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="5760" />
+        </mxCell>
+        
+        <mxCell id="ia_e5" edge="1" parent="1" source="ia_audit_findings" target="ia_followups" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="5760" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10033" value="Kyb Service" style="text;html=1;strokeColor=none;fillColor=#145a32;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="1650" y="5700" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10034" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#145a32;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="1650" y="5770" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="kyb_businesses" value="businesses&#10;----------------------&#10;id (PK, int, autoincrement)&#10;business_id (varchar, unique, indexed)&#10;tenant_id (varchar, indexed)&#10;business_name (varchar)&#10;registration_number (varchar, nullable)&#10;tin (varchar, nullable)&#10;business_type (varchar, nullable)&#10;industry (varchar, nullable)&#10;country (varchar, nullable)&#10;address (text, nullable)&#10;is_verified (bool, default false)&#10;verification_status (varchar: pending/verified/rejected)&#10;verification_date (timestamp, nullable)&#10;verification_path (varchar, nullable)&#10;contact_email (varchar, nullable)&#10;contact_phone (varchar, nullable)&#10;documents (JSON array: [{title, url}])&#10;metadata (JSON)&#10;created_at / updated_at / deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="5800" width="360" height="420" as="geometry" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10035" value="Loan Service" style="text;html=1;strokeColor=none;fillColor=#6e2c00;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="3300" y="5700" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10036" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#6e2c00;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="3300" y="5770" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="loan_loan_applications" value="loan_applications&#10;----------------------&#10;id (PK, serial)&#10;loan_application_id (varchar, unique)&#10;tenant_id (varchar)&#10;applicant_id (varchar)&#10;loan_amount (numeric(15,2))&#10;loan_purpose (text)&#10;requested_term (int)&#10;monthly_income (numeric(15,2))&#10;existing_debt (numeric)&#10;collateral_value (numeric)&#10;credit_score (int)&#10;employment_status (text)&#10;employment_duration (int)&#10;bank_statement_score (numeric)&#10;bvn_verified (bool)&#10;nin_verified (bool)&#10;interest_rate_percent (numeric)&#10;status (text: pending/approved/active/repaid/defaulted)&#10;loan_started_at (timestamp)&#10;created_at / updated_at&#10;INDEX: (id, tenant_id), (tenant_id, applicant_id)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="5800" width="320" height="440" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="loan_loan_payments" value="loan_payments&#10;----------------------&#10;id (PK, serial)&#10;loan_payment_id (varchar, unique)&#10;loan_application_id (FK -&gt; loan_applications)&#10;tenant_id (varchar)&#10;transaction_id (varchar, unique)&#10;amount (numeric(15,2))&#10;payment_date (timestamp)&#10;payment_method (text)&#10;status (text: completed/failed/pending)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="3710" y="5800" width="300" height="260" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="loan_e1" edge="1" parent="1" source="loan_loan_applications" target="loan_loan_payments" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="5760" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10037" value="Lpo Service" style="text;html=1;strokeColor=none;fillColor=#4a235a;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="4950" y="5700" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10038" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4a235a;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="4950" y="5770" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="lpo_lpo_applications" value="lpo_applications&#10;----------------------&#10;id (PK, serial)&#10;lpo_id (varchar, unique)&#10;supplier_id (varchar)&#10;tenant_id (varchar)&#10;lpo_number (varchar)&#10;issuing_organization (varchar)&#10;lpo_amount (decimal(15,2))&#10;currency (varchar, default NGN)&#10;financing_amount (decimal)&#10;interest_rate (decimal, default 5.0%)&#10;total_repayment (decimal)&#10;repayment_days (int)&#10;repayment_due_date (date)&#10;lpo_document_url (varchar)&#10;additional_documents (JSONB)&#10;status (varchar: submitted/under_review/approved/disbursed/repaid)&#10;risk_score (int)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="5800" width="300" height="400" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="lpo_lpo_verifications" value="lpo_verifications&#10;----------------------&#10;id (PK, serial)&#10;verification_id (varchar, unique)&#10;lpo_id (FK -&gt; lpo_applications.lpo_id)&#10;verified_by (varchar)&#10;is_authentic (bool)&#10;verification_method (varchar)&#10;verification_notes (text)&#10;verified_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="5340" y="5800" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="lpo_lpo_disbursements" value="lpo_disbursements&#10;----------------------&#10;id (PK, serial)&#10;disbursement_id (varchar, unique)&#10;lpo_id (FK -&gt; lpo_applications.lpo_id)&#10;amount (decimal(15,2))&#10;disbursed_to (varchar)&#10;bank_account (JSONB)&#10;transaction_reference (varchar)&#10;status (varchar: pending/completed/failed)&#10;disbursed_at (timestamp)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="5340" y="6060" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="lpo_e1" edge="1" parent="1" source="lpo_lpo_applications" target="lpo_lpo_verifications" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="5760" />
+        </mxCell>
+        
+        <mxCell id="lpo_e2" edge="1" parent="1" source="lpo_lpo_applications" target="lpo_lpo_disbursements" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="5760" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10039" value="Merchant Service" style="text;html=1;strokeColor=none;fillColor=#1b4332;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="6600" y="5700" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10040" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1b4332;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="6600" y="5770" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="merch_merchants" value="merchants&#10;----------------------&#10;id (PK, serial)&#10;merchant_id (varchar, unique)&#10;tenant_id (varchar)&#10;business_name (varchar)&#10;business_email (varchar)&#10;business_phone (varchar)&#10;business_address (text)&#10;business_type (varchar)&#10;registration_number (varchar)&#10;tax_id (varchar)&#10;contact_person_name (varchar)&#10;contact_person_email (varchar)&#10;contact_person_phone (varchar)&#10;industry (varchar)&#10;website (varchar, nullable)&#10;status (varchar: pending/active/suspended)&#10;kyb_status (varchar: not_started/pending/verified)&#10;api_key (varchar, nullable)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="5800" width="300" height="420" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="merch_kyb" value="merchant_kyb_verification&#10;----------------------&#10;id (PK, serial)&#10;merchant_id (FK -&gt; merchants.merchant_id)&#10;verification_status (varchar: pending/verified/rejected)&#10;documents (JSONB)&#10;verification_notes (text)&#10;verified_by (varchar)&#10;verified_at (timestamp)&#10;rejection_reason (text)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="6990" y="5800" width="300" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="merch_settlements" value="merchant_settlements&#10;----------------------&#10;id (PK, serial)&#10;settlement_id (varchar, unique)&#10;merchant_id (FK -&gt; merchants.merchant_id)&#10;settlement_period_start (timestamp)&#10;settlement_period_end (timestamp)&#10;total_transactions (int)&#10;gross_amount (decimal)&#10;fees_amount (decimal)&#10;net_amount (decimal)&#10;bank_account_number (varchar)&#10;bank_code (varchar)&#10;account_name (varchar)&#10;status (varchar: pending/processing/completed/failed)&#10;processed_at (timestamp)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="6990" y="6080" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="merch_e1" edge="1" parent="1" source="merch_merchants" target="merch_kyb" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="5760" />
+        </mxCell>
+        
+        <mxCell id="merch_e2" edge="1" parent="1" source="merch_merchants" target="merch_settlements" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="5760" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10041" value="Mortgage Service" style="text;html=1;strokeColor=none;fillColor=#1e3a5f;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="0" y="7600" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10042" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1e3a5f;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="0" y="7670" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="mort_mortgage_app" value="mortgage_applications&#10;----------------------&#10;id (PK, serial)&#10;application_id (varchar, unique)&#10;tenant_id (varchar)&#10;applicant_id (varchar)&#10;applicant_name / email / phone&#10;loan_amount (decimal)&#10;down_payment (decimal)&#10;loan_term_years (int)&#10;interest_rate (decimal)&#10;interest_type (varchar: fixed/variable)&#10;purpose (varchar: purchase/refinance/construction)&#10;employment_status / monthly_income&#10;credit_score / debt_to_income_ratio&#10;status (varchar: draft/submitted/under_review/approved/disbursed/active/closed)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="350" y="7700" width="300" height="380" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_joint_applicants" value="mortgage_joint_applicants&#10;----------------------&#10;id (PK, serial)&#10;application_id (FK -&gt; mortgage_applications)&#10;applicant_name&#10;applicant_email&#10;applicant_phone&#10;monthly_income (decimal)&#10;credit_score (int)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="30" y="7700" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_properties" value="mortgage_properties&#10;----------------------&#10;id (PK, serial)&#10;application_id (FK -&gt; mortgage_applications)&#10;property_address / city / state / lga&#10;property_type (varchar)&#10;property_value (decimal)&#10;property_size / bedrooms / bathrooms&#10;title_type (varchar: C-of-O/governor_consent/...)&#10;title_number&#10;developer_name (nullable)&#10;construction_stage (nullable)&#10;verified (bool)&#10;verified_by / verified_at&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="710" y="7700" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_repayment_schedule" value="mortgage_repayment_schedule&#10;----------------------&#10;id (PK, serial)&#10;application_id (FK)&#10;installment_number (int)&#10;due_date (date)&#10;principal_amount (decimal)&#10;interest_amount (decimal)&#10;total_amount (decimal)&#10;outstanding_balance (decimal)&#10;status (varchar: pending/paid/overdue)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="30" y="7960" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_payments" value="mortgage_payments&#10;----------------------&#10;id (PK, serial)&#10;application_id (FK)&#10;schedule_id (FK -&gt; repayment_schedule)&#10;amount (decimal)&#10;payment_date (timestamp)&#10;payment_method (varchar)&#10;transaction_reference (varchar)&#10;principal_portion / interest_portion&#10;status (varchar: completed/failed/reversed)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="30" y="8240" width="280" height="260" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_escrow_accounts" value="mortgage_escrow_accounts&#10;----------------------&#10;id (PK, serial)&#10;application_id (FK, unique)&#10;current_balance (decimal)&#10;annual_tax_amount / annual_insurance&#10;monthly_escrow_payment (decimal)&#10;last_tax_payment_date / last_insurance_payment_date&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="350" y="8120" width="300" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_underwriting" value="mortgage_underwriting_decisions&#10;----------------------&#10;id (PK, serial)&#10;application_id (FK)&#10;underwriter_id (varchar)&#10;decision (varchar: approved/rejected/conditional)&#10;credit_risk_score / market_risk_score&#10;property_risk_score / overall_risk&#10;ltv_ratio / dscr&#10;approved_amount / approved_rate&#10;conditions (JSONB)&#10;notes (text)&#10;decided_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="710" y="8040" width="300" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_approvals" value="mortgage_approvals&#10;----------------------&#10;id (PK, serial)&#10;application_id (FK)&#10;approved_by (varchar)&#10;approval_date (timestamp)&#10;offer_letter_url (varchar)&#10;offer_valid_until (date)&#10;disbursement_date (date)&#10;disbursement_account (varchar)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="350" y="8380" width="280" height="220" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_products" value="mortgage_products&#10;----------------------&#10;id (PK, serial)&#10;product_name (varchar, unique)&#10;product_type (varchar: fixed_rate/variable/hybrid)&#10;min_loan / max_loan (decimal)&#10;min_term / max_term (int, years)&#10;interest_rate (decimal)&#10;max_ltv (decimal, %)&#10;is_active (bool)&#10;features (JSONB)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="710" y="8360" width="280" height="240" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_audit_trail" value="mortgage_audit_trail&#10;----------------------&#10;id (PK, serial)&#10;application_id (FK)&#10;action (varchar)&#10;performed_by (varchar)&#10;details (JSONB)&#10;ip_address (varchar)&#10;performed_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="30" y="8540" width="280" height="200" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="mort_e1" edge="1" parent="1" source="mort_mortgage_app" target="mort_joint_applicants" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="7660" />
+        </mxCell>
+        
+        <mxCell id="mort_e2" edge="1" parent="1" source="mort_mortgage_app" target="mort_properties" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="7660" />
+        </mxCell>
+        
+        <mxCell id="mort_e3" edge="1" parent="1" source="mort_mortgage_app" target="mort_repayment_schedule" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="7660" />
+        </mxCell>
+        
+        <mxCell id="mort_e4" edge="1" parent="1" source="mort_repayment_schedule" target="mort_payments" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="7660" />
+        </mxCell>
+        
+        <mxCell id="mort_e5" edge="1" parent="1" source="mort_mortgage_app" target="mort_escrow_accounts" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="7660" />
+        </mxCell>
+        
+        <mxCell id="mort_e6" edge="1" parent="1" source="mort_mortgage_app" target="mort_underwriting" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="7660" />
+        </mxCell>
+        
+        <mxCell id="mort_e7" edge="1" parent="1" source="mort_mortgage_app" target="mort_approvals" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="7660" />
+        </mxCell>
+        
+        <mxCell id="mort_e8" edge="1" parent="1" source="mort_mortgage_app" target="mort_audit_trail" style="endArrow=block;dashed=1;strokeColor=#666666;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="7660" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10043" value="Notification Service" style="text;html=1;strokeColor=none;fillColor=#2d6a4f;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="1650" y="7600" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10044" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#2d6a4f;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="1650" y="7670" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="notif_support_tickets" value="support_tickets&#10;----------------------&#10;id (PK, int)&#10;ticket_number (varchar(50), unique, indexed)&#10;tenant_id (varchar, indexed)&#10;user_id (varchar, indexed)&#10;subject (varchar)&#10;description (text)&#10;category (varchar, indexed)&#10;priority (enum: low/medium/high/urgent)&#10;status (enum: open/in_progress/resolved/closed)&#10;assigned_to (varchar, indexed)&#10;created_at (datetime)&#10;updated_at (datetime)&#10;resolved_at (datetime)&#10;closed_at (datetime)&#10;resolution (text)&#10;metadata (JSON)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="7700" width="300" height="380" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="notif_ticket_messages" value="ticket_messages&#10;----------------------&#10;id (PK, int)&#10;ticket_id (FK -&gt; support_tickets.id)&#10;sender_id (varchar)&#10;sender_type (varchar: user/agent/system)&#10;message (text)&#10;created_at (datetime)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="2040" y="7700" width="280" height="180" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="notif_e1" edge="1" parent="1" source="notif_support_tickets" target="notif_ticket_messages" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="1640" y="7660" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10045" value="Payment Processing Service" style="text;html=1;strokeColor=none;fillColor=#6b2737;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="3300" y="7600" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10046" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#6b2737;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="3300" y="7670" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="pay_note1" parent="1" style="text;html=1;strokeColor=#b85450;fillColor=#f8cecc;align=left;verticalAlign=top;spacingLeft=4;" value="Payment Processing is primarily a stateless&#10;orchestrator. Transaction state is owned by:&#10;  - TigerBeetle (ledger entries / balances)&#10;  - Account service (account metadata)&#10;  - Audit service (HTTP event log)&#10;&#10;QR codes use RSA signing (qr_private.key)&#10;No dedicated tables — uses SQLAlchemy Base&#10;(schema defined but minimal persistence)." vertex="1">
+          <mxGeometry height="180" width="360" x="3330" y="7940" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="pay_transfer_flow" parent="1" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" value="TransferFlow (stateless)&#10;----------------------&#10;sender_account_id (varchar)&#10;recipient_account_id (varchar)&#10;amount (decimal)&#10;currency (varchar)&#10;narration (varchar)&#10;transaction_type (varchar: p2p/bill/salary/...)&#10;reference (varchar, UUID)&#10;tenant_id (varchar)&#10;keycloak_id (varchar)&#10;&#10;→ Debit TigerBeetle (sender)&#10;→ Credit TigerBeetle (recipient)&#10;→ Emit Kafka event" vertex="1">
+          <mxGeometry height="280" width="280" x="3750" y="7940" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="pay_qr_flow" parent="1" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" value="QRPayment (stateless)&#10;----------------------&#10;qr_code (varchar, signed JWT)&#10;amount (decimal)&#10;merchant_id (varchar)&#10;customer_id (varchar)&#10;expiry (timestamp)&#10;reference (varchar)&#10;&#10;→ RSA-signed payload&#10;→ Validated at scan&#10;→ Routed to transfer flow" vertex="1">
+          <mxGeometry height="220" width="280" x="3750" y="8260" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="pay_deposit_flow" parent="1" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" value="DepositFlow (stateless)&#10;----------------------&#10;account_id (varchar)&#10;amount (decimal)&#10;channel (varchar: bank_transfer/agent/atm)&#10;reference (varchar)&#10;tenant_id (varchar)&#10;&#10;→ Credit TigerBeetle&#10;→ Emit deposit event to Kafka" vertex="1">
+          <mxGeometry height="200" width="260" x="4090" y="7940" as="geometry" />
+        </mxCell>
+        
+        <mxCell id="pay_e1" edge="1" parent="1" source="pay_transfer_flow" style="endArrow=none;dashed=1;strokeColor=#6c8ebf;" target="pay_deposit_flow">
+          <mxGeometry relative="1" as="geometry" x="3290" y="7900" />
+        </mxCell>
+        
+        <mxCell id="pay_e2" edge="1" parent="1" source="pay_qr_flow" style="endArrow=block;strokeColor=#82b366;" target="pay_transfer_flow">
+          <mxGeometry relative="1" as="geometry" x="3290" y="7900" />
+        </mxCell>
+        
+        <mxCell id="pay_Jlw4SiuEyk49Kks-3_jL-1" parent="1" style="text;html=1;whiteSpace=wrap;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;rounded=0;" value="Text" vertex="1">
+          <mxGeometry height="30" width="60" x="3870" y="7700" as="geometry" />
+        </mxCell>
+      
+        <mxCell id="hdr_10047" value="Reconciliation Service" style="text;html=1;strokeColor=none;fillColor=#4a235a;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="4950" y="7600" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10048" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4a235a;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="4950" y="7670" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="rec_reconciliation_runs" value="reconciliation_runs&#10;----------------------&#10;id (PK, serial)&#10;run_id (varchar, unique)&#10;tenant_id (varchar)&#10;run_type (varchar: daily/weekly/on_demand)&#10;period_start / period_end (timestamp)&#10;status (varchar: running/completed/failed)&#10;total_tb_transactions (int)&#10;total_pg_transactions (int)&#10;matched_count (int)&#10;discrepancy_count (int)&#10;started_at / completed_at (timestamp)&#10;error_message (text, nullable)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="7700" width="300" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rec_discrepancies" value="reconciliation_discrepancies&#10;----------------------&#10;id (PK, serial)&#10;run_id (FK -&gt; reconciliation_runs)&#10;discrepancy_type (varchar: missing_in_pg/missing_in_tb/amount_mismatch)&#10;transaction_id (varchar)&#10;tb_amount / pg_amount (bigint)&#10;difference (bigint)&#10;currency (varchar)&#10;tenant_id (varchar)&#10;status (varchar: open/investigating/resolved)&#10;resolved_by / resolved_at&#10;resolution_notes (text)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="5340" y="7700" width="300" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rec_e1" edge="1" parent="1" source="rec_reconciliation_runs" target="rec_discrepancies" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="7660" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rec_note1" value="TigerBeetle is source of truth for balances.&#10;PostgreSQL stores transaction metadata.&#10;This service reconciles TB ledger entries&#10;against PG transaction records daily." style="text;html=1;strokeColor=#82b366;fillColor=#d5e8d4;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="8080" width="280" height="120" as="geometry" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10049" value="Relationship Manager Service" style="text;html=1;strokeColor=none;fillColor=#7d3c00;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="6600" y="7600" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10050" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#7d3c00;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="6600" y="7670" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="rm_note_storage" value="Storage model: In-memory (sync.RWMutex maps).&#10;Events published to Kafka / Lakehouse.&#10;Customer profiles synced from user-service." style="text;html=1;strokeColor=#d6b656;fillColor=#fff2cc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="7700" width="300" height="80" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rm_customer" value="Customer&#10;----------------------&#10;customer_id (varchar)&#10;tenant_id (varchar)&#10;rm_id (FK -&gt; RelationshipManager)&#10;first_name / last_name (varchar)&#10;email / phone (varchar)&#10;customer_type (varchar: retail/sme/corporate)&#10;segment (varchar: mass/premium/private)&#10;kyc_status / kyc_tier (varchar)&#10;account_ids ([]varchar)&#10;total_aum (int64)&#10;credit_score (int)&#10;onboarded_at / last_review_at (timestamp)&#10;status (varchar: active/dormant/exited)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="7840" width="300" height="360" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rm_portfolio" value="Portfolio&#10;----------------------&#10;portfolio_id (varchar)&#10;rm_id (FK -&gt; RelationshipManager)&#10;tenant_id (varchar)&#10;customer_ids ([]varchar)&#10;total_customers (int)&#10;total_aum (int64)&#10;total_deposits / total_loans (int64)&#10;npl_ratio (float)&#10;revenue_ytd (int64)&#10;target_aum / target_revenue (int64)&#10;performance_score (float)&#10;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="6990" y="7840" width="280" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rm_opportunities" value="Opportunity&#10;----------------------&#10;opportunity_id (varchar)&#10;customer_id (FK -&gt; Customer)&#10;rm_id (varchar)&#10;tenant_id (varchar)&#10;opportunity_type (varchar: loan/investment/insurance/fx)&#10;title / description (varchar)&#10;estimated_value (int64)&#10;probability (float)&#10;stage (varchar: prospect/qualified/proposal/negotiation/closed_won/closed_lost)&#10;expected_close_date (date)&#10;product_id / product_name (varchar)&#10;notes (text)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="8240" width="300" height="340" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rm_activities" value="Activity&#10;----------------------&#10;activity_id (varchar)&#10;customer_id (FK -&gt; Customer)&#10;rm_id / tenant_id (varchar)&#10;activity_type (varchar: call/meeting/email/visit/review)&#10;subject / notes (text)&#10;outcome (varchar)&#10;next_action (varchar)&#10;next_action_date (date)&#10;duration_minutes (int)&#10;scheduled_at / completed_at (timestamp)&#10;status (varchar: planned/completed/cancelled)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="6990" y="8180" width="280" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rm_campaigns" value="Campaign&#10;----------------------&#10;campaign_id (varchar)&#10;tenant_id (varchar)&#10;name / description (varchar)&#10;campaign_type (varchar: product/retention/acquisition)&#10;target_segment (varchar)&#10;target_product (varchar)&#10;start_date / end_date (date)&#10;target_customers (int)&#10;reached_customers (int)&#10;converted_customers (int)&#10;status (varchar: draft/active/paused/completed)&#10;created_by / created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="7330" y="7840" width="280" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="rm_e1" edge="1" parent="1" source="rm_customer" target="rm_opportunities" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="7660" />
+        </mxCell>
+        
+        <mxCell id="rm_e2" edge="1" parent="1" source="rm_customer" target="rm_activities" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="7660" />
+        </mxCell>
+        
+        <mxCell id="rm_e3" edge="1" parent="1" source="rm_portfolio" target="rm_customer" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="7660" />
+        </mxCell>
+        
+        <mxCell id="rm_e4" edge="1" parent="1" source="rm_campaigns" target="rm_customer" style="endArrow=block;dashed=1;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="7660" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10051" value="Risk Manager Service" style="text;html=1;strokeColor=none;fillColor=#1a5276;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="0" y="9500" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10052" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1a5276;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="0" y="9570" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="risk_note_storage" value="Storage model: In-memory state + external aggregation.&#10;Risk scores computed dynamically from:&#10;  - Account service (transaction history)&#10;  - Fraud service (fraud scores)&#10;  - Credit engine outputs&#10;No dedicated PostgreSQL tables — events&#10;persisted to Lakehouse via Kafka." style="text;html=1;strokeColor=#b85450;fillColor=#f8cecc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="30" y="9600" width="340" height="140" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="risk_credit_risk" value="CreditRiskProfile (computed)&#10;----------------------&#10;entity_id (varchar)&#10;entity_type (varchar: customer/business)&#10;tenant_id (varchar)&#10;credit_score (int)&#10;pd (float: probability of default)&#10;lgd (float: loss given default)&#10;ead (float: exposure at default)&#10;risk_grade (varchar: A/B/C/D/E)&#10;credit_limit (int64)&#10;outstanding_exposure (int64)&#10;collateral_value (int64)&#10;last_assessed_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="30" y="9800" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="risk_market_risk" value="MarketRiskPosition (computed)&#10;----------------------&#10;position_id (varchar)&#10;tenant_id (varchar)&#10;asset_type (varchar: fx/equity/bond/commodity)&#10;currency / asset_id (varchar)&#10;notional_value / market_value (int64)&#10;var_1d / var_10d (float: Value at Risk)&#10;sensitivity (float: delta/gamma/vega)&#10;stress_loss (int64)&#10;limit / utilization (float)&#10;status (varchar)&#10;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="390" y="9800" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="risk_operational_risk" value="OperationalRiskEvent (computed)&#10;----------------------&#10;event_id (varchar)&#10;tenant_id (varchar)&#10;event_type (varchar: fraud/system_failure/human_error)&#10;category (varchar: people/process/technology/external)&#10;severity (varchar)&#10;actual_loss / potential_loss (int64)&#10;description (text)&#10;root_cause / mitigation (text)&#10;status (varchar: open/mitigated/closed)&#10;occurred_at / reported_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="30" y="10140" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="risk_risk_limits" value="RiskLimit (computed)&#10;----------------------&#10;limit_id (varchar)&#10;tenant_id (varchar)&#10;limit_type (varchar: credit/market/operational/liquidity)&#10;entity_type / entity_id (varchar)&#10;limit_value (int64)&#10;current_utilization (int64)&#10;utilization_pct (float)&#10;warning_threshold / breach_threshold (float)&#10;status (varchar: normal/warning/breached)&#10;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="390" y="10140" width="300" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="risk_e1" edge="1" parent="1" source="risk_credit_risk" target="risk_risk_limits" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="9560" />
+        </mxCell>
+        
+        <mxCell id="risk_e2" edge="1" parent="1" source="risk_market_risk" target="risk_risk_limits" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="9560" />
+        </mxCell>
+        
+        <mxCell id="risk_e3" edge="1" parent="1" source="risk_operational_risk" target="risk_risk_limits" style="endArrow=block;dashed=1;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="9560" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10053" value="Savings Service" style="text;html=1;strokeColor=none;fillColor=#145a32;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="1650" y="9500" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10054" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#145a32;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="1650" y="9570" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="sav_savings_goals" value="savings_goals&#10;----------------------&#10;id (PK, serial)&#10;goal_id (varchar, unique)&#10;customer_id (varchar, indexed)&#10;tenant_id (varchar)&#10;savings_account_id (int)&#10;enable_auto_save (bool)&#10;goal_name (varchar)&#10;target_amount (decimal(15,2))&#10;target_date (date, nullable)&#10;interest_rate (decimal, default 2.5%)&#10;status (varchar: active/completed/paused/cancelled)&#10;created_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="1680" y="9600" width="320" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="sav_note1" value="Actual balances managed in TigerBeetle&#10;(savings_account_id links to TB account).&#10;Auto-save triggers scheduled transfers&#10;via the payment-processing-service." style="text;html=1;strokeColor=#d6b656;fillColor=#fff2cc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="2060" y="9600" width="260" height="120" as="geometry" />
+        </mxCell>
+
+        
+        <mxCell id="sav_e1" edge="1" parent="1" source="sav_savings_goals" target="sav_note1" style="endArrow=none;dashed=1;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="1480" y="9540" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10055" value="Teller Service" style="text;html=1;strokeColor=none;fillColor=#6e2c00;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="3300" y="9500" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10056" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#6e2c00;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="3300" y="9570" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="tell_tellers" value="tellers&#10;----------------------&#10;teller_id (PK, varchar)&#10;tenant_id / branch_id (varchar)&#10;employee_id / employee_number (varchar)&#10;first_name / last_name / email / phone&#10;status (varchar: active/inactive/on_break/suspended)&#10;till_id (varchar, nullable)&#10;window_number (int)&#10;single_txn_limit / daily_txn_limit / cash_handling_limit (bigint)&#10;can_process_checks / can_process_fx / can_override_holds (bool)&#10;login_pin_hash (varchar)&#10;session_start / session_end (timestamp)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="9600" width="300" height="340" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_tills" value="tills&#10;----------------------&#10;till_id (PK, varchar)&#10;tenant_id / branch_id (varchar)&#10;till_number (varchar)&#10;assigned_teller_id (FK -&gt; tellers)&#10;status (varchar: open/closed/balancing)&#10;opening_balance / closing_balance (bigint)&#10;current_balance (bigint)&#10;currency (varchar, default NGN)&#10;opened_at / closed_at (timestamp)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="3690" y="9600" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_till_balances" value="till_balances&#10;----------------------&#10;id (PK, serial)&#10;till_id (FK -&gt; tills)&#10;currency (varchar)&#10;denomination (bigint)&#10;count (int)&#10;amount (bigint)&#10;recorded_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="4030" y="9600" width="260" height="200" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_vaults" value="vaults&#10;----------------------&#10;vault_id (PK, varchar)&#10;tenant_id / branch_id (varchar)&#10;vault_name (varchar)&#10;status (varchar: open/closed/audit)&#10;current_balance / max_capacity (bigint)&#10;currency (varchar)&#10;dual_control_required (bool)&#10;primary_custodian_id / secondary_custodian_id (varchar)&#10;last_audit_at (timestamp)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="9980" width="300" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_vault_balances" value="vault_balances&#10;----------------------&#10;id (PK, serial)&#10;vault_id (FK -&gt; vaults)&#10;currency / denomination (varchar/bigint)&#10;count (int)&#10;amount (bigint)&#10;recorded_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="3690" y="9920" width="260" height="180" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_teller_txn" value="teller_transactions&#10;----------------------&#10;transaction_id (PK, varchar)&#10;tenant_id / branch_id (varchar)&#10;teller_id (FK -&gt; tellers)&#10;till_id (FK -&gt; tills)&#10;transaction_type (varchar)&#10;amount (bigint) / currency (varchar)&#10;customer_account / customer_name&#10;reference_number (varchar, unique)&#10;narration (text)&#10;check_number / check_bank / check_date (nullable)&#10;hold_id (varchar, nullable)&#10;status (varchar: pending/completed/reversed/failed)&#10;reversed_by / reversal_reason&#10;supervisor_override_by&#10;created_at / completed_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="4030" y="9840" width="280" height="400" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_till_transfers" value="till_transfers&#10;----------------------&#10;transfer_id (PK, varchar)&#10;tenant_id / branch_id (varchar)&#10;from_till_id / to_till_id (FK -&gt; tills)&#10;from_vault_id / to_vault_id (FK -&gt; vaults)&#10;transfer_type (varchar)&#10;amount (bigint) / currency (varchar)&#10;authorized_by (varchar)&#10;status (varchar)&#10;created_at / completed_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="10300" width="300" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_ctr_reports" value="ctr_reports&#10;----------------------&#10;report_id (PK, varchar)&#10;tenant_id / branch_id (varchar)&#10;teller_id (FK)&#10;customer_id / customer_name / customer_id_type&#10;transaction_ids (JSONB)&#10;total_amount (bigint)&#10;currency / transaction_date&#10;report_type (varchar: ctr/str)&#10;status / submitted_at / submission_ref&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="3690" y="10140" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_queue_tickets" value="queue_tickets&#10;----------------------&#10;ticket_id (PK, varchar)&#10;tenant_id / branch_id (varchar)&#10;customer_name / customer_phone&#10;service_type (varchar)&#10;priority (varchar)&#10;status (varchar: waiting/serving/completed)&#10;assigned_teller_id (FK)&#10;issued_at / called_at / served_at / completed_at&#10;wait_time_seconds / service_time_seconds (int)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="3330" y="10620" width="300" height="260" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="tell_e1" edge="1" parent="1" source="tell_tellers" target="tell_tills" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+        
+        <mxCell id="tell_e2" edge="1" parent="1" source="tell_tills" target="tell_till_balances" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+        
+        <mxCell id="tell_e3" edge="1" parent="1" source="tell_vaults" target="tell_vault_balances" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+        
+        <mxCell id="tell_e4" edge="1" parent="1" source="tell_tellers" target="tell_teller_txn" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+        
+        <mxCell id="tell_e5" edge="1" parent="1" source="tell_tills" target="tell_teller_txn" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+        
+        <mxCell id="tell_e6" edge="1" parent="1" source="tell_tills" target="tell_till_transfers" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+        
+        <mxCell id="tell_e7" edge="1" parent="1" source="tell_vaults" target="tell_till_transfers" style="endArrow=block;dashed=1;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+        
+        <mxCell id="tell_e8" edge="1" parent="1" source="tell_teller_txn" target="tell_ctr_reports" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+        
+        <mxCell id="tell_e9" edge="1" parent="1" source="tell_queue_tickets" target="tell_tellers" style="endArrow=block;dashed=1;strokeColor=#666666;">
+          <mxGeometry relative="1" as="geometry" x="3290" y="9560" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10057" value="Treasury Service" style="text;html=1;strokeColor=none;fillColor=#4a235a;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="4950" y="9500" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10058" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#4a235a;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="4950" y="9570" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="treas_note_storage" value="Storage model: In-memory (sync.RWMutex maps).&#10;Persistence via Kafka events to Data Lakehouse.&#10;No dedicated PostgreSQL tables — state is&#10;computed from real-time positions." style="text;html=1;strokeColor=#b85450;fillColor=#f8cecc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="9600" width="320" height="100" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="treas_liquidity" value="LiquidityPosition (in-memory)&#10;----------------------&#10;position_id (varchar)&#10;tenant_id (varchar)&#10;date (timestamp)&#10;currency (varchar)&#10;total_assets / total_liabilities (int64, kobo)&#10;net_position / cash_reserves (int64)&#10;cbn_balance (int64)&#10;nostro_balances / vostro_balances (map[string]int64)&#10;LCR / NSFR / CRR (float64, ratios)&#10;status (varchar: normal/warning/critical)&#10;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="9760" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="treas_cash_flows" value="CashFlow (in-memory)&#10;----------------------&#10;flow_id (varchar)&#10;tenant_id (varchar)&#10;date (timestamp)&#10;flow_type (varchar: inflow/outflow)&#10;category (varchar: deposits/withdrawals/loans/investments)&#10;amount (int64)&#10;currency (varchar)&#10;description / counter_party (varchar)&#10;status (varchar: projected/confirmed/settled)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="5340" y="9760" width="280" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="treas_fx_positions" value="FXPosition (in-memory)&#10;----------------------&#10;position_id (varchar)&#10;tenant_id (varchar)&#10;currency (varchar)&#10;long_position / short_position (int64)&#10;net_position (int64)&#10;avg_rate / current_rate (float64)&#10;unrealized_pnl (int64)&#10;limit / utilization (float64)&#10;status (varchar: within_limit/near_limit/breached)&#10;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="4980" y="10100" width="300" height="280" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="treas_fx_deals" value="FXDeal (in-memory)&#10;----------------------&#10;deal_id / deal_number (varchar)&#10;tenant_id (varchar)&#10;deal_type (varchar: spot/forward/swap)&#10;buy_currency / sell_currency (varchar)&#10;buy_amount / sell_amount (int64)&#10;rate (float64)&#10;value_date / maturity_date (timestamp)&#10;counter_party / counter_party_id (varchar)&#10;purpose (varchar)&#10;status (varchar: pending/approved/executed/settled/cancelled)&#10;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="5340" y="10080" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="treas_investments" value="Investment (in-memory)&#10;----------------------&#10;investment_id (varchar)&#10;tenant_id (varchar)&#10;investment_type (varchar: treasury_bill/bond/fixed_deposit)&#10;issuer / issuer_id (varchar)&#10;face_value / purchase_price / current_value (int64)&#10;currency (varchar)&#10;coupon_rate / yield_rate (float64)&#10;purchase_date / maturity_date (timestamp)&#10;status (varchar: active/matured/sold)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="5700" y="9760" width="300" height="300" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="treas_e1" edge="1" parent="1" source="treas_liquidity" target="treas_cash_flows" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="9560" />
+        </mxCell>
+        
+        <mxCell id="treas_e2" edge="1" parent="1" source="treas_fx_positions" target="treas_fx_deals" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="9560" />
+        </mxCell>
+        
+        <mxCell id="treas_e3" edge="1" parent="1" source="treas_investments" target="treas_liquidity" style="endArrow=block;dashed=1;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry" x="4940" y="9560" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10059" value="User Service" style="text;html=1;strokeColor=none;fillColor=#1b4332;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="6600" y="9500" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10060" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1b4332;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="6600" y="9570" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="usr_user" value="user&#10;----------------------&#10;id (PK, UUID)&#10;first_name (varchar, nullable)&#10;last_name (varchar, nullable)&#10;name (varchar)&#10;uin (varchar, nullable)&#10;email (varchar, unique)&#10;phone_number (varchar, unique, nullable)&#10;keycloak_id (varchar)&#10;tenant_id (varchar)&#10;user_role (enum: user/admin)&#10;status (enum: active/inactive/suspended)&#10;kyc_verification_status (enum: not_verified/pending/verified)&#10;kyc_verification_url (varchar, nullable)&#10;created_at / updated_at / deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="6630" y="9600" width="300" height="340" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="usr_feedback" value="feedback&#10;----------------------&#10;id (PK, UUID)&#10;user_id (FK -&gt; user.id)&#10;tenant_id (varchar)&#10;category (enum: general/feature/bug/complaint/compliment)&#10;subject (varchar)&#10;message (text)&#10;rating (int, nullable 1-5)&#10;status (enum: open/in_review/resolved/closed)&#10;response (text, nullable)&#10;responded_by (varchar, nullable)&#10;responded_at (timestamp, nullable)&#10;created_at / updated_at / deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="6990" y="9600" width="300" height="320" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="usr_e1" edge="1" parent="1" source="usr_user" target="usr_feedback" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="6590" y="9560" />
+        </mxCell>
+
+      
+        <mxCell id="hdr_10061" value="Virtual Account Service" style="text;html=1;strokeColor=none;fillColor=#1e3a5f;align=center;verticalAlign=middle;fontColor=#ffffff;fontStyle=1;fontSize=14;whiteSpace=wrap;" vertex="1" parent="1"><mxGeometry x="0" y="11400" width="1350" height="70" as="geometry"/></mxCell>
+        <mxCell id="bg_10062" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#1e3a5f;strokeWidth=2;arcSize=1;" vertex="1" parent="1"><mxGeometry x="0" y="11470" width="1350" height="1530" as="geometry"/></mxCell>
+        <mxCell id="va_virtual_accounts" value="VirtualAccount (in-memory / persisted)&#10;----------------------&#10;id (varchar, UUID)&#10;van (varchar, 10-digit NUBAN)&#10;bank_id / tenant_id (varchar)&#10;parent_account_id (varchar)&#10;customer_id (varchar)&#10;purpose (varchar: loan_collection/merchant/escrow/agent/payroll)&#10;reference_id / reference_type (varchar)&#10;account_name (varchar)&#10;currency (varchar: NGN/USD/...)&#10;status (varchar: active/suspended/closed)&#10;expires_at (timestamp, nullable)&#10;single_use (bool)&#10;expected_amount / min_amount / max_amount (float)&#10;total_received (float)&#10;payment_count (int)&#10;webhook_url (varchar)&#10;metadata (JSONB)&#10;created_at / updated_at / last_payment_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="30" y="11500" width="320" height="420" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="va_van_payments" value="VANPayment (in-memory / persisted)&#10;----------------------&#10;id (varchar, UUID)&#10;van_id (FK -&gt; VirtualAccount.id)&#10;van (varchar)&#10;bank_id (varchar)&#10;amount (float)&#10;currency (varchar)&#10;sender_name / sender_account / sender_bank&#10;sender_bank_code (varchar)&#10;narration (varchar)&#10;session_id (varchar, NIBSS)&#10;transaction_ref (varchar)&#10;status (varchar: pending/processed/failed/reversed)&#10;processed_at (timestamp)&#10;ledger_entry_id (TigerBeetle, varchar)&#10;webhook_sent (bool)&#10;webhook_response (varchar)&#10;metadata (JSONB)&#10;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="410" y="11500" width="300" height="400" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="va_van_allocations" value="VANAllocation (in-memory / persisted)&#10;----------------------&#10;id (varchar)&#10;bank_id (varchar)&#10;purpose (varchar)&#10;prefix (varchar, bank-specific)&#10;range_start / range_end (int64)&#10;allocated_at (timestamp)&#10;used_count (int)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="30" y="11960" width="300" height="180" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="va_note1" value="Storage: In-memory maps (sync.RWMutex).&#10;Persistence: Events published to Lakehouse&#10;via Kafka for durable audit trail.&#10;&#10;NIBSS integration for real-time NIP&#10;credit notifications.&#10;TigerBeetle for actual ledger entries." style="text;html=1;strokeColor=#b85450;fillColor=#f8cecc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="410" y="11940" width="280" height="160" as="geometry" />
+        </mxCell>
+
+        
+        
+        <mxCell id="va_e1" edge="1" parent="1" source="va_virtual_accounts" target="va_van_payments" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="11460" />
+        </mxCell>
+        
+        <mxCell id="va_e2" edge="1" parent="1" source="va_van_allocations" target="va_virtual_accounts" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry" x="-10" y="11460" />
+        </mxCell>
+
+      
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

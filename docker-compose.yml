@@ -27,9 +27,9 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.6-alpine  # CVE-2025-49844 fix: Lua use-after-free RCE (CVSS 10.0)
     ports: ["6379:6379"]
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --protected-mode yes --lua-time-limit 5000 --rename-command EVAL "" --rename-command EVALSHA ""
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -37,7 +37,7 @@ services:
       retries: 5
 
   kafka:
-    image: confluentinc/cp-kafka:7.6.0
+    image: confluentinc/cp-kafka:7.6.5  # mina-core, jinja2, jetty, netty CVE fixes
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
@@ -56,7 +56,7 @@ services:
       retries: 5
 
   opensearch:
-    image: opensearchproject/opensearch:2.12.0
+    image: opensearchproject/opensearch:2.19.0  # CVE-2024-32007 and HIGH/MEDIUM CVE fixes
     environment:
       - discovery.type=single-node
       - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
@@ -85,7 +85,7 @@ services:
 
   # Keycloak — Identity & access management (OIDC/OAuth2)
   keycloak:
-    image: quay.io/keycloak/keycloak:24.0
+    image: quay.io/keycloak/keycloak:24.0.9  # CVE-2024-10451, CVE-2024-1132, CVE-2025-13881 fixes
     command: start-dev
     environment:
       KC_HEALTH_ENABLED: "true"
@@ -123,7 +123,7 @@ services:
 
   # APISIX — API Gateway with dynamic routing, rate limiting, TLS
   apisix:
-    image: apache/apisix:3.9.1-debian
+    image: apache/apisix:3.11.0-debian  # CVE-2024-32638, CVE-2026-39999 fixes
     ports: ["9080:9080", "9443:9443", "9180:9180"]
     volumes:
       - ./config/apisix.yml:/usr/local/apisix/conf/apisix.yaml:ro
@@ -144,16 +144,81 @@ services:
       timeout: 5s
       retries: 5
 
-  # Fluvio — Streaming platform
+  # Fluvio — Streaming platform (SC + SPU)
   fluvio:
     image: infinyon/fluvio:0.11.9
     command: ["fluvio", "cluster", "start", "--local"]
-    ports: ["9003:9003"]
+    ports: ["9003:9003", "9005:9005"]
+    environment:
+      FLUVIO_LOG: "info"
     healthcheck:
       test: ["CMD-SHELL", "nc -z localhost 9003 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  # Temporal — Durable workflow orchestration server
+  temporal:
+    image: temporalio/auto-setup:1.30.3  # CVE-2026-33186 fix: gRPC auth bypass (CRITICAL)
+    ports: ["7233:7233"]
+    environment:
+      DB: postgresql
+      DB_PORT: "5432"
+      POSTGRES_USER: banking
+      POSTGRES_PWD: banking_dev_password
+      POSTGRES_SEEDS: postgres
+      TEMPORAL_ADDRESS: "0.0.0.0:7233"
+      TEMPORAL_BROADCAST_ADDRESS: "temporal"
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 7233 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Temporal UI — Web interface for workflow visibility
+  temporal-ui:
+    image: temporalio/ui:2.44.0  # CVE-2026-34986, CVE-2026-33186 fixes
+    ports: ["8088:8080"]
+    environment:
+      TEMPORAL_ADDRESS: "temporal:7233"
+      TEMPORAL_CORS_ORIGINS: "http://localhost:3000"
+    depends_on:
+      temporal: { condition: service_healthy }
+    profiles: ["monitoring"]
+
+  # OpenAppSec — Open-source ML-based WAF (Web Application Firewall)
+  openappsec:
+    image: openappsec/agent:latest
+    ports: ["8085:8080"]
+    environment:
+      OPENAPPSEC_TOKEN: "${OPENAPPSEC_TOKEN:-local-dev-token}"
+      OPENAPPSEC_UPSTREAM: "http://apisix:9080"
+      OPENAPPSEC_LOG_LEVEL: "info"
+      OPENAPPSEC_LEARNING_MODE: "true"
+      OPENAPPSEC_PREVENT_MODE: "false"
+    volumes:
+      - ./config/openappsec:/etc/openappsec
+    depends_on:
+      apisix: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    profiles: ["security"]
+
+  # Dapr Dashboard — Web UI for Dapr observability
+  dapr-dashboard:
+    image: daprio/dashboard:0.14.0
+    ports: ["8082:8082"]
+    environment:
+      DAPR_DASHBOARD_PORT: "8082"
+    depends_on:
+      - dapr-placement
+    profiles: ["monitoring"]
 
   # ── Express Gateway (BFF) ──
 

@@ -1,0 +1,68 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-infra-network
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9432
+    - port: 9433
+    - port: 9434
+    - port: 9435
+    - port: 9436
+    - port: 9437
+    - port: 9438
+    - port: 9439
+    - port: 9440
+    - port: 9441
+    - port: 9442
+    - port: 9443
+    - port: 9444
+    - port: 9445
+    - port: 9446
+    - port: 9447
+    - port: 9448
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: infra-network
+  appPort: 9435
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9432"
+  PORT_BASE: "9432"
+  SERVICE_GROUP: infra-network
+  SERVICES: "adaptive-rate-limiter-rs,circuit-breaker-rs,connection-pooler-rs,connectivity-service,egress-controller-rs,express-rate-limiter-rs,grpc-gateway-rs,grpc-hot-path-go,http2-multiplexer-rs,keepalive-tuner-rs,mtls-mesh-rs,network-optimization-service,network-policy-manager-py,path-validator-rs,request-validator-py,route-trie-optimizer-rs,tls-terminator-go"

@@ -1,0 +1,57 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-ledger-reconciliation
+  pullPolicy: IfNotPresent
+  tag: "0.0.2"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9481
+    - port: 9482
+    - port: 9483
+    - port: 9484
+    - port: 9485
+    - port: 9486
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: ledger-reconciliation
+  appPort: 9483
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9481"
+  PORT_BASE: "9481"
+  SERVICE_GROUP: ledger-reconciliation
+  SERVICES: "banking-clearing-ops-rs,ledger-reconciliation-rs,mojaloop-settlement-mgr-go,recon-engine-rs,reconciliation-engine-rs,reconciliation-service"

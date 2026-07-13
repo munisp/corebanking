@@ -1,0 +1,104 @@
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixTls
+metadata:
+  name: 54link-dev-backend-tls
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  hosts:
+    - 54link-dev.upi.dev
+  secret:
+    name: 54link-dev-backend-cert
+    namespace: 54link-dev
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixTls
+metadata:
+  name: 54link-dev-verification-ui-tls
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  hosts:
+    - kyc.54link-dev.upi.dev
+  secret:
+    name: 54link-dev-verification-ui-cert
+    namespace: 54link-dev
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixTls
+metadata:
+  name: 54link-dev-client-web-app-tls
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  hosts:
+    - app.54link-dev.upi.dev
+  secret:
+    name: 54link-dev-client-web-app-cert
+    namespace: 54link-dev
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixTls
+metadata:
+  name: 54link-dev-tenant-web-app-tls
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  hosts:
+    - tenant.54link-dev.upi.dev
+  secret:
+    name: 54link-dev-tenant-web-app-cert
+    namespace: 54link-dev
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixTls
+metadata:
+  name: 54link-dev-admin-web-app-tls
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  hosts:
+    - admin.54link-dev.upi.dev
+  secret:
+    name: 54link-dev-admin-web-app-cert
+    namespace: 54link-dev
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixTls
+metadata:
+  name: 54link-dev-compliance-ui-tls
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  hosts:
+    - compliance.54link-dev.upi.dev
+  secret:
+    name: 54link-dev-compliance-ui-cert
+    namespace: 54link-dev
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixTls
+metadata:
+  name: 54link-dev-pup-web-app-tls
+  namespace: 54link-dev
+spec:
+  ingressClassName: apisix
+  hosts:
+    - pup.54link-dev.upi.dev
+  secret:
+    name: 54link-dev-pup-web-app-cert
+    namespace: 54link-dev
+---
+apiVersion: apisix.apache.org/v2
+kind: ApisixTls
+metadata:
+  name: temporal-server-tls
+  namespace: temporal
+spec:
+  ingressClassName: apisix
+  hosts:
+    - temporal-web.54link-dev.upi.dev
+  secret:
+    name: temporal-server-cert
+    namespace: temporal

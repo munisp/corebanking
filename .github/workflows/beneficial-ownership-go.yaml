@@ -1,0 +1,43 @@
+name: Build and Deploy Beneficial Ownership Service
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/beneficial-ownership-go/**'
+      - 'infrastructure/charts/beneficial-ownership-go/**'
+      - '.github/workflows/beneficial-ownership-go.yaml'
+
+env:
+  IMAGE: registry.digitalocean.com/talentgraph-auth/54link-dev-beneficial-ownership-go
+  TAG: "0.0.1"
+  CHART: infrastructure/charts/beneficial-ownership-go
+  RELEASE: beneficial-ownership-go
+  NAMESPACE: 54link-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/beneficial-ownership-go
+          file: ./services/beneficial-ownership-go/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+

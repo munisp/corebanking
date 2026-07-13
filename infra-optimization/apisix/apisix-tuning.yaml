@@ -1,0 +1,170 @@
+# 54Bank APISIX Gateway Tuning — Millions TPS
+# Apache APISIX 3.x production configuration
+
+apisix:
+  node_listen:
+    - port: 9080
+      enable_http2: true
+    - port: 9443
+      enable_http2: true
+      ssl: true
+
+  # Worker processes — match CPU cores
+  worker_processes: auto
+  
+  # Worker connections — high for concurrent requests
+  worker_connections: 65535
+  
+  # Event model
+  events:
+    use: epoll
+  
+  # Enable batch processor for plugins
+  enable_batch_process: true
+
+  # Proxy buffer
+  proxy_buffer_size: 256k
+  proxy_buffers: 8 256k
+
+  # DNS resolver (CoreDNS in K8s)
+  dns_resolver:
+    - "kube-dns.kube-system.svc.cluster.local"
+  dns_resolver_valid: 30
+
+  # Real IP
+  real_ip_header: "X-Forwarded-For"
+  real_ip_recursive: "on"
+
+  # Keep-alive connections to upstream
+  upstream:
+    keepalive: 320
+    keepalive_timeout: 60s
+    keepalive_requests: 10000
+
+nginx_config:
+  error_log_level: warn
+  worker_rlimit_nofile: 131072
+  
+  http:
+    # Proxy settings for high throughput
+    proxy_connect_timeout: 5s
+    proxy_read_timeout: 30s
+    proxy_send_timeout: 30s
+    
+    # Gzip compression
+    gzip: "on"
+    gzip_min_length: 1024
+    gzip_comp_level: 4
+    gzip_types: "application/json application/xml text/plain"
+    
+    # Client body
+    client_max_body_size: 10m
+    client_body_buffer_size: 128k
+    
+    # Keepalive
+    keepalive_timeout: 65s
+    keepalive_requests: 10000
+    
+    # Access log buffering
+    access_log_buffer: 16384
+    
+    # Open file cache
+    open_file_cache: "max=10000 inactive=60s"
+    open_file_cache_valid: 30s
+
+# --- Plugin Optimization ---
+plugins:
+  # Rate limiting (sliding window for accuracy)
+  - limit-count:
+      count: 10000
+      time_window: 60
+      key: "$consumer_name"
+      policy: "redis-cluster"
+      redis_cluster_nodes:
+        - "redis-0:6379"
+        - "redis-1:6379"
+        - "redis-2:6379"
+      rejected_code: 429
+
+  # IP restriction
+  - ip-restriction
+
+  # JWT authentication
+  - jwt-auth:
+      header: "Authorization"
+      query: "jwt"
+      hide_credentials: true
+
+  # Prometheus metrics
+  - prometheus:
+      prefer_name: true
+      export_uri: "/apisix/prometheus/metrics"
+
+  # Request ID for tracing
+  - request-id:
+      header_name: "X-Request-Id"
+      include_in_response: true
+      algorithm: "uuid"
+
+  # Response rewrite (security headers)
+  - response-rewrite:
+      headers:
+        set:
+          X-Content-Type-Options: "nosniff"
+          X-Frame-Options: "DENY"
+          Strict-Transport-Security: "max-age=63072000; includeSubDomains"
+
+  # Traffic splitting (canary deployments)
+  - traffic-split
+
+  # Health check
+  - api-breaker:
+      break_response_code: 502
+      max_breaker_sec: 300
+      unhealthy:
+        http_statuses: [500, 502, 503]
+        failures: 3
+      healthy:
+        http_statuses: [200]
+        successes: 1
+
+# --- Upstream Health Checks ---
+upstream_defaults:
+  type: roundrobin
+  hash_on: vars
+  
+  checks:
+    active:
+      type: http
+      timeout: 5
+      concurrency: 10
+      http_path: "/healthz"
+      healthy:
+        interval: 5
+        http_statuses: [200]
+        successes: 2
+      unhealthy:
+        interval: 3
+        http_statuses: [429, 500, 502, 503]
+        http_failures: 3
+        tcp_failures: 2
+        timeouts: 3
+    passive:
+      healthy:
+        http_statuses: [200, 201, 202]
+        successes: 3
+      unhealthy:
+        http_statuses: [500, 502, 503]
+        http_failures: 3
+        tcp_failures: 2
+        timeouts: 3
+
+  # Retry
+  retries: 2
+  retry_timeout: 10
+
+  # Connection pool per upstream
+  keepalive_pool:
+    size: 320
+    idle_timeout: 60
+    requests: 10000

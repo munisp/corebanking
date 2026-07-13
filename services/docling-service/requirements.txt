@@ -1,0 +1,45 @@
+# Docling Service Dependencies
+# Core document processing
+docling==2.64.0
+
+# DeepSeek OCR integration
+openai==1.59.0  # For DeepSeek API compatibility
+pillow==11.3.0
+pytesseract==0.3.13  # Fallback OCR
+
+# Web framework
+fastapi==0.115.12
+uvicorn[standard]==0.34.3
+python-multipart==0.0.12  # File upload support
+
+# Data validation
+pydantic==2.11.5
+pydantic-settings==2.6.0
+
+# Database and caching
+sqlalchemy==2.0.41
+redis==5.2.1
+asyncpg==0.30.0  # PostgreSQL async driver
+
+# Document processing utilities
+python-magic==0.4.27  # File type detection
+pypdf==5.4.0  # PDF utilities
+python-docx==1.1.2  # DOCX processing
+openpyxl==3.1.5  # XLSX processing
+beautifulsoup4==4.12.3  # HTML parsing
+lxml==5.4.0
+
+# ML and AI integration
+langchain==0.3.25
+langchain-community==0.3.5
+llama-index==0.12.0
+
+# Monitoring and logging
+prometheus-client==0.21.0
+structlog==24.4.0
+
+# Utilities
+httpx==0.28.1
+aiofiles==24.1.0
+python-jose[cryptography]==3.3.0  # JWT tokens
+passlib[bcrypt]==1.7.4

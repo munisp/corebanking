@@ -1,0 +1,62 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-workflow-reporting
+  pullPolicy: IfNotPresent
+  tag: "0.0.3"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9727
+    - port: 9728
+    - port: 9729
+    - port: 9730
+    - port: 9731
+    - port: 9732
+    - port: 9733
+    - port: 9734
+    - port: 9735
+    - port: 9736
+    - port: 9737
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: workflow-reporting
+  appPort: 9729
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9727"
+  PORT_BASE: "9727"
+  SERVICE_GROUP: workflow-reporting
+  SERVICES: "analytics-engine-py,api-analytics-py,billing-analytics-py,customer-360-dashboard-py,kpi-analytics-py,kpi-engine-go,opensearch-analytics-py,prometheus-dashboard-py,reporting-service,stakeholder-kpi-dashboard-py,statement-generator-py"

@@ -1,4 +1,4 @@
-module github.com/54bank/aggregation-center-go
+module github.com/54link-dev/aggregation-center-go
 
 go 1.21
 

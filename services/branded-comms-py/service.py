@@ -6,51 +6,6 @@ import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
-
-SERVICE_NAME = "branded-comms-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
-
-
 PORT = int(os.environ.get("PORT", "8232"))
 
 MIDDLEWARE = ["kafka", "dapr", "fluvio", "temporal", "postgres", "keycloak",
@@ -58,30 +13,30 @@ MIDDLEWARE = ["kafka", "dapr", "fluvio", "temporal", "postgres", "keycloak",
               "apisix", "tigerbeetle", "lakehouse"]
 
 email_queue = [
-    {"id": "EQ-001", "tenantId": "54bank-retail", "templateName": "transaction_receipt", "recipient": "amina.yusuf@email.com", "subject": "Transaction Confirmation — 54Bank", "status": "delivered", "sentAt": "2026-05-09T10:00:00Z", "brandedFrom": "54Bank <noreply@54bank.app>"},
-    {"id": "EQ-002", "tenantId": "54bank-retail", "templateName": "kyc_approved", "recipient": "chidi.okafor@email.com", "subject": "KYC Verification Approved — 54Bank", "status": "delivered", "sentAt": "2026-05-09T10:05:00Z", "brandedFrom": "54Bank <noreply@54bank.app>"},
+    {"id": "EQ-001", "tenantId": "54link-dev-retail", "templateName": "transaction_receipt", "recipient": "amina.yusuf@email.com", "subject": "Transaction Confirmation — 54link-dev", "status": "delivered", "sentAt": "2026-05-09T10:00:00Z", "brandedFrom": "54link-dev <noreply@54link-dev.app>"},
+    {"id": "EQ-002", "tenantId": "54link-dev-retail", "templateName": "kyc_approved", "recipient": "chidi.okafor@email.com", "subject": "KYC Verification Approved — 54link-dev", "status": "delivered", "sentAt": "2026-05-09T10:05:00Z", "brandedFrom": "54link-dev <noreply@54link-dev.app>"},
     {"id": "EQ-003", "tenantId": "mutual-mfb", "templateName": "loan_approval", "recipient": "fatima.bello@email.com", "subject": "Loan Approved — Mutual MFB", "status": "delivered", "sentAt": "2026-05-09T10:10:00Z", "brandedFrom": "Mutual MFB <noreply@mutualmfb.com>"},
     {"id": "EQ-004", "tenantId": "xmts-agency", "templateName": "agent_commission", "recipient": "agent.kano@xmts.ng", "subject": "Commission Statement — XMTS", "status": "delivered", "sentAt": "2026-05-09T10:15:00Z", "brandedFrom": "XMTS Agency <noreply@xmts.ng>"},
     {"id": "EQ-005", "tenantId": "paystack-embed", "templateName": "transaction_receipt", "recipient": "dev@startup.io", "subject": "Payment Confirmation — Paystack Banking", "status": "failed", "sentAt": "2026-05-09T10:20:00Z", "error": "SMTP connection timeout", "brandedFrom": "Paystack Banking <noreply@banking.paystack.com>"},
 ]
 
 sms_queue = [
-    {"id": "SQ-001", "tenantId": "54bank-retail", "recipient": "+234801234567", "message": "Your 54Bank transfer of ₦50,000 to Chidi was successful. Ref: TXN-2026050901.", "status": "delivered", "sentAt": "2026-05-09T10:00:00Z", "senderName": "54Bank"},
+    {"id": "SQ-001", "tenantId": "54link-dev-retail", "recipient": "+234801234567", "message": "Your 54link-dev transfer of ₦50,000 to Chidi was successful. Ref: TXN-2026050901.", "status": "delivered", "sentAt": "2026-05-09T10:00:00Z", "senderName": "54link-dev"},
     {"id": "SQ-002", "tenantId": "mutual-mfb", "recipient": "+234802345678", "message": "Your Mutual MFB loan of ₦500,000 has been approved. Visit your nearest branch.", "status": "delivered", "sentAt": "2026-05-09T10:10:00Z", "senderName": "MutualMFB"},
     {"id": "SQ-003", "tenantId": "xmts-agency", "recipient": "+234803456789", "message": "XMTS Agent: Your commission of ₦12,500 has been credited. Balance: ₦45,200.", "status": "delivered", "sentAt": "2026-05-09T10:15:00Z", "senderName": "XMTS"},
-    {"id": "SQ-004", "tenantId": "54bank-retail", "recipient": "+234804567890", "message": "OTP: 482915. Valid for 5 minutes. Do not share. — 54Bank", "status": "delivered", "sentAt": "2026-05-09T10:25:00Z", "senderName": "54Bank"},
+    {"id": "SQ-004", "tenantId": "54link-dev-retail", "recipient": "+234804567890", "message": "OTP: 482915. Valid for 5 minutes. Do not share. — 54link-dev", "status": "delivered", "sentAt": "2026-05-09T10:25:00Z", "senderName": "54link-dev"},
 ]
 
 push_notifications = [
-    {"id": "PN-001", "tenantId": "54bank-retail", "title": "Transfer Received", "body": "₦25,000 received from Amina Yusuf", "deviceToken": "fcm_token_abc", "status": "delivered", "sentAt": "2026-05-09T10:00:00Z", "icon": "/assets/54bank-icon.png"},
+    {"id": "PN-001", "tenantId": "54link-dev-retail", "title": "Transfer Received", "body": "₦25,000 received from Amina Yusuf", "deviceToken": "fcm_token_abc", "status": "delivered", "sentAt": "2026-05-09T10:00:00Z", "icon": "/assets/54link-dev-icon.png"},
     {"id": "PN-002", "tenantId": "mutual-mfb", "title": "Savings Goal Reached!", "body": "Your 'Rent Fund' savings goal of ₦200,000 is complete", "deviceToken": "fcm_token_def", "status": "delivered", "sentAt": "2026-05-09T10:10:00Z", "icon": "/assets/mutual-icon.png"},
     {"id": "PN-003", "tenantId": "paystack-embed", "title": "Card Transaction", "body": "₦5,000 charged on your virtual card ending 4829", "deviceToken": "fcm_token_ghi", "status": "pending", "sentAt": "2026-05-09T10:20:00Z", "icon": "/assets/paystack-icon.png"},
 ]
 
 pdf_jobs = [
-    {"id": "PJ-001", "tenantId": "54bank-retail", "documentType": "account_statement", "customerName": "Amina Yusuf", "period": "April 2026", "status": "generated", "pages": 3, "fileSize": "245KB", "brandedHeader": "54Bank Financial Services Ltd", "createdAt": "2026-05-01T00:00:00Z"},
+    {"id": "PJ-001", "tenantId": "54link-dev-retail", "documentType": "account_statement", "customerName": "Amina Yusuf", "period": "April 2026", "status": "generated", "pages": 3, "fileSize": "245KB", "brandedHeader": "54link-dev Financial Services Ltd", "createdAt": "2026-05-01T00:00:00Z"},
     {"id": "PJ-002", "tenantId": "mutual-mfb", "documentType": "loan_schedule", "customerName": "Fatima Bello", "period": "May 2026 - May 2028", "status": "generated", "pages": 2, "fileSize": "128KB", "brandedHeader": "Mutual Microfinance Bank Ltd", "createdAt": "2026-05-05T00:00:00Z"},
-    {"id": "PJ-003", "tenantId": "54bank-retail", "documentType": "tax_certificate", "customerName": "Chidi Okafor", "period": "FY 2025", "status": "generated", "pages": 1, "fileSize": "89KB", "brandedHeader": "54Bank Financial Services Ltd", "createdAt": "2026-04-15T00:00:00Z"},
+    {"id": "PJ-003", "tenantId": "54link-dev-retail", "documentType": "tax_certificate", "customerName": "Chidi Okafor", "period": "FY 2025", "status": "generated", "pages": 1, "fileSize": "89KB", "brandedHeader": "54link-dev Financial Services Ltd", "createdAt": "2026-04-15T00:00:00Z"},
     {"id": "PJ-004", "tenantId": "xmts-agency", "documentType": "commission_report", "customerName": "Agent Kano Hub", "period": "April 2026", "status": "pending", "pages": 0, "fileSize": "0KB", "brandedHeader": "XMTS Mobile Money Operations Ltd", "createdAt": "2026-05-09T00:00:00Z"},
 ]
 
@@ -110,14 +65,14 @@ class Handler(BaseHTTPRequestHandler):
                 "fluvio": {"status": "connected", "topic": "branded_comms-stream"},
                 "temporal": {"status": "connected", "namespace": "branded_comms"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "branded_comms"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "branded_comms_authz"},
                 "redis": {"status": "connected", "prefix": "branded_comms:"},
                 "mojaloop": {"status": "connected", "participant": "branded_comms"},
                 "opensearch": {"status": "connected", "index": "branded_comms-*"},
                 "openappsec": {"status": "connected", "policy": "branded_comms-protection"},
                 "apisix": {"status": "connected", "upstream": "branded_comms"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "branded_comms_iceberg"}
             }, "service": "branded-comms-py", "port": PORT, "middleware": MIDDLEWARE})
 
@@ -173,14 +128,12 @@ class Handler(BaseHTTPRequestHandler):
                 "brandedFrom": f"{body['tenantId']} <noreply@{body['tenantId']}.app>",
             }
             email_queue.append(entry)
-            db_persist("email_queue", entry.to_dict() if hasattr(entry, "to_dict") else entry if isinstance(entry, dict) else {"value": str(entry)})
             return self._json(entry, 201)
 
         self._json({"error": "not found"}, 404)
 
 
 if __name__ == "__main__":
-    _init_db()
     server = HTTPServer(("0.0.0.0", PORT), Handler)
     print(f"branded-comms-py listening on :{PORT}")
     server.serve_forever()

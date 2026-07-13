@@ -1,0 +1,6 @@
+apiVersion: v2
+name: compliance-ui
+description: 54link Compliance UI Helm Chart
+type: application
+version: 0.0.1
+appVersion: "0.0.1"

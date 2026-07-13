@@ -1,0 +1,52 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Treasury Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- NOTE: In-memory service -->
+        <mxCell id="note_storage" value="Storage model: In-memory (sync.RWMutex maps).&#xa;Persistence via Kafka events to Data Lakehouse.&#xa;No dedicated PostgreSQL tables — state is&#xa;computed from real-time positions." style="text;html=1;strokeColor=#b85450;fillColor=#f8cecc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="320" height="100" as="geometry"/>
+        </mxCell>
+
+        <!-- LIQUIDITY POSITIONS -->
+        <mxCell id="liquidity" value="LiquidityPosition (in-memory)&#xa;----------------------&#xa;position_id (varchar)&#xa;tenant_id (varchar)&#xa;date (timestamp)&#xa;currency (varchar)&#xa;total_assets / total_liabilities (int64, kobo)&#xa;net_position / cash_reserves (int64)&#xa;cbn_balance (int64)&#xa;nostro_balances / vostro_balances (map[string]int64)&#xa;LCR / NSFR / CRR (float64, ratios)&#xa;status (varchar: normal/warning/critical)&#xa;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="200" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- CASH FLOWS -->
+        <mxCell id="cash_flows" value="CashFlow (in-memory)&#xa;----------------------&#xa;flow_id (varchar)&#xa;tenant_id (varchar)&#xa;date (timestamp)&#xa;flow_type (varchar: inflow/outflow)&#xa;category (varchar: deposits/withdrawals/loans/investments)&#xa;amount (int64)&#xa;currency (varchar)&#xa;description / counter_party (varchar)&#xa;status (varchar: projected/confirmed/settled)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="200" width="280" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- FX POSITIONS -->
+        <mxCell id="fx_positions" value="FXPosition (in-memory)&#xa;----------------------&#xa;position_id (varchar)&#xa;tenant_id (varchar)&#xa;currency (varchar)&#xa;long_position / short_position (int64)&#xa;net_position (int64)&#xa;avg_rate / current_rate (float64)&#xa;unrealized_pnl (int64)&#xa;limit / utilization (float64)&#xa;status (varchar: within_limit/near_limit/breached)&#xa;updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="540" width="300" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- FX DEALS -->
+        <mxCell id="fx_deals" value="FXDeal (in-memory)&#xa;----------------------&#xa;deal_id / deal_number (varchar)&#xa;tenant_id (varchar)&#xa;deal_type (varchar: spot/forward/swap)&#xa;buy_currency / sell_currency (varchar)&#xa;buy_amount / sell_amount (int64)&#xa;rate (float64)&#xa;value_date / maturity_date (timestamp)&#xa;counter_party / counter_party_id (varchar)&#xa;purpose (varchar)&#xa;status (varchar: pending/approved/executed/settled/cancelled)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="400" y="520" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- INVESTMENTS -->
+        <mxCell id="investments" value="Investment (in-memory)&#xa;----------------------&#xa;investment_id (varchar)&#xa;tenant_id (varchar)&#xa;investment_type (varchar: treasury_bill/bond/fixed_deposit)&#xa;issuer / issuer_id (varchar)&#xa;face_value / purchase_price / current_value (int64)&#xa;currency (varchar)&#xa;coupon_rate / yield_rate (float64)&#xa;purchase_date / maturity_date (timestamp)&#xa;status (varchar: active/matured/sold)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="760" y="200" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="liquidity" target="cash_flows" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="fx_positions" target="fx_deals" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="investments" target="liquidity" style="endArrow=block;dashed=1;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

@@ -1,10 +1,14 @@
-FROM golang:1.22-alpine AS build
+FROM golang:1.21-alpine AS builder
 WORKDIR /app
-COPY . .
-RUN go build -o server .
+COPY go.mod ./
+RUN go mod download
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -o service .
+
 FROM alpine:3.19
-COPY --from=build /app/server /server
 RUN adduser -D -u 1001 appuser
+COPY --from=builder /app/service /service
 USER appuser
-HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8100/healthz || exit 1
-CMD ["/server"]
+HEALTHCHECK --interval=30s --timeout=5s CMD wget -qO- http://localhost:8500/healthz || exit 1
+EXPOSE 8500
+CMD ["/service"]

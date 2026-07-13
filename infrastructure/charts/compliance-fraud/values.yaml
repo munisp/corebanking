@@ -1,0 +1,61 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-compliance-fraud
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9197
+    - port: 9198
+    - port: 9199
+    - port: 9200
+    - port: 9201
+    - port: 9202
+    - port: 9203
+    - port: 9204
+    - port: 9205
+    - port: 9206
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: compliance-fraud
+  appPort: 9202
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9197"
+  PORT_BASE: "9197"
+  SERVICE_GROUP: compliance-fraud
+  SERVICES: "agent-fraud-detection-py,ai-fraud-scoring-rs,anomaly-detector-py,fraud-detection-rs,fraud-service,fraudfusion,fraudfusion-ensemble-rs,gnn-fraud-detection-py,mcmc-bayesian-risk-py,txn-pattern-analyzer-py"

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: pup-web-app
+description: 54link pup Web App Helm Chart
+type: application
+version: 0.0.3
+appVersion: "0.0.1"

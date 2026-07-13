@@ -1,0 +1,123 @@
+@import "tailwindcss";
+
+@variant dark (&:where(.dark, .dark *));
+
+/* Mobile app color scheme - Light Mode (default) */
+:root {
+  --primary-color: #1A73E8;
+  --primary-dark: #0D47A1;
+  --primary-light: #64B5F6;
+  --secondary-color: #00C853;
+  --secondary-dark: #00A843;
+  --secondary-light: #69F0AE;
+  --background-color: #F5F7FA;
+  --surface-color: #FFFFFF;
+  --error-color: #D32F2F;
+  --warning-color: #FFA726;
+  --success-color: #66BB6A;
+  --text-primary: #212121;
+  --text-secondary: #757575;
+  --text-hint: #BDBDBD;
+  --border-color: #E0E0E0;
+}
+
+/* Mobile app color scheme - Dark Mode */
+.dark {
+  --primary-color: #64B5F6; /* primaryLight in dark mode */
+  --primary-dark: #1A73E8;
+  --primary-light: #64B5F6;
+  --secondary-color: #69F0AE; /* secondaryLight in dark mode */
+  --secondary-dark: #00C853;
+  --secondary-light: #69F0AE;
+  --background-color: #121212;
+  --surface-color: #1E1E1E;
+  --text-primary: #E3E3E3;
+  --text-secondary: #B0B0B0;
+  --text-hint: #6B6B6B;
+  --border-color: #404040;
+}
+
+/* Tenant-aware button styles - matching mobile app */
+.btn-primary {
+  background-color: var(--primary-color);
+  color: var(--text-primary, white);
+  transition: opacity 0.2s;
+  border-radius: 12px;
+  padding: 12px 24px;
+  font-weight: 600;
+  border: none;
+  cursor: pointer;
+}
+
+.dark .btn-primary {
+  color: #000000; /* Black text on light primary in dark mode */
+}
+
+.btn-primary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.btn-primary:disabled {
+  background-color: var(--text-hint);
+  cursor: not-allowed;
+}
+
+.btn-secondary {
+  background-color: var(--secondary-color);
+  color: white;
+  transition: opacity 0.2s;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  opacity: 0.9;
+}
+
+.btn-outline-primary {
+  border: 1px solid var(--primary-color);
+  color: var(--primary-color);
+  background-color: transparent;
+  transition: opacity 0.2s;
+}
+
+.btn-outline-primary:hover {
+  opacity: 0.8;
+}
+
+/* Tenant-aware text colors */
+.text-primary {
+  color: var(--primary-color);
+}
+
+.text-secondary {
+  color: var(--secondary-color);
+}
+
+/* Tenant-aware background colors */
+.bg-primary {
+  background-color: var(--primary-color);
+}
+
+.bg-secondary {
+  background-color: var(--secondary-color);
+}
+
+.bg-primary-light {
+  background-color: var(--primary-color);
+  opacity: 0.1;
+}
+
+/* Tenant-aware borders */
+.border-primary {
+  border-color: var(--primary-color);
+}
+
+.border-secondary {
+  border-color: var(--secondary-color);
+}
+
+/* Body background */
+body {
+  background-color: var(--background-color);
+  color: var(--text-primary);
+  transition: background-color 0.3s ease, color 0.3s ease;
+}

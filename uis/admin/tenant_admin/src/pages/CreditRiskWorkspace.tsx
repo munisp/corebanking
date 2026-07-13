@@ -1,0 +1,153 @@
+import CrudWorkspace from "@/components/CrudWorkspace";
+import { AlertCircle } from "lucide-react";
+
+export default function CreditRiskWorkspace() {
+  return (
+    <CrudWorkspace
+      config={{
+        domainKey: "credit-risk",
+        title: "Credit Risk Assessments",
+        subtitle: "PD/LGD/EAD models, IFRS 9 staging, ECL computation, credit grades",
+        icon: AlertCircle,
+        accentColor: "text-red-700",
+        idField: "id",
+        statusField: "creditGrade",
+        searchFields: ["customerName", "customerId", "creditGrade"],
+        apiBase: "/credit/v1/scores",
+        pageSize: 25,
+        columns: [
+          { key: "id", label: "ID" },
+          { key: "customerName", label: "Customer", sortable: true },
+          { key: "customerType", label: "Type", sortable: true },
+          { key: "creditScore", label: "Score", sortable: true },
+          { key: "creditGrade", label: "Grade", sortable: true },
+          { key: "pd", label: "PD", sortable: true, render: (v) => `${(Number(v) * 100).toFixed(1)}%` },
+          { key: "lgd", label: "LGD", render: (v) => `${(Number(v) * 100).toFixed(0)}%` },
+          { key: "ead", label: "EAD", render: (v) => v ? `₦${Number(v).toLocaleString()}` : "—" },
+          { key: "ecl", label: "ECL", sortable: true, render: (v) => `₦${Number(v).toLocaleString()}` },
+          { key: "stage", label: "Stage", sortable: true },
+          { key: "collateralCoverage", label: "Collateral %", render: (v) => v ? `${v}%` : "—" },
+          { key: "assessmentDate", label: "Assessed", render: (v) => v ? new Date(String(v)).toLocaleDateString("en-NG") : "—" },
+        ],
+        actions: [
+          { label: "View Assessment", key: "details" },
+          { label: "Re-score", key: "rescore" },
+          { label: "Escalate to Stage 3", key: "escalate", variant: "destructive", condition: (r) => String(r.stage) !== "3" },
+        ],
+        fields: [
+          {
+            key: "customerId",
+            label: "Customer ID",
+            type: "text",
+            required: true,
+            placeholder: "Customer account / CIF number",
+          },
+          {
+            key: "customerName",
+            label: "Customer Name",
+            type: "text",
+            required: true,
+            placeholder: "Full legal name of the customer",
+          },
+          {
+            key: "customerType",
+            label: "Customer Type",
+            type: "select",
+            required: true,
+            options: ["individual", "corporate", "sme", "financial_institution", "government"],
+            defaultValue: "individual",
+          },
+          {
+            key: "industry",
+            label: "Industry / Sector",
+            type: "text",
+            placeholder: "e.g. Manufacturing, Agriculture, Real Estate",
+          },
+          {
+            key: "creditScore",
+            label: "Credit Score",
+            type: "number",
+            required: true,
+            min: 0,
+            max: 1000,
+            placeholder: "0 – 1000",
+          },
+          {
+            key: "creditGrade",
+            label: "Credit Grade",
+            type: "select",
+            required: true,
+            options: ["A+", "A", "A-", "BBB+", "BBB", "BBB-", "BB+", "BB", "BB-", "B+", "B", "B-", "CCC", "CC", "C", "D"],
+            defaultValue: "BBB",
+          },
+          {
+            key: "pd",
+            label: "Probability of Default — PD (%)",
+            type: "number",
+            required: true,
+            min: 0,
+            max: 100,
+            placeholder: "e.g. 2.5",
+          },
+          {
+            key: "lgd",
+            label: "Loss Given Default — LGD (%)",
+            type: "number",
+            required: true,
+            min: 0,
+            max: 100,
+            placeholder: "e.g. 45",
+          },
+          {
+            key: "ead",
+            label: "Exposure at Default — EAD (₦)",
+            type: "number",
+            required: true,
+            min: 0,
+            placeholder: "0",
+          },
+          {
+            key: "ecl",
+            label: "Expected Credit Loss — ECL (₦)",
+            type: "number",
+            min: 0,
+            placeholder: "Auto-computed or enter manually",
+          },
+          {
+            key: "stage",
+            label: "IFRS 9 Stage",
+            type: "select",
+            required: true,
+            options: ["1", "2", "3"],
+            defaultValue: "1",
+          },
+          {
+            key: "collateralCoverage",
+            label: "Collateral Coverage (%)",
+            type: "number",
+            min: 0,
+            max: 500,
+            placeholder: "e.g. 120",
+          },
+          {
+            key: "assessmentDate",
+            label: "Assessment Date",
+            type: "date",
+            required: true,
+          },
+          {
+            key: "nextReviewDate",
+            label: "Next Review Date",
+            type: "date",
+          },
+          {
+            key: "notes",
+            label: "Analyst Notes",
+            type: "textarea",
+            placeholder: "Key observations, risk drivers, mitigants…",
+          },
+        ],
+      }}
+    />
+  );
+}

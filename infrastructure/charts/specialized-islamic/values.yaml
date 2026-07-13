@@ -1,0 +1,62 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-specialized-islamic
+  pullPolicy: IfNotPresent
+  tag: "0.0.2"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9602
+    - port: 9603
+    - port: 9604
+    - port: 9605
+    - port: 9606
+    - port: 9607
+    - port: 9608
+    - port: 9609
+    - port: 9610
+    - port: 9611
+    - port: 9612
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: specialized-islamic
+  appPort: 9603
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9602"
+  PORT_BASE: "9602"
+  SERVICE_GROUP: specialized-islamic
+  SERVICES: "area-yield-index-insurance-py,diaspora-banking-py,enaira-cbdc-py,etherisc-service,exam-management-py,insurance-py,insurance-service,islamic-banking-py,islamic-banking-service,parametric-insurance-iot-rs,pension-py"

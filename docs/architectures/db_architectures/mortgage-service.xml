@@ -1,0 +1,87 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Mortgage Service DB Architecture">
+    <mxGraphModel dx="1600" dy="1100" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- MORTGAGE APPLICATIONS (core) -->
+        <mxCell id="mortgage_app" value="mortgage_applications&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;applicant_id (varchar)&#xa;applicant_name / email / phone&#xa;loan_amount (decimal)&#xa;down_payment (decimal)&#xa;loan_term_years (int)&#xa;interest_rate (decimal)&#xa;interest_type (varchar: fixed/variable)&#xa;purpose (varchar: purchase/refinance/construction)&#xa;employment_status / monthly_income&#xa;credit_score / debt_to_income_ratio&#xa;status (varchar: draft/submitted/under_review/approved/disbursed/active/closed)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="360" y="40" width="300" height="380" as="geometry"/>
+        </mxCell>
+
+        <!-- JOINT APPLICANTS -->
+        <mxCell id="joint_applicants" value="mortgage_joint_applicants&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (FK -> mortgage_applications)&#xa;applicant_name&#xa;applicant_email&#xa;applicant_phone&#xa;monthly_income (decimal)&#xa;credit_score (int)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- PROPERTIES -->
+        <mxCell id="properties" value="mortgage_properties&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (FK -> mortgage_applications)&#xa;property_address / city / state / lga&#xa;property_type (varchar)&#xa;property_value (decimal)&#xa;property_size / bedrooms / bathrooms&#xa;title_type (varchar: C-of-O/governor_consent/...)&#xa;title_number&#xa;developer_name (nullable)&#xa;construction_stage (nullable)&#xa;verified (bool)&#xa;verified_by / verified_at&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="720" y="40" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- REPAYMENT SCHEDULE -->
+        <mxCell id="repayment_schedule" value="mortgage_repayment_schedule&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (FK)&#xa;installment_number (int)&#xa;due_date (date)&#xa;principal_amount (decimal)&#xa;interest_amount (decimal)&#xa;total_amount (decimal)&#xa;outstanding_balance (decimal)&#xa;status (varchar: pending/paid/overdue)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="40" y="300" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- PAYMENTS -->
+        <mxCell id="payments" value="mortgage_payments&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (FK)&#xa;schedule_id (FK -> repayment_schedule)&#xa;amount (decimal)&#xa;payment_date (timestamp)&#xa;payment_method (varchar)&#xa;transaction_reference (varchar)&#xa;principal_portion / interest_portion&#xa;status (varchar: completed/failed/reversed)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="580" width="280" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- ESCROW ACCOUNTS -->
+        <mxCell id="escrow_accounts" value="mortgage_escrow_accounts&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (FK, unique)&#xa;current_balance (decimal)&#xa;annual_tax_amount / annual_insurance&#xa;monthly_escrow_payment (decimal)&#xa;last_tax_payment_date / last_insurance_payment_date&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;" vertex="1" parent="1">
+          <mxGeometry x="360" y="460" width="300" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- UNDERWRITING DECISIONS -->
+        <mxCell id="underwriting" value="mortgage_underwriting_decisions&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (FK)&#xa;underwriter_id (varchar)&#xa;decision (varchar: approved/rejected/conditional)&#xa;credit_risk_score / market_risk_score&#xa;property_risk_score / overall_risk&#xa;ltv_ratio / dscr&#xa;approved_amount / approved_rate&#xa;conditions (JSONB)&#xa;notes (text)&#xa;decided_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="720" y="380" width="300" height="280" as="geometry"/>
+        </mxCell>
+
+        <!-- APPROVALS -->
+        <mxCell id="approvals" value="mortgage_approvals&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (FK)&#xa;approved_by (varchar)&#xa;approval_date (timestamp)&#xa;offer_letter_url (varchar)&#xa;offer_valid_until (date)&#xa;disbursement_date (date)&#xa;disbursement_account (varchar)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;" vertex="1" parent="1">
+          <mxGeometry x="360" y="720" width="280" height="220" as="geometry"/>
+        </mxCell>
+
+        <!-- PRODUCTS -->
+        <mxCell id="products" value="mortgage_products&#xa;----------------------&#xa;id (PK, serial)&#xa;product_name (varchar, unique)&#xa;product_type (varchar: fixed_rate/variable/hybrid)&#xa;min_loan / max_loan (decimal)&#xa;min_term / max_term (int, years)&#xa;interest_rate (decimal)&#xa;max_ltv (decimal, %)&#xa;is_active (bool)&#xa;features (JSONB)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="720" y="700" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- AUDIT TRAIL -->
+        <mxCell id="audit_trail" value="mortgage_audit_trail&#xa;----------------------&#xa;id (PK, serial)&#xa;application_id (FK)&#xa;action (varchar)&#xa;performed_by (varchar)&#xa;details (JSONB)&#xa;ip_address (varchar)&#xa;performed_at (timestamp)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;" vertex="1" parent="1">
+          <mxGeometry x="40" y="880" width="280" height="200" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="mortgage_app" target="joint_applicants" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="mortgage_app" target="properties" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e3" edge="1" parent="1" source="mortgage_app" target="repayment_schedule" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e4" edge="1" parent="1" source="repayment_schedule" target="payments" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e5" edge="1" parent="1" source="mortgage_app" target="escrow_accounts" style="endArrow=block;strokeColor=#d79b00;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e6" edge="1" parent="1" source="mortgage_app" target="underwriting" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e7" edge="1" parent="1" source="mortgage_app" target="approvals" style="endArrow=block;strokeColor=#9673a6;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e8" edge="1" parent="1" source="mortgage_app" target="audit_trail" style="endArrow=block;dashed=1;strokeColor=#666666;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

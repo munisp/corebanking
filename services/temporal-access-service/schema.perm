@@ -1,0 +1,260 @@
+// 54link Banking Platform - Permify Schema
+// Enhanced with Temporal Access, Policies, and Delegations
+
+// ============================================================================
+// CORE ENTITIES
+// ============================================================================
+
+// Platform - Top-level tenant
+entity platform {
+    // Relations
+    relation admin @user
+    relation member @user
+    relation bank @bank
+
+    // Permissions
+    permission view = admin or member
+    permission manage_banks = admin
+    permission audit = admin
+}
+
+// Bank - Tenant in the multi-tenant system
+entity bank {
+    // Relations
+    relation platform @platform
+    relation admin @user
+    relation manager @user
+    relation employee @user
+    relation customer @user
+    relation auditor @user
+
+    // Permissions
+    permission view = admin or manager or employee or customer
+    permission manage = admin
+    permission create_account = admin or manager
+    permission audit_access = admin or auditor
+    permission manage_users = admin or manager
+}
+
+// ============================================================================
+// FINANCIAL ENTITIES
+// ============================================================================
+
+// Account
+entity account {
+    // Relations
+    relation bank @bank
+    relation owner @user
+    relation co_owner @user
+    relation authorized_user @user
+    relation manager @user @bank#manager
+
+    // Permissions
+    permission view = owner or co_owner or authorized_user or manager or bank.admin
+    permission deposit = owner or co_owner or authorized_user or manager
+    permission withdraw = owner or co_owner or manager
+    permission transfer = owner or co_owner or manager
+    permission close = owner or bank.admin
+    permission audit = bank.admin or bank.auditor
+}
+
+// Transaction
+entity transaction {
+    // Relations
+    relation bank @bank
+    relation account @account
+    relation initiator @user
+    relation approver @user
+
+    // Permissions
+    permission view = account.view or bank.admin or bank.auditor
+    permission approve = approver or bank.admin
+    permission dispute = initiator or account.owner
+    permission audit = bank.admin or bank.auditor
+}
+
+// Loan
+entity loan {
+    // Relations
+    relation bank @bank
+    relation borrower @user
+    relation co_borrower @user
+    relation loan_officer @user
+    relation approver @user
+
+    // Permissions
+    permission view = borrower or co_borrower or loan_officer or bank.admin
+    permission apply = borrower
+    permission approve = approver or bank.admin
+    permission disburse = loan_officer or bank.admin
+    permission repay = borrower or co_borrower
+    permission modify = loan_officer or bank.admin
+    permission audit = bank.admin or bank.auditor
+}
+
+// Card
+entity card {
+    // Relations
+    relation bank @bank
+    relation account @account
+    relation cardholder @user
+    relation manager @user @bank#manager
+
+    // Permissions
+    permission view = cardholder or account.owner or manager or bank.admin
+    permission activate = cardholder or manager
+    permission block = cardholder or manager or bank.admin
+    permission set_limit = account.owner or manager
+    permission audit = bank.admin or bank.auditor
+}
+
+// ============================================================================
+// TEMPORAL ACCESS ENTITIES
+// ============================================================================
+
+// Temporal Grant - Time-limited permission grant
+entity temporal_grant {
+    // Relations
+    relation bank @bank
+    relation grantor @user @bank#admin  // Only bank admins can grant
+    relation grantee @user
+    relation resource @account @transaction @loan @card
+
+    // Permissions
+    permission create = grantor or bank.admin
+    permission view = grantor or grantee or bank.admin
+    permission revoke = grantor or bank.admin
+    permission extend = grantor or bank.admin
+    permission audit = bank.admin or bank.auditor
+}
+
+// Access Policy - Conditional access rules
+entity access_policy {
+    // Relations
+    relation bank @bank
+    relation owner @user @bank#admin
+    relation resource_type @account @transaction @loan @card
+
+    // Permissions
+    permission create = owner or bank.admin
+    permission view = owner or bank.admin or bank.manager
+    permission edit = owner or bank.admin
+    permission delete = owner or bank.admin
+    permission enable = owner or bank.admin
+    permission disable = owner or bank.admin
+}
+
+// Delegation - User-to-user permission delegation
+entity delegation {
+    // Relations
+    relation bank @bank
+    relation delegator @user
+    relation delegate @user
+    relation resource @account @transaction @loan @card
+
+    // Permissions
+    permission create = delegator
+    permission view = delegator or delegate or bank.admin
+    permission revoke = delegator or bank.admin
+    permission use = delegate
+}
+
+// ============================================================================
+// BUSINESS ENTITIES
+// ============================================================================
+
+// LPO (Local Purchase Order)
+entity lpo {
+    // Relations
+    relation bank @bank
+    relation creator @user
+    relation approver @user
+    relation vendor @user
+
+    // Permissions
+    permission view = creator or approver or vendor or bank.admin
+    permission create = creator or bank.employee
+    permission approve = approver or bank.admin
+    permission reject = approver or bank.admin
+    permission pay = bank.admin or bank.manager
+}
+
+// Insurance Policy
+entity insurance_policy {
+    // Relations
+    relation bank @bank
+    relation policyholder @user
+    relation agent @user
+    relation underwriter @user
+
+    // Permissions
+    permission view = policyholder or agent or underwriter or bank.admin
+    permission apply = policyholder
+    permission underwrite = underwriter
+    permission approve = underwriter or bank.admin
+    permission claim = policyholder
+    permission audit = bank.admin or bank.auditor
+}
+
+// Escrow
+entity escrow {
+    // Relations
+    relation bank @bank
+    relation buyer @user
+    relation seller @user
+    relation agent @user
+
+    // Permissions
+    permission view = buyer or seller or agent or bank.admin
+    permission create = buyer or seller or agent
+    permission fund = buyer
+    permission release = agent or bank.admin
+    permission dispute = buyer or seller
+}
+
+// ============================================================================
+// COMPLIANCE ENTITIES
+// ============================================================================
+
+// KYC (Know Your Customer)
+entity kyc {
+    // Relations
+    relation bank @bank
+    relation customer @user
+    relation officer @user
+
+    // Permissions
+    permission view = customer or officer or bank.admin or bank.auditor
+    permission submit = customer
+    permission review = officer or bank.admin
+    permission approve = officer or bank.admin
+    permission reject = officer or bank.admin
+}
+
+// Document
+entity document {
+    // Relations
+    relation bank @bank
+    relation owner @user
+    relation viewer @user
+    relation approver @user
+
+    // Permissions
+    permission view = owner or viewer or approver or bank.admin
+    permission upload = owner
+    permission approve = approver or bank.admin
+    permission delete = owner or bank.admin
+    permission audit = bank.admin or bank.auditor
+}
+
+// Audit Log
+entity audit_log {
+    // Relations
+    relation bank @bank
+    relation subject @user
+    relation auditor @user
+
+    // Permissions
+    permission view = auditor or bank.admin
+    permission export = bank.admin
+}

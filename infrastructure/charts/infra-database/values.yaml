@@ -1,0 +1,64 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-infra-database
+  pullPolicy: IfNotPresent
+  tag: "0.0.2"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9400
+    - port: 9401
+    - port: 9402
+    - port: 9403
+    - port: 9404
+    - port: 9405
+    - port: 9406
+    - port: 9407
+    - port: 9408
+    - port: 9409
+    - port: 9410
+    - port: 9411
+    - port: 9412
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: infra-database
+  appPort: 9402
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9400"
+  PORT_BASE: "9400"
+  SERVICE_GROUP: infra-database
+  SERVICES: "avro-schema-registry-go,backup-manager-py,data-export-rs,db-migration-manager-go,db-migrations,pgbouncer-manager-go,read-replica-router-rs,route-schema-enforcer-go,table-partitioner-rs"

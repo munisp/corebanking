@@ -1,49 +1,67 @@
-# 54Bank — Consolidated Multi-Service Dockerfile
-# Builds and runs multiple microservices in a single container
+# syntax=docker/dockerfile:1
+FROM ubuntu:22.04 AS base
 
-ARG PRIMARY_LANG=go
+ARG SERVICES
+ARG PRIMARY_LANG=python
+ARG PORT_BASE=9100
 
-# ── Go Build Stage ──
-FROM golang:1.22-alpine AS go-builder
-RUN apk add --no-cache git
-WORKDIR /build
-COPY go.mod go.sum* ./
-RUN go mod download 2>/dev/null || true
-COPY services/ /build/services/
-COPY middleware-go/ /build/middleware-go/ 2>/dev/null || true
+ENV DEBIAN_FRONTEND=noninteractive
+ENV SERVICES=${SERVICES}
+ENV PORT_BASE=${PORT_BASE}
+ENV PRIMARY_LANG=${PRIMARY_LANG}
 
-# Build all Go services (skip failures for non-Go dirs)
-RUN for svc in /build/services/*-go; do \
-      if [ -f "$svc/main.go" ]; then \
-        name=$(basename "$svc"); \
-        echo "Building $name..."; \
-        cd "$svc" && go build -o "/out/$name/$name" main.go 2>/dev/null || echo "WARN: $name build skipped"; \
-        cd /build; \
-      fi \
-    done
+# ── Runtimes ────────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 python3-pip python3.11-dev python3.11-venv \
+    curl wget ca-certificates git \
+    libpq-dev gcc g++ make \
+    supervisor \
+    && rm -rf /var/lib/apt/lists/*
 
-# ── Python Stage ──
-FROM python:3.12-slim AS python-base
-RUN pip install --no-cache-dir psycopg2-binary redis opensearch-py 2>/dev/null || true
+# Python default
+RUN ln -sf /usr/bin/python3.11 /usr/bin/python3 && ln -sf /usr/bin/python3 /usr/bin/python
+RUN pip install --no-cache-dir uvicorn[standard]
 
-# ── Runtime ──
-FROM python:3.12-slim
+# Go
+RUN curl -fsSL --retry 5 --retry-delay 3 -o /tmp/go.tar.gz https://go.dev/dl/go1.23.4.linux-amd64.tar.gz \
+    && tar -C /usr/local -xzf /tmp/go.tar.gz \
+    && rm /tmp/go.tar.gz
+ENV PATH="/usr/local/go/bin:$PATH"
+ENV GOPATH="/root/go"
 
-# Install Go runtime (for compiled binaries)
-COPY --from=go-builder /out/ /app/services/
+# Rust — download installer separately so we can set RUSTUP_IO_THREADS=1
+# to avoid the CloseHandle/RecvError disk-IO panic on Docker Desktop for Mac
+RUN curl --retry 5 --retry-delay 5 --http1.1 --proto '=https' --tlsv1.2 -sSf \
+        https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && RUSTUP_IO_THREADS=1 sh /tmp/rustup-init.sh -y \
+        --default-toolchain stable --profile minimal \
+    && rm /tmp/rustup-init.sh
+ENV PATH="/root/.cargo/bin:$PATH"
 
-# Copy Python services
-COPY services/ /app/services/
+# Node 18
+RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
+    && apt-get install -y nodejs \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy Rust binaries (pre-built or skip)
-# Note: Rust services require separate compilation
+# ── Source code ──────────────────────────────────────────────────────────────
+WORKDIR /app
+COPY ["services/", "/app/services/"]
 
-# Copy entrypoint scripts
-COPY docker/entrypoints/ /app/entrypoints/
+RUN mkdir -p /app/bin /var/log/supervisor /etc/supervisor/conf.d
 
-# Common env
-ENV DATABASE_URL=postgresql://banking:banking_dev_password@postgres:5432/banking54
-ENV REDIS_URL=redis://redis:6379
+# ── Build all services in this group ─────────────────────────────────────────
+COPY docker/build-services.sh /docker/build-services.sh
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/pip \
+    chmod +x /docker/build-services.sh && /docker/build-services.sh
 
-ENTRYPOINT ["/bin/bash"]
-CMD ["/app/entrypoints/default.sh"]
+# ── Supervisor base config ───────────────────────────────────────────────────
+COPY docker/supervisord.conf /etc/supervisor/supervisord.conf
+
+# ── Entrypoint: generates per-service supervisor programs and starts supervisord
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

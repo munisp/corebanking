@@ -1,0 +1,62 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-workflow-batch
+  pullPolicy: IfNotPresent
+  tag: "0.0.2"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9658
+    - port: 9659
+    - port: 9660
+    - port: 9661
+    - port: 9662
+    - port: 9663
+    - port: 9664
+    - port: 9665
+    - port: 9666
+    - port: 9667
+    - port: 9668
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: workflow-batch
+  appPort: 9658
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9658"
+  PORT_BASE: "9658"
+  SERVICE_GROUP: workflow-batch
+  SERVICES: "batch-aggregator-go,batch-processing-py,e2e-orchestrator-go,orchestrator-service,saga-coordinator-py,temporal-access-service,temporal-memoizer-go,temporal-orchestrator-py,temporal-sagas-go,temporal-worker-go,workflow-engine-py"

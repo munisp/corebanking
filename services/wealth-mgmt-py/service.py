@@ -8,7 +8,7 @@ MW = {
     "redis": {"url": os.environ.get("REDIS_URL", "redis://localhost:6379"), "cache_keys": ["wealth:nav", "wealth:clients", "wealth:models"]},
     "postgres": {"url": os.environ.get("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": ["wealth_clients", "wealth_portfolios", "wealth_transactions", "investment_models"]},
     "opensearch": {"url": os.environ.get("OPENSEARCH_URL", "http://localhost:9200"), "indices": ["wealth-transactions", "wealth-audit"]},
-    "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "wealth-mgmt"},
+    "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "client": "wealth-mgmt"},
     "permify": {"url": os.environ.get("PERMIFY_URL", "http://localhost:3476"), "resources": ["wealth_client", "wealth_portfolio"]},
     "dapr": {"url": os.environ.get("DAPR_URL", "http://localhost:3500"), "app_id": "wealth-mgmt", "pubsub": "wealth-pubsub"},
     "fluvio": {"url": os.environ.get("FLUVIO_URL", "localhost:9003"), "topics": ["wealth-market-stream"]},

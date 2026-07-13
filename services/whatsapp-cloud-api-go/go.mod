@@ -1,4 +1,4 @@
-module github.com/54bank/whatsapp-cloud-api-go
+module github.com/54link-dev/whatsapp-cloud-api-go
 
 go 1.22
 

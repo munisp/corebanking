@@ -5,7 +5,7 @@ syntax = "proto3";
 
 package banking.v1;
 
-option go_package = "github.com/54bank/proto/banking/v1;bankingv1";
+option go_package = "github.com/54link-dev/proto/banking/v1;bankingv1";
 
 // ── Account Service ──
 

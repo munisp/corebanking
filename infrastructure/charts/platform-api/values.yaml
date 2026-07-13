@@ -1,0 +1,86 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-platform-api
+  pullPolicy: IfNotPresent
+  tag: "0.0.14"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9492
+    - port: 9493
+    - port: 9494
+    - port: 9495
+    - port: 9496
+    - port: 9497
+    - port: 9498
+    - port: 9499
+    - port: 9500
+    - port: 9501
+    - port: 9502
+    - port: 9503
+    - port: 9504
+    - port: 9505
+    - port: 9506
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: platform-api
+  appPort: 9492
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  DAPR_HOST: "localhost"
+  APP_PORT: "9492"
+  PORT_BASE: "9492"
+  SERVICE_GROUP: platform-api
+  NODE_ENV: "production"
+  DB_DATABASE: "link_core_banking"
+  DB_DATABASE_TYPE: "postgres"
+  AUTH_SVC_URL: "http://identity-auth.54link-dev.svc.cluster.local:9365"
+  ACCOUNT_SVC_URL: "http://core-accounts.54link-dev.svc.cluster.local:9280"
+  ADMIN_SVC_URL: "http://platform-api.54link-dev.svc.cluster.local:9492"
+  USER_SVC_URL: "http://identity-auth.54link-dev.svc.cluster.local:9382"
+  AGENT_SVC_URL: "http://channels-agents.54link-dev.svc.cluster.local:9135"
+  VERIFICATION_SVC_URL: "http://verification-service.54link-dev.svc.cluster.local:8383"
+  VERIFICATION_SVC_IDP: "liveness"
+  VERIFICATION_SVC_CLIENT_ID: "54link-orchestrator"
+  VERIFICATION_SVC_CLIENT_SECRET: "54link-orchestrator-secret"
+  BILLING_SVC_URL: "http://platform-tenant.54link-dev.svc.cluster.local:9523"
+  BUSINESS_SVC_URL: "http://workflow-operations.54link-dev.svc.cluster.local:9677"
+  BVN_NIN_SVC_URL: "http://compliance-kyc-aml.54link-dev.svc.cluster.local:9219"
+  SANCTIONS_SCREENING_URL: "http://compliance-kyc-aml.54link-dev.svc.cluster.local:9236"
+  TEMPORAL_TASK_QUEUE: "orchestrator-service"
+  DAPR_PUBSUB_TOPIC_PREFIX: ""
+  TENANT_SERVICE_APP_ID: "platform-tenant"
+  SERVICES: "admin-service,api-key-enforcer-go,api-key-vault-go,api-marketplace-go,api-metering,api-versioning-go,apisix-plugin-optimizer-go,bundle-splitter-py,cors-gateway-go,dapr-sidecar-go,graphql-gateway-go,plugin-marketplace-py,security-gateway-go,webhook-engine-go,orchestrator-service"

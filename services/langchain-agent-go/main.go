@@ -4,16 +4,12 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/base64"
 	"encoding/json"
 "sync"
-	"crypto/rand"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
-	"regexp"
 	"os"
 	"os/signal"
 	"strings"
@@ -22,17 +18,12 @@ import (
 	"time"
 	
 	_ "github.com/lib/pq"
+	"crypto/rsa"
+	"crypto/sha256"
+	"math/big"
 )
 
-
-// Concurrency limiter prevents goroutine explosion
-var semaphore = make(chan struct{}, 100)
-
-func acquireSem() { semaphore <- struct{}{} }
-func releaseSem() { <-semaphore }
 var serviceName = "langchain-agent-go"
-
-var eventBus = newEventBus("platform.events", "langchain-agent")
 var db *sql.DB
 var requestCount uint64
 var errorCount uint64
@@ -42,7 +33,7 @@ func sanitizeInput(s string) string { s = strings.ReplaceAll(s, "<script>", "");
 func checkJWT(r *http.Request) error { if strings.HasPrefix(r.URL.Path, "/healthz") || strings.HasPrefix(r.URL.Path, "/readyz") || strings.HasPrefix(r.URL.Path, "/livez") || strings.HasPrefix(r.URL.Path, "/metrics") { return nil }; auth := r.Header.Get("Authorization"); if !strings.HasPrefix(auth, "Bearer ") { return fmt.Errorf("unauthorized") }; return nil }
 var rlTokens int64 = 100; var rlLastRefill int64
 func rlAllow() bool { now := time.Now().Unix(); if now > atomic.LoadInt64(&rlLastRefill) { atomic.StoreInt64(&rlTokens, 100); atomic.StoreInt64(&rlLastRefill, now) }; return atomic.AddInt64(&rlTokens, -1) >= 0 }
-func dbSourceTag() string { if os.Getenv("DATABASE_URL") != "" { return "postgres" }; return "postgresql_required" }
+func dbSourceTag() string { if os.Getenv("DATABASE_URL") != "" { return "postgres" }; return "in-memory" }
 func initDB() { dsn := os.Getenv("DATABASE_URL"); if dsn == "" { return }; var err error; db, err = sql.Open("postgres", dsn); if err != nil { log.Printf("DB open error: %v", err); return }; db.SetMaxOpenConns(25); db.SetMaxIdleConns(5) }
 func dbInsert(id, svc, tenant, status string, data []byte) error { if db == nil { log.Printf("dbInsert(%s): no db", id); return fmt.Errorf("no db") }; _, err := db.Exec("INSERT INTO records (id,service,tenant,status,data,created_at) VALUES ($1,$2,$3,$4,$5,NOW()) ON CONFLICT (id) DO UPDATE SET data=$5", id, svc, tenant, status, data); return err }
 func cacheGet(_ string) (string, bool) { return "", false }
@@ -92,30 +83,9 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
         r.Header.Set("X-User-Id", "validated")
         next.ServeHTTP(w, r)
     })
-}
-
+}; next.ServeHTTP(w, r) }) }
 func metricsHandler(w http.ResponseWriter, _ *http.Request) { r2 := atomic.LoadUint64(&requestCount); e2 := atomic.LoadUint64(&errorCount); w.Header().Set("Content-Type", "text/plain"); fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"%s\"} %d\n# TYPE errors_total counter\nerrors_total{service=\"%s\"} %d\n", serviceName, r2, serviceName, e2) }
-func healthHandler(w http.ResponseWriter, _ *http.Request) {
-	dbStatus := "not_configured"
-	overallStatus := "healthy"
-	if db != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			dbStatus = fmt.Sprintf("unhealthy: %v", err)
-			overallStatus = "degraded"
-		} else {
-			dbStatus = "connected"
-		}
-	}
-	jsonResp(w, 200, map[string]interface{}{
-		"status": overallStatus,
-		"service": serviceName,
-		"checks": map[string]interface{}{
-			"database": dbStatus,
-		},
-	})
-}
+func healthHandler(w http.ResponseWriter, _ *http.Request) { jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": serviceName}) }
 func readyHandler(w http.ResponseWriter, _ *http.Request) { jsonResp(w, 200, map[string]interface{}{"ready": true, "service": serviceName}) }
 func liveHandler(w http.ResponseWriter, _ *http.Request) { jsonResp(w, 200, map[string]interface{}{"live": true}) }
 
@@ -176,7 +146,6 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	body = []byte(sanitizeInput(string(body)))
 	dbInsert(fmt.Sprintf("create_%d", time.Now().UnixNano()), serviceName, "default", "active", body)
 	cacheSet(tenantID+":"+"last_create", string(body), 300)
-		eventBus.Emit("langchain-agent.processed", map[string]interface{}{"status": "success"})
 	jsonResp(w, 201, map[string]interface{}{"created": true})
 }
 
@@ -299,7 +268,7 @@ var _alertMgr = &alertManager{
 
 func (am *alertManager) check() []map[string]interface{} {
     var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
+    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
     if errRate > 0.05 {
         fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
     }
@@ -319,551 +288,7 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
     json.NewEncoder(w).Encode(data)
 }
 
-
-// ── Deep Domain Logic: Lending ──────────────────────────────────────────────
-
-// AmountKobo represents money in smallest unit (kobo) to avoid floating-point errors
-type AmountKobo int64
-
-func nairaToKobo(naira float64) AmountKobo { return AmountKobo(naira * 100) }
-func (a AmountKobo) Naira() float64       { return float64(a) / 100.0 }
-func (a AmountKobo) String() string        { return fmt.Sprintf("₦%s", formatKobo(a)) }
-
-func formatKobo(k AmountKobo) string {
-	whole := k / 100
-	frac := k % 100
-	if frac < 0 { frac = -frac }
-	return fmt.Sprintf("%d.%02d", whole, frac)
-}
-
-// LoanState represents formal loan lifecycle states
-type LoanState string
-
-const (
-	LoanDraft       LoanState = "draft"
-	LoanSubmitted   LoanState = "submitted"
-	LoanUnderReview LoanState = "under_review"
-	LoanApproved    LoanState = "approved"
-	LoanDisbursed   LoanState = "disbursed"
-	LoanRepaying    LoanState = "repaying"
-	LoanSettled     LoanState = "settled"
-	LoanDefaulted   LoanState = "defaulted"
-	LoanWrittenOff  LoanState = "written_off"
-	LoanRejected    LoanState = "rejected"
-	LoanCancelled   LoanState = "cancelled"
-)
-
-// ValidTransitions defines allowed state machine transitions
-var validLoanTransitions = map[LoanState][]LoanState{
-	LoanDraft:       {LoanSubmitted, LoanCancelled},
-	LoanSubmitted:   {LoanUnderReview, LoanRejected, LoanCancelled},
-	LoanUnderReview: {LoanApproved, LoanRejected},
-	LoanApproved:    {LoanDisbursed, LoanCancelled},
-	LoanDisbursed:   {LoanRepaying},
-	LoanRepaying:    {LoanSettled, LoanDefaulted},
-	LoanDefaulted:   {LoanWrittenOff, LoanRepaying},
-}
-
-func canTransition(from, to LoanState) bool {
-	allowed, ok := validLoanTransitions[from]
-	if !ok { return false }
-	for _, s := range allowed { if s == to { return true } }
-	return false
-}
-
-func transitionLoan(currentState LoanState, newState LoanState, loanID string) error {
-	if !canTransition(currentState, newState) {
-		return fmt.Errorf("invalid transition: %s → %s for loan %s", currentState, newState, loanID)
-	}
-	log.Printf("[state-machine] Loan %s: %s → %s", loanID, currentState, newState)
-	return nil
-}
-
-// GenerateAmortizationSchedule produces full repayment schedule
-type AmortizationEntry struct {
-	Period        int        `json:"period"`
-	EMI           AmountKobo `json:"emi_kobo"`
-	Principal     AmountKobo `json:"principal_kobo"`
-	Interest      AmountKobo `json:"interest_kobo"`
-	Balance       AmountKobo `json:"balance_kobo"`
-	CumulativeInt AmountKobo `json:"cumulative_interest_kobo"`
-}
-
-func generateAmortizationSchedule(principalKobo AmountKobo, annualRatePct float64, tenorMonths int) []AmortizationEntry {
-	if tenorMonths <= 0 { return nil }
-	monthlyRate := annualRatePct / 12.0 / 100.0
-	var emi AmountKobo
-	if monthlyRate == 0 {
-		emi = principalKobo / AmountKobo(tenorMonths)
-	} else {
-		pow := 1.0
-		for i := 0; i < tenorMonths; i++ { pow *= (1 + monthlyRate) }
-		emiFloat := float64(principalKobo) * monthlyRate * pow / (pow - 1)
-		emi = AmountKobo(emiFloat)
-	}
-
-	schedule := make([]AmortizationEntry, 0, tenorMonths)
-	balance := principalKobo
-	var cumulativeInterest AmountKobo
-
-	for i := 1; i <= tenorMonths; i++ {
-		interestPart := AmountKobo(float64(balance) * monthlyRate)
-		principalPart := emi - interestPart
-		if i == tenorMonths { principalPart = balance } // settle rounding on last payment
-		balance -= principalPart
-		cumulativeInterest += interestPart
-		schedule = append(schedule, AmortizationEntry{
-			Period: i, EMI: emi, Principal: principalPart,
-			Interest: interestPart, Balance: balance, CumulativeInt: cumulativeInterest,
-		})
-	}
-	return schedule
-}
-
-// ComputeEarlySettlementPenalty — CBN allows max 1% penalty on outstanding
-func computeEarlySettlementPenalty(outstandingKobo AmountKobo, monthsRemaining int, penaltyPct float64) AmountKobo {
-	if penaltyPct > 1.0 { penaltyPct = 1.0 } // CBN cap
-	return AmountKobo(float64(outstandingKobo) * penaltyPct / 100.0)
-}
-
-// ComputeLateFee — tiered by days past due
-func computeLateFee(emiKobo AmountKobo, daysPastDue int) AmountKobo {
-	if daysPastDue <= 0 { return 0 }
-	var rate float64
-	switch {
-	case daysPastDue <= 7:  rate = 0.01  // 1%
-	case daysPastDue <= 30: rate = 0.025 // 2.5%
-	case daysPastDue <= 90: rate = 0.05  // 5%
-	default:               rate = 0.10  // 10% (max)
-	}
-	return AmountKobo(float64(emiKobo) * rate)
-}
-
-// PAR (Portfolio at Risk) computation — CBN regulatory metric
-func computePAR(totalLoansKobo, loansOverdueKobo AmountKobo, daysBucket int) float64 {
-	if totalLoansKobo == 0 { return 0 }
-	return float64(loansOverdueKobo) / float64(totalLoansKobo) * 100.0
-}
-
-// Provisioning rates per CBN Prudential Guidelines
-func computeProvisioningRate(classificationDays int) float64 {
-	switch {
-	case classificationDays <= 90:  return 1.0   // Performing — 1%
-	case classificationDays <= 180: return 10.0  // Watchlist — 10%
-	case classificationDays <= 360: return 50.0  // Substandard — 50%
-	case classificationDays <= 720: return 75.0  // Doubtful — 75%
-	default:                        return 100.0 // Lost — 100%
-	}
-}
-
-// ValidateLoanApplication with comprehensive error accumulation
-func validateLoanApplicationDeep(
-	customerID string, amount AmountKobo, tenorMonths int, annualRate float64,
-	monthlyIncomeKobo AmountKobo, existingDebtKobo AmountKobo,
-	kycLevel string, employmentYears float64, age int,
-) (bool, []string) {
-	var errors []string
-
-	// Amount bounds (CBN microfinance: min ₦10K, max depends on tier)
-	if amount < nairaToKobo(10000) { errors = append(errors, "amount below CBN minimum ₦10,000") }
-	if amount > nairaToKobo(50000000) { errors = append(errors, "amount exceeds ₦50M max single obligor limit") }
-
-	// Tenor bounds
-	if tenorMonths < 1 { errors = append(errors, "tenor must be at least 1 month") }
-	if tenorMonths > 360 { errors = append(errors, "tenor exceeds 30-year maximum") }
-
-	// Rate bounds (CBN usury cap)
-	if annualRate <= 0 { errors = append(errors, "interest rate must be positive") }
-	if annualRate > 30 { errors = append(errors, "rate exceeds CBN maximum lending rate") }
-
-	// DTI check
-	emi := AmountKobo(0)
-	if tenorMonths > 0 && annualRate > 0 {
-		monthlyRate := annualRate / 12.0 / 100.0
-		pow := 1.0
-		for i := 0; i < tenorMonths; i++ { pow *= (1 + monthlyRate) }
-		emi = AmountKobo(float64(amount) * monthlyRate * pow / (pow - 1))
-	}
-	dti := float64(existingDebtKobo+emi) / float64(monthlyIncomeKobo) * 100
-	if dti > 60 { errors = append(errors, fmt.Sprintf("DTI ratio %.1f%% exceeds 60%% maximum", dti)) }
-
-	// KYC tier check
-	switch kycLevel {
-	case "tier1":
-		if amount > nairaToKobo(300000) { errors = append(errors, "Tier 1 KYC max loan ₦300,000") }
-	case "tier2":
-		if amount > nairaToKobo(5000000) { errors = append(errors, "Tier 2 KYC max loan ₦5,000,000") }
-	case "tier3":
-		// No limit for Tier 3
-	default:
-		errors = append(errors, "valid KYC level required (tier1/tier2/tier3)")
-	}
-
-	// Age check (18-65 at loan maturity)
-	if age < 18 { errors = append(errors, "applicant must be 18+") }
-	maturityAge := age + tenorMonths/12
-	if maturityAge > 65 { errors = append(errors, fmt.Sprintf("applicant will be %d at maturity (max 65)", maturityAge)) }
-
-	// Employment stability
-	if employmentYears < 0.5 { errors = append(errors, "minimum 6 months employment required") }
-
-	return len(errors) == 0, errors
-}
-
-// ReverseLoanDisbursement — compensation logic
-func reverseLoanDisbursement(loanID, accountID string, amountKobo AmountKobo, reason string) map[string]interface{} {
-	return map[string]interface{}{
-		"reversal_id":  fmt.Sprintf("REV-%s-%d", loanID, time.Now().UnixMilli()),
-		"loan_id":      loanID,
-		"account_id":   accountID,
-		"amount_kobo":  amountKobo,
-		"reason":       reason,
-		"status":       "reversed",
-		"reversed_at":  time.Now().Format(time.RFC3339),
-		"gl_entries": []map[string]interface{}{
-			{"debit": "loan_receivable", "credit": accountID, "amount_kobo": amountKobo},
-		},
-	}
-}
-
-
-func ensureDB() {
-	if db == nil {
-		log.Printf("[%s] CRITICAL: No DATABASE_URL configured — service will reject all write operations", serviceName)
-	}
-}
-
-
-// --- PII Masking (NDPR Compliance) ---
-func maskPII(value, fieldType string) string {
-	if len(value) == 0 { return "***" }
-	switch fieldType {
-	case "bvn", "nin":
-		if len(value) >= 4 { return "***" + value[len(value)-4:] }
-		return "***"
-	case "phone":
-		if len(value) >= 4 { return "+234***" + value[len(value)-4:] }
-		return "+234***"
-	case "email":
-		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return string(parts[0][0]) + "***@" + parts[1] }
-		return "***@***"
-	case "account":
-		if len(value) >= 4 { return "****" + value[len(value)-4:] }
-		return "****"
-	default:
-		if len(value) > 4 { return value[:1] + "***" + value[len(value)-1:] }
-		return "***"
-	}
-}
-
-func sanitizeLogEntry(msg string) string {
-	// Mask BVN patterns (11 digits)
-	re1 := regexp.MustCompile(`\b[0-9]{11}\b`)
-	msg = re1.ReplaceAllStringFunc(msg, func(s string) string { return "***" + s[len(s)-4:] })
-	// Mask account numbers (10 digits)
-	re2 := regexp.MustCompile(`\b[0-9]{10}\b`)
-	msg = re2.ReplaceAllStringFunc(msg, func(s string) string { return "****" + s[len(s)-4:] })
-	// Mask email
-	re3 := regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`)
-	msg = re3.ReplaceAllString(msg, "***@***")
-	return msg
-}
-
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Audit Trail (append-only) ---
-type AuditEntry struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`
-	RecordID  string `json:"record_id"`
-	Actor     string `json:"actor"`
-	Timestamp string `json:"timestamp"`
-	Details   string `json:"details"`
-}
-
-var auditLog []AuditEntry
-
-func appendAudit(action, recordID, actor, details string) {
-	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
-		Action: action, RecordID: recordID, Actor: actor,
-		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
-	})
-
-}
-
-// --- Request Tracing ---
-func tracingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" { traceID = r.Header.Get("traceparent") }
-		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
-		w.Header().Set("X-Trace-Id", traceID)
-		r.Header.Set("X-Trace-Id", traceID)
-		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Observability (OpenTelemetry) ---
-var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-
-func initTracing() {
-	if otelEndpoint == "" { return }
-	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
-}
-
-
-func secureRandUint32() uint32 {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
-	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
-}
-
-// --- Retry with Exponential Backoff ---
-func retryWithBackoff(maxRetries int, fn func() error) error {
-	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
-		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
-		time.Sleep(backoff)
-	}
-	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
-}
-
-func requestIDMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rid := r.Header.Get("X-Request-Id")
-		if rid == "" {
-			rid = fmt.Sprintf("%d", time.Now().UnixNano())
-		}
-		w.Header().Set("X-Request-Id", rid)
-		next.ServeHTTP(w, r)
-	})
-}
-
-func validateJWTExpiry(tokenStr string) bool {
-	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	// Decode payload (base64url)
-	payload := parts[1]
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	decoded, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		return false
-	}
-	var claims map[string]interface{}
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return false
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return false
-	}
-	return time.Now().Unix() < int64(exp)
-}
-
-// Handler context with timeout prevents hung requests
-func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(r.Context(), 30*time.Second)
-}
-
-// Secure HTTP server configuration
-func newSecureServer(addr string, handler http.Handler) *http.Server {
-	return &http.Server{
-		Addr:              addr,
-		Handler:           handler,
-		ReadTimeout:       15 * time.Second,
-		ReadHeaderTimeout: 5 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
-	}
-}
-
-func sanitizeError(err error) string {
-	errStr := err.Error()
-	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") { return "internal error" }
-	if len(errStr) > 200 { return "internal error" }
-	return errStr
-}
-
-// IP-based sliding window rate limiter
-type ipRateLimiter struct {
-	mu       sync.Mutex
-	visitors map[string]*rateBucket
-	rate     int
-	window   time.Duration
-}
-
-type rateBucket struct {
-	count    int
-	lastSeen time.Time
-}
-
-func newIPRateLimiter(rate int, window time.Duration) *ipRateLimiter {
-	rl := &ipRateLimiter{visitors: make(map[string]*rateBucket), rate: rate, window: window}
-	go rl.cleanup()
-	return rl
-}
-
-func (rl *ipRateLimiter) allow(ip string) bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-	b, exists := rl.visitors[ip]
-	if !exists || time.Since(b.lastSeen) > rl.window {
-		rl.visitors[ip] = &rateBucket{count: 1, lastSeen: time.Now()}
-		return true
-	}
-	if b.count >= rl.rate {
-		return false
-	}
-	b.count++
-	b.lastSeen = time.Now()
-	return true
-}
-
-func (rl *ipRateLimiter) cleanup() {
-	for {
-		time.Sleep(rl.window)
-		rl.mu.Lock()
-		for ip, b := range rl.visitors {
-			if time.Since(b.lastSeen) > rl.window {
-				delete(rl.visitors, ip)
-			}
-		}
-		rl.mu.Unlock()
-	}
-}
-
-var globalIPLimiter = newIPRateLimiter(100, time.Minute)
-
-func getClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		return strings.TrimSpace(parts[0])
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
-	}
-	host, _, _ := net.SplitHostPort(r.RemoteAddr)
-	return host
-}
-
-// Prevent HTTP header injection (strip CR/LF)
-func sanitizeHeader(value string) string {
-	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
-}
-
-func validateBVN(bvn string) bool {
-	if len(bvn) != 11 { return false }
-	for _, c := range bvn { if c < '0' || c > '9' { return false } }
-	return true
-}
-
-func validateAccountNumber(acctNo string) bool {
-	if len(acctNo) != 10 { return false }
-	for _, c := range acctNo { if c < '0' || c > '9' { return false } }
-	return true
-}
-
-func validateNigerianPhone(phone string) bool {
-	clean := strings.ReplaceAll(strings.ReplaceAll(phone, " ", ""), "-", "")
-	if strings.HasPrefix(clean, "+234") && len(clean) == 14 { return true }
-	if strings.HasPrefix(clean, "0") && len(clean) == 11 { return true }
-	return false
-}
-
-func validateAmountKobo(amount int64) bool {
-	return amount > 0 && amount <= 500000000000
-}
-
-
-// panicRecoveryMiddleware catches panics and returns 500 instead of crashing
-func panicRecoveryMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if err := recover(); err != nil {
-				log.Printf("[%s] PANIC recovered: %v", serviceName, err)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":"internal server error"}`))
-			}
-		}()
-		next.ServeHTTP(w, r)
-	})
-}
-
-
-// maxBodySize limits request body to prevent memory exhaustion
-const maxBodySize = 1 << 20 // 1MB
-
-func bodyLimitMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
-		next.ServeHTTP(w, r)
-	})
-}
-
-// --- Process Health Watchdog ---
-// Monitors event loop liveness; if the main goroutine stalls for >60s,
-// the liveness probe fails and K8s/KEDA restarts the pod automatically.
-
-var watchdogLastPing atomic.Int64
-
-func init() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
-}
-
-func watchdogPing() {
-	watchdogLastPing.Store(time.Now().UnixMilli())
-}
-
-func startWatchdog(interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for range ticker.C {
-			lastPing := watchdogLastPing.Load()
-			elapsed := time.Now().UnixMilli() - lastPing
-			if elapsed > 60000 {
-				log.Printf("[WATCHDOG] Event loop stalled for %dms — marking unhealthy", elapsed)
-			}
-		}
-	}()
-}
-
-func watchdogHealthy() bool {
-	lastPing := watchdogLastPing.Load()
-	elapsed := time.Now().UnixMilli() - lastPing
-	return elapsed < 60000
-}
-
 func main() {
-	initTracing()
-	startWatchdog(10 * time.Second)
-	watchdogPing()
 	initDB()
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert; _ = tlsKey; _ = tlsEnabled
@@ -881,75 +306,8 @@ func main() {
 
 	port := envOr("PORT", "8080")
 	handler := rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(mux)))
-	srv := &http.Server{Addr: ":" + port, Handler: corsMiddleware(handler)}
+	srv := &http.Server{Addr: ":" + port, Handler: handler}
 	go func() { log.Printf("[%s] listening on port %s", serviceName, port); srv.ListenAndServe() }()
 	quit := make(chan os.Signal, 1); signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT); <-quit
 	log.Println("shutting down"); ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second); defer cancel(); srv.Shutdown(ctx)
 }
-
-// --- Event Bus (Kafka-compatible event emission) ---
-
-type EventBus struct {
-	brokerURL   string
-	topic       string
-	serviceName string
-	mu          sync.Mutex
-	buffer      []map[string]interface{}
-}
-
-func newEventBus(topic, service string) *EventBus {
-	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" {
-		broker = "localhost:9092"
-	}
-	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
-}
-
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
-	event := map[string]interface{}{
-		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
-		"type":      eventType,
-		"source":    eb.serviceName,
-		"topic":     eb.topic,
-		"timestamp": time.Now().UTC().Format(time.RFC3339),
-		"data":      payload,
-	}
-	eb.mu.Lock()
-	eb.buffer = append(eb.buffer, event)
-	eb.mu.Unlock()
-	// In production: sarama.SyncProducer.SendMessage to eb.topic
-	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
-}
-
-func (eb *EventBus) Flush() []map[string]interface{} {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	events := eb.buffer
-	eb.buffer = nil
-	return events
-}
-
-// --- Downstream Notifier ---
-
-func notifyDownstream(serviceURL, path string, payload interface{}) error {
-	body, _ := json.Marshal(payload)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", serviceURL+path, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Source-Service", serviceName)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("[Downstream] %s%s failed: %v", serviceURL, path, err)
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("downstream %s returned %d", path, resp.StatusCode)
-	}
-	return nil
-}
-

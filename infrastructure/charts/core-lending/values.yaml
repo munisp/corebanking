@@ -1,0 +1,69 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-core-lending
+  pullPolicy: IfNotPresent
+  tag: "0.0.6"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9310
+    - port: 9311
+    - port: 9312
+    - port: 9313
+    - port: 9314
+    - port: 9315
+    - port: 9316
+    - port: 9317
+    - port: 9318
+    - port: 9319
+    - port: 9320
+    - port: 9321
+    - port: 9322
+    - port: 9323
+    - port: 9324
+    - port: 9325
+    - port: 9326
+    - port: 9327
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: core-lending
+  appPort: 9311
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9310"
+  PORT_BASE: "9310"
+  SERVICE_GROUP: core-lending
+  SERVICES: "agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,education-loans-py,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go"

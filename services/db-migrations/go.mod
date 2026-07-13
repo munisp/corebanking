@@ -1,5 +1,3 @@
-module github.com/54bank/db-migrations
+module github.com/54link-dev/db-migrations
 
 go 1.22
-
-require github.com/lib/pq v1.12.3 // indirect

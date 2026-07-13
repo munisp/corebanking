@@ -1,0 +1,56 @@
+name: Build Workflow Reporting Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/analytics-engine-py/**'
+      - 'services/api-analytics-py/**'
+      - 'services/billing-analytics-py/**'
+      - 'services/customer-360-dashboard-py/**'
+      - 'services/kpi-analytics-py/**'
+      - 'services/kpi-engine-go/**'
+      - 'services/opensearch-analytics-py/**'
+      - 'services/prometheus-dashboard-py/**'
+      - 'services/reporting-service/**'
+      - 'services/stakeholder-kpi-dashboard-py/**'
+      - 'services/statement-generator-py/**'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/workflow-reporting.yaml'
+
+env:
+  TAG: "0.0.3"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=analytics-engine-py,api-analytics-py,billing-analytics-py,customer-360-dashboard-py,kpi-analytics-py,kpi-engine-go,opensearch-analytics-py,prometheus-dashboard-py,reporting-service,stakeholder-kpi-dashboard-py,statement-generator-py
+            PRIMARY_LANG=go
+            PORT_BASE=9727
+          tags: registry.digitalocean.com/talentgraph-auth/54link-dev-workflow-reporting:${{ env.TAG }}

@@ -1,0 +1,83 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-compliance-kyc-aml
+  pullPolicy: IfNotPresent
+  tag: "0.0.4"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9209
+    - port: 9210
+    - port: 9211
+    - port: 9212
+    - port: 9213
+    - port: 9214
+    - port: 9215
+    - port: 9216
+    - port: 9217
+    - port: 9218
+    - port: 9219
+    - port: 9220
+    - port: 9221
+    - port: 9222
+    - port: 9223
+    - port: 9224
+    - port: 9225
+    - port: 9226
+    - port: 9227
+    - port: 9228
+    - port: 9229
+    - port: 9230
+    - port: 9231
+    - port: 9232
+    - port: 9233
+    - port: 9234
+    - port: 9235
+    - port: 9237
+    - port: 9238
+    - port: 9239
+    - port: 9240
+    - port: 9241
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: compliance-kyc-aml
+  appPort: 9211
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9209"
+  PORT_BASE: "9209"
+  SERVICE_GROUP: compliance-kyc-aml
+  SERVICES: "address-verification-py,adverse-media-scanner-py,adverse-media-screening-py,agent-kyc-capture-go,aml-case-manager-go,aml-compliance-dashboard-py,aml-engine-rs,aml-risk-scoring-rs,aml-training-tracker-go,bvn-nin-verification-go,cbn-tiered-kyc-rs,corporate-doc-verification-py,efass-kyc-returns-py,goaml-integration-go,kyb-service,kyc-aml-screening-py,kyc-analytics-dashboard-py,kyc-data-quality-py,kyc-event-consumer-py,kyc-self-service-py,kyc-workflow-orchestration-py,multi-bureau-verification-go,pep-enhanced-dd-py,sanctions-batch-rescreener-rs,sanctions-engine-rs,sanctions-screening-rs,signature-verification-rs,telegram-kyc-bot-rs,ubo-service,video-kyc-py,watchlist-manager-rs"

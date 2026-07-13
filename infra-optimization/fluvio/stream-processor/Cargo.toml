@@ -1,0 +1,10 @@
+[package]
+name = "fluvio-stream-processor"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+actix-web = "4.9.0"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+tokio = { version = "1.43.1", features = ["full"] }

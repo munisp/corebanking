@@ -1,0 +1,34 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Merchant Service DB Architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- MERCHANTS -->
+        <mxCell id="merchants" value="merchants&#xa;----------------------&#xa;id (PK, serial)&#xa;merchant_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;business_name (varchar)&#xa;business_email (varchar)&#xa;business_phone (varchar)&#xa;business_address (text)&#xa;business_type (varchar)&#xa;registration_number (varchar)&#xa;tax_id (varchar)&#xa;contact_person_name (varchar)&#xa;contact_person_email (varchar)&#xa;contact_person_phone (varchar)&#xa;industry (varchar)&#xa;website (varchar, nullable)&#xa;status (varchar: pending/active/suspended)&#xa;kyb_status (varchar: not_started/pending/verified)&#xa;api_key (varchar, nullable)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="420" as="geometry"/>
+        </mxCell>
+
+        <!-- MERCHANT KYB VERIFICATION -->
+        <mxCell id="kyb" value="merchant_kyb_verification&#xa;----------------------&#xa;id (PK, serial)&#xa;merchant_id (FK -> merchants.merchant_id)&#xa;verification_status (varchar: pending/verified/rejected)&#xa;documents (JSONB)&#xa;verification_notes (text)&#xa;verified_by (varchar)&#xa;verified_at (timestamp)&#xa;rejection_reason (text)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="300" height="240" as="geometry"/>
+        </mxCell>
+
+        <!-- MERCHANT SETTLEMENTS -->
+        <mxCell id="settlements" value="merchant_settlements&#xa;----------------------&#xa;id (PK, serial)&#xa;settlement_id (varchar, unique)&#xa;merchant_id (FK -> merchants.merchant_id)&#xa;settlement_period_start (timestamp)&#xa;settlement_period_end (timestamp)&#xa;total_transactions (int)&#xa;gross_amount (decimal)&#xa;fees_amount (decimal)&#xa;net_amount (decimal)&#xa;bank_account_number (varchar)&#xa;bank_code (varchar)&#xa;account_name (varchar)&#xa;status (varchar: pending/processing/completed/failed)&#xa;processed_at (timestamp)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="400" y="320" width="300" height="300" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="merchants" target="kyb" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="merchants" target="settlements" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

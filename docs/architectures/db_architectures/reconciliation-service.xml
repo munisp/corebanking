@@ -1,0 +1,31 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Reconciliation Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- RECONCILIATION RUNS -->
+        <mxCell id="reconciliation_runs" value="reconciliation_runs&#xa;----------------------&#xa;id (PK, serial)&#xa;run_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;run_type (varchar: daily/weekly/on_demand)&#xa;period_start / period_end (timestamp)&#xa;status (varchar: running/completed/failed)&#xa;total_tb_transactions (int)&#xa;total_pg_transactions (int)&#xa;matched_count (int)&#xa;discrepancy_count (int)&#xa;started_at / completed_at (timestamp)&#xa;error_message (text, nullable)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="300" height="320" as="geometry"/>
+        </mxCell>
+
+        <!-- RECONCILIATION DISCREPANCIES -->
+        <mxCell id="discrepancies" value="reconciliation_discrepancies&#xa;----------------------&#xa;id (PK, serial)&#xa;run_id (FK -> reconciliation_runs)&#xa;discrepancy_type (varchar: missing_in_pg/missing_in_tb/amount_mismatch)&#xa;transaction_id (varchar)&#xa;tb_amount / pg_amount (bigint)&#xa;difference (bigint)&#xa;currency (varchar)&#xa;tenant_id (varchar)&#xa;status (varchar: open/investigating/resolved)&#xa;resolved_by / resolved_at&#xa;resolution_notes (text)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;" vertex="1" parent="1">
+          <mxGeometry x="400" y="40" width="300" height="320" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationship -->
+        <mxCell id="e1" edge="1" parent="1" source="reconciliation_runs" target="discrepancies" style="endArrow=block;strokeColor=#b85450;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+        <!-- Note -->
+        <mxCell id="note1" value="TigerBeetle is source of truth for balances.&#xa;PostgreSQL stores transaction metadata.&#xa;This service reconciles TB ledger entries&#xa;against PG transaction records daily." style="text;html=1;strokeColor=#82b366;fillColor=#d5e8d4;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="40" y="420" width="280" height="120" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

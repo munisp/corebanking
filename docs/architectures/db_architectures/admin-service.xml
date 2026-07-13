@@ -1,0 +1,25 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Admin Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- ADMIN TABLE -->
+        <mxCell id="admin" value="Admin&#xa;----------------------&#xa;id (PK, int)&#xa;first_name (varchar)&#xa;last_name (varchar)&#xa;email (varchar, unique)&#xa;phone (varchar)&#xa;uin (varchar)&#xa;tenant_id (varchar)&#xa;keycloak_id (varchar)&#xa;kyc_url (varchar, nullable)&#xa;access_level (varchar: super_admin | branch_manager |&#xa;  operations_manager | risk_manager |&#xa;  internal_auditor | it_admin |&#xa;  relationship_manager | compliance_officer |&#xa;  support_agent | ...)&#xa;is_verified (bool)&#xa;is_suspended (bool)&#xa;created_at&#xa;updated_at&#xa;deleted_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="200" y="60" width="340" height="360" as="geometry"/>
+        </mxCell>
+
+        <!-- NOTE: Platform roles vs Tenant roles -->
+        <mxCell id="note1" value="Platform Roles (54link admins):&#xa;super_admin, tenant_manager,&#xa;operations_manager, risk_manager,&#xa;internal_auditor, it_admin,&#xa;relationship_manager, compliance_officer,&#xa;support_agent&#xa;&#xa;Tenant Roles (bank staff):&#xa;super_admin, branch_manager,&#xa;vault_manager, treasury_manager,&#xa;loan_officer, trade_finance_admin, ..." style="text;html=1;strokeColor=#d6b656;fillColor=#fff2cc;align=left;verticalAlign=top;spacingLeft=4;spacingRight=4;overflow=hidden;rotatable=0;" vertex="1" parent="1">
+          <mxGeometry x="600" y="60" width="280" height="240" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" edge="1" parent="1" source="admin" target="note1" style="endArrow=none;dashed=1;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

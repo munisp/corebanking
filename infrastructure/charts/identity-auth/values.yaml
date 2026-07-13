@@ -1,0 +1,90 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-identity-auth
+  pullPolicy: IfNotPresent
+  tag: "0.0.14"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9364
+    - port: 9365
+    - port: 9366
+    - port: 9367
+    - port: 9368
+    - port: 9369
+    - port: 9370
+    - port: 9371
+    - port: 9372
+    - port: 9373
+    - port: 9374
+    - port: 9375
+    - port: 9376
+    - port: 9377
+    - port: 9378
+    - port: 9379
+    - port: 9380
+    - port: 9381
+    - port: 9382
+    - port: 9383
+    - port: 9384
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: identity-auth
+  appPort: 9368
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  DAPR_HOST: "localhost"
+  NODE_ENV: "production"
+  DB_DATABASE: "link_core_banking"
+  DB_DATABASE_TYPE: "postgres"
+  TEMPORAL_TASK_QUEUE: "verification-task-queue"
+  KYB_COLLECTION_FLOW_BASE_URL: "http://verification-service.54link-dev.svc.cluster.local:8383"
+  KYC_FLOW_BASE_URL: "https://kyc.54link-dev.upi.dev"
+  KYC_FLOW_API_KEY: "placeholder"
+  BALLERINE_API_URL: "https://api.ballerine.com"
+  BALLERINE_API_KEY: "placeholder"
+  DEFAULT_KYB_WORKFLOW_ID: "placeholder"
+  SHIELD_VERIFICATION_BASE_URL: "https://shield.verification.com"
+  SHIELD_VERIFICATION_API_KEY: "placeholder"
+  DEFAULT_CLIENT_ID: "54link-orchestrator"
+  DEFAULT_CLIENT_SECRET: "54link-orchestrator-secret"
+  DB_DATABASE: "link_core_banking"
+  DB_DATABASE_TYPE: "postgres"
+  DB_SSL_ENABLED: "true"
+  APP_PORT: "9364"
+  PORT_BASE: "9364"
+  SERVICE_GROUP: identity-auth
+  SERVICES: "auth-enforcer-rs,auth-service,biometric-auth-rs,biometric-service,browser-fingerprint-go,continuous-liveness-rs,face-match-rs,identity-channels-go,identity-verification-go,identity-verification-service,jwt-validator-rs,liveness-detection-rs,liveness-inference-py,liveness-orchestrator-go,mfa-orchestrator-go,otp-hardening-rs,pkce-auth-flow-go,token-rotation-rs,user-service"

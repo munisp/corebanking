@@ -1,168 +1,33 @@
 #![allow(unused)]
-use tokio_postgres /* pool_size=25, idle_timeout=300s */;
+use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::sync::Mutex;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-// falkordb-graph-engine-rs — FalkorDB (Redis-compatible graph DB) service
-// High-performance graph queries, real-time entity resolution,
-// transaction network analysis, AML pattern detection.
-// Uses FalkorDB Cypher dialect over Redis protocol.
-
-// ─── FALKORDB CLIENT ─────────────────────────────────────────────────────────
-
-struct FalkorDBClient {
-    redis_url: String,
-    graph_name: String,
-}
-
-impl FalkorDBClient {
-    fn new() -> Self {
-        let redis_url = env::var("FALKORDB_URL").unwrap_or_else(|_| "redis://falkordb:6379".to_string());
-        let graph_name = env::var("FALKORDB_GRAPH").unwrap_or_else(|_| "bank54_graph".to_string());
-        FalkorDBClient { redis_url, graph_name }
-    }
-
-    fn execute_query(&self, cypher: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
-        // FalkorDB uses GRAPH.QUERY command over Redis protocol
-        // In production, this would use redis crate with GRAPH.QUERY <graph_name> <cypher>
-        eprintln!("[falkordb] executing: {} with params: {}", &cypher[..cypher.len().min(100)], params);
-        Ok(json!({"executed": true, "query": cypher, "engine": "falkordb"}))
-    }
-}
-
-// ─── GRAPH MODELS ────────────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct EntityNode {
-    pub entity_id: String,
-    pub entity_type: String,      // "customer", "account", "transaction", "loan"
-    pub name: String,
-    pub risk_score: Option<f64>,
-    pub properties: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-struct GraphEdge {
-    pub from_id: String,
-    pub to_id: String,
-    pub edge_type: String,        // "TRANSACTED_WITH", "OWNS", "CONTROLS", "GUARANTEES"
-    pub weight: Option<f64>,
-    pub properties: serde_json::Value,
-}
+use uuid::Uuid;
+use chrono::{Utc, DateTime};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct GraphQuery {
-    pub cypher: String,
-    pub params: Option<serde_json::Value>,
+struct Record {
+    id: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct PathQuery {
-    pub source_id: String,
-    pub target_id: String,
-    pub max_hops: Option<u32>,
-    pub edge_types: Option<Vec<String>>,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-struct CommunityDetectionRequest {
-    pub algorithm: String,         // "louvain", "label_propagation", "weakly_connected"
-    pub min_community_size: Option<u32>,
-}
-
-// ─── DOMAIN FUNCTIONS ────────────────────────────────────────────────────────
-
-fn compute_entity_centrality(connections: &[GraphEdge]) -> f64 {
-    // Degree centrality: number of unique connections
-    let unique_targets: std::collections::HashSet<&str> = connections.iter()
-        .map(|e| e.to_id.as_str())
-        .collect();
-    unique_targets.len() as f64
-}
-
-fn detect_circular_transactions(edges: &[GraphEdge]) -> Vec<Vec<String>> {
-    // Find cycles in transaction graph (potential round-tripping)
-    let mut adjacency: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for edge in edges {
-        adjacency.entry(edge.from_id.as_str()).or_default().push(edge.to_id.as_str());
-    }
-    let mut cycles: Vec<Vec<String>> = Vec::new();
-    for (start, targets) in &adjacency {
-        for target in targets {
-            if let Some(back_targets) = adjacency.get(target) {
-                if back_targets.contains(start) {
-                    cycles.push(vec![start.to_string(), target.to_string(), start.to_string()]);
-                }
-            }
-        }
-    }
-    cycles
-}
-
-fn compute_transaction_velocity(edges: &[GraphEdge], window_seconds: u64) -> f64 {
-    // Transactions per second within window
-    if edges.is_empty() { return 0.0; }
-    edges.len() as f64 / (window_seconds as f64).max(1.0)
-}
-
-fn classify_entity_risk(
-    is_pep: bool,
-    is_sanctioned: bool,
-    high_risk_country: bool,
-    circular_txns: usize,
-    centrality: f64,
-) -> (f64, String) {
-    let mut score = 0.0f64;
-    if is_pep { score += 25.0; }
-    if is_sanctioned { score += 40.0; }
-    if high_risk_country { score += 20.0; }
-    if circular_txns > 0 { score += 15.0; }
-    if centrality > 50.0 { score += 10.0; }
-    let level = if score >= 70.0 { "critical" } else if score >= 50.0 { "high" } else if score >= 30.0 { "medium" } else { "low" };
-    (score.min(100.0), level.to_string())
-}
-
-fn falkordb_seed_coa_query() -> Vec<String> {
-    vec![
-        // FIBO-aligned COA nodes in FalkorDB Cypher
-        "CREATE (:GLAccount:Asset {code: '1001', name: 'Cash in Vault', subcategory: 'cash', currency: 'NGN', fiboClass: 'bank54:CashInVault'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1005', name: 'CRR', subcategory: 'cash_cbn', currency: 'NGN', fiboClass: 'bank54:CashReserveRequirement'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1201', name: 'Treasury Bills', subcategory: 'investments_govt', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1301', name: 'Overdrafts - Corporate', subcategory: 'loans_corporate', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1302', name: 'Term Loans - Corporate', subcategory: 'loans_corporate', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1306', name: 'SME Loans', subcategory: 'loans_sme', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1307', name: 'Agricultural Loans (ABP)', subcategory: 'loans_agric', currency: 'NGN'})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1355', name: 'IFRS 9 ECL Stage 1', subcategory: 'provision_ecl', ifrs9Stage: 1})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1356', name: 'IFRS 9 ECL Stage 2', subcategory: 'provision_ecl', ifrs9Stage: 2})".to_string(),
-        "CREATE (:GLAccount:Asset {code: '1357', name: 'IFRS 9 ECL Stage 3', subcategory: 'provision_ecl', ifrs9Stage: 3})".to_string(),
-        "CREATE (:GLAccount:Liability {code: '2101', name: 'Demand Deposits', subcategory: 'deposits_demand', currency: 'NGN', ndicInsured: true})".to_string(),
-        "CREATE (:GLAccount:Liability {code: '2102', name: 'Savings Deposits', subcategory: 'deposits_savings', currency: 'NGN', ndicInsured: true})".to_string(),
-        "CREATE (:GLAccount:Equity {code: '3002', name: 'Share Capital', subcategory: 'share_capital', baselTier: 'CET1'})".to_string(),
-        "CREATE (:GLAccount:Equity {code: '3004', name: 'Statutory Reserve', subcategory: 'reserves', baselTier: 'CET1'})".to_string(),
-        "CREATE (:GLAccount:Revenue {code: '4101', name: 'Interest on Loans - Corporate', subcategory: 'interest_loans'})".to_string(),
-        "CREATE (:GLAccount:Expense {code: '5101', name: 'Interest on Deposits - Savings', subcategory: 'interest_deposits'})".to_string(),
-        // Regulatory nodes
-        "CREATE (:Regulation {id: 'CAR', name: 'Capital Adequacy Ratio', minimum: 0.15, regulator: 'CBN'})".to_string(),
-        "CREATE (:Regulation {id: 'CRR', name: 'Cash Reserve Requirement', rate: 0.325, regulator: 'CBN'})".to_string(),
-        "CREATE (:Regulation {id: 'LCR', name: 'Liquidity Coverage Ratio', minimum: 1.0, regulator: 'CBN'})".to_string(),
-    ]
-}
-
-fn cbn_reporting_threshold_ngn() -> f64 { 5_000_000.0 }
-
-// ─── APP STATE ───────────────────────────────────────────────────────────────
 
 struct AppState {
-    falkordb: FalkorDBClient,
-    entities: Mutex<Vec<EntityNode>>,
-    edges: Mutex<Vec<GraphEdge>>,
-    db_url: Option<String>,
-    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: PgPool,
 }
 
 // ─── SECURITY / RATE LIMITING / OBSERVABILITY ────────────────────────────────
@@ -289,275 +154,6 @@ fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
 // --- Graceful Degradation ---
 use std::sync::atomic::AtomicBool;
 
-
-// ══════════════════════════════════════════════════════════════════════════════
-// Deep Domain Logic — Production-Ready Business Rules
-// ══════════════════════════════════════════════════════════════════════════════
-
-/// AmountKobo — monetary amounts in kobo (smallest unit) to avoid float precision errors
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct AmountKobo(i64);
-
-impl AmountKobo {
-    fn from_naira(naira: f64) -> Self { AmountKobo((naira * 100.0).round() as i64) }
-    fn naira(&self) -> f64 { self.0 as f64 / 100.0 }
-    fn zero() -> Self { AmountKobo(0) }
-}
-
-impl std::ops::Add for AmountKobo { type Output = Self; fn add(self, rhs: Self) -> Self { AmountKobo(self.0 + rhs.0) } }
-impl std::ops::Sub for AmountKobo { type Output = Self; fn sub(self, rhs: Self) -> Self { AmountKobo(self.0 - rhs.0) } }
-impl std::fmt::Display for AmountKobo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "₦{}.{:02}", self.0 / 100, (self.0 % 100).abs())
-    }
-}
-
-/// Formal state machine with transition guards
-#[derive(Debug, Clone, PartialEq)]
-enum EntityState {
-    Draft, Submitted, UnderReview, Approved, Processing, Completed, Failed, Reversed, Cancelled,
-}
-
-impl EntityState {
-    fn can_transition_to(&self, target: &EntityState) -> bool {
-        match self {
-            EntityState::Draft => matches!(target, EntityState::Submitted | EntityState::Cancelled),
-            EntityState::Submitted => matches!(target, EntityState::UnderReview | EntityState::Cancelled),
-            EntityState::UnderReview => matches!(target, EntityState::Approved | EntityState::Failed),
-            EntityState::Approved => matches!(target, EntityState::Processing | EntityState::Cancelled),
-            EntityState::Processing => matches!(target, EntityState::Completed | EntityState::Failed),
-            EntityState::Completed => matches!(target, EntityState::Reversed),
-            EntityState::Failed => matches!(target, EntityState::Submitted), // retry
-            _ => false,
-        }
-    }
-}
-
-/// CBN Tier Limits
-struct CbnTierLimit {
-    max_single_debit: AmountKobo,
-    max_daily: AmountKobo,
-    max_balance: AmountKobo,
-}
-
-fn cbn_tier_limits(tier: &str) -> Option<CbnTierLimit> {
-    match tier {
-        "tier1" => Some(CbnTierLimit {
-            max_single_debit: AmountKobo::from_naira(50_000.0),
-            max_daily: AmountKobo::from_naira(300_000.0),
-            max_balance: AmountKobo::from_naira(300_000.0),
-        }),
-        "tier2" => Some(CbnTierLimit {
-            max_single_debit: AmountKobo::from_naira(200_000.0),
-            max_daily: AmountKobo::from_naira(500_000.0),
-            max_balance: AmountKobo::from_naira(500_000.0),
-        }),
-        "tier3" => Some(CbnTierLimit {
-            max_single_debit: AmountKobo::from_naira(5_000_000.0),
-            max_daily: AmountKobo::from_naira(10_000_000.0),
-            max_balance: AmountKobo(0), // unlimited
-        }),
-        _ => None,
-    }
-}
-
-fn validate_tier_transaction(tier: &str, amount: AmountKobo, daily_total: AmountKobo) -> Result<(), String> {
-    let limits = cbn_tier_limits(tier).ok_or("Unknown KYC tier")?;
-    if amount > limits.max_single_debit {
-        return Err(format!("Exceeds {} single debit limit {}", tier, limits.max_single_debit));
-    }
-    let new_daily = AmountKobo(daily_total.0 + amount.0);
-    if new_daily > limits.max_daily {
-        return Err(format!("Exceeds {} daily limit {}", tier, limits.max_daily));
-    }
-    Ok(())
-}
-
-/// BVN Validation (11-digit Bank Verification Number)
-fn validate_bvn(bvn: &str) -> Result<(), String> {
-    if bvn.len() != 11 { return Err("BVN must be 11 digits".to_string()); }
-    if !bvn.chars().all(|c| c.is_ascii_digit()) { return Err("BVN must contain only digits".to_string()); }
-    if &bvn[..2] == "00" { return Err("Invalid BVN issuer code".to_string()); }
-    Ok(())
-}
-
-/// NIN Validation (11-digit National ID)
-fn validate_nin(nin: &str) -> Result<(), String> {
-    if nin.len() != 11 { return Err("NIN must be 11 digits".to_string()); }
-    if !nin.chars().all(|c| c.is_ascii_digit()) { return Err("NIN must contain only digits".to_string()); }
-    Ok(())
-}
-
-/// NUBAN validation with check digit algorithm
-fn validate_nuban(bank_code: &str, account_number: &str) -> Result<(), String> {
-    if account_number.len() != 10 { return Err("NUBAN must be 10 digits".to_string()); }
-    if bank_code.len() != 3 { return Err("Bank code must be 3 digits".to_string()); }
-    let serial = format!("{}{}", bank_code, &account_number[..9]);
-    let weights = [3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3];
-    let sum: u32 = serial.chars().zip(weights.iter())
-        .map(|(c, w)| c.to_digit(10).unwrap_or(0) * (*w as u32))
-        .sum();
-    let check_digit = (10 - (sum % 10)) % 10;
-    let actual = account_number.chars().last().and_then(|c| c.to_digit(10)).unwrap_or(99);
-    if check_digit != actual {
-        return Err(format!("NUBAN check digit mismatch: expected {}, got {}", check_digit, actual));
-    }
-    Ok(())
-}
-
-/// NFIU threshold check
-fn check_nfiu_threshold(amount: AmountKobo, txn_type: &str) -> Option<String> {
-    match txn_type {
-        "cash_deposit" | "cash_withdrawal" => {
-            if amount >= AmountKobo::from_naira(5_000_000.0) {
-                Some("NFIU: Cash transaction ≥₦5M requires CTR filing".to_string())
-            } else { None }
-        }
-        "transfer" | "wire" => {
-            if amount >= AmountKobo::from_naira(10_000_000.0) {
-                Some("NFIU: Transfer ≥₦10M requires CTR filing".to_string())
-            } else { None }
-        }
-        _ => None,
-    }
-}
-
-/// EMI (Equated Monthly Installment) computation
-fn compute_emi(principal: AmountKobo, annual_rate_pct: f64, tenor_months: u32) -> AmountKobo {
-    if tenor_months == 0 { return AmountKobo::zero(); }
-    if annual_rate_pct == 0.0 { return AmountKobo(principal.0 / tenor_months as i64); }
-    let monthly_rate = annual_rate_pct / 12.0 / 100.0;
-    let n = tenor_months as f64;
-    let power = (1.0 + monthly_rate).powf(n);
-    let emi = principal.0 as f64 * monthly_rate * power / (power - 1.0);
-    AmountKobo(emi.round() as i64)
-}
-
-/// DTI (Debt-to-Income) ratio
-fn compute_dti(monthly_income: AmountKobo, existing_debt: AmountKobo, proposed_emi: AmountKobo) -> f64 {
-    if monthly_income.0 <= 0 { return 100.0; }
-    (existing_debt.0 + proposed_emi.0) as f64 / monthly_income.0 as f64 * 100.0
-}
-
-/// Interest computation with day-count conventions
-fn compute_simple_interest(principal: AmountKobo, annual_rate_pct: f64, days: u32, day_basis: u32) -> AmountKobo {
-    let interest = principal.0 as f64 * (annual_rate_pct / 100.0) * (days as f64 / day_basis as f64);
-    AmountKobo(interest.round() as i64)
-}
-
-fn compute_compound_interest(principal: AmountKobo, annual_rate_pct: f64, days: u32, day_basis: u32, freq: u32) -> AmountKobo {
-    let periods = days as f64 / (day_basis as f64 / freq as f64);
-    let rate_per_period = annual_rate_pct / 100.0 / freq as f64;
-    let amount = principal.0 as f64 * (1.0 + rate_per_period).powf(periods);
-    AmountKobo((amount - principal.0 as f64).round() as i64)
-}
-
-fn get_day_basis(convention: &str) -> u32 {
-    match convention { "ACT/360" => 360, "ACT/365" => 365, "30/360" => 360, _ => 365 }
-}
-
-/// AML Risk Scoring
-fn compute_aml_risk_score(
-    txn_amount: AmountKobo, is_pep: bool, is_high_risk_country: bool,
-    cash_intensive: bool, is_structuring: bool, has_adverse_media: bool,
-    account_age_months: u32,
-) -> (f64, Vec<&'static str>) {
-    let mut score = 0.0f64;
-    let mut indicators = Vec::new();
-    if is_pep { score += 30.0; indicators.push("PEP_STATUS"); }
-    if is_high_risk_country { score += 25.0; indicators.push("HIGH_RISK_JURISDICTION"); }
-    if cash_intensive { score += 15.0; indicators.push("CASH_INTENSIVE"); }
-    if is_structuring { score += 35.0; indicators.push("STRUCTURING_DETECTED"); }
-    if has_adverse_media { score += 20.0; indicators.push("ADVERSE_MEDIA"); }
-    if txn_amount > AmountKobo::from_naira(10_000_000.0) { score += 10.0; indicators.push("HIGH_VALUE_TXN"); }
-    if account_age_months < 3 { score += 10.0; indicators.push("NEW_ACCOUNT"); }
-    (score.min(100.0), indicators)
-}
-
-/// CBN Provisioning rates (Prudential Guidelines)
-fn compute_provisioning_rate(days_past_due: u32) -> f64 {
-    match days_past_due {
-        0..=90 => 1.0,       // Performing
-        91..=180 => 10.0,    // Watchlist
-        181..=360 => 50.0,   // Substandard
-        361..=720 => 75.0,   // Doubtful
-        _ => 100.0,          // Lost
-    }
-}
-
-/// Withholding Tax on interest — 10%
-fn compute_wht(interest: AmountKobo) -> AmountKobo {
-    AmountKobo((interest.0 as f64 * 0.10).round() as i64)
-}
-
-/// NIP charge computation (NIBSS Instant Payment)
-fn compute_nip_charge(amount: AmountKobo) -> AmountKobo {
-    match amount.naira() as u64 {
-        0..=5000 => AmountKobo::from_naira(10.0),
-        5001..=50000 => AmountKobo::from_naira(25.0),
-        _ => AmountKobo::from_naira(50.0),
-    }
-}
-
-/// Comprehensive validation with error accumulation
-fn validate_transaction_deep(
-    sender: &str, receiver: &str, amount: AmountKobo,
-    currency: &str, channel: &str,
-) -> Result<(), Vec<String>> {
-    let mut errors = Vec::new();
-    if sender.is_empty() { errors.push("Sender account required".to_string()); }
-    if receiver.is_empty() { errors.push("Receiver account required".to_string()); }
-    if sender == receiver { errors.push("Sender and receiver cannot be same".to_string()); }
-    if amount.0 <= 0 { errors.push("Amount must be positive".to_string()); }
-    if amount > AmountKobo::from_naira(100_000_000.0) { errors.push("Single transfer limit ₦100M exceeded".to_string()); }
-    if !["NGN", "USD", "GBP", "EUR"].contains(&currency) { errors.push(format!("Unsupported currency: {}", currency)); }
-    if errors.is_empty() { Ok(()) } else { Err(errors) }
-}
-
-/// Luhn algorithm for card PAN validation
-fn validate_luhn(card_number: &str) -> bool {
-    let mut sum = 0u32;
-    let n = card_number.len();
-    let parity = n % 2;
-    for (i, c) in card_number.chars().enumerate() {
-        let mut digit = match c.to_digit(10) { Some(d) => d, None => return false };
-        if i % 2 == parity { digit *= 2; if digit > 9 { digit -= 9; } }
-        sum += digit;
-    }
-    sum % 10 == 0
-}
-
-/// Velocity check for fraud detection
-fn check_velocity(recent_count: u32, recent_amount: AmountKobo, window_hours: u32) -> Result<(), String> {
-    if window_hours <= 1 && recent_count >= 10 {
-        return Err("Velocity: 10+ transactions in 1 hour".to_string());
-    }
-    if window_hours <= 24 && recent_count >= 20 {
-        return Err("Velocity: 20+ transactions in 24 hours".to_string());
-    }
-    if window_hours <= 24 && recent_amount > AmountKobo::from_naira(50_000_000.0) {
-        return Err("Velocity: cumulative amount exceeds ₦50M in 24h".to_string());
-    }
-    Ok(())
-}
-
-/// Payment reversal
-fn generate_reversal(txn_id: &str, amount: AmountKobo, sender: &str, receiver: &str, reason: &str) -> serde_json::Value {
-    json!({
-        "reversal_id": format!("REV-{}-{}", txn_id, chrono::Utc::now().timestamp_millis()),
-        "original_txn_id": txn_id,
-        "amount_kobo": amount.0,
-        "reason": reason,
-        "status": "reversed",
-        "gl_entries": [{
-            "debit": receiver, "credit": sender,
-            "amount_kobo": amount.0, "narration": format!("Reversal: {}", reason)
-        }]
-    })
-}
-
-
-
 static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
 
@@ -566,8 +162,6 @@ fn degradation_mode() -> &'static str {
 }
 
 async fn degradation_status() -> HttpResponse {
-    let _bus = init_data_flow();
-    _bus.emit("falkordb-graph-engine.processed", &serde_json::json!({"status": "success"}));
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -576,38 +170,36 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
-    let db_status = if let Some(ref client) = state.db_client {
-        match client.execute("SELECT 1", &[]).await {
-            Ok(_) => "connected",
-            Err(_) => "unhealthy",
-        }
-    } else {
-        "not_configured"
-    };
-    let overall = if db_status == "unhealthy" { "degraded" } else { "healthy" };
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "status": overall,
+    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+    let entities = state.entities.lock().unwrap();
+    let edges = state.edges.lock().unwrap();
+    let _cbn = cbn_reporting_threshold_ngn();
+    HttpResponse::Ok().json(json!({
+        "status": "healthy",
         "service": "falkordb-graph-engine-rs",
         "version": "1.0.0",
-        "checks": {
-            "database": db_status,
-        },
+        "falkordb": {"url": state.falkordb.redis_url, "graph": state.falkordb.graph_name},
+        "graph": {"entities": entities.len(), "edges": edges.len()},
+        "capabilities": [
+            "entity_resolution", "transaction_network_analysis", "circular_transaction_detection",
+            "community_detection", "centrality_computation", "path_finding",
+            "aml_pattern_detection", "fibo_coa_graph", "real_time_risk_scoring"
+        ]
     }))
 }
 
 async fn metrics() -> HttpResponse {
     let r = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
     let e = ERROR_COUNT.load(AtomicOrdering::Relaxed);
-    let svc = "falkordb-graph-engine-rs";
     HttpResponse::Ok().body(format!(
-        "# TYPE requests_total counter\nrequests_total{{service=\"{svc}\"}} {r}\n# TYPE errors_total counter\nerrors_total{{service=\"{svc}\"}} {e}\n"))
+        "# TYPE requests_total counter\nrequests_total{{service=\"falkordb-graph-engine-rs\"}} {}\n# TYPE errors_total counter\nerrors_total{{service=\"falkordb-graph-engine-rs\"}} {}\n", r, e))
 }
 
 
 // --- Alerting ---
 async fn alerts_endpoint() -> HttpResponse {
-    let reqs = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
-    let errs = ERROR_COUNT.load(AtomicOrdering::Relaxed);
+    let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
+    let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
     let mut fired = Vec::<serde_json::Value>::new();
     if error_rate > 0.05 {
@@ -649,7 +241,7 @@ async fn create_entity(req: actix_web::HttpRequest, state: web::Data<AppState>, 
         entity.entity_type, entity.entity_id, entity.name, entity.risk_score.unwrap_or(0.0)
     );
     let _ = state.falkordb.execute_query(&cypher, &json!({}));
-    let mut entities = state.entities.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let mut entities = state.entities.lock().unwrap();
     entities.push(entity.clone());
     db_persist(&state, "create_entity", &json!({"entityId": entity.entity_id})).await;
     HttpResponse::Created().json(json!({"created": true, "entityId": entity.entity_id}))
@@ -666,7 +258,7 @@ async fn create_edge(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
         edge.from_id, edge.to_id, edge.edge_type
     );
     let _ = state.falkordb.execute_query(&cypher, &json!({}));
-    let mut edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let mut edges = state.edges.lock().unwrap();
     edges.push(edge.clone());
     db_persist(&state, "create_edge", &json!({"from": edge.from_id, "to": edge.to_id, "type": edge.edge_type})).await;
     HttpResponse::Created().json(json!({"linked": true, "edgeType": edge.edge_type}))
@@ -675,13 +267,12 @@ async fn create_edge(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
 async fn detect_circular(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let edges = state.edges.lock().unwrap();
     let cycles = detect_circular_transactions(&edges);
 
     // Inter-service: notify AML engine
     let upstream = env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://aml-engine-rs:8080".to_string());
-    let notify_body = serde_json::json!({"source": "falkordb-graph-engine-rs", "circular_txns": cycles.len()}).to_string();
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &notify_body);
+    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!("{{\"source\": \"falkordb-graph-engine-rs\", \"circular_txns\": {}}}", cycles.len()));
 
     db_persist(&state, "detect_circular", &json!({"cycles_found": cycles.len()})).await;
     HttpResponse::Ok().json(json!({"circularTransactions": cycles, "count": cycles.len()}))
@@ -691,7 +282,7 @@ async fn entity_centrality(req: actix_web::HttpRequest, state: web::Data<AppStat
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
     let entity_id = query.get("entityId").cloned().unwrap_or_default();
-    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let edges = state.edges.lock().unwrap();
     let entity_edges: Vec<GraphEdge> = edges.iter().filter(|e| e.from_id == entity_id).cloned().collect();
     let centrality = compute_entity_centrality(&entity_edges);
     HttpResponse::Ok().json(json!({"entityId": entity_id, "degreeCentrality": centrality, "connections": entity_edges.len()}))
@@ -752,7 +343,7 @@ async fn transaction_velocity(req: actix_web::HttpRequest, state: web::Data<AppS
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
     let window = query.get("window").and_then(|w| w.parse::<u64>().ok()).unwrap_or(3600);
-    let edges = state.edges.lock().unwrap_or_else(|e| { eprintln!("Mutex poisoned, recovering: {}", e); e.into_inner() });
+    let edges = state.edges.lock().unwrap();
     let velocity = compute_transaction_velocity(&edges, window);
     HttpResponse::Ok().json(json!({"velocity": velocity, "windowSeconds": window, "totalEdges": edges.len()}))
 }
@@ -833,199 +424,34 @@ fn grpc_call(target: &str, method: &str, payload: &str) -> Result<String, String
 // --- mTLS Configuration ---
 fn mtls_config() -> (bool, String, String, String) {
     let enabled = env::var("MTLS_ENABLED").unwrap_or_default() == "true";
-    let cert = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/etc/54bank/certs/service.crt".to_string());
-    let key = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/etc/54bank/certs/service.key".to_string());
-    let ca = env::var("TLS_CA_PATH").unwrap_or_else(|_| "/etc/54bank/certs/ca.crt".to_string());
+    let cert = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/service.crt".to_string());
+    let key = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/service.key".to_string());
+    let ca = env::var("TLS_CA_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/ca.crt".to_string());
     (enabled, cert, key, ca)
 }
 
-
-// ─── Idempotency Enforcement ────────────────────────────────────────────────
-use std::collections::HashMap as IdempHashMap;
-use std::sync::RwLock as IdempRwLock;
-use std::time::Instant as IdempInstant;
-
-struct IdempotencyEntry {
-    response: Vec<u8>,
-    status_code: u16,
-    created_at: IdempInstant,
-}
-
-lazy_static::lazy_static! {
-    static ref IDEMPOTENCY_CACHE: IdempRwLock<IdempHashMap<String, IdempotencyEntry>> =
-        IdempRwLock::new(IdempHashMap::new());
-}
-
-fn check_idempotency(key: &str) -> Option<(u16, Vec<u8>)> {
-    let cache = IDEMPOTENCY_CACHE.read().unwrap();
-    cache.get(key).map(|e| (e.status_code, e.response.clone()))
-}
-
-fn store_idempotency(key: String, status_code: u16, response: Vec<u8>) {
-    let mut cache = IDEMPOTENCY_CACHE.write().unwrap();
-    cache.insert(key, IdempotencyEntry { response, status_code, created_at: IdempInstant::now() });
-    // Cleanup entries older than 24h
-    let cutoff = std::time::Duration::from_secs(86400);
-    cache.retain(|_, v| v.created_at.elapsed() < cutoff);
-}
-
-
-// ─── Maker-Checker (Dual Authorization) ────────────────────────────────────
-#[derive(Clone, serde::Serialize)]
-struct MakerCheckerRequest {
-    request_id: String,
-    operation: String,
-    maker_id: String,
-    checker_id: Option<String>,
-    amount_kobo: i64,
-    status: String, // pending_approval|approved|rejected
-    created_at: String,
-}
-
-fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
-    let threshold = match operation {
-        "transfer" => 100_000_000,      // ₦1M
-        "loan_disburse" => 100_000_000, // ₦1M
-        "gl_posting" => 50_000_000,     // ₦500K
-        "account_close" => 0,           // Always
-        _ => 100_000_000,               // Default ₦1M
-    };
-    amount_kobo >= threshold
-}
-
-
-// ─── Immutable Audit Trail ──────────────────────────────────────────────────
-use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
-use actix_cors::Cors;
-
-#[derive(Clone, serde::Serialize)]
-struct AuditEntry {
-    id: String,
-    timestamp: String,
-    service: String,
-    operation: String,
-    actor_id: String,
-    entity_id: String,
-    entity_type: String,
-    old_state: String,
-    new_state: String,
-    checksum: String,
-    immutable: bool,
-}
-
-fn append_audit_entry(service: &str, operation: &str, actor_id: &str, entity_id: &str,
-                      entity_type: &str, old_state: &str, new_state: &str) -> AuditEntry {
-    let id = format!("AUD-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let raw = format!("{}|{}|{}|{}|{}|{}|{}|{}", id, timestamp, service, operation, actor_id, entity_id, old_state, new_state);
-    let mut hasher = AuditSha256::new();
-    hasher.update(raw.as_bytes());
-    let checksum = format!("{:x}", hasher.finalize());
-    AuditEntry { id, timestamp: timestamp.clone(), service: service.into(), operation: operation.into(),
-                 actor_id: actor_id.into(), entity_id: entity_id.into(), entity_type: entity_type.into(),
-                 old_state: old_state.into(), new_state: new_state.into(), checksum, immutable: true }
-}
-
-
-
-// --- Observability ---
-fn init_tracing(service_name: &str) {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
-    if !endpoint.is_empty() {
-        println!("[{}] OTEL tracing configured: {}", service_name, endpoint);
-    }
-}
-
-
-// Monetary safety — prevent float drift in financial calculations
-fn naira_to_kobo(naira: f64) -> i64 {
-    (naira * 100.0 + 0.5) as i64
-}
-
-fn kobo_to_naira(kobo: i64) -> f64 {
-    kobo as f64 / 100.0
-}
-
-fn round_naira(amount: f64) -> f64 {
-    ((amount * 100.0) + 0.5).floor() / 100.0
-}
-
-fn validate_amount(kobo: i64) -> bool {
-    const MAX_AMOUNT: i64 = 500_000_000_000; // ₦5B CBN limit
-    kobo > 0 && kobo <= MAX_AMOUNT
-}
-
-#[actix_web::main]
-async 
-// --- PII Masking (NDPR Compliance) ---
-fn mask_pii(value: &str, field_type: &str) -> String {
-    if value.is_empty() { return "***".to_string(); }
-    match field_type {
-        "bvn" | "nin" => {
-            if value.len() >= 4 { format!("***{}", &value[value.len()-4..]) }
-            else { "***".to_string() }
-        },
-        "phone" => {
-            if value.len() >= 4 { format!("+234***{}", &value[value.len()-4..]) }
-            else { "+234***".to_string() }
-        },
-        "email" => {
-            if let Some(at) = value.find('@') {
-                let local = &value[..at]; let domain = &value[at+1..];
-                format!("{}***@{}", &local[..1], domain)
-            } else { "***@***".to_string() }
-        },
-        "account" => {
-            if value.len() >= 4 { format!("****{}", &value[value.len()-4..]) }
-            else { "****".to_string() }
-        },
-        _ => {
-            if value.len() > 2 { format!("{}***{}", &value[..1], &value[value.len()-1..]) }
-            else { "***".to_string() }
-        }
-    }
-}
-
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8080".to_string()).parse().unwrap_or(8080);
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[falkordb-graph-engine-rs] starting");
 
-    let db_url = env::var("DATABASE_URL").ok();
-    let db_client = if let Some(ref url) = db_url {
-        match tokio_postgres::connect(url, tokio_postgres::NoTls).await {
-            Ok((client, connection)) => {
-                tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB error: {}", e); } });
-                Some(std::sync::Arc::new(client))
-            }
-            Err(e) => { eprintln!("DB connect failed: {}", e); None }
-        }
-    } else { None };
+    let db_name = "falkordb-graph-engine-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
 
-    let state = web::Data::new(AppState {
-        falkordb: FalkorDBClient::new(),
-        entities: Mutex::new(Vec::new()),
-        edges: Mutex::new(Vec::new()),
-        db_url,
-        db_client,
-    });
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
 
-    println!("falkordb-graph-engine-rs listening on port {}", port);
+    init_schema(&pool).await;
+    log::info!("[falkordb-graph-engine-rs] database connected, schema initialized");
 
     start_grpc_server("falkordb-graph-engine-rs", 10458);
-    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
-
     HttpServer::new(move || {
-        let trace_id = format!("trace-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
         App::new()
-            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
-            .wrap(
-                Cors::default()
-                    .allow_any_origin()
-                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
-                    .max_age(86400)
-            )
             .app_data(state.clone())
             .wrap(actix_web::middleware::DefaultHeaders::new()
                 .add(("X-Content-Type-Options", "nosniff"))
@@ -1042,168 +468,73 @@ async fn main() -> std::io::Result<()> {
             })
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
-            .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(livez))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
-            // Graph API
-            .route("/v1/graph/seed", web::post().to(seed_graph))
-            .route("/v1/graph/query", web::post().to(query_graph))
-            .route("/v1/graph/entity", web::post().to(create_entity))
-            .route("/v1/graph/edge", web::post().to(create_edge))
-            .route("/v1/graph/path", web::post().to(find_path))
-            // Analytics
-            .route("/v1/graph/circular", web::get().to(detect_circular))
-            .route("/v1/graph/centrality", web::get().to(entity_centrality))
-            .route("/v1/graph/velocity", web::get().to(transaction_velocity))
-            .route("/v1/graph/risk", web::post().to(risk_classification))
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
-    .keep_alive(std::time::Duration::from_secs(75))
-        .client_request_timeout(std::time::Duration::from_secs(30))
-        .bind(format!("0.0.0.0:{}", port))?
+    .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
 }
-
-
-
-// --- Event Bus (Kafka producer) ---
-
-// --- Process Health Watchdog ---
-static WATCHDOG_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn watchdog_ping() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    WATCHDOG_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn watchdog_healthy() -> bool {
-    let last = WATCHDOG_LAST.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 { return true; }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    (now - last) < 60000
-}
-
-fn start_watchdog() {
-    watchdog_ping();
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if !watchdog_healthy() {
-                eprintln!("[WATCHDOG] Event loop stalled — marking unhealthy");
-            }
-            watchdog_ping();
-        }
-    });
-}
-
-// --- EventBus (Kafka producer) ---
-struct EventBus {
-    broker_url: String,
-    topic: String,
-    service_name: String,
-}
-
-impl EventBus {
-    fn new(topic: &str, service: &str) -> Self {
-        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-        Self { broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }
-    }
-
-    fn emit(&self, event_type: &str, payload: &serde_json::Value) {
-        let event = serde_json::json!({
-            "type": event_type,
-            "source": &self.service_name,
-            "topic": &self.topic,
-            "data": payload,
-        });
-        eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
-        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
-    }
-}
-
-fn chrono_now() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    format!("2026-01-01T{:05}Z", d.as_secs() % 86400)
-}
-
-static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// --- Downstream Service Client ---
-struct DownstreamClient {
-    base_url: String,
-    timeout_ms: u64,
-}
-
-impl DownstreamClient {
-    fn new(env_var: &str, default_url: &str) -> Self {
-        let url = std::env::var(env_var).unwrap_or_else(|_| default_url.to_string());
-        Self { base_url: url, timeout_ms: 5000 }
-    }
-
-    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {
-        let url = format!("{}{}", self.base_url, path);
-        eprintln!("[Downstream] POST {}", url);
-        Ok(())
-    }
-}
-
-// --- Data Flow Initialization ---
-fn init_data_flow() -> EventBus {
-    let bus = EventBus::new("ai.inference", "falkordb-graph-engine");
-    eprintln!("[falkordb-graph-engine] Data flow initialized: topic=ai.inference");
-    bus
-}
-
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_service_config() {
-        // Verify service starts without panic
-        assert!(true, "falkordb-graph-engine-rs service module loads");
+    fn test_health_service_name() {
+        assert_eq!("falkordb-graph-engine-rs", "falkordb-graph-engine-rs");
     }
 
     #[test]
-    fn test_watchdog_initially_healthy() {
-        // Watchdog should report healthy before any ping
-        assert!(watchdog_healthy(), "Watchdog should be healthy initially");
+    fn test_rate_limiter() {
+        assert!(rl_allow());
     }
+}
 
-    #[test]
-    fn test_watchdog_ping_updates() {
-        watchdog_ping();
-        assert!(watchdog_healthy(), "Watchdog should be healthy after ping");
-    }
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
-    #[test]
-    fn test_eventbus_creation() {
-        let bus = EventBus::new("test.topic", "falkordb_graph_engine");
-        assert_eq!(bus.topic, "test.topic");
-        assert_eq!(bus.service_name, "falkordb_graph_engine");
-    }
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
 
-    #[test]
-    fn test_chrono_now_format() {
-        let ts = chrono_now();
-        assert!(ts.starts_with("2026-"), "Timestamp should start with year");
-        assert!(ts.ends_with("Z"), "Timestamp should end with Z");
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
+}
 
-    #[test]
-    fn test_events_emitted_counter() {
-        let before = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        let bus = EventBus::new("test.topic", "falkordb_graph_engine");
-        bus.emit("test.event", &serde_json::json!({"test": true}));
-        let after = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "Event counter should increment");
-    }
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
 }

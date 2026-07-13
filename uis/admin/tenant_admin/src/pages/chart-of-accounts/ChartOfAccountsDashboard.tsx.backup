@@ -1,0 +1,1541 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  accountsApi,
+  categoriesApi,
+  reportsApi,
+  reconciliationApi,
+  tenantsApi,
+  type Account,
+  type AccountType,
+  type AccountCategory,
+  type TrialBalance,
+  type BalanceSheet,
+  type IncomeStatement,
+  type ReconciliationStatus,
+  type AccountHierarchyNode,
+  type Tenant,
+} from '../../api/chartOfAccountsApi';
+
+const styles = {
+  container: {
+    minHeight: '100vh',
+    backgroundColor: '#F3F4F6',
+    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+  } as React.CSSProperties,
+  header: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '16px 24px',
+    backgroundColor: '#FFFFFF',
+    borderBottom: '1px solid #E5E7EB',
+    position: 'sticky' as const,
+    top: 0,
+    zIndex: 100,
+  } as React.CSSProperties,
+  headerTitle: {
+    fontSize: '24px',
+    fontWeight: 700,
+    color: '#1F2937',
+    margin: 0,
+  } as React.CSSProperties,
+  headerActions: {
+    display: 'flex',
+    gap: '12px',
+  } as React.CSSProperties,
+  tabBar: {
+    display: 'flex',
+    backgroundColor: '#FFFFFF',
+    borderBottom: '1px solid #E5E7EB',
+    overflowX: 'auto' as const,
+  } as React.CSSProperties,
+  tab: {
+    padding: '16px 24px',
+    textAlign: 'center' as const,
+    cursor: 'pointer',
+    border: 'none',
+    backgroundColor: 'transparent',
+    color: '#6B7280',
+    fontSize: '14px',
+    fontWeight: 500,
+    borderBottom: '2px solid transparent',
+    transition: 'all 0.2s',
+    whiteSpace: 'nowrap' as const,
+  } as React.CSSProperties,
+  activeTab: {
+    color: '#2563EB',
+    borderBottomColor: '#2563EB',
+  } as React.CSSProperties,
+  content: {
+    padding: '24px',
+    maxWidth: '1600px',
+    margin: '0 auto',
+  } as React.CSSProperties,
+  statsGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))',
+    gap: '16px',
+    marginBottom: '24px',
+  } as React.CSSProperties,
+  statCard: {
+    backgroundColor: '#FFFFFF',
+    padding: '20px',
+    borderRadius: '12px',
+    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+  } as React.CSSProperties,
+  statLabel: {
+    fontSize: '12px',
+    color: '#6B7280',
+    marginBottom: '4px',
+    textTransform: 'uppercase' as const,
+  } as React.CSSProperties,
+  statValue: {
+    fontSize: '28px',
+    fontWeight: 700,
+    color: '#1F2937',
+  } as React.CSSProperties,
+  card: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: '12px',
+    boxShadow: '0 1px 3px rgba(0,0,0,0.1)',
+    marginBottom: '24px',
+  } as React.CSSProperties,
+  cardHeader: {
+    padding: '16px 20px',
+    borderBottom: '1px solid #E5E7EB',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  } as React.CSSProperties,
+  cardTitle: {
+    fontSize: '16px',
+    fontWeight: 600,
+    color: '#1F2937',
+    margin: 0,
+  } as React.CSSProperties,
+  cardBody: {
+    padding: '20px',
+  } as React.CSSProperties,
+  searchBar: {
+    display: 'flex',
+    gap: '12px',
+    marginBottom: '24px',
+  } as React.CSSProperties,
+  searchInput: {
+    flex: 1,
+    padding: '12px 16px',
+    border: '1px solid #E5E7EB',
+    borderRadius: '8px',
+    fontSize: '14px',
+    outline: 'none',
+  } as React.CSSProperties,
+  button: {
+    padding: '10px 20px',
+    border: 'none',
+    borderRadius: '8px',
+    fontSize: '14px',
+    fontWeight: 500,
+    cursor: 'pointer',
+    transition: 'all 0.2s',
+  } as React.CSSProperties,
+  primaryButton: {
+    backgroundColor: '#2563EB',
+    color: '#FFFFFF',
+  } as React.CSSProperties,
+  secondaryButton: {
+    backgroundColor: '#FFFFFF',
+    color: '#1F2937',
+    border: '1px solid #E5E7EB',
+  } as React.CSSProperties,
+  successButton: {
+    backgroundColor: '#10B981',
+    color: '#FFFFFF',
+  } as React.CSSProperties,
+  table: {
+    width: '100%',
+    borderCollapse: 'collapse' as const,
+  } as React.CSSProperties,
+  th: {
+    padding: '12px 16px',
+    textAlign: 'left' as const,
+    fontSize: '12px',
+    fontWeight: 600,
+    color: '#6B7280',
+    textTransform: 'uppercase' as const,
+    borderBottom: '1px solid #E5E7EB',
+    backgroundColor: '#F9FAFB',
+  } as React.CSSProperties,
+  td: {
+    padding: '12px 16px',
+    fontSize: '14px',
+    color: '#1F2937',
+    borderBottom: '1px solid #E5E7EB',
+  } as React.CSSProperties,
+  badge: {
+    padding: '4px 10px',
+    borderRadius: '12px',
+    fontSize: '12px',
+    fontWeight: 600,
+  } as React.CSSProperties,
+  treeNode: {
+    paddingLeft: '20px',
+  } as React.CSSProperties,
+  treeItem: {
+    display: 'flex',
+    alignItems: 'center',
+    padding: '8px 12px',
+    cursor: 'pointer',
+    borderRadius: '6px',
+    transition: 'background-color 0.2s',
+  } as React.CSSProperties,
+  treeExpander: {
+    width: '20px',
+    height: '20px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: '8px',
+    cursor: 'pointer',
+  } as React.CSSProperties,
+  modal: {
+    position: 'fixed' as const,
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 1000,
+  } as React.CSSProperties,
+  modalContent: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: '12px',
+    width: '90%',
+    maxWidth: '600px',
+    maxHeight: '90vh',
+    overflow: 'auto',
+  } as React.CSSProperties,
+  modalHeader: {
+    padding: '20px',
+    borderBottom: '1px solid #E5E7EB',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  } as React.CSSProperties,
+  modalBody: {
+    padding: '20px',
+  } as React.CSSProperties,
+  modalFooter: {
+    padding: '16px 20px',
+    borderTop: '1px solid #E5E7EB',
+    display: 'flex',
+    justifyContent: 'flex-end',
+    gap: '12px',
+  } as React.CSSProperties,
+  formGroup: {
+    marginBottom: '16px',
+  } as React.CSSProperties,
+  label: {
+    display: 'block',
+    fontSize: '14px',
+    fontWeight: 500,
+    color: '#374151',
+    marginBottom: '6px',
+  } as React.CSSProperties,
+  input: {
+    width: '100%',
+    padding: '10px 12px',
+    border: '1px solid #D1D5DB',
+    borderRadius: '6px',
+    fontSize: '14px',
+    outline: 'none',
+    boxSizing: 'border-box' as const,
+  } as React.CSSProperties,
+  select: {
+    width: '100%',
+    padding: '10px 12px',
+    border: '1px solid #D1D5DB',
+    borderRadius: '6px',
+    fontSize: '14px',
+    outline: 'none',
+    backgroundColor: '#FFFFFF',
+    boxSizing: 'border-box' as const,
+  } as React.CSSProperties,
+  textarea: {
+    width: '100%',
+    padding: '10px 12px',
+    border: '1px solid #D1D5DB',
+    borderRadius: '6px',
+    fontSize: '14px',
+    outline: 'none',
+    minHeight: '80px',
+    resize: 'vertical' as const,
+    boxSizing: 'border-box' as const,
+  } as React.CSSProperties,
+};
+
+const formatCurrency = (amount: number): string => {
+  return `₦${Math.abs(amount).toLocaleString('en-NG', { minimumFractionDigits: 2 })}`;
+};
+
+const getTypeColor = (type: AccountType): string => {
+  const colors: Record<AccountType, string> = {
+    asset: '#10B981',
+    liability: '#EF4444',
+    equity: '#8B5CF6',
+    revenue: '#3B82F6',
+    expense: '#F59E0B',
+  };
+  return colors[type];
+};
+
+const getTypeBgColor = (type: AccountType): string => {
+  const colors: Record<AccountType, string> = {
+    asset: '#D1FAE5',
+    liability: '#FEE2E2',
+    equity: '#EDE9FE',
+    revenue: '#DBEAFE',
+    expense: '#FEF3C7',
+  };
+  return colors[type];
+};
+
+interface AccountTreeNodeProps {
+  node: AccountHierarchyNode;
+  level: number;
+  onSelect: (account: Account) => void;
+  expandedNodes: Set<string>;
+  toggleExpand: (id: string) => void;
+}
+
+const AccountTreeNode: React.FC<AccountTreeNodeProps> = ({
+  node,
+  level,
+  onSelect,
+  expandedNodes,
+  toggleExpand,
+}) => {
+  const hasChildren = node.children && node.children.length > 0;
+  const isExpanded = expandedNodes.has(node.account.id);
+
+  return (
+    <div style={{ marginLeft: level * 20 }}>
+      <div
+        style={{
+          ...styles.treeItem,
+          backgroundColor: 'transparent',
+        }}
+        onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#F3F4F6')}
+        onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+      >
+        <span
+          style={styles.treeExpander}
+          onClick={() => hasChildren && toggleExpand(node.account.id)}
+        >
+          {hasChildren ? (isExpanded ? '▼' : '▶') : ''}
+        </span>
+        <span
+          style={{
+            ...styles.badge,
+            backgroundColor: getTypeBgColor(node.account.type),
+            color: getTypeColor(node.account.type),
+            marginRight: '8px',
+          }}
+        >
+          {node.account.code}
+        </span>
+        <span
+          style={{ flex: 1, cursor: 'pointer' }}
+          onClick={() => onSelect(node.account)}
+        >
+          {node.account.name}
+        </span>
+        <span style={{ fontWeight: 600, color: node.balance >= 0 ? '#10B981' : '#EF4444' }}>
+          {formatCurrency(node.balance)}
+        </span>
+      </div>
+      {isExpanded && hasChildren && (
+        <div>
+          {node.children.map((child) => (
+            <AccountTreeNode
+              key={child.account.id}
+              node={child}
+              level={level + 1}
+              onSelect={onSelect}
+              expandedNodes={expandedNodes}
+              toggleExpand={toggleExpand}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+interface CreateAccountModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSubmit: (account: Partial<Account>) => void;
+  categories: AccountCategory[];
+  parentAccounts: Account[];
+}
+
+const CreateAccountModal: React.FC<CreateAccountModalProps> = ({
+  isOpen,
+  onClose,
+  onSubmit,
+  categories,
+  parentAccounts,
+}) => {
+  const [formData, setFormData] = useState({
+    code: '',
+    name: '',
+    description: '',
+    type: 'asset' as AccountType,
+    parentId: '',
+    currency: 'NGN',
+  });
+
+  if (!isOpen) return null;
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    onSubmit({
+      ...formData,
+      parentId: formData.parentId || undefined,
+      normalBalance: ['asset', 'expense'].includes(formData.type) ? 'debit' : 'credit',
+    });
+    setFormData({ code: '', name: '', description: '', type: 'asset', parentId: '', currency: 'NGN' });
+  };
+
+  return (
+    <div style={styles.modal} onClick={onClose}>
+      <div style={styles.modalContent} onClick={(e) => e.stopPropagation()}>
+        <div style={styles.modalHeader}>
+          <h3 style={{ margin: 0, fontSize: '18px', fontWeight: 600 }}>Create New Account</h3>
+          <button
+            onClick={onClose}
+            style={{ background: 'none', border: 'none', fontSize: '24px', cursor: 'pointer', color: '#6B7280' }}
+          >
+            ×
+          </button>
+        </div>
+        <form onSubmit={handleSubmit}>
+          <div style={styles.modalBody}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px' }}>
+              <div style={styles.formGroup}>
+                <label style={styles.label}>Account Code *</label>
+                <input
+                  type="text"
+                  style={styles.input}
+                  value={formData.code}
+                  onChange={(e) => setFormData({ ...formData, code: e.target.value })}
+                  placeholder="e.g., 1100"
+                  required
+                />
+              </div>
+              <div style={styles.formGroup}>
+                <label style={styles.label}>Account Type *</label>
+                <select
+                  style={styles.select}
+                  value={formData.type}
+                  onChange={(e) => setFormData({ ...formData, type: e.target.value as AccountType })}
+                >
+                  <option value="asset">Asset</option>
+                  <option value="liability">Liability</option>
+                  <option value="equity">Equity</option>
+                  <option value="revenue">Revenue</option>
+                  <option value="expense">Expense</option>
+                </select>
+              </div>
+            </div>
+            <div style={styles.formGroup}>
+              <label style={styles.label}>Account Name *</label>
+              <input
+                type="text"
+                style={styles.input}
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                placeholder="e.g., Cash at Bank - GTBank"
+                required
+              />
+            </div>
+            <div style={styles.formGroup}>
+              <label style={styles.label}>Parent Account</label>
+              <select
+                style={styles.select}
+                value={formData.parentId}
+                onChange={(e) => setFormData({ ...formData, parentId: e.target.value })}
+              >
+                <option value="">No Parent (Top Level)</option>
+                {parentAccounts
+                  .filter((a) => a.type === formData.type)
+                  .map((account) => (
+                    <option key={account.id} value={account.id}>
+                      {account.code} - {account.name}
+                    </option>
+                  ))}
+              </select>
+            </div>
+            <div style={styles.formGroup}>
+              <label style={styles.label}>Description</label>
+              <textarea
+                style={styles.textarea}
+                value={formData.description}
+                onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+                placeholder="Optional description of this account"
+              />
+            </div>
+            <div style={styles.formGroup}>
+              <label style={styles.label}>Currency</label>
+              <select
+                style={styles.select}
+                value={formData.currency}
+                onChange={(e) => setFormData({ ...formData, currency: e.target.value })}
+              >
+                <option value="NGN">NGN - Nigerian Naira</option>
+                <option value="USD">USD - US Dollar</option>
+                <option value="EUR">EUR - Euro</option>
+                <option value="GBP">GBP - British Pound</option>
+              </select>
+            </div>
+          </div>
+          <div style={styles.modalFooter}>
+            <button type="button" style={{ ...styles.button, ...styles.secondaryButton }} onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" style={{ ...styles.button, ...styles.primaryButton }}>
+              Create Account
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+type TabType = 'accounts' | 'hierarchy' | 'trial-balance' | 'balance-sheet' | 'income-statement' | 'cbn-returns' | 'reconciliation';
+
+export type UserRole = 'super_admin' | 'bank_admin' | 'finance_admin' | 'auditor' | 'viewer';
+
+interface ChartOfAccountsDashboardProps {
+  tenantId?: string;
+  userRole?: UserRole;
+  userId?: string;
+  availableTenants?: Tenant[];
+  onTenantChange?: (tenantId: string) => void;
+}
+
+const isAdminRole = (role: UserRole): boolean => {
+  return role === 'super_admin' || role === 'bank_admin' || role === 'finance_admin';
+};
+
+const canManageAccounts = (role: UserRole): boolean => {
+  return role === 'super_admin' || role === 'bank_admin' || role === 'finance_admin';
+};
+
+const canDeleteAccounts = (role: UserRole): boolean => {
+  return role === 'super_admin' || role === 'bank_admin';
+};
+
+const canManageTenants = (role: UserRole): boolean => {
+  return role === 'super_admin';
+};
+
+export const ChartOfAccountsDashboard: React.FC<ChartOfAccountsDashboardProps> = ({
+  tenantId = 'default',
+  userRole = 'viewer',
+  userId = '',
+  availableTenants = [],
+  onTenantChange,
+}) => {
+  const [activeTab, setActiveTab] = useState<TabType>('accounts');
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  const [categories, setCategories] = useState<AccountCategory[]>([]);
+  const [hierarchy, setHierarchy] = useState<AccountHierarchyNode[]>([]);
+  const [trialBalance, setTrialBalance] = useState<TrialBalance | null>(null);
+  const [balanceSheet, setBalanceSheet] = useState<BalanceSheet | null>(null);
+  const [incomeStatement, setIncomeStatement] = useState<IncomeStatement | null>(null);
+  const [reconciliation, setReconciliation] = useState<ReconciliationStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [typeFilter, setTypeFilter] = useState<AccountType | ''>('');
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
+  const [selectedAccount, setSelectedAccount] = useState<Account | null>(null);
+  const [tenants, setTenants] = useState<Tenant[]>(availableTenants);
+  const [selectedTenantId, setSelectedTenantId] = useState(tenantId);
+  const [showTenantModal, setShowTenantModal] = useState(false);
+
+  const loadAccounts = useCallback(async () => {
+    try {
+      const [accountsRes, categoriesRes] = await Promise.all([
+        accountsApi.listAccounts(tenantId, typeFilter ? { type: typeFilter } : undefined),
+        categoriesApi.listCategories(tenantId),
+      ]);
+      setAccounts(accountsRes.accounts);
+      setCategories(categoriesRes.categories);
+    } catch (error) {
+      console.error('Failed to load accounts:', error);
+    }
+  }, [tenantId, typeFilter]);
+
+  const loadHierarchy = useCallback(async () => {
+    try {
+      const res = await accountsApi.getAccountHierarchy(tenantId);
+      setHierarchy(res.hierarchy);
+    } catch (error) {
+      console.error('Failed to load hierarchy:', error);
+    }
+  }, [tenantId]);
+
+  const loadTrialBalance = useCallback(async () => {
+    try {
+      const res = await reportsApi.getTrialBalance(tenantId);
+      setTrialBalance(res);
+    } catch (error) {
+      console.error('Failed to load trial balance:', error);
+    }
+  }, [tenantId]);
+
+  const loadBalanceSheet = useCallback(async () => {
+    try {
+      const res = await reportsApi.getBalanceSheet(tenantId);
+      setBalanceSheet(res);
+    } catch (error) {
+      console.error('Failed to load balance sheet:', error);
+    }
+  }, [tenantId]);
+
+  const loadIncomeStatement = useCallback(async () => {
+    try {
+      const today = new Date();
+      const startOfYear = new Date(today.getFullYear(), 0, 1).toISOString().split('T')[0];
+      const endDate = today.toISOString().split('T')[0];
+      const res = await reportsApi.getIncomeStatement(tenantId, startOfYear, endDate);
+      setIncomeStatement(res);
+    } catch (error) {
+      console.error('Failed to load income statement:', error);
+    }
+  }, [tenantId]);
+
+  const loadReconciliation = useCallback(async () => {
+    try {
+      const res = await reconciliationApi.getReconciliationStatus(tenantId);
+      setReconciliation(res);
+    } catch (error) {
+      console.error('Failed to load reconciliation:', error);
+    }
+  }, [tenantId]);
+
+  useEffect(() => {
+    setLoading(true);
+    const loadData = async () => {
+      switch (activeTab) {
+        case 'accounts':
+          await loadAccounts();
+          break;
+        case 'hierarchy':
+          await loadHierarchy();
+          break;
+        case 'trial-balance':
+          await loadTrialBalance();
+          break;
+        case 'balance-sheet':
+          await loadBalanceSheet();
+          break;
+        case 'income-statement':
+          await loadIncomeStatement();
+          break;
+        case 'reconciliation':
+          await loadReconciliation();
+          break;
+      }
+      setLoading(false);
+    };
+    loadData();
+  }, [activeTab, loadAccounts, loadHierarchy, loadTrialBalance, loadBalanceSheet, loadIncomeStatement, loadReconciliation]);
+
+  const handleCreateAccount = async (accountData: Partial<Account>) => {
+    try {
+      await accountsApi.createAccount(tenantId, accountData);
+      setShowCreateModal(false);
+      loadAccounts();
+    } catch (error) {
+      console.error('Failed to create account:', error);
+      alert('Failed to create account');
+    }
+  };
+
+  const handleInitializeDefaults = async () => {
+    if (!confirm('This will create all default CBN-compliant accounts. Continue?')) return;
+    try {
+      const res = await categoriesApi.initializeDefaultAccounts(tenantId);
+      alert(`Created ${res.created} default accounts`);
+      loadAccounts();
+    } catch (error) {
+      console.error('Failed to initialize defaults:', error);
+      alert('Failed to initialize default accounts');
+    }
+  };
+
+  const handleRunReconciliation = async () => {
+    try {
+      const res = await reconciliationApi.runReconciliation(tenantId);
+      setReconciliation(res);
+    } catch (error) {
+      console.error('Failed to run reconciliation:', error);
+      alert('Failed to run reconciliation');
+    }
+  };
+
+  const toggleExpand = (id: string) => {
+    const newExpanded = new Set(expandedNodes);
+    if (newExpanded.has(id)) {
+      newExpanded.delete(id);
+    } else {
+      newExpanded.add(id);
+    }
+    setExpandedNodes(newExpanded);
+  };
+
+  const filteredAccounts = accounts.filter((account) => {
+    const matchesSearch =
+      searchQuery === '' ||
+      account.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      account.code.includes(searchQuery);
+    return matchesSearch;
+  });
+
+  const accountStats = {
+    total: accounts.length,
+    assets: accounts.filter((a) => a.type === 'asset').length,
+    liabilities: accounts.filter((a) => a.type === 'liability').length,
+    equity: accounts.filter((a) => a.type === 'equity').length,
+    revenue: accounts.filter((a) => a.type === 'revenue').length,
+    expenses: accounts.filter((a) => a.type === 'expense').length,
+  };
+
+  const tabs: { key: TabType; label: string }[] = [
+    { key: 'accounts', label: 'Accounts' },
+    { key: 'hierarchy', label: 'Hierarchy' },
+    { key: 'trial-balance', label: 'Trial Balance' },
+    { key: 'balance-sheet', label: 'Balance Sheet' },
+    { key: 'income-statement', label: 'Income Statement' },
+    { key: 'cbn-returns', label: 'CBN Returns' },
+    { key: 'reconciliation', label: 'Reconciliation' },
+  ];
+
+  const loadTenants = useCallback(async () => {
+    if (!canManageTenants(userRole)) return;
+    try {
+      const res = await tenantsApi.listTenants(userRole, userId);
+      setTenants(res.tenants);
+    } catch (error) {
+      console.error('Failed to load tenants:', error);
+    }
+  }, [userRole, userId]);
+
+  useEffect(() => {
+    if (canManageTenants(userRole)) {
+      loadTenants();
+    }
+  }, [userRole, loadTenants]);
+
+  const handleTenantChange = (newTenantId: string) => {
+    setSelectedTenantId(newTenantId);
+    if (onTenantChange) {
+      onTenantChange(newTenantId);
+    }
+  };
+
+  const handleCreateTenant = async (tenantData: { tenantId: string; tenantName: string; tenantType: string; initializeCoA: boolean }) => {
+    try {
+      await tenantsApi.createTenant(tenantData, userRole, userId);
+      setShowTenantModal(false);
+      loadTenants();
+    } catch (error) {
+      console.error('Failed to create tenant:', error);
+      alert('Failed to create tenant');
+    }
+  };
+
+  return (
+    <div style={styles.container}>
+      <div style={styles.header}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
+          <h1 style={styles.headerTitle}>Chart of Accounts</h1>
+          {canManageTenants(userRole) && tenants.length > 0 && (
+            <select
+              style={{ ...styles.select, minWidth: '200px' }}
+              value={selectedTenantId}
+              onChange={(e) => handleTenantChange(e.target.value)}
+            >
+              {tenants.map((tenant) => (
+                <option key={tenant.id} value={tenant.id}>
+                  {tenant.name} ({tenant.type})
+                </option>
+              ))}
+            </select>
+          )}
+          <span style={{
+            padding: '4px 12px',
+            borderRadius: '12px',
+            fontSize: '12px',
+            fontWeight: 500,
+            backgroundColor: isAdminRole(userRole) ? '#DCFCE7' : '#FEF3C7',
+            color: isAdminRole(userRole) ? '#166534' : '#92400E',
+          }}>
+            {userRole.replace('_', ' ').toUpperCase()}
+          </span>
+        </div>
+        <div style={styles.headerActions}>
+          {canManageTenants(userRole) && (
+            <button
+              style={{ ...styles.button, ...styles.secondaryButton }}
+              onClick={() => setShowTenantModal(true)}
+            >
+              + New Tenant
+            </button>
+          )}
+          {canManageAccounts(userRole) && (
+            <>
+              <button
+                style={{ ...styles.button, ...styles.secondaryButton }}
+                onClick={handleInitializeDefaults}
+              >
+                Initialize Defaults
+              </button>
+              <button
+                style={{ ...styles.button, ...styles.primaryButton }}
+                onClick={() => setShowCreateModal(true)}
+              >
+                + New Account
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+
+      <div style={styles.tabBar}>
+        {tabs.map((tab) => (
+          <button
+            key={tab.key}
+            style={{ ...styles.tab, ...(activeTab === tab.key ? styles.activeTab : {}) }}
+            onClick={() => setActiveTab(tab.key)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      <div style={styles.content}>
+        {activeTab === 'accounts' && (
+          <>
+            <div style={styles.statsGrid}>
+              <div style={styles.statCard}>
+                <div style={styles.statLabel}>Total Accounts</div>
+                <div style={styles.statValue}>{accountStats.total}</div>
+              </div>
+              <div style={{ ...styles.statCard, borderLeft: '4px solid #10B981' }}>
+                <div style={styles.statLabel}>Assets</div>
+                <div style={{ ...styles.statValue, color: '#10B981' }}>{accountStats.assets}</div>
+              </div>
+              <div style={{ ...styles.statCard, borderLeft: '4px solid #EF4444' }}>
+                <div style={styles.statLabel}>Liabilities</div>
+                <div style={{ ...styles.statValue, color: '#EF4444' }}>{accountStats.liabilities}</div>
+              </div>
+              <div style={{ ...styles.statCard, borderLeft: '4px solid #8B5CF6' }}>
+                <div style={styles.statLabel}>Equity</div>
+                <div style={{ ...styles.statValue, color: '#8B5CF6' }}>{accountStats.equity}</div>
+              </div>
+              <div style={{ ...styles.statCard, borderLeft: '4px solid #3B82F6' }}>
+                <div style={styles.statLabel}>Revenue</div>
+                <div style={{ ...styles.statValue, color: '#3B82F6' }}>{accountStats.revenue}</div>
+              </div>
+              <div style={{ ...styles.statCard, borderLeft: '4px solid #F59E0B' }}>
+                <div style={styles.statLabel}>Expenses</div>
+                <div style={{ ...styles.statValue, color: '#F59E0B' }}>{accountStats.expenses}</div>
+              </div>
+            </div>
+
+            <div style={styles.searchBar}>
+              <input
+                type="text"
+                placeholder="Search by account name or code..."
+                style={styles.searchInput}
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+              <select
+                style={{ ...styles.select, width: '200px' }}
+                value={typeFilter}
+                onChange={(e) => setTypeFilter(e.target.value as AccountType | '')}
+              >
+                <option value="">All Types</option>
+                <option value="asset">Assets</option>
+                <option value="liability">Liabilities</option>
+                <option value="equity">Equity</option>
+                <option value="revenue">Revenue</option>
+                <option value="expense">Expenses</option>
+              </select>
+            </div>
+
+            <div style={styles.card}>
+              <div style={styles.cardHeader}>
+                <h3 style={styles.cardTitle}>Account List</h3>
+                <span style={{ color: '#6B7280', fontSize: '14px' }}>
+                  {filteredAccounts.length} accounts
+                </span>
+              </div>
+              <div style={{ overflowX: 'auto' }}>
+                <table style={styles.table}>
+                  <thead>
+                    <tr>
+                      <th style={styles.th}>Code</th>
+                      <th style={styles.th}>Name</th>
+                      <th style={styles.th}>Type</th>
+                      <th style={styles.th}>Normal Balance</th>
+                      <th style={styles.th}>Currency</th>
+                      <th style={styles.th}>Status</th>
+                      <th style={styles.th}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {loading ? (
+                      <tr>
+                        <td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '40px' }}>
+                          Loading...
+                        </td>
+                      </tr>
+                    ) : filteredAccounts.length === 0 ? (
+                      <tr>
+                        <td colSpan={7} style={{ ...styles.td, textAlign: 'center', padding: '40px' }}>
+                          No accounts found. Click "Initialize Defaults" to create CBN-compliant accounts.
+                        </td>
+                      </tr>
+                    ) : (
+                      filteredAccounts.map((account) => (
+                        <tr key={account.id}>
+                          <td style={styles.td}>
+                            <span
+                              style={{
+                                ...styles.badge,
+                                backgroundColor: getTypeBgColor(account.type),
+                                color: getTypeColor(account.type),
+                              }}
+                            >
+                              {account.code}
+                            </span>
+                          </td>
+                          <td style={styles.td}>{account.name}</td>
+                          <td style={styles.td}>
+                            <span style={{ textTransform: 'capitalize' }}>{account.type}</span>
+                          </td>
+                          <td style={styles.td}>
+                            <span style={{ textTransform: 'capitalize' }}>{account.normalBalance}</span>
+                          </td>
+                          <td style={styles.td}>{account.currency}</td>
+                          <td style={styles.td}>
+                            <span
+                              style={{
+                                ...styles.badge,
+                                backgroundColor: account.isActive ? '#D1FAE5' : '#FEE2E2',
+                                color: account.isActive ? '#10B981' : '#EF4444',
+                              }}
+                            >
+                              {account.isActive ? 'Active' : 'Inactive'}
+                            </span>
+                          </td>
+                          <td style={styles.td}>
+                            <button
+                              style={{ ...styles.button, ...styles.secondaryButton, padding: '6px 12px', fontSize: '12px' }}
+                              onClick={() => setSelectedAccount(account)}
+                            >
+                              View
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </>
+        )}
+
+        {activeTab === 'hierarchy' && (
+          <div style={styles.card}>
+            <div style={styles.cardHeader}>
+              <h3 style={styles.cardTitle}>Account Hierarchy</h3>
+              <button
+                style={{ ...styles.button, ...styles.secondaryButton, padding: '6px 12px' }}
+                onClick={() => {
+                  if (expandedNodes.size > 0) {
+                    setExpandedNodes(new Set());
+                  } else {
+                    const allIds = new Set<string>();
+                    const collectIds = (nodes: AccountHierarchyNode[]) => {
+                      nodes.forEach((n) => {
+                        allIds.add(n.account.id);
+                        if (n.children) collectIds(n.children);
+                      });
+                    };
+                    collectIds(hierarchy);
+                    setExpandedNodes(allIds);
+                  }
+                }}
+              >
+                {expandedNodes.size > 0 ? 'Collapse All' : 'Expand All'}
+              </button>
+            </div>
+            <div style={styles.cardBody}>
+              {loading ? (
+                <div style={{ textAlign: 'center', padding: '40px' }}>Loading...</div>
+              ) : hierarchy.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: '40px', color: '#6B7280' }}>
+                  No accounts found. Initialize default accounts first.
+                </div>
+              ) : (
+                hierarchy.map((node) => (
+                  <AccountTreeNode
+                    key={node.account.id}
+                    node={node}
+                    level={0}
+                    onSelect={setSelectedAccount}
+                    expandedNodes={expandedNodes}
+                    toggleExpand={toggleExpand}
+                  />
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'trial-balance' && (
+          <div style={styles.card}>
+            <div style={styles.cardHeader}>
+              <h3 style={styles.cardTitle}>Trial Balance</h3>
+              {trialBalance && (
+                <span style={{ color: '#6B7280', fontSize: '14px' }}>
+                  As of {new Date(trialBalance.asOfDate).toLocaleDateString()}
+                </span>
+              )}
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+              <table style={styles.table}>
+                <thead>
+                  <tr>
+                    <th style={styles.th}>Code</th>
+                    <th style={styles.th}>Account Name</th>
+                    <th style={styles.th}>Type</th>
+                    <th style={{ ...styles.th, textAlign: 'right' }}>Debit</th>
+                    <th style={{ ...styles.th, textAlign: 'right' }}>Credit</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loading ? (
+                    <tr>
+                      <td colSpan={5} style={{ ...styles.td, textAlign: 'center', padding: '40px' }}>
+                        Loading...
+                      </td>
+                    </tr>
+                  ) : !trialBalance || trialBalance.accounts.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} style={{ ...styles.td, textAlign: 'center', padding: '40px' }}>
+                        No trial balance data available.
+                      </td>
+                    </tr>
+                  ) : (
+                    <>
+                      {trialBalance.accounts.map((account) => (
+                        <tr key={account.accountId}>
+                          <td style={styles.td}>{account.accountCode}</td>
+                          <td style={styles.td}>{account.accountName}</td>
+                          <td style={styles.td}>
+                            <span style={{ textTransform: 'capitalize' }}>{account.accountType}</span>
+                          </td>
+                          <td style={{ ...styles.td, textAlign: 'right' }}>
+                            {account.debit > 0 ? formatCurrency(account.debit) : '-'}
+                          </td>
+                          <td style={{ ...styles.td, textAlign: 'right' }}>
+                            {account.credit > 0 ? formatCurrency(account.credit) : '-'}
+                          </td>
+                        </tr>
+                      ))}
+                      <tr style={{ backgroundColor: '#F9FAFB', fontWeight: 600 }}>
+                        <td colSpan={3} style={{ ...styles.td, fontWeight: 600 }}>TOTALS</td>
+                        <td style={{ ...styles.td, textAlign: 'right', fontWeight: 600 }}>
+                          {formatCurrency(trialBalance.totalDebits)}
+                        </td>
+                        <td style={{ ...styles.td, textAlign: 'right', fontWeight: 600 }}>
+                          {formatCurrency(trialBalance.totalCredits)}
+                        </td>
+                      </tr>
+                    </>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            {trialBalance && (
+              <div style={{ padding: '16px 20px', borderTop: '1px solid #E5E7EB' }}>
+                <span
+                  style={{
+                    ...styles.badge,
+                    backgroundColor: trialBalance.isBalanced ? '#D1FAE5' : '#FEE2E2',
+                    color: trialBalance.isBalanced ? '#10B981' : '#EF4444',
+                  }}
+                >
+                  {trialBalance.isBalanced ? 'Balanced' : 'Out of Balance'}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'balance-sheet' && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px' }}>
+            <div style={styles.card}>
+              <div style={styles.cardHeader}>
+                <h3 style={styles.cardTitle}>Assets</h3>
+              </div>
+              <div style={styles.cardBody}>
+                {loading ? (
+                  <div style={{ textAlign: 'center', padding: '20px' }}>Loading...</div>
+                ) : balanceSheet?.assets.accounts.map((account) => (
+                  <div
+                    key={account.code}
+                    style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #F3F4F6' }}
+                  >
+                    <span>{account.code} - {account.name}</span>
+                    <span style={{ fontWeight: 500 }}>{formatCurrency(account.balance)}</span>
+                  </div>
+                ))}
+                <div
+                  style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 0', fontWeight: 700, borderTop: '2px solid #E5E7EB', marginTop: '8px' }}
+                >
+                  <span>Total Assets</span>
+                  <span style={{ color: '#10B981' }}>{formatCurrency(balanceSheet?.totalAssets || 0)}</span>
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <div style={{ ...styles.card, marginBottom: '24px' }}>
+                <div style={styles.cardHeader}>
+                  <h3 style={styles.cardTitle}>Liabilities</h3>
+                </div>
+                <div style={styles.cardBody}>
+                  {loading ? (
+                    <div style={{ textAlign: 'center', padding: '20px' }}>Loading...</div>
+                  ) : balanceSheet?.liabilities.accounts.map((account) => (
+                    <div
+                      key={account.code}
+                      style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #F3F4F6' }}
+                    >
+                      <span>{account.code} - {account.name}</span>
+                      <span style={{ fontWeight: 500 }}>{formatCurrency(account.balance)}</span>
+                    </div>
+                  ))}
+                  <div
+                    style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 0', fontWeight: 600, borderTop: '1px solid #E5E7EB', marginTop: '8px' }}
+                  >
+                    <span>Total Liabilities</span>
+                    <span>{formatCurrency(balanceSheet?.liabilities.total || 0)}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div style={styles.card}>
+                <div style={styles.cardHeader}>
+                  <h3 style={styles.cardTitle}>Equity</h3>
+                </div>
+                <div style={styles.cardBody}>
+                  {loading ? (
+                    <div style={{ textAlign: 'center', padding: '20px' }}>Loading...</div>
+                  ) : balanceSheet?.equity.accounts.map((account) => (
+                    <div
+                      key={account.code}
+                      style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #F3F4F6' }}
+                    >
+                      <span>{account.code} - {account.name}</span>
+                      <span style={{ fontWeight: 500 }}>{formatCurrency(account.balance)}</span>
+                    </div>
+                  ))}
+                  <div
+                    style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 0', fontWeight: 600, borderTop: '1px solid #E5E7EB', marginTop: '8px' }}
+                  >
+                    <span>Total Equity</span>
+                    <span>{formatCurrency(balanceSheet?.equity.total || 0)}</span>
+                  </div>
+                  <div
+                    style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 0', fontWeight: 700, borderTop: '2px solid #E5E7EB', marginTop: '8px' }}
+                  >
+                    <span>Total Liabilities + Equity</span>
+                    <span style={{ color: '#EF4444' }}>{formatCurrency(balanceSheet?.totalLiabilitiesAndEquity || 0)}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {balanceSheet && (
+              <div style={{ gridColumn: '1 / -1', textAlign: 'center', padding: '16px' }}>
+                <span
+                  style={{
+                    ...styles.badge,
+                    backgroundColor: balanceSheet.isBalanced ? '#D1FAE5' : '#FEE2E2',
+                    color: balanceSheet.isBalanced ? '#10B981' : '#EF4444',
+                    fontSize: '14px',
+                    padding: '8px 16px',
+                  }}
+                >
+                  {balanceSheet.isBalanced
+                    ? 'Balance Sheet is Balanced (Assets = Liabilities + Equity)'
+                    : 'Balance Sheet is Out of Balance'}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'income-statement' && (
+          <div style={styles.card}>
+            <div style={styles.cardHeader}>
+              <h3 style={styles.cardTitle}>Income Statement</h3>
+              {incomeStatement && (
+                <span style={{ color: '#6B7280', fontSize: '14px' }}>
+                  {new Date(incomeStatement.startDate).toLocaleDateString()} - {new Date(incomeStatement.endDate).toLocaleDateString()}
+                </span>
+              )}
+            </div>
+            <div style={styles.cardBody}>
+              {loading ? (
+                <div style={{ textAlign: 'center', padding: '40px' }}>Loading...</div>
+              ) : !incomeStatement ? (
+                <div style={{ textAlign: 'center', padding: '40px', color: '#6B7280' }}>
+                  No income statement data available.
+                </div>
+              ) : (
+                <>
+                  <h4 style={{ fontSize: '16px', fontWeight: 600, color: '#3B82F6', marginBottom: '16px' }}>Revenue</h4>
+                  {incomeStatement.revenue.accounts.map((account) => (
+                    <div
+                      key={account.code}
+                      style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #F3F4F6' }}
+                    >
+                      <span>{account.code} - {account.name}</span>
+                      <span style={{ fontWeight: 500 }}>{formatCurrency(account.balance)}</span>
+                    </div>
+                  ))}
+                  <div
+                    style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 0', fontWeight: 600, borderTop: '1px solid #E5E7EB', marginTop: '8px', color: '#3B82F6' }}
+                  >
+                    <span>Total Revenue</span>
+                    <span>{formatCurrency(incomeStatement.totalRevenue)}</span>
+                  </div>
+
+                  <h4 style={{ fontSize: '16px', fontWeight: 600, color: '#F59E0B', marginTop: '24px', marginBottom: '16px' }}>Expenses</h4>
+                  {incomeStatement.expenses.accounts.map((account) => (
+                    <div
+                      key={account.code}
+                      style={{ display: 'flex', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid #F3F4F6' }}
+                    >
+                      <span>{account.code} - {account.name}</span>
+                      <span style={{ fontWeight: 500 }}>{formatCurrency(account.balance)}</span>
+                    </div>
+                  ))}
+                  <div
+                    style={{ display: 'flex', justifyContent: 'space-between', padding: '12px 0', fontWeight: 600, borderTop: '1px solid #E5E7EB', marginTop: '8px', color: '#F59E0B' }}
+                  >
+                    <span>Total Expenses</span>
+                    <span>{formatCurrency(incomeStatement.totalExpenses)}</span>
+                  </div>
+
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      padding: '16px',
+                      fontWeight: 700,
+                      fontSize: '18px',
+                      borderTop: '2px solid #E5E7EB',
+                      marginTop: '24px',
+                      backgroundColor: incomeStatement.netIncome >= 0 ? '#D1FAE5' : '#FEE2E2',
+                      borderRadius: '8px',
+                    }}
+                  >
+                    <span>Net Income</span>
+                    <span style={{ color: incomeStatement.netIncome >= 0 ? '#10B981' : '#EF4444' }}>
+                      {formatCurrency(incomeStatement.netIncome)}
+                    </span>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeTab === 'cbn-returns' && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '24px' }}>
+            {['SFP', 'PL', 'CAR', 'LR'].map((returnType) => (
+              <div key={returnType} style={styles.card}>
+                <div style={styles.cardHeader}>
+                  <h3 style={styles.cardTitle}>
+                    {returnType === 'SFP' && 'Statement of Financial Position'}
+                    {returnType === 'PL' && 'Profit & Loss'}
+                    {returnType === 'CAR' && 'Capital Adequacy Ratio'}
+                    {returnType === 'LR' && 'Liquidity Ratio'}
+                  </h3>
+                </div>
+                <div style={styles.cardBody}>
+                  <p style={{ color: '#6B7280', fontSize: '14px', marginBottom: '16px' }}>
+                    CBN Prudential Return - {returnType}
+                  </p>
+                  <button
+                    style={{ ...styles.button, ...styles.primaryButton, width: '100%' }}
+                    onClick={async () => {
+                      try {
+                        const res = await reportsApi.getCBNReturn(tenantId, returnType as 'SFP' | 'PL' | 'CAR' | 'LR');
+                        console.log('CBN Return:', res);
+                        alert(`Generated ${returnType} return with ${res.lines.length} line items`);
+                      } catch (error) {
+                        console.error('Failed to generate CBN return:', error);
+                      }
+                    }}
+                  >
+                    Generate {returnType} Return
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {activeTab === 'reconciliation' && (
+          <div style={styles.card}>
+            <div style={styles.cardHeader}>
+              <h3 style={styles.cardTitle}>TigerBeetle Reconciliation</h3>
+              <button
+                style={{ ...styles.button, ...styles.successButton }}
+                onClick={handleRunReconciliation}
+              >
+                Run Reconciliation
+              </button>
+            </div>
+            <div style={styles.cardBody}>
+              {loading ? (
+                <div style={{ textAlign: 'center', padding: '40px' }}>Loading...</div>
+              ) : !reconciliation ? (
+                <div style={{ textAlign: 'center', padding: '40px', color: '#6B7280' }}>
+                  Click "Run Reconciliation" to compare CoA balances with TigerBeetle.
+                </div>
+              ) : (
+                <>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '16px', marginBottom: '24px' }}>
+                    <div style={{ ...styles.statCard, textAlign: 'center' }}>
+                      <div style={styles.statLabel}>Status</div>
+                      <span
+                        style={{
+                          ...styles.badge,
+                          backgroundColor: reconciliation.status === 'matched' ? '#D1FAE5' : '#FEE2E2',
+                          color: reconciliation.status === 'matched' ? '#10B981' : '#EF4444',
+                          fontSize: '14px',
+                        }}
+                      >
+                        {reconciliation.status === 'matched' ? 'All Matched' : 'Discrepancies Found'}
+                      </span>
+                    </div>
+                    <div style={{ ...styles.statCard, textAlign: 'center' }}>
+                      <div style={styles.statLabel}>Matched Accounts</div>
+                      <div style={styles.statValue}>
+                        {reconciliation.matchedAccounts}/{reconciliation.totalAccounts}
+                      </div>
+                    </div>
+                    <div style={{ ...styles.statCard, textAlign: 'center' }}>
+                      <div style={styles.statLabel}>Last Reconciled</div>
+                      <div style={{ fontSize: '14px', color: '#1F2937' }}>
+                        {new Date(reconciliation.lastReconciled).toLocaleString()}
+                      </div>
+                    </div>
+                  </div>
+
+                  {reconciliation.discrepancies.length > 0 && (
+                    <>
+                      <h4 style={{ fontSize: '16px', fontWeight: 600, marginBottom: '16px' }}>Discrepancies</h4>
+                      <table style={styles.table}>
+                        <thead>
+                          <tr>
+                            <th style={styles.th}>Account</th>
+                            <th style={{ ...styles.th, textAlign: 'right' }}>CoA Balance</th>
+                            <th style={{ ...styles.th, textAlign: 'right' }}>TigerBeetle</th>
+                            <th style={{ ...styles.th, textAlign: 'right' }}>Difference</th>
+                            <th style={styles.th}>Severity</th>
+                            <th style={styles.th}>Action</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {reconciliation.discrepancies.map((d) => (
+                            <tr key={d.accountId}>
+                              <td style={styles.td}>{d.accountCode} - {d.accountName}</td>
+                              <td style={{ ...styles.td, textAlign: 'right' }}>{formatCurrency(d.coaBalance)}</td>
+                              <td style={{ ...styles.td, textAlign: 'right' }}>{formatCurrency(d.tigerBeetleBalance)}</td>
+                              <td style={{ ...styles.td, textAlign: 'right', color: '#EF4444' }}>
+                                {formatCurrency(d.difference)}
+                              </td>
+                              <td style={styles.td}>
+                                <span
+                                  style={{
+                                    ...styles.badge,
+                                    backgroundColor:
+                                      d.severity === 'critical' ? '#FEE2E2' :
+                                      d.severity === 'high' ? '#FEF3C7' :
+                                      d.severity === 'medium' ? '#DBEAFE' : '#D1FAE5',
+                                    color:
+                                      d.severity === 'critical' ? '#EF4444' :
+                                      d.severity === 'high' ? '#F59E0B' :
+                                      d.severity === 'medium' ? '#3B82F6' : '#10B981',
+                                  }}
+                                >
+                                  {d.severity}
+                                </span>
+                              </td>
+                              <td style={styles.td}>
+                                <button
+                                  style={{ ...styles.button, ...styles.secondaryButton, padding: '4px 8px', fontSize: '12px' }}
+                                  onClick={() => {
+                                    reconciliationApi.resolveDiscrepancy(tenantId, d.accountId, 'adjust_coa');
+                                  }}
+                                >
+                                  Resolve
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {canManageAccounts(userRole) && (
+        <CreateAccountModal
+          isOpen={showCreateModal}
+          onClose={() => setShowCreateModal(false)}
+          onSubmit={handleCreateAccount}
+          categories={categories}
+          parentAccounts={accounts}
+        />
+      )}
+
+      {showTenantModal && canManageTenants(userRole) && (
+        <CreateTenantModal
+          isOpen={showTenantModal}
+          onClose={() => setShowTenantModal(false)}
+          onSubmit={handleCreateTenant}
+        />
+      )}
+    </div>
+  );
+};
+
+interface CreateTenantModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  onSubmit: (data: { tenantId: string; tenantName: string; tenantType: string; initializeCoA: boolean }) => void;
+}
+
+const CreateTenantModal: React.FC<CreateTenantModalProps> = ({ isOpen, onClose, onSubmit }) => {
+  const [formData, setFormData] = useState({
+    tenantId: '',
+    tenantName: '',
+    tenantType: 'bank',
+    initializeCoA: true,
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!formData.tenantId || !formData.tenantName) {
+      alert('Tenant ID and Name are required');
+      return;
+    }
+    onSubmit(formData);
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <div style={styles.modalOverlay}>
+      <div style={styles.modal}>
+        <div style={styles.modalHeader}>
+          <h2 style={styles.modalTitle}>Create New Tenant</h2>
+          <button style={styles.closeButton} onClick={onClose}>&times;</button>
+        </div>
+        <form onSubmit={handleSubmit}>
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Tenant ID</label>
+            <input
+              type="text"
+              style={styles.input}
+              value={formData.tenantId}
+              onChange={(e) => setFormData({ ...formData, tenantId: e.target.value })}
+              placeholder="e.g., bank-001"
+              pattern="[a-z0-9-]+"
+              title="Lowercase letters, numbers, and hyphens only"
+            />
+          </div>
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Tenant Name</label>
+            <input
+              type="text"
+              style={styles.input}
+              value={formData.tenantName}
+              onChange={(e) => setFormData({ ...formData, tenantName: e.target.value })}
+              placeholder="e.g., First Bank Nigeria"
+            />
+          </div>
+          <div style={styles.formGroup}>
+            <label style={styles.label}>Tenant Type</label>
+            <select
+              style={styles.select}
+              value={formData.tenantType}
+              onChange={(e) => setFormData({ ...formData, tenantType: e.target.value })}
+            >
+              <option value="bank">Commercial Bank</option>
+              <option value="mfb">Microfinance Bank</option>
+              <option value="fintech">Fintech</option>
+              <option value="cooperative">Cooperative</option>
+            </select>
+          </div>
+          <div style={styles.formGroup}>
+            <label style={{ ...styles.label, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <input
+                type="checkbox"
+                checked={formData.initializeCoA}
+                onChange={(e) => setFormData({ ...formData, initializeCoA: e.target.checked })}
+              />
+              Initialize with CBN-compliant Chart of Accounts
+            </label>
+          </div>
+          <div style={styles.modalFooter}>
+            <button type="button" style={{ ...styles.button, ...styles.secondaryButton }} onClick={onClose}>
+              Cancel
+            </button>
+            <button type="submit" style={{ ...styles.button, ...styles.primaryButton }}>
+              Create Tenant
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
+
+export default ChartOfAccountsDashboard;

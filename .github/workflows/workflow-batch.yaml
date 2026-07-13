@@ -1,0 +1,66 @@
+name: Build and Deploy Workflow Batch Consolidated Service
+
+on:
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - 'services/batch-aggregator-go/**'
+      - 'services/batch-processing-py/**'
+      - 'services/e2e-orchestrator-go/**'
+      - 'services/orchestrator-service/**'
+      - 'services/saga-coordinator-py/**'
+      - 'services/temporal-access-service/**'
+      - 'services/temporal-memoizer-go/**'
+      - 'services/temporal-orchestrator-py/**'
+      - 'services/temporal-sagas-go/**'
+      - 'services/temporal-worker-go/**'
+      - 'services/workflow-engine-py/**'
+      - 'infrastructure/charts/workflow-batch/**'
+      - 'infrastructure/apisix-resources/routes/temporal-access-service.yaml'
+      - 'infrastructure/apisix-resources/routes/temporal-memoizer-go.yaml'
+      - 'infrastructure/apisix-resources/routes/temporal-orchestrator-py.yaml'
+      - 'infrastructure/apisix-resources/routes/temporal-sagas-go.yaml'
+      - 'infrastructure/apisix-resources/routes/temporal-worker-go.yaml'
+      - 'docker/Dockerfile.consolidated'
+      - 'docker/build-services.sh'
+      - 'docker/entrypoint.sh'
+      - '.github/workflows/workflow-batch.yaml'
+
+env:
+  IMAGE: registry.digitalocean.com/talentgraph-auth/54link-dev-workflow-batch
+  TAG: "0.0.2"
+  CHART: infrastructure/charts/workflow-batch
+  RELEASE: workflow-batch
+  NAMESPACE: 54link-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile.consolidated
+          push: true
+          build-args: |
+            SERVICES=batch-aggregator-go,batch-processing-py,e2e-orchestrator-go,orchestrator-service,saga-coordinator-py,temporal-access-service,temporal-memoizer-go,temporal-orchestrator-py,temporal-sagas-go,temporal-worker-go,workflow-engine-py
+            PRIMARY_LANG=go
+            PORT_BASE=9658
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+

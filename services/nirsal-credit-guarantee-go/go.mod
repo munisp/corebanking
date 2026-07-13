@@ -1,4 +1,4 @@
-module github.com/54bank/nirsal-credit-guarantee-go
+module github.com/54link-dev/nirsal-credit-guarantee-go
 
 go 1.21
 

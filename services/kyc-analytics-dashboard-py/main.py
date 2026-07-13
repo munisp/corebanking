@@ -1,66 +1,35 @@
-import sys; sys.path.insert(0, '/home/ubuntu/repos/corebanking/libs/banking-rules-py')
-
-# --- PII Masking (NDPR Compliance) ---
-import re as _pii_re
-
-def mask_pii(value: str, field_type: str = "generic") -> str:
-    if not value: return "***"
-    if field_type in ("bvn", "nin"):
-        return f"***{value[-4:]}" if len(value) >= 4 else "***"
-    elif field_type == "phone":
-        return f"+234***{value[-4:]}" if len(value) >= 4 else "+234***"
-    elif field_type == "email" and "@" in value:
-        local, domain = value.split("@", 1)
-        return f"{local[0]}***@{domain}"
-    elif field_type == "account":
-        return f"****{value[-4:]}" if len(value) >= 4 else "****"
-    return f"{value[0]}***{value[-1]}" if len(value) > 2 else "***"
-
-def sanitize_log(msg: str) -> str:
-    msg = _pii_re.sub(r"\b\d{11}\b", lambda m: f"***{m.group()[-4:]}", msg)
-    msg = _pii_re.sub(r"\b\d{10}\b", lambda m: f"****{m.group()[-4:]}", msg)
-    msg = _pii_re.sub(r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}", "***@***", msg)
-    return msg
-
 """
-kyc-analytics-dashboard-py — Production-hardened service
+kyc-analytics-dashboard-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
+
 import os
-import sys
 import json
-import urllib.request
-import time
-import signal
-import logging
-import threading
 import uuid
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+import logging
 from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
-# --- Structured Logging ---
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        return json.dumps({
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname,
-            "service": "kyc-analytics-dashboard-py",
-            "message": record.getMessage(),
-        })
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
-handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
-logging.basicConfig(level=logging.INFO, handlers=[handler])
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("kyc-analytics-dashboard-py")
 
-# --- Redis Caching Layer ---
-import socket as _socket
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/kyc_analytics_dashboard_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+PORT = int(os.getenv("PORT", "8189"))
 
-# Rate limiting
-import threading as _rl_threading
-_rl_tokens = 100
-_rl_lock = _rl_threading.Lock()
-_rl_last_refill = [0.0]
+db_conn = None
 
 def _rl_allow():
     global _rl_tokens
@@ -75,558 +44,31 @@ def _rl_allow():
         _rl_tokens -= 1
         return True
 
-# --- Production Cache (connection-pooled, multi-level L1+L2, stampede protection, metrics) ---
-import socket as _cache_socket
-import threading as _cache_threading
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Deep Domain Logic — Production-Ready Business Rules
-# ══════════════════════════════════════════════════════════════════════════════
-
-class AmountKobo:
-    """Monetary amounts in kobo (smallest unit) to avoid float precision errors."""
-    __slots__ = ('_value',)
-
-    def __init__(self, kobo: int):
-        self._value = int(kobo)
-
-    @classmethod
-    def from_naira(cls, naira: float) -> 'AmountKobo':
-        return cls(int(round(naira * 100)))
-
-    @property
-    def kobo(self) -> int:
-        return self._value
-
-    @property
-    def naira(self) -> float:
-        return self._value / 100.0
-
-    def __repr__(self):
-        return f"₦{self._value // 100}.{abs(self._value % 100):02d}"
-
-    def __add__(self, other): return AmountKobo(self._value + other._value)
-    def __sub__(self, other): return AmountKobo(self._value - other._value)
-    def __gt__(self, other): return self._value > other._value
-    def __ge__(self, other): return self._value >= other._value
-    def __lt__(self, other): return self._value < other._value
-    def __eq__(self, other): return self._value == other._value
-
-
-# ── State Machine ────────────────────────────────────────────────────────────
-
-class StateMachine:
-    """Formal state machine with transition guards."""
-
-    TRANSITIONS = {
-        "draft": ["submitted", "cancelled"],
-        "submitted": ["under_review", "rejected", "cancelled"],
-        "under_review": ["approved", "rejected"],
-        "approved": ["processing", "cancelled"],
-        "processing": ["completed", "failed"],
-        "completed": ["reversed"],
-        "failed": ["submitted"],  # retry
-    }
-
-    @classmethod
-    def can_transition(cls, from_state: str, to_state: str) -> bool:
-        allowed = cls.TRANSITIONS.get(from_state, [])
-        return to_state in allowed
-
-    @classmethod
-    def transition(cls, entity_id: str, from_state: str, to_state: str) -> dict:
-        if not cls.can_transition(from_state, to_state):
-            return {"error": f"Invalid transition: {from_state} → {to_state}", "entity_id": entity_id}
-        return {"entity_id": entity_id, "from": from_state, "to": to_state, "transitioned_at": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ")}
-
-
-# ── Nigerian Regulatory Rules ────────────────────────────────────────────────
-
-CBN_TIER_LIMITS = {
-    "tier1": {"max_single_debit_kobo": 5_000_000, "max_daily_kobo": 30_000_000, "max_balance_kobo": 30_000_000, "required_docs": ["phone"]},
-    "tier2": {"max_single_debit_kobo": 20_000_000, "max_daily_kobo": 50_000_000, "max_balance_kobo": 50_000_000, "required_docs": ["bvn", "phone", "dob"]},
-    "tier3": {"max_single_debit_kobo": 500_000_000, "max_daily_kobo": 1_000_000_000, "max_balance_kobo": 0, "required_docs": ["bvn", "nin", "address_proof", "passport_photo", "utility_bill"]},
-}
-
-def validate_tier_transaction(tier: str, amount_kobo: int, daily_total_kobo: int) -> tuple:
-    """Validate transaction against CBN tier limits."""
-    limits = CBN_TIER_LIMITS.get(tier)
-    if not limits:
-        return False, "Unknown KYC tier"
-    if amount_kobo > limits["max_single_debit_kobo"]:
-        return False, f"Exceeds {tier} single debit limit ₦{limits['max_single_debit_kobo'] // 100:,}"
-    if daily_total_kobo + amount_kobo > limits["max_daily_kobo"]:
-        return False, f"Exceeds {tier} daily cumulative limit ₦{limits['max_daily_kobo'] // 100:,}"
-    return True, ""
-
-
-def validate_bvn(bvn: str) -> tuple:
-    """Validate Bank Verification Number (11 digits)."""
-    if len(bvn) != 11:
-        return False, "BVN must be 11 digits"
-    if not bvn.isdigit():
-        return False, "BVN must contain only digits"
-    if bvn[:2] == "00":
-        return False, "Invalid BVN issuer code"
-    return True, ""
-
-
-def validate_nin(nin: str) -> tuple:
-    """Validate National Identification Number (11 digits)."""
-    if len(nin) != 11:
-        return False, "NIN must be 11 digits"
-    if not nin.isdigit():
-        return False, "NIN must contain only digits"
-    return True, ""
-
-
-def validate_nuban(bank_code: str, account_number: str) -> tuple:
-    """Validate NUBAN (Nigerian Uniform Bank Account Number) with check digit."""
-    if len(account_number) != 10:
-        return False, "NUBAN must be 10 digits"
-    if len(bank_code) != 3:
-        return False, "Bank code must be 3 digits"
-    serial = bank_code + account_number[:9]
-    weights = [3, 7, 3, 3, 7, 3, 3, 7, 3, 3, 7, 3]
-    total = sum(int(serial[i]) * weights[i] for i in range(min(len(serial), len(weights))))
-    check_digit = (10 - (total % 10)) % 10
-    if check_digit != int(account_number[9]):
-        return False, f"NUBAN check digit mismatch: expected {check_digit}"
-    return True, ""
-
-
-# ── NFIU Threshold Reporting ─────────────────────────────────────────────────
-
-def check_nfiu_threshold(amount_kobo: int, txn_type: str) -> tuple:
-    """Check if transaction triggers NFIU Currency Transaction Report."""
-    if txn_type in ("cash_deposit", "cash_withdrawal"):
-        if amount_kobo >= 500_000_000:  # ₦5M
-            return True, "NFIU: Cash transaction ≥₦5M requires CTR filing"
-    elif txn_type in ("transfer", "wire"):
-        if amount_kobo >= 1_000_000_000:  # ₦10M
-            return True, "NFIU: Transfer ≥₦10M requires CTR filing"
-    return False, ""
-
-
-def generate_ctr(customer_id: str, txn_id: str, amount_kobo: int, txn_type: str) -> dict:
-    """Generate Currency Transaction Report for NFIU."""
-    import time
-    threshold_hit, reason = check_nfiu_threshold(amount_kobo, txn_type)
-    if not threshold_hit:
-        return None
-    return {
-        "report_id": f"CTR-{int(time.time()*1000)}",
-        "customer_id": customer_id,
-        "transaction_id": txn_id,
-        "amount_kobo": amount_kobo,
-        "type": txn_type,
-        "reason": reason,
-        "filed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "status": "pending",
-    }
-
-
-# ── AML Risk Scoring ─────────────────────────────────────────────────────────
-
-SANCTIONED_COUNTRIES = {"KP", "IR", "SY", "CU", "VE", "MM", "BY", "ZW", "SD"}
-
-def compute_aml_risk_score(
-    txn_amount_kobo: int, is_pep: bool = False, is_high_risk_country: bool = False,
-    cash_intensive: bool = False, is_structuring: bool = False,
-    has_adverse_media: bool = False, account_age_months: int = 12
-) -> tuple:
-    """Multi-factor AML risk scoring."""
-    score = 0.0
-    indicators = []
-    if is_pep: score += 30; indicators.append("PEP_STATUS")
-    if is_high_risk_country: score += 25; indicators.append("HIGH_RISK_JURISDICTION")
-    if cash_intensive: score += 15; indicators.append("CASH_INTENSIVE")
-    if is_structuring: score += 35; indicators.append("STRUCTURING_DETECTED")
-    if has_adverse_media: score += 20; indicators.append("ADVERSE_MEDIA")
-    if txn_amount_kobo > 1_000_000_000: score += 10; indicators.append("HIGH_VALUE_TXN")
-    if account_age_months < 3: score += 10; indicators.append("NEW_ACCOUNT")
-    return min(score, 100.0), indicators
-
-
-def detect_structuring(transactions: list, threshold_kobo: int = 500_000_000) -> bool:
-    """Detect structuring: multiple just-below-threshold transactions."""
-    count = sum(1 for t in transactions if t.get("amount_kobo", 0) >= threshold_kobo * 0.8 and t.get("amount_kobo", 0) < threshold_kobo)
-    return count >= 3
-
-
-# ── Financial Calculations ───────────────────────────────────────────────────
-
-def compute_emi(principal_kobo: int, annual_rate_pct: float, tenor_months: int) -> int:
-    """Compute Equated Monthly Installment in kobo."""
-    if tenor_months <= 0: return 0
-    if annual_rate_pct == 0: return principal_kobo // tenor_months
-    monthly_rate = annual_rate_pct / 12.0 / 100.0
-    power = (1 + monthly_rate) ** tenor_months
-    emi = principal_kobo * monthly_rate * power / (power - 1)
-    return int(round(emi))
-
-
-def generate_amortization_schedule(principal_kobo: int, annual_rate_pct: float, tenor_months: int) -> list:
-    """Generate full amortization schedule."""
-    if tenor_months <= 0: return []
-    monthly_rate = annual_rate_pct / 12.0 / 100.0
-    emi = compute_emi(principal_kobo, annual_rate_pct, tenor_months)
-    schedule = []
-    balance = principal_kobo
-    cumulative_interest = 0
-    for period in range(1, tenor_months + 1):
-        interest = int(balance * monthly_rate)
-        principal_part = emi - interest
-        if period == tenor_months: principal_part = balance  # settle rounding
-        balance -= principal_part
-        cumulative_interest += interest
-        schedule.append({
-            "period": period, "emi_kobo": emi, "principal_kobo": principal_part,
-            "interest_kobo": interest, "balance_kobo": max(balance, 0),
-            "cumulative_interest_kobo": cumulative_interest,
-        })
-    return schedule
-
-
-def compute_dti(monthly_income_kobo: int, existing_debt_kobo: int, proposed_emi_kobo: int) -> float:
-    """Compute Debt-to-Income ratio as percentage."""
-    if monthly_income_kobo <= 0: return 100.0
-    return (existing_debt_kobo + proposed_emi_kobo) / monthly_income_kobo * 100.0
-
-
-def compute_provisioning_rate(days_past_due: int) -> float:
-    """CBN Prudential Guidelines provisioning rates."""
-    if days_past_due <= 90: return 1.0      # Performing
-    if days_past_due <= 180: return 10.0    # Watchlist
-    if days_past_due <= 360: return 50.0    # Substandard
-    if days_past_due <= 720: return 75.0    # Doubtful
-    return 100.0                              # Lost
-
-
-def compute_interest_daily_accrual(balance_kobo: int, annual_rate_pct: float) -> int:
-    """Daily interest accrual for savings accounts."""
-    daily_rate = annual_rate_pct / 365.0 / 100.0
-    return int(balance_kobo * daily_rate)
-
-
-def compute_wht(interest_kobo: int) -> int:
-    """Withholding Tax on interest — 10% per Nigerian tax law."""
-    return int(interest_kobo * 0.10)
-
-
-# ── Validation with Error Accumulation ───────────────────────────────────────
-
-def validate_loan_application(
-    customer_id: str, amount_kobo: int, tenor_months: int, annual_rate: float,
-    monthly_income_kobo: int, existing_debt_kobo: int, kyc_level: str,
-    employment_years: float = 0, age: int = 30,
-) -> tuple:
-    """Comprehensive loan validation with error accumulation."""
-    errors = []
-    if amount_kobo < 1_000_000: errors.append("Amount below CBN minimum ₦10,000")
-    if amount_kobo > 5_000_000_000: errors.append("Amount exceeds ₦50M max single obligor limit")
-    if tenor_months < 1: errors.append("Tenor must be at least 1 month")
-    if tenor_months > 360: errors.append("Tenor exceeds 30-year maximum")
-    if annual_rate <= 0: errors.append("Interest rate must be positive")
-    if annual_rate > 30: errors.append("Rate exceeds CBN maximum lending rate")
-
-    # DTI check
-    emi = compute_emi(amount_kobo, annual_rate, tenor_months)
-    dti = compute_dti(monthly_income_kobo, existing_debt_kobo, emi)
-    if dti > 60: errors.append(f"DTI ratio {dti:.1f}% exceeds 60% maximum")
-
-    # KYC tier limits
-    tier_limits = {"tier1": 30_000_000, "tier2": 500_000_000, "tier3": 0}
-    if kyc_level in tier_limits and tier_limits[kyc_level] > 0:
-        if amount_kobo > tier_limits[kyc_level]:
-            errors.append(f"{kyc_level} KYC max loan ₦{tier_limits[kyc_level] // 100:,}")
-
-    # Age check
-    if age < 18: errors.append("Applicant must be 18+")
-    if age + tenor_months // 12 > 65: errors.append(f"Applicant will be {age + tenor_months // 12} at maturity (max 65)")
-
-    # Employment
-    if employment_years < 0.5: errors.append("Minimum 6 months employment required")
-
-    return len(errors) == 0, errors
-
-
-# ── Payment Reversal & Reconciliation ────────────────────────────────────────
-
-def reverse_transaction(txn_id: str, amount_kobo: int, sender: str, receiver: str, reason: str) -> dict:
-    """Generate reversal with GL entries."""
-    import time
-    return {
-        "reversal_id": f"REV-{txn_id}-{int(time.time()*1000)}",
-        "original_txn_id": txn_id,
-        "amount_kobo": amount_kobo,
-        "reason": reason,
-        "status": "reversed",
-        "reversed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "gl_entries": [
-            {"debit": receiver, "credit": sender, "amount_kobo": amount_kobo, "narration": f"Reversal: {reason}"},
-        ],
-    }
-
-
-def reconcile_transactions(internal: list, external: list) -> dict:
-    """Match internal records vs external (NIBSS/processor) records."""
-    ext_map = {t.get("session_id", ""): t for t in external if t.get("session_id")}
-    matched, unmatched, amount_mismatches = 0, 0, 0
-    for txn in internal:
-        sid = txn.get("session_id", "")
-        if sid in ext_map:
-            if txn.get("amount_kobo") == ext_map[sid].get("amount_kobo"):
-                matched += 1
-            else:
-                amount_mismatches += 1
-        else:
-            unmatched += 1
-    return {
-        "matched": matched, "unmatched": unmatched,
-        "amount_mismatches": amount_mismatches,
-        "total_internal": len(internal), "total_external": len(external),
-        "exceptions": len(external) - matched,
-    }
-
-
-# ── Velocity & Fraud Detection ───────────────────────────────────────────────
-
-VELOCITY_RULES = [
-    {"max_amount_kobo": 490_000_000, "max_count": 3, "window_hours": 24, "description": "3x near-threshold in 24h"},
-    {"max_amount_kobo": 100_000_000, "max_count": 10, "window_hours": 1, "description": "10 transfers in 1h"},
-    {"max_amount_kobo": 50_000_000, "max_count": 20, "window_hours": 24, "description": "20 transfers in 24h"},
-]
-
-def check_velocity(recent_transactions: list, new_amount_kobo: int) -> tuple:
-    """Check velocity limits to detect potential fraud/structuring."""
-    for rule in VELOCITY_RULES:
-        count = sum(1 for t in recent_transactions if t.get("amount_kobo", 0) >= rule["max_amount_kobo"])
-        if count >= rule["max_count"]:
-            return False, f"Velocity breach: {rule['description']}"
-    return True, ""
-
-
-def compute_fraud_score(
-    amount_kobo: int, is_international: bool = False, is_new_beneficiary: bool = False,
-    unusual_time: bool = False, device_changed: bool = False, failed_attempts: int = 0,
-) -> tuple:
-    """Multi-factor transaction fraud scoring."""
-    score = 0.0
-    if is_international: score += 20
-    if is_new_beneficiary: score += 15
-    if unusual_time: score += 10
-    if device_changed: score += 25
-    if failed_attempts >= 3: score += 30
-    if amount_kobo > 500_000_000: score += 15
-    risk = "low" if score < 40 else ("medium" if score < 70 else "high")
-    return min(score, 100.0), risk
-
-
-
-
 _REDIS_URL = os.environ.get("REDIS_URL", "localhost:6379")
-_CACHE_POOL_SIZE = int(os.environ.get("REDIS_POOL_SIZE", "8"))
-
-class _CachePool:
-    """Thread-safe Redis connection pool with health checks."""
-    def __init__(self, url, size=8):
-        parts = url.rsplit(":", 1)
-        self.host = parts[0] if parts else "localhost"
-        self.port = int(parts[1]) if len(parts) > 1 else 6379
-        self.pool = []
-        self.lock = _cache_threading.Lock()
-        self.max_size = size
-        # Pre-warm 2 connections
-        for _ in range(2):
-            c = self._dial()
-            if c: self.pool.append(c)
-
-    def _dial(self):
-        try:
-            s = _cache_socket.create_connection((self.host, self.port), timeout=2)
-            s.settimeout(3)
-            s.sendall(b"*1\r\n$4\r\nPING\r\n")
-            resp = s.recv(64)
-            if resp and resp[0:1] == b'+':
-                return s
-            s.close()
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
-        return None
-
-    def get(self):
-        with self.lock:
-            while self.pool:
-                conn = self.pool.pop()
-                try:
-                    conn.settimeout(1)
-                    conn.sendall(b"*1\r\n$4\r\nPING\r\n")
-                    r = conn.recv(64)
-                    if r and r[0:1] == b'+':
-                        conn.settimeout(3)
-                        return conn
-                except Exception as _exc:
-                    logger.debug(f"Suppressed error: {_exc}")
-                try: conn.close()
-                except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-        return self._dial()
-
-    def put(self, conn):
-        if conn is None: return
-        with self.lock:
-            if len(self.pool) < self.max_size:
-                self.pool.append(conn)
-            else:
-                try: conn.close()
-                except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-    def health(self):
-        c = self.get()
-        if c:
-            self.put(c)
-            return True
-        return False
-
-_cache_pool = _CachePool(_REDIS_URL, _CACHE_POOL_SIZE)
-_l1_cache = {}  # key -> (value, expiry_time)
-_l1_lock = _cache_threading.Lock()
-_l1_max_size = int(os.environ.get("CACHE_L1_MAX_SIZE", "500"))
-_cache_hits = 0
-_cache_misses = 0
-_cache_stampedes = 0
-_cache_metrics_lock = _cache_threading.Lock()
-
-def _l1_get(key):
-    with _l1_lock:
-        entry = _l1_cache.get(key)
-        if entry:
-            val, exp = entry
-            if time.time() < exp:
-                return val
-            del _l1_cache[key]
-    return None
-
-def _l1_set(key, value, ttl=10):
-    with _l1_lock:
-        if len(_l1_cache) >= _l1_max_size:
-            # Evict oldest
-            oldest_k = min(_l1_cache, key=lambda k: _l1_cache[k][1])
-            del _l1_cache[oldest_k]
-        _l1_cache[key] = (value, time.time() + ttl)
-
-def _l1_delete(key):
-    with _l1_lock:
-        _l1_cache.pop(key, None)
 
 def cache_get(key):
-    global _cache_hits, _cache_misses
-    # L1: in-process
-    val = _l1_get(key)
-    if val is not None:
-        with _cache_metrics_lock: _cache_hits += 1
-        return val
-    # L2: Redis via pool
-    conn = _cache_pool.get()
-    if conn is None:
-        with _cache_metrics_lock: _cache_misses += 1
-        return None
     try:
-        conn.sendall(f"*2\r\n$3\r\nGET\r\n${len(key)}\r\n{key}\r\n".encode())
-        data = conn.recv(8192).decode()
-        _cache_pool.put(conn)
-        if data.startswith("$-1"):
-            with _cache_metrics_lock: _cache_misses += 1
-            return None
+        host, port = _REDIS_URL.rsplit(":", 1)
+        s = _socket.create_connection((host, int(port)), timeout=2)
+        s.sendall(f"*2\r\n$3\r\nGET\r\n${len(key)}\r\n{key}\r\n".encode())
+        data = s.recv(4096).decode()
+        s.close()
+        if data.startswith("$-1"): return None
         parts = data.split("\r\n", 2)
-        if len(parts) >= 3 and parts[1]:
-            with _cache_metrics_lock: _cache_hits += 1
-            _l1_set(key, parts[1])  # Promote to L1
-            return parts[1]
+        return parts[1] if len(parts) >= 3 else None
     except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-    with _cache_metrics_lock: _cache_misses += 1
-    return None
+        return None
 
 def cache_set(key, value, ttl=300):
-    # L1 store
-    _l1_set(key, str(value), min(ttl, 30))
-    # L2: Redis via pool
-    conn = _cache_pool.get()
-    if conn is None: return
     try:
-        v = str(value)
-        t = str(ttl)
-        cmd = f"*6\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(v)}\r\n{v}\r\n$2\r\nEX\r\n${len(t)}\r\n{t}\r\n$2\r\nNX\r\n"
-        conn.sendall(cmd.encode())
-        conn.recv(256)
-        _cache_pool.put(conn)
+        host, port = _REDIS_URL.rsplit(":", 1)
+        s = _socket.create_connection((host, int(port)), timeout=2)
+        cmd = f"*4\r\n$3\r\nSET\r\n${len(key)}\r\n{key}\r\n${len(str(value))}\r\n{value}\r\n$2\r\nEX\r\n${len(str(ttl))}\r\n{ttl}\r\n"
+        s.sendall(cmd.encode())
+        s.recv(256)
+        s.close()
     except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-def cache_invalidate(key):
-    _l1_delete(key)
-    conn = _cache_pool.get()
-    if conn is None: return
-    try:
-        conn.sendall(f"*2\r\n$3\r\nDEL\r\n${len(key)}\r\n{key}\r\n".encode())
-        conn.recv(64)
-        # Distributed invalidation via PUBLISH
-        channel = "54bank:cache:invalidate"
-        conn.sendall(f"*3\r\n$7\r\nPUBLISH\r\n${len(channel)}\r\n{channel}\r\n${len(key)}\r\n{key}\r\n".encode())
-        conn.recv(64)
-        _cache_pool.put(conn)
-    except Exception:
-        try: conn.close()
-        except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-
-def cache_get_or_load(key, loader, ttl=300):
-    """Get from cache or load with stampede protection."""
-    global _cache_stampedes
-    val = cache_get(key)
-    if val is not None: return val
-    # Stampede lock via SETNX
-    lock_key = key + ":lock"
-    conn = _cache_pool.get()
-    if conn:
-        try:
-            conn.sendall(f"*6\r\n$3\r\nSET\r\n${len(lock_key)}\r\n{lock_key}\r\n$1\r\n1\r\n$2\r\nNX\r\n$2\r\nEX\r\n$1\r\n5\r\n".encode())
-            resp = conn.recv(64).decode()
-            _cache_pool.put(conn)
-            if "$-1" in resp or resp.startswith("-"):
-                with _cache_metrics_lock: _cache_stampedes += 1
-                time.sleep(0.05)
-                val = cache_get(key)
-                if val is not None: return val
-        except Exception:
-            try: conn.close()
-            except Exception as _exc:
-                    logger.debug(f"Suppressed: {_exc}")
-    # Load from source
-    result = loader()
-    if result is not None:
-        cache_set(key, result if isinstance(result, str) else json.dumps(result, default=str), ttl)
-    return result
-
-def cache_metrics():
-    with _cache_metrics_lock:
-        total = _cache_hits + _cache_misses
-        rate = (_cache_hits / total * 100) if total > 0 else 0
-    return {
-        "hits": _cache_hits, "misses": _cache_misses,
-        "hit_rate_pct": round(rate, 2),
-        "stampedes_prevented": _cache_stampedes,
-        "l1_size": len(_l1_cache),
-        "pool_connected": _cache_pool.health(),
-    }
+        pass
 
 # --- Configuration ---
 DB_URL = os.environ.get("DATABASE_URL", "")
@@ -635,10 +77,9 @@ KYC_ENGINE_URL = os.environ.get("KYC_ENGINE_URL", "http://localhost:8122")
 
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
-TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54bank/certs/service.crt")
-TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54bank/certs/service.key")
-TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54bank/certs/ca.crt")
-MAX_BODY_SIZE = 1_048_576  # 1MB request body limit
+TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54link-dev/certs/service.crt")
+TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54link-dev/certs/service.key")
+TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54link-dev/certs/ca.crt")
 PORT = int(os.environ.get("PORT", "9431"))
 START_TIME = time.time()
 
@@ -661,20 +102,11 @@ def inc_errors():
 _db_pool = None
 
 def get_db():
-    global _db_pool
-    if not DB_URL:
-        return None
-    try:
-        if _db_pool is None:
-            from psycopg2.pool import SimpleConnectionPool
-            _db_pool = SimpleConnectionPool(minconn=2, maxconn=10, dsn=DB_URL)
-            logger.info("Database connection pool initialized (2-10 connections)")
-        conn = _db_pool.getconn()
-        conn.autocommit = True
-        return conn
-    except Exception as e:
-        logger.warning(f"DB pool connection failed: {e}")
-        return None
+    global db_conn
+    if db_conn is None or db_conn.closed:
+        db_conn = psycopg2.connect(DATABASE_URL)
+        db_conn.autocommit = True
+    return db_conn
 
 def release_db(conn):
     """Return a connection to the pool."""
@@ -682,14 +114,15 @@ def release_db(conn):
     if _db_pool and conn:
         try:
             _db_pool.putconn(conn)
-        except Exception as _exc:
-            logger.debug(f"Suppressed error: {_exc}")
+        except Exception:
+            pass
 
-def db_insert(table, record):
+def init_schema():
     conn = get_db()
     if not conn:
-        logger.error(f"[{SERVICE_NAME}] CRITICAL: No database connection — refusing write to prevent data loss")
-        raise ConnectionError(f"Database unavailable for {SERVICE_NAME}. Set DATABASE_URL environment variable.")
+        record["id"] = str(uuid.uuid4())
+        record["created_at"] = datetime.now(timezone.utc).isoformat()
+        return record
     try:
         cur = conn.cursor()
         data = json.dumps(record)
@@ -700,10 +133,94 @@ def db_insert(table, record):
         record["created_at"] = str(row[1])
         return record
     except Exception as e:
-        logger.error(f"[{SERVICE_NAME}] DB insert failed: {e}")
-        raise
+        logger.error(f"DB insert failed: {e}")
+        record["id"] = str(uuid.uuid4())
+        return record
 
-def db_query(table, page=1, limit=50):
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_tenant ON kyc_records(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_status ON kyc_records(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kyc_records_created ON kyc_records(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+    conn.commit()
+    logger.info("Schema initialized")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_schema()
+    logger.info(f"[kyc-analytics-dashboard-py] ready on :%d", PORT)
+    logger.info(f"[kyc-analytics-dashboard-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+                KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
+    yield
+    if db_conn:
+        db_conn.close()
+
+
+app = FastAPI(title="kyc-analytics-dashboard-py", version="1.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class CreateRequest(BaseModel):
+    status: Optional[str] = "active"
+    tenant_id: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+class UpdateRequest(BaseModel):
+    status: Optional[str] = None
+    data: Optional[Dict[str, Any]] = None
+
+
+@app.get("/healthz")
+def health():
+    return {"status": "healthy", "service": "kyc-analytics-dashboard-py", "version": "1.0.0"}
+
+
+@app.get("/readyz")
+def readyz():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return {"status": "ready"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"not ready: {e}")
+
+
+@app.get("/livez")
+def livez():
+    return {"status": "alive"}
+
+
+@app.get("/metrics")
+def metrics():
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM kyc_records")
+            count = cur.fetchone()[0]
+        return {"service": "kyc-analytics-dashboard-py", "total_records": count}
+    except Exception:
+        return {"service": "kyc-analytics-dashboard-py", "total_records": 0}
+
+
+@app.get("/api/v1/kyc_records")
+def list_records(x_tenant_id: Optional[str] = Header(None)):
     conn = get_db()
     if not conn:
         return [], 0
@@ -953,48 +470,6 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
-
-# --- Rate Limiter (Token Bucket) ---
-import threading as _threading
-import time as _time
-
-class _RateLimiter:
-    def __init__(self, rate=100, burst=200):
-        self._rate = rate
-        self._burst = burst
-        self._tokens = {}
-        self._lock = _threading.Lock()
-
-    def allow(self, key="global"):
-        with self._lock:
-            now = _time.monotonic()
-            if key not in self._tokens:
-                self._tokens[key] = (self._burst, now)
-                return True
-            tokens, last = self._tokens[key]
-            elapsed = now - last
-            tokens = min(self._burst, tokens + elapsed * self._rate)
-            if tokens >= 1:
-                self._tokens[key] = (tokens - 1, now)
-                return True
-            return False
-
-_rate_limiter = _RateLimiter()
-
-
-# --- Retry with Exponential Backoff ---
-import time as _retry_time
-
-def retry_with_backoff(fn, max_retries=3, base_delay=0.1):
-    for attempt in range(max_retries):
-        try:
-            return fn()
-        except Exception:
-            if attempt == max_retries - 1:
-                raise
-            delay = min(base_delay * (2 ** attempt), 5.0)
-            _retry_time.sleep(delay)
-
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
@@ -1032,42 +507,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
 
-        if path == "/v1/cache-metrics":
-            self._respond(200, cache_metrics())
-            return
-        elif path == "/healthz":
+        if path == "/healthz":
             db = get_db()
-            db_status = "not_configured"
-            redis_status = "not_configured"
-            overall = "healthy"
-            if db:
-                try:
-                    cur = db.cursor()
-                    cur.execute("SELECT 1")
-                    cur.fetchone()
-                    db_status = "connected"
-                except Exception as _hce:
-                    db_status = f"unhealthy: {_hce}"
-                    overall = "degraded"
-            if _cache_pool:
-                try:
-                    cache_set("__healthcheck__", "1", 10)
-                    if cache_get("__healthcheck__"):
-                        redis_status = "connected"
-                    else:
-                        redis_status = "unreachable"
-                        overall = "degraded"
-                except Exception:
-                    redis_status = "unreachable"
-                    overall = "degraded"
             self.respond(200, {
-                "status": overall,
+                "status": "healthy",
                 "service": "kyc-analytics-dashboard-py",
                 "version": "2.0.0",
-                "checks": {
-                    "database": db_status,
-                    "cache": redis_status,
-                },
+                "db": "connected" if db else "not_configured",
                 "uptime_secs": round(time.time() - START_TIME),
             })
         elif path == "/readyz":
@@ -1075,10 +521,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/livez":
             self.respond(200, {"alive": True})
         elif path == "/v1/degradation":
-            self._json(200, {"service": "kyc-analytics-dashboard-py", **_degrade.status()})
-        elif path == "/v1/alerts":
-            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-        elif path == "/metrics":
+                self._json(200, {"service": "kyc-analytics-dashboard-py", **_degrade.status()})
+            elif path == "/v1/alerts":
+                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+            elif path == "/metrics":
             body = (
                 f'# HELP requests_total Total requests\n'
                 f'# TYPE requests_total counter\n'
@@ -1087,27 +533,9 @@ class Handler(BaseHTTPRequestHandler):
                 f'# TYPE errors_total counter\n'
                 f'errors_total{{service=\"kyc-analytics-dashboard-py\"}} {error_count}\n'
             )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body.encode())
-        elif path in ("/v1/records", "/v1/list"):
-            claims, err = validate_jwt(dict(self.headers))
-            if err:
-                self.respond(401, {"error": "unauthorized", "detail": err})
-                return
-            items, total = db_query("kyc_analytics_dashboard_py")
-            self.respond(200, {"items": items, "total": total, "source": "database" if get_db() else "no_db"})
-        elif path == "/v1/stats":
-            self.respond(200, {
-                "service": "kyc-analytics-dashboard-py",
-                "requests": request_count,
-                "errors": error_count,
-                "db_connected": get_db() is not None,
-                "uptime_secs": round(time.time() - START_TIME),
-            })
         else:
-            self.respond(404, {"error": "not_found", "path": path})
+            cur.execute("SELECT id, status, created_at FROM kyc_records ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
 
     def do_POST(self):
         trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
@@ -1138,18 +566,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/v1/create":
-            try:
-                result = db_insert("kyc_analytics_dashboard_py", body)
-                _compute_trend_result = compute_trend(body.get("data", {}))
-                cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-                self.respond(201, {"created": True, "data": result})
-            except ConnectionError as ce:
-                self.respond(503, {"error": "database_unavailable", "detail": str(ce)})
-                return
-            except Exception as de:
-                logger.error(f"[{SERVICE_NAME}] Write failed: {de}")
-                self.respond(500, {"error": "write_failed", "detail": str(de)})
-                return
+            result = db_insert("kyc_analytics_dashboard_py", body)
+            _compute_trend_result = compute_trend(body.get("data", {}))
+            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
+            self.respond(201, {"created": True, "data": result})
         else:
             self.respond(404, {"error": "not_found", "path": path})
 
@@ -1175,7 +595,7 @@ SECURITY_HEADERS = {
     "Referrer-Policy": "strict-origin-when-cross-origin",
     "Content-Security-Policy": "default-src 'self'",
 }
-CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54bank.ng").split(",")
+CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "https://dashboard.54link-dev.ng").split(",")
 
 def add_security_headers(handler_self):
     """Add security + CORS headers to response."""
@@ -1224,244 +644,6 @@ def init_tracing(service_name):
         logger.warning(f"Failed to init tracing: {e}")
 signal.signal(signal.SIGINT, shutdown_handler)
 
-
-
-# ─── Idempotency Enforcement ────────────────────────────────────────────────
-import hashlib as _idem_hashlib
-_idempotency_cache = {}  # key -> (status_code, response_body, timestamp)
-
-def check_idempotency(key: str) -> tuple:
-    """Check if idempotency key has been seen. Returns (is_duplicate, cached_response)."""
-    if key and key in _idempotency_cache:
-        entry = _idempotency_cache[key]
-        return True, entry
-    return False, None
-
-def store_idempotency(key: str, status_code: int, response: dict):
-    """Store idempotency response for deduplication (24h TTL)."""
-    import time
-    if key:
-        _idempotency_cache[key] = (status_code, response, time.time())
-        # Cleanup entries older than 24h
-        cutoff = time.time() - 86400
-        for k in list(_idempotency_cache.keys()):
-            if _idempotency_cache[k][2] < cutoff:
-                del _idempotency_cache[k]
-
-
-# ─── Maker-Checker (Dual Authorization) ─────────────────────────────────────
-_maker_checker_requests = []
-_MAKER_CHECKER_THRESHOLDS = {
-    "transfer": 100_000_000,       # ₦1M
-    "loan_disburse": 100_000_000,  # ₦1M
-    "gl_posting": 50_000_000,      # ₦500K
-    "account_close": 0,            # Always
-}
-
-def requires_maker_checker(operation: str, amount_kobo: int) -> bool:
-    """Check if operation needs dual authorization per CBN guidelines."""
-    threshold = _MAKER_CHECKER_THRESHOLDS.get(operation, 100_000_000)
-    return amount_kobo >= threshold
-
-def submit_for_approval(operation: str, maker_id: str, amount_kobo: int, payload: dict) -> dict:
-    """Submit operation for maker-checker approval."""
-    import time
-    req = {
-        "request_id": f"MCR-{int(time.time()*1000000)}",
-        "operation": operation, "maker_id": maker_id, "amount_kobo": amount_kobo,
-        "status": "pending_approval", "payload": payload,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    _maker_checker_requests.append(req)
-    return req
-
-
-# ─── Immutable Audit Trail ───────────────────────────────────────────────────
-import hashlib as _audit_hashlib
-
-# --- Monetary Safety (kobo precision) ---
-def round_naira(amount):
-    """Round to 2 decimal places (kobo precision) to prevent float drift."""
-    return round(float(amount), 2)
-
-def naira_to_kobo(naira):
-    """Convert naira (float) to kobo (int) for precise storage."""
-    return int(round(float(naira) * 100))
-
-def kobo_to_naira(kobo):
-    """Convert kobo (int) back to naira (float) for display."""
-    return round(int(kobo) / 100.0, 2)
-
-def validate_amount(amount):
-    """Validate monetary amount: non-negative, within CBN limits."""
-    amount = float(amount)
-    if amount < 0:
-        raise ValueError(f"Amount must be non-negative, got {amount:.2f}")
-    if amount > 999_999_999_999.99:
-        raise ValueError(f"Amount exceeds maximum (NGN 999,999,999,999.99)")
-    return round_naira(amount)
-
-_audit_log = []  # Append-only. No deletion permitted.
-
-def append_audit_entry(service: str, operation: str, actor_id: str, entity_id: str,
-                       entity_type: str, old_state: str = "", new_state: str = "", ip: str = ""):
-    """Append immutable audit entry with tamper-detection checksum."""
-    import time
-    entry_id = f"AUD-{int(time.time()*1000000)}"
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    raw = f"{entry_id}|{timestamp}|{service}|{operation}|{actor_id}|{entity_id}|{old_state}|{new_state}|{ip}"
-    checksum = _audit_hashlib.sha256(raw.encode()).hexdigest()
-    entry = {
-        "id": entry_id, "timestamp": timestamp, "service": service,
-        "operation": operation, "actor_id": actor_id, "entity_id": entity_id,
-        "entity_type": entity_type, "old_state": old_state, "new_state": new_state,
-        "ip_address": ip, "checksum": checksum, "immutable": True,
-    }
-    _audit_log.append(entry)
-    # Persist to DB if available
-    if _db_conn:
-        try:
-            _db_conn.cursor().execute(
-                "INSERT INTO audit_trail (id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip_address, checksum) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (entry_id, timestamp, service, operation, actor_id, entity_id, entity_type, old_state, new_state, ip, checksum))
-            _db_conn.commit()
-        except Exception:
-            pass
-    return entry
-
-
-# ─── Transaction Atomicity ───────────────────────────────────────────────────
-def db_exec_atomic(queries_params: list) -> bool:
-    """Execute multiple DB operations in a single atomic transaction.
-    queries_params: [(sql, params_tuple), ...]
-    Returns True on success, False on rollback.
-    """
-    if not _db_conn:
-        return False
-    cur = _db_conn.cursor()
-    try:
-        for sql, params in queries_params:
-            cur.execute(sql, params)
-        _db_conn.commit()
-        return True
-    except Exception as e:
-        _db_conn.rollback()
-        import logging
-        logging.error(f"Atomic transaction failed, rolled back: {e}")
-        return False
-
-
-# --- Event Bus (Kafka-compatible event emission) ---
-
-
-# --- Process Health Watchdog ---
-# Monitors event loop liveness; if stalled >60s, liveness probe fails
-# and K8s/KEDA restarts the pod.
-
-_watchdog_last_ping = time.time()
-_watchdog_lock = threading.Lock()
-
-
-def watchdog_ping():
-    global _watchdog_last_ping
-    with _watchdog_lock:
-        _watchdog_last_ping = time.time()
-
-
-def watchdog_healthy() -> bool:
-    with _watchdog_lock:
-        return (time.time() - _watchdog_last_ping) < 60
-
-
-def _watchdog_loop():
-    while True:
-        time.sleep(10)
-        if not watchdog_healthy():
-            logger.warning("[WATCHDOG] Event loop stalled — marking unhealthy")
-        watchdog_ping()
-
-
-threading.Thread(target=_watchdog_loop, daemon=True).start()
-
-class EventBus:
-    """Publishes domain events to Kafka topics for downstream consumption."""
-
-    def __init__(self, topic: str, service: str):
-        self._broker = os.environ.get("KAFKA_BROKERS", "localhost:9092")
-        self._topic = topic
-        self._service = service
-        self._buffer: list = []
-        self._lock = threading.Lock()
-
-    def emit(self, event_type: str, payload: dict) -> None:
-        """Emit a domain event. In production: kafka-python producer."""
-        event = {{
-            "id": f"{{self._service}}_{{int(time.time() * 1000)}}",
-            "type": event_type,
-            "source": self._service,
-            "topic": self._topic,
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "data": payload,
-        }}
-        with self._lock:
-            self._buffer.append(event)
-        logger.info(f"[EventBus] {{self._service}} -> {{self._topic}}: {{event_type}}")
-
-    def flush(self) -> list:
-        with self._lock:
-            events = self._buffer[:]
-            self._buffer.clear()
-        return events
-
-    def pending_count(self) -> int:
-        return len(self._buffer)
-
-
-class EventConsumer:
-    """Subscribes to Kafka topics for incoming events."""
-
-    def __init__(self, topics: list, group_id: str):
-        self._topics = topics
-        self._group_id = group_id
-        self._handlers: dict = {{}}
-
-    def on(self, event_type: str, handler):
-        self._handlers[event_type] = handler
-
-    def start(self):
-        logger.info(f"[EventConsumer] Subscribing to {{self._topics}} as {{self._group_id}}")
-        # In production: kafka-python KafkaConsumer with group_id
-
-
-def notify_downstream(service_url: str, path: str, payload: dict) -> bool:
-    """Notify a downstream service via HTTP with retry."""
-    try:
-        resp = call_service("POST", f"{{service_url}}{{path}}", payload)
-        return resp is not None
-    except Exception as e:
-        logger.warning(f"[Downstream] {{service_url}}{{path}} failed: {{e}}")
-        return False
-
-
-_event_bus = EventBus("identity.verification", "kyc-analytics-dashboard")
-
-
-# --- Data Flow Emit Point ---
-def emit_processing_event(action: str, data: dict) -> None:
-    """Called by handlers after successful processing."""
-    _event_bus.emit("kyc-analytics-dashboard." + action, data)
-
 if __name__ == "__main__":
-    get_db()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    logger.info(json.dumps({"service": "kyc-analytics-dashboard-py", "port": PORT, "message": "starting"}))
-    threading.Thread(target=start_grpc_server, args=("kyc-analytics-dashboard-py", 9200), daemon=True).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        if db_conn:
-            db_conn.close()
-        logger.info("Server stopped gracefully")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

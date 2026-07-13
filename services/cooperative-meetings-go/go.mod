@@ -1,4 +1,4 @@
-module github.com/54bank/cooperative-meetings-go
+module github.com/54link-dev/cooperative-meetings-go
 
 go 1.21
 

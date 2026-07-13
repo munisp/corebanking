@@ -85,7 +85,7 @@ export type BillingIngestionBridgeSummary = {
 export const defaultBillingApprovalMatrices: BillingApprovalMatrix[] = [
   {
     id: "BAM-001",
-    tenantId: "54bank-platform-prod",
+    tenantId: "54link-dev-platform-prod",
     billingAccountId: "BAC-001",
     name: "Enterprise monthly invoice controls",
     status: "active",
@@ -118,7 +118,7 @@ export const defaultBillingInvoiceDisputes: BillingInvoiceDispute[] = [
   {
     id: "BID-001",
     invoiceId: "BINV-001",
-    tenantId: "54bank-platform-prod",
+    tenantId: "54link-dev-platform-prod",
     status: "under_review",
     severity: "medium",
     reasonCode: "usage_dispute",
@@ -290,7 +290,7 @@ export function buildErpPostingPayload(args: {
     documentType: "Sales Invoice",
     invoiceNumber: args.invoice.invoiceNumber,
     customer: args.account?.accountName ?? args.invoice.tenantId,
-    company: "54Bank Platform",
+    company: "54link-dev Platform",
     currency: args.invoice.currency,
     postingDate: args.invoice.generatedAt.slice(0, 10),
     dueDate: args.invoice.dueAt.slice(0, 10),

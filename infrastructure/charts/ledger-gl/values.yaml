@@ -1,0 +1,65 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-ledger-gl
+  pullPolicy: IfNotPresent
+  tag: "0.0.8"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9465
+    - port: 9466
+    - port: 9467
+    - port: 9468
+    - port: 9469
+    - port: 9470
+    - port: 9471
+    - port: 9472
+    - port: 9473
+    - port: 9474
+    - port: 9475
+    - port: 9476
+    - port: 9477
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: ledger-gl
+  appPort: 9468
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  POSTGRES_URL: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking?sslmode=require"
+  APP_PORT: "9465"
+  PORT_BASE: "9465"
+  SERVICE_GROUP: ledger-gl
+  SERVICES: "accounting-rules-rs,chart-of-accounts-service,finance-service,gl-engine-go,gl-engine-rs,operations-control-gl-rs,tigerbeetle-adapter-rs,tigerbeetle-batch-engine-rs,tigerbeetle-multicurrency-rs,tigerbeetle-postgres-sync,tigerbeetle-protocol-rs,tigerbeetle-sync-go,transaction-ledger"

@@ -1,4 +1,4 @@
-module github.com/54bank/agri-reinsurance-go
+module github.com/54link-dev/agri-reinsurance-go
 
 go 1.21
 

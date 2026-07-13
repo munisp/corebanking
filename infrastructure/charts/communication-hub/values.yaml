@@ -1,0 +1,56 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-communication-hub
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: "communication-hub"
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  port: 8124
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    ephemeral-storage: 1Gi
+    cpu: 300m
+    memory: 512Mi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: communication-hub
+  appPort: 8124
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 50m
+  cpu-limit: 150m
+  memory-request: 128Mi
+  memory-limit: 512Mi
+secrets:
+  FLUVIO_URL: fluvio:9003
+  TEMPORAL_HOST: temporal-frontend.temporal.svc:7233
+  WHATSAPP_SERVICE_URL: "http://whatsapp-service.54link-dev.svc.cluster.local:8102"
+  USSD_SERVICE_URL: "http://ussd-service.54link-dev.svc.cluster.local:8103"
+  SMS_SERVICE_URL: "http://sms-service.54link-dev.svc.cluster.local:8104"
+  TELEGRAM_SERVICE_URL: "http://telegram-service.54link-dev.svc.cluster.local:8123"
+  LAKEHOUSE_URL: http://data-intelligence.54link.svc.cluster.local:8000
+  PORT: "8124"
+  APP_PORT: "8124"

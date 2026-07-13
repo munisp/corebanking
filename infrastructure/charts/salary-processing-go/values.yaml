@@ -1,0 +1,48 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-salary-processing-go
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: "salary-processing-go"
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  port: 8150
+resources:
+  requests:
+    cpu: 100m
+    memory: 64Mi
+  limits:
+    ephemeral-storage: 512Mi
+    cpu: 200m
+    memory: 256Mi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: salary-processing-go
+  appPort: 8150
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 50m
+  cpu-limit: 150m
+  memory-request: 64Mi
+  memory-limit: 256Mi
+secrets:
+  ADDR: ":8150"

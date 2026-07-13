@@ -1,0 +1,73 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-platform-tenant
+  pullPolicy: IfNotPresent
+  tag: "0.0.7"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9518
+    - port: 9519
+    - port: 9520
+    - port: 9521
+    - port: 9522
+    - port: 9523
+    - port: 9524
+    - port: 9525
+    - port: 9526
+    - port: 9527
+    - port: 9528
+    - port: 9529
+    - port: 9530
+    - port: 9531
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: platform-tenant
+  appPort: 9528
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  DB_USERNAME: doadmin
+  DB_DATABASE: link_core_banking
+  DB_SSL: "true"
+  DAPR_HOST: "localhost"
+  NODE_ENV: "production"
+  DB_DATABASE: "link_core_banking"
+  DB_DATABASE_TYPE: "postgres"
+  APP_PORT: "9518"
+  PORT_BASE: "9518"
+  BILLING_SERVICE_URL: "http://localhost:9523"
+  SERVICE_GROUP: platform-tenant
+  SERVICES: "billing-enforcement-rs,billing-ingestor-go,billing-orchestrator-go,billing-rating-rs,billing-rbac-rs,billing-service,multi-entity-go,tenant-billing-go,tenant-export-go,tenant-isolation-go,tenant-management,tenant-metering-go,tenant-ratelimit-rs,white-label-engine-go"

@@ -1,0 +1,47 @@
+name: Build and Deploy Verification UI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'services/verification-ui/**'
+      - 'infrastructure/charts/verification-ui/**'
+      - 'infrastructure/apisix-resources/routes/verification-ui.yaml'
+      - '.github/workflows/verification-ui.yaml'
+
+env:
+  IMAGE: registry.digitalocean.com/talentgraph-auth/54link-dev-verification-ui
+  TAG: "0.0.3"
+  CHART: infrastructure/charts/verification-ui
+  RELEASE: verification-ui
+  NAMESPACE: 54link-dev
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to DigitalOcean Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: registry.digitalocean.com
+          username: docker
+          password: ${{ secrets.DO_API_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/verification-ui
+          file: ./services/verification-ui/Dockerfile
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.TAG }}
+          build-args: |
+            VITE_VERIFICATION_API_URL=${{ secrets.VITE_VERIFICATION_API_URL }}
+            VITE_KYC_FLOW_API_KEY=${{ secrets.VITE_KYC_FLOW_API_KEY }}
+

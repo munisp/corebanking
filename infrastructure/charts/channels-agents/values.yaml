@@ -1,0 +1,59 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-channels-agents
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9135
+    - port: 9136
+    - port: 9137
+    - port: 9138
+    - port: 9139
+    - port: 9140
+    - port: 9141
+    - port: 9142
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: channels-agents
+  appPort: 9135
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9135"
+  PORT_BASE: "9135"
+  SERVICE_GROUP: channels-agents
+  SERVICES: "agent-banking-go,agent-cash-management-py,agent-customer-360-py,agent-dormancy-prevention-py,agent-farmer-onboarding-go,agent-nl-reporting-py,agent-reconciliation-py,agent-transaction-investigation-py"

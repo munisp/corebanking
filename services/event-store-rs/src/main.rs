@@ -1,679 +1,257 @@
-use actix_web::{web, App, HttpServer, HttpResponse};
+use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-use chrono::Utc;
+use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use std::env;
 use uuid::Uuid;
-use tokio_postgres /* pool_size=25, idle_timeout=300s */::NoTls;
+use chrono::{Utc, DateTime};
 
-// --- 54Bank Event Store — Append-Only Immutable Event Log with PostgreSQL Persistence ---
-
-#[derive(Clone, Serialize, Deserialize)]
-struct Event {
+#[derive(Debug, Serialize, Deserialize)]
+struct Record {
     id: String,
-    aggregate_id: String,
-    aggregate_type: String,
-    event_type: String,
-    event_data: serde_json::Value,
-    metadata: serde_json::Value,
-    version: u64,
-    tenant_id: Option<String>,
-    created_at: String,
+    status: String,
+    tenant_id: String,
+    created_at: DateTime<Utc>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-struct Snapshot {
-    aggregate_id: String,
-    aggregate_type: String,
-    state: serde_json::Value,
-    version: u64,
-    created_at: String,
+#[derive(Debug, Deserialize)]
+struct CreateRequest {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(flatten)]
+    extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 struct AppState {
-    events: Mutex<Vec<Event>>,
-    snapshots: Mutex<Vec<Snapshot>>,
-    db: Option<Arc<tokio_postgres::Client>>,
-}
-
-#[derive(Deserialize)]
-struct AppendRequest {
-    aggregate_id: String,
-    aggregate_type: String,
-    event_type: String,
-    event_data: serde_json::Value,
-    metadata: Option<serde_json::Value>,
-    tenant_id: Option<String>,
-    expected_version: Option<u64>,
-}
-
-async fn init_db() -> Option<Arc<tokio_postgres::Client>> {
-    let db_url = std::env::var("DATABASE_URL").ok()?;
-    match tokio_postgres::connect(&db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move {
-                if let Err(e) = connection.await {
-                    eprintln!("[event-store] DB connection error: {}", e);
-                }
-            });
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS event_store (
-                    id TEXT PRIMARY KEY,
-                    aggregate_id TEXT NOT NULL,
-                    aggregate_type TEXT NOT NULL,
-                    event_type TEXT NOT NULL,
-                    event_data JSONB DEFAULT '{}',
-                    metadata JSONB DEFAULT '{}',
-                    version BIGINT NOT NULL,
-                    tenant_id TEXT,
-                    created_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute(
-                "CREATE INDEX IF NOT EXISTS idx_es_agg ON event_store(aggregate_id, version)", &[]).await;
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS event_snapshots (
-                    aggregate_id TEXT NOT NULL,
-                    aggregate_type TEXT NOT NULL,
-                    state JSONB DEFAULT '{}',
-                    version BIGINT NOT NULL,
-                    created_at TIMESTAMPTZ DEFAULT NOW(),
-                    PRIMARY KEY (aggregate_id, version)
-                )", &[]).await;
-            println!("[event-store] PostgreSQL connected — events will be persisted");
-            Some(Arc::new(client))
-        }
-        Err(e) => {
-            eprintln!("[event-store] DB connect failed: {} — in-memory only", e);
-            None
-        }
-    }
-}
-
-async fn db_persist_event(db: &Option<Arc<tokio_postgres::Client>>, event: &Event) {
-    if let Some(ref client) = db {
-        if let Err(e) = client.execute(
-            "INSERT INTO event_store (id, aggregate_id, aggregate_type, event_type, event_data, metadata, version, tenant_id, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())",
-            &[&event.id, &event.aggregate_id, &event.aggregate_type, &event.event_type,
-              &event.event_data, &event.metadata, &(event.version as i64), &event.tenant_id],
-        ).await {
-            eprintln!("[event-store] CRITICAL: DB persist event failed: {}", e);
-        }
-    }
-}
-
-async fn db_persist_snapshot(db: &Option<Arc<tokio_postgres::Client>>, snap: &Snapshot) {
-    if let Some(ref client) = db {
-        if let Err(e) = client.execute(
-            "INSERT INTO event_snapshots (aggregate_id, aggregate_type, state, version, created_at) VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT (aggregate_id, version) DO NOTHING",
-            &[&snap.aggregate_id, &snap.aggregate_type, &snap.state, &(snap.version as i64)],
-        ).await {
-            eprintln!("[event-store] DB persist snapshot failed: {}", e);
-        }
-    }
-}
-
-async fn healthz(state: web::Data<AppState>) -> HttpResponse {
-    let db_status = if state.db.is_some() { "connected" } else { "not_configured" };
-    let _bus = init_data_flow();
-    _bus.emit("event-store.processed", &serde_json::json!({"status": "success"}));
-    HttpResponse::Ok().json(serde_json::json!({
-        "status": "healthy",
-        "service": "event-store",
-        "version": "1.0.0",
-        "persistence": db_status
-    }))
-}
-
-async fn append_event(state: web::Data<AppState>, body: web::Json<AppendRequest>) -> HttpResponse {
-    let mut events = state.events.lock().unwrap_or_else(|e| e.into_inner());
-
-    let current_version = events.iter()
-        .filter(|e| e.aggregate_id == body.aggregate_id)
-        .map(|e| e.version)
-        .max()
-        .unwrap_or(0);
-
-    if let Some(expected) = body.expected_version {
-        if current_version != expected {
-            return HttpResponse::Conflict().json(serde_json::json!({
-                "error": "Version conflict",
-                "expected": expected,
-                "actual": current_version
-            }));
-        }
-    }
-
-    let event = Event {
-        id: Uuid::new_v4().to_string(),
-        aggregate_id: body.aggregate_id.clone(),
-        aggregate_type: body.aggregate_type.clone(),
-        event_type: body.event_type.clone(),
-        event_data: body.event_data.clone(),
-        metadata: body.metadata.clone().unwrap_or(serde_json::json!({})),
-        version: current_version + 1,
-        tenant_id: body.tenant_id.clone(),
-        created_at: Utc::now().to_rfc3339(),
-    };
-
-    events.push(event.clone());
-    drop(events);
-
-    // Persist to PostgreSQL
-    db_persist_event(&state.db, &event).await;
-
-    HttpResponse::Created().json(serde_json::json!({
-        "event_id": event.id,
-        "version": event.version,
-        "aggregate_id": event.aggregate_id
-    }))
-}
-
-async fn get_events(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let aggregate_id = path.into_inner();
-    let events = state.events.lock().unwrap_or_else(|e| e.into_inner());
-    let agg_events: Vec<&Event> = events.iter()
-        .filter(|e| e.aggregate_id == aggregate_id)
-        .collect();
-    HttpResponse::Ok().json(serde_json::json!({
-        "aggregate_id": aggregate_id,
-        "events": agg_events,
-        "count": agg_events.len()
-    }))
-}
-
-async fn get_events_by_type(state: web::Data<AppState>, path: web::Path<(String, String)>) -> HttpResponse {
-    let (agg_type, event_type) = path.into_inner();
-    let events = state.events.lock().unwrap_or_else(|e| e.into_inner());
-    let filtered: Vec<&Event> = events.iter()
-        .filter(|e| e.aggregate_type == agg_type && e.event_type == event_type)
-        .collect();
-    HttpResponse::Ok().json(serde_json::json!({"events": filtered, "count": filtered.len()}))
-}
-
-async fn create_snapshot(state: web::Data<AppState>, body: web::Json<Snapshot>) -> HttpResponse {
-    let mut snapshots = state.snapshots.lock().unwrap_or_else(|e| e.into_inner());
-    let snapshot = Snapshot {
-        aggregate_id: body.aggregate_id.clone(),
-        aggregate_type: body.aggregate_type.clone(),
-        state: body.state.clone(),
-        version: body.version,
-        created_at: Utc::now().to_rfc3339(),
-    };
-    snapshots.push(snapshot.clone());
-    drop(snapshots);
-
-    db_persist_snapshot(&state.db, &snapshot).await;
-
-    HttpResponse::Created().json(serde_json::json!({"status": "snapshot_created"}))
-}
-
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
-    let events = state.events.lock().unwrap_or_else(|e| e.into_inner());
-    let snapshots = state.snapshots.lock().unwrap_or_else(|e| e.into_inner());
-
-    let mut type_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for e in events.iter() {
-        *type_counts.entry(e.event_type.clone()).or_insert(0) += 1;
-    }
-
-    HttpResponse::Ok().json(serde_json::json!({
-        "total_events": events.len(),
-        "total_snapshots": snapshots.len(),
-        "event_types": type_counts
-    }))
-}
-
-
-// ─── Idempotency Enforcement ────────────────────────────────────────────────
-use std::collections::HashMap as IdempHashMap;
-use std::sync::RwLock as IdempRwLock;
-use std::time::Instant as IdempInstant;
-
-struct IdempotencyEntry {
-    response: Vec<u8>,
-    status_code: u16,
-    created_at: IdempInstant,
-}
-
-lazy_static::lazy_static! {
-    static ref IDEMPOTENCY_CACHE: IdempRwLock<IdempHashMap<String, IdempotencyEntry>> =
-        IdempRwLock::new(IdempHashMap::new());
-}
-
-fn check_idempotency(key: &str) -> Option<(u16, Vec<u8>)> {
-    let cache = IDEMPOTENCY_CACHE.read().unwrap();
-    cache.get(key).map(|e| (e.status_code, e.response.clone()))
-}
-
-fn store_idempotency(key: String, status_code: u16, response: Vec<u8>) {
-    let mut cache = IDEMPOTENCY_CACHE.write().unwrap();
-    cache.insert(key, IdempotencyEntry { response, status_code, created_at: IdempInstant::now() });
-    // Cleanup entries older than 24h
-    let cutoff = std::time::Duration::from_secs(86400);
-    cache.retain(|_, v| v.created_at.elapsed() < cutoff);
-}
-
-
-// ─── Maker-Checker (Dual Authorization) ────────────────────────────────────
-#[derive(Clone, serde::Serialize)]
-struct MakerCheckerRequest {
-    request_id: String,
-    operation: String,
-    maker_id: String,
-    checker_id: Option<String>,
-    amount_kobo: i64,
-    status: String, // pending_approval|approved|rejected
-    created_at: String,
-}
-
-fn requires_maker_checker(operation: &str, amount_kobo: i64) -> bool {
-    let threshold = match operation {
-        "transfer" => 100_000_000,      // ₦1M
-        "loan_disburse" => 100_000_000, // ₦1M
-        "gl_posting" => 50_000_000,     // ₦500K
-        "account_close" => 0,           // Always
-        _ => 100_000_000,               // Default ₦1M
-    };
-    amount_kobo >= threshold
-}
-
-
-// ─── Immutable Audit Trail ──────────────────────────────────────────────────
-use sha2::{Sha256 as AuditSha256, Digest as AuditDigest};
-use actix_cors::Cors;
-
-#[derive(Clone, serde::Serialize)]
-struct AuditEntry {
-    id: String,
-    timestamp: String,
-    service: String,
-    operation: String,
-    actor_id: String,
-    entity_id: String,
-    entity_type: String,
-    old_state: String,
-    new_state: String,
-    checksum: String,
-    immutable: bool,
-}
-
-fn append_audit_entry(service: &str, operation: &str, actor_id: &str, entity_id: &str,
-                      entity_type: &str, old_state: &str, new_state: &str) -> AuditEntry {
-    let id = format!("AUD-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let raw = format!("{}|{}|{}|{}|{}|{}|{}|{}", id, timestamp, service, operation, actor_id, entity_id, old_state, new_state);
-    let mut hasher = AuditSha256::new();
-    hasher.update(raw.as_bytes());
-    let checksum = format!("{:x}", hasher.finalize());
-    AuditEntry { id, timestamp: timestamp.clone(), service: service.into(), operation: operation.into(),
-                 actor_id: actor_id.into(), entity_id: entity_id.into(), entity_type: entity_type.into(),
-                 old_state: old_state.into(), new_state: new_state.into(), checksum, immutable: true }
-}
-
-
-
-// --- Request Tracing ---
-fn extract_trace_id(req: &actix_web::HttpRequest) -> String {
-    req.headers()
-        .get("X-Trace-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string()
-}
-
-
-// --- Circuit Breaker ---
-use std::sync::atomic::{AtomicU64, AtomicI64, Ordering};
-
-static CB_FAIL_COUNT: AtomicU64 = AtomicU64::new(0);
-static CB_LAST_FAIL: AtomicI64 = AtomicI64::new(0);
-const CB_THRESHOLD: u64 = 5;
-const CB_TIMEOUT_SECS: i64 = 30;
-
-fn cb_allow() -> bool {
-    let fails = CB_FAIL_COUNT.load(Ordering::Relaxed);
-    if fails < CB_THRESHOLD { return true; }
-    let now = chrono::Utc::now().timestamp();
-    now - CB_LAST_FAIL.load(Ordering::Relaxed) > CB_TIMEOUT_SECS
-}
-
-fn cb_record_success() { CB_FAIL_COUNT.store(0, Ordering::Relaxed); }
-fn cb_record_failure() {
-    CB_FAIL_COUNT.fetch_add(1, Ordering::Relaxed);
-    CB_LAST_FAIL.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
-}
-
-
-// --- Observability ---
-fn init_tracing(service_name: &str) {
-    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").unwrap_or_default();
-    if !endpoint.is_empty() {
-        println!("[{}] OTEL tracing configured: {}", service_name, endpoint);
-    }
-}
-
-
-// --- Rate Limiter ---
-static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
-static RL_LAST: AtomicU64 = AtomicU64::new(0);
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-    let last = RL_LAST.load(Ordering::Relaxed);
-    if now > last { RL_TOKENS.store(100, Ordering::Relaxed); RL_LAST.store(now, Ordering::Relaxed); }
-    RL_TOKENS.fetch_sub(1, Ordering::Relaxed) > 0
-}
-
-
-
-fn security_headers() -> actix_web::middleware::DefaultHeaders {
-    actix_web::middleware::DefaultHeaders::new()
-        .add(("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'"))
-        .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-        .add(("X-Content-Type-Options", "nosniff"))
-        .add(("X-Frame-Options", "DENY"))
-        .add(("X-XSS-Protection", "1; mode=block"))
-        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
-}
-
-static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
-static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
-
-// --- Retry with Exponential Backoff ---
-fn retry_with_backoff<F, T, E>(max_retries: u32, mut f: F) -> Result<T, E>
-where F: FnMut() -> Result<T, E> {
-    let mut attempt = 0;
-    loop {
-        match f() {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                attempt += 1;
-                if attempt >= max_retries { return Err(e); }
-                let delay = std::cmp::min(100 * (1 << attempt), 5000);
-                std::thread::sleep(std::time::Duration::from_millis(delay));
-            }
-        }
-    }
-}
-
-fn validate_request(body: &serde_json::Value) -> Result<(), String> {
-    if body.is_null() { return Err("Request body is required".into()); }
-    if let Some(obj) = body.as_object() {
-        for (k, v) in obj {
-            if k.len() > 256 { return Err(format!("Field name too long: {}", &k[..32])); }
-            if let Some(s) = v.as_str() {
-                if s.len() > 10000 { return Err(format!("Field {} value too long", k)); }
-            }
-        }
-    }
-    Ok(())
-}
-
-
-#[derive(serde::Deserialize)]
-struct PaginationParams {
-    #[serde(default = "default_page")]
-    page: u32,
-    #[serde(default = "default_limit")]
-    limit: u32,
-}
-fn default_page() -> u32 { 1 }
-fn default_limit() -> u32 { 50 }
-
-
-fn mask_pii(value: &str, field_type: &str) -> String {
-    if value.len() < 4 { return "***".to_string(); }
-    match field_type {
-        "bvn" => format!("{}****{}", &value[..3], &value[value.len()-4..]),
-        "phone" => format!("{}****{}", &value[..4], &value[value.len()-2..]),
-        "email" => {
-            if let Some(at) = value.find('@') {
-                format!("{}***@{}", &value[..1], &value[at+1..])
-            } else { "***".to_string() }
-        }
-        _ => format!("{}{}{}",
-            &value[..2],
-            "*".repeat(value.len().saturating_sub(4)),
-            &value[value.len().saturating_sub(2)..])
-    }
-}
-
-
-fn validate_bvn(bvn: &str) -> bool {
-    bvn.len() == 11 && bvn.chars().all(|c| c.is_ascii_digit())
-}
-
-fn validate_nuban(account_no: &str) -> bool {
-    account_no.len() == 10 && account_no.chars().all(|c| c.is_ascii_digit())
-}
-
-fn sanitize_input(s: &str, max_len: usize) -> String {
-    s.chars().take(max_len).filter(|c| *c >= ' ' && *c != '\x7f').collect()
-}
-
-fn validate_amount_kobo(amount: i64) -> bool {
-    amount > 0 && amount <= 500_000_000_000
-}
-
-
-// Rate limiter
-use std::sync::Mutex as StdMutex;
-use std::collections::HashMap;
-
-struct RateLimiter {
-    visitors: StdMutex<HashMap<String, (u32, std::time::Instant)>>,
-    max_requests: u32,
-    window: std::time::Duration,
-}
-
-impl RateLimiter {
-    fn new(max_requests: u32, window_secs: u64) -> Self {
-        Self {
-            visitors: StdMutex::new(HashMap::new()),
-            max_requests,
-            window: std::time::Duration::from_secs(window_secs),
-        }
-    }
-    
-    fn allow(&self, ip: &str) -> bool {
-        let mut visitors = self.visitors.lock().unwrap();
-        let now = std::time::Instant::now();
-        let entry = visitors.entry(ip.to_string()).or_insert((0, now));
-        if now.duration_since(entry.1) > self.window {
-            *entry = (1, now);
-            return true;
-        }
-        if entry.0 >= self.max_requests {
-            return false;
-        }
-        entry.0 += 1;
-        true
-    }
-}
-
-lazy_static::lazy_static! {
-    static ref RATE_LIMITER: RateLimiter = RateLimiter::new(100, 60);
+    db: PgPool,
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8098".to_string()).parse().unwrap_or(8098);
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[event-store-rs] starting");
 
-    let db = init_db().await;
+    let db_name = "event-store-rs".replace("-", "_");
+    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
+    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
 
-    let state = web::Data::new(AppState {
-        events: Mutex::new(Vec::new()),
-        snapshots: Mutex::new(Vec::new()),
-        db,
-    });
+    let pool = PgPoolOptions::new()
+        .max_connections(25)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to database");
 
-    println!("54Bank Event Store listening on :{}", port);
-    const MAX_REQUEST_SIZE: usize = 1_048_576; // 1MB
+    init_schema(&pool).await;
+    log::info!("[event-store-rs] database connected, schema initialized");
+
+    let keycloak_url = env::var("KEYCLOAK_REALM_URL").unwrap_or_else(|_| "http://keycloak:8080/realms/54bank".to_string());
+    let kafka_brokers = env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
+    let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "localhost:6379".to_string());
+    let opensearch_url = env::var("OPENSEARCH_ENDPOINT").unwrap_or_else(|_| "http://opensearch:9200".to_string());
+    let permify_url = env::var("PERMIFY_ENDPOINT").unwrap_or_else(|_| "http://permify:3476".to_string());
+
+    log::info!("[event-store-rs] middleware: keycloak={} kafka={} redis={} opensearch={} permify={}",
+        keycloak_url, kafka_brokers, redis_url, opensearch_url, permify_url);
+
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8801".to_string()).parse().unwrap_or(8801);
+    let data = web::Data::new(AppState { db: pool });
+
+    log::info!("[event-store-rs] ready on :{}", port);
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::JsonConfig::default().limit(MAX_REQUEST_SIZE))
-            .wrap(
-                Cors::default()
-                    .allow_any_origin()
-                    .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
-                    .allowed_headers(vec!["Content-Type", "Authorization", "X-Idempotency-Key", "X-Tenant-ID"])
-                    .max_age(86400)
-            )
-            .app_data(state.clone())
-            .route("/healthz", web::get().to(healthz))
-            .route("/readyz", web::get().to(healthz))
-            .route("/livez", web::get().to(healthz))
-            .route("/v1/event-store/events", web::post().to(append_event))
-            .route("/events/{aggregate_id}", web::get().to(get_events))
-            .route("/events/type/{agg_type}/{event_type}", web::get().to(get_events_by_type))
-            .route("/v1/event-store/snapshots", web::post().to(create_snapshot))
-            .route("/v1/event-store/stats", web::get().to(stats))
+            .app_data(data.clone())
+            .wrap(middleware::Logger::default())
+            .route("/healthz", web::get().to(health))
+            .route("/readyz", web::get().to(readyz))
+            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/metrics", web::get().to(metrics))
+            .route("/api/v1/service_configs", web::get().to(list_records))
+            .route("/api/v1/service_configs", web::post().to(create_record))
+            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
+            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
+            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
     })
-    .keep_alive(std::time::Duration::from_secs(75))
-        .client_request_timeout(std::time::Duration::from_secs(30))
-        .bind(format!("0.0.0.0:{}", port))?
+    .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
 }
 
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
 
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(64) NOT NULL,
+        aggregate_id VARCHAR(128) NOT NULL,
+        payload JSONB NOT NULL,
+        published BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .ok();
 
-// --- Event Bus (Kafka producer) ---
-
-// --- Process Health Watchdog ---
-static WATCHDOG_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn watchdog_ping() {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    WATCHDOG_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
+        .execute(pool).await.ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
+        .execute(pool).await.ok();
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
+        .execute(pool).await.ok();
 }
 
-fn watchdog_healthy() -> bool {
-    let last = WATCHDOG_LAST.load(std::sync::atomic::Ordering::Relaxed);
-    if last == 0 { return true; }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
-    (now - last) < 60000
+async fn health(data: web::Data<AppState>) -> HttpResponse {
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "healthy",
+        "service": "event-store-rs",
+        "version": "1.0.0"
+    }))
 }
 
-fn start_watchdog() {
-    watchdog_ping();
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            if !watchdog_healthy() {
-                eprintln!("[WATCHDOG] Event loop stalled — marking unhealthy");
-            }
-            watchdog_ping();
+async fn readyz(data: web::Data<AppState>) -> HttpResponse {
+    match sqlx::query("SELECT 1").execute(&data.db).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status": "ready"})),
+        Err(e) => HttpResponse::ServiceUnavailable().json(serde_json::json!({"status": "not ready", "error": e.to_string()})),
+    }
+}
+
+async fn metrics(data: web::Data<AppState>) -> HttpResponse {
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM service_configs")
+        .fetch_one(&data.db).await.unwrap_or(0);
+    HttpResponse::Ok().json(serde_json::json!({
+        "service": "event-store-rs",
+        "total_records": count
+    }))
+}
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    let tenant_id = req.headers().get("X-Tenant-ID")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+
+    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+        .bind(tenant_id)
+        .fetch_all(&data.db)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "status": r.get::<String, _>("status"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+                })
+            }).collect();
+            let count = records.len();
+            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
         }
-    });
-}
-
-// --- EventBus (Kafka producer) ---
-struct EventBus {
-    broker_url: String,
-    topic: String,
-    service_name: String,
-}
-
-impl EventBus {
-    fn new(topic: &str, service: &str) -> Self {
-        let broker = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
-        Self { broker_url: broker, topic: topic.to_string(), service_name: service.to_string() }
-    }
-
-    fn emit(&self, event_type: &str, payload: &serde_json::Value) {
-        let event = serde_json::json!({
-            "type": event_type,
-            "source": &self.service_name,
-            "topic": &self.topic,
-            "data": payload,
-        });
-        eprintln!("[EventBus] {} -> {}: {}", self.service_name, self.topic, event_type);
-        EVENTS_EMITTED.fetch_add(1, AtomicOrdering::Relaxed);
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
-fn chrono_now() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    format!("2026-01-01T{:05}Z", d.as_secs() % 86400)
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    let tenant_id = body.tenant_id.clone()
+        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
+        .unwrap_or_else(|| "default".to_string());
+
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
+    )
+    .bind(&tenant_id)
+    .bind(&status)
+    .fetch_one(&data.db)
+    .await;
+
+    match result {
+        Ok(id) => {
+            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.created")
+                .bind(id.to_string())
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
 }
 
-static EVENTS_EMITTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
 
-// --- Downstream Service Client ---
-struct DownstreamClient {
-    base_url: String,
-    timeout_ms: u64,
-}
-
-impl DownstreamClient {
-    fn new(env_var: &str, default_url: &str) -> Self {
-        let url = std::env::var(env_var).unwrap_or_else(|_| default_url.to_string());
-        Self { base_url: url, timeout_ms: 5000 }
-    }
-
-    async fn notify(&self, path: &str, payload: &serde_json::Value) -> Result<(), String> {
-        let url = format!("{}{}", self.base_url, path);
-        eprintln!("[Downstream] POST {}", url);
-        Ok(())
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
-// --- Data Flow Initialization ---
-fn init_data_flow() -> EventBus {
-    let bus = EventBus::new("infra.events", "event-store");
-    eprintln!("[event-store] Data flow initialized: topic=infra.events");
-    bus
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(&status)
+        .bind(&id)
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.updated")
+                .bind(&id)
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
 }
 
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&data.db)
+        .await
+        .ok();
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    let payload = serde_json::json!({"id": &id});
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+        .bind("service_configs.deleted")
+        .bind(&id)
+        .bind(&payload)
+        .execute(&data.db).await.ok();
 
-    #[test]
-    fn test_service_config() {
-        // Verify service starts without panic
-        assert!(true, "event-store-rs service module loads");
-    }
-
-    #[test]
-    fn test_watchdog_initially_healthy() {
-        // Watchdog should report healthy before any ping
-        assert!(watchdog_healthy(), "Watchdog should be healthy initially");
-    }
-
-    #[test]
-    fn test_watchdog_ping_updates() {
-        watchdog_ping();
-        assert!(watchdog_healthy(), "Watchdog should be healthy after ping");
-    }
-
-    #[test]
-    fn test_eventbus_creation() {
-        let bus = EventBus::new("test.topic", "event_store");
-        assert_eq!(bus.topic, "test.topic");
-        assert_eq!(bus.service_name, "event_store");
-    }
-
-    #[test]
-    fn test_chrono_now_format() {
-        let ts = chrono_now();
-        assert!(ts.starts_with("2026-"), "Timestamp should start with year");
-        assert!(ts.ends_with("Z"), "Timestamp should end with Z");
-    }
-
-    #[test]
-    fn test_events_emitted_counter() {
-        let before = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        let bus = EventBus::new("test.topic", "event_store");
-        bus.emit("test.event", &serde_json::json!({"test": true}));
-        let after = EVENTS_EMITTED.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after > before, "Event counter should increment");
-    }
+    HttpResponse::NoContent().finish()
 }

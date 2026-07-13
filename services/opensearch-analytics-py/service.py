@@ -20,51 +20,6 @@ from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Any
 
-
-SERVICE_NAME = "opensearch-analytics-py"
-
-# ─── PostgreSQL Persistence ───
-import time as _time
-
-_db_conn = None
-
-def _init_db():
-    global _db_conn
-    db_url = os.environ.get("DATABASE_URL")
-    if not db_url:
-        return
-    try:
-        import psycopg2
-        _db_conn = psycopg2.connect(db_url)
-        _db_conn.autocommit = True
-        cur = _db_conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS service_records (
-            id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-            status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-            created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-        )""")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)")
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] DB init failed: {e} — in-memory fallback")
-        _db_conn = None
-
-
-def db_persist(record_type: str, data: dict, status: str = "active"):
-    if _db_conn is None:
-        return
-    try:
-        record_id = f"{SERVICE_NAME}_{record_type}_{int(_time.time() * 1000000)}"
-        cur = _db_conn.cursor()
-        cur.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES (%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET data=%s, status=%s, updated_at=NOW()",
-            (record_id, SERVICE_NAME, record_type, status, json.dumps(data), json.dumps(data), status)
-        )
-        cur.close()
-    except Exception as e:
-        print(f"[{SERVICE_NAME}] db_persist failed: {e}")
-
-
 indices: list[dict] = []
 documents: dict[str, list[dict]] = {}
 saved_queries: list[dict] = []
@@ -116,13 +71,11 @@ def init_data() -> None:
             "createdAt": now_iso(),
         }
         indices.append(idx)
-        db_persist("indices", idx.to_dict() if hasattr(idx, "to_dict") else idx if isinstance(idx, dict) else {"value": str(idx)})
         documents[idx_def["name"]] = []
 
     for dash in DEFAULT_DASHBOARDS:
         dash["createdAt"] = now_iso()
         dashboards.append(dash)
-        db_persist("dashboards", dash.to_dict() if hasattr(dash, "to_dict") else dash if isinstance(dash, dict) else {"value": str(dash)})
 
 
 init_data()
@@ -147,7 +100,6 @@ def create_index(body: dict) -> tuple[dict, int]:
         "createdAt": now_iso(),
     }
     indices.append(idx)
-    db_persist("indices", idx.to_dict() if hasattr(idx, "to_dict") else idx if isinstance(idx, dict) else {"value": str(idx)})
     documents[name] = []
     return idx, 201
 
@@ -184,7 +136,6 @@ def bulk_ingest(body: dict) -> tuple[dict, int]:
     for d in docs:
         result, _ = ingest_document(index_name, {"document": d})
         results.append(result)
-        db_persist("results", result.to_dict() if hasattr(result, "to_dict") else result if isinstance(result, dict) else {"value": str(result)})
     return {"index": index_name, "ingested": len(results), "items": results}, 201
 
 
@@ -233,7 +184,6 @@ def search_documents(body: dict) -> tuple[dict, int]:
                         highlights[k] = [str(v).replace(query_text, f"<em>{query_text}</em>")]
                 hit["highlight"] = highlights
             matched.append(hit)
-            db_persist("matched", hit.to_dict() if hasattr(hit, "to_dict") else hit if isinstance(hit, dict) else {"value": str(hit)})
 
     total = len(matched)
     hits = matched[from_offset:from_offset + size]
@@ -283,7 +233,6 @@ def create_alert(body: dict) -> tuple[dict, int]:
         "createdAt": now_iso(),
     }
     alerts.append(alert)
-    db_persist("alerts", alert.to_dict() if hasattr(alert, "to_dict") else alert if isinstance(alert, dict) else {"value": str(alert)})
     return alert, 201
 
 
@@ -322,14 +271,14 @@ class OpenSearchHandler(BaseHTTPRequestHandler):
                 "fluvio": {"status": "connected", "topic": "opensearch_analytics-stream"},
                 "temporal": {"status": "connected", "namespace": "opensearch_analytics"},
                 "postgres": {"status": "connected", "database": "ndsep_db", "schema": "opensearch_analytics"},
-                "keycloak": {"status": "connected", "realm": "54bank"},
+                "keycloak": {"status": "connected", "realm": "54link-dev"},
                 "permify": {"status": "connected", "schema": "opensearch_analytics_authz"},
                 "redis": {"status": "connected", "prefix": "opensearch_analytics:"},
                 "mojaloop": {"status": "connected", "participant": "opensearch_analytics"},
                 "opensearch": {"status": "connected", "index": "opensearch_analytics-*"},
                 "openappsec": {"status": "connected", "policy": "opensearch_analytics-protection"},
                 "apisix": {"status": "connected", "upstream": "opensearch_analytics"},
-                "tigerbeetle": {"status": "connected", "cluster": "54bank-ledger"},
+                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
                 "lakehouse": {"status": "connected", "table": "opensearch_analytics_iceberg"}
             }})
         elif path == "/v1/search/indices":
@@ -379,14 +328,12 @@ class OpenSearchHandler(BaseHTTPRequestHandler):
                 "createdAt": now_iso(),
             }
             saved_queries.append(sq)
-            db_persist("saved_queries", sq.to_dict() if hasattr(sq, "to_dict") else sq if isinstance(sq, dict) else {"value": str(sq)})
             self._send(sq, 201)
         else:
             self._send({"error": "not found"}, 404)
 
 
 if __name__ == "__main__":
-    _init_db()
     port = int(os.environ.get("PORT", "8125"))
     server = HTTPServer(("0.0.0.0", port), OpenSearchHandler)
     print(f"OpenSearch Analytics Service starting on :{port}")

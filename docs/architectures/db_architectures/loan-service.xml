@@ -1,0 +1,26 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Loan Service DB Architecture">
+    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- LOAN APPLICATIONS -->
+        <mxCell id="loan_applications" value="loan_applications&#xa;----------------------&#xa;id (PK, serial)&#xa;loan_application_id (varchar, unique)&#xa;tenant_id (varchar)&#xa;applicant_id (varchar)&#xa;loan_amount (numeric(15,2))&#xa;loan_purpose (text)&#xa;requested_term (int)&#xa;monthly_income (numeric(15,2))&#xa;existing_debt (numeric)&#xa;collateral_value (numeric)&#xa;credit_score (int)&#xa;employment_status (text)&#xa;employment_duration (int)&#xa;bank_statement_score (numeric)&#xa;bvn_verified (bool)&#xa;nin_verified (bool)&#xa;interest_rate_percent (numeric)&#xa;status (text: pending/approved/active/repaid/defaulted)&#xa;loan_started_at (timestamp)&#xa;created_at / updated_at&#xa;INDEX: (id, tenant_id), (tenant_id, applicant_id)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="320" height="440" as="geometry"/>
+        </mxCell>
+
+        <!-- LOAN PAYMENTS -->
+        <mxCell id="loan_payments" value="loan_payments&#xa;----------------------&#xa;id (PK, serial)&#xa;loan_payment_id (varchar, unique)&#xa;loan_application_id (FK -> loan_applications)&#xa;tenant_id (varchar)&#xa;transaction_id (varchar, unique)&#xa;amount (numeric(15,2))&#xa;payment_date (timestamp)&#xa;payment_method (text)&#xa;status (text: completed/failed/pending)&#xa;created_at / updated_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="420" y="40" width="300" height="260" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationship -->
+        <mxCell id="e1" edge="1" parent="1" source="loan_applications" target="loan_payments" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

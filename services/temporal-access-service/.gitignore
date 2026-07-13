@@ -1,0 +1,22 @@
+# Temporal Access Service
+
+*.log
+coverage.out
+temporal-access-service
+*.test
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+bin/
+dist/

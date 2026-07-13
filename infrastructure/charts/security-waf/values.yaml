@@ -1,0 +1,72 @@
+replicaCount: 1
+image:
+  repository: registry.digitalocean.com/talentgraph-auth/54link-dev-security-waf
+  pullPolicy: IfNotPresent
+  tag: "0.0.1"
+nameOverride: ""
+fullnameOverride: ""
+serviceAccount:
+  create: false
+  name: 54link
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+securityContext: {}
+service:
+  type: ClusterIP
+  ports:
+    - port: 9540
+    - port: 9541
+    - port: 9542
+    - port: 9543
+    - port: 9544
+    - port: 9545
+    - port: 9546
+    - port: 9547
+    - port: 9548
+    - port: 9549
+    - port: 9550
+    - port: 9551
+    - port: 9552
+    - port: 9553
+    - port: 9554
+    - port: 9555
+    - port: 9556
+    - port: 9557
+    - port: 9558
+    - port: 9559
+    - port: 9560
+resources:
+  requests:
+    cpu: 200m
+    memory: 256Mi
+  limits:
+    ephemeral-storage: 2Gi
+    cpu: 500m
+    memory: 1Gi
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 80
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+dapr:
+  appId: security-waf
+  appPort: 9558
+  enableMetrics: true
+  enabled: true
+  metricsPort: 9099
+  sidecarListenAddresses: "0.0.0.0"
+  cpu-request: 100m
+  cpu-limit: 300m
+  memory-request: 250Mi
+  memory-limit: 1000Mi
+secrets:
+  APP_PORT: "9540"
+  PORT_BASE: "9540"
+  SERVICE_GROUP: security-waf
+  SERVICES: "body-limit-enforcer-go,clickjack-defender-rs,cloud-kms-bridge-rs,csp-nonce-engine-go,ddos-protection-go,ddos-shield-go,distroless-builder-py,docker-hardener-py,field-level-encryption-rs,helm-validator-go,hsm-key-manager-rs,image-scanner-go,ip-allowlist-rs,key-rotation-engine-go,ml-security-service,openappsec-waf-rs,output-encoder-rs,pci-scanner-rs,security-service,sri-validator-rs,waf-rules-engine-rs"

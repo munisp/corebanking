@@ -1,4 +1,4 @@
-module github.com/54bank/open-banking-baas-go
+module github.com/54link-dev/open-banking-baas-go
 
 go 1.21
 

@@ -1,0 +1,39 @@
+<mxfile host="app.diagrams.net">
+  <diagram name="Virtual Account Service DB Architecture">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+
+        <!-- VIRTUAL ACCOUNTS -->
+        <mxCell id="virtual_accounts" value="VirtualAccount (in-memory / persisted)&#xa;----------------------&#xa;id (varchar, UUID)&#xa;van (varchar, 10-digit NUBAN)&#xa;bank_id / tenant_id (varchar)&#xa;parent_account_id (varchar)&#xa;customer_id (varchar)&#xa;purpose (varchar: loan_collection/merchant/escrow/agent/payroll)&#xa;reference_id / reference_type (varchar)&#xa;account_name (varchar)&#xa;currency (varchar: NGN/USD/...)&#xa;status (varchar: active/suspended/closed)&#xa;expires_at (timestamp, nullable)&#xa;single_use (bool)&#xa;expected_amount / min_amount / max_amount (float)&#xa;total_received (float)&#xa;payment_count (int)&#xa;webhook_url (varchar)&#xa;metadata (JSONB)&#xa;created_at / updated_at / last_payment_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="320" height="420" as="geometry"/>
+        </mxCell>
+
+        <!-- VAN PAYMENTS -->
+        <mxCell id="van_payments" value="VANPayment (in-memory / persisted)&#xa;----------------------&#xa;id (varchar, UUID)&#xa;van_id (FK -> VirtualAccount.id)&#xa;van (varchar)&#xa;bank_id (varchar)&#xa;amount (float)&#xa;currency (varchar)&#xa;sender_name / sender_account / sender_bank&#xa;sender_bank_code (varchar)&#xa;narration (varchar)&#xa;session_id (varchar, NIBSS)&#xa;transaction_ref (varchar)&#xa;status (varchar: pending/processed/failed/reversed)&#xa;processed_at (timestamp)&#xa;ledger_entry_id (TigerBeetle, varchar)&#xa;webhook_sent (bool)&#xa;webhook_response (varchar)&#xa;metadata (JSONB)&#xa;created_at" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;" vertex="1" parent="1">
+          <mxGeometry x="420" y="40" width="300" height="400" as="geometry"/>
+        </mxCell>
+
+        <!-- VAN ALLOCATIONS -->
+        <mxCell id="van_allocations" value="VANAllocation (in-memory / persisted)&#xa;----------------------&#xa;id (varchar)&#xa;bank_id (varchar)&#xa;purpose (varchar)&#xa;prefix (varchar, bank-specific)&#xa;range_start / range_end (int64)&#xa;allocated_at (timestamp)&#xa;used_count (int)" style="shape=rectangle;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;" vertex="1" parent="1">
+          <mxGeometry x="40" y="500" width="300" height="180" as="geometry"/>
+        </mxCell>
+
+        <!-- Note -->
+        <mxCell id="note1" value="Storage: In-memory maps (sync.RWMutex).&#xa;Persistence: Events published to Lakehouse&#xa;via Kafka for durable audit trail.&#xa;&#xa;NIBSS integration for real-time NIP&#xa;credit notifications.&#xa;TigerBeetle for actual ledger entries." style="text;html=1;strokeColor=#b85450;fillColor=#f8cecc;align=left;verticalAlign=top;spacingLeft=4;" vertex="1" parent="1">
+          <mxGeometry x="420" y="480" width="280" height="160" as="geometry"/>
+        </mxCell>
+
+        <!-- Relationships -->
+        <mxCell id="e1" edge="1" parent="1" source="virtual_accounts" target="van_payments" style="endArrow=block;strokeColor=#d6b656;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+        <mxCell id="e2" edge="1" parent="1" source="van_allocations" target="virtual_accounts" style="endArrow=block;strokeColor=#82b366;">
+          <mxGeometry relative="1" as="geometry"/>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

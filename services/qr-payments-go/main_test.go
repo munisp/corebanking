@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,66 +11,66 @@ import (
 func TestQRHealthz(t *testing.T) {
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
-	handleHealthz(w, req)
+	healthz(w, req)
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "qr-payments") {
-		t.Error("expected service name in health response")
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["service"] != "qr-payments-go" {
+		t.Fatalf("expected service qr-payments-go, got %v", resp["service"])
 	}
 }
 
-func TestReadyz(t *testing.T) {
-	req := httptest.NewRequest("GET", "/readyz", nil)
+func TestListQRPayments(t *testing.T) {
+	req := httptest.NewRequest("GET", "/v1/qr/payments", nil)
 	w := httptest.NewRecorder()
-	readyzHandler(w, req)
+	listItems(w, req)
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	items, ok := resp["items"].([]interface{})
+	if !ok {
+		t.Fatal("expected items array")
+	}
+	if len(items) < 4 {
+		t.Fatalf("expected at least 4 QR payments, got %d", len(items))
+	}
 }
 
-func TestMetrics(t *testing.T) {
-	req := httptest.NewRequest("GET", "/metrics", nil)
+func TestGenerateQR(t *testing.T) {
+	body := `{"merchantId":"M-001","amount":5000,"currency":"NGN","description":"Test QR"}`
+	req := httptest.NewRequest("POST", "/v1/qr/generate", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	metricsHandler(w, req)
+	listItems(w, req)
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "requests_total") {
-		t.Error("expected requests_total metric")
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["qrType"] != "dynamic" {
+		t.Errorf("expected dynamic QR, got %v", resp["qrType"])
 	}
 }
 
-func TestHandleList(t *testing.T) {
-	req := httptest.NewRequest("GET", "/v1/qr-payments/list", nil)
+func TestQRPaymentStats(t *testing.T) {
+	req := httptest.NewRequest("GET", "/v1/qr/stats", nil)
 	w := httptest.NewRecorder()
-	handleList(w, req)
+	getStats(w, req)
+
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-}
-
-func TestHandleStats(t *testing.T) {
-	req := httptest.NewRequest("GET", "/v1/qr-payments/stats", nil)
-	w := httptest.NewRecorder()
-	handleStats(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-}
-
-func TestValidateAmount(t *testing.T) {
-	if err := validateAmount(100); err != nil {
-		t.Errorf("100 should be valid: %v", err)
-	}
-	if err := validateAmount(-1); err == nil {
-		t.Error("negative should be invalid")
-	}
-}
-
-func TestRoundNaira(t *testing.T) {
-	got := roundNaira(100.005)
-	if got != 100.01 {
-		t.Errorf("roundNaira(100.005) = %f, want 100.01", got)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	successful := resp["successfulCount"].(float64)
+	if successful != 4 {
+		t.Errorf("expected 4 successful payments, got %v", successful)
 	}
 }
