@@ -1,19 +1,42 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// Cache middleware tests — verify X-Cache HIT/MISS behavior
+// Mock fetch to simulate cache middleware behavior without a running server
+const mockFetch = vi.fn();
+beforeEach(() => {
+  vi.stubGlobal("fetch", mockFetch);
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
 describe("Cache Middleware", () => {
   it("returns X-Cache header on /api/db/ requests", async () => {
+    mockFetch.mockResolvedValueOnce({
+      status: 200,
+      headers: { get: (h: string) => h === "x-cache" ? "MISS" : null },
+      json: async () => ({ data: [] }),
+    });
     const uniqueKey = `_t=${Date.now()}-${Math.random()}`;
     const resp = await fetch(`http://localhost:3000/api/db/customers?${uniqueKey}`);
     expect(resp.status).toBe(200);
     const cacheHeader = resp.headers.get("x-cache");
-    // Cache middleware should set X-Cache header (MISS on unique request)
     if (cacheHeader) {
       expect(["HIT", "MISS"]).toContain(cacheHeader);
     }
   });
 
   it("returns X-Cache: HIT on second identical request", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: { get: (h: string) => h === "x-cache" ? "MISS" : null },
+        json: async () => ({ data: [] }),
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: { get: (h: string) => h === "x-cache" ? "HIT" : null },
+        json: async () => ({ data: [] }),
+      });
     const url = `http://localhost:3000/api/db/accounts?_cache_test=${Date.now()}`;
     await fetch(url);
     const resp2 = await fetch(url);
@@ -24,6 +47,11 @@ describe("Cache Middleware", () => {
   });
 
   it("does not cache POST requests", async () => {
+    mockFetch.mockResolvedValueOnce({
+      status: 201,
+      headers: { get: () => null },
+      json: async () => ({ published: true }),
+    });
     const resp = await fetch("http://localhost:3000/api/events/transaction", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -33,6 +61,17 @@ describe("Cache Middleware", () => {
   });
 
   it("caches /api/db/ routes but not /api/auth/ routes", async () => {
+    mockFetch
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: { get: (h: string) => h === "x-cache" ? "MISS" : null },
+        json: async () => ({ data: [] }),
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: { get: () => null },
+        json: async () => ({ roles: [] }),
+      });
     const dbResp = await fetch("http://localhost:3000/api/db/customers");
     const authResp = await fetch("http://localhost:3000/api/auth/roles");
     expect(authResp.headers.get("x-cache")).toBeNull();
