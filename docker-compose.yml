@@ -350,7 +350,53 @@ services:
     ports: ["8142:8142"]
     profiles: ["services"]
 
+  # ─── Ollama — Local LLM Backend ──────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: 54bank-ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - OLLAMA_NUM_PARALLEL=4
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ─── Ollama Model Puller — pulls default models on startup ───────────────────
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: 54bank-ollama-init
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo "Pulling default models..."
+        ollama pull llama3.2
+        ollama pull llava
+        ollama pull whisper
+        echo "All models pulled successfully"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    restart: "no"
+
 volumes:
+  ollama_data:
   pgdata:
   osdata:
   tbdata:
