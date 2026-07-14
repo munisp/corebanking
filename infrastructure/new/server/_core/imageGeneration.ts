@@ -4,9 +4,9 @@
  * Compatible with any OpenAI-compatible image generation provider.
  *
  * Configuration:
- *   OPENAI_API_KEY   — required
- *   OPENAI_API_BASE  — optional (default: https://api.openai.com/v1)
- *   IMAGE_GEN_MODEL  — optional (default: dall-e-3)
+ *   OLLAMA_API_BASE  — Ollama server URL (default: http://ollama:11434)
+ *   OLLAMA_API_KEY   — optional API key (not required for standard Ollama)
+ *   IMAGE_GEN_MODEL  — optional (default: llava for Ollama)
  */
 import { ENV } from "./env";
 
@@ -25,19 +25,19 @@ export type GenerateImageResult = {
 };
 
 export async function generateImage(params: GenerateImageParams): Promise<GenerateImageResult> {
-  if (!ENV.openaiApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured for image generation.");
+  // Ollama does not require an API key — no assertion needed
+    // (key is optional for Ollama)
   }
 
-  const base = (ENV.openaiApiBase ?? "https://api.openai.com/v1").replace(/\/$/, "");
+  const base = (ENV.ollamaApiBase ?? "http://ollama:11434").replace(/\/$/, "");
   const response = await fetch(`${base}/images/generations`, {
     method: "POST",
     headers: {
       "content-type": "application/json",
-      authorization: `Bearer ${ENV.openaiApiKey}`,
+      ...(ENV.ollamaApiKey ? { authorization: `Bearer ${ENV.ollamaApiKey}` } : {}),
     },
     body: JSON.stringify({
-      model: params.model ?? process.env.IMAGE_GEN_MODEL ?? "dall-e-3",
+      model: params.model ?? process.env.IMAGE_GEN_MODEL ?? "llava",
       prompt: params.prompt,
       size: params.size ?? "1024x1024",
       quality: params.quality ?? "standard",
