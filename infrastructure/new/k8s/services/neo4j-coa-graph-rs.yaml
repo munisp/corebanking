@@ -120,10 +120,10 @@ spec:
                   name: 54bank-qdrant
                   key: url
                   optional: true
-            - name: OPENAI_API_KEY
+            - name: OLLAMA_API_KEY
               valueFrom:
                 secretKeyRef:
-                  name: 54bank-openai
+                  name: 54bank-ollama
                   key: api_key
                   optional: true
           resources:

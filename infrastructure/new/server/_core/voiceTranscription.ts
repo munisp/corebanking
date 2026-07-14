@@ -4,9 +4,9 @@
  * Compatible with any OpenAI-compatible transcription provider.
  *
  * Configuration:
- *   OPENAI_API_KEY      — required
- *   OPENAI_API_BASE     — optional (default: https://api.openai.com/v1)
- *   WHISPER_MODEL       — optional (default: whisper-1)
+ *   OLLAMA_API_BASE     — Ollama server URL (default: http://ollama:11434)
+ *   OLLAMA_API_KEY      — optional API key (not required for standard Ollama)
+ *   WHISPER_MODEL       — optional (default: whisper for Ollama)
  */
 import { ENV } from "./env";
 
@@ -24,8 +24,8 @@ export type TranscribeResult = {
 };
 
 export async function transcribeAudio(params: TranscribeParams): Promise<TranscribeResult> {
-  if (!ENV.openaiApiKey) {
-    throw new Error("OPENAI_API_KEY is not configured for voice transcription.");
+  // Ollama does not require an API key
+    // (key is optional for Ollama)
   }
 
   // Download the audio file from the URL
@@ -38,15 +38,15 @@ export async function transcribeAudio(params: TranscribeParams): Promise<Transcr
 
   const formData = new FormData();
   formData.append("file", audioBlob, "audio.webm");
-  formData.append("model", process.env.WHISPER_MODEL ?? "whisper-1");
+  formData.append("model", process.env.WHISPER_MODEL ?? "whisper");
   formData.append("response_format", "verbose_json");
   if (params.language) formData.append("language", params.language);
   if (params.prompt) formData.append("prompt", params.prompt);
 
-  const base = (ENV.openaiApiBase ?? "https://api.openai.com/v1").replace(/\/$/, "");
+  const base = (ENV.ollamaApiBase ?? "http://ollama:11434").replace(/\/$/, "");
   const response = await fetch(`${base}/audio/transcriptions`, {
     method: "POST",
-    headers: { authorization: `Bearer ${ENV.openaiApiKey}` },
+    headers: { ...(ENV.ollamaApiKey ? { authorization: `Bearer ${ENV.ollamaApiKey}` } : {}) },
     body: formData,
   });
 

@@ -1,12 +1,21 @@
 /**
  * LLM integration helper for 54Bank platform.
- * Uses the standard OpenAI-compatible Chat Completions API.
- * Compatible with: OpenAI, Azure OpenAI, Ollama, vLLM, LM Studio, Groq, Anthropic (via proxy), etc.
+ * Default backend: Ollama (local, open-source, no API key required).
+ *
+ * Ollama exposes an OpenAI-compatible API at /api/chat and /v1/chat/completions.
+ * This module uses the /v1/chat/completions endpoint for maximum compatibility.
  *
  * Configuration (environment variables):
- *   OPENAI_API_KEY   — required: your API key
- *   OPENAI_API_BASE  — optional: override base URL (default: https://api.openai.com/v1)
- *   LLM_MODEL        — optional: override default model (default: gpt-4o-mini)
+ *   OLLAMA_API_BASE  — Ollama server URL (default: http://ollama:11434)
+ *   OLLAMA_API_KEY   — API key (optional, only needed behind an auth proxy)
+ *   LLM_MODEL        — Model to use (default: llama3.2)
+ *
+ * Supported Ollama models (pull with `ollama pull <model>`):
+ *   llama3.2, llama3.1, mistral, gemma2, phi3, qwen2.5, deepseek-r1, etc.
+ *
+ * To switch to a different OpenAI-compatible provider, set:
+ *   OLLAMA_API_BASE=https://api.openai.com/v1  OLLAMA_API_KEY=sk-...  LLM_MODEL=gpt-4o-mini
+ *   OLLAMA_API_BASE=https://api.groq.com/openai/v1  OLLAMA_API_KEY=gsk_...  LLM_MODEL=llama-3.1-70b-versatile
  *
  * Example usage:
  *   const result = await invokeLLM({
@@ -96,22 +105,27 @@ export type InvokeResult = {
   usage?: { prompt_tokens: number; completion_tokens: number; total_tokens: number };
 };
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Configuration ────────────────────────────────────────────────────────────
 
-const DEFAULT_MODEL = process.env.LLM_MODEL ?? "gpt-4o-mini";
+/** Default model — llama3.2 is a fast, capable general-purpose model available in Ollama */
+const DEFAULT_MODEL = process.env.LLM_MODEL ?? "llama3.2";
 
 const resolveApiUrl = (): string => {
-  const base = (ENV.openaiApiBase ?? "https://api.openai.com/v1").replace(/\/$/, "");
-  return `${base}/chat/completions`;
+  const base = (ENV.ollamaApiBase ?? "http://ollama:11434").replace(/\/$/, "");
+  // Ollama supports the OpenAI-compatible endpoint at /v1/chat/completions
+  return `${base}/v1/chat/completions`;
 };
 
-const assertApiKey = (): void => {
-  if (!ENV.openaiApiKey) {
-    throw new Error(
-      "OPENAI_API_KEY is not configured. Set the OPENAI_API_KEY environment variable."
-    );
+const buildHeaders = (): Record<string, string> => {
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  // Ollama does not require an API key — only add if explicitly configured
+  if (ENV.ollamaApiKey) {
+    headers["authorization"] = `Bearer ${ENV.ollamaApiKey}`;
   }
+  return headers;
 };
+
+// ─── Normalizers ──────────────────────────────────────────────────────────────
 
 const ensureArray = (value: MessageContent | MessageContent[]): MessageContent[] =>
   Array.isArray(value) ? value : [value];
@@ -157,12 +171,7 @@ const normalizeResponseFormat = ({
 }: Pick<InvokeParams, "responseFormat" | "response_format" | "outputSchema" | "output_schema">):
   ResponseFormat | undefined => {
   const explicit = responseFormat ?? response_format;
-  if (explicit) {
-    if (explicit.type === "json_schema" && !(explicit as any).json_schema?.schema) {
-      throw new Error("responseFormat json_schema requires a defined schema object");
-    }
-    return explicit;
-  }
+  if (explicit) return explicit;
   const schema = outputSchema ?? output_schema;
   if (!schema) return undefined;
   if (!schema.name || !schema.schema) throw new Error("outputSchema requires both name and schema");
@@ -175,12 +184,13 @@ const normalizeResponseFormat = ({
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /**
- * Invoke the configured LLM via the standard OpenAI Chat Completions API.
- * Works with any OpenAI-compatible provider.
+ * Invoke Ollama (or any OpenAI-compatible LLM) via the /v1/chat/completions endpoint.
+ *
+ * Ollama must be running and the model must be pulled:
+ *   docker run -d -p 11434:11434 ollama/ollama
+ *   ollama pull llama3.2
  */
 export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
-  assertApiKey();
-
   const {
     messages, tools, toolChoice, tool_choice,
     outputSchema, output_schema, responseFormat, response_format,
@@ -190,6 +200,7 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
   const payload: Record<string, unknown> = {
     model: model ?? DEFAULT_MODEL,
     messages: messages.map(normalizeMessage),
+    stream: false,
   };
 
   if (tools?.length) payload.tools = tools;
@@ -208,32 +219,45 @@ export async function invokeLLM(params: InvokeParams): Promise<InvokeResult> {
 
   const response = await fetch(resolveApiUrl(), {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${ENV.openaiApiKey}`,
-    },
+    headers: buildHeaders(),
     body: JSON.stringify(payload),
   });
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`LLM invoke failed: ${response.status} ${response.statusText} — ${errorText}`);
+    throw new Error(
+      `Ollama LLM invoke failed [${response.status} ${response.statusText}]: ${errorText}\n` +
+      `Ensure Ollama is running at ${ENV.ollamaApiBase} and model '${model ?? DEFAULT_MODEL}' is pulled.\n` +
+      `Run: docker exec -it ollama ollama pull ${model ?? DEFAULT_MODEL}`
+    );
   }
 
   return (await response.json()) as InvokeResult;
 }
 
 /**
- * List available models from the configured OpenAI-compatible provider.
+ * List models available in the Ollama instance.
+ * Equivalent to `ollama list`.
  */
 export async function listLLMModels(): Promise<{ id: string; object: string; created: number; owned_by: string }[]> {
-  assertApiKey();
-  const base = (ENV.openaiApiBase ?? "https://api.openai.com/v1").replace(/\/$/, "");
-  const response = await fetch(`${base}/models`, {
-    headers: { authorization: `Bearer ${ENV.openaiApiKey}` },
+  const base = (ENV.ollamaApiBase ?? "http://ollama:11434").replace(/\/$/, "");
+  // Ollama exposes /v1/models (OpenAI-compatible) and /api/tags (native)
+  const response = await fetch(`${base}/v1/models`, {
+    headers: buildHeaders(),
   });
   if (!response.ok) {
-    throw new Error(`Failed to list models: ${response.status} ${response.statusText}`);
+    // Fallback to Ollama native /api/tags endpoint
+    const tagsResponse = await fetch(`${base}/api/tags`, { headers: buildHeaders() });
+    if (!tagsResponse.ok) {
+      throw new Error(`Failed to list Ollama models: ${response.status} ${response.statusText}`);
+    }
+    const tags = await tagsResponse.json() as { models: Array<{ name: string; modified_at: string }> };
+    return (tags.models ?? []).map(m => ({
+      id: m.name,
+      object: "model",
+      created: Math.floor(new Date(m.modified_at).getTime() / 1000),
+      owned_by: "ollama",
+    }));
   }
   const data = await response.json() as { data: any[] };
   return data.data ?? [];
