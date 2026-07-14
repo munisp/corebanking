@@ -1,11 +1,11 @@
 /**
- * Quick example (matches curl usage):
- *   await callDataApi("Youtube/search", {
- *     query: { gl: "US", hl: "en", q: "manus" },
- *   })
+ * External Data API helper for 54Bank platform.
+ * Makes authenticated requests to external REST APIs.
+ *
+ * Configuration:
+ *   DATA_API_BASE_URL — base URL of your data API gateway (optional)
+ *   DATA_API_KEY      — API key for the data gateway (optional)
  */
-import { ENV } from "./env";
-
 export type DataApiCallOptions = {
   query?: Record<string, unknown>;
   body?: Record<string, unknown>;
@@ -14,51 +14,49 @@ export type DataApiCallOptions = {
 };
 
 export async function callDataApi(
-  apiId: string,
+  apiPath: string,
   options: DataApiCallOptions = {}
 ): Promise<unknown> {
-  if (!ENV.forgeApiUrl) {
-    throw new Error("BUILT_IN_FORGE_API_URL is not configured");
-  }
-  if (!ENV.forgeApiKey) {
-    throw new Error("BUILT_IN_FORGE_API_KEY is not configured");
-  }
-
-  // Build the full URL by appending the service path to the base URL
-  const baseUrl = ENV.forgeApiUrl.endsWith("/") ? ENV.forgeApiUrl : `${ENV.forgeApiUrl}/`;
-  const fullUrl = new URL("webdevtoken.v1.WebDevService/CallApi", baseUrl).toString();
-
-  const response = await fetch(fullUrl, {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json",
-      "connect-protocol-version": "1",
-      authorization: `Bearer ${ENV.forgeApiKey}`,
-    },
-    body: JSON.stringify({
-      apiId,
-      query: options.query,
-      body: options.body,
-      path_params: options.pathParams,
-      multipart_form_data: options.formData,
-    }),
-  });
-
-  if (!response.ok) {
-    const detail = await response.text().catch(() => "");
+  const baseUrl = process.env.DATA_API_BASE_URL;
+  if (!baseUrl) {
     throw new Error(
-      `Data API request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`
+      "DATA_API_BASE_URL is not configured. Set the DATA_API_BASE_URL environment variable."
     );
   }
 
-  const payload = await response.json().catch(() => ({}));
-  if (payload && typeof payload === "object" && "jsonData" in payload) {
-    try {
-      return JSON.parse((payload as Record<string, string>).jsonData ?? "{}");
-    } catch {
-      return (payload as Record<string, unknown>).jsonData;
+  const apiKey = process.env.DATA_API_KEY ?? "";
+  let url = `${baseUrl.replace(/\/$/, "")}/${apiPath.replace(/^\//, "")}`;
+
+  // Apply path params
+  if (options.pathParams) {
+    for (const [key, value] of Object.entries(options.pathParams)) {
+      url = url.replace(`{${key}}`, encodeURIComponent(String(value)));
     }
   }
-  return payload;
+
+  // Apply query params
+  if (options.query) {
+    const qs = new URLSearchParams(
+      Object.entries(options.query)
+        .filter(([, v]) => v !== undefined && v !== null)
+        .map(([k, v]) => [k, String(v)])
+    );
+    url = `${url}?${qs.toString()}`;
+  }
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (apiKey) headers["x-api-key"] = apiKey;
+
+  const response = await fetch(url, {
+    method: options.body ? "POST" : "GET",
+    headers,
+    ...(options.body ? { body: JSON.stringify(options.body) } : {}),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Data API call failed: ${response.status} ${response.statusText} — ${errorText}`);
+  }
+
+  return response.json();
 }
