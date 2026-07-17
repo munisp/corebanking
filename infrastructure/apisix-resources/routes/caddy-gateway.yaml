@@ -1,0 +1,110 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# APISIX Route — Caddy Gateway Integration
+# ═══════════════════════════════════════════════════════════════════════════════
+# This route configures APISIX to trust headers forwarded by Caddy:
+#   - X-Real-IP          : Original client IP (Caddy sets this)
+#   - X-Forwarded-For    : Full IP chain
+#   - X-Forwarded-Proto  : Original scheme (https)
+#   - X-Request-ID       : Correlation ID injected by Caddy
+#   - X-User-ID          : Keycloak user ID (Caddy forward_auth copies this)
+#   - X-User-Role        : Keycloak role (Caddy forward_auth copies this)
+#   - X-Tenant-ID        : Tenant ID (Caddy forward_auth copies this)
+#   - X-WAF-Score        : OpenAppSec WAF risk score (Caddy forward_auth copies)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+apiVersion: apisix.apache.org/v2
+kind: ApisixRoute
+metadata:
+  name: caddy-gateway-trust
+  namespace: 54link-dev
+  labels:
+    app: apisix
+    role: caddy-integration
+spec:
+  http:
+    # ── Trust Caddy-forwarded headers for all API routes ──────────────────────
+    - name: caddy-trusted-headers
+      match:
+        hosts:
+          - "*.54bank.local"
+          - "54bank.local"
+        paths:
+          - "/api/*"
+        methods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+      backends:
+        - serviceName: gateway
+          servicePort: 3000
+      plugins:
+        # ── Real IP extraction from Caddy's X-Real-IP header ─────────────────
+        - name: real-ip
+          enable: true
+          config:
+            source: "http_x_real_ip"
+            recursive: false
+            trusted_addresses:
+              - "172.16.0.0/12"  # Docker network (Caddy container)
+              - "10.0.0.0/8"     # K8s pod network (Caddy pod)
+
+        # ── Request ID propagation ────────────────────────────────────────────
+        - name: request-id
+          enable: true
+          config:
+            header_name: "X-Request-ID"
+            include_in_response: true
+
+        # ── Proxy rewrite — strip /api prefix before forwarding ───────────────
+        - name: proxy-rewrite
+          enable: true
+          config:
+            regex_uri:
+              - "^/api/v1/(.*)"
+              - "/$1"
+
+        # ── JWT payload decoder — reads Caddy-forwarded user headers ─────────
+        - name: 54link-jwt-payload-decoder
+          enable: true
+          config:
+            trust_caddy_headers: true
+            caddy_user_id_header: "X-User-ID"
+            caddy_user_role_header: "X-User-Role"
+            caddy_tenant_id_header: "X-Tenant-ID"
+
+        # ── CORS — Caddy handles CORS for browser clients ─────────────────────
+        - name: cors
+          enable: true
+          config:
+            allow_origins: "https://54bank.local,https://*.54bank.local"
+            allow_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+            allow_headers: "Content-Type,Authorization,X-Request-ID,X-Correlation-ID,X-Tenant-ID,X-User-ID,X-User-Role,X-WAF-Score,Idempotency-Key"
+            expose_headers: "X-Request-ID,X-Correlation-ID,X-RateLimit-Remaining,X-RateLimit-Reset"
+            max_age: 3600
+            allow_credential: true
+
+        # ── WAF score check — block requests with high WAF risk score ─────────
+        - name: serverless-pre-function
+          enable: true
+          config:
+            phase: "access"
+            functions:
+              - |
+                local waf_score = tonumber(ngx.req.get_headers()["X-WAF-Score"] or "0")
+                if waf_score and waf_score >= 80 then
+                  ngx.status = 403
+                  ngx.header["Content-Type"] = "application/json"
+                  ngx.say('{"error":"WAF_BLOCKED","message":"Request blocked by WAF","score":' .. waf_score .. '}')
+                  ngx.exit(403)
+                end
+
+        # ── Response headers — add Caddy gateway identification ───────────────
+        - name: response-rewrite
+          enable: true
+          config:
+            headers:
+              X-Gateway: "caddy+apisix"
+              X-Platform: "54bank"
