@@ -1,0 +1,413 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# 54Bank Corebanking Platform — Caddy Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Architecture:
+#   Internet → Caddy (TLS termination, WAF pre-check, rate limiting)
+#            → OpenAppSec WAF (inline security inspection)
+#            → APISIX (API gateway, JWT validation, routing)
+#            → Upstream microservices (via Dapr sidecars)
+#
+# Caddy's role in this stack:
+#   1. Automatic TLS (Let's Encrypt in prod, internal PKI in dev/staging)
+#   2. HTTP/3 (QUIC) for low-latency banking API responses
+#   3. Global rate limiting (per-IP, per-tenant, per-endpoint)
+#   4. Keycloak forward_auth for admin/dashboard routes
+#   5. mTLS enforcement for internal service-to-service communication
+#   6. Structured JSON access logs → Kafka/Fluvio for audit trail
+#   7. Security headers (HSTS, CSP, X-Frame-Options, etc.)
+#   8. OpenAppSec WAF pre-check via forward_auth
+#   9. Internal PKI CA for all internal TLS certificates
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─── Global Options ───────────────────────────────────────────────────────────
+{
+	# Admin API — bind to localhost only for security
+	admin localhost:2019
+
+	# Email for Let's Encrypt ACME registration
+	email {$CADDY_ACME_EMAIL:ops@54bank.com}
+
+	# Internal PKI — Caddy acts as its own CA for internal services
+	pki {
+		ca internal {
+			name "54Bank Internal CA"
+			root_cn "54Bank Root CA"
+			intermediate_cn "54Bank Intermediate CA"
+		}
+	}
+
+	# Default TLS policy — TLS 1.2 minimum, prefer TLS 1.3
+	# Compliant with PCI DSS 4.0 and CBN cybersecurity guidelines
+	default_sni {$PLATFORM_DOMAIN:54bank.local}
+
+	# Enable HTTP/3 (QUIC) globally
+	servers {
+		protocols h1 h2 h3
+		timeouts {
+			read_body   10s
+			read_header 5s
+			write       30s
+			idle        120s
+		}
+		# Trusted proxies for X-Forwarded-For (load balancer IPs)
+		trusted_proxies static 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+	}
+
+	# Structured JSON logging to stdout (captured by Fluvio/Kafka)
+	log default {
+		format json {
+			time_format iso8601
+			time_local false
+		}
+		output stdout
+		level INFO
+	}
+}
+
+# ─── Snippets ─────────────────────────────────────────────────────────────────
+
+# Security headers applied to all responses
+(security_headers) {
+	header {
+		# HSTS — 1 year, include subdomains, preload
+		Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+		# Prevent clickjacking
+		X-Frame-Options "SAMEORIGIN"
+		# Prevent MIME-type sniffing
+		X-Content-Type-Options "nosniff"
+		# XSS protection (legacy browsers)
+		X-XSS-Protection "1; mode=block"
+		# Referrer policy
+		Referrer-Policy "strict-origin-when-cross-origin"
+		# Permissions policy — restrict sensitive browser APIs
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(self)"
+		# Content Security Policy
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; frame-ancestors 'self'; form-action 'self'; upgrade-insecure-requests"
+		# Remove server identification
+		-Server
+		-X-Powered-By
+	}
+}
+
+# Rate limiting snippet — applied to API routes
+(api_rate_limit) {
+	rate_limit {
+		zone global {
+			# 1000 requests per second globally
+			key static
+			events 1000
+			window 1s
+		}
+		zone per_ip {
+			# 100 requests per second per IP
+			key {remote_host}
+			events 100
+			window 1s
+		}
+		zone per_tenant {
+			# 500 requests per second per tenant
+			key {header.X-Tenant-ID}
+			events 500
+			window 1s
+		}
+	}
+}
+
+# Keycloak forward_auth — validates JWT and copies claims to upstream headers
+(keycloak_auth) {
+	forward_auth keycloak:8080 {
+		uri /realms/{$KEYCLOAK_REALM:54bank}/protocol/openid-connect/userinfo
+		copy_headers {
+			X-Auth-User>X-User-ID
+			X-Auth-Email>X-User-Email
+			X-Auth-Roles>X-User-Role
+			X-Auth-Tenant>X-Tenant-ID
+		}
+		header_up Authorization {header.Authorization}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Original-URI {uri}
+		header_up X-Original-Method {method}
+	}
+}
+
+# OpenAppSec WAF pre-check — inspects requests before forwarding to APISIX
+(openappsec_waf) {
+	forward_auth openappsec:1080 {
+		uri /api/v1/waf/check
+		copy_headers {
+			X-WAF-Request-ID>X-WAF-Request-ID
+			X-WAF-Score>X-WAF-Score
+		}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Original-URI {uri}
+		header_up X-Original-Method {method}
+		header_up X-Original-Host {host}
+		header_up Content-Type {header.Content-Type}
+	}
+}
+
+# Request ID injection — ensures every request has a correlation ID
+(request_id) {
+	header {
+		X-Request-ID {header.X-Request-ID}{uuid}
+		X-Correlation-ID {header.X-Correlation-ID}{uuid}
+	}
+}
+
+# mTLS client certificate enforcement for internal services
+(mtls_internal) {
+	tls {
+		client_auth {
+			mode require_and_verify
+			trusted_ca_certs_pem_files /data/caddy/pki/authorities/internal/root.crt
+		}
+	}
+}
+
+# ─── Public API Gateway (HTTPS → APISIX) ─────────────────────────────────────
+# All external API traffic enters here, gets WAF-checked, then forwarded to APISIX
+{$PLATFORM_DOMAIN:54bank.local} {
+	import security_headers
+	import request_id
+	import api_rate_limit
+
+	# Structured access log for audit trail
+	log {
+		output stdout
+		format json {
+			time_format iso8601
+			message_key msg
+		}
+		# Log all fields including request/response headers for PCI DSS compliance
+		include http.request.headers.Authorization
+		include http.request.headers.X-Tenant-ID
+		include http.request.headers.X-User-ID
+		include http.response.status
+		include http.request.duration
+	}
+
+	# Health check endpoint — no auth, no WAF
+	handle /health {
+		respond `{"status":"ok","service":"caddy-gateway","version":"2.x"}` 200 {
+			close
+		}
+	}
+
+	# Readiness probe
+	handle /ready {
+		reverse_proxy apisix:9080 {
+			header_up Host {upstream_hostport}
+		}
+	}
+
+	# ── API routes — WAF check → APISIX ────────────────────────────────────
+	handle /api/* {
+		# Step 1: OpenAppSec WAF pre-inspection
+		import openappsec_waf
+
+		# Step 2: Forward to APISIX API gateway
+		reverse_proxy apisix:9080 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+			header_up X-Forwarded-Host {host}
+			header_up X-Real-IP {remote_host}
+			header_up X-Request-ID {header.X-Request-ID}
+			header_up X-Correlation-ID {header.X-Correlation-ID}
+
+			# Health check APISIX upstream
+			health_uri /apisix/status
+			health_interval 10s
+			health_timeout 5s
+			health_status 200
+
+			# Load balancing (multiple APISIX instances in prod)
+			lb_policy least_conn
+
+			# Circuit breaker
+			fail_duration 30s
+			max_fails 3
+			unhealthy_latency 5s
+
+			# Transport — keep-alive for performance
+			transport http {
+				keepalive 30s
+				keepalive_idle_conns 100
+				dial_timeout 5s
+				response_header_timeout 30s
+			}
+		}
+	}
+
+	# ── WebSocket routes (real-time notifications, Fluvio streams) ──────────
+	handle /ws/* {
+		reverse_proxy apisix:9080 {
+			header_up Connection {header.Connection}
+			header_up Upgrade {header.Upgrade}
+			transport http {
+				keepalive 0
+			}
+		}
+	}
+
+	# ── Static assets (PWA/SPA) ─────────────────────────────────────────────
+	handle /app/* {
+		reverse_proxy gateway:3000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto {scheme}
+		}
+	}
+
+	# ── Fallback — redirect root to app ────────────────────────────────────
+	handle {
+		redir /app/ 302
+	}
+}
+
+# ─── Keycloak SSO (HTTPS → Keycloak) ─────────────────────────────────────────
+auth.{$PLATFORM_DOMAIN:54bank.local} {
+	import security_headers
+	import request_id
+
+	# Rate limit auth endpoints more aggressively (brute-force protection)
+	rate_limit {
+		zone auth_global {
+			key static
+			events 200
+			window 1s
+		}
+		zone auth_per_ip {
+			key {remote_host}
+			events 10
+			window 1s
+		}
+	}
+
+	reverse_proxy keycloak:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
+		header_up X-Forwarded-Host {host}
+		header_up X-Real-IP {remote_host}
+
+		transport http {
+			keepalive 30s
+			dial_timeout 5s
+		}
+	}
+}
+
+# ─── Temporal Web UI (HTTPS → Temporal UI) ───────────────────────────────────
+temporal.{$PLATFORM_DOMAIN:54bank.local} {
+	import security_headers
+	import request_id
+
+	# Require Keycloak auth for Temporal UI (admin-only)
+	import keycloak_auth
+
+	reverse_proxy temporal-ui:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
+	}
+}
+
+# ─── APISIX Dashboard (HTTPS → APISIX Admin UI) ──────────────────────────────
+apisix-admin.{$PLATFORM_DOMAIN:54bank.local} {
+	import security_headers
+	import request_id
+
+	# Require Keycloak auth for APISIX admin (admin-only)
+	import keycloak_auth
+
+	# Restrict to internal networks only
+	@internal_only {
+		remote_ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.1
+	}
+	handle @internal_only {
+		reverse_proxy apisix:9000 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto https
+		}
+	}
+	handle {
+		respond "Access denied: admin interface restricted to internal networks" 403
+	}
+}
+
+# ─── Ollama LLM API (HTTPS → Ollama) ─────────────────────────────────────────
+llm.{$PLATFORM_DOMAIN:54bank.local} {
+	import security_headers
+	import request_id
+
+	# Require Keycloak auth for LLM API
+	import keycloak_auth
+
+	# Rate limit LLM requests (expensive operations)
+	rate_limit {
+		zone llm_per_ip {
+			key {remote_host}
+			events 10
+			window 1m
+		}
+		zone llm_per_tenant {
+			key {header.X-Tenant-ID}
+			events 50
+			window 1m
+		}
+	}
+
+	reverse_proxy ollama:11434 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
+
+		transport http {
+			response_header_timeout 120s
+		}
+	}
+}
+
+# ─── Dapr Dashboard (HTTPS → Dapr Dashboard) ─────────────────────────────────
+dapr.{$PLATFORM_DOMAIN:54bank.local} {
+	import security_headers
+	import request_id
+	import keycloak_auth
+
+	@internal_only {
+		remote_ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 127.0.0.1
+	}
+	handle @internal_only {
+		reverse_proxy dapr-dashboard:8080 {
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto https
+		}
+	}
+	handle {
+		respond "Access denied" 403
+	}
+}
+
+# ─── Internal mTLS endpoint (service-to-service) ─────────────────────────────
+# Internal services communicate over mTLS using Caddy's internal PKI
+internal.{$PLATFORM_DOMAIN:54bank.local} {
+	import mtls_internal
+	import security_headers
+	import request_id
+
+	# Only accessible from within the Docker network
+	@internal_only {
+		remote_ip 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16
+	}
+	handle @internal_only {
+		reverse_proxy apisix:9080 {
+			header_up X-Internal-Request "true"
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+	handle {
+		respond "Access denied" 403
+	}
+}
+
+# ─── HTTP → HTTPS redirect ────────────────────────────────────────────────────
+http:// {
+	redir https://{host}{uri} 301
+}

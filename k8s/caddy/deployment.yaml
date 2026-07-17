@@ -1,0 +1,257 @@
+---
+# ═══════════════════════════════════════════════════════════════════════════════
+# 54Bank Caddy Gateway — Kubernetes Deployment
+# ═══════════════════════════════════════════════════════════════════════════════
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: caddy-gateway
+  namespace: 54link-dev
+  labels:
+    app: caddy-gateway
+    component: ingress
+    version: "2.9"
+    app.kubernetes.io/name: caddy-gateway
+    app.kubernetes.io/component: ingress-gateway
+    app.kubernetes.io/part-of: 54bank-platform
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: caddy-gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: caddy-gateway
+        component: ingress
+      annotations:
+        # Prometheus scraping
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "2019"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: caddy-gateway
+      securityContext:
+        runAsNonRoot: false  # Caddy needs root to bind to port 80/443
+        fsGroup: 1000
+      containers:
+        - name: caddy
+          image: 54bank/caddy-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+            - name: https
+              containerPort: 443
+              protocol: TCP
+            - name: https-quic
+              containerPort: 443
+              protocol: UDP
+            - name: admin
+              containerPort: 2019
+              protocol: TCP
+          env:
+            - name: PLATFORM_DOMAIN
+              valueFrom:
+                configMapKeyRef:
+                  name: caddy-config
+                  key: platform_domain
+            - name: KEYCLOAK_REALM
+              valueFrom:
+                configMapKeyRef:
+                  name: caddy-config
+                  key: keycloak_realm
+            - name: CADDY_ACME_EMAIL
+              valueFrom:
+                configMapKeyRef:
+                  name: caddy-config
+                  key: acme_email
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: password
+                  optional: true
+            - name: CADDY_STORAGE_REDIS_HOST
+              value: "redis-master.redis.svc.cluster.local"
+            - name: CADDY_STORAGE_REDIS_PORT
+              value: "6379"
+            - name: CADDY_STORAGE_REDIS_DB
+              value: "1"
+          volumeMounts:
+            - name: caddy-config
+              mountPath: /etc/caddy/Caddyfile
+              subPath: Caddyfile
+              readOnly: true
+            - name: caddy-data
+              mountPath: /data
+            - name: caddy-config-vol
+              mountPath: /config
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          livenessProbe:
+            httpGet:
+              path: /config/
+              port: 2019
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /config/
+              port: 2019
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: caddy-config
+          configMap:
+            name: caddy-caddyfile
+        - name: caddy-data
+          persistentVolumeClaim:
+            claimName: caddy-data-pvc
+        - name: caddy-config-vol
+          emptyDir: {}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: caddy-gateway
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: caddy-gateway
+  namespace: 54link-dev
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: caddy-gateway
+  namespace: 54link-dev
+  labels:
+    app: caddy-gateway
+  annotations:
+    # AWS NLB for production (replace with your cloud provider's annotation)
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+spec:
+  type: LoadBalancer
+  selector:
+    app: caddy-gateway
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: 443
+      protocol: TCP
+    - name: https-quic
+      port: 443
+      targetPort: 443
+      protocol: UDP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: caddy-gateway-admin
+  namespace: 54link-dev
+  labels:
+    app: caddy-gateway
+spec:
+  type: ClusterIP
+  selector:
+    app: caddy-gateway
+  ports:
+    - name: admin
+      port: 2019
+      targetPort: 2019
+      protocol: TCP
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: caddy-data-pvc
+  namespace: 54link-dev
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  storageClassName: standard
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: caddy-config
+  namespace: 54link-dev
+data:
+  platform_domain: "54bank.local"
+  keycloak_realm: "54bank"
+  acme_email: "ops@54bank.com"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: caddy-caddyfile
+  namespace: 54link-dev
+data:
+  Caddyfile: |
+    # Loaded from config/caddy/Caddyfile
+    # See repository root: config/caddy/Caddyfile
+    import /etc/caddy/Caddyfile
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: caddy-gateway-pdb
+  namespace: 54link-dev
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: caddy-gateway
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: caddy-gateway-hpa
+  namespace: 54link-dev
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: caddy-gateway
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80

@@ -1,0 +1,136 @@
+{
+  "admin": {
+    "listen": "localhost:2019",
+    "enforce_origin": true,
+    "origins": ["localhost:2019"]
+  },
+  "logging": {
+    "logs": {
+      "default": {
+        "writer": { "output": "stdout" },
+        "encoder": {
+          "format": "json",
+          "time_format": "iso8601"
+        },
+        "level": "INFO"
+      }
+    }
+  },
+  "storage": {
+    "module": "redis",
+    "address": "redis:6379",
+    "password": "{$REDIS_PASSWORD}",
+    "db": 1,
+    "key_prefix": "caddy:"
+  },
+  "apps": {
+    "pki": {
+      "certificate_authorities": {
+        "internal": {
+          "name": "54Bank Internal CA",
+          "root": {
+            "common_name": "54Bank Root CA"
+          },
+          "intermediate": {
+            "common_name": "54Bank Intermediate CA"
+          },
+          "install_trust": false
+        }
+      }
+    },
+    "tls": {
+      "automation": {
+        "policies": [
+          {
+            "subjects": [
+              "{$PLATFORM_DOMAIN:54bank.local}",
+              "auth.{$PLATFORM_DOMAIN:54bank.local}",
+              "temporal.{$PLATFORM_DOMAIN:54bank.local}",
+              "apisix-admin.{$PLATFORM_DOMAIN:54bank.local}",
+              "llm.{$PLATFORM_DOMAIN:54bank.local}",
+              "dapr.{$PLATFORM_DOMAIN:54bank.local}",
+              "internal.{$PLATFORM_DOMAIN:54bank.local}"
+            ],
+            "issuers": [
+              {
+                "module": "internal",
+                "ca": "internal"
+              }
+            ],
+            "key_type": "ecdsa_p256",
+            "on_demand": false
+          }
+        ],
+        "on_demand": {
+          "rate_limit": {
+            "interval": "2m",
+            "burst": 5
+          }
+        }
+      },
+      "certificates": {
+        "load_files": []
+      }
+    },
+    "http": {
+      "http_port": 80,
+      "https_port": 443,
+      "grace_period": "10s",
+      "servers": {
+        "main": {
+          "listen": [":443"],
+          "protocols": ["h1", "h2", "h3"],
+          "tls_connection_policies": [
+            {
+              "match": {
+                "sni": ["{$PLATFORM_DOMAIN:54bank.local}"]
+              },
+              "protocol_min": "tls1.2",
+              "protocol_max": "tls1.3",
+              "cipher_suites": [
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+              ],
+              "curves": ["x25519", "secp256r1", "secp384r1"]
+            }
+          ],
+          "logs": {
+            "default_logger_name": "access",
+            "logger_names": {
+              "{$PLATFORM_DOMAIN:54bank.local}": "access"
+            }
+          },
+          "routes": []
+        },
+        "redirect_http": {
+          "listen": [":80"],
+          "routes": [
+            {
+              "match": [{ "path": ["/health"] }],
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "status_code": 200,
+                  "body": "{\"status\":\"ok\"}"
+                }
+              ]
+            },
+            {
+              "handle": [
+                {
+                  "handler": "static_response",
+                  "status_code": 301,
+                  "headers": {
+                    "Location": ["https://{http.request.host}{http.request.uri}"]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

@@ -5,12 +5,47 @@
       "practices": ["WebAttacks", "Snort"],
       "triggers": ["log"],
       "exceptions": []
+    },
+    "api-strict": {
+      "mode": "prevent",
+      "practices": ["WebAttacks", "Snort"],
+      "triggers": ["log", "alert"],
+      "exceptions": [
+        {
+          "comment": "Allow Caddy health checks",
+          "match": { "url": "/health" },
+          "action": "skip"
+        }
+      ]
+    },
+    "auth-endpoints": {
+      "mode": "prevent",
+      "practices": ["WebAttacks", "BruteForce"],
+      "triggers": ["log", "alert"],
+      "exceptions": []
     }
   },
   "assets": [
     {
       "name": "54bank-api",
-      "urls": ["http://apisix:9080/api/v1/*"],
+      "urls": [
+        "https://54bank.local/api/v1/*",
+        "http://apisix:9080/api/v1/*"
+      ],
+      "policy": "api-strict",
+      "sourceIdentifiers": ["caddy-gateway", "apisix"]
+    },
+    {
+      "name": "54bank-auth",
+      "urls": [
+        "https://auth.54bank.local/*",
+        "http://keycloak:8080/realms/*"
+      ],
+      "policy": "auth-endpoints"
+    },
+    {
+      "name": "54bank-internal",
+      "urls": ["http://internal.54bank.local/*"],
       "policy": "default"
     }
   ],
@@ -19,15 +54,48 @@
       "name": "log",
       "type": "log",
       "verbosity": "standard",
-      "extendedLogging": true
+      "extendedLogging": true,
+      "logDestination": { "type": "stdout" }
+    },
+    {
+      "name": "alert",
+      "type": "log",
+      "verbosity": "extended",
+      "extendedLogging": true,
+      "logDestination": { "type": "stdout" },
+      "responseBody": true,
+      "responseCode": true
     }
   ],
   "practices": [
     {
       "name": "WebAttacks",
       "type": "WebAttacks",
-      "overrideMode": "learning",
-      "minimumConfidence": "medium"
+      "overrideMode": "prevent",
+      "minimumConfidence": "medium",
+      "protections": {
+        "csrfProtection": "prevent",
+        "errorDisclosure": "prevent",
+        "openRedirect": "prevent",
+        "sqlInjection": "prevent",
+        "xssProtection": "prevent",
+        "remoteCodeExecution": "prevent",
+        "serverSideRequestForgery": "prevent",
+        "pathTraversal": "prevent"
+      }
+    },
+    {
+      "name": "BruteForce",
+      "type": "WebAttacks",
+      "overrideMode": "prevent",
+      "minimumConfidence": "high",
+      "protections": { "bruteForce": "prevent" }
+    }
+  ],
+  "trustedSources": [
+    {
+      "name": "caddy-gateway",
+      "identifiers": ["172.16.0.0/12", "10.0.0.0/8"]
     }
   ]
 }
