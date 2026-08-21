@@ -545,7 +545,14 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
                     if msg_len > 4 * 1024 * 1024 { return; }
                     let mut payload = vec![0u8; msg_len];
                     if stream.read_exact(&mut payload).is_err() { return; }
-                    let resp = format!(r#"{{"status":"ok","service":"{}"}}"#, service_name);
+                    let resp = if std::env::var("FAKE_GRPC_OK").ok().as_deref() == Some("1") {
+                        // FAKE_GRPC_OK=1: legacy stub for local development only.
+                        format!(r#"{"status":"ok","service":"{}"}"#, service_name)
+                    } else {
+                        // gRPC UNIMPLEMENTED (status 12): never fabricate OK for
+                        // an unimplemented handler.
+                        format!(r#"{"error":"unimplemented","grpcStatus":12,"service":"{}"}"#, service_name)
+                    };
                     let resp_bytes = resp.as_bytes();
                     let resp_len = (resp_bytes.len() as u32).to_be_bytes();
                     let _ = stream.write_all(&resp_len);
