@@ -1,27 +1,11 @@
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::dev::Service;
+use actix_web::{web, App, HttpServer, HttpResponse, HttpRequest};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::env;
 use std::sync::Mutex;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
-}
 
 struct AppState {
     start_time: Instant,
@@ -30,6 +14,99 @@ struct AppState {
     config: ScoringConfig,
     stats: Mutex<EngineStats>,
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ScoringConfig {
+    ibeta_level: u32,
+    liveness_threshold: f64,
+    face_match_threshold: f64,
+    anti_spoof_threshold: f64,
+    deepfake_threshold: f64,
+    passive_3d_weight: f64,
+    texture_weight: f64,
+    depth_weight: f64,
+    frequency_weight: f64,
+    deepfake_weight: f64,
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        ScoringConfig {
+            ibeta_level: 2,
+            liveness_threshold: 0.72,
+            face_match_threshold: 0.68,
+            anti_spoof_threshold: 0.65,
+            deepfake_threshold: 0.35,
+            passive_3d_weight: 0.30,
+            texture_weight: 0.20,
+            depth_weight: 0.20,
+            frequency_weight: 0.15,
+            deepfake_weight: 0.15,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct MethodScore {
+    method: String,
+    score: f64,
+    weight: f64,
+    passed: bool,
+    threshold: f64,
+}
+
+#[derive(Clone, Serialize)]
+struct AntiSpoofScore {
+    is_spoof: bool,
+    spoof_type: String,
+    overall_confidence: f64,
+    // Components are None when the corresponding signal was not supplied —
+    // never defaulted to a passing value.
+    texture_lbp: Option<f64>,
+    monocular_depth: Option<f64>,
+    frequency_fft: Option<f64>,
+    edge_boundary: Option<f64>,
+    moire_detected: bool,
+    reflection_anomaly: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct LivenessCheck {
+    id: String,
+    customer_id: String,
+    session_id: String,
+    is_live: bool,
+    overall_score: f64,
+    confidence_score: f64,
+    verdict: String,
+    method_scores: Vec<MethodScore>,
+    anti_spoof: AntiSpoofScore,
+    deepfake_probability: f64,
+    face_detected: bool,
+    face_quality: f64,
+    head_pose_valid: bool,
+    device_platform: String,
+    processing_time_ms: f64,
+    challenge_type: Option<String>,
+    challenges_passed: u32,
+    challenges_total: u32,
+    timestamp: String,
+}
+
+#[derive(Clone, Serialize)]
+struct FaceMatch {
+    id: String,
+    customer_id: String,
+    matched: bool,
+    similarity_score: f64,
+    embedding_distance: f64,
+    face1_quality: f64,
+    face2_quality: f64,
+    age_estimation: Option<u32>,
+    gender_estimation: Option<String>,
+    processing_time_ms: f64,
+    timestamp: String,
 }
 
 #[derive(Clone, Serialize, Default)]
@@ -199,27 +276,52 @@ fn compute_ensemble_score(req: &LivenessScoreRequest, config: &ScoringConfig) ->
 }
 
 fn classify_spoof(req: &LivenessScoreRequest, config: &ScoringConfig) -> AntiSpoofScore {
-    let texture = req.texture_score.unwrap_or(0.9);
-    let depth = req.depth_score.unwrap_or(0.9);
-    let frequency = req.frequency_score.unwrap_or(0.9);
+    // Only REAL supplied signals contribute. Missing signals are excluded;
+    // if no anti-spoof signals were supplied at all, fail closed (is_spoof=true).
+    let mut weighted_sum = 0.0;
+    let mut total_weight = 0.0;
+    if let Some(t) = req.texture_score { weighted_sum += t * 0.30; total_weight += 0.30; }
+    if let Some(d) = req.depth_score { weighted_sum += d * 0.25; total_weight += 0.25; }
+    if let Some(f) = req.frequency_score { weighted_sum += f * 0.25; total_weight += 0.25; }
+    if let Some(dp) = req.deepfake_probability { weighted_sum += (1.0 - dp) * 0.20; total_weight += 0.20; }
+
     let moire = req.moire_detected.unwrap_or(false);
     let reflection = req.reflection_anomaly.unwrap_or(false);
-    let deepfake_prob = req.deepfake_probability.unwrap_or(0.05);
 
-    let ensemble = texture * 0.30 + depth * 0.25 + frequency * 0.25 + 0.85 * 0.20;
-    let is_spoof = ensemble < config.anti_spoof_threshold || deepfake_prob >= config.deepfake_threshold;
+    if total_weight == 0.0 {
+        return AntiSpoofScore {
+            is_spoof: true,
+            spoof_type: "insufficient_evidence".to_string(),
+            overall_confidence: 0.0,
+            texture_lbp: req.texture_score,
+            monocular_depth: req.depth_score,
+            frequency_fft: req.frequency_score,
+            edge_boundary: None,
+            moire_detected: moire,
+            reflection_anomaly: reflection,
+        };
+    }
+
+    let ensemble = weighted_sum / total_weight;
+    let deepfake_prob = req.deepfake_probability;
+    let texture = req.texture_score;
+    let depth = req.depth_score;
+    let frequency = req.frequency_score;
+
+    let is_spoof = ensemble < config.anti_spoof_threshold
+        || deepfake_prob.map(|dp| dp >= config.deepfake_threshold).unwrap_or(false);
 
     let spoof_type = if !is_spoof {
         "none".to_string()
-    } else if moire || frequency < 0.5 {
+    } else if moire || frequency.map(|f| f < 0.5).unwrap_or(false) {
         "screen_replay".to_string()
-    } else if deepfake_prob >= config.deepfake_threshold {
+    } else if deepfake_prob.map(|dp| dp >= config.deepfake_threshold).unwrap_or(false) {
         "deepfake".to_string()
-    } else if depth < 0.5 {
+    } else if depth.map(|d| d < 0.5).unwrap_or(false) {
         "printed_photo".to_string()
-    } else if texture < 0.5 && depth < 0.6 {
+    } else if texture.map(|t| t < 0.5).unwrap_or(false) && depth.map(|d| d < 0.6).unwrap_or(false) {
         "paper_mask".to_string()
-    } else if depth < 0.55 && texture > 0.6 {
+    } else if depth.map(|d| d < 0.55).unwrap_or(false) && texture.map(|t| t > 0.6).unwrap_or(false) {
         "3d_mask".to_string()
     } else {
         "high_quality_photo".to_string()
@@ -232,7 +334,7 @@ fn classify_spoof(req: &LivenessScoreRequest, config: &ScoringConfig) -> AntiSpo
         texture_lbp: texture,
         monocular_depth: depth,
         frequency_fft: frequency,
-        edge_boundary: 0.85,
+        edge_boundary: None,
         moire_detected: moire,
         reflection_anomaly: reflection,
     }
@@ -305,13 +407,36 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
 async fn score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<AppState>) -> HttpResponse {
     let _sanitized = sanitize_input("");
     let start = Instant::now();
+
+    // FAIL CLOSED on absent inputs: an empty request must NOT verify LIVE.
+    let face_detected = match body.face_detected {
+        Some(v) => v,
+        None => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "face_detected", "is_live": false, "verdict": "INDETERMINATE"})),
+    };
+    let face_quality = match body.face_quality {
+        Some(v) => v,
+        None => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "face_quality", "is_live": false, "verdict": "INDETERMINATE"})),
+    };
+    let deepfake_prob = match body.deepfake_probability {
+        Some(v) => v,
+        None => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "deepfake_probability", "is_live": false, "verdict": "INDETERMINATE"})),
+    };
+    let (yaw, pitch) = match (body.head_pose_yaw, body.head_pose_pitch) {
+        (Some(y), Some(p)) => (y, p),
+        _ => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "head_pose_yaw/head_pose_pitch", "is_live": false, "verdict": "INDETERMINATE"})),
+    };
+    let has_method_input = body.passive_3d_score.is_some()
+        || body.texture_score.is_some()
+        || body.depth_score.is_some()
+        || body.frequency_score.is_some();
+    if !has_method_input {
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "at least one of passive_3d_score/texture_score/depth_score/frequency_score", "is_live": false, "verdict": "INDETERMINATE"}));
+    }
+
     let (overall_score, method_scores, noise_info) = compute_ensemble_score(&body, &state.config);
     let anti_spoof = classify_spoof(&body, &state.config);
-    let deepfake_prob = body.deepfake_probability.unwrap_or(0.05);
 
-    let face_quality = body.face_quality.unwrap_or(0.9);
-    let head_pose_valid = body.head_pose_yaw.unwrap_or(0.0).abs() < 30.0
-        && body.head_pose_pitch.unwrap_or(0.0).abs() < 25.0;
+    let head_pose_valid = yaw.abs() < 30.0 && pitch.abs() < 25.0;
 
     // Adaptive liveness threshold based on noise level
     let noise_adj = body.noise_threshold_adjustment.unwrap_or(0.0);
@@ -321,7 +446,7 @@ async fn score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<
     let is_live = overall_score >= adjusted_threshold
         && !anti_spoof.is_spoof
         && deepfake_prob < state.config.deepfake_threshold
-        && body.face_detected.unwrap_or(true)
+        && face_detected
         && face_quality > adjusted_quality_min
         && head_pose_valid;
 
@@ -345,7 +470,7 @@ async fn score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<
         method_scores,
         anti_spoof: anti_spoof.clone(),
         deepfake_probability: deepfake_prob,
-        face_detected: body.face_detected.unwrap_or(true),
+        face_detected,
         face_quality,
         head_pose_valid,
         device_platform: body.device_platform.clone().unwrap_or_else(|| "unknown".into()),
@@ -396,10 +521,20 @@ async fn score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<
 
 async fn score_face_match(body: web::Json<FaceMatchScoreRequest>, state: web::Data<AppState>) -> HttpResponse {
     let start = Instant::now();
-    let sim = body.similarity_score.unwrap_or(0.0);
-    let dist = body.embedding_distance.unwrap_or(1.0);
-    let q1 = body.face1_quality.unwrap_or(0.9);
-    let q2 = body.face2_quality.unwrap_or(0.9);
+    // Fail closed on absent inputs — never default qualities/similarity high.
+    let sim = match body.similarity_score {
+        Some(v) => v,
+        None => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "similarity_score", "matched": false})),
+    };
+    let q1 = match body.face1_quality {
+        Some(v) => v,
+        None => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "face1_quality", "matched": false})),
+    };
+    let q2 = match body.face2_quality {
+        Some(v) => v,
+        None => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "face2_quality", "matched": false})),
+    };
+    let dist = body.embedding_distance.unwrap_or(1.0 - sim / 100.0);
     let quality_factor = q1.min(q2);
     let adaptive_threshold = state.config.face_match_threshold - (1.0 - quality_factor) * 0.1;
     let matched = (sim / 100.0) >= adaptive_threshold;
@@ -413,8 +548,8 @@ async fn score_face_match(body: web::Json<FaceMatchScoreRequest>, state: web::Da
         embedding_distance: dist,
         face1_quality: q1,
         face2_quality: q2,
-        age_estimation: body.age_estimation.unwrap_or(30),
-        gender_estimation: body.gender_estimation.clone().unwrap_or_else(|| "unknown".into()),
+        age_estimation: body.age_estimation,
+        gender_estimation: body.gender_estimation.clone(),
         processing_time_ms: processing_ms,
         timestamp: chrono_now(),
     };
@@ -530,8 +665,15 @@ struct MotionScoreRequest {
 async fn score_motion(body: web::Json<MotionScoreRequest>, state: web::Data<AppState>) -> HttpResponse {
     let motion = body.motion_score.unwrap_or(0.0);
     let liveness = body.liveness_score.unwrap_or(0.0);
-    let anti_spoof_ok = body.anti_spoof_passed.unwrap_or(true);
-    let deepfake_prob = body.deepfake_probability.unwrap_or(0.05);
+    // Fail closed: without real anti-spoof / deepfake evidence the challenge cannot pass.
+    let anti_spoof_ok = match body.anti_spoof_passed {
+        Some(v) => v,
+        None => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "anti_spoof_passed", "challenge_passed": false})),
+    };
+    let deepfake_prob = match body.deepfake_probability {
+        Some(v) => v,
+        None => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "deepfake_probability", "challenge_passed": false})),
+    };
     let noise_adj = body.noise_threshold_adjustment.unwrap_or(0.0);
     let challenge_type = body.challenge_type.clone().unwrap_or_default();
 
@@ -588,15 +730,12 @@ async fn get_config(req: actix_web::HttpRequest, state: web::Data<AppState>) -> 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn rand_u32() -> u32 {
-    use std::time::SystemTime;
-    let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-    (d.subsec_nanos() ^ (d.as_secs() as u32)) & 0xFFFFFFFF
+    // UUIDv4-derived (random, not time-derived) identifier component.
+    (uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFF) as u32
 }
 
 fn chrono_now() -> String {
-    use std::time::SystemTime;
-    let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-    format!("2026-05-09T{:02}:{:02}:{:02}Z", (d.as_secs() / 3600) % 24, (d.as_secs() / 60) % 60, d.as_secs() % 60)
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -669,14 +808,23 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
     }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"}))),
+    };
+    let secret = match std::env::var("JWT_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::ServiceUnavailable().json(json!({"error": "jwt_validation_unavailable"}))),
+    };
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    match jsonwebtoken::decode::<serde_json::Value>(token, &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()), &validation) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(HttpResponse::Unauthorized().json(json!({"error": "invalid or expired token"}))),
     }
 }
 
@@ -1025,46 +1173,4 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE kyc_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("kyc_records.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("kyc_records.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }
