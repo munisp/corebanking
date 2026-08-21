@@ -20,8 +20,14 @@
  *  - The feature-flag engine is FAIL CLOSED: flags are read from the
  *    FEATURE_FLAGS_JSON env var (JSON object of flagKey -> boolean).
  *    Unknown flags default to DISABLED for non-admin tenants.
- *    TEN-PLATFORM-ADMIN retains full access. The in-memory admin store is
- *    only mutable in demo mode; otherwise flags are env-backed read-only.
+ *  - FAIL CLOSED TENANCY: a request WITHOUT an explicit x-tenant-id header
+ *    is treated as the zero-privilege tenant "anonymous" — never as the
+ *    platform admin. The platform-admin bypass applies ONLY when the header
+ *    explicitly equals TEN-PLATFORM-ADMIN AND the environment opts in via
+ *    PLATFORM_ADMIN_BYPASS=true. In production with that env unset there is
+ *    no bypass at all.
+ *  - The in-memory admin store is only mutable in demo mode; otherwise
+ *    flags are env-backed read-only.
  */
 import type { Express, Request, Response } from "express";
 import { randomUUID } from "crypto";
@@ -151,6 +157,31 @@ const FLAG_CATEGORIES = [
 ];
 
 const PLATFORM_ADMIN_TENANT = "TEN-PLATFORM-ADMIN";
+/** Zero-privilege tenant used when no x-tenant-id header is presented. */
+const ZERO_PRIVILEGE_TENANT = "anonymous";
+
+/**
+ * Resolve the effective tenant. FAIL CLOSED: a missing/empty x-tenant-id
+ * header yields the zero-privilege "anonymous" tenant — never the platform
+ * admin.
+ */
+function tenantFromRequest(req: Request): string {
+  const header = req.headers["x-tenant-id"];
+  const tenantId = typeof header === "string" ? header.trim() : "";
+  return tenantId !== "" ? tenantId : ZERO_PRIVILEGE_TENANT;
+}
+
+/**
+ * Platform-admin bypass applies ONLY when the tenant was EXPLICITLY
+ * presented as TEN-PLATFORM-ADMIN (via the header — "anonymous" never
+ * qualifies) AND the environment opts in with PLATFORM_ADMIN_BYPASS=true.
+ * With the env unset (including all of production), there is no bypass.
+ */
+function adminBypassEnabled(tenantId: string): boolean {
+  if (tenantId !== PLATFORM_ADMIN_TENANT) return false;
+  if (process.env.PLATFORM_ADMIN_BYPASS !== "true") return false;
+  return true;
+}
 
 // Route-to-flag mapping for API middleware (route gating)
 const ROUTE_FLAG_MAP: Record<string, string> = {
@@ -271,9 +302,9 @@ interface TenantFlags {
 }
 const tenantFlagStore = new Map<string, TenantFlags>();
 
-/** Fail-closed flag resolution: unknown flags are disabled for non-admin tenants. */
+/** Fail-closed flag resolution: unknown flags are disabled unless the admin bypass explicitly applies. */
 function isFlagEnabled(tenantId: string, flagKey: string): boolean {
-  if (tenantId === PLATFORM_ADMIN_TENANT) return true;
+  if (adminBypassEnabled(tenantId)) return true;
   if (isDemoSeedMode()) {
     const override = tenantFlagStore.get(tenantId);
     const flag = override?.flags.find((f) => f.key === flagKey);
@@ -283,7 +314,7 @@ function isFlagEnabled(tenantId: string, flagKey: string): boolean {
 }
 
 function flagsForTenant(tenantId: string): TenantFlags {
-  if (tenantId === PLATFORM_ADMIN_TENANT) {
+  if (adminBypassEnabled(tenantId)) {
     return { tenantId, flags: FLAG_CATEGORIES.map((key) => ({ key, enabled: true, rolloutPct: 100 })) };
   }
   if (isDemoSeedMode()) {
@@ -307,7 +338,7 @@ const READ_ONLY_ERROR = {
 export function registerFeatureFlagEngine(app: Express): void {
   // GET tenant flags (for sidebar filtering) — fail closed for non-admins.
   app.get("/api/feature-flag-engine/v1/tenant-flags", (req: Request, res: Response) => {
-    const tenantId = (req.headers["x-tenant-id"] as string) || PLATFORM_ADMIN_TENANT;
+    const tenantId = tenantFromRequest(req);
     const config = flagsForTenant(tenantId);
     res.json({
       items: config.flags.map((f) => ({
@@ -354,7 +385,7 @@ export function registerFeatureFlagEngine(app: Express): void {
 
   // Service catalog endpoint — static module catalog with effective state.
   app.get("/api/service-catalog/v1/modules", (req: Request, res: Response) => {
-    const tenantId = (req.headers["x-tenant-id"] as string) || PLATFORM_ADMIN_TENANT;
+    const tenantId = tenantFromRequest(req);
     res.json({
       items: FLAG_CATEGORIES.map((key) => ({
         key,
@@ -368,8 +399,9 @@ export function registerFeatureFlagEngine(app: Express): void {
 }
 
 // Feature flag API middleware — checks tenant's enabled flags before routing.
-// FAIL CLOSED: for non-admin tenants a route is allowed only when its flag is
-// explicitly enabled (env-backed, or in-memory override in demo mode).
+// FAIL CLOSED: a missing tenant header maps to the zero-privilege
+// "anonymous" tenant, and the platform-admin bypass requires BOTH the
+// explicit admin header AND PLATFORM_ADMIN_BYPASS=true.
 export function featureFlagMiddleware(app: Express): void {
   app.use("/api", (req: Request, res: Response, next: () => void) => {
     if (req.path.includes("/healthz") || req.path.includes("/feature-flag-engine") ||
@@ -379,10 +411,10 @@ export function featureFlagMiddleware(app: Express): void {
       return;
     }
 
-    const tenantId = (req.headers["x-tenant-id"] as string) || PLATFORM_ADMIN_TENANT;
+    const tenantId = tenantFromRequest(req);
 
-    // Platform admin bypasses all checks.
-    if (tenantId === PLATFORM_ADMIN_TENANT) {
+    // Platform admin bypass — explicit header + env opt-in only.
+    if (adminBypassEnabled(tenantId)) {
       next();
       return;
     }
