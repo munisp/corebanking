@@ -1,6 +1,11 @@
 package main
 
 import (
+	"math/big"
+	"encoding/base64"
+	"crypto/sha256"
+	"crypto/rsa"
+	"crypto"
 	_ "github.com/lib/pq"
 "context"
 "os/signal"
@@ -214,31 +219,13 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	id := getString(body, "id")
-	for i := range records {
-		if records[i].ID == id && records[i].Status == "pending" {
-			records[i].Status = "processing"
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
-			// Simulate domain processing
-			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
-			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
-			records[i].Status = "completed"
-			domainStats.ProcessedToday++
-			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
-			return
-		}
-	}
-	respondJSON(w, 404, map[string]string{"error": "Record not found or not pending: " + id})
+	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
+	// (processingResult="success" and a random score via math/rand). Real domain
+	// processing must be implemented before this endpoint is enabled.
+	// Fail fast; never fabricate.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
+
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
@@ -392,38 +379,146 @@ func initDB() {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
-func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
+
+// ── MIDDLEWARE: JWT Validation (JWKS / RS256) — fail-closed ────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		for range time.Tick(5 * time.Minute) {
+			fetchJWKS(jwtRealmURL())
+		}
 	}()
+}
+
+// jwtMiddleware(realmURL string) validates Bearer tokens against the Keycloak JWKS endpoint (RS256
+// signature + expiry). Fail-closed: no token is accepted on structure alone.
+func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip health endpoints
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":"escrow-go"}`)
 			return
 		}
-		token := auth[7:]
+		token := strings.TrimPrefix(auth, "Bearer ")
 		parts := strings.Split(token, ".")
 		if len(parts) != 3 {
-			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			http.Error(w, `{"error":"malformed token"}`, http.StatusUnauthorized)
 			return
 		}
-		// Decode header for kid
 		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 		if err != nil {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
 		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 // --- Redis Caching Layer ---
 var redisAddr string
