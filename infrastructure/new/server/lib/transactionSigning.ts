@@ -1,6 +1,18 @@
 /**
  * C8: Transaction Signing — OTP and HMAC-based transaction authentication
  * Provides multi-factor auth for financial operations above configurable thresholds.
+ *
+ * Hardening notes:
+ *  - OTP codes use crypto.randomInt (CSPRNG), never Math.random().
+ *  - Per-user rate limiting: max 5 active OTPs per user, 60s resend cooldown.
+ *  - Attempt limiting: max 5 verify attempts per otpId, then the OTP is invalidated.
+ *  - OTP TTL: 5 minutes.
+ *  - OTP DELIVERY INTEGRATION POINT: this module only generates and verifies
+ *    codes. The caller MUST hand the generated code to the notifications /
+ *    communication service (e.g. POST to the messaging gateway with the
+ *    recipient's registered channel) for out-of-band delivery. This module
+ *    deliberately does NOT claim the OTP was "sent" — it returns only the
+ *    otpId and TTL; the code never leaves the server in the response.
  */
 
 import crypto from "crypto";
@@ -11,21 +23,61 @@ import { logger } from "./logger";
 const OTP_THRESHOLD = Number(process.env.OTP_THRESHOLD_NGN || "1000000"); // ₦1M
 const HMAC_SECRET = process.env.TX_SIGNING_SECRET || "54bank-tx-signing-default-key-32chars";
 
+// OTP security policy
+const OTP_TTL_SECONDS = 300; // 5 minutes
+const MAX_ACTIVE_OTPS_PER_USER = 5;
+const RESEND_COOLDOWN_MS = 60_000; // 60s resend cooldown per user
+const MAX_VERIFY_ATTEMPTS = 5;
+
 // In-memory OTP store (production: Redis with TTL)
-const otpStore = new Map<string, { code: string; expiresAt: number; attempts: number }>();
+const otpStore = new Map<string, { code: string; userId: string; expiresAt: number; attempts: number }>();
+// Per-user resend cooldown tracker
+const lastOtpRequestAt = new Map<string, number>();
+
+function countActiveOtpsForUser(userId: string, now: number): number {
+  let count = 0;
+  otpStore.forEach((entry, otpId) => {
+    if (entry.expiresAt <= now) {
+      otpStore.delete(otpId); // lazy cleanup of expired entries
+      return;
+    }
+    if (entry.userId === userId) count++;
+  });
+  return count;
+}
 
 export function generateOTP(userId: string): { otpId: string; expiresInSeconds: number } {
-  const code = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit
-  const otpId = `otp-${userId}-${Date.now().toString(36)}`;
-  const expiresInSeconds = 300; // 5 minutes
+  const now = Date.now();
+
+  // Resend cooldown: reject rapid successive OTP requests for the same user.
+  const lastRequest = lastOtpRequestAt.get(userId);
+  if (lastRequest !== undefined && now - lastRequest < RESEND_COOLDOWN_MS) {
+    logger.warn("OTP resend cooldown triggered", { userId, retryAfterSeconds: Math.ceil((RESEND_COOLDOWN_MS - (now - lastRequest)) / 1000) });
+    throw new Error(`OTP resend cooldown active. Retry after ${Math.ceil((RESEND_COOLDOWN_MS - (now - lastRequest)) / 1000)} seconds.`);
+  }
+
+  // Rate limit: cap the number of concurrently active OTPs per user.
+  if (countActiveOtpsForUser(userId, now) >= MAX_ACTIVE_OTPS_PER_USER) {
+    logger.warn("OTP active-limit reached for user", { userId, maxActive: MAX_ACTIVE_OTPS_PER_USER });
+    throw new Error(`Too many active OTPs for user. Maximum ${MAX_ACTIVE_OTPS_PER_USER} concurrent OTPs allowed.`);
+  }
+
+  // CSPRNG 6-digit code — never Math.random() for security tokens.
+  const code = String(crypto.randomInt(100000, 1000000));
+  const otpId = `otp-${userId}-${now.toString(36)}-${crypto.randomBytes(4).toString("hex")}`;
   otpStore.set(otpId, {
     code,
-    expiresAt: Date.now() + expiresInSeconds * 1000,
+    userId,
+    expiresAt: now + OTP_TTL_SECONDS * 1000,
     attempts: 0,
   });
+  lastOtpRequestAt.set(userId, now);
 
   logger.info("OTP generated", { otpId, userId });
-  return { otpId, expiresInSeconds };
+  // NOTE: the code is stored server-side only. Delivery to the user happens
+  // via the notifications/communication service (see module header); the
+  // caller is responsible for dispatch and must not log the code.
+  return { otpId, expiresInSeconds: OTP_TTL_SECONDS };
 }
 
 export function verifyOTP(otpId: string, code: string): boolean {
@@ -36,11 +88,15 @@ export function verifyOTP(otpId: string, code: string): boolean {
     return false;
   }
   entry.attempts++;
-  if (entry.attempts > 3) {
+  if (entry.attempts > MAX_VERIFY_ATTEMPTS) {
     otpStore.delete(otpId);
+    logger.warn("OTP invalidated after too many verify attempts", { otpId, attempts: entry.attempts });
     return false;
   }
-  if (entry.code !== code) return false;
+  // Constant-time comparison to avoid timing attacks on the code.
+  const provided = Buffer.from(code);
+  const expected = Buffer.from(entry.code);
+  if (provided.length !== expected.length || !crypto.timingSafeEqual(provided, expected)) return false;
   otpStore.delete(otpId);
   return true;
 }
@@ -52,7 +108,10 @@ export function signTransaction(payload: Record<string, unknown>): string {
 
 export function verifyTransactionSignature(payload: Record<string, unknown>, signature: string): boolean {
   const expected = signTransaction(payload);
-  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  const expectedBuf = Buffer.from(expected);
+  const providedBuf = Buffer.from(signature);
+  if (expectedBuf.length !== providedBuf.length) return false;
+  return crypto.timingSafeEqual(expectedBuf, providedBuf);
 }
 
 /**
