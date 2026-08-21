@@ -1,6 +1,7 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
@@ -63,8 +64,7 @@ struct RwaCalcRequest {
 }
 
 struct AppState {
-    exposures: Mutex<Vec<RwaExposure>>,
-    capital: Mutex<Vec<CapitalRatio>>,
+    db: Option<PgPool>,
 }
 
 fn risk_weight(asset_class: &str, rating: &str) -> f64 {
@@ -94,44 +94,110 @@ fn risk_weight(asset_class: &str, rating: &str) -> f64 {
     }
 }
 
-fn seed() -> (Vec<RwaExposure>, Vec<CapitalRatio>) {
-    let exposures = vec![
-        RwaExposure { id: "RWA-001".into(), asset_class: "sovereign".into(), exposure_type: "on_balance".into(), counterparty: "Federal Government of Nigeria".into(), rating: "B".into(), original_exposure: 150_000_000_000.0, credit_conversion_factor: 1.0, ead: 150_000_000_000.0, risk_weight: 100.0, rwa: 150_000_000_000.0, currency: "NGN".into(), maturity_date: "2030-12-31".into(), collateral_value: 0.0, collateral_type: "none".into(), netting_set: None },
-        RwaExposure { id: "RWA-002".into(), asset_class: "bank".into(), exposure_type: "on_balance".into(), counterparty: "First Bank of Nigeria".into(), rating: "BBB".into(), original_exposure: 50_000_000_000.0, credit_conversion_factor: 1.0, ead: 50_000_000_000.0, risk_weight: 100.0, rwa: 50_000_000_000.0, currency: "NGN".into(), maturity_date: "2027-06-30".into(), collateral_value: 10_000_000_000.0, collateral_type: "cash".into(), netting_set: Some("NETTING-FBN-001".into()) },
-        RwaExposure { id: "RWA-003".into(), asset_class: "corporate".into(), exposure_type: "on_balance".into(), counterparty: "Dangote Industries".into(), rating: "A".into(), original_exposure: 80_000_000_000.0, credit_conversion_factor: 1.0, ead: 80_000_000_000.0, risk_weight: 50.0, rwa: 40_000_000_000.0, currency: "NGN".into(), maturity_date: "2028-03-15".into(), collateral_value: 30_000_000_000.0, collateral_type: "property".into(), netting_set: None },
-        RwaExposure { id: "RWA-004".into(), asset_class: "retail".into(), exposure_type: "on_balance".into(), counterparty: "Retail Portfolio".into(), rating: "unrated".into(), original_exposure: 200_000_000_000.0, credit_conversion_factor: 1.0, ead: 200_000_000_000.0, risk_weight: 75.0, rwa: 150_000_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 50_000_000_000.0, collateral_type: "mixed".into(), netting_set: None },
-        RwaExposure { id: "RWA-005".into(), asset_class: "mortgage".into(), exposure_type: "on_balance".into(), counterparty: "Mortgage Portfolio".into(), rating: "unrated".into(), original_exposure: 120_000_000_000.0, credit_conversion_factor: 1.0, ead: 120_000_000_000.0, risk_weight: 35.0, rwa: 42_000_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 180_000_000_000.0, collateral_type: "residential_property".into(), netting_set: None },
-        RwaExposure { id: "RWA-006".into(), asset_class: "sme".into(), exposure_type: "on_balance".into(), counterparty: "SME Portfolio".into(), rating: "unrated".into(), original_exposure: 60_000_000_000.0, credit_conversion_factor: 1.0, ead: 60_000_000_000.0, risk_weight: 85.0, rwa: 51_000_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 15_000_000_000.0, collateral_type: "inventory".into(), netting_set: None },
-        RwaExposure { id: "RWA-007".into(), asset_class: "derivative".into(), exposure_type: "derivative".into(), counterparty: "OTC Derivative Portfolio".into(), rating: "A".into(), original_exposure: 25_000_000_000.0, credit_conversion_factor: 0.5, ead: 12_500_000_000.0, risk_weight: 50.0, rwa: 6_250_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 5_000_000_000.0, collateral_type: "cash_margin".into(), netting_set: Some("NETTING-OTC-001".into()) },
-        RwaExposure { id: "RWA-008".into(), asset_class: "off_balance".into(), exposure_type: "off_balance".into(), counterparty: "Guarantee Portfolio".into(), rating: "BBB".into(), original_exposure: 40_000_000_000.0, credit_conversion_factor: 0.5, ead: 20_000_000_000.0, risk_weight: 100.0, rwa: 20_000_000_000.0, currency: "NGN".into(), maturity_date: "various".into(), collateral_value: 15_000_000_000.0, collateral_type: "cash_margin".into(), netting_set: None },
-    ];
+fn source_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(serde_json::json!({
+        "error": "source_unavailable",
+        "detail": detail,
+    }))
+}
 
-    // CBN minimum ratios: CET1=6%, Tier1=8%, Total CAR=15% (for systemically important banks)
-    let credit_rwa = 509_250_000_000.0;
-    let market_rwa = 25_000_000_000.0;
-    let operational_rwa = 45_000_000_000.0;
-    let total_rwa = credit_rwa + market_rwa + operational_rwa;
-    let cet1 = 120_000_000_000.0;
-    let at1 = 15_000_000_000.0;
-    let t2 = 25_000_000_000.0;
+async fn fetch_exposures(db: &PgPool) -> Result<Vec<RwaExposure>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"SELECT id, asset_class, exposure_type, counterparty, rating,
+                  original_exposure, credit_conversion_factor, ead, risk_weight, rwa,
+                  currency, maturity_date, collateral_value, collateral_type, netting_set
+           FROM rwa_exposures ORDER BY id"#,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| RwaExposure {
+            id: r.get("id"),
+            asset_class: r.get("asset_class"),
+            exposure_type: r.get("exposure_type"),
+            counterparty: r.get("counterparty"),
+            rating: r.get("rating"),
+            original_exposure: r.get("original_exposure"),
+            credit_conversion_factor: r.get("credit_conversion_factor"),
+            ead: r.get("ead"),
+            risk_weight: r.get("risk_weight"),
+            rwa: r.get("rwa"),
+            currency: r.get("currency"),
+            maturity_date: r.get("maturity_date"),
+            collateral_value: r.get("collateral_value"),
+            collateral_type: r.get("collateral_type"),
+            netting_set: r.get("netting_set"),
+        })
+        .collect())
+}
+
+// Build the capital ratio report from real data:
+//   credit RWA = SUM(rwa) over rwa_exposures
+//   capital components + market/operational RWA from latest capital_positions row
+// Never fabricate ratios: any missing upstream data => error => HTTP 503.
+async fn compute_capital_ratio(db: &PgPool) -> Result<CapitalRatio, String> {
+    let exposures = fetch_exposures(db)
+        .await
+        .map_err(|e| format!("rwa_exposures query failed: {}", e))?;
+    let credit_rwa: f64 = exposures.iter().map(|e| e.rwa).sum();
+
+    let row = sqlx::query(
+        r#"SELECT id, report_date, tier1_common_equity, additional_tier1, tier2_capital,
+                  market_rwa, operational_rwa, leverage_exposure, lcr, nsfr,
+                  countercyclical_buffer, systemic_buffer, capital_conservation_buffer,
+                  minimum_cet1, minimum_tier1, minimum_total
+           FROM capital_positions ORDER BY report_date DESC LIMIT 1"#,
+    )
+    .fetch_optional(db)
+    .await
+    .map_err(|e| format!("capital_positions query failed: {}", e))?
+    .ok_or_else(|| "capital_positions is empty — no capital data available".to_string())?;
+
+    let cet1: f64 = row.get("tier1_common_equity");
+    let at1: f64 = row.get("additional_tier1");
+    let t2: f64 = row.get("tier2_capital");
+    let market_rwa: f64 = row.get("market_rwa");
+    let operational_rwa: f64 = row.get("operational_rwa");
+    let leverage_exposure: f64 = row.get("leverage_exposure");
     let total_cap = cet1 + at1 + t2;
+    let total_rwa = credit_rwa + market_rwa + operational_rwa;
+    if total_rwa <= 0.0 {
+        return Err("total RWA is zero — cannot compute capital ratios without exposure data".into());
+    }
+    let minimum_total: f64 = row.get("minimum_total");
+    let minimum_cet1: f64 = row.get("minimum_cet1");
 
-    let capital = vec![CapitalRatio {
-        id: "CAP-2026Q1".into(), report_date: "2026-03-31".into(),
-        tier1_common_equity: cet1, additional_tier1: at1, tier2_capital: t2, total_capital: total_cap,
-        total_rwa, credit_rwa, market_rwa, operational_rwa,
+    Ok(CapitalRatio {
+        id: row.get("id"),
+        report_date: row.get("report_date"),
+        tier1_common_equity: cet1,
+        additional_tier1: at1,
+        tier2_capital: t2,
+        total_capital: total_cap,
+        total_rwa,
+        credit_rwa,
+        market_rwa,
+        operational_rwa,
         cet1_ratio: (cet1 / total_rwa * 10000.0).round() / 100.0,
         tier1_ratio: ((cet1 + at1) / total_rwa * 10000.0).round() / 100.0,
         total_car: (total_cap / total_rwa * 10000.0).round() / 100.0,
-        leverage_ratio: ((cet1 + at1) / 800_000_000_000.0 * 10000.0).round() / 100.0,
-        lcr: 145.0, nsfr: 112.0,
-        countercyclical_buffer: 0.0, systemic_buffer: 1.0, capital_conservation_buffer: 2.5,
-        minimum_cet1: 6.0, minimum_tier1: 8.0, minimum_total: 15.0,
-        cet1_surplus: (cet1 / total_rwa * 100.0) - 6.0,
-        compliant: (total_cap / total_rwa * 100.0) >= 15.0,
-    }];
-
-    (exposures, capital)
+        leverage_ratio: if leverage_exposure > 0.0 {
+            ((cet1 + at1) / leverage_exposure * 10000.0).round() / 100.0
+        } else {
+            0.0
+        },
+        lcr: row.get("lcr"),
+        nsfr: row.get("nsfr"),
+        countercyclical_buffer: row.get("countercyclical_buffer"),
+        systemic_buffer: row.get("systemic_buffer"),
+        capital_conservation_buffer: row.get("capital_conservation_buffer"),
+        minimum_cet1,
+        minimum_tier1: row.get("minimum_tier1"),
+        minimum_total,
+        cet1_surplus: (cet1 / total_rwa * 100.0) - minimum_cet1,
+        compliant: (total_cap / total_rwa * 100.0) >= minimum_total,
+    })
 }
 
 async fn healthz() -> HttpResponse {
@@ -141,13 +207,31 @@ async fn healthz() -> HttpResponse {
 }
 
 async fn list_exposures(data: web::Data<AppState>) -> HttpResponse {
-    let e = data.exposures.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({ "items": *e, "total": e.len() }))
+    let db = match &data.db {
+        Some(d) => d,
+        None => return source_unavailable("DATABASE_URL not configured; refusing to serve fabricated RWA exposures"),
+    };
+    match fetch_exposures(db).await {
+        Ok(e) => HttpResponse::Ok().json(serde_json::json!({ "items": e, "total": e.len() })),
+        Err(err) => {
+            eprintln!("[basel-engine-rs] exposures query failed: {}", err);
+            source_unavailable("rwa_exposures query failed; no data served")
+        }
+    }
 }
 
 async fn capital_ratios(data: web::Data<AppState>) -> HttpResponse {
-    let c = data.capital.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({ "items": *c, "total": c.len() }))
+    let db = match &data.db {
+        Some(d) => d,
+        None => return source_unavailable("DATABASE_URL not configured; refusing to serve fabricated capital ratios"),
+    };
+    match compute_capital_ratio(db).await {
+        Ok(c) => HttpResponse::Ok().json(serde_json::json!({ "items": [c], "total": 1 })),
+        Err(e) => {
+            eprintln!("[basel-engine-rs] capital computation failed: {}", e);
+            source_unavailable(&format!("capital ratio computation failed: {}", e))
+        }
+    }
 }
 
 async fn calculate_rwa(body: web::Json<RwaCalcRequest>) -> HttpResponse {
@@ -174,17 +258,32 @@ async fn calculate_rwa(body: web::Json<RwaCalcRequest>) -> HttpResponse {
 }
 
 async fn pillar3(data: web::Data<AppState>) -> HttpResponse {
-    let exposures = data.exposures.lock().unwrap();
-    let capital = data.capital.lock().unwrap();
-    let latest = capital.last();
+    let db = match &data.db {
+        Some(d) => d,
+        None => return source_unavailable("DATABASE_URL not configured; refusing to serve fabricated Pillar 3 disclosure"),
+    };
+    let exposures = match fetch_exposures(db).await {
+        Ok(e) => e,
+        Err(err) => {
+            eprintln!("[basel-engine-rs] pillar3 exposures query failed: {}", err);
+            return source_unavailable("rwa_exposures query failed; no disclosure served");
+        }
+    };
+    let capital = match compute_capital_ratio(db).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[basel-engine-rs] pillar3 capital computation failed: {}", e);
+            return source_unavailable(&format!("capital ratio computation failed: {}", e));
+        }
+    };
     let mut by_asset_class: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for e in exposures.iter() {
         *by_asset_class.entry(e.asset_class.clone()).or_insert(0.0) += e.rwa;
     }
     HttpResponse::Ok().json(serde_json::json!({
         "pillar3Disclosure": {
-            "reportDate": latest.map(|c| c.report_date.clone()).unwrap_or_default(),
-            "capitalRatios": latest,
+            "reportDate": capital.report_date.clone(),
+            "capitalRatios": capital,
             "rwaByAssetClass": by_asset_class,
             "totalExposures": exposures.len(),
             "regulatoryMinimums": { "cet1": 6.0, "tier1": 8.0, "totalCar": 15.0, "lcr": 100.0, "nsfr": 100.0 },
@@ -195,8 +294,28 @@ async fn pillar3(data: web::Data<AppState>) -> HttpResponse {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let (exposures, capital) = seed();
-    let state = web::Data::new(AppState { exposures: Mutex::new(exposures), capital: Mutex::new(capital) });
+    let db = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.is_empty() => {
+            match PgPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .connect(&url)
+                .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("[basel-engine-rs] DB connect failed: {} — regulatory endpoints will 503 (fail-fast)", e);
+                    None
+                }
+            }
+        }
+        _ => {
+            eprintln!("[basel-engine-rs] DATABASE_URL not set — regulatory endpoints will 503 (fail-fast)");
+            None
+        }
+    };
+    let _ = env_or("PORT", "8163");
+    let state = web::Data::new(AppState { db });
     println!("Basel III/IV Engine on :8163");
     HttpServer::new(move || {
         App::new()
