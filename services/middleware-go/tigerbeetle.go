@@ -1,15 +1,24 @@
 package middleware
 
 import (
+	"context"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/munisp/corebanking/pkg/tbclient"
 )
 
-// A2: Double-Entry Ledger with TigerBeetle
-// Every monetary operation creates balanced debit/credit entries.
+// A2: Double-Entry Ledger backed by a real TigerBeetle cluster.
+// Every monetary operation creates balanced debit/credit transfers in
+// TigerBeetle via the official SDK (pkg/tbclient). Nothing is "posted"
+// unless the cluster confirms it; when the cluster is unreachable every
+// posting method fails fast with an explicit error.
 
 type AccountType int
 
@@ -27,7 +36,7 @@ type LedgerAccount struct {
 	Code          string      `json:"code"`
 	AccountType   AccountType `json:"accountType"`
 	Currency      string      `json:"currency"`
-	Balance       int64       `json:"balance"`       // in minor units (kobo)
+	Balance       int64       `json:"balance"` // in minor units (kobo)
 	PendingDebit  int64       `json:"pendingDebit"`
 	PendingCredit int64       `json:"pendingCredit"`
 	TenantID      string      `json:"tenantId"`
@@ -50,30 +59,72 @@ type TBLedgerEntry struct {
 type LedgerTransaction struct {
 	ID          string          `json:"id"`
 	Entries     []TBLedgerEntry `json:"entries"`
-	Description string        `json:"description"`
-	Domain      string        `json:"domain"`
-	Status      string        `json:"status"` // "pending", "posted", "reversed"
-	PostedAt    time.Time     `json:"postedAt"`
-	PostedBy    string        `json:"postedBy"`
+	Description string          `json:"description"`
+	Domain      string          `json:"domain"`
+	Status      string          `json:"status"` // "pending", "posted", "reversed"
+	PostedAt    time.Time       `json:"postedAt"`
+	PostedBy    string          `json:"postedBy"`
 }
 
+// TigerBeetleLedger posts to a real TigerBeetle cluster. The in-memory
+// accounts map holds chart-of-accounts metadata only (names/types — static
+// configuration); balances always come from the cluster. The entries slice
+// is a journal of entries the cluster has confirmed — never fabricated.
 type TigerBeetleLedger struct {
 	addresses string
-	clusterID string
+	clusterID uint64
+	client    *tbclient.Client // nil when the cluster is unreachable/unconfigured
 	mu        sync.RWMutex
-	accounts  map[string]*LedgerAccount
-	entries   []TBLedgerEntry
-	txns      []LedgerTransaction
+	accounts  map[string]*LedgerAccount // CoA metadata (static)
+	entries   []TBLedgerEntry           // confirmed postings journal
+	txns      []LedgerTransaction       // confirmed transactions
 }
+
+// tbLedgerID is the TigerBeetle ledger for NGN minor units (kobo).
+const tbLedgerID uint32 = 1
+
+// domainTransferCodes maps business domains to TigerBeetle transfer codes.
+var domainTransferCodes = map[string]uint16{
+	"teller":        100,
+	"loans":         200,
+	"trade-finance": 300,
+	"insurance":     400,
+	"general":       1,
+}
+
+func transferCodeFor(domain string) uint16 {
+	if c, ok := domainTransferCodes[domain]; ok {
+		return c
+	}
+	return domainTransferCodes["general"]
+}
+
+// ledgerAccountUint128 maps a chart-of-accounts code to a deterministic
+// TigerBeetle account ID. Numeric CoA codes map 1:1 into the low 64 bits;
+// anything else is namespaced via SHA-256 so IDs are stable across restarts.
+func ledgerAccountUint128(accountCode string) tbclient.Uint128 {
+	if n, err := strconv.ParseUint(strings.TrimSpace(accountCode), 10, 64); err == nil {
+		return tbclient.Uint128FromU64(n, 0)
+	}
+	sum := sha256.Sum256([]byte("54bank/middleware-ledger/" + accountCode))
+	var id [16]byte
+	copy(id[:], sum[:16])
+	return tbclient.BytesToUint128(id)
+}
+
+// ErrTigerBeetleUnavailable is returned by every posting path when the
+// TigerBeetle cluster cannot be reached. Callers (HTTP handlers) must
+// surface this as 502/503 — money has NOT moved.
+var ErrTigerBeetleUnavailable = fmt.Errorf("tigerbeetle ledger unavailable: cluster client not configured or connection failed (set TIGERBEETLE_ADDRESSES)")
 
 func NewTigerBeetleLedger() *TigerBeetleLedger {
 	addresses := os.Getenv("TIGERBEETLE_ADDRESSES")
-	if addresses == "" {
-		addresses = "tigerbeetle:3000"
-	}
-	clusterID := os.Getenv("TIGERBEETLE_CLUSTER_ID")
-	if clusterID == "" {
-		clusterID = "54bankcluster00000000000000000000"
+	clusterIDStr := os.Getenv("TIGERBEETLE_CLUSTER_ID")
+	var clusterID uint64
+	if clusterIDStr != "" {
+		if n, err := strconv.ParseUint(clusterIDStr, 10, 64); err == nil {
+			clusterID = n
+		}
 	}
 
 	ledger := &TigerBeetleLedger{
@@ -82,7 +133,25 @@ func NewTigerBeetleLedger() *TigerBeetleLedger {
 		accounts:  make(map[string]*LedgerAccount),
 	}
 	ledger.seedChartOfAccounts()
+
+	client, err := tbclient.NewClient(tbclient.Config{ClusterID: clusterID})
+	if err != nil {
+		// Fail fast at posting time: PostTransaction and the Post* helpers
+		// return ErrTigerBeetleUnavailable and never report "posted".
+		log.Printf("[TigerBeetle] FATAL: cannot connect to cluster (%v) — ledger postings will fail with 503 until the cluster is reachable", err)
+		ledger.client = nil
+	} else {
+		ledger.client = client
+		log.Printf("[TigerBeetle] ledger connected to cluster %d at %s", clusterID, addresses)
+	}
 	return ledger
+}
+
+// Available reports whether the ledger has a live cluster connection.
+func (l *TigerBeetleLedger) Available() bool {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.client != nil
 }
 
 func (l *TigerBeetleLedger) seedChartOfAccounts() {
@@ -130,11 +199,97 @@ func (l *TigerBeetleLedger) seedChartOfAccounts() {
 	}
 }
 
-func (l *TigerBeetleLedger) PostTransaction(txn LedgerTransaction) (*LedgerTransaction, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// ensureClusterAccounts idempotently creates the CoA accounts referenced by
+// this transaction in the TigerBeetle cluster (AccountExists is tolerated).
+func (l *TigerBeetleLedger) ensureClusterAccounts(ctx context.Context, txn *LedgerTransaction) error {
+	seen := make(map[string]bool)
+	var accounts []tbclient.Account
+	for _, entry := range txn.Entries {
+		if seen[entry.AccountID] {
+			continue
+		}
+		seen[entry.AccountID] = true
+		meta, ok := l.accounts[entry.AccountID]
+		if !ok {
+			return fmt.Errorf("account %s not found in chart of accounts", entry.AccountID)
+		}
+		accounts = append(accounts, tbclient.Account{
+			ID:     ledgerAccountUint128(entry.AccountID),
+			Ledger: tbLedgerID,
+			Code:   uint16(meta.AccountType),
+		})
+	}
+	results, err := l.client.CreateAccounts(ctx, accounts)
+	if err != nil {
+		return fmt.Errorf("tigerbeetle create accounts: %w", err)
+	}
+	for _, r := range results {
+		if r.Status != tbclient.AccountCreated && r.Status != tbclient.AccountExists {
+			return fmt.Errorf("tigerbeetle create account rejected: status=%v", r.Status)
+		}
+	}
+	return nil
+}
 
-	// Validate balanced entries
+// pairEntries decomposes balanced debit/credit entries into individual
+// TigerBeetle transfers (one debit account → one credit account each).
+func pairEntries(txn *LedgerTransaction) ([]tbclient.Transfer, error) {
+	type side struct {
+		accountID string
+		remaining int64
+	}
+	var debits, credits []side
+	for _, e := range txn.Entries {
+		if e.DebitAmount > 0 {
+			debits = append(debits, side{e.AccountID, e.DebitAmount})
+		}
+		if e.CreditAmount > 0 {
+			credits = append(credits, side{e.AccountID, e.CreditAmount})
+		}
+	}
+	if len(debits) == 0 || len(credits) == 0 {
+		return nil, fmt.Errorf("transaction has no debit/credit legs")
+	}
+
+	code := transferCodeFor(txn.Domain)
+	var transfers []tbclient.Transfer
+	di, ci := 0, 0
+	for di < len(debits) && ci < len(credits) {
+		amt := debits[di].remaining
+		if credits[ci].remaining < amt {
+			amt = credits[ci].remaining
+		}
+		flags := tbclient.TransferFlags{Linked: true}.ToUint16()
+		transfers = append(transfers, tbclient.Transfer{
+			ID:              tbclient.ID(),
+			DebitAccountID:  ledgerAccountUint128(debits[di].accountID),
+			CreditAccountID: ledgerAccountUint128(credits[ci].accountID),
+			Amount:          tbclient.ToUint128(uint64(amt)),
+			Ledger:          tbLedgerID,
+			Code:            code,
+			Flags:           flags,
+		})
+		debits[di].remaining -= amt
+		credits[ci].remaining -= amt
+		if debits[di].remaining == 0 {
+			di++
+		}
+		if credits[ci].remaining == 0 {
+			ci++
+		}
+	}
+	if di != len(debits) || ci != len(credits) {
+		return nil, fmt.Errorf("internal error: unbalanced pairing")
+	}
+	// The last transfer in a linked chain must not carry the linked flag.
+	if len(transfers) > 0 {
+		transfers[len(transfers)-1].Flags = tbclient.TransferFlags{}.ToUint16()
+	}
+	return transfers, nil
+}
+
+func (l *TigerBeetleLedger) PostTransaction(txn LedgerTransaction) (*LedgerTransaction, error) {
+	// Validate balanced entries before touching the cluster.
 	var totalDebit, totalCredit int64
 	for _, entry := range txn.Entries {
 		totalDebit += entry.DebitAmount
@@ -146,7 +301,38 @@ func (l *TigerBeetleLedger) PostTransaction(txn LedgerTransaction) (*LedgerTrans
 	if totalDebit != totalCredit {
 		return nil, fmt.Errorf("unbalanced transaction: debit=%d credit=%d", totalDebit, totalCredit)
 	}
+	if totalDebit <= 0 {
+		return nil, fmt.Errorf("transaction amount must be positive")
+	}
 
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.client == nil {
+		return nil, ErrTigerBeetleUnavailable
+	}
+
+	ctx := context.Background()
+	if err := l.ensureClusterAccounts(ctx, &txn); err != nil {
+		return nil, err
+	}
+
+	transfers, err := pairEntries(&txn)
+	if err != nil {
+		return nil, err
+	}
+
+	results, err := l.client.CreateTransfers(ctx, transfers)
+	if err != nil {
+		return nil, fmt.Errorf("tigerbeetle create transfers: %w", err)
+	}
+	for _, r := range results {
+		if r.Status != tbclient.TransferCreated && r.Status != tbclient.TransferExists {
+			return nil, fmt.Errorf("tigerbeetle transfer rejected: status=%v", r.Status)
+		}
+	}
+
+	// The cluster has confirmed the transfers — only now mark as posted.
 	txn.Status = "posted"
 	txn.PostedAt = time.Now()
 	txn.ID = fmt.Sprintf("TXN-%d", time.Now().UnixNano())
@@ -158,32 +344,49 @@ func (l *TigerBeetleLedger) PostTransaction(txn LedgerTransaction) (*LedgerTrans
 		if entry.ValueDate.IsZero() {
 			entry.ValueDate = time.Now()
 		}
-
-		acct := l.accounts[entry.AccountID]
-		acct.Balance += entry.DebitAmount - entry.CreditAmount
-		if acct.AccountType == AccountTypeLiability || acct.AccountType == AccountTypeEquity || acct.AccountType == AccountTypeRevenue {
-			acct.Balance = -(entry.CreditAmount - entry.DebitAmount) + acct.Balance + (entry.CreditAmount - entry.DebitAmount)
-		}
-
 		l.entries = append(l.entries, entry)
 		txn.Entries[i] = entry
+
+		// Refresh the metadata balance from the real cluster state.
+		if bal, berr := l.client.GetAccountBalance(ctx, ledgerAccountUint128(entry.AccountID)); berr == nil {
+			l.accounts[entry.AccountID].Balance = bal
+		} else {
+			log.Printf("[TigerBeetle] WARNING: balance refresh failed for %s: %v", entry.AccountID, berr)
+		}
 	}
 	l.txns = append(l.txns, txn)
 
-	log.Printf("[TigerBeetle] Posted %s: %d entries, debit=%d credit=%d", txn.ID, len(txn.Entries), totalDebit, totalCredit)
+	log.Printf("[TigerBeetle] Posted %s: %d entries, debit=%d credit=%d (cluster-confirmed)", txn.ID, len(txn.Entries), totalDebit, totalCredit)
 	return &txn, nil
 }
 
 func (l *TigerBeetleLedger) GetAccount(id string) (*LedgerAccount, error) {
 	l.mu.RLock()
-	defer l.mu.RUnlock()
-	acct, ok := l.accounts[id]
+	meta, ok := l.accounts[id]
 	if !ok {
+		l.mu.RUnlock()
 		return nil, fmt.Errorf("account %s not found", id)
 	}
-	return acct, nil
+	client := l.client
+	l.mu.RUnlock()
+
+	if client == nil {
+		return nil, ErrTigerBeetleUnavailable
+	}
+
+	acct := *meta
+	bal, err := client.GetAccountBalanceFull(context.Background(), ledgerAccountUint128(id))
+	if err != nil {
+		return nil, fmt.Errorf("tigerbeetle balance lookup for %s: %w", id, err)
+	}
+	acct.Balance = bal.NetBalance
+	acct.PendingDebit = int64(bal.DebitsPending)
+	acct.PendingCredit = int64(bal.CreditsPending)
+	return &acct, nil
 }
 
+// GetAccountEntries returns journal entries confirmed by the cluster for an
+// account. Entries are recorded only after the cluster confirms the posting.
 func (l *TigerBeetleLedger) GetAccountEntries(accountID string) []TBLedgerEntry {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
@@ -196,19 +399,42 @@ func (l *TigerBeetleLedger) GetAccountEntries(accountID string) []TBLedgerEntry 
 	return result
 }
 
+// GetTrialBalance returns real cluster balances for every CoA account with a
+// non-zero balance. When the cluster is unreachable it returns an empty map
+// and logs the failure — callers needing hard guarantees should use
+// GetAccount (which returns an error) instead.
 func (l *TigerBeetleLedger) GetTrialBalance() map[string]int64 {
 	l.mu.RLock()
-	defer l.mu.RUnlock()
+	client := l.client
+	ids := make([]string, 0, len(l.accounts))
+	for id := range l.accounts {
+		ids = append(ids, id)
+	}
+	l.mu.RUnlock()
+
 	balance := make(map[string]int64)
-	for id, acct := range l.accounts {
-		if acct.Balance != 0 {
-			balance[id+" "+acct.Name] = acct.Balance
+	if client == nil {
+		log.Printf("[TigerBeetle] trial balance unavailable: %v", ErrTigerBeetleUnavailable)
+		return balance
+	}
+	for _, id := range ids {
+		bal, err := client.GetAccountBalance(context.Background(), ledgerAccountUint128(id))
+		if err != nil {
+			log.Printf("[TigerBeetle] trial balance: lookup failed for %s: %v", id, err)
+			continue
+		}
+		if bal != 0 {
+			l.mu.RLock()
+			name := l.accounts[id].Name
+			l.mu.RUnlock()
+			balance[id+" "+name] = bal
 		}
 	}
 	return balance
 }
 
-// Posting rule helpers
+// Posting rule helpers. Each returns ErrTigerBeetleUnavailable (never a
+// fabricated "posted" result) when the cluster is unreachable.
 func PostTellerDeposit(ledger *TigerBeetleLedger, amount int64, ref, actor string) (*LedgerTransaction, error) {
 	return ledger.PostTransaction(LedgerTransaction{
 		Description: "Teller cash deposit",
