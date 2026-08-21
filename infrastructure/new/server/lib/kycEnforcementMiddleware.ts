@@ -414,7 +414,7 @@ async function saveKybRecord(record: KYBVerificationRecord): Promise<boolean> {
 }
 
 /** A record only clears the gate when it is verified, unexpired, AND sanctions-cleared. */
-function isCleared(rec: VerificationRecord | KYBVerificationRecord | null | undefined): rec is VerificationRecord {
+function isCleared(rec: VerificationRecord | KYBVerificationRecord | null | undefined): boolean {
   if (!rec) return false;
   if (rec.status !== "verified") return false;
   if (rec.sanctionsCleared !== true) return false;
@@ -545,7 +545,8 @@ async function kycEnforcementHandler(req: Request, res: Response, next: NextFunc
       return next();
     }
 
-    // Check level hierarchy
+    // Check level hierarchy (reaching here means isCleared(kyc) === true)
+    if (!kyc) return next();
     if (LEVEL_HIERARCHY[kyc.level] < LEVEL_HIERARCHY[matchedRule.minimumLevel]) {
       logEnforcement({
         serviceId: matchedRule.serviceId, path: req.path, method: req.method,
@@ -796,7 +797,7 @@ export function registerKYCEnforcementRoutes(app: import("express").Express) {
     const kyb = companyId ? await lookupKyb(companyId) : undefined;
 
     const kycOk = !rule?.kycRequired ||
-      (isCleared(kyc) && (!rule || LEVEL_HIERARCHY[kyc.level] >= LEVEL_HIERARCHY[rule.minimumLevel]));
+      (kyc != null && isCleared(kyc) && (!rule || LEVEL_HIERARCHY[kyc.level] >= LEVEL_HIERARCHY[rule.minimumLevel]));
     const kybOk = !rule?.kybRequired || isCleared(kyb);
     const allowed = kycOk && kybOk;
 
