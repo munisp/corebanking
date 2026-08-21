@@ -1,166 +1,333 @@
 /**
- * Real TigerBeetle Double-Entry Ledger — Immutable financial transactions.
- * Implements account creation, transfer posting, balance queries,
- * batch operations, and ledger reconciliation across all financial services.
+ * TigerBeetle Double-Entry Ledger — gateway to the REAL TigerBeetle cluster.
+ *
+ * There is NO in-memory ledger in this module. A transfer is only reported as
+ * "posted" when the TigerBeetle cluster has accepted it through the official
+ * `tigerbeetle-node` client, and reconciliation compares real cluster balances
+ * against Postgres. When the client library or cluster is unavailable, every
+ * data route fails fast with 503 `ledger_unavailable`; when Postgres is
+ * unavailable, reconciliation fails with 503 `source_unavailable`.
+ *
+ * Configuration:
+ *   TIGERBEETLE_ADDRESSES   — comma-separated replica addresses (required)
+ *   TIGERBEETLE_CLUSTER_ID  — u128 cluster id (default "0")
  */
+import { createHash } from "crypto";
+import { createRequire } from "module";
 import type { Express, Request, Response } from "express";
+import { sql } from "drizzle-orm";
+import { getDb } from "../db";
+import { logger } from "./logger";
 
-interface TBAccount {
-  id: string;
-  ledger: number;
-  code: number;
-  debitsPending: number;
-  debitsPosted: number;
-  creditsPending: number;
-  creditsPosted: number;
-  balance: number;
-  flags: string[];
-  description: string;
-  tenantId: string;
-  linkedEntity: string;
-  createdAt: string;
-}
-
-interface TBTransfer {
-  id: string;
-  debitAccountId: string;
-  creditAccountId: string;
-  amount: number;
-  ledger: number;
-  code: number;
-  pendingId?: string;
-  flags: string[];
-  narration: string;
-  status: "posted" | "pending" | "voided";
-  createdAt: string;
-}
-
+// ── Ledger catalogue (static metadata only — no balances, counts, or totals) ──
 interface LedgerDefinition {
   id: number;
   name: string;
   currency: string;
   description: string;
-  accountCount: number;
-  totalDebits: number;
-  totalCredits: number;
 }
 
 const LEDGERS: LedgerDefinition[] = [
-  { id: 1, name: "NGN Operating", currency: "NGN", description: "Nigerian Naira operating accounts", accountCount: 4500, totalDebits: 125000000000, totalCredits: 125000000000 },
-  { id: 2, name: "USD Nostro", currency: "USD", description: "US Dollar correspondent banking", accountCount: 120, totalDebits: 450000000, totalCredits: 450000000 },
-  { id: 3, name: "GBP Nostro", currency: "GBP", description: "British Pound correspondent banking", accountCount: 45, totalDebits: 85000000, totalCredits: 85000000 },
-  { id: 4, name: "EUR Nostro", currency: "EUR", description: "Euro correspondent banking", accountCount: 38, totalDebits: 62000000, totalCredits: 62000000 },
-  { id: 5, name: "Loan Portfolio", currency: "NGN", description: "All loan disbursements and repayments", accountCount: 1200, totalDebits: 45000000000, totalCredits: 42000000000 },
-  { id: 6, name: "Card Settlement", currency: "NGN", description: "Card transaction settlements", accountCount: 800, totalDebits: 18000000000, totalCredits: 18000000000 },
-  { id: 7, name: "FX Dealing", currency: "NGN", description: "Foreign exchange position management", accountCount: 60, totalDebits: 8500000000, totalCredits: 8500000000 },
-  { id: 8, name: "Fee & Commission", currency: "NGN", description: "Platform fee collection", accountCount: 200, totalDebits: 3200000000, totalCredits: 3200000000 },
-  { id: 9, name: "Escrow", currency: "NGN", description: "Escrow and trust accounts", accountCount: 150, totalDebits: 12000000000, totalCredits: 11500000000 },
-  { id: 10, name: "Mojaloop Settlement", currency: "NGN", description: "Interoperability settlement accounts", accountCount: 50, totalDebits: 2800000000, totalCredits: 2800000000 },
-  { id: 11, name: "Agent Float", currency: "NGN", description: "Agent banking float management", accountCount: 350, totalDebits: 5600000000, totalCredits: 5600000000 },
-  { id: 12, name: "Microfinance Savings", currency: "NGN", description: "Microfinance group savings", accountCount: 400, totalDebits: 890000000, totalCredits: 890000000 },
+  { id: 1, name: "NGN Operating", currency: "NGN", description: "Nigerian Naira operating accounts" },
+  { id: 2, name: "USD Nostro", currency: "USD", description: "US Dollar correspondent banking" },
+  { id: 3, name: "GBP Nostro", currency: "GBP", description: "British Pound correspondent banking" },
+  { id: 4, name: "EUR Nostro", currency: "EUR", description: "Euro correspondent banking" },
+  { id: 5, name: "Loan Portfolio", currency: "NGN", description: "All loan disbursements and repayments" },
+  { id: 6, name: "Card Settlement", currency: "NGN", description: "Card transaction settlements" },
+  { id: 7, name: "FX Dealing", currency: "NGN", description: "Foreign exchange position management" },
+  { id: 8, name: "Fee & Commission", currency: "NGN", description: "Platform fee collection" },
+  { id: 9, name: "Escrow", currency: "NGN", description: "Escrow and trust accounts" },
+  { id: 10, name: "Mojaloop Settlement", currency: "NGN", description: "Interoperability settlement accounts" },
+  { id: 11, name: "Agent Float", currency: "NGN", description: "Agent banking float management" },
+  { id: 12, name: "Microfinance Savings", currency: "NGN", description: "Microfinance group savings" },
 ];
 
-const ACCOUNTS: TBAccount[] = [
-  { id: "TB-ACC-001", ledger: 1, code: 100, debitsPending: 0, debitsPosted: 45000000, creditsPending: 0, creditsPosted: 48500000, balance: 3500000, flags: ["debits_must_not_exceed_credits"], description: "Dangote Industries Operating", tenantId: "TEN-GTBANK", linkedEntity: "ACCT-0012345678", createdAt: "2026-01-15T10:00:00Z" },
-  { id: "TB-ACC-002", ledger: 1, code: 100, debitsPending: 500000, debitsPosted: 12000000, creditsPending: 0, creditsPosted: 15200000, balance: 3200000, flags: ["debits_must_not_exceed_credits"], description: "BUA Group Operating", tenantId: "TEN-GTBANK", linkedEntity: "ACCT-0012345679", createdAt: "2026-01-15T10:01:00Z" },
-  { id: "TB-ACC-003", ledger: 1, code: 200, debitsPending: 0, debitsPosted: 8500000, creditsPending: 0, creditsPosted: 8500000, balance: 0, flags: [], description: "GL Suspense Account", tenantId: "TEN-PLATFORM-ADMIN", linkedEntity: "GL-1001", createdAt: "2026-01-15T10:02:00Z" },
-  { id: "TB-ACC-004", ledger: 5, code: 300, debitsPending: 0, debitsPosted: 25000000, creditsPending: 0, creditsPosted: 18000000, balance: -7000000, flags: [], description: "Loan Portfolio — Personal Loans", tenantId: "TEN-FIRSTBANK", linkedEntity: "LOAN-PORT-001", createdAt: "2026-02-01T08:00:00Z" },
-  { id: "TB-ACC-005", ledger: 6, code: 400, debitsPending: 150000, debitsPosted: 5200000, creditsPending: 0, creditsPosted: 5350000, balance: 150000, flags: [], description: "Card Settlement Pool", tenantId: "TEN-WEMA", linkedEntity: "CARD-SETTLE-001", createdAt: "2026-02-15T09:00:00Z" },
-  { id: "TB-ACC-006", ledger: 8, code: 500, debitsPending: 0, debitsPosted: 0, creditsPending: 0, creditsPosted: 1250000, balance: 1250000, flags: ["credits_must_not_exceed_debits"], description: "Platform Fee Revenue", tenantId: "TEN-PLATFORM-ADMIN", linkedEntity: "GL-4001", createdAt: "2026-01-15T10:03:00Z" },
-  { id: "TB-ACC-007", ledger: 9, code: 600, debitsPending: 0, debitsPosted: 50000000, creditsPending: 0, creditsPosted: 48000000, balance: -2000000, flags: ["linked", "debits_must_not_exceed_credits"], description: "Escrow — Real Estate", tenantId: "TEN-GTBANK", linkedEntity: "ESCROW-RE-001", createdAt: "2026-03-01T10:00:00Z" },
-  { id: "TB-ACC-008", ledger: 10, code: 700, debitsPending: 0, debitsPosted: 1200000, creditsPending: 0, creditsPosted: 1200000, balance: 0, flags: [], description: "Mojaloop Net Settlement", tenantId: "TEN-PLATFORM-ADMIN", linkedEntity: "MOJA-NET-001", createdAt: "2026-03-15T08:00:00Z" },
-  { id: "TB-ACC-009", ledger: 11, code: 800, debitsPending: 0, debitsPosted: 3500000, creditsPending: 0, creditsPosted: 4000000, balance: 500000, flags: [], description: "Agent Float — Lagos Island", tenantId: "TEN-ACCESS", linkedEntity: "AGT-LAGOS-001", createdAt: "2026-04-01T07:00:00Z" },
-  { id: "TB-ACC-010", ledger: 12, code: 900, debitsPending: 0, debitsPosted: 450000, creditsPending: 0, creditsPosted: 520000, balance: 70000, flags: [], description: "Solidarity Savings Group — Ikeja", tenantId: "TEN-MUTUAL-MFB", linkedEntity: "MFG-SOL-001", createdAt: "2026-04-15T06:00:00Z" },
-];
+// ── Real TigerBeetle client (lazy; never faked) ──
 
-const TRANSFERS: TBTransfer[] = [
-  { id: "TB-TXN-001", debitAccountId: "TB-ACC-001", creditAccountId: "TB-ACC-002", amount: 5000000, ledger: 1, code: 100, flags: [], narration: "Supplier payment — BUA Cement Q2 2026", status: "posted", createdAt: "2026-05-09T10:30:00Z" },
-  { id: "TB-TXN-002", debitAccountId: "TB-ACC-001", creditAccountId: "TB-ACC-006", amount: 25000, ledger: 1, code: 501, flags: [], narration: "Transfer fee — ₦25,000", status: "posted", createdAt: "2026-05-09T10:30:01Z" },
-  { id: "TB-TXN-003", debitAccountId: "TB-ACC-004", creditAccountId: "TB-ACC-001", amount: 150000, ledger: 5, code: 301, flags: [], narration: "Loan repayment — PLN-2026-0045", status: "posted", createdAt: "2026-05-09T11:00:00Z" },
-  { id: "TB-TXN-004", debitAccountId: "TB-ACC-005", creditAccountId: "TB-ACC-003", amount: 85000, ledger: 6, code: 401, flags: ["pending"], narration: "Card settlement batch — Verve POS", status: "pending", createdAt: "2026-05-09T14:00:00Z" },
-  { id: "TB-TXN-005", debitAccountId: "TB-ACC-009", creditAccountId: "TB-ACC-001", amount: 200000, ledger: 11, code: 801, flags: [], narration: "Agent deposit — Lagos Island branch", status: "posted", createdAt: "2026-05-09T09:15:00Z" },
-  { id: "TB-TXN-006", debitAccountId: "TB-ACC-010", creditAccountId: "TB-ACC-003", amount: 15000, ledger: 12, code: 901, flags: [], narration: "Group savings contribution — Week 18", status: "posted", createdAt: "2026-05-09T08:00:00Z" },
-  { id: "TB-TXN-007", debitAccountId: "TB-ACC-007", creditAccountId: "TB-ACC-001", amount: 25000000, ledger: 9, code: 601, flags: [], narration: "Escrow release — Plot A12 Lekki Phase 2", status: "posted", createdAt: "2026-05-09T12:00:00Z" },
-  { id: "TB-TXN-008", debitAccountId: "TB-ACC-008", creditAccountId: "TB-ACC-001", amount: 350000, ledger: 10, code: 701, flags: [], narration: "Mojaloop inward settlement — Batch 2026-05-09", status: "posted", createdAt: "2026-05-09T13:00:00Z" },
-];
+interface TBClient {
+  createAccounts(accounts: unknown[]): Promise<Array<{ index: number; result: number }>>;
+  createTransfers(transfers: unknown[]): Promise<Array<{ index: number; result: number }>>;
+  lookupAccounts(ids: bigint[]): Promise<Array<Record<string, unknown>>>;
+  lookupTransfers(ids: bigint[]): Promise<Array<Record<string, unknown>>>;
+}
+
+let clientPromise: Promise<TBClient | null> | null = null;
+
+function tigerBeetleConfigured(): boolean {
+  return Boolean(process.env.TIGERBEETLE_ADDRESSES?.trim());
+}
+
+async function getTBClient(): Promise<TBClient | null> {
+  if (!tigerBeetleConfigured()) {
+    return null;
+  }
+  if (!clientPromise) {
+    clientPromise = (async () => {
+      try {
+        // The official client is CJS; require() keeps this ESM module bootable
+        // even when the dependency is not installed.
+        const require = createRequire(import.meta.url);
+        const tb = require("tigerbeetle-node");
+        const addresses = process
+          .env.TIGERBEETLE_ADDRESSES!.split(",")
+          .map((a) => a.trim())
+          .filter(Boolean);
+        const clusterId = BigInt(process.env.TIGERBEETLE_CLUSTER_ID || "0");
+        const client = tb.createClient({ cluster_id: clusterId, replica_addresses: addresses });
+        logger.info("TigerBeetle client initialized", { addresses: addresses.length });
+        return client as TBClient;
+      } catch (error) {
+        logger.error("TigerBeetle client initialization failed", { error: String(error) });
+        return null;
+      }
+    })();
+  }
+  return clientPromise;
+}
+
+// ── Helpers ──
+
+/** Deterministically maps an external string id to a TigerBeetle u128 id. */
+function toU128(id: string): bigint {
+  return BigInt(`0x${createHash("sha256").update(id).digest("hex").slice(0, 32)}`);
+}
+
+function u128ToHex(id: unknown): string {
+  if (typeof id === "bigint") return `0x${id.toString(16).padStart(32, "0")}`;
+  return String(id);
+}
+
+function num(value: unknown): number {
+  if (typeof value === "bigint") return Number(value);
+  const n = Number(value ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function mapAccount(raw: Record<string, unknown>) {
+  const debitsPosted = num(raw.debits_posted);
+  const creditsPosted = num(raw.credits_posted);
+  return {
+    id: u128ToHex(raw.id),
+    ledger: num(raw.ledger),
+    code: num(raw.code),
+    debitsPending: num(raw.debits_pending),
+    debitsPosted,
+    creditsPending: num(raw.credits_pending),
+    creditsPosted,
+    balance: creditsPosted - debitsPosted,
+    flagsBitmask: num(raw.flags),
+  };
+}
+
+function mapTransfer(raw: Record<string, unknown>) {
+  const flags = num(raw.flags);
+  return {
+    id: u128ToHex(raw.id),
+    debitAccountId: u128ToHex(raw.debit_account_id),
+    creditAccountId: u128ToHex(raw.credit_account_id),
+    amount: num(raw.amount),
+    ledger: num(raw.ledger),
+    code: num(raw.code),
+    pendingId: raw.pending_id ? u128ToHex(raw.pending_id) : undefined,
+    flagsBitmask: flags,
+    // TigerBeetle TransferFlags: pending = 1 << 1
+    status: (flags & 2) !== 0 ? "pending" : "posted",
+  };
+}
+
+function ledgerUnavailable(res: Response) {
+  return res.status(503).json({
+    error: "ledger_unavailable",
+    message: "TigerBeetle client not configured",
+  });
+}
+
+function asyncHandler(fn: (req: Request, res: Response) => Promise<unknown>) {
+  return (req: Request, res: Response) => {
+    fn(req, res).catch((error) => {
+      logger.error("TigerBeetle ledger route failed", { path: req.path, error: String(error) });
+      if (!res.headersSent) {
+        res.status(500).json({ error: "internal_error", message: "Ledger request failed" });
+      }
+    });
+  };
+}
+
+function parseIds(req: Request): string[] {
+  const raw = String(req.query.ids ?? "").trim();
+  return raw ? raw.split(",").map((s) => s.trim()).filter(Boolean).slice(0, 1000) : [];
+}
+
+// ── Route registration ──
 
 export function registerTigerBeetleLedger(app: Express) {
-  // Ledgers
+  // Ledger catalogue (static metadata; contains no financial state)
   app.get("/api/tigerbeetle/v1/ledgers", (_req: Request, res: Response) => {
-    res.json({ items: LEDGERS, total: LEDGERS.length, totalAccounts: LEDGERS.reduce((s, l) => s + l.accountCount, 0) });
+    res.json({ items: LEDGERS, total: LEDGERS.length });
   });
 
-  // Accounts
-  app.get("/api/tigerbeetle/v1/accounts", (req: Request, res: Response) => {
-    const ledger = req.query.ledger ? parseInt(req.query.ledger as string) : null;
-    const filtered = ledger ? ACCOUNTS.filter((a) => a.ledger === ledger) : ACCOUNTS;
-    res.json({ items: filtered, total: filtered.length });
-  });
-  app.get("/api/tigerbeetle/v1/accounts/:id", (req: Request, res: Response) => {
-    const a = ACCOUNTS.find((x) => x.id === req.params.id);
-    a ? res.json(a) : res.status(404).json({ error: "Account not found" });
-  });
-  app.post("/api/tigerbeetle/v1/accounts", (req: Request, res: Response) => {
-    const { ledger, code, description, tenantId, linkedEntity } = req.body ?? {};
-    const newAcc: TBAccount = {
-      id: `TB-ACC-${String(ACCOUNTS.length + 1).padStart(3, "0")}`,
-      ledger: ledger ?? 1, code: code ?? 100,
-      debitsPending: 0, debitsPosted: 0, creditsPending: 0, creditsPosted: 0, balance: 0,
-      flags: ["debits_must_not_exceed_credits"],
-      description: description ?? "New account",
-      tenantId: tenantId ?? "TEN-PLATFORM-ADMIN",
-      linkedEntity: linkedEntity ?? "",
-      createdAt: new Date().toISOString(),
+  // Accounts — real cluster lookups only; TigerBeetle has no "list all" API,
+  // so callers must provide the ids they want to inspect.
+  app.get("/api/tigerbeetle/v1/accounts", asyncHandler(async (req, res) => {
+    const client = await getTBClient();
+    if (!client) return ledgerUnavailable(res);
+    const ids = parseIds(req);
+    if (ids.length === 0) {
+      return res.status(400).json({ error: "ids_required", message: "Provide ?ids=<id,id,...> — cluster accounts cannot be enumerated" });
+    }
+    const accounts = await client.lookupAccounts(ids.map(toU128));
+    res.json({ items: accounts.map(mapAccount), total: accounts.length });
+  }));
+
+  app.get("/api/tigerbeetle/v1/accounts/:id", asyncHandler(async (req, res) => {
+    const client = await getTBClient();
+    if (!client) return ledgerUnavailable(res);
+    const accounts = await client.lookupAccounts([toU128(req.params.id)]);
+    if (accounts.length === 0) return res.status(404).json({ error: "Account not found" });
+    res.json(mapAccount(accounts[0]));
+  }));
+
+  app.post("/api/tigerbeetle/v1/accounts", asyncHandler(async (req, res) => {
+    const client = await getTBClient();
+    if (!client) return ledgerUnavailable(res);
+    const { id, ledger, code, description } = req.body ?? {};
+    const ledgerNum = Number(ledger);
+    const codeNum = Number(code);
+    if (!Number.isInteger(ledgerNum) || ledgerNum <= 0 || !Number.isInteger(codeNum) || codeNum <= 0) {
+      return res.status(400).json({ error: "validation_error", message: "Positive integer ledger and code are required" });
+    }
+    const externalId = typeof id === "string" && id.trim() ? id.trim() : `tb-acc-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 16)}`;
+    const tbId = toU128(externalId);
+    const errors = await client.createAccounts([{ id: tbId, ledger: ledgerNum, code: codeNum }]);
+    if (errors.length > 0) {
+      logger.error("TigerBeetle account creation rejected by cluster", { externalId, errors });
+      return res.status(502).json({ error: "cluster_rejected", message: "TigerBeetle cluster rejected the account", clusterErrors: errors });
+    }
+    const [created] = await client.lookupAccounts([tbId]);
+    res.status(201).json({ externalId, description: description ?? null, ...mapAccount(created ?? { id: tbId, ledger: ledgerNum, code: codeNum }) });
+  }));
+
+  // Transfers — only real cluster-committed transfers are ever returned.
+  app.get("/api/tigerbeetle/v1/transfers", asyncHandler(async (req, res) => {
+    const client = await getTBClient();
+    if (!client) return ledgerUnavailable(res);
+    const ids = parseIds(req);
+    if (ids.length === 0) {
+      return res.status(400).json({ error: "ids_required", message: "Provide ?ids=<id,id,...> — cluster transfers cannot be enumerated" });
+    }
+    const transfers = await client.lookupTransfers(ids.map(toU128));
+    res.json({ items: transfers.map(mapTransfer), total: transfers.length });
+  }));
+
+  app.post("/api/tigerbeetle/v1/transfers", asyncHandler(async (req, res) => {
+    const client = await getTBClient();
+    if (!client) return ledgerUnavailable(res);
+    const { id, debitAccountId, creditAccountId, amount, ledger, code, narration } = req.body ?? {};
+    const amountNum = Number(amount);
+    if (!debitAccountId || !creditAccountId || !Number.isFinite(amountNum) || amountNum <= 0) {
+      return res.status(400).json({ error: "validation_error", message: "debitAccountId, creditAccountId and a positive amount are required" });
+    }
+    const ledgerNum = Number(ledger ?? 1);
+    const codeNum = Number(code ?? 100);
+    if (!Number.isInteger(ledgerNum) || ledgerNum <= 0 || !Number.isInteger(codeNum) || codeNum <= 0) {
+      return res.status(400).json({ error: "validation_error", message: "Positive integer ledger and code are required" });
+    }
+    const externalId = typeof id === "string" && id.trim() ? id.trim() : `tb-txn-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 16)}`;
+    const transfer = {
+      id: toU128(externalId),
+      debit_account_id: toU128(String(debitAccountId)),
+      credit_account_id: toU128(String(creditAccountId)),
+      amount: BigInt(Math.trunc(amountNum)),
+      ledger: ledgerNum,
+      code: codeNum,
     };
-    ACCOUNTS.push(newAcc);
-    res.status(201).json(newAcc);
-  });
+    const errors = await client.createTransfers([transfer]);
+    if (errors.length > 0) {
+      logger.error("TigerBeetle transfer rejected by cluster", { externalId, errors });
+      return res.status(502).json({ error: "cluster_rejected", message: "TigerBeetle cluster rejected the transfer", clusterErrors: errors });
+    }
+    const [committed] = await client.lookupTransfers([transfer.id]);
+    res.status(201).json({ externalId, narration: narration ?? null, ...mapTransfer(committed ?? { ...transfer, flags: 0 }) });
+  }));
 
-  // Transfers
-  app.get("/api/tigerbeetle/v1/transfers", (req: Request, res: Response) => {
-    const status = req.query.status as string;
-    const filtered = status ? TRANSFERS.filter((t) => t.status === status) : TRANSFERS;
-    res.json({ items: filtered, total: filtered.length });
-  });
-  app.post("/api/tigerbeetle/v1/transfers", (req: Request, res: Response) => {
-    const { debitAccountId, creditAccountId, amount, ledger, code, narration } = req.body ?? {};
-    if (!debitAccountId || !creditAccountId || !amount) return res.status(400).json({ error: "debitAccountId, creditAccountId, amount required" });
-    const transfer: TBTransfer = {
-      id: `TB-TXN-${String(TRANSFERS.length + 1).padStart(3, "0")}`,
-      debitAccountId, creditAccountId, amount, ledger: ledger ?? 1, code: code ?? 100,
-      flags: [], narration: narration ?? "", status: "posted",
-      createdAt: new Date().toISOString(),
-    };
-    TRANSFERS.push(transfer);
-    res.status(201).json(transfer);
-  });
+  // Reconciliation — compares REAL TigerBeetle balances against REAL Postgres
+  // balances and reports the actual mismatches. Fails fast (503) when either
+  // source is unavailable; never reports "balanced" without real data.
+  app.get("/api/tigerbeetle/v1/reconciliation", asyncHandler(async (_req, res) => {
+    const client = await getTBClient();
+    if (!client) return ledgerUnavailable(res);
+    const db = await getDb();
+    if (!db) {
+      return res.status(503).json({
+        error: "source_unavailable",
+        message: "Postgres is unavailable; reconciliation requires both TigerBeetle and Postgres",
+      });
+    }
 
-  // Reconciliation
-  app.get("/api/tigerbeetle/v1/reconciliation", (_req: Request, res: Response) => {
-    const totalDebits = LEDGERS.reduce((s, l) => s + l.totalDebits, 0);
-    const totalCredits = LEDGERS.reduce((s, l) => s + l.totalCredits, 0);
+    let rows: Array<{ tb_id: string; balance: number }>;
+    try {
+      const result = await db.execute(sql`
+        SELECT tigerbeetle_account_id::text AS tb_id, available_balance::float8 AS balance
+        FROM account_balances
+        WHERE tigerbeetle_account_id IS NOT NULL
+      `);
+      rows = ((result as unknown as { rows?: unknown[] }).rows ?? []) as Array<{ tb_id: string; balance: number }>;
+    } catch (error) {
+      logger.error("Reconciliation Postgres source query failed", { error: String(error) });
+      return res.status(503).json({
+        error: "source_unavailable",
+        message: "Postgres balance source query failed; reconciliation cannot run",
+        detail: String(error),
+      });
+    }
+
+    let clusterAccounts: Array<Record<string, unknown>>;
+    try {
+      clusterAccounts = await client.lookupAccounts(rows.map((r) => toU128(String(r.tb_id))));
+    } catch (error) {
+      logger.error("Reconciliation TigerBeetle lookup failed", { error: String(error) });
+      return res.status(503).json({
+        error: "source_unavailable",
+        message: "TigerBeetle cluster lookup failed; reconciliation cannot run",
+        detail: String(error),
+      });
+    }
+
+    const byId = new Map(clusterAccounts.map((a) => [u128ToHex(a.id), a]));
+    const mismatches: Array<{ accountId: string; tigerbeetleBalance: number | null; postgresBalance: number; difference: number | null }> = [];
+    for (const row of rows) {
+      const account = byId.get(u128ToHex(toU128(String(row.tb_id))));
+      const tbBalance = account ? num(account.credits_posted) - num(account.debits_posted) : null;
+      const pgBalance = Number(row.balance);
+      if (tbBalance === null || tbBalance !== pgBalance) {
+        mismatches.push({
+          accountId: String(row.tb_id),
+          tigerbeetleBalance: tbBalance,
+          postgresBalance: pgBalance,
+          difference: tbBalance === null ? null : tbBalance - pgBalance,
+        });
+      }
+    }
+
     res.json({
-      status: totalDebits === totalCredits ? "balanced" : "imbalanced",
-      totalDebits,
-      totalCredits,
-      difference: Math.abs(totalDebits - totalCredits),
-      ledgers: LEDGERS.map((l) => ({ name: l.name, balanced: l.totalDebits === l.totalCredits, difference: Math.abs(l.totalDebits - l.totalCredits) })),
-      lastReconciliationAt: "2026-05-09T00:05:00Z",
+      status: mismatches.length === 0 ? "balanced" : "mismatches_found",
+      accountsChecked: rows.length,
+      accountsFoundInCluster: clusterAccounts.length,
+      mismatchedAccounts: mismatches.length,
+      mismatches,
+      reconciledAt: new Date().toISOString(),
     });
-  });
+  }));
 
-  // Stats
-  app.get("/api/tigerbeetle/v1/stats", (_req: Request, res: Response) => {
+  // Stats — only real cluster connectivity information; no fabricated throughput.
+  app.get("/api/tigerbeetle/v1/stats", asyncHandler(async (_req, res) => {
+    const client = await getTBClient();
+    if (!client) return ledgerUnavailable(res);
     res.json({
-      totalLedgers: LEDGERS.length,
-      totalAccounts: LEDGERS.reduce((s, l) => s + l.accountCount, 0),
-      totalTransfers: TRANSFERS.length,
-      transfersToday: TRANSFERS.filter((t) => t.createdAt.startsWith("2026-05-09")).length,
-      pendingTransfers: TRANSFERS.filter((t) => t.status === "pending").length,
-      clusterStatus: "healthy",
-      replicaCount: 3,
-      batchLatencyP99Ms: 2.1,
-      throughputTps: 12500,
+      clusterStatus: "connected",
+      replicaAddresses: process.env.TIGERBEETLE_ADDRESSES!.split(",").map((a) => a.trim()).filter(Boolean),
+      clusterId: process.env.TIGERBEETLE_CLUSTER_ID || "0",
+      ledgersDefined: LEDGERS.length,
     });
-  });
+  }));
 }
