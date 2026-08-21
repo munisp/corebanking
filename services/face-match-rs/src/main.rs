@@ -2,7 +2,10 @@
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use std::sync::Mutex;
+use std::time::Instant;
 use std::env;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
@@ -30,6 +33,44 @@ struct AppState {
     matches: Mutex<Vec<FaceMatchResult>>,
     stats: Mutex<MatchStats>,
     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FaceMatchResult {
+    id: String,
+    customer_id: String,
+    matched: bool,
+    similarity_score: f64,
+    embedding_distance: f64,
+    face1_quality: f64,
+    face2_quality: f64,
+    age_estimation: Option<u32>,
+    gender_estimation: Option<String>,
+    glasses_detected: bool,
+    mask_detected: bool,
+    // Only reported when computable from real inputs; never fabricated.
+    head_pose_diff: Option<f64>,
+    purpose: String,
+    processing_time_ms: f64,
+    timestamp: String,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+struct PurposeBreakdown {
+    kyc_onboarding: u64,
+    transaction_auth: u64,
+    periodic_reverify: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Default)]
+struct MatchStats {
+    total_matches: u64,
+    successful_matches: u64,
+    failed_matches: u64,
+    match_rate: f64,
+    avg_similarity: f64,
+    avg_processing_ms: f64,
+    purpose_breakdown: PurposeBreakdown,
 }
 
 #[derive(Deserialize)]
@@ -116,16 +157,27 @@ async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppSt
     let _sanitized = sanitize_input("");
     let start = Instant::now();
 
-    let emb1 = body.image1_embedding.clone().unwrap_or_else(|| vec![0.0; 512]);
-    let emb2 = body.image2_embedding.clone().unwrap_or_else(|| vec![0.0; 512]);
+    // Fail closed: a match verdict requires BOTH real embeddings.
+    let emb1 = match &body.image1_embedding {
+        Some(e) if !e.is_empty() => e.clone(),
+        _ => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "image1_embedding", "matched": false})),
+    };
+    let emb2 = match &body.image2_embedding {
+        Some(e) if !e.is_empty() => e.clone(),
+        _ => return HttpResponse::UnprocessableEntity().json(json!({"error": "missing_required_input", "field": "image2_embedding", "matched": false})),
+    };
+    if emb1.len() != emb2.len() {
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "embedding_dimension_mismatch", "matched": false}));
+    }
 
-    let cosine_sim = if emb1.len() == emb2.len() && !emb1.is_empty() {
-        let dot: f64 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
-        let norm1: f64 = emb1.iter().map(|x| x * x).sum::<f64>().sqrt();
-        let norm2: f64 = emb2.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm1 > 0.0 && norm2 > 0.0 { dot / (norm1 * norm2) } else { 0.0 }
+    // Real cosine similarity — never synthesized.
+    let dot: f64 = emb1.iter().zip(emb2.iter()).map(|(a, b)| a * b).sum();
+    let norm1: f64 = emb1.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let norm2: f64 = emb2.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let cosine_sim = if norm1 > 0.0 && norm2 > 0.0 {
+        dot / (norm1 * norm2)
     } else {
-        0.85 + (rand_u32() % 15) as f64 / 100.0
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "zero_norm_embedding", "matched": false}));
     };
 
     let similarity_pct = (cosine_sim + 1.0) / 2.0 * 100.0;
@@ -146,11 +198,11 @@ async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppSt
         embedding_distance: 1.0 - cosine_sim,
         face1_quality: q1,
         face2_quality: q2,
-        age_estimation: body.age_estimation.unwrap_or(30),
-        gender_estimation: body.gender_estimation.clone().unwrap_or_else(|| "unknown".into()),
+        age_estimation: body.age_estimation,
+        gender_estimation: body.gender_estimation.clone(),
         glasses_detected: body.glasses_detected.unwrap_or(false),
         mask_detected: body.mask_detected.unwrap_or(false),
-        head_pose_diff: (rand_u32() % 20) as f64 * 0.5,
+        head_pose_diff: None,
         purpose: purpose.clone(),
         processing_time_ms: processing_ms,
         timestamp: chrono_now(),
@@ -206,15 +258,12 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn rand_u32() -> u32 {
-    use std::time::SystemTime;
-    let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-    (d.subsec_nanos() ^ (d.as_secs() as u32)) & 0xFFFFFFFF
+    // UUIDv4-derived (random, not time-derived) identifier component.
+    (Uuid::new_v4().as_u128() & 0xFFFFFFFF) as u32
 }
 
 fn chrono_now() -> String {
-    use std::time::SystemTime;
-    let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
-    format!("2026-05-09T{:02}:{:02}:{:02}Z", (d.as_secs() / 3600) % 24, (d.as_secs() / 60) % 60, d.as_secs() % 60)
+    Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 async fn deepface_info() -> HttpResponse {
@@ -308,14 +357,23 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
     }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"}))),
+    };
+    let secret = match std::env::var("JWT_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::ServiceUnavailable().json(json!({"error": "jwt_validation_unavailable"}))),
+    };
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    match jsonwebtoken::decode::<serde_json::Value>(token, &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()), &validation) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(HttpResponse::Unauthorized().json(json!({"error": "invalid or expired token"}))),
     }
 }
 
@@ -658,46 +716,4 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }
