@@ -160,7 +160,7 @@ type nibssClient struct {
 func newNIBSSClient() *nibssClient {
 	timeout := 10 * time.Second
 	if v := os.Getenv("NIBSS_TIMEOUT_SECS"); v != "" {
-		if n, err := time.ParseDuration(v+"s"); err == nil && n > 0 {
+		if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
 			timeout = n
 		}
 	}
