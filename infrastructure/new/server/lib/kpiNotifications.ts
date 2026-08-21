@@ -2,9 +2,24 @@
  * KPI Notifications & Cadence — Threshold breach events + customizable display periods
  * Publishes events via Kafka when KPI thresholds are exceeded.
  * Supports: hourly, daily, weekly, monthly, quarterly, semi-annually, yearly
+ *
+ * Data doctrine: rules are only evaluated against real values computed from
+ * Postgres (via computeKpiMetricValues in ./kpiGateway). A rule whose metric
+ * has no computable value is SKIPPED and logged — no breach and no all-clear
+ * is ever derived from a hardcoded number. Cadence history comes from the
+ * kpi_scores table; when there is no recorded history, the series is empty
+ * and marked unavailable. When the database is unreachable, endpoints fail
+ * fast with 503.
  */
 
 import type { Express, Request, Response } from "express";
+import { sql } from "drizzle-orm";
+import { getDb } from "../db";
+import { logger } from "./logger";
+import { publish, getKafkaStatus } from "./kafkaClient";
+import { getRedisStatus } from "./redisClient";
+import { checkDatabaseHealth } from "./postgresRepository";
+import { computeKpiMetricValues, DatabaseUnavailableError } from "./kpiGateway";
 
 // ─── NOTIFICATION TYPES ─────────────────────────────────────────────────────
 
@@ -82,24 +97,9 @@ const DEFAULT_RULES: NotificationRule[] = [
   { id: "nr-012", role: "credit", metricId: "crd_par30", metricName: "PAR > 30 days", condition: "gt", thresholdValue: 10, severity: "warning", channels: ["kafka", "email", "in_app"], cooldownMinutes: 1440, enabled: true, escalationChain: ["credit", "cro"], createdBy: "system", description: "Portfolio at risk exceeds warning level" },
 ];
 
-// In-memory event store (production: Kafka + OpenSearch)
+// In-memory event store of REAL fired events (production: Kafka + OpenSearch)
 const notificationEvents: NotificationEvent[] = [];
 let eventCounter = 0;
-
-// ─── SIMULATED CURRENT VALUES ───────────────────────────────────────────────
-
-const CURRENT_VALUES: Record<string, number> = {
-  cro_aml_alerts: 3, cro_npl: 3.5,
-  cso_incidents: 0, cso_unauthorized: 7,
-  coo_fail_rate: 0.3, coo_tps: 520,
-  htl_cash_variance: 0, htl_txn_per_hr: 18,
-  cmp_sar_backlog: 0, cmp_kyc_pending: 35,
-  cto_error_rate: 0.05, cto_availability: 99.97,
-  trs_liquidity: 42.5, trs_crr: 28.5,
-  cs_open_complaints: 12, cs_fcr: 82,
-  aud_maker_checker: 0, aud_trail_completeness: 100,
-  crd_par30: 6.5, crd_npl: 3.5,
-};
 
 // ─── EVALUATION ENGINE ──────────────────────────────────────────────────────
 
@@ -114,13 +114,24 @@ function evaluateCondition(value: number, condition: string, threshold: number):
   }
 }
 
-function evaluateAllRules(): NotificationEvent[] {
+/**
+ * Evaluate all enabled rules against real computed values.
+ * Rules whose metric value is null (no computable source) are skipped and
+ * logged — they produce neither a breach nor an all-clear.
+ */
+function evaluateAllRules(values: Record<string, number | null>): { newEvents: NotificationEvent[]; skipped: string[] } {
   const newEvents: NotificationEvent[] = [];
+  const skipped: string[] = [];
   const now = new Date().toISOString();
 
   for (const rule of DEFAULT_RULES) {
     if (!rule.enabled) continue;
-    const value = CURRENT_VALUES[rule.metricId] ?? 0;
+    const value = values[rule.metricId];
+    if (value === null || value === undefined) {
+      skipped.push(rule.metricId);
+      logger.warn(`[KPI-NOTIFICATION] Skipping rule ${rule.id} (${rule.metricId}) — no real computed value available; not evaluating`);
+      continue;
+    }
     const breached = evaluateCondition(value, rule.condition, rule.thresholdValue);
 
     if (breached) {
@@ -150,45 +161,58 @@ function evaluateAllRules(): NotificationEvent[] {
       notificationEvents.push(event);
       newEvents.push(event);
 
-      // Publish to Kafka topic (in production)
+      // Publish to the real event bus
       publishToKafka("kpi.notifications", event);
     }
   }
 
-  return newEvents;
+  return { newEvents, skipped };
 }
 
 function publishToKafka(topic: string, event: NotificationEvent): void {
-  // In production: KafkaProducer.send(topic, JSON.stringify(event))
-  // Currently logs for observability
-  console.log(`[KPI-NOTIFICATION] topic=${topic} severity=${event.severity} role=${event.role} metric=${event.metricId} value=${event.currentValue}`);
+  const status = getKafkaStatus();
+  if (!status.connected) {
+    logger.warn(`[KPI-NOTIFICATION] Event bus not connected (mode=${status.mode}) — breach event ${event.id} recorded locally but not published`);
+    return;
+  }
+  publish(topic, event);
+  logger.info(`[KPI-NOTIFICATION] topic=${topic} severity=${event.severity} role=${event.role} metric=${event.metricId} value=${event.currentValue}`);
 }
 
-// ─── CADENCE DATA GENERATION ────────────────────────────────────────────────
+// ─── CADENCE DATA (real history only) ───────────────────────────────────────
 
-function generateCadenceData(metricId: string, cadence: Cadence, periods?: number): any[] {
+interface CadencePoint {
+  period_end: string;
+  period_label: string;
+  value: number;
+  status: string;
+}
+
+/**
+ * Fetch recorded score history for a metric from kpi_scores.
+ * Returns an empty array when there is no history — the series is never
+ * synthesized.
+ */
+async function fetchCadenceData(metricId: string, cadence: Cadence, periods?: number): Promise<CadencePoint[]> {
+  const db = await getDb();
+  if (!db) throw new DatabaseUnavailableError();
   const config = CADENCE_MAP[cadence];
   const numPeriods = periods || config.defaultPeriods;
-  const baseValue = CURRENT_VALUES[metricId] ?? 50;
-  const now = Date.now();
-  const data = [];
 
-  for (let i = numPeriods; i > 0; i--) {
-    const periodEnd = new Date(now - config.intervalSeconds * 1000 * i);
-    const noise = Math.sin(i * 0.7) * baseValue * 0.08;
-    const trend = (numPeriods - i) * baseValue * 0.002;
-    const value = Math.max(0, baseValue + noise + trend);
+  const result = await db.execute(
+    sql`SELECT period_end, value, status FROM kpi_scores WHERE metric_key = ${metricId} ORDER BY period_end DESC LIMIT ${numPeriods}`
+  );
+  const rows = (result.rows as Array<{ period_end: string | Date; value: number | string; status: string | null }>).reverse();
 
-    data.push({
+  return rows.map(r => {
+    const periodEnd = new Date(r.period_end);
+    return {
       period_end: periodEnd.toISOString(),
       period_label: formatPeriodLabel(periodEnd, cadence),
-      value: Math.round(value * 100) / 100,
-      target: baseValue,
-      status: getStatus(value, baseValue, metricId),
-    });
-  }
-
-  return data;
+      value: Number(r.value),
+      status: r.status ?? "unknown",
+    };
+  });
 }
 
 function formatPeriodLabel(dt: Date, cadence: Cadence): string {
@@ -208,11 +232,15 @@ function getWeekNumber(d: Date): number {
   return Math.ceil((((d.getTime() - oneJan.getTime()) / 86400000) + oneJan.getDay() + 1) / 7);
 }
 
-function getStatus(value: number, target: number, metricId: string): string {
-  const ratio = value / target;
-  if (ratio >= 0.95) return "green";
-  if (ratio >= 0.75) return "amber";
-  return "red";
+// ─── ERROR HANDLING ─────────────────────────────────────────────────────────
+
+function handleNotificationError(res: Response, error: unknown): void {
+  if (error instanceof DatabaseUnavailableError) {
+    res.status(503).json({ error: "database_unavailable", message: "KPI notification evaluation requires a live Postgres connection" });
+    return;
+  }
+  logger.error("[KPI-NOTIFICATION] endpoint failed", { error: String(error) });
+  res.status(500).json({ error: "kpi_notification_failed" });
 }
 
 // ─── REGISTER ENDPOINTS ─────────────────────────────────────────────────────
@@ -233,15 +261,23 @@ export function registerKPINotifications(app: Express): void {
     });
   });
 
-  // Evaluate rules now (trigger evaluation)
-  app.post("/api/kpi/notifications/evaluate", (_req: Request, res: Response) => {
-    const newEvents = evaluateAllRules();
-    res.json({
-      evaluated: DEFAULT_RULES.filter(r => r.enabled).length,
-      breached: newEvents.length,
-      events: newEvents,
-      timestamp: new Date().toISOString(),
-    });
+  // Evaluate rules now (trigger evaluation against real computed values)
+  app.post("/api/kpi/notifications/evaluate", async (_req: Request, res: Response) => {
+    try {
+      const enabledRules = DEFAULT_RULES.filter(r => r.enabled);
+      const values = await computeKpiMetricValues(enabledRules.map(r => r.metricId));
+      const { newEvents, skipped } = evaluateAllRules(values);
+      res.json({
+        evaluated: enabledRules.length - skipped.length,
+        skippedUnavailable: skipped,
+        breached: newEvents.length,
+        events: newEvents,
+        note: "Rules with no computable metric value were skipped — no breach or all-clear is inferred from missing data",
+        timestamp: new Date().toISOString(),
+      });
+    } catch (error) {
+      handleNotificationError(res, error);
+    }
   });
 
   // List notification events/history
@@ -317,8 +353,8 @@ export function registerKPINotifications(app: Express): void {
     });
   });
 
-  // Get KPI data by custom cadence
-  app.get("/api/kpi/data/:metricId", (req: Request, res: Response) => {
+  // Get KPI data by custom cadence — real recorded history from kpi_scores only
+  app.get("/api/kpi/data/:metricId", async (req: Request, res: Response) => {
     const { metricId } = req.params;
     const cadence = (req.query.cadence as Cadence) || "daily";
     const periods = parseInt(req.query.periods as string) || undefined;
@@ -327,29 +363,54 @@ export function registerKPINotifications(app: Express): void {
       return res.status(400).json({ error: "invalid cadence", validCadences: Object.keys(CADENCE_MAP) });
     }
 
-    const data = generateCadenceData(metricId, cadence, periods);
-    const config = CADENCE_MAP[cadence];
+    try {
+      const config = CADENCE_MAP[cadence];
+      const [data, values] = await Promise.all([
+        fetchCadenceData(metricId, cadence, periods),
+        computeKpiMetricValues([metricId]),
+      ]);
+      const currentValue = values[metricId] ?? null;
 
-    res.json({
-      metricId,
-      cadence,
-      cadenceLabel: config.label,
-      periods: data.length,
-      retentionDays: config.retentionDays,
-      aggregation: config.aggregation,
-      data,
-      currentValue: CURRENT_VALUES[metricId] ?? null,
-      summary: {
-        avg: Math.round(data.reduce((s, d) => s + d.value, 0) / data.length * 100) / 100,
-        min: Math.min(...data.map(d => d.value)),
-        max: Math.max(...data.map(d => d.value)),
-        trend: data[data.length - 1]?.value > data[0]?.value ? "improving" : "declining",
-      },
-    });
+      if (data.length === 0) {
+        return res.json({
+          metricId,
+          cadence,
+          cadenceLabel: config.label,
+          periods: 0,
+          retentionDays: config.retentionDays,
+          aggregation: config.aggregation,
+          status: "unavailable",
+          data: [],
+          currentValue,
+          summary: null,
+          message: "No recorded history for this metric in kpi_scores — series is not synthesized",
+        });
+      }
+
+      res.json({
+        metricId,
+        cadence,
+        cadenceLabel: config.label,
+        periods: data.length,
+        retentionDays: config.retentionDays,
+        aggregation: config.aggregation,
+        status: "ok",
+        data,
+        currentValue,
+        summary: {
+          avg: Math.round(data.reduce((s, d) => s + d.value, 0) / data.length * 100) / 100,
+          min: Math.min(...data.map(d => d.value)),
+          max: Math.max(...data.map(d => d.value)),
+          trend: data[data.length - 1]?.value > data[0]?.value ? "improving" : data[data.length - 1]?.value < data[0]?.value ? "declining" : "flat",
+        },
+      });
+    } catch (error) {
+      handleNotificationError(res, error);
+    }
   });
 
-  // Get all metrics for a role by cadence
-  app.get("/api/kpi/data/role/:role", (req: Request, res: Response) => {
+  // Get all metrics for a role by cadence — real recorded history only
+  app.get("/api/kpi/data/role/:role", async (req: Request, res: Response) => {
     const { role } = req.params;
     const cadence = (req.query.cadence as Cadence) || "daily";
 
@@ -370,64 +431,84 @@ export function registerKPINotifications(app: Express): void {
 
     const metrics = roleMetrics[role];
     if (!metrics) return res.status(404).json({ error: "role not found" });
+    if (!CADENCE_MAP[cadence]) {
+      return res.status(400).json({ error: "invalid cadence", validCadences: Object.keys(CADENCE_MAP) });
+    }
 
-    const result = metrics.map(metricId => ({
-      metricId,
-      data: generateCadenceData(metricId, cadence, CADENCE_MAP[cadence].defaultPeriods),
-    }));
+    try {
+      const result = await Promise.all(metrics.map(async metricId => {
+        const data = await fetchCadenceData(metricId, cadence, CADENCE_MAP[cadence].defaultPeriods);
+        return { metricId, status: data.length > 0 ? "ok" : "unavailable", data };
+      }));
 
-    res.json({ role, cadence, cadenceLabel: CADENCE_MAP[cadence].label, metrics: result });
+      res.json({ role, cadence, cadenceLabel: CADENCE_MAP[cadence].label, metrics: result });
+    } catch (error) {
+      handleNotificationError(res, error);
+    }
   });
 
-  // Branch geospatial data (for map)
-  app.get("/api/kpi/branches", (_req: Request, res: Response) => {
+  // Branch geospatial data (for map) — served from the kpi_branches table
+  app.get("/api/kpi/branches", async (_req: Request, res: Response) => {
+    try {
+      const db = await getDb();
+      if (!db) throw new DatabaseUnavailableError();
+
+      const result = await db.execute(
+        sql`SELECT branch_id, name, state, lga, latitude, longitude, revenue_ngn, transactions_daily, customers, npl_pct, deposits_ngn, status FROM kpi_branches ORDER BY branch_id`
+      );
+      const rows = result.rows as Array<Record<string, unknown>>;
+
+      res.json({
+        branches: rows.map(r => ({
+          branch_id: r.branch_id,
+          name: r.name,
+          state: r.state,
+          lga: r.lga,
+          lat: r.latitude === null ? null : Number(r.latitude),
+          lon: r.longitude === null ? null : Number(r.longitude),
+          revenue_ngn: r.revenue_ngn === null ? null : Number(r.revenue_ngn),
+          transactions_daily: r.transactions_daily === null ? null : Number(r.transactions_daily),
+          customers: r.customers === null ? null : Number(r.customers),
+          npl_pct: r.npl_pct === null ? null : Number(r.npl_pct),
+          deposits_ngn: r.deposits_ngn === null ? null : Number(r.deposits_ngn),
+          status: r.status ?? "unknown",
+        })),
+        total: rows.length,
+        source: "kpi_branches table (Postgres)",
+      });
+    } catch (error) {
+      handleNotificationError(res, error);
+    }
+  });
+
+  // Middleware status — probed from real client helpers; components without a
+  // probe are reported as "unknown", never as "connected".
+  app.get("/api/kpi/middleware/status", async (_req: Request, res: Response) => {
+    const [dbHealth, kafka, redis] = [await checkDatabaseHealth(), getKafkaStatus(), getRedisStatus()];
+
+    const middlewareList = [
+      { name: "Apache Kafka", status: kafka.connected ? "connected" : kafka.mode === "memory" ? "memory_mode" : "unavailable", purpose: "KPI event publishing & alert streaming" },
+      { name: "Dapr Sidecar", status: "unknown", purpose: "State management, pub/sub, service invocation" },
+      { name: "Fluvio Streaming", status: "unknown", purpose: "Real-time KPI metric streaming" },
+      { name: "Temporal Workflow", status: "unknown", purpose: "Scheduled KPI evaluation workflows" },
+      { name: "PostgreSQL 16", status: dbHealth.healthy ? "connected" : "unavailable", latencyMs: dbHealth.latencyMs, purpose: "Primary data source for all KPI calculations" },
+      { name: "Keycloak SSO", status: "unknown", purpose: "Authentication, MFA adoption metrics" },
+      { name: "Permify", status: "unknown", purpose: "Fine-grained RBAC for KPI access" },
+      { name: "Redis Cache", status: redis.connected ? "connected" : redis.mode === "memory" ? "memory_mode" : "unavailable", purpose: "KPI result caching (30s TTL)" },
+      { name: "Mojaloop Hub", status: "unknown", purpose: "Interop transfer KPIs" },
+      { name: "OpenSearch", status: "unknown", purpose: "KPI alert indexing & analytics" },
+      { name: "OpenAppSec WAF", status: "unknown", purpose: "Security metrics for CSO" },
+      { name: "Apache APISIX", status: "unknown", purpose: "API gateway metrics for CTO" },
+      { name: "TigerBeetle", status: "unknown", purpose: "Ledger performance KPIs" },
+      { name: "Lakehouse (Iceberg+Sedona)", status: "unknown", purpose: "Materialized KPI views, geospatial analytics" },
+    ];
     res.json({
-      branches: [
-        { branch_id: "BR-001", name: "Lagos Island Main", state: "Lagos", lga: "Lagos Island", lat: 6.4541, lon: 3.4082, revenue_ngn: 850000000, transactions_daily: 2400, customers: 15200, npl_pct: 2.1, deposits_ngn: 12500000000, status: "green" },
-        { branch_id: "BR-002", name: "Victoria Island", state: "Lagos", lga: "Eti-Osa", lat: 6.4281, lon: 3.4219, revenue_ngn: 1200000000, transactions_daily: 3100, customers: 18500, npl_pct: 1.8, deposits_ngn: 18000000000, status: "green" },
-        { branch_id: "BR-003", name: "Ikeja GRA", state: "Lagos", lga: "Ikeja", lat: 6.5833, lon: 3.3500, revenue_ngn: 620000000, transactions_daily: 1800, customers: 12000, npl_pct: 3.2, deposits_ngn: 8500000000, status: "green" },
-        { branch_id: "BR-004", name: "Lekki Phase 1", state: "Lagos", lga: "Eti-Osa", lat: 6.4474, lon: 3.4734, revenue_ngn: 950000000, transactions_daily: 2200, customers: 14000, npl_pct: 2.5, deposits_ngn: 14000000000, status: "green" },
-        { branch_id: "BR-005", name: "Abuja Central", state: "FCT", lga: "Municipal", lat: 9.0579, lon: 7.4951, revenue_ngn: 780000000, transactions_daily: 2000, customers: 11000, npl_pct: 2.8, deposits_ngn: 10500000000, status: "green" },
-        { branch_id: "BR-006", name: "Garki Area 11", state: "FCT", lga: "Garki", lat: 9.0227, lon: 7.4880, revenue_ngn: 450000000, transactions_daily: 1200, customers: 8500, npl_pct: 3.5, deposits_ngn: 6000000000, status: "amber" },
-        { branch_id: "BR-007", name: "Wuse Zone 5", state: "FCT", lga: "Wuse", lat: 9.0765, lon: 7.4892, revenue_ngn: 520000000, transactions_daily: 1500, customers: 9200, npl_pct: 2.9, deposits_ngn: 7200000000, status: "green" },
-        { branch_id: "BR-008", name: "Port Harcourt Main", state: "Rivers", lga: "Port Harcourt", lat: 4.8156, lon: 7.0498, revenue_ngn: 380000000, transactions_daily: 1100, customers: 7800, npl_pct: 4.2, deposits_ngn: 5200000000, status: "amber" },
-        { branch_id: "BR-009", name: "Kano City Gate", state: "Kano", lga: "Nassarawa", lat: 12.0022, lon: 8.5920, revenue_ngn: 290000000, transactions_daily: 950, customers: 6500, npl_pct: 5.8, deposits_ngn: 3800000000, status: "red" },
-        { branch_id: "BR-010", name: "Ibadan Ring Road", state: "Oyo", lga: "Ibadan North", lat: 7.3776, lon: 3.9470, revenue_ngn: 320000000, transactions_daily: 1000, customers: 7200, npl_pct: 3.5, deposits_ngn: 4500000000, status: "green" },
-        { branch_id: "BR-011", name: "Enugu Main", state: "Enugu", lga: "Enugu North", lat: 6.4584, lon: 7.5464, revenue_ngn: 280000000, transactions_daily: 850, customers: 5800, npl_pct: 3.8, deposits_ngn: 3500000000, status: "amber" },
-        { branch_id: "BR-012", name: "Benin City", state: "Edo", lga: "Oredo", lat: 6.3350, lon: 5.6037, revenue_ngn: 310000000, transactions_daily: 900, customers: 6100, npl_pct: 4.0, deposits_ngn: 4000000000, status: "amber" },
-        { branch_id: "BR-013", name: "Kaduna Central", state: "Kaduna", lga: "Kaduna North", lat: 10.5105, lon: 7.4165, revenue_ngn: 260000000, transactions_daily: 780, customers: 5500, npl_pct: 4.5, deposits_ngn: 3200000000, status: "amber" },
-        { branch_id: "BR-014", name: "Owerri Main", state: "Imo", lga: "Owerri Municipal", lat: 5.4836, lon: 7.0333, revenue_ngn: 240000000, transactions_daily: 720, customers: 5000, npl_pct: 3.2, deposits_ngn: 2800000000, status: "green" },
-        { branch_id: "BR-015", name: "Calabar Marina", state: "Cross River", lga: "Calabar Municipal", lat: 4.9517, lon: 8.3220, revenue_ngn: 180000000, transactions_daily: 550, customers: 4200, npl_pct: 3.0, deposits_ngn: 2200000000, status: "green" },
-        { branch_id: "BR-016", name: "Jos Terminus", state: "Plateau", lga: "Jos North", lat: 9.8965, lon: 8.8583, revenue_ngn: 195000000, transactions_daily: 600, customers: 4500, npl_pct: 4.8, deposits_ngn: 2400000000, status: "amber" },
-        { branch_id: "BR-017", name: "Abeokuta Kuto", state: "Ogun", lga: "Abeokuta South", lat: 7.1475, lon: 3.3619, revenue_ngn: 270000000, transactions_daily: 820, customers: 5600, npl_pct: 3.1, deposits_ngn: 3400000000, status: "green" },
-        { branch_id: "BR-018", name: "Warri Effurun", state: "Delta", lga: "Uvwie", lat: 5.5544, lon: 5.7812, revenue_ngn: 350000000, transactions_daily: 980, customers: 6800, npl_pct: 4.1, deposits_ngn: 4800000000, status: "amber" },
-        { branch_id: "BR-019", name: "Uyo Ikot Ekpene Rd", state: "Akwa Ibom", lga: "Uyo", lat: 5.0377, lon: 7.9128, revenue_ngn: 220000000, transactions_daily: 650, customers: 4800, npl_pct: 2.9, deposits_ngn: 2600000000, status: "green" },
-        { branch_id: "BR-020", name: "Maiduguri GRA", state: "Borno", lga: "Maiduguri", lat: 11.8469, lon: 13.1600, revenue_ngn: 150000000, transactions_daily: 420, customers: 3200, npl_pct: 6.2, deposits_ngn: 1800000000, status: "red" },
-      ],
-      total: 20,
-      source: "Apache Sedona + Lakehouse (kpi_catalog.geospatial.branch_locations)",
-      sedonaStatus: { enabled: true, geospatialFunctions: ["ST_Point", "ST_Buffer", "ST_Contains", "ST_Distance", "ST_Within"] },
+      middleware: middlewareList,
+      total: middlewareList.length,
+      connectedCount: middlewareList.filter(m => m.status === "connected").length,
+      note: "Components without a live probe in this process report status \"unknown\" — no component is reported connected without a real check",
     });
   });
 
-  // Middleware status (aggregate across all 3 microservices)
-  app.get("/api/kpi/middleware/status", (_req: Request, res: Response) => {
-    const middlewareList = [
-      { name: "Apache Kafka", status: "memory_mode", purpose: "KPI event publishing & alert streaming" },
-      { name: "Dapr Sidecar", status: "configured", purpose: "State management, pub/sub, service invocation" },
-      { name: "Fluvio Streaming", status: "configured", purpose: "Real-time KPI metric streaming" },
-      { name: "Temporal Workflow", status: "configured", purpose: "Scheduled KPI evaluation workflows" },
-      { name: "PostgreSQL 16", status: "connected", purpose: "Primary data source for all KPI calculations" },
-      { name: "Keycloak SSO", status: "local_fallback", purpose: "Authentication, MFA adoption metrics" },
-      { name: "Permify", status: "configured", purpose: "Fine-grained RBAC for KPI access" },
-      { name: "Redis Cache", status: "memory_mode", purpose: "KPI result caching (30s TTL)" },
-      { name: "Mojaloop Hub", status: "configured", purpose: "Interop transfer KPIs" },
-      { name: "OpenSearch", status: "configured", purpose: "KPI alert indexing & analytics" },
-      { name: "OpenAppSec WAF", status: "configured", purpose: "Security metrics for CSO" },
-      { name: "Apache APISIX", status: "configured", purpose: "API gateway metrics for CTO" },
-      { name: "TigerBeetle", status: "configured", purpose: "Ledger performance KPIs" },
-      { name: "Lakehouse (Iceberg+Sedona)", status: "configured", purpose: "Materialized KPI views, geospatial analytics" },
-    ];
-    res.json({ middleware: middlewareList, total: middlewareList.length, connectedCount: middlewareList.filter(m => m.status === "connected").length });
-  });
+  logger.info("[KPINotifications] Registered rules/events/cadence endpoints — evaluation runs only against real computed values");
 }
