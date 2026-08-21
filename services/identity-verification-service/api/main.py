@@ -1,6 +1,11 @@
 """
 Identity Verification Service
 Integrations with NIMC, BVN, Nigerian Immigration, FRSC
+
+Fail-closed behavior: if an identity provider (NIMC/NIBSS/Immigration/FRSC)
+is unreachable or not configured, verification endpoints return HTTP 503 with
+{"verified": None, "status": "provider_unavailable", "confidence": 0}.
+No fallback path may ever produce a synthetic verification verdict.
 """
 
 import os
@@ -34,6 +39,22 @@ IMMIGRATION_API_KEY = os.getenv("IMMIGRATION_API_KEY", "")
 FRSC_API_URL = os.getenv("FRSC_API_URL", "https://api.frsc.gov.ng/v1")
 FRSC_API_KEY = os.getenv("FRSC_API_KEY", "")
 
+PROVIDER_UNAVAILABLE_BODY = {
+    "verified": None,
+    "status": "provider_unavailable",
+    "confidence": 0,
+}
+
+
+class ProviderUnavailableError(Exception):
+    """Raised when an identity provider cannot be reached. Carries the source."""
+
+    def __init__(self, source: str, detail: str):
+        self.source = source
+        self.detail = detail
+        super().__init__(f"{source} provider unavailable: {detail}")
+
+
 class NINVerificationRequest(BaseModel):
     nin: str  # 11-digit National Identification Number
     first_name: Optional[str] = None
@@ -61,20 +82,14 @@ async def persist_verification_audit(record: Dict[str, Any]):
         del audit_log[0 : len(audit_log) - 1000]
 
 
-def build_fallback_match(primary_id: str, supplied_fields: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = "".join(ch for ch in primary_id if ch.isdigit())
-    checksum = sum(int(ch) for ch in normalized[-4:]) if normalized else 0
-    confidence = min(96, 58 + checksum)
-    verified = len(normalized) >= 8 and checksum % 2 == 0
-    return {
-        "verified": verified,
-        "confidence_score": confidence,
-        "fallback": True,
-        "matched_fields": {k: v for k, v in supplied_fields.items() if v},
-    }
-
-
 async def call_provider(url: str, payload: Dict[str, Any], auth_key: str, source: str) -> Dict[str, Any]:
+    """Call a real identity provider.
+
+    verified=True is only ever returned when the provider itself returned a
+    real 200 response. Provider unreachable -> raises ProviderUnavailableError
+    (callers translate to HTTP 503). Confidence comes only from the provider's
+    own match_score; it is None when the provider does not supply one.
+    """
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -94,7 +109,7 @@ async def call_provider(url: str, payload: Dict[str, Any], auth_key: str, source
                 "provider_data": data,
                 "source": source,
                 "fallback": False,
-                "confidence_score": data.get("match_score", 92),
+                "confidence_score": data.get("match_score"),
             }
         return {
             "verified": False,
@@ -102,18 +117,17 @@ async def call_provider(url: str, payload: Dict[str, Any], auth_key: str, source
             "provider_data": response.json() if response.content else {},
             "source": source,
             "fallback": False,
-            "confidence_score": 25,
+            "confidence_score": None,
         }
     except Exception as exc:
-        logger.warning("provider_call_failed", source=source, error=str(exc))
-        return {
-            "verified": False,
-            "provider_status": 0,
-            "provider_data": {"error": str(exc)},
-            "source": source,
-            "fallback": True,
-            "confidence_score": 40,
-        }
+        logger.error("provider_call_failed", source=source, url=url, error=str(exc))
+        raise ProviderUnavailableError(source, str(exc))
+
+
+def provider_unavailable_response(exc: ProviderUnavailableError) -> HTTPException:
+    detail = dict(PROVIDER_UNAVAILABLE_BODY)
+    detail["source"] = exc.source
+    return HTTPException(status_code=503, detail=detail)
 
 
 @app.get("/health")
@@ -145,10 +159,10 @@ async def verify_nin(request: NINVerificationRequest, x_tenant_id: str = Header(
         "last_name": request.last_name,
         "date_of_birth": request.date_of_birth,
     }
-    provider = await call_provider(f"{NIMC_API_URL}/verify", payload, NIMC_API_KEY, "NIMC")
-    if provider["fallback"]:
-        fallback = build_fallback_match(request.nin, payload)
-        provider.update(fallback)
+    try:
+        provider = await call_provider(f"{NIMC_API_URL}/verify", payload, NIMC_API_KEY, "NIMC")
+    except ProviderUnavailableError as exc:
+        raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
         "nin": request.nin,
@@ -173,10 +187,10 @@ async def verify_bvn(request: BVNVerificationRequest, x_tenant_id: str = Header(
         "last_name": request.last_name,
         "date_of_birth": request.date_of_birth,
     }
-    provider = await call_provider(f"{BVN_API_URL}/verify", payload, BVN_API_KEY, "NIBSS_BVN")
-    if provider["fallback"]:
-        fallback = build_fallback_match(request.bvn, payload)
-        provider.update(fallback)
+    try:
+        provider = await call_provider(f"{BVN_API_URL}/verify", payload, BVN_API_KEY, "NIBSS_BVN")
+    except ProviderUnavailableError as exc:
+        raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
         "bvn": request.bvn,
@@ -199,10 +213,10 @@ async def verify_passport(request: PassportVerificationRequest, x_tenant_id: str
         "surname": request.surname,
         "given_names": request.given_names,
     }
-    provider = await call_provider(f"{IMMIGRATION_API_URL}/verify", payload, IMMIGRATION_API_KEY, "NIGERIAN_IMMIGRATION")
-    if provider["fallback"]:
-        fallback = build_fallback_match(request.passport_number, payload)
-        provider.update(fallback)
+    try:
+        provider = await call_provider(f"{IMMIGRATION_API_URL}/verify", payload, IMMIGRATION_API_KEY, "NIGERIAN_IMMIGRATION")
+    except ProviderUnavailableError as exc:
+        raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
         "passport_number": request.passport_number,
@@ -226,10 +240,10 @@ async def verify_drivers_license(request: DriversLicenseVerificationRequest, x_t
         "license_number": request.license_number,
         "date_of_birth": request.date_of_birth,
     }
-    provider = await call_provider(f"{FRSC_API_URL}/verify", payload, FRSC_API_KEY, "FRSC")
-    if provider["fallback"]:
-        fallback = build_fallback_match(request.license_number, payload)
-        provider.update(fallback)
+    try:
+        provider = await call_provider(f"{FRSC_API_URL}/verify", payload, FRSC_API_KEY, "FRSC")
+    except ProviderUnavailableError as exc:
+        raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
         "license_number": request.license_number,
