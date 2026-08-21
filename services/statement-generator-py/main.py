@@ -1,6 +1,15 @@
 """
 statement-generator-py - Production-ready service with PostgreSQL persistence.
 Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
+
+Fail-closed behavior:
+- JWT auth performs real HS256 signature verification (JWT_SECRET); tokens that
+  cannot be cryptographically verified are rejected with 401, including when
+  no secret is configured (auth_not_configured). Never warn-and-allow.
+- Statement opening balances come from the transaction ledger service
+  (TRANSACTION_LEDGER_URL); when the ledger is unavailable the generate
+  endpoint returns 503 {"error": "ledger_unavailable"} and no statement is
+  emitted with a fabricated balance.
 """
 
 import os
@@ -8,6 +17,11 @@ import json
 import uuid
 import random
 import string
+import time
+import logging
+import threading
+import signal
+import socket as _socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timezone
@@ -30,14 +44,19 @@ KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
 OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+TRANSACTION_LEDGER_URL = os.getenv("TRANSACTION_LEDGER_URL", "")
 PORT = int(os.getenv("PORT", "8937"))
 
 db_conn = None
 
+# Rate limiting state
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -124,7 +143,7 @@ def start_grpc_server(service_name, port):
 
 # --- Configuration ---
 DB_URL = os.environ.get("DATABASE_URL", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "${JWT_SECRET}")
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
 AML_ENGINE_URL = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
 
 # --- mTLS Configuration ---
@@ -169,26 +188,38 @@ def release_db(conn):
         except Exception:
             pass
 
-def init_schema():
+def db_insert(service, record):
+    """Insert a record into Postgres. Raises on failure — no silent fake IDs."""
     conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
-    try:
-        cur = conn.cursor()
-        data = json.dumps(record)
+    data = json.dumps(record)
+    with conn.cursor() as cur:
         cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "statement-generator-py"))
+                    (data, service))
         row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
+    record["id"] = str(row[0])
+    record["created_at"] = str(row[1])
+    return record
 
+def init_schema():
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"Schema init skipped — database unavailable: {e}")
+        return
+    with conn.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS records (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            service VARCHAR(128) NOT NULL,
+            data JSONB,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID NOT NULL,
+            status VARCHAR(20) NOT NULL DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -197,7 +228,6 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
@@ -272,40 +302,65 @@ def metrics():
 
 
 @app.get("/api/v1/service_configs")
-def list_records(x_tenant_id: Optional[str] = Header(None)):
+def list_records(page: int = 1, limit: int = 50, x_tenant_id: Optional[str] = Header(None)):
     conn = get_db()
-    if not conn:
-        return [], 0
     try:
         cur = conn.cursor()
         offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("statement-generator-py", limit, offset))
+        cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (limit, offset))
         rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("statement-generator-py",))
-        total = cur.fetchone()[0]
-        return items, total
+        items = [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
+        return {"items": items, "total": len(items)}
     except Exception as e:
         logger.error(f"DB query failed: {e}")
-        return [], 0
+        raise HTTPException(status_code=503, detail="database_unavailable")
 
 # --- JWT Auth ---
 def validate_jwt(headers):
-    auth = headers.get("Authorization", "")
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
     if not auth.startswith("Bearer "):
         return None, "Missing Bearer token"
     token = auth[7:]
+    import hmac, hashlib, base64, json as _json
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
     parts = token.split(".")
     if len(parts) != 3:
         return None, "Invalid token format"
-    # In production: verify JWT signature with JWT_SECRET
-    return {"sub": "authenticated"}, None
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if time.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
 
 # --- Domain Logic ---
 def gen_id():
@@ -315,9 +370,46 @@ def gen_id():
 def now_iso():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+
+class LedgerUnavailable(Exception):
+    """Raised when the transaction ledger cannot provide an opening balance."""
+
+
+def fetch_opening_balance(account_id, period_start=None):
+    """Fetch the account's opening balance from the transaction ledger service.
+
+    Fails closed: raises LedgerUnavailable when the ledger is not configured,
+    unreachable, or returns no balance. Never fabricates a balance.
+    """
+    if not TRANSACTION_LEDGER_URL:
+        raise LedgerUnavailable("TRANSACTION_LEDGER_URL not configured")
+    if not account_id:
+        raise LedgerUnavailable("account_id is required")
+    url = f"{TRANSACTION_LEDGER_URL.rstrip('/')}/v1/ledger/accounts/{account_id}/balance"
+    if period_start:
+        url += f"?as_of={period_start}"
+    result = call_service("GET", url, retries=2, timeout=10)
+    if result is None:
+        raise LedgerUnavailable(f"transaction ledger unreachable for account {account_id}")
+    balance = result.get("opening_balance", result.get("balance"))
+    if balance is None:
+        raise LedgerUnavailable(f"ledger returned no balance for account {account_id}")
+    try:
+        return float(balance)
+    except (TypeError, ValueError):
+        raise LedgerUnavailable(f"ledger returned a non-numeric balance for account {account_id}")
+
+
 def generate_statement(account_id, transactions, period_start, period_end, currency="NGN"):
+    """Generate an account statement.
+
+    The opening balance is fetched from the transaction ledger service; if it
+    cannot be obtained, LedgerUnavailable is raised and no statement is
+    emitted (callers return HTTP 503 ledger_unavailable).
+    """
+    opening_balance = fetch_opening_balance(account_id, period_start)
     sorted_txns = sorted(transactions, key=lambda t: t.get("date", ""))
-    balance = 0
+    balance = opening_balance
     entries = []
     for t in sorted_txns:
         amount = t.get("amount", 0)
@@ -327,7 +419,7 @@ def generate_statement(account_id, transactions, period_start, period_end, curre
         else:
             balance -= amount
         entries.append({"date": t.get("date",""), "description": t.get("description",""), "debit": amount if txn_type == "debit" else 0, "credit": amount if txn_type == "credit" else 0, "balance": round(balance, 2)})
-    return {"account_id": account_id, "period": {"start": period_start, "end": period_end}, "currency": currency, "entries": entries, "opening_balance": 0, "closing_balance": round(balance, 2), "total_debits": round(sum(e["debit"] for e in entries), 2), "total_credits": round(sum(e["credit"] for e in entries), 2), "transaction_count": len(entries)}
+    return {"account_id": account_id, "period": {"start": period_start, "end": period_end}, "currency": currency, "entries": entries, "opening_balance": round(opening_balance, 2), "closing_balance": round(balance, 2), "total_debits": round(sum(e["debit"] for e in entries), 2), "total_credits": round(sum(e["credit"] for e in entries), 2), "transaction_count": len(entries)}
 
 
 
@@ -511,7 +603,6 @@ class Handler(BaseHTTPRequestHandler):
             inc_errors()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
         add_security_headers(self)
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
@@ -527,7 +618,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(_cached.encode() if isinstance(_cached, str) else _cached)
             return
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
+        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(time.time()*1000)}-{os.getpid()}"
         logger.info(f"[statement-generator-py] {self.command} {self.path} trace={trace_id}")
         inc_requests()
         if not _rl_allow():
@@ -540,12 +631,16 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/healthz":
-            db = get_db()
+            try:
+                get_db()
+                db_status = "connected"
+            except Exception:
+                db_status = "unavailable"
             self.respond(200, {
-                "status": "healthy",
+                "status": "healthy" if db_status == "connected" else "degraded",
                 "service": "statement-generator-py",
                 "version": "2.0.0",
-                "db": "connected" if db else "not_configured",
+                "db": db_status,
                 "uptime_secs": round(time.time() - START_TIME),
             })
         elif path == "/readyz":
@@ -560,17 +655,20 @@ class Handler(BaseHTTPRequestHandler):
             body = (
                 f'# HELP requests_total Total requests\n'
                 f'# TYPE requests_total counter\n'
-                f'requests_total{{service=\"statement-generator-py\"}} {request_count}\n'
+                f'requests_total{{service="statement-generator-py"}} {request_count}\n'
                 f'# HELP errors_total Total errors\n'
                 f'# TYPE errors_total counter\n'
-                f'errors_total{{service=\"statement-generator-py\"}} {error_count}\n'
+                f'errors_total{{service="statement-generator-py"}} {error_count}\n'
             )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(body.encode())
         else:
-            cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
+            self.respond(404, {"error": "Not found"})
 
     def do_POST(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
+        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(time.time()*1000)}-{os.getpid()}"
         logger.info(f"[statement-generator-py] {self.command} {self.path} trace={trace_id}")
         inc_requests()
         if not _rl_allow():
@@ -582,22 +680,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(length).decode() if isinstance(self.rfile.read(length), bytes) else str(self.rfile.read(length)))) if length > 0 else {}
+        body = json.loads(sanitize_input(self.rfile.read(length).decode())) if length > 0 else {}
 
-        # JWT auth check (monitoring mode: warn but allow)
+        # JWT auth check — real signature verification, fail closed
         claims, err = validate_jwt(dict(self.headers))
         if err:
             self.respond(401, {"error": "unauthorized", "detail": err})
-            # Inter-service call
-            try:
-                _upstream = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-                call_service("POST", f"{_upstream}/v1/screen", {"service": "statement-generator-py", "action": "notify"})
-            except Exception as _e:
-                logger.warning(f"inter-service call failed: {_e}")
             return
 
         if path == "/v1/create":
-            result = db_insert("statement_generator_py", body)
+            try:
+                result = db_insert("statement_generator_py", body)
+            except Exception as e:
+                logger.error(f"DB insert failed: {e}")
+                self.respond(503, {"error": "database_unavailable"})
+                return
             cache_set("statement_generator:last_post", str(body))
             self.respond(201, {"created": True, "data": result})
         elif path == "/v1/statement-generator/update":
@@ -622,7 +719,6 @@ class Handler(BaseHTTPRequestHandler):
                     rec["status"] = "completed"
                     rec["data"]["processed_at"] = now_iso()
                     rec["data"]["processing_result"] = "success"
-                    rec["data"]["score"] = round(0.85 + random.random() * 0.14, 3)
                     rec["updated_at"] = now_iso()
                     rec["version"] += 1
                     domain_stats["processed_today"] += 1
@@ -632,8 +728,15 @@ class Handler(BaseHTTPRequestHandler):
                     return
             self.respond(404, {"error": f"Record not found or not processable: {rid}"})
         elif path == "/v1/statement-generator/generate":
-            result = generate_statement(body.get("account_id",""), body.get("transactions",[]), body.get("period_start",""), body.get("period_end",""), body.get("currency","NGN"))
+            try:
+                result = generate_statement(body.get("account_id",""), body.get("transactions",[]), body.get("period_start",""), body.get("period_end",""), body.get("currency","NGN"))
+            except LedgerUnavailable as e:
+                logger.error(f"statement generation blocked — ledger unavailable: {e}")
+                self.respond(503, {"error": "ledger_unavailable", "detail": str(e)})
+                return
             self.respond(200, result)
+        else:
+            self.respond(404, {"error": "Not found"})
 
 
 @app.post("/api/v1/service_configs", status_code=201)
