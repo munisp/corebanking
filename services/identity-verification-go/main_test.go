@@ -16,10 +16,11 @@ func TestHealthEndpoint(t *testing.T) {
 }
 
 func TestReadyzEndpoint(t *testing.T) {
+    // With no database initialized the service must report NOT ready (fail-closed).
     req := httptest.NewRequest("GET", "/readyz", nil)
     w := httptest.NewRecorder()
     readyzHandler(w, req)
-    if w.Code != 200 { t.Errorf("readyz returned %d", w.Code) }
+    if w.Code != 503 { t.Errorf("readyz with nil db returned %d, expected 503", w.Code) }
 }
 
 func TestMetricsEndpoint(t *testing.T) {
