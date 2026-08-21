@@ -19,7 +19,7 @@ func TestReadyzEndpoint(t *testing.T) {
     req := httptest.NewRequest("GET", "/readyz", nil)
     w := httptest.NewRecorder()
     readyzHandler(w, req)
-    if w.Code != 200 { t.Errorf("readyz returned %d", w.Code) }
+    if w.Code != 503 { t.Errorf("readyz with nil db returned %d, expected 503 (fail-closed)", w.Code) }
 }
 
 func TestMetricsEndpoint(t *testing.T) {
