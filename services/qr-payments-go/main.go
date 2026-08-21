@@ -1,6 +1,11 @@
 package main
 
 import (
+	"math/big"
+	"encoding/base64"
+	"crypto/sha256"
+	"crypto/rsa"
+	"crypto"
 	_ "github.com/lib/pq"
 "context"
 "os/signal"
@@ -61,9 +66,9 @@ type DomainStats struct {
 var (
 	mu      sync.Mutex
 	records = []Record{
-		{ID: "QR--001", Type: "primary", Status: "active", Data: map[string]interface{}{"domain": "Payments", "priority": "high", "region": "lagos"}, CreatedAt: "2026-05-09T10:00:00Z", UpdatedAt: "2026-05-09T10:00:00Z", Version: 1},
-		{ID: "QR--002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Payments", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
-		{ID: "QR--003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Payments", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
+		{ID: "QR-001", Type: "primary", Status: "active", Data: map[string]interface{}{"domain": "Payments", "priority": "high", "region": "lagos"}, CreatedAt: "2026-05-09T10:00:00Z", UpdatedAt: "2026-05-09T10:00:00Z", Version: 1},
+		{ID: "QR-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Payments", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
+		{ID: "QR-003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Payments", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
 	}
 	auditLog = []AuditEntry{}
 	domainStats = DomainStats{
@@ -91,12 +96,12 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"uptime_secs": int(time.Since(startTime).Seconds()),
 		"domain": "Qr Payments — Payments",
 		"middleware": map[string]string{
-			"kafka":      "qr-payments.events, qr-payments.audit",
-			"postgres":   "qr_payments_records",
-			"redis":      "qr-payments_cache",
+			"kafka":      "qrpayments.events, qrpayments.audit",
+			"postgres":   "qrpayments_records",
+			"redis":      "qrpayments_cache",
 			"temporal":   "QrPaymentsWorkflow",
-			"permify":    "qr-payments:manage, qr-payments:view",
-			"opensearch": "qr-payments-2026",
+			"permify":    "qrpayments:manage, qrpayments:view",
+			"opensearch": "qrpayments-2026",
 		},
 	})
 }
@@ -139,14 +144,14 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	// Inter-service call: aml_screening
-	_upstreamURL := os.Getenv("AML_ENGINE_URL")
-	if _upstreamURL == "" { _upstreamURL = "http://localhost:8127" }
-	_result, _err := callService("POST", _upstreamURL+"/v1/screen", nil)
+	// Inter-service call: workflow_call
+	_upstreamURL := os.Getenv("CORE_BANKING_URL")
+	if _upstreamURL == "" { _upstreamURL = "http://localhost:8100" }
+	_result, _err := callService("POST", _upstreamURL+"/v1/transactions", nil)
 	if _err != nil {
-		log.Printf("qr-payments-go: aml_screening failed: %v", _err)
+		log.Printf("qr-payments-go: workflow_call failed: %v", _err)
 	} else {
-		log.Printf("qr-payments-go: aml_screening ok: %v", _result)
+		log.Printf("qr-payments-go: workflow_call ok: %v", _result)
 	}
 
 
@@ -154,7 +159,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("QR--%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("QR-%08X", rand.Uint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -166,7 +171,6 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	if rec.Type == "" { rec.Type = "primary" }
 	records = append(records, rec)
-	publishDomainEvent("qr-payments.created", rec.TenantID, rec)
 	domainStats.TotalRecords = len(records)
 
 	// Persist to database
@@ -215,33 +219,13 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	id := getString(body, "id")
-	for i := range records {
-		if records[i].ID == id && records[i].Status == "pending" {
-			records[i].Status = "processing"
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
-			// Simulate domain processing
-			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
-			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
-			records[i].Status = "completed"
-			domainStats.ProcessedToday++
-			postLedgerTransfer(records[i].ID, mwExtractKobo(records[i].Data), records[i].TenantID, getString(records[i].Data, "currency"))
-			publishDomainEvent("qr-payments.processed", records[i].TenantID, records[i])
-			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
-			return
-		}
-	}
-	respondJSON(w, 404, map[string]string{"error": "Record not found or not pending: " + id})
+	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
+	// (processingResult="success" and a random score via math/rand). Real domain
+	// processing must be implemented before this endpoint is enabled.
+	// Fail fast; never fabricate.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
+
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
@@ -269,39 +253,37 @@ func getString(m map[string]interface{}, key string) string {
 }
 
 
-func computeTransferFee(amount float64, channel string) float64 {
-    switch channel {
-    case "NIP": if amount <= 5000 { return 10 }; if amount <= 50000 { return 25 }; return 50
-    case "NEFT": return 0
-    case "RTGS": return amount * 0.001
-    default: return 25
-    }
+func qr_paymentsComputeFee(amount float64, rate float64, cap_ float64) float64 {
+    fee := amount * rate
+    if fee > cap_ { fee = cap_ }
+    return fee
 }
 
-func routePayment(amount float64, bank string) string {
-    if amount >= 10000000 { return "RTGS" }
-    if bank == "same_bank" { return "INTERNAL" }
+func qr_paymentsRouteRequest(channel string, amount float64) string {
+    if amount > 1000000 { return "RTGS" }
+    if channel == "mobile" { return "NIP" }
     return "NIP"
 }
 
 func qr_paymentsFeeHandler(w http.ResponseWriter, r *http.Request) {
     var req struct {
-        Amount  float64 `json:"amount"`
-        Channel string  `json:"channel"`
+        Amount float64 `json:"amount"`
+        Rate   float64 `json:"rate"`
+        Cap    float64 `json:"cap"`
     }
     json.NewDecoder(r.Body).Decode(&req)
-    fee := computeTransferFee(req.Amount, req.Channel)
-    respondJSON(w, 200, map[string]interface{}{"amount": req.Amount, "fee": fee, "total": req.Amount + fee, "channel": req.Channel})
+    fee := qr_paymentsComputeFee(req.Amount, req.Rate, req.Cap)
+    respondJSON(w, 200, map[string]interface{}{"fee": fee})
 }
 
 func qr_paymentsRouteHandler(w http.ResponseWriter, r *http.Request) {
     var req struct {
-        Amount float64 `json:"amount"`
-        Bank   string  `json:"destination_bank"`
+        Channel string  `json:"channel"`
+        Amount  float64 `json:"amount"`
     }
     json.NewDecoder(r.Body).Decode(&req)
-    route := routePayment(req.Amount, req.Bank)
-    respondJSON(w, 200, map[string]interface{}{"route": route, "amount": req.Amount})
+    route := qr_paymentsRouteRequest(req.Channel, req.Amount)
+    respondJSON(w, 200, map[string]interface{}{"route": route})
 }
 
 // --- Production Hardening ---
@@ -395,38 +377,146 @@ func initDB() {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
-func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
+
+// ── MIDDLEWARE: JWT Validation (JWKS / RS256) — fail-closed ────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		for range time.Tick(5 * time.Minute) {
+			fetchJWKS(jwtRealmURL())
+		}
 	}()
+}
+
+// jwtMiddleware(realmURL string) validates Bearer tokens against the Keycloak JWKS endpoint (RS256
+// signature + expiry). Fail-closed: no token is accepted on structure alone.
+func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip health endpoints
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":"qr-payments-go"}`)
 			return
 		}
-		token := auth[7:]
+		token := strings.TrimPrefix(auth, "Bearer ")
 		parts := strings.Split(token, ".")
 		if len(parts) != 3 {
-			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			http.Error(w, `{"error":"malformed token"}`, http.StatusUnauthorized)
 			return
 		}
-		// Decode header for kid
 		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 		if err != nil {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
 		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 // --- Redis Caching Layer ---
 var redisAddr string
@@ -557,7 +647,7 @@ func relayOutbox(brokers string, topic string) {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("[qr-payments-go] starting on :8534")
+	log.Printf("[qr-payments-go] starting on :8864")
 
 	// PostgreSQL connection
 	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/qr_payments_go?sslmode=disable")
@@ -601,11 +691,11 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	// Domain endpoints
-	mux.HandleFunc("/api/v1/payments", domainHandler)
-	mux.HandleFunc("/api/v1/payments/", domainDetailHandler)
+	mux.HandleFunc("/api/v1/service_configs", domainHandler)
+	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
 
 	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8534"),
+		Addr:         ":" + getEnv("PORT", "8864"),
 		Handler:      loggingMiddleware(corsMiddleware(mux)),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 30 * time.Second,
@@ -618,7 +708,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("[qr-payments-go] ready on :%s", getEnv("PORT", "8534"))
+	log.Printf("[qr-payments-go] ready on :%s", getEnv("PORT", "8864"))
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -632,25 +722,19 @@ func main() {
 }
 
 func initSchema() {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS payments (
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_configs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    reference VARCHAR(64) NOT NULL UNIQUE,
-    payment_type VARCHAR(32) NOT NULL,
-    source_account VARCHAR(20) NOT NULL,
-    destination_account VARCHAR(20) NOT NULL,
-    destination_bank VARCHAR(10),
-    amount_kobo BIGINT NOT NULL CHECK (amount_kobo > 0),
-    fee_kobo BIGINT NOT NULL DEFAULT 0,
-    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
-    status VARCHAR(20) NOT NULL DEFAULT 'initiated',
-    channel VARCHAR(32) NOT NULL,
-    session_id VARCHAR(64),
-    narration TEXT,
-    beneficiary_name VARCHAR(100),
-    tenant_id UUID NOT NULL,
-    initiated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
 	)`)
 	if err != nil {
 		log.Fatalf("schema init failed: %v", err)
@@ -669,9 +753,9 @@ func initSchema() {
 		log.Printf("outbox table creation (may already exist): %v", err)
 	}
 
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_payments_tenant ON payments(tenant_id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_payments_created ON payments(created_at DESC)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
 }
 
@@ -687,7 +771,7 @@ func domainHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/payments/"), "/")
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/service_configs/"), "/")
 	id := parts[0]
 	if id == "" {
 		http.Error(w, `{"error":"id required"}`, http.StatusBadRequest)
@@ -711,7 +795,7 @@ func listRecords(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	offset := 0
 
-	query := `SELECT id, status, created_at FROM payments WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	query := `SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -750,7 +834,7 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	var id string
 	err := db.QueryRowContext(r.Context(),
-		`INSERT INTO payments (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
+		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -760,7 +844,7 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 	// Write to outbox for event publishing
 	_, _ = db.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"payments.created", id, string(payload))
+		"service_configs.created", id, string(payload))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -771,7 +855,7 @@ func getRecord(w http.ResponseWriter, r *http.Request, id string) {
 	var status string
 	var createdAt time.Time
 	err := db.QueryRowContext(r.Context(),
-		`SELECT status, created_at FROM payments WHERE id = $1`, id).Scan(&status, &createdAt)
+		`SELECT status, created_at FROM service_configs WHERE id = $1`, id).Scan(&status, &createdAt)
 	if err == sql.ErrNoRows {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
@@ -798,7 +882,7 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	_, err := db.ExecContext(r.Context(),
-		`UPDATE payments SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
+		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -807,7 +891,7 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	payload, _ := json.Marshal(body)
 	_, _ = db.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"payments.updated", id, string(payload))
+		"service_configs.updated", id, string(payload))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
@@ -815,7 +899,7 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
 	_, err := db.ExecContext(r.Context(),
-		`UPDATE payments SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
+		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -823,7 +907,7 @@ func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
 
 	_, _ = db.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"payments.deleted", id, `{"id":"`+id+`"}`)
+		"service_configs.deleted", id, `{"id":"`+id+`"}`)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -849,7 +933,7 @@ func readyzHandler(w http.ResponseWriter, r *http.Request) {
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
 	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM payments`).Scan(&count)
+	db.QueryRow(`SELECT COUNT(*) FROM service_configs`).Scan(&count)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"service":       "qr-payments-go",
