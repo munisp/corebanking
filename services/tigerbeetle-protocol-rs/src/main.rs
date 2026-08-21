@@ -260,14 +260,28 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
     }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"}))),
+    };
+    // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+    let secret = match std::env::var("JWT_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::ServiceUnavailable().json(json!({"error": "jwt_validation_unavailable"}))),
+    };
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    match jsonwebtoken::decode::<serde_json::Value>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    ) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(HttpResponse::Unauthorized().json(json!({"error": "invalid or expired token"}))),
     }
 }
 
@@ -439,7 +453,14 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
                     if msg_len > 4 * 1024 * 1024 { return; }
                     let mut payload = vec![0u8; msg_len];
                     if stream.read_exact(&mut payload).is_err() { return; }
-                    let resp = format!(r#"{{"status":"ok","service":"{}"}}"#, service_name);
+                    let resp = if std::env::var("FAKE_GRPC_OK").ok().as_deref() == Some("1") {
+                        // FAKE_GRPC_OK=1: legacy stub for local development only.
+                        format!(r#"{"status":"ok","service":"{}"}"#, service_name)
+                    } else {
+                        // gRPC UNIMPLEMENTED (status 12): never fabricate OK for
+                        // an unimplemented handler.
+                        format!(r#"{"error":"unimplemented","grpcStatus":12,"service":"{}"}"#, service_name)
+                    };
                     let resp_bytes = resp.as_bytes();
                     let resp_len = (resp_bytes.len() as u32).to_be_bytes();
                     let _ = stream.write_all(&resp_len);
