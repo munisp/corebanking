@@ -1,12 +1,41 @@
 /**
  * Event Publisher — wires Kafka event publishing into Express routes.
  * Publishes banking domain events for audit, analytics, and real-time processing.
+ *
+ * Doctrine: the SSE stream at /api/events/stream forwards ONLY real events
+ * observed on the event bus (via kafkaClient subscriptions) plus a replay of
+ * recently published real messages. No synthetic or random events are ever
+ * emitted to subscribers.
  */
 
 import type { Express, Request, Response, NextFunction } from "express";
-import { publish, subscribe } from "./kafkaClient";
+import { publish, subscribe, getRecentMessages } from "./kafkaClient";
 import { cacheGet, cacheSet } from "./redisClient";
 import { logger } from "./logger";
+
+// Topics forwarded to SSE subscribers — real banking domain events only.
+const SSE_STREAM_TOPICS = [
+  "txn.created",
+  "txn.completed",
+  "txn.failed",
+  "txn.reversed",
+  "customer.created",
+  "customer.updated",
+  "customer.kyc.verified",
+  "account.opened",
+  "account.closed",
+  "account.balance.changed",
+  "loan.disbursed",
+  "loan.repaid",
+  "loan.overdue",
+  "aml.alert",
+  "aml.sar.filed",
+  "fraud.detected",
+  "auth.login",
+  "auth.logout",
+  "auth.failed",
+  "audit.event",
+];
 
 // Event publishing middleware — publishes events based on route patterns
 export function registerEventPublisher(app: Express): void {
@@ -95,22 +124,51 @@ export function registerEventPublisher(app: Express): void {
     res.status(201).json({ published: true, event: "aml.alert" });
   });
 
-  // Event stream endpoint — returns recent events as SSE
+  // Event stream endpoint — SSE stream of REAL events only.
+  // Replays recently published real messages on connect, then live-forwards
+  // events observed on the event bus. No fabricated heartbeats or random
+  // transactions are emitted; a comment keep-alive keeps the socket open.
   app.get("/api/events/stream", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
+    res.flushHeaders();
 
-    const interval = setInterval(() => {
-      const events = [
-        { topic: "txn.created", data: { id: `TXN-${Date.now()}`, amount: Math.floor(Math.random() * 5000000), currency: "NGN" } },
-        { topic: "audit.event", data: { path: "/api/db/customers", method: "GET" } },
-      ];
-      const event = events[Math.floor(Math.random() * events.length)];
-      res.write(`event: ${event.topic}\ndata: ${JSON.stringify(event.data)}\n\n`);
-    }, 5000);
+    let closed = false;
+    const writeEvent = (topic: string, data: unknown) => {
+      if (closed) return;
+      try {
+        res.write(`event: ${topic}\ndata: ${JSON.stringify(data)}\n\n`);
+      } catch {
+        closed = true;
+      }
+    };
 
-    req.on("close", () => clearInterval(interval));
+    // Replay recent real events so a new subscriber sees actual history
+    for (const entry of getRecentMessages(undefined, 20)) {
+      writeEvent(entry.topic, { ...entry.message, _replayed: true, _publishedAt: entry.timestamp });
+    }
+
+    // Live-forward real bus events for the duration of the connection
+    for (const topic of SSE_STREAM_TOPICS) {
+      subscribe(topic, (t, msg) => writeEvent(t, msg));
+    }
+
+    // SSE comment keep-alive (not an event — carries no fabricated data)
+    const keepAlive = setInterval(() => {
+      if (!closed) {
+        try {
+          res.write(": keep-alive\n\n");
+        } catch {
+          closed = true;
+        }
+      }
+    }, 25000);
+
+    req.on("close", () => {
+      closed = true;
+      clearInterval(keepAlive);
+    });
   });
 
   logger.info("[EventPublisher] Registered audit middleware + 6 event subscribers + 4 event endpoints");
