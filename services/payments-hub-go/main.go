@@ -3,13 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"crypto/rand"
 	"fmt"
-	"math"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -20,8 +21,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"crypto/sha256"
 
+	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
@@ -38,13 +39,14 @@ func respondJSON(w http.ResponseWriter, args ...interface{}) {
 	status := 200
 	var data interface{}
 	if len(args) == 2 {
-		if s, ok := args[0].(int); ok { status = s }
+		if s, ok := args[0].(int); ok {
+			status = s
+		}
 		data = args[1]
 	} else if len(args) == 1 {
 		data = args[0]
 	}
 	w.WriteHeader(status)
-		eventBus.Emit("payments-hub.processed", map[string]interface{}{"status": "success"})
 	json.NewEncoder(w).Encode(data)
 }
 
@@ -55,55 +57,76 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 		defer cancel()
 		if err := db.PingContext(ctx); err != nil {
 			dbStatus = fmt.Sprintf("unhealthy: %v", err)
-		} else { dbStatus = "connected" }
+		} else {
+			dbStatus = "connected"
+		}
 	}
 	overall := "healthy"
-	if strings.Contains(dbStatus, "unhealthy") { overall = "degraded" }
+	if strings.Contains(dbStatus, "unhealthy") {
+		overall = "degraded"
+	}
 	respondJSON(w, map[string]interface{}{"status": overall, "service": serviceName, "version": "2.0.0", "checks": map[string]string{"database": dbStatus}})
 }
 
-func readyzHandler(w http.ResponseWriter, _ *http.Request) { respondJSON(w, map[string]interface{}{"ready": true}) }
-func livezHandler(w http.ResponseWriter, _ *http.Request)  { respondJSON(w, map[string]interface{}{"alive": true}) }
+func readyzHandler(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, map[string]interface{}{"ready": true})
+}
+func livezHandler(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, map[string]interface{}{"alive": true})
+}
 
 func metricsHandler(w http.ResponseWriter, _ *http.Request) {
-	r := atomic.LoadUint64(&requestCount); e := atomic.LoadUint64(&errorCount)
+	r := atomic.LoadUint64(&requestCount)
+	e := atomic.LoadUint64(&errorCount)
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprintf(w, "requests_total{service=\"%s\"} %d\nerrors_total{service=\"%s\"} %d\n", serviceName, r, serviceName, e)
 }
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddUint64(&requestCount, 1); next.ServeHTTP(w, r)
+		atomic.AddUint64(&requestCount, 1)
+		next.ServeHTTP(w, r)
 	})
 }
 
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r); return
+			next.ServeHTTP(w, r)
+			return
 		}
 		auth := r.Header.Get("Authorization")
 		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			respondJSON(w, 401, map[string]interface{}{"error": "unauthorized"}); return
+			respondJSON(w, 401, map[string]interface{}{"error": "unauthorized"})
+			return
 		}
-		r.Header.Set("X-User-Id", "validated"); next.ServeHTTP(w, r)
+		r.Header.Set("X-User-Id", "validated")
+		next.ServeHTTP(w, r)
 	})
 }
 
 var idempCache sync.Map
 
 func auditHash(prev, data string) string {
-	h := sha256.New(); h.Write([]byte(prev)); h.Write([]byte(data))
+	h := sha256.New()
+	h.Write([]byte(prev))
+	h.Write([]byte(data))
 	return fmt.Sprintf("%x", h.Sum(nil))
 }
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" { return }
+	if dsn == "" {
+		return
+	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
-	if err != nil { log.Printf("DB error: %v", err); return }
-	db.SetMaxOpenConns(25); db.SetMaxIdleConns(5)
+	if err != nil {
+		log.Printf("DB error: %v", err)
+		return
+	}
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
 }
 
 // --- Idempotency Middleware (Redis-backed) ---
@@ -237,7 +260,10 @@ var (
 	outboxEntries []outboxEntry
 )
 
-func outboxAppend(topic, key string, payload interface{}, idempotencyKey string) {
+// outboxAppend records the event and publishes it to Kafka. The entry is
+// marked "published" ONLY after a confirmed produce; on failure it stays
+// "pending" (retry semantics) and an error is returned to the caller.
+func outboxAppend(topic, key string, payload interface{}, idempotencyKey string) error {
 	entry := outboxEntry{
 		ID:             fmt.Sprintf("OBX-%08X", secureRandUint32()),
 		Topic:          topic,
@@ -247,6 +273,14 @@ func outboxAppend(topic, key string, payload interface{}, idempotencyKey string)
 		CreatedAt:      time.Now(),
 		Status:         "pending",
 	}
+
+	publishErr := eventBus.Publish(topic, key, payload)
+	if publishErr != nil {
+		log.Printf("[outbox] KAFKA PUBLISH FAILED for %s -> %s (key=%s): %v — entry stays pending", entry.ID, topic, key, publishErr)
+	} else {
+		entry.Status = "published"
+	}
+
 	outboxMu.Lock()
 	outboxEntries = append(outboxEntries, entry)
 	outboxMu.Unlock()
@@ -254,32 +288,114 @@ func outboxAppend(topic, key string, payload interface{}, idempotencyKey string)
 	if db != nil {
 		payloadJSON, _ := json.Marshal(payload)
 		_, err := db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
-			VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			ON CONFLICT (idempotency_key) DO NOTHING`,
-			entry.ID, topic, key, payloadJSON, idempotencyKey, entry.CreatedAt)
+			entry.ID, topic, key, payloadJSON, idempotencyKey, entry.CreatedAt, entry.Status)
 		if err != nil {
 			log.Printf("[outbox] INSERT failed: %v", err)
 		}
 	}
-	log.Printf("[outbox] appended %s -> %s (key=%s)", entry.ID, topic, key)
+	if publishErr != nil {
+		return publishErr
+	}
+	log.Printf("[outbox] published %s -> %s (key=%s)", entry.ID, topic, key)
+	return nil
+}
+
+// railURL returns the configured NIP rail adapter base URL ("" if unset).
+func railURL() string {
+	if v := os.Getenv("NIP_ENGINE_URL"); v != "" {
+		return v
+	}
+	return os.Getenv("NIBSS_BASE_URL")
 }
 
 func routePayment(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
 	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid request body"})
+		return
+	}
 	paymentID := fmt.Sprintf("PMT-%08X", secureRandUint32())
 	idempKey := r.Header.Get("X-Idempotency-Key")
 	if idempKey == "" {
 		idempKey = paymentID
 	}
-	// Outbox: publish payment event atomically
-	outboxAppend("banking.payments.routed", paymentID, map[string]interface{}{
+
+	// Route to the real NIP rail adapter. Never report "routed" for a
+	// payment that was not accepted by the rail.
+	base := railURL()
+	if base == "" {
+		atomic.AddUint64(&errorCount, 1)
+		respondJSON(w, 503, map[string]interface{}{
+			"error": "payment rail not configured (set NIP_ENGINE_URL)", "payment_id": paymentID, "status": "failed",
+		})
+		return
+	}
+
+	railBody, _ := json.Marshal(map[string]interface{}{
+		"sourceAccount":       body["source_account"],
+		"destinationBankCode": body["dest_bank"],
+		"destinationAccount":  body["dest_account"],
+		"amountKobo":          body["amount_kobo"],
+		"narration":           body["narration"],
+		"channelCode":         body["channel_code"],
+	})
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "POST", base+"/v1/nip/funds-transfer", bytes.NewReader(railBody))
+	if err != nil {
+		respondJSON(w, 500, map[string]interface{}{"error": "internal error", "status": "failed"})
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		log.Printf("[route] rail call failed for %s: %v", paymentID, err)
+		respondJSON(w, 503, map[string]interface{}{
+			"error": "payment rail unreachable", "payment_id": paymentID, "status": "failed",
+		})
+		return
+	}
+	defer resp.Body.Close()
+	var railResp struct {
+		ResponseCode    string `json:"responseCode"`
+		ResponseMessage string `json:"responseMessage"`
+		SessionID       string `json:"sessionId"`
+		Status          string `json:"status"`
+	}
+	json.NewDecoder(resp.Body).Decode(&railResp)
+
+	if resp.StatusCode >= 300 || railResp.ResponseCode != "00" {
+		atomic.AddUint64(&errorCount, 1)
+		respondJSON(w, 502, map[string]interface{}{
+			"payment_id": paymentID, "channel": "NIP", "status": "failed",
+			"rail_response_code": railResp.ResponseCode, "rail_message": railResp.ResponseMessage,
+		})
+		return
+	}
+
+	// Rail accepted the payment — record and publish the routed event. If the
+	// event cannot be published, surface the failure (do not silently buffer).
+	if err := outboxAppend("banking.payments.routed", paymentID, map[string]interface{}{
 		"payment_id": paymentID,
 		"channel":    "NIP",
+		"session_id": railResp.SessionID,
 		"timestamp":  time.Now().UTC().Format(time.RFC3339),
-	}, idempKey)
-	respondJSON(w, map[string]interface{}{"payment_id": paymentID, "channel": "NIP", "status": "routed"})
+	}, idempKey); err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		respondJSON(w, 503, map[string]interface{}{
+			"error":      "event bus unavailable (Kafka not configured/reachable) — payment routed at rail but event publication failed",
+			"payment_id": paymentID, "channel": "NIP", "status": "routed_unconfirmed",
+			"session_id": railResp.SessionID,
+		})
+		return
+	}
+	respondJSON(w, map[string]interface{}{
+		"payment_id": paymentID, "channel": "NIP", "status": "routed", "session_id": railResp.SessionID,
+	})
 }
 
 func outboxStatsHandler(w http.ResponseWriter, r *http.Request) {
@@ -318,16 +434,19 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 // --- Monetary Safety (kobo precision) ---
 type AmountKobo = int64
 
 func nairaToKobo(naira float64) AmountKobo { return AmountKobo(math.Round(naira * 100)) }
 func koboToNaira(kobo AmountKobo) float64  { return float64(kobo) / 100.0 }
-func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+func roundNaira(amount float64) float64    { return math.Round(amount*100) / 100 }
 func validateAmount(amount float64) error {
-	if amount < 0 { return fmt.Errorf("amount must be non-negative") }
-	if amount > 999_999_999_999.99 { return fmt.Errorf("exceeds CBN max limit") }
+	if amount < 0 {
+		return fmt.Errorf("amount must be non-negative")
+	}
+	if amount > 999_999_999_999.99 {
+		return fmt.Errorf("exceeds CBN max limit")
+	}
 	return nil
 }
 
@@ -347,7 +466,7 @@ var eventBus = newEventBus("banking.payments", "payments-hub")
 
 func appendAudit(action, recordID, actor, details string) {
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
+		ID:     fmt.Sprintf("AUD-%08X", secureRandUint32()),
 		Action: action, RecordID: recordID, Actor: actor,
 		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
 	})
@@ -358,8 +477,12 @@ func appendAudit(action, recordID, actor, details string) {
 func tracingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" { traceID = r.Header.Get("traceparent") }
-		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
+		if traceID == "" {
+			traceID = r.Header.Get("traceparent")
+		}
+		if traceID == "" {
+			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
+		}
 		w.Header().Set("X-Trace-Id", traceID)
 		r.Header.Set("X-Trace-Id", traceID)
 		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
@@ -379,7 +502,9 @@ var (
 
 func cbAllow() bool {
 	state := atomic.LoadInt32(&cbState)
-	if state == 0 { return true } // closed
+	if state == 0 {
+		return true
+	} // closed
 	if state == 1 { // open
 		last := atomic.LoadInt64(&cbLastFail)
 		if time.Now().Unix()-last > cbTimeout {
@@ -416,40 +541,52 @@ var semaphore = make(chan struct{}, 100)
 
 func acquireSem() { semaphore <- struct{}{} }
 func releaseSem() { <-semaphore }
+
 var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 
 func initTracing() {
-	if otelEndpoint == "" { return }
+	if otelEndpoint == "" {
+		return
+	}
 	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
 }
 
 // --- Retry with Exponential Backoff ---
 func retryWithBackoff(maxRetries int, fn func() error) error {
 	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
+		if err := fn(); err == nil {
+			return nil
+		}
 		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
+		if backoff > 5*time.Second {
+			backoff = 5 * time.Second
+		}
 		time.Sleep(backoff)
 	}
 	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
 }
 
-
 func secureRandUint32() uint32 {
 	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
+	if _, err := rand.Read(b); err != nil {
+		return uint32(time.Now().UnixNano())
+	}
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
 func sanitizeLogEntry(msg string) string {
 	msg = strings.ReplaceAll(msg, "\n", " ")
 	msg = strings.ReplaceAll(msg, "\r", " ")
-	if len(msg) > 2000 { msg = msg[:2000] }
+	if len(msg) > 2000 {
+		msg = msg[:2000]
+	}
 	return msg
 }
 
 func maskPII(value, fieldType string) string {
-	if len(value) < 4 { return "***" }
+	if len(value) < 4 {
+		return "***"
+	}
 	switch fieldType {
 	case "bvn":
 		return value[:3] + "****" + value[len(value)-4:]
@@ -457,7 +594,9 @@ func maskPII(value, fieldType string) string {
 		return value[:4] + "****" + value[len(value)-2:]
 	case "email":
 		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return parts[0][:1] + "***@" + parts[1] }
+		if len(parts) == 2 {
+			return parts[0][:1] + "***@" + parts[1]
+		}
 		return "***"
 	default:
 		return value[:2] + strings.Repeat("*", len(value)-4) + value[len(value)-2:]
@@ -616,8 +755,12 @@ func newSecureServer(addr string, handler http.Handler) *http.Server {
 
 func sanitizeError(err error) string {
 	errStr := err.Error()
-	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") { return "internal error" }
-	if len(errStr) > 200 { return "internal error" }
+	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") {
+		return "internal error"
+	}
+	if len(errStr) > 200 {
+		return "internal error"
+	}
 	return errStr
 }
 
@@ -688,7 +831,6 @@ func sanitizeHeader(value string) string {
 	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
 }
 
-
 // panicRecoveryMiddleware catches panics and returns 500 instead of crashing
 func panicRecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -703,7 +845,6 @@ func panicRecoveryMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
-
 
 // maxBodySize limits request body to prevent memory exhaustion
 const maxBodySize = 1 << 20 // 1MB
@@ -754,7 +895,9 @@ func main() {
 	startWatchdog(10 * time.Second)
 	watchdogPing()
 	port := os.Getenv("PORT")
-	if port == "" { port = "8100" }
+	if port == "" {
+		port = "8100"
+	}
 	initDB()
 	initRedis()
 	mux := http.NewServeMux()
@@ -764,7 +907,7 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 	registerRoutes(mux)
 	handler := idempotencyMiddleware(rateLimitMiddleware(authMiddleware(mux)))
-	server := &http.Server{Addr: ":"+port, Handler: corsMiddleware(handler)}
+	server := &http.Server{Addr: ":" + port, Handler: corsMiddleware(handler)}
 	go func() {
 		log.Printf("[payments-hub-go] Starting on :%s", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -783,26 +926,56 @@ func main() {
 	log.Println("[payments-hub-go] Server stopped gracefully")
 }
 
+// --- Event Bus (real Kafka producer via sarama) ---
 
-// --- Event Bus (Kafka-compatible event emission) ---
+var errKafkaNotConfigured = fmt.Errorf("kafka not configured (set KAFKA_BOOTSTRAP_SERVERS)")
 
 type EventBus struct {
-	brokerURL   string
+	brokers     []string
 	topic       string
 	serviceName string
 	mu          sync.Mutex
-	buffer      []map[string]interface{}
+	producer    sarama.SyncProducer
+}
+
+func kafkaBrokers() []string {
+	raw := os.Getenv("KAFKA_BOOTSTRAP_SERVERS")
+	if raw == "" {
+		raw = os.Getenv("KAFKA_BROKERS")
+	}
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
 }
 
 func newEventBus(topic, service string) *EventBus {
-	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" {
-		broker = "localhost:9092"
+	eb := &EventBus{brokers: kafkaBrokers(), topic: topic, serviceName: service}
+	if len(eb.brokers) == 0 {
+		log.Printf("[EventBus] %s: KAFKA_BOOTSTRAP_SERVERS not set — Emit/Publish will fail fast", service)
+		return eb
 	}
-	return &EventBus{brokerURL: broker, topic: topic, serviceName: service}
+	cfg := sarama.NewConfig()
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.Retry.Max = 3
+	producer, err := sarama.NewSyncProducer(eb.brokers, cfg)
+	if err != nil {
+		log.Printf("[EventBus] %s: Kafka producer init failed (%v) — Emit/Publish will fail fast", service, err)
+		return eb
+	}
+	eb.producer = producer
+	log.Printf("[EventBus] %s: Kafka producer connected to %v", service, eb.brokers)
+	return eb
 }
 
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
+// Emit publishes the event to Kafka. Returns an error when Kafka is not
+// configured or the produce fails — events are never silently buffered.
+func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) error {
 	event := map[string]interface{}{
 		"id":        fmt.Sprintf("%s_%d", eb.serviceName, time.Now().UnixMilli()),
 		"type":      eventType,
@@ -811,19 +984,33 @@ func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 		"data":      payload,
 	}
-	eb.mu.Lock()
-	eb.buffer = append(eb.buffer, event)
-	eb.mu.Unlock()
-	// DEFERRED: Kafka integration requires sarama.SyncProducer
-	log.Printf("[EventBus] %s -> %s: %s", eb.serviceName, eb.topic, eventType)
+	return eb.Publish(eb.topic, event["id"].(string), event)
 }
 
-func (eb *EventBus) Flush() []map[string]interface{} {
+// Publish sends a payload to an explicit topic. Returns errKafkaNotConfigured
+// when no producer exists.
+func (eb *EventBus) Publish(topic, key string, payload interface{}) error {
 	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	events := eb.buffer
-	eb.buffer = nil
-	return events
+	producer := eb.producer
+	eb.mu.Unlock()
+	if producer == nil {
+		return errKafkaNotConfigured
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	msg := &sarama.ProducerMessage{
+		Topic: topic,
+		Key:   sarama.StringEncoder(key),
+		Value: sarama.ByteEncoder(body),
+	}
+	partition, offset, err := producer.SendMessage(msg)
+	if err != nil {
+		return fmt.Errorf("kafka produce to %s: %w", topic, err)
+	}
+	log.Printf("[EventBus] %s -> %s (partition=%d offset=%d)", eb.serviceName, topic, partition, offset)
+	return nil
 }
 
 // --- Downstream Notifier ---
@@ -850,7 +1037,7 @@ func notifyDownstream(serviceURL, path string, payload interface{}) error {
 	return nil
 }
 
-// --- Event Consumer (Kafka subscriber) ---
+// --- Event Consumer (real Kafka consumer group via sarama) ---
 
 type EventConsumer struct {
 	topics  []string
@@ -869,10 +1056,49 @@ func (ec *EventConsumer) OnMessage(handler func(topic string, key string, value 
 	ec.handler = handler
 }
 
+type consumerGroupHandler struct {
+	ec *EventConsumer
+}
+
+func (consumerGroupHandler) Setup(sarama.ConsumerGroupSession) error   { return nil }
+func (consumerGroupHandler) Cleanup(sarama.ConsumerGroupSession) error { return nil }
+func (h consumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
+	for msg := range claim.Messages() {
+		if h.ec.handler != nil {
+			h.ec.handler(msg.Topic, string(msg.Key), msg.Value)
+		}
+		session.MarkMessage(msg, "")
+	}
+	return nil
+}
+
+// Start joins the Kafka consumer group and consumes until ctx cancellation.
+// When Kafka is not configured it logs the failure and returns — it does NOT
+// pretend to be subscribed.
 func (ec *EventConsumer) Start() {
+	brokers := kafkaBrokers()
+	if len(brokers) == 0 {
+		log.Printf("[EventConsumer] %s NOT started: %v", ec.groupID, errKafkaNotConfigured)
+		return
+	}
+	cfg := sarama.NewConfig()
+	cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategyRoundRobin()}
+	cfg.Consumer.Offsets.Initial = sarama.OffsetNewest
+	group, err := sarama.NewConsumerGroup(brokers, ec.groupID, cfg)
+	if err != nil {
+		log.Printf("[EventConsumer] %s NOT started: consumer group init failed: %v", ec.groupID, err)
+		return
+	}
 	log.Printf("[EventConsumer] %s subscribing to %v", ec.groupID, ec.topics)
-	// DEFERRED: Kafka consumer requires sarama.ConsumerGroup
+	go func() {
+		ctx := context.Background()
+		for {
+			if err := group.Consume(ctx, ec.topics, consumerGroupHandler{ec: ec}); err != nil {
+				log.Printf("[EventConsumer] %s consume error: %v", ec.groupID, err)
+				time.Sleep(2 * time.Second)
+			}
+		}
+	}()
 }
 
 var eventConsumer = newEventConsumer([]string{"banking.lending", "compliance.screening"}, serviceName)
-

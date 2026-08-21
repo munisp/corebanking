@@ -3,9 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/IBM/sarama/mocks"
 )
 
 func setupHubTest() {
@@ -14,8 +17,59 @@ func setupHubTest() {
 	outboxEntries = nil
 }
 
+// stubRail returns an httptest server mimicking the NIP rail adapter.
+func stubRail(t *testing.T, responseCode string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"responseCode":%q,"responseMessage":"ok","sessionId":"SES-1","status":"successful"}`, responseCode)
+	}))
+}
+
+// injectMockProducer swaps in a mock Kafka producer for the duration of a test.
+func injectMockProducer(t *testing.T) *mocks.SyncProducer {
+	t.Helper()
+	mockProducer := mocks.NewSyncProducer(t, nil)
+	eventBus.mu.Lock()
+	eventBus.producer = mockProducer
+	eventBus.mu.Unlock()
+	t.Cleanup(func() {
+		eventBus.mu.Lock()
+		eventBus.producer = nil
+		eventBus.mu.Unlock()
+	})
+	return mockProducer
+}
+
+func TestRoutePaymentFailsWhenRailUnconfigured(t *testing.T) {
+	setupHubTest()
+	t.Setenv("NIP_ENGINE_URL", "")
+	t.Setenv("NIBSS_BASE_URL", "")
+	body := `{"source_bank":"054","dest_bank":"058","amount_kobo":100000}`
+	req := httptest.NewRequest("POST", "/v1/payments-hub/route", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	routePayment(w, req)
+	if w.Code != 503 {
+		t.Fatalf("expected 503 when rail unconfigured, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "failed" {
+		t.Fatalf("expected status=failed, got %v", resp["status"])
+	}
+	if len(outboxEntries) != 0 {
+		t.Fatalf("no outbox entry may exist for a payment that was never routed")
+	}
+}
+
 func TestRoutePayment(t *testing.T) {
 	setupHubTest()
+	rail := stubRail(t, "00")
+	defer rail.Close()
+	t.Setenv("NIP_ENGINE_URL", rail.URL)
+	mockProducer := injectMockProducer(t)
+	mockProducer.ExpectSendMessageAndSucceed()
+
 	body := `{"source_bank":"054","dest_bank":"058","amount_kobo":100000}`
 	req := httptest.NewRequest("POST", "/v1/payments-hub/route", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
@@ -36,8 +90,34 @@ func TestRoutePayment(t *testing.T) {
 	}
 }
 
+func TestRoutePaymentRailRejected(t *testing.T) {
+	setupHubTest()
+	rail := stubRail(t, "51")
+	defer rail.Close()
+	t.Setenv("NIP_ENGINE_URL", rail.URL)
+
+	body := `{"source_bank":"054","dest_bank":"058","amount_kobo":100000}`
+	req := httptest.NewRequest("POST", "/v1/payments-hub/route", bytes.NewBufferString(body))
+	w := httptest.NewRecorder()
+	routePayment(w, req)
+	if w.Code != 502 {
+		t.Fatalf("expected 502 when rail rejects, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] == "routed" {
+		t.Fatal("a rail-rejected payment must never be reported as routed")
+	}
+}
+
 func TestRoutePaymentIdempotencyKeyPropagated(t *testing.T) {
 	setupHubTest()
+	rail := stubRail(t, "00")
+	defer rail.Close()
+	t.Setenv("NIP_ENGINE_URL", rail.URL)
+	mockProducer := injectMockProducer(t)
+	mockProducer.ExpectSendMessageAndSucceed()
+
 	body := `{"source_bank":"054","dest_bank":"058","amount_kobo":50000}`
 	req := httptest.NewRequest("POST", "/v1/payments-hub/route", bytes.NewBufferString(body))
 	req.Header.Set("X-Idempotency-Key", "IDEMP-TEST-001")
@@ -46,12 +126,22 @@ func TestRoutePaymentIdempotencyKeyPropagated(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
-	// Verify outbox entry captured the idempotency key
+	// Verify outbox entry captured the idempotency key and was published
 	if len(outboxEntries) != 1 {
 		t.Fatalf("expected 1 outbox entry, got %d", len(outboxEntries))
 	}
 	if outboxEntries[0].IdempotencyKey != "IDEMP-TEST-001" {
 		t.Fatalf("expected idemp key IDEMP-TEST-001, got %s", outboxEntries[0].IdempotencyKey)
+	}
+	if outboxEntries[0].Status != "published" {
+		t.Fatalf("expected outbox entry published, got %s", outboxEntries[0].Status)
+	}
+}
+
+func TestEventBusFailsWithoutKafka(t *testing.T) {
+	eb := &EventBus{topic: "test", serviceName: "test"}
+	if err := eb.Emit("test.event", map[string]interface{}{"k": "v"}); err == nil {
+		t.Fatal("Emit must fail when Kafka is not configured")
 	}
 }
 
@@ -72,11 +162,20 @@ func TestOutboxStatsEmpty(t *testing.T) {
 
 func TestOutboxStatsAfterPayment(t *testing.T) {
 	setupHubTest()
+	rail := stubRail(t, "00")
+	defer rail.Close()
+	t.Setenv("NIP_ENGINE_URL", rail.URL)
+	mockProducer := injectMockProducer(t)
+	mockProducer.ExpectSendMessageAndSucceed()
+
 	// Route a payment to create an outbox entry
 	body := `{"amount_kobo":25000}`
 	req := httptest.NewRequest("POST", "/v1/payments-hub/route", bytes.NewBufferString(body))
 	w := httptest.NewRecorder()
 	routePayment(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
 
 	// Check outbox stats
 	req2 := httptest.NewRequest("GET", "/v1/payments-hub/outbox/stats", nil)
@@ -87,8 +186,8 @@ func TestOutboxStatsAfterPayment(t *testing.T) {
 	if int(resp["total"].(float64)) != 1 {
 		t.Fatalf("expected 1 total, got %v", resp["total"])
 	}
-	if int(resp["pending"].(float64)) != 1 {
-		t.Fatalf("expected 1 pending, got %v", resp["pending"])
+	if int(resp["pending"].(float64)) != 0 {
+		t.Fatalf("expected 0 pending (published on success), got %v", resp["pending"])
 	}
 }
 
