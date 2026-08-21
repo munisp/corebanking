@@ -41,19 +41,26 @@ The replacement verifier:
   * optionally enforces iss when JWT_ISSUER is set
   * NEVER warns-and-allows: any failure returns (None, reason)
 
+Safety
+------
+DRY-RUN IS THE DEFAULT: the script only reports the files it would change.
+Pass --apply to actually rewrite files. Every rewritten file is verified with
+py_compile immediately after the write; if the syntax check fails the file is
+rolled back to its original content and the failure is reported.
+
 Usage
 -----
-    python scripts/fix-validate-jwt.py [--root services] [--dry-run] [--verbose]
+    python scripts/fix-validate-jwt.py [--root services] [--apply] [--verbose]
 
-Exit code is 0 on success. With --dry-run, prints the files it would change
-without writing. This script was committed for reproducibility; the 14
-highest-risk services were already patched by hand on
-fix/silent-mockware-remediation. Run it (then review + commit) to remediate
-the remaining services.
+Exit code is 0 on success (rollbacks also exit 0 but are printed loudly).
+This script was committed for reproducibility; the 14 highest-risk services
+were already patched by hand on fix/silent-mockware-remediation. Run it
+(then review + commit) to remediate the remaining services.
 """
 
 import argparse
 import os
+import py_compile
 import re
 import sys
 
@@ -167,11 +174,15 @@ def iter_python_files(root):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Replace fake validate_jwt with real HS256 verification.")
     ap.add_argument("--root", default="services", help="Directory to scan (default: services)")
-    ap.add_argument("--dry-run", action="store_true", help="Print files that would change; do not write")
+    ap.add_argument("--apply", action="store_true",
+                    help="Actually rewrite files (DEFAULT is dry-run: report only)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(argv)
 
-    fixed, scanned = [], 0
+    if not args.apply:
+        print("DRY-RUN (default): no files will be written. Pass --apply to rewrite.")
+
+    fixed, scanned, rolled_back = [], 0, []
     for path in iter_python_files(args.root):
         scanned += 1
         with open(path, "r", encoding="utf-8") as f:
@@ -182,15 +193,26 @@ def main(argv=None):
         if not changed:
             continue
         fixed.append(path)
-        if args.dry_run:
+        if not args.apply:
             print(f"[dry-run] would rewrite: {path}")
-        else:
+            continue
+
+        # --apply: write, then verify syntax, rolling back on failure.
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(new_src)
+        try:
+            py_compile.compile(path, doraise=True)
+        except py_compile.PyCompileError as exc:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(new_src)
-            print(f"rewrote: {path}")
+                f.write(src)  # roll back to the original content
+            rolled_back.append(path)
+            print(f"ROLLBACK {path}: post-write py_compile failed ({exc}); original restored")
+            continue
+        print(f"rewrote+verified: {path}")
 
     print(f"\nscanned {scanned} python files under {args.root}; "
-          f"{'would fix' if args.dry_run else 'fixed'} {len(fixed)} file(s).")
+          f"{'would fix' if not args.apply else 'fixed'} {len(fixed) - len(rolled_back)} file(s)"
+          + (f"; rolled back {len(rolled_back)} file(s)" if rolled_back else ""))
     return 0
 
 
