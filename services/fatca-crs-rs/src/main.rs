@@ -1,6 +1,7 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 
 #[derive(Clone, Serialize, Deserialize)]
 struct MiddlewareConfig {
@@ -42,15 +43,7 @@ struct FATCAReport {
     status: String,
 }
 
-fn seed() -> Vec<FATCAReport> { vec![
-        FATCAReport { id: "FATCA-001".into(), report_type: "FATCA".into(), reporting_year: "2025".into(), jurisdiction: "US".into(), accounts_reported: 342, total_balance: 85_000_000.0, currency: "USD".into(), filing_deadline: "2026-03-31".into(), status: "filed".into() },
-        FATCAReport { id: "CRS-001".into(), report_type: "CRS".into(), reporting_year: "2025".into(), jurisdiction: "UK".into(), accounts_reported: 156, total_balance: 45_000_000.0, currency: "GBP".into(), filing_deadline: "2026-06-30".into(), status: "pending".into() },
-        FATCAReport { id: "CRS-002".into(), report_type: "CRS".into(), reporting_year: "2025".into(), jurisdiction: "AE".into(), accounts_reported: 89, total_balance: 120_000_000.0, currency: "AED".into(), filing_deadline: "2026-06-30".into(), status: "pending".into() },
-        FATCAReport { id: "FATCA-002".into(), report_type: "FATCA".into(), reporting_year: "2024".into(), jurisdiction: "US".into(), accounts_reported: 298, total_balance: 72_000_000.0, currency: "USD".into(), filing_deadline: "2025-03-31".into(), status: "filed".into() },
-    ]
-}
-
-struct AppState { items: Mutex<Vec<FATCAReport>> }
+struct AppState { db: Option<PgPool> }
 
 async fn healthz() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
@@ -58,61 +51,81 @@ async fn healthz() -> HttpResponse {
     }))
 }
 
+fn source_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(serde_json::json!({
+        "error": "source_unavailable",
+        "detail": detail,
+    }))
+}
+
+// FATCA/CRS regulatory reports must come from the reporting database.
+// Never fabricate filings: if the DB is unreachable or the query fails, fail fast (503).
 async fn list_items(data: web::Data<AppState>) -> HttpResponse {
-    let d = data.items.lock().unwrap();
-    HttpResponse::Ok().json(serde_json::json!({ "items": *d, "total": d.len() }))
+    let pool = match &data.db {
+        Some(p) => p,
+        None => return source_unavailable("DATABASE_URL not configured; refusing to serve fabricated FATCA/CRS reports"),
+    };
+    let rows = sqlx::query(
+        r#"SELECT id, report_type, reporting_year, jurisdiction, accounts_reported,
+                  total_balance, currency, filing_deadline, status
+           FROM fatca_crs_reports ORDER BY id"#,
+    )
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => {
+            let items: Vec<FATCAReport> = rows
+                .iter()
+                .map(|r| FATCAReport {
+                    id: r.get("id"),
+                    report_type: r.get("report_type"),
+                    reporting_year: r.get("reporting_year"),
+                    jurisdiction: r.get("jurisdiction"),
+                    accounts_reported: r.get::<i32, _>("accounts_reported") as u32,
+                    total_balance: r.get("total_balance"),
+                    currency: r.get("currency"),
+                    filing_deadline: r.get("filing_deadline"),
+                    status: r.get("status"),
+                })
+                .collect();
+            HttpResponse::Ok().json(serde_json::json!({ "items": items, "total": items.len() }))
+        }
+        Err(e) => {
+            eprintln!("[fatca-crs-rs] report query failed: {}", e);
+            source_unavailable("fatca_crs_reports query failed; no data served")
+        }
+    }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8188".into()).parse().unwrap_or(8188);
-    let data = web::Data::new(AppState { items: Mutex::new(seed()) });
+    let _ = mw(); // middleware endpoints are environment-derived config display only
+    let db = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.is_empty() => {
+            match PgPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .connect(&url)
+                .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("[fatca-crs-rs] DB connect failed: {} — reports will 503 (fail-fast)", e);
+                    None
+                }
+            }
+        }
+        _ => {
+            eprintln!("[fatca-crs-rs] DATABASE_URL not set — reports will 503 (fail-fast)");
+            None
+        }
+    };
+    let data = web::Data::new(AppState { db });
     println!("FATCA/CRS Compliance Service running on port {}", port);
     HttpServer::new(move || {
         App::new().app_data(data.clone())
             .route("/healthz", web::get().to(healthz))
             .route("/v1/fatca-crs-rs/list", web::get().to(list_items))
     }).bind(("0.0.0.0", port))?.run().await
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }
