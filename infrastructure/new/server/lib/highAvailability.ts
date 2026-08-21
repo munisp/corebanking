@@ -11,6 +11,12 @@
  * real client helpers (Postgres SELECT 1, getRedisStatus, getKafkaStatus).
  * Uptime percentages are not computable from a point-in-time probe and are
  * reported as null rather than fabricated.
+ *
+ * Zone doctrine: zone names/regions are static desired-state topology.
+ * Zone TELEMETRY (services count, replica count, traffic share, latency,
+ * active/standby status) is null/"unknown" because this process runs no
+ * zone probes — the previous revision's hardcoded 45/35/25/10 replica counts
+ * and "active" statuses served as zone stats have been removed.
  */
 
 import { checkDatabaseHealth } from "./postgresRepository";
@@ -55,11 +61,12 @@ interface HAMiddleware {
 interface HAZone {
   zone: string;
   region: string;
-  services: number;
-  replicas: number;
+  // Live telemetry — null until computed from real zone probes.
+  services: number | null;
+  replicas: number | null;
   traffic: string | null;
   latencyMs: number | null;
-  status: "active" | "standby" | "draining";
+  status: "active" | "standby" | "draining" | "unknown";
 }
 
 // Desired-state configuration (replica counts, zones, failover strategy are
@@ -86,14 +93,19 @@ const haMiddlewareConfig: Array<Omit<HAMiddleware, "status">> = [
   { name: "APISIX", type: "api-gateway", replicas: 3, mode: "active-active", failoverTimeMs: 1000, dataReplication: "etcd-based", backupFrequency: "continuous", rpo: "0ms", rto: "1s", lastFailover: null },
 ];
 
-// Zone topology is deployment configuration. traffic/latency are live
-// telemetry that this process cannot measure — reported as null.
+// Zone TOPOLOGY (names/regions) is desired-state deployment configuration
+// and is clearly labeled as such. Zone TELEMETRY (services/replicas/traffic/
+// latency/status) is not probed by this process, so every telemetry field is
+// null and status is "unknown" — never hardcoded counts or "active".
 const haZones: HAZone[] = [
-  { zone: "lagos-1a", region: "West Africa (Lagos)", services: 172, replicas: 45, traffic: null, latencyMs: null, status: "active" },
-  { zone: "lagos-1b", region: "West Africa (Lagos)", services: 172, replicas: 35, traffic: null, latencyMs: null, status: "active" },
-  { zone: "abuja-1a", region: "Central Nigeria (Abuja)", services: 172, replicas: 25, traffic: null, latencyMs: null, status: "active" },
-  { zone: "london-1a", region: "Europe (London)", services: 20, replicas: 10, traffic: null, latencyMs: null, status: "standby" },
+  { zone: "lagos-1a", region: "West Africa (Lagos)", services: null, replicas: null, traffic: null, latencyMs: null, status: "unknown" },
+  { zone: "lagos-1b", region: "West Africa (Lagos)", services: null, replicas: null, traffic: null, latencyMs: null, status: "unknown" },
+  { zone: "abuja-1a", region: "Central Nigeria (Abuja)", services: null, replicas: null, traffic: null, latencyMs: null, status: "unknown" },
+  { zone: "london-1a", region: "Europe (London)", services: null, replicas: null, traffic: null, latencyMs: null, status: "unknown" },
 ];
+
+const ZONE_SOURCE_NOTE =
+  "Zone names/regions are static desired-state topology; services/replicas/traffic/latency/status are null/unknown because no zone telemetry probes are wired in this process";
 
 // ─── REAL HEALTH PROBING ────────────────────────────────────────────────────
 
@@ -215,14 +227,22 @@ export function registerHighAvailability(app: any) {
     });
   });
 
+  // Zones — desired-state topology only; telemetry fields are null/unknown.
   app.get("/api/platform/ha/zones", (_req: any, res: any) => {
-    res.json({ items: haZones, total: haZones.length });
+    res.json({ items: haZones, total: haZones.length, source: "desired-state-config", note: ZONE_SOURCE_NOTE });
   });
 
+  // Zone stats — only the configured zone count is real; everything derived
+  // from zone telemetry is null until real probes exist.
   app.get("/api/platform/ha/zones/stats", (_req: any, res: any) => {
-    const active = haZones.filter(z => z.status === "active").length;
-    const totalReplicas = haZones.reduce((s, z) => s + z.replicas, 0);
-    res.json({ totalZones: haZones.length, active, standby: haZones.length - active, totalReplicas });
+    res.json({
+      totalZones: haZones.length,
+      active: null, // zone status is unprobed — never fabricated
+      standby: null,
+      totalReplicas: null,
+      source: "desired-state-config",
+      note: ZONE_SOURCE_NOTE,
+    });
   });
 
   // Platform-wide HA dashboard — aggregates only real probe results
@@ -240,11 +260,11 @@ export function registerHighAvailability(app: any) {
       trackedMiddleware: middleware.length,
       healthyMiddleware: middlewareHealthy,
       totalReplicas: services.reduce((s, h) => s + h.replicas, 0) + middleware.reduce((s, m) => s + m.replicas, 0),
-      zones: haZones.length,
+      zones: haZones.length, // configured zone count (topology), not telemetry
       failoversLast24h: null, // no failover events are tracked in this process
       rpoTargets: { tigerbeetle: "0ms", redis: "5s", kafka: "0ms" },
       rtoTargets: { tigerbeetle: "100ms", redis: "2s", kafka: "10s" },
-      note: "Statuses are live probes (/healthz, SELECT 1, client helpers). Uptime and failover counts are null because this process does not track them — they are not fabricated.",
+      note: "Statuses are live probes (/healthz, SELECT 1, client helpers). Uptime and failover counts are null because this process does not track them — they are not fabricated. " + ZONE_SOURCE_NOTE,
     });
   });
 }
