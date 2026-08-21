@@ -6,6 +6,16 @@ Fail-closed behavior: if an identity provider (NIMC/NIBSS/Immigration/FRSC)
 is unreachable or not configured, verification endpoints return HTTP 503 with
 {"verified": None, "status": "provider_unavailable", "confidence": 0}.
 No fallback path may ever produce a synthetic verification verdict.
+
+Verdict honesty: an HTTP 200 from a provider is NOT proof of verification.
+verified=True is set ONLY when the provider's response BODY explicitly affirms
+the match via a documented verdict field (see extract_provider_verdict):
+  - body["status"] == "verified"  (string, case-insensitive), or
+  - body["match"] is True         (boolean), or
+  - body["verified"] is True      (boolean)
+An explicit negative verdict yields verified=False/status="not_verified".
+An ambiguous or absent verdict yields verified=None/status="indeterminate" —
+callers must NOT treat it as a pass.
 """
 
 import os
@@ -44,6 +54,36 @@ PROVIDER_UNAVAILABLE_BODY = {
     "status": "provider_unavailable",
     "confidence": 0,
 }
+
+# Explicit negative verdict strings (anything else string-valued is ambiguous).
+_NEGATIVE_VERDICTS = {"not_verified", "unverified", "rejected", "no_match", "failed", "mismatch"}
+
+
+def extract_provider_verdict(data: Any) -> Optional[bool]:
+    """Parse the provider's verification verdict from its response body.
+
+    Returns True  — only on an EXPLICIT affirmation:
+                    status == "verified", or match is True, or verified is True.
+    Returns False — on an explicit negative (status in a known negative set,
+                    or match/verified explicitly False).
+    Returns None  — ambiguous or absent verdict; callers must report
+                    verified=None, status="indeterminate" and never treat the
+                    identity as verified.
+    """
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    if isinstance(status, str):
+        s = status.strip().lower()
+        if s == "verified":
+            return True
+        if s in _NEGATIVE_VERDICTS:
+            return False
+    for key in ("match", "verified"):
+        val = data.get(key)
+        if isinstance(val, bool):
+            return val
+    return None
 
 
 class ProviderUnavailableError(Exception):
@@ -85,10 +125,13 @@ async def persist_verification_audit(record: Dict[str, Any]):
 async def call_provider(url: str, payload: Dict[str, Any], auth_key: str, source: str) -> Dict[str, Any]:
     """Call a real identity provider.
 
-    verified=True is only ever returned when the provider itself returned a
-    real 200 response. Provider unreachable -> raises ProviderUnavailableError
-    (callers translate to HTTP 503). Confidence comes only from the provider's
-    own match_score; it is None when the provider does not supply one.
+    verified=True is returned ONLY when the provider's response body contains
+    an explicit affirmative verdict (see extract_provider_verdict) — never on
+    HTTP 200 alone. Ambiguous/absent verdict -> verified=None with
+    status="indeterminate". Provider unreachable -> raises
+    ProviderUnavailableError (callers translate to HTTP 503). Confidence comes
+    only from the provider's own match_score and only for affirmed verdicts;
+    it is None otherwise.
     """
     try:
         async with httpx.AsyncClient() as client:
@@ -102,23 +145,32 @@ async def call_provider(url: str, payload: Dict[str, Any], auth_key: str, source
                 timeout=20.0,
             )
         if response.status_code == 200:
-            data = response.json()
+            try:
+                data = response.json()
+            except Exception:
+                data = {}
+            verdict = extract_provider_verdict(data)
             return {
-                "verified": True,
+                "verified": verdict,  # True only on explicit body affirmation
+                "status": "verified" if verdict is True else ("not_verified" if verdict is False else "indeterminate"),
                 "provider_status": response.status_code,
                 "provider_data": data,
                 "source": source,
                 "fallback": False,
-                "confidence_score": data.get("match_score"),
+                "confidence_score": data.get("match_score") if verdict is True else None,
             }
+        # Non-200: the provider responded but did not affirm the identity.
         return {
             "verified": False,
+            "status": "not_verified",
             "provider_status": response.status_code,
             "provider_data": response.json() if response.content else {},
             "source": source,
             "fallback": False,
             "confidence_score": None,
         }
+    except ProviderUnavailableError:
+        raise
     except Exception as exc:
         logger.error("provider_call_failed", source=source, url=url, error=str(exc))
         raise ProviderUnavailableError(source, str(exc))
@@ -165,6 +217,7 @@ async def verify_nin(request: NINVerificationRequest, x_tenant_id: str = Header(
         raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
+        "status": provider.get("status"),
         "nin": request.nin,
         "full_name": provider.get("provider_data", {}).get("full_name"),
         "date_of_birth": provider.get("provider_data", {}).get("date_of_birth") or request.date_of_birth,
@@ -193,6 +246,7 @@ async def verify_bvn(request: BVNVerificationRequest, x_tenant_id: str = Header(
         raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
+        "status": provider.get("status"),
         "bvn": request.bvn,
         "full_name": provider.get("provider_data", {}).get("full_name"),
         "date_of_birth": provider.get("provider_data", {}).get("date_of_birth") or request.date_of_birth,
@@ -219,6 +273,7 @@ async def verify_passport(request: PassportVerificationRequest, x_tenant_id: str
         raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
+        "status": provider.get("status"),
         "passport_number": request.passport_number,
         "surname": provider.get("provider_data", {}).get("surname") or request.surname,
         "given_names": provider.get("provider_data", {}).get("given_names") or request.given_names,
@@ -246,6 +301,7 @@ async def verify_drivers_license(request: DriversLicenseVerificationRequest, x_t
         raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
+        "status": provider.get("status"),
         "license_number": request.license_number,
         "full_name": provider.get("provider_data", {}).get("full_name"),
         "date_of_birth": provider.get("provider_data", {}).get("date_of_birth") or request.date_of_birth,
