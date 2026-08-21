@@ -10,6 +10,11 @@ Real-dependency behavior (no silent mockware):
   seeded from the official OFAC SDN / UN Consolidated lists when WATCHLIST_AUTO_SEED=true).
   Missing/empty lists -> HTTP 503 {"error": "sanctions_list_unavailable"} (fail closed).
 - /healthz actively probes every dependency and reports per-component status.
+- Demo seed records (KYC_SEED_DEMO_DATA=true, non-production only) use
+  OBVIOUSLY SYNTHETIC identities ("Demo Person A", BVN "00000000001") marked
+  demo=true — no real-looking names, BVNs, or phone numbers.
+- A KYC record created with empty/insufficient identity data is NEVER
+  auto-cleared: its screening_status is "incomplete".
 
 Middleware: Kafka, Redis, Postgres, OpenSearch, NIBSS BVN Validation.
 """
@@ -81,6 +86,8 @@ class ScreeningStatus(str, Enum):
     PEP_MATCH = "pep_match"
     SANCTIONS_MATCH = "sanctions_match"
     PENDING_REVIEW = "pending_review"
+    # Identity data was insufficient to run screening — never treat as clear.
+    INCOMPLETE = "incomplete"
 
 
 # ── Models ──
@@ -113,6 +120,7 @@ class KYCRecord:
     documents: list[dict]
     created_at: str
     updated_at: str
+    demo: bool = False
 
 @dataclass
 class ScreeningResult:
@@ -465,50 +473,55 @@ KYC_TIER_LIMITS = {
 # ── Seed Data (demo only — explicit opt-in, never in production) ──
 
 def _seed():
+    # OBVIOUSLY SYNTHETIC demo identities. No real names, BVNs, phone numbers,
+    # or ID numbers: every field is a placeholder and every record carries
+    # demo=True plus "DEMO-" identifiers.
     kyc_records.extend([
         KYCRecord(
-            id="KYC-001", customer_id="CUST-001", bvn="22012345678", full_name="Fatima Abdullahi",
-            date_of_birth="1990-03-15", phone="+2348012345678", email="fatima@example.com",
-            tier="tier3", bvn_verified=True, bvn_verification_date="2026-01-05",
-            id_type="national_id", id_number="NIN-A12345678", id_verified=True,
-            address="12 Adeola Odeku, VI, Lagos", address_verified=True,
-            risk_score=20, risk_level="low", screening_status="clear", screening_notes=[],
+            id="DEMO-KYC-001", customer_id="DEMO-CUST-001", bvn="00000000001", full_name="Demo Person A",
+            date_of_birth="1970-01-01", phone="+2340000000001", email="demo.person.a@example.invalid",
+            tier="tier3", bvn_verified=True, bvn_verification_date="1970-01-01",
+            id_type="demo_id", id_number="DEMO-00000001", id_verified=True,
+            address="0 Demo Street, Demo City", address_verified=True,
+            risk_score=20, risk_level="low", screening_status="clear", screening_notes=["demo record — not a real screening"],
             pep_check=True, sanctions_check=True, edd_required=False,
-            last_screening_date="2026-01-05", documents=[
-                {"type": "national_id", "status": "verified", "uploadedAt": "2026-01-05"},
-                {"type": "utility_bill", "status": "verified", "uploadedAt": "2026-01-05"},
+            last_screening_date="1970-01-01", documents=[
+                {"type": "demo_id", "status": "demo", "uploadedAt": "1970-01-01"},
             ],
-            created_at="2026-01-05T10:00:00Z", updated_at="2026-01-05T10:00:00Z",
+            created_at="1970-01-01T00:00:00Z", updated_at="1970-01-01T00:00:00Z",
+            demo=True,
         ),
         KYCRecord(
-            id="KYC-002", customer_id="CUST-002", bvn="22098765432", full_name="Ibrahim Musa",
-            date_of_birth="1985-07-22", phone="+2348087654321", email="ibrahim@example.com",
-            tier="tier2", bvn_verified=True, bvn_verification_date="2026-01-10",
-            id_type="drivers_license", id_number="DL-B98765432", id_verified=True,
-            address="45 Wuse II, Abuja", address_verified=False,
-            risk_score=35, risk_level="low", screening_status="clear", screening_notes=[],
+            id="DEMO-KYC-002", customer_id="DEMO-CUST-002", bvn="00000000002", full_name="Demo Person B",
+            date_of_birth="1970-01-01", phone="+2340000000002", email="demo.person.b@example.invalid",
+            tier="tier2", bvn_verified=True, bvn_verification_date="1970-01-01",
+            id_type="demo_id", id_number="DEMO-00000002", id_verified=True,
+            address="0 Demo Avenue, Demo Town", address_verified=False,
+            risk_score=35, risk_level="low", screening_status="clear", screening_notes=["demo record — not a real screening"],
             pep_check=True, sanctions_check=True, edd_required=False,
-            last_screening_date="2026-01-10", documents=[
-                {"type": "drivers_license", "status": "verified", "uploadedAt": "2026-01-10"},
+            last_screening_date="1970-01-01", documents=[
+                {"type": "demo_id", "status": "demo", "uploadedAt": "1970-01-01"},
             ],
-            created_at="2026-01-10T14:00:00Z", updated_at="2026-01-10T14:00:00Z",
+            created_at="1970-01-01T00:00:00Z", updated_at="1970-01-01T00:00:00Z",
+            demo=True,
         ),
         KYCRecord(
-            id="KYC-003", customer_id="CUST-003", bvn="22055512345", full_name="Chioma Okafor",
-            date_of_birth="1995-11-30", phone="+2349011223344", email="chioma@example.com",
-            tier="tier1", bvn_verified=True, bvn_verification_date="2026-02-01",
+            id="DEMO-KYC-003", customer_id="DEMO-CUST-003", bvn="00000000003", full_name="Demo Person C",
+            date_of_birth="1970-01-01", phone="+2340000000003", email="demo.person.c@example.invalid",
+            tier="tier1", bvn_verified=True, bvn_verification_date="1970-01-01",
             id_type=None, id_number=None, id_verified=False,
             address=None, address_verified=False,
-            risk_score=50, risk_level="medium", screening_status="pending_review",
-            screening_notes=["Tier 1 only — encourage ID submission for upgrade"],
+            risk_score=50, risk_level="medium", screening_status="incomplete",
+            screening_notes=["demo record — insufficient identity data, screening not run"],
             pep_check=False, sanctions_check=False, edd_required=False,
-            last_screening_date="2026-02-01", documents=[],
-            created_at="2026-02-01T09:00:00Z", updated_at="2026-02-01T09:00:00Z",
+            last_screening_date="1970-01-01", documents=[],
+            created_at="1970-01-01T00:00:00Z", updated_at="1970-01-01T00:00:00Z",
+            demo=True,
         ),
     ])
 
-# Demo records carry fabricated verification flags — only load them behind an
-# explicit opt-in and never in production.
+# Demo records are clearly synthetic (Demo Person A/B/C, BVN 0000000000N,
+# demo=True markers) and only load behind an explicit opt-in, never in production.
 if os.environ.get("KYC_SEED_DEMO_DATA", "").lower() == "true" and APP_ENV != "production":
     _seed()
 
@@ -687,13 +700,22 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             self._respond(503, {"error": "bvn_provider_unavailable", "message": str(e)})
             return
 
-        full_name = body.get("fullName", "")
-        try:
-            matches, screening_status = screen_name(full_name) if full_name else ([], "clear")
-        except ScreeningUnavailable as e:
-            # Fail closed: cannot clear the customer, so do not create the record.
-            self._respond(503, {"error": "sanctions_list_unavailable", "message": str(e)})
-            return
+        # Insufficient identity data (no usable full name) means screening
+        # CANNOT run — the record is "incomplete", never "clear".
+        full_name = (body.get("fullName") or "").strip()
+        screening_ran = bool(full_name)
+        if screening_ran:
+            try:
+                matches, screening_status = screen_name(full_name)
+            except ScreeningUnavailable as e:
+                # Fail closed: cannot clear the customer, so do not create the record.
+                self._respond(503, {"error": "sanctions_list_unavailable", "message": str(e)})
+                return
+            screening_notes = [m["matchedName"] + f" ({m['type']})" for m in matches]
+        else:
+            matches = []
+            screening_status = ScreeningStatus.INCOMPLETE.value
+            screening_notes = ["insufficient identity data (fullName missing) — screening not run; do not treat as clear"]
 
         risk_data = {"bvn_verified": bvn_valid, "pep_match": screening_status == "pep_match",
                      "sanctions_match": screening_status == "sanctions_match",
@@ -715,17 +737,19 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             address=None, address_verified=False,
             risk_score=score, risk_level=level,
             screening_status=screening_status,
-            screening_notes=[m["matchedName"] + f" ({m['type']})" for m in matches],
-            pep_check=True, sanctions_check=True,
+            screening_notes=screening_notes,
+            # Only claim checks that actually ran.
+            pep_check=screening_ran, sanctions_check=screening_ran,
             edd_required=level in ("high", "prohibited") or screening_status == "pep_match",
-            last_screening_date=now_iso()[:10], documents=[],
+            last_screening_date=now_iso()[:10] if screening_ran else "",
+            documents=[],
             created_at=now_iso(), updated_at=now_iso(),
         )
         kyc_records.append(rec)
         self._respond(201, asdict(rec))
 
     def _screen_customer(self, body: dict):
-        name = body.get("name", "")
+        name = (body.get("name") or "").strip()
         if not name:
             self._respond(400, {"message": "name is required"})
             return
@@ -768,6 +792,12 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
 
         results = []
         for name in names:
+            name = (name or "").strip() if isinstance(name, str) else ""
+            if not name:
+                # Never auto-clear an empty identity.
+                results.append({"name": name, "status": ScreeningStatus.INCOMPLETE.value,
+                                "matchCount": 0, "matches": []})
+                continue
             matches, status = screen_name(name)
             results.append({"name": name, "status": status, "matchCount": len(matches),
                             "matches": matches})
