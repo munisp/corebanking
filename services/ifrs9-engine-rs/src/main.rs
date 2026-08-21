@@ -1,6 +1,7 @@
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Row};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.into())
@@ -54,8 +55,7 @@ struct EclCalcRequest {
 }
 
 struct AppState {
-    exposures: Mutex<Vec<Exposure>>,
-    transitions: Mutex<Vec<TransitionMatrix>>,
+    db: Option<PgPool>,
 }
 
 // calc_ecl_kobo: returns ECL values in kobo (i64).
@@ -74,55 +74,78 @@ fn calc_ecl_kobo(outstanding_kobo: i64, pd_12m: f64, lgd: f64, stage: u8, years:
     (ecl_12m_f.round() as i64, ecl_lifetime_f.round() as i64)
 }
 
-// naira_to_kobo: converts NGN amount to kobo integer. Only for seed data initialisation.
-fn naira_to_kobo(naira: f64) -> i64 { (naira * 100.0).round() as i64 }
+fn source_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(serde_json::json!({
+        "error": "source_unavailable",
+        "detail": detail,
+    }))
+}
 
-fn seed() -> (Vec<Exposure>, Vec<TransitionMatrix>) {
-    // Seed amounts are in NGN (f64) for readability, converted to kobo (i64) immediately.
-    // (id, account_id, name, product, outstanding_ngn, original_ngn, stage, reason, dpd, pd12m%, pdlt%, lgd%, orig_date, mat_date, sicr)
-    let exposures_raw: Vec<(&str, &str, &str, &str, f64, f64, u8, &str, u32, f64, f64, f64, &str, &str, bool)> = vec![
-        ("EXP-001", "LN-001", "Dangote Industries",  "term_loan",    45_000_000_000.0, 50_000_000_000.0,  1, "Performing - current",           0,   0.5,  2.5, 40.0, "2024-01-15", "2029-01-15", false),
-        ("EXP-002", "LN-002", "MTN Nigeria",          "term_loan",    30_000_000_000.0, 30_000_000_000.0,  1, "Performing - current",           0,   0.8,  4.0, 45.0, "2025-06-01", "2030-06-01", false),
-        ("EXP-003", "LN-003", "Pan Ocean Oil",        "trade_finance",15_000_000_000.0, 20_000_000_000.0,  2, "SICR - rating downgrade",       45,   3.5, 15.0, 55.0, "2024-03-01", "2026-09-01", true),
-        ("EXP-004", "LN-004", "Arik Air",             "term_loan",     8_000_000_000.0, 12_000_000_000.0,  3, "Credit-impaired - 90+ DPD",    120,  25.0, 80.0, 65.0, "2023-01-01", "2028-01-01", false),
-        ("EXP-005", "MG-001", "Retail Mortgage Pool", "mortgage",    120_000_000_000.0,150_000_000_000.0,  1, "Performing - current",           0,   1.2,  6.0, 25.0, "various",    "various",    false),
-        ("EXP-006", "OD-001", "SME Overdraft Pool",   "overdraft",    25_000_000_000.0, 25_000_000_000.0,  2, "SICR - 30+ DPD",                35,   5.0, 20.0, 60.0, "various",    "various",    true),
-        ("EXP-007", "CC-001", "Credit Card Pool",     "credit_card",  10_000_000_000.0, 15_000_000_000.0,  1, "Performing - current",           5,   2.0, 10.0, 70.0, "various",    "various",    false),
-        ("EXP-008", "BD-001", "Corporate Bond",       "bond",         50_000_000_000.0, 50_000_000_000.0,  1, "Performing - investment grade",  0,   0.3,  1.5, 35.0, "2025-01-01", "2030-12-31", false),
-    ];
+// The exposure book and transition matrix are regulatory data: they MUST come
+// from the impairment database (ifrs9_exposures / ifrs9_transition_matrix).
+// No data source => 503. Never seed a fake book.
+async fn fetch_exposures(db: &PgPool) -> Result<Vec<Exposure>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"SELECT id, account_id, customer_name, product_type,
+                  outstanding_balance_kobo, original_amount_kobo, currency, stage, stage_reason,
+                  days_past_due, pd_12m, pd_lifetime, lgd, ead_kobo, ecl_kobo,
+                  ecl_12m_kobo, ecl_lifetime_kobo, collateral_value_kobo,
+                  origination_date, maturity_date, last_review_date, sicr_triggered, write_off
+           FROM ifrs9_exposures ORDER BY id"#,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| Exposure {
+            id: r.get("id"),
+            account_id: r.get("account_id"),
+            customer_name: r.get("customer_name"),
+            product_type: r.get("product_type"),
+            outstanding_balance_kobo: r.get("outstanding_balance_kobo"),
+            original_amount_kobo: r.get("original_amount_kobo"),
+            currency: r.get("currency"),
+            stage: r.get::<i16, _>("stage") as u8,
+            stage_reason: r.get("stage_reason"),
+            days_past_due: r.get::<i32, _>("days_past_due") as u32,
+            pd_12m: r.get("pd_12m"),
+            pd_lifetime: r.get("pd_lifetime"),
+            lgd: r.get("lgd"),
+            ead_kobo: r.get("ead_kobo"),
+            ecl_kobo: r.get("ecl_kobo"),
+            ecl_12m_kobo: r.get("ecl_12m_kobo"),
+            ecl_lifetime_kobo: r.get("ecl_lifetime_kobo"),
+            collateral_value_kobo: r.get("collateral_value_kobo"),
+            origination_date: r.get("origination_date"),
+            maturity_date: r.get("maturity_date"),
+            last_review_date: r.get("last_review_date"),
+            sicr_triggered: r.get("sicr_triggered"),
+            write_off: r.get("write_off"),
+        })
+        .collect())
+}
 
-    let exposures = exposures_raw.into_iter().map(|(id, acc, name, prod, bal_ngn, orig_ngn, stage, reason, dpd, pd12, pdlt, lgd, odate, mdate, sicr)| {
-        let bal_kobo  = naira_to_kobo(bal_ngn);
-        let orig_kobo = naira_to_kobo(orig_ngn);
-        let remaining = 3.0;
-        let (ecl_12m_kobo, ecl_lifetime_kobo) = calc_ecl_kobo(bal_kobo, pd12, lgd, stage, remaining);
-        let ecl_kobo = if stage == 1 { ecl_12m_kobo } else { ecl_lifetime_kobo };
-        let collateral_kobo = (bal_kobo as f64 * 0.3).round() as i64;
-        Exposure {
-            id: id.into(), account_id: acc.into(), customer_name: name.into(),
-            product_type: prod.into(),
-            outstanding_balance_kobo: bal_kobo,
-            original_amount_kobo: orig_kobo,
-            currency: "NGN".into(), stage, stage_reason: reason.into(),
-            days_past_due: dpd, pd_12m: pd12, pd_lifetime: pdlt, lgd,
-            ead_kobo: bal_kobo,
-            ecl_kobo, ecl_12m_kobo, ecl_lifetime_kobo,
-            collateral_value_kobo: collateral_kobo,
-            origination_date: odate.into(), maturity_date: mdate.into(),
-            last_review_date: "2026-03-31".into(), sicr_triggered: sicr, write_off: false,
-        }
-    }).collect();
-
-    let transitions = vec![
-        TransitionMatrix { from_rating: "AAA".into(), to_aaa: 90.0, to_aa: 8.0, to_a: 1.5, to_bbb: 0.3, to_bb: 0.1, to_b: 0.05, to_ccc: 0.03, to_default: 0.02 },
-        TransitionMatrix { from_rating: "AA".into(), to_aaa: 2.0, to_aa: 88.0, to_a: 7.0, to_bbb: 2.0, to_bb: 0.5, to_b: 0.3, to_ccc: 0.1, to_default: 0.1 },
-        TransitionMatrix { from_rating: "A".into(), to_aaa: 0.5, to_aa: 3.0, to_a: 85.0, to_bbb: 8.0, to_bb: 2.0, to_b: 1.0, to_ccc: 0.3, to_default: 0.2 },
-        TransitionMatrix { from_rating: "BBB".into(), to_aaa: 0.1, to_aa: 0.5, to_a: 3.0, to_bbb: 82.0, to_bb: 10.0, to_b: 3.0, to_ccc: 1.0, to_default: 0.4 },
-        TransitionMatrix { from_rating: "BB".into(), to_aaa: 0.05, to_aa: 0.1, to_a: 0.5, to_bbb: 5.0, to_bb: 75.0, to_b: 12.0, to_ccc: 5.0, to_default: 2.35 },
-        TransitionMatrix { from_rating: "B".into(), to_aaa: 0.02, to_aa: 0.05, to_a: 0.1, to_bbb: 0.5, to_bb: 5.0, to_b: 70.0, to_ccc: 15.0, to_default: 9.33 },
-    ];
-
-    (exposures, transitions)
+async fn fetch_transitions(db: &PgPool) -> Result<Vec<TransitionMatrix>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"SELECT from_rating, to_aaa, to_aa, to_a, to_bbb, to_bb, to_b, to_ccc, to_default
+           FROM ifrs9_transition_matrix ORDER BY from_rating"#,
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| TransitionMatrix {
+            from_rating: r.get("from_rating"),
+            to_aaa: r.get("to_aaa"),
+            to_aa: r.get("to_aa"),
+            to_a: r.get("to_a"),
+            to_bbb: r.get("to_bbb"),
+            to_bb: r.get("to_bb"),
+            to_b: r.get("to_b"),
+            to_ccc: r.get("to_ccc"),
+            to_default: r.get("to_default"),
+        })
+        .collect())
 }
 
 async fn healthz() -> HttpResponse {
@@ -132,30 +155,37 @@ async fn healthz() -> HttpResponse {
 }
 
 async fn list_exposures(data: web::Data<AppState>) -> HttpResponse {
-    let e = match data.exposures.lock() {
-    Ok(v) => v,
-    Err(_) => {
-        return HttpResponse::InternalServerError()
-            .json(serde_json::json!({
-                "error": "internal state lock failed"
-            }));
+    let db = match &data.db {
+        Some(d) => d,
+        None => return source_unavailable("DATABASE_URL not configured; refusing to serve a fabricated exposure book"),
+    };
+    match fetch_exposures(db).await {
+        Ok(e) if !e.is_empty() => {
+            HttpResponse::Ok().json(serde_json::json!({ "items": e, "total": e.len() }))
+        }
+        Ok(_) => source_unavailable("ifrs9_exposures is empty — no exposure book available"),
+        Err(err) => {
+            eprintln!("[ifrs9-engine-rs] exposures query failed: {}", err);
+            source_unavailable("ifrs9_exposures query failed; no data served")
+        }
     }
-};
-    HttpResponse::Ok().json(serde_json::json!({ "items": *e, "total": e.len() }))
 }
 
 async fn transition_matrix(data: web::Data<AppState>) -> HttpResponse {
-    let t = match data.transitions.lock() {
-    Ok(v) => v,
-    Err(_) => {
-        return HttpResponse::InternalServerError().json(
-            serde_json::json!({
-                "error": "failed to lock transitions state"
-            })
-        );
+    let db = match &data.db {
+        Some(d) => d,
+        None => return source_unavailable("DATABASE_URL not configured; refusing to serve a fabricated transition matrix"),
+    };
+    match fetch_transitions(db).await {
+        Ok(t) if !t.is_empty() => {
+            HttpResponse::Ok().json(serde_json::json!({ "items": t, "total": t.len() }))
+        }
+        Ok(_) => source_unavailable("ifrs9_transition_matrix is empty — no rating data available"),
+        Err(err) => {
+            eprintln!("[ifrs9-engine-rs] transition matrix query failed: {}", err);
+            source_unavailable("ifrs9_transition_matrix query failed; no data served")
+        }
     }
-};
-    HttpResponse::Ok().json(serde_json::json!({ "items": *t, "total": t.len() }))
 }
 
 // ── Middleware integration: TigerBeetle ledger + Kafka events ──────────────
@@ -278,15 +308,19 @@ async fn calculate_ecl(body: web::Json<EclCalcRequest>) -> HttpResponse {
 }
 
 async fn summary(data: web::Data<AppState>) -> HttpResponse {
-    let e = match data.exposures.lock() {
-    Ok(v) => v,
-    Err(_) => {
-        return HttpResponse::InternalServerError()
-            .json(serde_json::json!({
-                "error": "internal state lock failed"
-            }));
-    }
-};
+    let db = match &data.db {
+        Some(d) => d,
+        None => return source_unavailable("DATABASE_URL not configured; refusing to serve a fabricated ECL summary"),
+    };
+    let exposures = match fetch_exposures(db).await {
+        Ok(e) if !e.is_empty() => e,
+        Ok(_) => return source_unavailable("ifrs9_exposures is empty — no ECL summary available"),
+        Err(err) => {
+            eprintln!("[ifrs9-engine-rs] summary query failed: {}", err);
+            return source_unavailable("ifrs9_exposures query failed; no data served");
+        }
+    };
+    let e = &exposures;
     let total_exposure_kobo: i64 = e.iter().map(|x| x.outstanding_balance_kobo).sum();
     let total_ecl_kobo: i64 = e.iter().map(|x| x.ecl_kobo).sum();
     let stage1_exposure_kobo: i64 = e.iter().filter(|x| x.stage == 1).map(|x| x.outstanding_balance_kobo).sum();
@@ -311,8 +345,28 @@ async fn summary(data: web::Data<AppState>) -> HttpResponse {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let (exposures, transitions) = seed();
-    let state = web::Data::new(AppState { exposures: Mutex::new(exposures), transitions: Mutex::new(transitions) });
+    let db = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.is_empty() => {
+            match PgPoolOptions::new()
+                .max_connections(5)
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .connect(&url)
+                .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    eprintln!("[ifrs9-engine-rs] DB connect failed: {} — book endpoints will 503 (fail-fast)", e);
+                    None
+                }
+            }
+        }
+        _ => {
+            eprintln!("[ifrs9-engine-rs] DATABASE_URL not set — book endpoints will 503 (fail-fast)");
+            None
+        }
+    };
+    let _ = env_or("PORT", "8164");
+    let state = web::Data::new(AppState { db });
     println!("IFRS 9 Engine on :8164");
     HttpServer::new(move || {
         App::new()
