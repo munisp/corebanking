@@ -13,6 +13,10 @@
  *    recipient's registered channel) for out-of-band delivery. This module
  *    deliberately does NOT claim the OTP was "sent" — it returns only the
  *    otpId and TTL; the code never leaves the server in the response.
+ *  - HMAC SIGNING KEY: there is NO built-in default signing secret. In
+ *    production a missing TX_SIGNING_SECRET throws at module init (fail
+ *    closed); in non-production a per-process random key is used with a loud
+ *    warning, so signatures never silently rely on a committed default.
  */
 
 import crypto from "crypto";
@@ -21,7 +25,30 @@ import { logger } from "./logger";
 
 // Configurable thresholds
 const OTP_THRESHOLD = Number(process.env.OTP_THRESHOLD_NGN || "1000000"); // ₦1M
-const HMAC_SECRET = process.env.TX_SIGNING_SECRET || "54bank-tx-signing-default-key-32chars";
+
+// HMAC signing key — no hardcoded fallback.
+const HMAC_SECRET: string = (() => {
+  const fromEnv = process.env.TX_SIGNING_SECRET;
+  if (fromEnv && fromEnv.length >= 16) return fromEnv;
+  if (fromEnv && fromEnv.length > 0) {
+    logger.warn("TX_SIGNING_SECRET is shorter than 16 characters — use a longer random secret");
+    return fromEnv;
+  }
+  if (process.env.NODE_ENV === "production") {
+    // Fail closed: never sign financial transactions with a built-in default.
+    throw new Error(
+      "TX_SIGNING_SECRET is required in production — refusing to initialize transaction signing",
+    );
+  }
+  // Non-production: per-process random key. Signatures do NOT survive a
+  // restart — intentional, since there is no safe shared default.
+  const generated = crypto.randomBytes(32).toString("hex");
+  logger.warn(
+    "TX_SIGNING_SECRET is not set — using a per-process random key. " +
+      "Transaction signatures will NOT survive a restart. Set TX_SIGNING_SECRET in any shared environment.",
+  );
+  return generated;
+})();
 
 // OTP security policy
 const OTP_TTL_SECONDS = 300; // 5 minutes
