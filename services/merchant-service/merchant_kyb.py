@@ -1,6 +1,11 @@
 """
 Merchant KYB (Know Your Business) Verification Module
 Handles business verification, document validation, and compliance checks
+
+Fail-closed behavior: sanctions/PEP screening is performed by calling the
+kyc-aml-screening service (SANCTIONS_SCREENING_URL). If screening cannot be
+completed, sanctions_check/pep_check are None, no final risk tier is computed,
+and the assessment is persisted with status "pending_screening".
 """
 
 from fastapi import APIRouter, HTTPException, Depends
@@ -9,9 +14,20 @@ from typing import List, Optional, Dict
 from datetime import datetime
 from enum import Enum
 import asyncpg
+import asyncio
 import json
+import logging
+import os
+import urllib.request
+import urllib.error
+
+logger = logging.getLogger("merchant-kyb")
 
 router = APIRouter(prefix="/api/v1/merchants", tags=["KYB Verification"])
+
+# Sanctions/PEP screening service (kyc-aml-screening-py, port 8136 by default)
+SANCTIONS_SCREENING_URL = os.getenv("SANCTIONS_SCREENING_URL", "http://localhost:8136")
+SCREENING_TIMEOUT_SECONDS = float(os.getenv("SANCTIONS_SCREENING_TIMEOUT", "10"))
 
 class DocumentType(str, Enum):
     BUSINESS_REGISTRATION = "business_registration"
@@ -60,6 +76,45 @@ class RiskAssessment(BaseModel):
     aml_check: bool
     sanctions_check: bool
     pep_check: bool
+
+
+def _screen_names_http(names: List[str]) -> Dict:
+    """Blocking HTTP call to the sanctions/PEP screening service (batch)."""
+    url = SANCTIONS_SCREENING_URL.rstrip("/") + "/v1/aml/batch-screen"
+    payload = json.dumps({"names": names}).encode()
+    req = urllib.request.Request(
+        url, data=payload, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=SCREENING_TIMEOUT_SECONDS) as resp:
+        return json.loads(resp.read().decode())
+
+
+async def screen_parties(names: List[str]) -> Dict:
+    """Screen party names against sanctions/PEP lists via the screening service."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _screen_names_http, names)
+
+
+def _collect_party_names(merchant, kyb) -> List[str]:
+    """Collect real party names for screening: business name + owners/directors/UBOs."""
+    names = []
+    business_name = merchant["business_name"] if merchant else None
+    if business_name:
+        names.append(business_name)
+    if kyb:
+        for key in ("business_owners", "directors", "beneficial_owners"):
+            try:
+                parties = json.loads(kyb[key]) if kyb[key] else []
+            except Exception:
+                parties = []
+            for party in parties:
+                if isinstance(party, dict):
+                    name = party.get("name") or party.get("full_name") or party.get("fullName")
+                    if name:
+                        names.append(name)
+    return names
+
 
 @router.post("/{merchant_id}/kyb/submit")
 async def submit_kyb_documents(
@@ -208,7 +263,13 @@ async def perform_risk_assessment(
     merchant_id: str,
     db: asyncpg.Pool = Depends()
 ):
-    """Perform automated risk assessment on merchant"""
+    """Perform risk assessment on merchant.
+
+    Sanctions/PEP screening is a hard dependency: when the screening service
+    cannot be reached (or returns an error), sanctions_check/pep_check are
+    None, no final pass/fail risk tier is computed, and the assessment is
+    persisted with status "pending_screening" for later re-screening.
+    """
     async with db.acquire() as conn:
         # Get merchant and KYB data
         merchant = await conn.fetchrow(
@@ -223,13 +284,13 @@ async def perform_risk_assessment(
             merchant_id
         )
         
-        # Calculate risk score
+        # Calculate risk score from real factors only
         risk_factors = []
         risk_score = 0
         
         # Industry risk
         high_risk_industries = ['gambling', 'crypto', 'forex', 'adult_content']
-        if merchant['industry'].lower() in high_risk_industries:
+        if merchant['industry'] and merchant['industry'].lower() in high_risk_industries:
             risk_factors.append("High-risk industry")
             risk_score += 30
         
@@ -247,26 +308,65 @@ async def perform_risk_assessment(
             risk_factors.append("KYB not submitted")
             risk_score += 40
         
-        # Business age (simulated - would check registration date)
-        # New businesses are higher risk
-        risk_factors.append("New business (< 1 year)")
-        risk_score += 15
-        
-        # Determine risk level
-        if risk_score >= 60:
-            risk_level = "high"
-        elif risk_score >= 30:
-            risk_level = "medium"
+        # Business age from the real registration date; unknown when not on file
+        registration_date = merchant['registration_date'] if 'registration_date' in merchant.keys() else None
+        if registration_date:
+            try:
+                if isinstance(registration_date, str):
+                    reg_dt = datetime.fromisoformat(registration_date[:10])
+                else:
+                    reg_dt = registration_date.replace(tzinfo=None) if getattr(registration_date, 'tzinfo', None) else registration_date
+                age_days = (datetime.now() - reg_dt).days
+                if age_days < 365:
+                    risk_factors.append("New business (< 1 year)")
+                    risk_score += 15
+            except Exception:
+                risk_factors.append("Business age unknown (registration date unparsable)")
         else:
-            risk_level = "low"
+            risk_factors.append("Business age unknown (no registration date on file)")
         
-        # Compliance score (inverse of risk score)
-        compliance_score = max(0, 100 - risk_score)
+        # Sanctions/PEP screening via the screening service (fail closed)
+        screening_names = _collect_party_names(merchant, kyb)
+        assessment_status = "completed"
+        sanctions_check: Optional[bool] = None
+        pep_check: Optional[bool] = None
+        try:
+            if not screening_names:
+                raise ValueError("no party names available to screen")
+            screen = await screen_parties(screening_names)
+            screen_results = screen.get("results", [])
+            sanctions_check = not any(r.get("status") == "sanctions_match" for r in screen_results)
+            pep_check = not any(r.get("status") == "pep_match" for r in screen_results)
+            if sanctions_check is False:
+                risk_factors.append("Sanctions watchlist match")
+                risk_score += 100
+            elif pep_check is False:
+                risk_factors.append("PEP match found")
+                risk_score += 25
+        except Exception as e:
+            logger.error(
+                "sanctions_screening_failed merchant=%s error=%s — assessment will be pending_screening",
+                merchant_id, e,
+            )
+            assessment_status = "pending_screening"
+            sanctions_check = None
+            pep_check = None
+            risk_factors.append("Sanctions/PEP screening unavailable — cannot clear merchant")
         
-        # Perform checks (simulated)
-        aml_check = risk_score < 70
-        sanctions_check = True  # Would integrate with sanctions list API
-        pep_check = True  # Would integrate with PEP screening API
+        # Determine risk level — never compute a final tier without screening
+        if assessment_status == "pending_screening":
+            risk_level = "pending_screening"
+            aml_check: Optional[bool] = None
+            compliance_score: Optional[int] = None
+        else:
+            if risk_score >= 60:
+                risk_level = "high"
+            elif risk_score >= 30:
+                risk_level = "medium"
+            else:
+                risk_level = "low"
+            aml_check = risk_score < 70
+            compliance_score = max(0, 100 - risk_score)
         
         assessment = {
             "merchant_id": merchant_id,
@@ -277,17 +377,25 @@ async def perform_risk_assessment(
             "aml_check": aml_check,
             "sanctions_check": sanctions_check,
             "pep_check": pep_check,
+            "status": assessment_status,
             "assessed_at": datetime.now()
         }
         
-        # Store assessment
-        await conn.execute("""
-            INSERT INTO merchant_risk_assessments (
-                merchant_id, risk_level, risk_score, risk_factors,
-                compliance_score, aml_check, sanctions_check, pep_check
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        """, merchant_id, risk_level, risk_score, json.dumps(risk_factors),
-            compliance_score, aml_check, sanctions_check, pep_check)
+        # Store assessment. Fail loudly if the (legacy NOT NULL) schema rejects
+        # a pending row rather than persisting a fabricated pass/fail result.
+        persisted = True
+        try:
+            await conn.execute("""
+                INSERT INTO merchant_risk_assessments (
+                    merchant_id, risk_level, risk_score, risk_factors,
+                    compliance_score, aml_check, sanctions_check, pep_check
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """, merchant_id, risk_level, risk_score, json.dumps(risk_factors),
+                compliance_score, aml_check, sanctions_check, pep_check)
+        except Exception as e:
+            persisted = False
+            logger.error("risk_assessment_persist_failed merchant=%s error=%s", merchant_id, e)
+        assessment["persisted"] = persisted
         
         return assessment
 
@@ -403,13 +511,13 @@ async def create_kyb_tables(conn: asyncpg.Connection):
         CREATE TABLE IF NOT EXISTS merchant_risk_assessments (
             id SERIAL PRIMARY KEY,
             merchant_id VARCHAR(50) REFERENCES merchants(merchant_id) ON DELETE CASCADE,
-            risk_level VARCHAR(20) NOT NULL,
+            risk_level VARCHAR(30) NOT NULL,
             risk_score INT NOT NULL,
             risk_factors JSONB,
-            compliance_score INT NOT NULL,
-            aml_check BOOLEAN DEFAULT false,
-            sanctions_check BOOLEAN DEFAULT false,
-            pep_check BOOLEAN DEFAULT false,
+            compliance_score INT,
+            aml_check BOOLEAN,
+            sanctions_check BOOLEAN,
+            pep_check BOOLEAN,
             assessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
         
