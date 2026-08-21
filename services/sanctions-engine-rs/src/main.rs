@@ -9,6 +9,7 @@ use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::env;
 use std::sync::Mutex;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -80,13 +81,12 @@ struct AppState {
 }
 
 fn rand_id(prefix: &str) -> String {
-    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-    format!("{}-{:08X}", prefix, (t.subsec_nanos() ^ (t.as_secs() as u32)) & 0xFFFFFFFF)
+    // UUIDv4-derived (random, not time-derived) identifier component.
+    format!("{}-{:08X}", prefix, (uuid::Uuid::new_v4().as_u128() & 0xFFFFFFFF) as u32)
 }
 
 fn now_str() -> String {
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
-    format!("2026-05-09T{:02}:{:02}:{:02}Z", (d.as_secs() / 3600) % 24, (d.as_secs() / 60) % 60, d.as_secs() % 60)
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 fn fuzzy_score(name: &str, target: &str) -> f64 {
@@ -147,6 +147,7 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
         "domain": "Sanctions Screening Engine",
         "watchlist_entries": watchlist.len(),
         "total_screenings": screenings.len(),
+        "lists_loaded": loaded_lists(&watchlist),
         "capabilities": [
             "ofac_sdn_screening", "eu_consolidated_screening", "un_security_council",
             "cbn_watchlist", "interpol_red_notice", "nfiu_watchlist", "pep_database",
@@ -156,15 +157,10 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
             "goaml_reporting", "nfiu_str_filing", "real_time_screening",
             "transaction_screening", "customer_screening", "periodic_rescreening",
         ],
-        "lists": {
-            "OFAC_SDN": {"entries": 12450, "last_updated": "2026-05-09"},
-            "EU_CONSOLIDATED": {"entries": 8920, "last_updated": "2026-05-08"},
-            "UN_SECURITY_COUNCIL": {"entries": 1245, "last_updated": "2026-05-07"},
-            "CBN_WATCHLIST": {"entries": 3200, "last_updated": "2026-05-09"},
-            "INTERPOL_RED": {"entries": 7890, "last_updated": "2026-05-06"},
-            "NFIU_WATCHLIST": {"entries": 1580, "last_updated": "2026-05-09"},
-            "PEP_DATABASE": {"entries": 45600, "last_updated": "2026-05-05"},
-        },
+        "lists": loaded_lists(&watchlist).iter().map(|l| {
+            let count = watchlist.iter().filter(|w| &w.list_name == l).count();
+            (l.clone(), json!({"entries": count}))
+        }).collect::<serde_json::Map<String, serde_json::Value>>(),
         "thresholds": {"auto_clear": 0.3, "potential_match": 0.7, "high_confidence": 0.9, "auto_block": 0.95},
         "algorithms": ["exact_match", "levenshtein", "jaro_winkler", "soundex", "nysiis", "transliteration", "alias_expansion", "phonetic_matching"],
         "middleware": {
@@ -184,6 +180,15 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
     let screening_type = body.screening_type.as_deref().unwrap_or("customer_onboarding");
 
     let watchlist = state.watchlist.lock().unwrap();
+    if watchlist.is_empty() {
+        // FAIL CLOSED: no real watchlist -> no safe-negative "clear" verdict.
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "watchlist_unavailable",
+            "status": "indeterminate",
+            "detail": "no sanctions watchlist loaded from DATABASE_URL; screening cannot be performed",
+        }));
+    }
+    let lists_screened = loaded_lists(&watchlist);
     let mut best_score = 0.0_f64;
     let mut best_match: Option<&WatchlistEntry> = None;
 
@@ -211,7 +216,7 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
         matched_list: best_match.map(|m| m.list_name.clone()),
         decision: decision.into(),
         algorithms_used: vec!["exact_match".into(), "fuzzy_overlap".into(), "alias_expansion".into()],
-        lists_screened: vec!["OFAC_SDN".into(), "EU_CONSOLIDATED".into(), "UN_SECURITY_COUNCIL".into(), "CBN_WATCHLIST".into(), "INTERPOL_RED".into(), "NFIU_WATCHLIST".into(), "PEP_DATABASE".into()],
+        lists_screened: lists_screened.clone(),
         screening_type: screening_type.into(),
         risk_level: risk.into(),
         screened_by: "system".into(),
@@ -256,7 +261,17 @@ async fn record_decision(body: web::Json<DecisionRequest>, state: web::Data<AppS
 }
 
 async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let entity_count = body.entities.as_ref().map(|e| e.len()).unwrap_or(12450);
+    let watchlist = state.watchlist.lock().unwrap();
+    if watchlist.is_empty() {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "watchlist_unavailable",
+            "status": "indeterminate",
+        }));
+    }
+    let entity_count = match &body.entities {
+        Some(v) if !v.is_empty() => v.len(),
+        _ => return HttpResponse::BadRequest().json(json!({"error": "entities_required", "detail": "supply the explicit list of entities to rescreen"})),
+    };
     HttpResponse::Accepted().json(json!({
         "accepted": true,
         "type": "batch_rescreening",
@@ -264,7 +279,7 @@ async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<Ap
         "trigger": body.list_update.as_deref().unwrap_or("scheduled_daily"),
         "estimated_duration": format!("{}-{} minutes", entity_count / 1000, entity_count / 500),
         "workflow_id": rand_id("WF-BATCH"),
-        "lists_to_screen": ["OFAC_SDN", "EU_CONSOLIDATED", "UN_SECURITY_COUNCIL", "CBN_WATCHLIST", "INTERPOL_RED", "NFIU_WATCHLIST", "PEP_DATABASE"],
+        "lists_to_screen": loaded_lists(&watchlist),
         "priority": "high",
         "kafka_topic": "sanctions.batch-rescreen",
     }))
@@ -285,6 +300,7 @@ async fn list_screenings(req: actix_web::HttpRequest, state: web::Data<AppState>
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
     let screenings = state.screenings.lock().unwrap();
+    let watchlist = state.watchlist.lock().unwrap();
     let total = screenings.len();
     let matches = screenings.iter().filter(|s| s.match_score >= 0.7).count();
     let false_positives = screenings.iter().filter(|s| s.status == "false_positive").count();
@@ -298,11 +314,9 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
         "auto_cleared": screenings.iter().filter(|s| s.decision == "auto_clear").count(),
         "hit_rate_pct": if total > 0 { matches as f64 / total as f64 * 100.0 } else { 0.0 },
         "false_positive_rate_pct": if matches > 0 { false_positives as f64 / matches as f64 * 100.0 } else { 0.0 },
-        "avg_screening_time_ms": 12,
-        "lists_synced": true,
-        "last_list_update": "2026-05-09T06:00:00Z",
-        "str_filings_this_month": 3,
-        "nfiu_reports_filed": 1,
+        // Only real, computed values — no fabricated filing counts or sync times.
+        "watchlist_entries_loaded": watchlist.len(),
+        "lists_loaded": loaded_lists(&watchlist),
     }))
 }
 
@@ -320,15 +334,38 @@ async fn get_false_positives(req: actix_web::HttpRequest, state: web::Data<AppSt
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-fn seed_watchlist() -> Vec<WatchlistEntry> {
-    vec![
-        WatchlistEntry { list_id: "OFAC-001".into(), list_name: "OFAC_SDN".into(), entity_name: "AL RASHID TRADING COMPANY".into(), entity_type: "organization".into(), aliases: vec!["AL-RASHID TRADING CO".into(), "ALRASHID INTL".into()], nationality: Some("Syria".into()), date_of_birth: None, designation_date: "2018-03-15".into(), reason: "WMD proliferation financing".into(), source_url: "https://sanctionssearch.ofac.treas.gov/".into() },
-        WatchlistEntry { list_id: "UN-001".into(), list_name: "UN_SECURITY_COUNCIL".into(), entity_name: "IBRAHIM MOUSSA DANLADI".into(), entity_type: "individual".into(), aliases: vec!["IBRAHIM MUSA DANLADI".into(), "MOUSSA IBRAHIM".into()], nationality: Some("Nigeria".into()), date_of_birth: Some("1975-06-12".into()), designation_date: "2019-11-20".into(), reason: "UN SC Resolution 2368 — terrorism financing".into(), source_url: "https://www.un.org/securitycouncil/sanctions/".into() },
-        WatchlistEntry { list_id: "CBN-001".into(), list_name: "CBN_WATCHLIST".into(), entity_name: "CHUKWUDI OKONKWO".into(), entity_type: "individual".into(), aliases: vec!["CHUKWUDI NNAMDI OKONKWO".into()], nationality: Some("Nigeria".into()), date_of_birth: Some("1982-01-05".into()), designation_date: "2025-08-10".into(), reason: "CBN circular — fraud proceeds laundering".into(), source_url: "https://www.cbn.gov.ng/".into() },
-        WatchlistEntry { list_id: "EU-001".into(), list_name: "EU_CONSOLIDATED".into(), entity_name: "PETROGRAD ENERGY GROUP".into(), entity_type: "organization".into(), aliases: vec!["PETROGRAD OIL".into(), "PEG LTD".into()], nationality: Some("Russia".into()), date_of_birth: None, designation_date: "2022-03-01".into(), reason: "EU Sanctions — Russia energy sector".into(), source_url: "https://data.europa.eu/euodp/en/data/dataset/consolidated-list-of-sanctions".into() },
-        WatchlistEntry { list_id: "NFIU-001".into(), list_name: "NFIU_WATCHLIST".into(), entity_name: "ADAMU BELLO ENTERPRISE".into(), entity_type: "organization".into(), aliases: vec!["ABE NIG LTD".into()], nationality: Some("Nigeria".into()), date_of_birth: None, designation_date: "2025-12-01".into(), reason: "NFIU STR — structuring transactions to avoid CTR thresholds".into(), source_url: "https://www.nfiu.gov.ng/".into() },
-        WatchlistEntry { list_id: "INTERPOL-001".into(), list_name: "INTERPOL_RED".into(), entity_name: "JOHN OKAFOR".into(), entity_type: "individual".into(), aliases: vec!["JOHNNY OKAFOR".into(), "JOHN NNAEMEKA OKAFOR".into()], nationality: Some("Nigeria".into()), date_of_birth: Some("1990-04-22".into()), designation_date: "2024-07-15".into(), reason: "INTERPOL Red Notice — cyber fraud syndicate".into(), source_url: "https://www.interpol.int/en/How-we-work/Notices/Red-Notices".into() },
-    ]
+/// Load the watchlist from Postgres. The service NEVER seeds or fabricates
+/// watchlist entries: an unavailable/empty watchlist makes screening fail closed.
+async fn load_watchlist(client: &tokio_postgres::Client) -> Vec<WatchlistEntry> {
+    let rows = match client.query(
+        "SELECT list_id, list_name, entity_name, entity_type, aliases, nationality, date_of_birth, designation_date, reason, source_url FROM watchlist_entries",
+        &[],
+    ).await {
+        Ok(r) => r,
+        Err(err) => { eprintln!("sanctions-engine-rs: watchlist load failed: {}", err); return Vec::new(); }
+    };
+    rows.iter().map(|row| {
+        let aliases_raw: String = row.get::<_, String>(4);
+        WatchlistEntry {
+            list_id: row.get(0),
+            list_name: row.get(1),
+            entity_name: row.get(2),
+            entity_type: row.get(3),
+            aliases: serde_json::from_str(&aliases_raw).unwrap_or_default(),
+            nationality: row.get(5),
+            date_of_birth: row.get(6),
+            designation_date: row.get(7),
+            reason: row.get(8),
+            source_url: row.get(9),
+        }
+    }).collect()
+}
+
+fn loaded_lists(watchlist: &[WatchlistEntry]) -> Vec<String> {
+    let mut lists: Vec<String> = watchlist.iter().map(|e| e.list_name.clone()).collect();
+    lists.sort();
+    lists.dedup();
+    lists
 }
 
 
@@ -386,6 +423,14 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
                     created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
                 )", &[]).await;
             let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
+            // Watchlist schema only — entries are loaded from the DB, never seeded here.
+            let _ = client.execute(
+                "CREATE TABLE IF NOT EXISTS watchlist_entries (
+                    list_id TEXT NOT NULL, list_name TEXT NOT NULL,
+                    entity_name TEXT NOT NULL, entity_type TEXT DEFAULT 'individual',
+                    aliases TEXT DEFAULT '[]', nationality TEXT, date_of_birth TEXT,
+                    designation_date TEXT DEFAULT '', reason TEXT DEFAULT '', source_url TEXT DEFAULT ''
+                )", &[]).await;
             Some(client)
         }
         Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
@@ -399,14 +444,23 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
     }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"}))),
+    };
+    let secret = match std::env::var("JWT_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::ServiceUnavailable().json(json!({"error": "jwt_validation_unavailable"}))),
+    };
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    match jsonwebtoken::decode::<serde_json::Value>(token, &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()), &validation) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(HttpResponse::Unauthorized().json(json!({"error": "invalid or expired token"}))),
     }
 }
 
@@ -637,11 +691,20 @@ async fn main() -> std::io::Result<()> {
     let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
-        screenings: Mutex::new(vec![
-            Screening { id: "SCR-SEED-001".into(), entity_name: "JOHN ADEWALE OKO".into(), entity_type: "individual".into(), match_score: 0.0, status: "clear".into(), matched_entry: None, matched_list: None, decision: "auto_clear".into(), algorithms_used: vec!["exact_match".into(), "fuzzy_overlap".into()], lists_screened: vec!["OFAC_SDN".into(), "EU_CONSOLIDATED".into(), "UN_SECURITY_COUNCIL".into(), "CBN_WATCHLIST".into(), "INTERPOL_RED".into()], screening_type: "customer_onboarding".into(), risk_level: "low".into(), screened_by: "system".into(), screened_at: "2026-05-09T14:30:00Z".into(), decision_by: Some("auto".into()), decision_at: Some("2026-05-09T14:30:00Z".into()), notes: None },
-            Screening { id: "SCR-SEED-002".into(), entity_name: "AL-RASHID TRADING COMPANY".into(), entity_type: "organization".into(), match_score: 0.87, status: "potential_match".into(), matched_entry: Some("AL RASHID TRADING COMPANY (OFAC SDN)".into()), matched_list: Some("OFAC_SDN".into()), decision: "escalate".into(), algorithms_used: vec!["exact_match".into(), "fuzzy_overlap".into(), "alias_expansion".into()], lists_screened: vec!["OFAC_SDN".into(), "EU_CONSOLIDATED".into(), "UN_SECURITY_COUNCIL".into(), "CBN_WATCHLIST".into(), "INTERPOL_RED".into()], screening_type: "transaction".into(), risk_level: "high".into(), screened_by: "system".into(), screened_at: "2026-05-09T14:35:00Z".into(), decision_by: None, decision_at: None, notes: None },
-        ]),
-        watchlist: Mutex::new(seed_watchlist()),
+        // No seeded/fake screenings: only real screening operations populate state.
+        screenings: Mutex::new(Vec::new()),
+        watchlist: Mutex::new(match &_db_client {
+            Some(c) => {
+                let wl = load_watchlist(c).await;
+                println!("sanctions-engine-rs: loaded {} watchlist entries from database", wl.len());
+                wl
+            }
+            None => {
+                println!("sanctions-engine-rs: DATABASE_URL not set — screening will fail closed (503 watchlist_unavailable)");
+                Vec::new()
+            }
+        }),
+        db_client: _db_client.map(|c| std::sync::Arc::new(c)),
     });
     println!("Sanctions Screening Engine v3.0 (Rust) on :{} — OFAC/EU/UN/CBN/INTERPOL/NFIU/PEP", port);
     start_grpc_server("sanctions-engine-rs", 10321);
