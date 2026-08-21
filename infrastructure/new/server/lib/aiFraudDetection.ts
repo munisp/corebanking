@@ -32,20 +32,27 @@ const SCORE_UNAVAILABLE_BODY = {
   action: "manual_review",
 };
 
-async function fetchUpstream(path: string, init?: RequestInit): Promise<{ status: number; body: unknown } | null> {
+interface UpstreamInit {
+  method?: string;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+async function fetchUpstream(path: string, init?: UpstreamInit): Promise<{ status: number; body: unknown } | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   try {
     const upstream = await fetch(`${FRAUD_SERVICE_URL}${path}`, {
-      ...init,
-      signal: controller.signal,
+      method: init?.method ?? "GET",
       headers: { accept: "application/json", ...(init?.headers ?? {}) },
+      ...(init?.body !== undefined ? { body: init.body } : {}),
+      signal: controller.signal,
     });
     if (!upstream.ok) {
       logger.error("Fraud service returned non-2xx", { path, status: upstream.status });
       return null;
     }
-    const body = await upstream.json().catch(() => null);
+    const body: unknown = await upstream.json().catch(() => null);
     if (body === null) {
       logger.error("Fraud service returned a non-JSON body", { path });
       return null;
