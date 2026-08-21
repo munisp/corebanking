@@ -1,7 +1,7 @@
+use postgres::{Client, NoTls};
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, RwLock};
 
 fn get_env(key: &str, default: &str) -> String { env::var(key).unwrap_or_else(|_| default.to_string()) }
 
@@ -24,153 +24,162 @@ fn middleware_config() -> serde_json::Value {
     })
 }
 
-fn seed_data() -> serde_json::Value {
+fn source_unavailable(detail: &str) -> (u16, String) {
+    (503, serde_json::json!({
+        "error": "source_unavailable",
+        "detail": detail,
+    }).to_string())
+}
+
+// LCR/NSFR are regulatory ratios: NEVER fabricate them.
+// Both are computed from the liquidity reporting tables; any DB failure => 503.
+fn with_db<T>(f: impl FnOnce(&mut Client) -> Result<T, String>) -> Result<T, String> {
+    let url = env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL not set; refusing to fabricate LCR/NSFR".to_string())?;
+    if url.is_empty() {
+        return Err("DATABASE_URL empty; refusing to fabricate LCR/NSFR".to_string());
+    }
+    let mut client = Client::connect(&url, NoTls)
+        .map_err(|e| format!("postgres connect failed: {}", e))?;
+    f(&mut client)
+}
+
+struct LcrRow { report_date: String, total_hqla: f64, net_outflows: f64 }
+struct NsfrRow { report_date: String, total_asf: f64, total_rsf: f64 }
+
+fn latest_lcr(c: &mut Client) -> Result<LcrRow, String> {
+    let row = c.query_opt(
+        "SELECT report_date::text, total_hqla::float8, net_outflows::float8 FROM lcr_reports ORDER BY report_date DESC LIMIT 1",
+        &[],
+    ).map_err(|e| format!("lcr_reports query failed: {}", e))?
+    .ok_or_else(|| "lcr_reports is empty — no HQLA/outflow data available".to_string())?;
+    Ok(LcrRow { report_date: row.get(0), total_hqla: row.get(1), net_outflows: row.get(2) })
+}
+
+fn latest_nsfr(c: &mut Client) -> Result<NsfrRow, String> {
+    let row = c.query_opt(
+        "SELECT report_date::text, total_asf::float8, total_rsf::float8 FROM nsfr_reports ORDER BY report_date DESC LIMIT 1",
+        &[],
+    ).map_err(|e| format!("nsfr_reports query failed: {}", e))?
+    .ok_or_else(|| "nsfr_reports is empty — no ASF/RSF data available".to_string())?;
+    Ok(NsfrRow { report_date: row.get(0), total_asf: row.get(1), total_rsf: row.get(2) })
+}
+
+fn lcr_json(l: &LcrRow) -> serde_json::Value {
+    let lcr = if l.net_outflows > 0.0 { l.total_hqla / l.net_outflows * 100.0 } else { 0.0 };
+    let lcr = (lcr * 10.0).round() / 10.0;
     serde_json::json!({
-        "lcr": {
-            "reportDate": "2026-05-10",
-            "hqla": {
-                "level1": {"cashAndReserves": 78000000000.0, "govSecurities": 45000000000.0, "total": 123000000000.0, "weight": 1.0},
-                "level2a": {"corporateBonds": 12000000000.0, "coveredBonds": 5000000000.0, "total": 17000000000.0, "weight": 0.85, "weighted": 14450000000.0},
-                "level2b": {"equities": 3000000000.0, "rmbs": 2000000000.0, "total": 5000000000.0, "weight": 0.5, "weighted": 2500000000.0},
-                "totalHQLA": 139950000000.0
-            },
-            "netCashOutflows": {
-                "retailDepositsStable": {"amount": 180000000000.0, "runoffRate": 0.05, "outflow": 9000000000.0},
-                "retailDepositsLessStable": {"amount": 98000000000.0, "runoffRate": 0.10, "outflow": 9800000000.0},
-                "wholesaleOperational": {"amount": 120000000000.0, "runoffRate": 0.25, "outflow": 30000000000.0},
-                "wholesaleNonOperational": {"amount": 45000000000.0, "runoffRate": 0.40, "outflow": 18000000000.0},
-                "committedFacilities": {"amount": 75600000000.0, "drawdownRate": 0.10, "outflow": 7560000000.0},
-                "totalOutflows": 74360000000.0,
-                "inflows": {"retailInflows": 8000000000.0, "wholesaleInflows": 12000000000.0, "totalInflows": 20000000000.0, "cappedInflows": 20000000000.0},
-                "netOutflows": 54360000000.0
-            },
-            "lcr": 257.4,
-            "minimum": 100.0,
-            "buffer": 157.4,
-            "status": "compliant"
-        },
-        "nsfr": {
-            "reportDate": "2026-05-10",
-            "asf": {
-                "tier1Capital": {"amount": 62000000000.0, "factor": 1.0, "weighted": 62000000000.0},
-                "tier2Capital": {"amount": 13000000000.0, "factor": 1.0, "weighted": 13000000000.0},
-                "stableRetailDeposits": {"amount": 180000000000.0, "factor": 0.95, "weighted": 171000000000.0},
-                "lessStableRetailDeposits": {"amount": 98000000000.0, "factor": 0.90, "weighted": 88200000000.0},
-                "wholesaleFunding1Y": {"amount": 85000000000.0, "factor": 1.0, "weighted": 85000000000.0},
-                "wholesaleFundingLess1Y": {"amount": 45000000000.0, "factor": 0.50, "weighted": 22500000000.0},
-                "totalASF": 441700000000.0
-            },
-            "rsf": {
-                "cashAndReserves": {"amount": 78000000000.0, "factor": 0.0, "weighted": 0.0},
-                "govSecurities": {"amount": 45000000000.0, "factor": 0.05, "weighted": 2250000000.0},
-                "corporateLoans1Y": {"amount": 120000000000.0, "factor": 0.50, "weighted": 60000000000.0},
-                "retailLoans": {"amount": 220000000000.0, "factor": 0.85, "weighted": 187000000000.0},
-                "mortgages": {"amount": 45000000000.0, "factor": 0.65, "weighted": 29250000000.0},
-                "otherAssets": {"amount": 12000000000.0, "factor": 1.0, "weighted": 12000000000.0},
-                "offBalanceSheet": {"amount": 75600000000.0, "factor": 0.05, "weighted": 3780000000.0},
-                "totalRSF": 294280000000.0
-            },
-            "nsfr": 150.1,
-            "minimum": 100.0,
-            "buffer": 50.1,
-            "status": "compliant"
-        },
-        "history": [
-            {"date": "2026-05-10", "lcr": 257.4, "nsfr": 150.1},
-            {"date": "2026-04-30", "lcr": 245.2, "nsfr": 148.5},
-            {"date": "2026-03-31", "lcr": 238.8, "nsfr": 145.2},
-            {"date": "2026-02-28", "lcr": 232.1, "nsfr": 142.8},
-            {"date": "2025-12-31", "lcr": 225.5, "nsfr": 138.9},
-        ],
-        "stats": {
-            "currentLCR": 257.4, "currentNSFR": 150.1,
-            "lcrMinimum": 100.0, "nsfrMinimum": 100.0,
-            "lcrTrend": "improving", "nsfrTrend": "improving",
-            "totalHQLA": 139950000000.0, "netCashOutflows30D": 54360000000.0,
-            "totalASF": 441700000000.0, "totalRSF": 294280000000.0,
-            "complianceStatus": "fully_compliant"
-        }
+        "reportDate": l.report_date,
+        "totalHQLA": l.total_hqla,
+        "netCashOutflows": l.net_outflows,
+        "lcr": lcr,
+        "minimum": 100.0,
+        "buffer": (lcr - 100.0 * 10.0).round() / 10.0,
+        "status": if lcr >= 100.0 { "compliant" } else { "breach" },
     })
 }
 
-fn handle_request(request: &str, data: &Arc<RwLock<serde_json::Value>>) -> (u16, String) {
+fn nsfr_json(n: &NsfrRow) -> serde_json::Value {
+    let nsfr = if n.total_rsf > 0.0 { n.total_asf / n.total_rsf * 100.0 } else { 0.0 };
+    let nsfr = (nsfr * 10.0).round() / 10.0;
+    serde_json::json!({
+        "reportDate": n.report_date,
+        "totalASF": n.total_asf,
+        "totalRSF": n.total_rsf,
+        "nsfr": nsfr,
+        "minimum": 100.0,
+        "buffer": (nsfr - 100.0 * 10.0).round() / 10.0,
+        "status": if nsfr >= 100.0 { "compliant" } else { "breach" },
+    })
+}
+
+fn handle_request(request: &str) -> (u16, String) {
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 { return (400, r#"{"error":"Bad request"}"#.to_string()); }
     let path = parts[1];
-    let d = data.read().unwrap();
 
     if path == "/healthz" {
-        return (200, serde_json::json!({"status": "healthy", "service": "lcr-nsfr",
-            "compliance": {"lcr": d["stats"]["currentLCR"], "nsfr": d["stats"]["currentNSFR"], "status": "compliant"},
+        let db_ok = with_db(|c| c.query_one("SELECT 1", &[]).map(|_| ()).map_err(|e| e.to_string())).is_ok();
+        return (200, serde_json::json!({"status": if db_ok { "healthy" } else { "degraded" }, "service": "lcr-nsfr",
+            "database": if db_ok { "connected" } else { "unavailable" },
             "middleware": middleware_config()}).to_string());
     }
-    if path == "/v1/lcr" { return (200, d["lcr"].to_string()); }
-    if path == "/v1/nsfr" { return (200, d["nsfr"].to_string()); }
-    if path == "/v1/history" { return (200, serde_json::json!({"items": d["history"], "total": d["history"].as_array().map_or(0, |a| a.len())}).to_string()); }
-    if path == "/v1/stats" { return (200, d["stats"].to_string()); }
+    if path == "/v1/lcr" {
+        return match with_db(|c| latest_lcr(c)) {
+            Ok(l) => (200, lcr_json(&l).to_string()),
+            Err(e) => { eprintln!("[lcr-nsfr] LCR unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
+    if path == "/v1/nsfr" {
+        return match with_db(|c| latest_nsfr(c)) {
+            Ok(n) => (200, nsfr_json(&n).to_string()),
+            Err(e) => { eprintln!("[lcr-nsfr] NSFR unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
+    if path == "/v1/history" {
+        return match with_db(|c| {
+            let lrows = c.query(
+                "SELECT report_date::text, total_hqla::float8, net_outflows::float8 FROM lcr_reports ORDER BY report_date DESC LIMIT 30",
+                &[],
+            ).map_err(|e| e.to_string())?;
+            let nrows = c.query(
+                "SELECT report_date::text, total_asf::float8, total_rsf::float8 FROM nsfr_reports ORDER BY report_date DESC LIMIT 30",
+                &[],
+            ).map_err(|e| e.to_string())?;
+            let mut items: Vec<serde_json::Value> = Vec::new();
+            for r in &lrows {
+                let date: String = r.get(0);
+                let hqla: f64 = r.get(1);
+                let outflows: f64 = r.get(2);
+                let lcr = if outflows > 0.0 { (hqla / outflows * 1000.0).round() / 10.0 } else { 0.0 };
+                let nsfr = nrows.iter().find(|n| n.get::<usize, String>(0) == date).map(|n| {
+                    let asf: f64 = n.get(1);
+                    let rsf: f64 = n.get(2);
+                    if rsf > 0.0 { (asf / rsf * 1000.0).round() / 10.0 } else { 0.0 }
+                });
+                items.push(serde_json::json!({"date": date, "lcr": lcr, "nsfr": nsfr}));
+            }
+            Ok(items)
+        }) {
+            Ok(items) => (200, serde_json::json!({"items": items, "total": items.len()}).to_string()),
+            Err(e) => { eprintln!("[lcr-nsfr] history unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
+    if path == "/v1/stats" {
+        return match with_db(|c| Ok((latest_lcr(c)?, latest_nsfr(c)?))) {
+            Ok((l, n)) => {
+                let lj = lcr_json(&l);
+                let nj = nsfr_json(&n);
+                (200, serde_json::json!({
+                    "currentLCR": lj["lcr"], "currentNSFR": nj["nsfr"],
+                    "lcrMinimum": 100.0, "nsfrMinimum": 100.0,
+                    "totalHQLA": l.total_hqla, "netCashOutflows30D": l.net_outflows,
+                    "totalASF": n.total_asf, "totalRSF": n.total_rsf,
+                    "complianceStatus": if lj["lcr"].as_f64().unwrap_or(0.0) >= 100.0 && nj["nsfr"].as_f64().unwrap_or(0.0) >= 100.0 { "fully_compliant" } else { "breach" },
+                }).to_string())
+            }
+            Err(e) => { eprintln!("[lcr-nsfr] stats unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
     (404, r#"{"error":"Not found"}"#.to_string())
 }
 
 fn main() {
     let port = get_env("PORT", "8217");
-    let data = Arc::new(RwLock::new(seed_data()));
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).expect("Failed to bind");
-    eprintln!("[lcr-nsfr] Listening on :{} — LCR: 257.4%, NSFR: 150.1%", port);
+    eprintln!("[lcr-nsfr] Listening on :{} — LCR/NSFR computed from Postgres (fail-fast 503 when unavailable)", port);
     for stream in listener.incoming() {
         if let Ok(mut stream) = stream {
-            let data = Arc::clone(&data);
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                let (status, body) = handle_request(&req, &data);
+                let (status, body) = handle_request(&req);
                 let st = match status { 200 => "OK", _ => "Error" };
                 let resp = format!("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", status, st, body.len(), body);
                 let _ = stream.write_all(resp.as_bytes());
             });
         }
     }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }
