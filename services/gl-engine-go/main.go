@@ -1,48 +1,41 @@
 // 54Bank GL Engine Service — Go
 // Core General Ledger operations: CoA management, journal posting,
 // trial balance aggregation, eFASS report data generation.
-// Integrates with all 14 middleware systems.
+//
+// Data integrity doctrine: GL balances, regulatory (eFASS/CBN) figures and
+// period-close results are served ONLY from Postgres. When the ledger store
+// is unavailable or has no data, handlers fail fast (503) — no sample or
+// in-memory figures are ever served on request paths.
 package main
 
 import (
+	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
+	"math/big"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 )
 
-// ─── MIDDLEWARE CLIENTS ─────────────────────────────────────────────────────
-
-type MiddlewareStatus struct {
-	Kafka       ConnStatus `json:"kafka"`
-	Dapr        ConnStatus `json:"dapr"`
-	Fluvio      ConnStatus `json:"fluvio"`
-	Temporal    ConnStatus `json:"temporal"`
-	Postgres    ConnStatus `json:"postgres"`
-	Keycloak    ConnStatus `json:"keycloak"`
-	Permify     ConnStatus `json:"permify"`
-	Redis       ConnStatus `json:"redis"`
-	Mojaloop    ConnStatus `json:"mojaloop"`
-	OpenSearch  ConnStatus `json:"opensearch"`
-	OpenAppSec  ConnStatus `json:"openappsec"`
-	APISIX      ConnStatus `json:"apisix"`
-	TigerBeetle ConnStatus `json:"tigerbeetle"`
-	Lakehouse   ConnStatus `json:"lakehouse"`
-}
+// ─── MIDDLEWARE STATUS (honest: only probed systems report connected) ──────
 
 type ConnStatus struct {
-	Status    string `json:"status"`
-	Endpoint  string `json:"endpoint,omitempty"`
-	Topic     string `json:"topic,omitempty"`
-	Namespace string `json:"namespace,omitempty"`
-	Index     string `json:"index,omitempty"`
-	Table     string `json:"table,omitempty"`
+	Status   string `json:"status"` // connected | unavailable | not_configured
+	Endpoint string `json:"endpoint,omitempty"`
+	Detail   string `json:"detail,omitempty"`
 }
 
 // ─── DATA MODELS ────────────────────────────────────────────────────────────
@@ -55,7 +48,7 @@ type GLAccount struct {
 	Subcategory      string  `json:"subcategory"`
 	ParentCode       *string `json:"parentCode"`
 	Currency         string  `json:"currency"`
-	BalanceKobo      int64   `json:"balance_kobo"`   // kobo integer — never float
+	BalanceKobo      int64   `json:"balance_kobo"` // kobo integer — never float
 	Status           string  `json:"status"`
 	IsControlAccount int     `json:"isControlAccount"`
 }
@@ -66,28 +59,27 @@ type JournalEntry struct {
 	AccountID      string    `json:"accountId"`
 	GLAccountCode  string    `json:"glAccountCode"`
 	Type           string    `json:"type"`
-	AmountKobo     int64     `json:"amount_kobo"`    // kobo integer — never float
+	AmountKobo     int64     `json:"amount_kobo"` // kobo integer — never float
 	Currency       string    `json:"currency"`
 	Narration      string    `json:"narration"`
 	TransactionRef string    `json:"transactionRef"`
-	IdempotencyKey string    `json:"idempotency_key,omitempty"`
 	BatchID        *string   `json:"batchId"`
 	PostingDate    time.Time `json:"postingDate"`
 	ValueDate      time.Time `json:"valueDate"`
 }
 
 type TrialBalance struct {
-	TrialBalanceID      string    `json:"trialBalanceId"`
-	TenantID            string    `json:"tenantId"`
-	GLAccountCode       string    `json:"glAccountCode"`
-	PeriodStart         time.Time `json:"periodStart"`
-	PeriodEnd           time.Time `json:"periodEnd"`
-	OpeningBalanceKobo  int64     `json:"opening_balance_kobo"`
-	TotalDebitsKobo     int64     `json:"total_debits_kobo"`
-	TotalCreditsKobo    int64     `json:"total_credits_kobo"`
-	ClosingBalanceKobo  int64     `json:"closing_balance_kobo"`
-	Currency            string    `json:"currency"`
-	Status              string    `json:"status"`
+	TrialBalanceID     string    `json:"trialBalanceId"`
+	TenantID           string    `json:"tenantId"`
+	GLAccountCode      string    `json:"glAccountCode"`
+	PeriodStart        time.Time `json:"periodStart"`
+	PeriodEnd          time.Time `json:"periodEnd"`
+	OpeningBalanceKobo int64     `json:"opening_balance_kobo"`
+	TotalDebitsKobo    int64     `json:"total_debits_kobo"`
+	TotalCreditsKobo   int64     `json:"total_credits_kobo"`
+	ClosingBalanceKobo int64     `json:"closing_balance_kobo"`
+	Currency           string    `json:"currency"`
+	Status             string    `json:"status"`
 }
 
 type EFASSLine struct {
@@ -95,7 +87,7 @@ type EFASSLine struct {
 	MBRLine        int    `json:"mbrLine"`
 	LineName       string `json:"lineName"`
 	ReportCategory string `json:"reportCategory"`
-	AmountKobo     int64  `json:"amount_kobo"`     // kobo integer — never float
+	AmountKobo     int64  `json:"amount_kobo"` // kobo integer — never float
 	CBNCode        string `json:"cbnCode"`
 }
 
@@ -125,7 +117,7 @@ type PostJournalRequest struct {
 	AccountID      string `json:"accountId"`
 	GLAccountCode  string `json:"glAccountCode"`
 	Type           string `json:"type"`
-	AmountKobo     int64  `json:"amount_kobo"`    // kobo integer — never float
+	AmountKobo     int64  `json:"amount_kobo"` // kobo integer — never float
 	Currency       string `json:"currency"`
 	Narration      string `json:"narration"`
 	TransactionRef string `json:"transactionRef"`
@@ -141,9 +133,8 @@ type PeriodCloseRequest struct {
 // ─── APP STATE ──────────────────────────────────────────────────────────────
 
 type App struct {
-	db         *sql.DB
-	dbURL      string
-	middleware MiddlewareStatus
+	db    *sql.DB
+	dbURL string
 }
 
 func NewApp() *App {
@@ -152,27 +143,8 @@ func NewApp() *App {
 		dbURL = "postgres://localhost:5432/ndsep_db?sslmode=disable"
 	}
 
-	app := &App{
-		dbURL: dbURL,
-		middleware: MiddlewareStatus{
-			Kafka:       ConnStatus{Status: "connected", Topic: "gl.journal.posted,gl.trial_balance.closed,gl.efass.generated"},
-			Dapr:        ConnStatus{Status: "connected", Endpoint: "http://localhost:3500/v1.0", Namespace: "gl-engine"},
-			Fluvio:     ConnStatus{Status: "connected", Topic: "gl-events-stream"},
-			Temporal:    ConnStatus{Status: "connected", Namespace: "gl-workflows", Endpoint: "temporal:7233"},
-			Postgres:    ConnStatus{Status: "connected", Endpoint: dbURL},
-			Keycloak:    ConnStatus{Status: "connected", Endpoint: "http://keycloak:8080/realms/54bank"},
-			Permify:     ConnStatus{Status: "connected", Endpoint: "permify:3476", Namespace: "gl_authz"},
-			Redis:       ConnStatus{Status: "connected", Endpoint: "redis:6379"},
-			Mojaloop:    ConnStatus{Status: "connected", Endpoint: "http://mojaloop-switch:4003"},
-			OpenSearch:  ConnStatus{Status: "connected", Index: "gl-journal-*,gl-trial-balance-*"},
-			OpenAppSec:  ConnStatus{Status: "connected", Endpoint: "http://openappsec:8090"},
-			APISIX:      ConnStatus{Status: "connected", Endpoint: "http://apisix:9180", Namespace: "/gl/*"},
-			TigerBeetle: ConnStatus{Status: "connected", Endpoint: "tigerbeetle:3001", Table: "gl_ledger"},
-			Lakehouse:   ConnStatus{Status: "connected", Table: "kpi_catalog.accounting.gl_journal_iceberg"},
-		},
-	}
+	app := &App{dbURL: dbURL}
 
-	// Attempt DB connection
 	db, err := sql.Open("postgres", dbURL)
 	if err == nil {
 		db.SetMaxOpenConns(20)
@@ -180,24 +152,43 @@ func NewApp() *App {
 		db.SetConnMaxLifetime(5 * time.Minute)
 		if err := db.Ping(); err == nil {
 			app.db = db
-			app.middleware.Postgres.Status = "connected"
+			log.Printf("[gl-engine-go] postgres connected")
 		} else {
-			app.middleware.Postgres.Status = "configured"
+			log.Printf("[gl-engine-go] postgres unavailable: %v — GL endpoints will fail closed (503)", err)
 		}
+	} else {
+		log.Printf("[gl-engine-go] postgres open failed: %v — GL endpoints will fail closed (503)", err)
 	}
 
 	return app
 }
 
+func (app *App) postgresStatus() ConnStatus {
+	if app.db == nil {
+		return ConnStatus{Status: "unavailable", Endpoint: app.dbURL}
+	}
+	if err := app.db.Ping(); err != nil {
+		return ConnStatus{Status: "unavailable", Endpoint: app.dbURL, Detail: err.Error()}
+	}
+	return ConnStatus{Status: "connected", Endpoint: app.dbURL}
+}
+
 // ─── HANDLERS ───────────────────────────────────────────────────────────────
 
 func (app *App) health(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]interface{}{
-		"status":     "healthy",
-		"service":    "gl-engine-go",
-		"version":    "2.0.1",
-		"database":   app.middleware.Postgres.Status,
-		"middleware": app.middleware,
+	pg := app.postgresStatus()
+	writeJSON(w, 200, map[string]interface{}{
+		"status":   "healthy",
+		"service":  "gl-engine-go",
+		"version":  "2.0.1",
+		"database": pg,
+		"middleware": map[string]ConnStatus{
+			"postgres": pg,
+			// Not probed by this service — reported honestly instead of a
+			// hardcoded "connected".
+			"kafka":       kafkaStatus(),
+			"tigerbeetle": {Status: tigerBeetleStatus()},
+		},
 		"capabilities": []string{
 			"chart_of_accounts",
 			"journal_posting",
@@ -206,8 +197,27 @@ func (app *App) health(w http.ResponseWriter, r *http.Request) {
 			"period_close",
 			"cbn_returns_computation",
 		},
+	})
+}
+
+func kafkaStatus() ConnStatus {
+	brokers := os.Getenv("KAFKA_BROKERS")
+	if brokers == "" {
+		return ConnStatus{Status: "not_configured"}
 	}
-	writeJSON(w, 200, resp)
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return ConnStatus{Status: "connected", Endpoint: brokers}
+	}
+	return ConnStatus{Status: "not_configured", Endpoint: brokers, Detail: "producer not yet established"}
+}
+
+func tigerBeetleStatus() string {
+	if os.Getenv("TB_ADDRESS") != "" || os.Getenv("TIGERBEETLE_ADDRESSES") != "" {
+		return "configured"
+	}
+	return "not_configured"
 }
 
 func (app *App) listGLAccounts(w http.ResponseWriter, r *http.Request) {
@@ -217,39 +227,37 @@ func (app *App) listGLAccounts(w http.ResponseWriter, r *http.Request) {
 		tenantID = "tenant-lagos-main"
 	}
 
-	if app.db != nil {
-		query := `SELECT "glAccountCode", "tenantId", "name", "category", "subcategory",
-			"parentCode", "currency", "balance_kobo", "status", "isControlAccount"
-			FROM "glAccounts" WHERE "tenantId" = $1`
-		args := []interface{}{tenantID}
-		if category != "" {
-			query += ` AND "category" = $2`
-			args = append(args, category)
-		}
-		query += ` ORDER BY "glAccountCode"`
-
-		rows, err := app.db.Query(query, args...)
-		if err == nil {
-			defer rows.Close()
-			var accounts []GLAccount
-			for rows.Next() {
-				var a GLAccount
-				err := rows.Scan(&a.GLAccountCode, &a.TenantID, &a.Name, &a.Category,
-					&a.Subcategory, &a.ParentCode, &a.Currency, &a.BalanceKobo, &a.Status, &a.IsControlAccount)
-				if err == nil {
-					accounts = append(accounts, a)
-				}
-			}
-			writeJSON(w, 200, map[string]interface{}{
-				"items": accounts, "total": len(accounts), "source": "postgres",
-			})
-			return
-		}
+	if app.db == nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable", "detail": "postgres not connected; refusing to serve GL accounts from any other source"})
+		return
 	}
 
-	// Fallback: return sample CoA structure
+	query := `SELECT "glAccountCode", "tenantId", "name", "category", "subcategory",
+		"parentCode", "currency", "balance_kobo", "status", "isControlAccount"
+		FROM "glAccounts" WHERE "tenantId" = $1`
+	args := []interface{}{tenantID}
+	if category != "" {
+		query += ` AND "category" = $2`
+		args = append(args, category)
+	}
+	query += ` ORDER BY "glAccountCode"`
+
+	rows, err := app.db.Query(query, args...)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_query_failed", "detail": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var accounts []GLAccount
+	for rows.Next() {
+		var a GLAccount
+		if err := rows.Scan(&a.GLAccountCode, &a.TenantID, &a.Name, &a.Category,
+			&a.Subcategory, &a.ParentCode, &a.Currency, &a.BalanceKobo, &a.Status, &a.IsControlAccount); err == nil {
+			accounts = append(accounts, a)
+		}
+	}
 	writeJSON(w, 200, map[string]interface{}{
-		"items": getSampleCoA(), "total": 10, "source": "memory",
+		"items": accounts, "total": len(accounts), "source": "postgres",
 	})
 }
 
@@ -260,13 +268,21 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entryID := fmt.Sprintf("JE-%s-%d", req.GLAccountCode, time.Now().UnixNano())
-	now := time.Now()
-
 	if req.AmountKobo <= 0 {
 		writeJSON(w, 400, map[string]string{"error": "amount_kobo must be positive"})
 		return
 	}
+	if req.Type != "debit" && req.Type != "credit" {
+		writeJSON(w, 400, map[string]string{"error": "type must be debit or credit"})
+		return
+	}
+	if app.db == nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable", "detail": "journal NOT posted — postgres not connected"})
+		return
+	}
+
+	entryID := fmt.Sprintf("JE-%s-%d", req.GLAccountCode, time.Now().UnixNano())
+	now := time.Now()
 
 	entry := JournalEntry{
 		EntryID:        entryID,
@@ -282,74 +298,71 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		ValueDate:      now,
 	}
 
-	if app.db != nil {
-		_, err := app.db.Exec(`INSERT INTO "journalEntries"
-			("entryId", "tenantId", "accountId", "glAccountCode", "type", "amount_kobo", "currency", "narration", "transactionRef", "postingDate", "valueDate")
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-			entry.EntryID, entry.TenantID, entry.AccountID, entry.GLAccountCode,
-			entry.Type, entry.AmountKobo, entry.Currency, entry.Narration,
-			entry.TransactionRef, entry.PostingDate, entry.ValueDate)
-		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
+	// Journal insert + balance update + outbox row in ONE transaction: either
+	// the posting fully happens or nothing is recorded.
+	tx, err := app.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable", "detail": err.Error()})
+		return
+	}
+	defer tx.Rollback()
 
-		// Update GL account balance using integer kobo arithmetic
-		if entry.Type == "debit" {
-			app.db.Exec(`UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" + $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`,
-				entry.AmountKobo, entry.GLAccountCode)
-		} else {
-			app.db.Exec(`UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" - $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`,
-				entry.AmountKobo, entry.GLAccountCode)
-		}
+	if _, err := tx.Exec(`INSERT INTO "journalEntries"
+		("entryId", "tenantId", "accountId", "glAccountCode", "type", "amount_kobo", "currency", "narration", "transactionRef", "postingDate", "valueDate")
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		entry.EntryID, entry.TenantID, entry.AccountID, entry.GLAccountCode,
+		entry.Type, entry.AmountKobo, entry.Currency, entry.Narration,
+		entry.TransactionRef, entry.PostingDate, entry.ValueDate); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "journal_insert_failed", "detail": err.Error()})
+		return
 	}
 
-	// Outbox: guaranteed event delivery for journal postings
+	var balanceOp string
+	if entry.Type == "debit" {
+		balanceOp = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" + $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
+	} else {
+		balanceOp = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" - $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
+	}
+	if _, err := tx.Exec(balanceOp, entry.AmountKobo, entry.GLAccountCode); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "balance_update_failed", "detail": err.Error()})
+		return
+	}
+
 	outboxEvent := map[string]interface{}{
-		"event":      "journal.posted",
-		"entry_id":   entryID,
-		"gl_code":    req.GLAccountCode,
-		"type":       req.Type,
-		"amount":     req.Amount,
-		"currency":   req.Currency,
-		"tenant_id":  req.TenantID,
-		"account_id": req.AccountID,
-		"timestamp":  now.Format(time.RFC3339),
-	}
-	outboxID := fmt.Sprintf("OBX-%s", entryID)
-	if app.db != nil {
-		outboxPayload, _ := json.Marshal(outboxEvent)
-		app.db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
-			VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-			ON CONFLICT (idempotency_key) DO NOTHING`,
-			outboxID, "gl.journal.posted", entryID, outboxPayload, req.TransactionRef, now)
-	}
-	log.Printf("[outbox] journal entry %s queued for Kafka delivery", entryID)
-
-	kafkaEvent := map[string]interface{}{
 		"event":       "journal.posted",
-		"entryId":     entryID,
-		"glCode":      req.GLAccountCode,
+		"entry_id":    entryID,
+		"gl_code":     req.GLAccountCode,
 		"type":        req.Type,
 		"amount_kobo": req.AmountKobo,
+		"currency":    req.Currency,
+		"tenant_id":   req.TenantID,
+		"account_id":  req.AccountID,
 		"timestamp":   now.Format(time.RFC3339),
-		"middleware": map[string]string{
-			"kafka_topic":       "gl.journal.posted",
-			"dapr_pubsub":      "gl-pubsub",
-			"fluvio_topic":     "gl-events-stream",
-			"opensearch_index": "gl-journal-2026",
-			"tigerbeetle":      "transfer_created",
-			"lakehouse_table":  "kpi_catalog.accounting.gl_journal_iceberg",
-		},
+	}
+	outboxID := fmt.Sprintf("OBX-%s", entryID)
+	outboxPayload, _ := json.Marshal(outboxEvent)
+	if _, err := tx.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+		ON CONFLICT (idempotency_key) DO NOTHING`,
+		outboxID, "gl.journal.posted", entryID, outboxPayload, req.TransactionRef, now); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "outbox_insert_failed", "detail": err.Error()})
+		return
 	}
 
+	if err := tx.Commit(); err != nil {
+		writeJSON(w, 500, map[string]string{"error": "commit_failed", "detail": err.Error()})
+		return
+	}
+
+	// Honest response: only what actually happened. The outbox relay publishes
+	// to Kafka asynchronously and flips status to 'published' on success.
 	writeJSON(w, 201, map[string]interface{}{
-		"entry":      entry,
-		"kafka":      kafkaEvent,
-		"outbox":      map[string]string{"id": outboxID, "status": "pending", "topic": "gl.journal.posted"},
-		"tigerbeetle": map[string]string{"status": "synced", "transferId": entryID},
-		"opensearch":  map[string]string{"status": "indexed", "index": "gl-journal-2026"},
-		"lakehouse":   map[string]string{"status": "appended", "table": "gl_journal_iceberg"},
+		"entry":  entry,
+		"outbox": map[string]string{"id": outboxID, "status": "pending", "topic": "gl.journal.posted"},
+		"persisted": map[string]string{
+			"journalEntries": "inserted",
+			"glAccounts":     "balance_updated",
+		},
 	})
 }
 
@@ -360,104 +373,120 @@ func (app *App) periodClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if app.db != nil {
-		// Aggregate journal entries into trial balance for the period
-		query := `
-			INSERT INTO "trialBalances" ("trialBalanceId", "tenantId", "glAccountCode", "periodStart", "periodEnd",
-				"opening_balance_kobo", "total_debits_kobo", "total_credits_kobo", "closing_balance_kobo", "currency", "status")
-			SELECT
-				'TB-' || TO_CHAR($2::timestamp, 'YYYY-MM') || '-' || je."glAccountCode",
-				$1,
-				je."glAccountCode",
-				$2::timestamp,
-				$3::timestamp,
-				COALESCE(gl."balance_kobo", 0) - COALESCE(SUM(CASE WHEN je."type" = 'debit' THEN je."amount_kobo" ELSE -je."amount_kobo" END), 0),
-				COALESCE(SUM(CASE WHEN je."type" = 'debit' THEN je."amount_kobo" ELSE 0 END), 0),
-				COALESCE(SUM(CASE WHEN je."type" = 'credit' THEN je."amount_kobo" ELSE 0 END), 0),
-				COALESCE(gl."balance_kobo", 0),
-				COALESCE(gl."currency", 'NGN'),
-				'draft'
-			FROM "journalEntries" je
-			LEFT JOIN "glAccounts" gl ON gl."glAccountCode" = je."glAccountCode"
-			WHERE je."tenantId" = $1
-				AND je."postingDate" >= $2::timestamp
-				AND je."postingDate" <= $3::timestamp
-			GROUP BY je."glAccountCode", gl."balance_kobo", gl."currency"
-			ON CONFLICT ("trialBalanceId") DO UPDATE SET
-				"total_debits_kobo" = EXCLUDED."total_debits_kobo",
-				"total_credits_kobo" = EXCLUDED."total_credits_kobo",
-				"closing_balance_kobo" = EXCLUDED."closing_balance_kobo",
-				"status" = 'draft'`
-
-		result, err := app.db.Exec(query, req.TenantID, req.PeriodStart, req.PeriodEnd)
-		if err != nil {
-			writeJSON(w, 500, map[string]string{"error": err.Error()})
-			return
-		}
-		affected, _ := result.RowsAffected()
-
-		// Publish period close event
-		writeJSON(w, 200, map[string]interface{}{
-			"status":          "period_closed",
-			"tenantId":        req.TenantID,
-			"period":          req.PeriodStart + " to " + req.PeriodEnd,
-			"accountsClosed":  affected,
-			"kafka":           map[string]string{"topic": "gl.trial_balance.closed", "status": "published"},
-			"temporal":        map[string]string{"workflow": "PeriodCloseWorkflow", "status": "completed"},
-			"lakehouse":       map[string]string{"table": "trial_balance_iceberg", "status": "snapshot_created"},
-		})
+	if app.db == nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable", "detail": "period NOT closed — postgres not connected"})
 		return
 	}
 
+	// Aggregate journal entries into trial balance for the period
+	query := `
+		INSERT INTO "trialBalances" ("trialBalanceId", "tenantId", "glAccountCode", "periodStart", "periodEnd",
+			"opening_balance_kobo", "total_debits_kobo", "total_credits_kobo", "closing_balance_kobo", "currency", "status")
+		SELECT
+			'TB-' || TO_CHAR($2::timestamp, 'YYYY-MM') || '-' || je."glAccountCode",
+			$1,
+			je."glAccountCode",
+			$2::timestamp,
+			$3::timestamp,
+			COALESCE(gl."balance_kobo", 0) - COALESCE(SUM(CASE WHEN je."type" = 'debit' THEN je."amount_kobo" ELSE -je."amount_kobo" END), 0),
+			COALESCE(SUM(CASE WHEN je."type" = 'debit' THEN je."amount_kobo" ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN je."type" = 'credit' THEN je."amount_kobo" ELSE 0 END), 0),
+			COALESCE(gl."balance_kobo", 0),
+			COALESCE(gl."currency", 'NGN'),
+			'closed'
+		FROM "journalEntries" je
+		LEFT JOIN "glAccounts" gl ON gl."glAccountCode" = je."glAccountCode"
+		WHERE je."tenantId" = $1
+			AND je."postingDate" >= $2::timestamp
+			AND je."postingDate" <= $3::timestamp
+		GROUP BY je."glAccountCode", gl."balance_kobo", gl."currency"
+		ON CONFLICT ("trialBalanceId") DO UPDATE SET
+			"total_debits_kobo" = EXCLUDED."total_debits_kobo",
+			"total_credits_kobo" = EXCLUDED."total_credits_kobo",
+			"closing_balance_kobo" = EXCLUDED."closing_balance_kobo",
+			"status" = 'closed'`
+
+	result, err := app.db.Exec(query, req.TenantID, req.PeriodStart, req.PeriodEnd)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "period_close_failed", "detail": err.Error()})
+		return
+	}
+	affected, _ := result.RowsAffected()
+
+	// Queue a real outbox event; the relay publishes it to Kafka.
+	outboxPayload, _ := json.Marshal(map[string]interface{}{
+		"event": "gl.trial_balance.closed", "tenantId": req.TenantID,
+		"periodStart": req.PeriodStart, "periodEnd": req.PeriodEnd,
+		"accountsClosed": affected, "timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+	outboxID := fmt.Sprintf("OBX-PC-%s-%d", req.TenantID, time.Now().UnixNano())
+	if _, err := app.db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending') ON CONFLICT (id) DO NOTHING`,
+		outboxID, "gl.trial_balance.closed", req.TenantID, outboxPayload, outboxID, time.Now()); err != nil {
+		log.Printf("[gl-engine-go] period-close outbox insert failed: %v", err)
+	}
+
 	writeJSON(w, 200, map[string]interface{}{
-		"status":         "period_closed_simulated",
+		"status":         "period_closed",
 		"tenantId":       req.TenantID,
 		"period":         req.PeriodStart + " to " + req.PeriodEnd,
-		"accountsClosed": 205,
+		"accountsClosed": affected,
+		"outbox":         map[string]string{"id": outboxID, "status": "pending", "topic": "gl.trial_balance.closed"},
 	})
 }
 
 func (app *App) generateEFASS(w http.ResponseWriter, r *http.Request) {
 	period := r.URL.Query().Get("period")
 	if period == "" {
-		period = "2026-04"
+		writeJSON(w, 400, map[string]string{"error": "period query parameter is required (YYYY-MM)"})
+		return
 	}
 	tenantID := r.URL.Query().Get("tenantId")
 	if tenantID == "" {
 		tenantID = "tenant-lagos-main"
 	}
 
+	if app.db == nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable", "detail": "eFASS report NOT generated — postgres not connected"})
+		return
+	}
+
+	// Pull from trial balance using eFASS mapping — regulatory figures come
+	// ONLY from real closed trial balances.
+	query := `
+		SELECT m."mbrForm", m."mbrLine", m."lineName", m."reportCategory", m."cbnCode",
+			COALESCE(SUM(
+				CASE WHEN m."signConvention" = 'negate' THEN -tb."closing_balance_kobo"
+				ELSE tb."closing_balance_kobo" END
+			), 0) as amount
+		FROM "efassMapping" m
+		LEFT JOIN "trialBalances" tb ON tb."glAccountCode" >= m."glCodeStart"
+			AND tb."glAccountCode" <= m."glCodeEnd"
+			AND tb."tenantId" = $1
+			AND TO_CHAR(tb."periodEnd", 'YYYY-MM') = $2
+		GROUP BY m."mbrForm", m."mbrLine", m."lineName", m."reportCategory", m."cbnCode"
+		ORDER BY m."mbrForm", m."mbrLine"`
+
+	rows, err := app.db.Query(query, tenantID, period)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "efass_source_query_failed", "detail": err.Error()})
+		return
+	}
+	defer rows.Close()
 	var lines []EFASSLine
-
-	if app.db != nil {
-		// Pull from trial balance using eFASS mapping
-		query := `
-			SELECT m."mbrForm", m."mbrLine", m."lineName", m."reportCategory", m."cbnCode",
-				COALESCE(SUM(
-					CASE WHEN m."signConvention" = 'negate' THEN -tb."closingBalance"
-					ELSE tb."closingBalance" END
-				), 0) as amount
-			FROM "efassMapping" m
-			LEFT JOIN "trialBalances" tb ON tb."glAccountCode" >= m."glCodeStart" 
-				AND tb."glAccountCode" <= m."glCodeEnd"
-				AND tb."tenantId" = $1
-				AND TO_CHAR(tb."periodEnd", 'YYYY-MM') = $2
-			GROUP BY m."mbrForm", m."mbrLine", m."lineName", m."reportCategory", m."cbnCode"
-			ORDER BY m."mbrForm", m."mbrLine"`
-
-		rows, err := app.db.Query(query, tenantID, period)
-		if err == nil {
-			defer rows.Close()
-			for rows.Next() {
-				var l EFASSLine
-				rows.Scan(&l.MBRForm, &l.MBRLine, &l.LineName, &l.ReportCategory, &l.CBNCode, &l.AmountKobo)
-				lines = append(lines, l)
-			}
+	for rows.Next() {
+		var l EFASSLine
+		if err := rows.Scan(&l.MBRForm, &l.MBRLine, &l.LineName, &l.ReportCategory, &l.CBNCode, &l.AmountKobo); err == nil {
+			lines = append(lines, l)
 		}
 	}
 
 	if len(lines) == 0 {
-		lines = getSampleEFASSLines()
+		writeJSON(w, 503, map[string]string{
+			"error":  "insufficient_data",
+			"detail": "no eFASS mapping rows or no closed trial balance for period " + period + " — refusing to fabricate a regulatory return",
+		})
+		return
 	}
 
 	// Compute totals (all in kobo — exact integer arithmetic)
@@ -479,18 +508,17 @@ func (app *App) generateEFASS(w http.ResponseWriter, r *http.Request) {
 	totals.NetProfitKobo = totals.TotalIncomeKobo - totals.TotalExpensesKobo
 
 	// CAR and LiquidityRatio are percentages (ratios) — intermediate float is correct here.
-	// Convert kobo to f64 only for ratio computation; result is stored as float, not money.
 	equityF := float64(totals.TotalEquityKobo)
 	assetsF := float64(totals.TotalAssetsKobo)
-	liabF   := float64(totals.TotalLiabilitiesKobo)
+	liabF := float64(totals.TotalLiabilitiesKobo)
 	tier1 := equityF * 0.85
 	tier2 := equityF * 0.15
-	rwa   := assetsF * 0.65
+	rwa := assetsF * 0.65
 	if rwa > 0 {
 		totals.CAR = ((tier1 + tier2) / rwa) * 100
 	}
 	liquidAssets := assetsF * 0.35
-	currentLiab  := liabF * 0.60
+	currentLiab := liabF * 0.60
 	if currentLiab > 0 {
 		totals.LiquidityRatio = (liquidAssets / currentLiab) * 100
 	}
@@ -505,14 +533,22 @@ func (app *App) generateEFASS(w http.ResponseWriter, r *http.Request) {
 		Totals:      totals,
 	}
 
+	// Queue a real outbox event; the relay publishes it to Kafka.
+	outboxPayload, _ := json.Marshal(map[string]interface{}{
+		"event": "gl.efass.generated", "reportId": report.ReportID, "tenantId": tenantID,
+		"period": period, "timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+	outboxID := fmt.Sprintf("OBX-EFASS-%s-%s", tenantID, period)
+	if _, err := app.db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending') ON CONFLICT (id) DO NOTHING`,
+		outboxID, "gl.efass.generated", report.ReportID, outboxPayload, outboxID, time.Now()); err != nil {
+		log.Printf("[gl-engine-go] efass outbox insert failed: %v", err)
+	}
+
 	writeJSON(w, 200, map[string]interface{}{
 		"report": report,
-		"middleware": map[string]interface{}{
-			"kafka":      map[string]string{"topic": "gl.efass.generated", "status": "published"},
-			"opensearch": map[string]string{"index": "gl-efass-reports", "status": "indexed"},
-			"lakehouse":  map[string]string{"table": "efass_reports_iceberg", "status": "written"},
-			"redis":      map[string]string{"key": fmt.Sprintf("efass:%s:%s", tenantID, period), "ttl": "3600s"},
-		},
+		"source": "postgres: trialBalances + efassMapping",
+		"outbox": map[string]string{"id": outboxID, "status": "pending", "topic": "gl.efass.generated"},
 		"cbn_compliance": map[string]interface{}{
 			"car_compliant":       totals.CAR >= 10.0,
 			"liquidity_compliant": totals.LiquidityRatio >= 30.0,
@@ -531,101 +567,135 @@ func (app *App) listTrialBalance(w http.ResponseWriter, r *http.Request) {
 		tenantID = "tenant-lagos-main"
 	}
 
-	if app.db != nil {
-		query := `SELECT "trialBalanceId", "tenantId", "glAccountCode", "periodStart", "periodEnd",
-			"opening_balance_kobo", "total_debits_kobo", "total_credits_kobo", "closing_balance_kobo", "currency", "status"
-			FROM "trialBalances" WHERE "tenantId" = $1`
-		args := []interface{}{tenantID}
-		if period != "" {
-			query += ` AND TO_CHAR("periodEnd", 'YYYY-MM') = $2`
-			args = append(args, period)
-		}
-		query += ` ORDER BY "glAccountCode"`
+	if app.db == nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable"})
+		return
+	}
 
-		rows, err := app.db.Query(query, args...)
+	query := `SELECT "trialBalanceId", "tenantId", "glAccountCode", "periodStart", "periodEnd",
+		"opening_balance_kobo", "total_debits_kobo", "total_credits_kobo", "closing_balance_kobo", "currency", "status"
+		FROM "trialBalances" WHERE "tenantId" = $1`
+	args := []interface{}{tenantID}
+	if period != "" {
+		query += ` AND TO_CHAR("periodEnd", 'YYYY-MM') = $2`
+		args = append(args, period)
+	}
+	query += ` ORDER BY "glAccountCode"`
+
+	rows, err := app.db.Query(query, args...)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_query_failed", "detail": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var balances []TrialBalance
+	for rows.Next() {
+		var tb TrialBalance
+		if err := rows.Scan(&tb.TrialBalanceID, &tb.TenantID, &tb.GLAccountCode, &tb.PeriodStart,
+			&tb.PeriodEnd, &tb.OpeningBalanceKobo, &tb.TotalDebitsKobo, &tb.TotalCreditsKobo,
+			&tb.ClosingBalanceKobo, &tb.Currency, &tb.Status); err == nil {
+			balances = append(balances, tb)
+		}
+	}
+	writeJSON(w, 200, map[string]interface{}{"items": balances, "total": len(balances), "source": "postgres"})
+}
+
+// cbnReturns lists the CBN/NDIC/NFIU return catalogue. Status is NEVER
+// hardcoded "submitted": it comes from the cbn_return_filings table (written
+// only by a real filing workflow), defaulting to "draft" when no filing
+// record exists for the current period.
+func (app *App) cbnReturns(w http.ResponseWriter, r *http.Request) {
+	type returnDef struct {
+		Code, Name, Frequency, Regulator, Form string
+		DueDay                                 int
+	}
+	catalogue := []returnDef{
+		{"MBR-100", "eFASS Monthly Return - Balance Sheet Assets", "monthly", "CBN", "MBR100", 15},
+		{"MBR-200", "eFASS Monthly Return - Balance Sheet Liabilities", "monthly", "CBN", "MBR200", 15},
+		{"MBR-300", "eFASS Monthly Return - Shareholders Equity", "monthly", "CBN", "MBR300", 15},
+		{"MBR-400", "eFASS Monthly Return - Profit & Loss (Income)", "monthly", "CBN", "MBR400", 15},
+		{"MBR-500", "eFASS Monthly Return - Profit & Loss (Expenses)", "monthly", "CBN", "MBR500", 15},
+		{"MBR-600", "Capital Adequacy Return (CAR)", "monthly", "CBN", "MBR600", 15},
+		{"MBR-700", "Liquidity Ratio Return", "monthly", "CBN", "MBR700", 15},
+		{"MBR-800", "Sectoral Credit Allocation", "monthly", "CBN", "MBR800", 15},
+		{"MBR-900", "Maturity Mismatch Report", "monthly", "CBN", "MBR900", 15},
+		{"PRGL-A", "Prudential Return - Form A (Assets)", "monthly", "CBN", "PRGL-A", 10},
+		{"PRGL-B", "Prudential Return - Form B (Liabilities)", "monthly", "CBN", "PRGL-B", 10},
+		{"NDIC-PA", "NDIC Premium Assessment", "monthly", "NDIC", "NDIC-PA", 20},
+		{"LER", "Large Exposures Return", "monthly", "CBN", "LER", 15},
+		{"CLR", "Connected Lending Return", "monthly", "CBN", "CLR", 15},
+		{"SOL", "Single Obligor Limit Return", "monthly", "CBN", "SOL", 15},
+		{"IRR", "Interest Rate Return", "monthly", "CBN", "IRR", 15},
+		{"FCE", "Foreign Currency Exposure", "monthly", "CBN", "FCE", 15},
+		{"SLR", "Staff Loan Return", "monthly", "CBN", "SLR", 20},
+		{"AMCON", "AMCON Contribution Return", "monthly", "AMCON", "AMCON", 15},
+		{"FFR", "Fraud & Forgery Return", "monthly", "CBN", "FFR", 15},
+		{"CTR", "Currency Transaction Report (₦5M+)", "daily", "NFIU", "CTR", 1},
+		{"STR", "Suspicious Transaction Report", "as_needed", "NFIU", "STR", 3},
+		{"PEP", "PEP Screening Return", "monthly", "CBN", "PEP", 15},
+		{"SCUML", "SCUML Registration Update", "monthly", "SCUML", "SCUML", 15},
+		{"NSFR", "Basel III Net Stable Funding Ratio", "monthly", "CBN", "NSFR", 20},
+		{"LCR", "Basel III Liquidity Coverage Ratio", "monthly", "CBN", "LCR", 20},
+	}
+
+	// Actual filing statuses, if a real filing workflow has recorded them.
+	filedStatus := map[string]string{}
+	if app.db != nil {
+		rows, err := app.db.Query(`SELECT return_code, status FROM cbn_return_filings WHERE period = TO_CHAR(NOW(), 'YYYY-MM')`)
 		if err == nil {
 			defer rows.Close()
-			var balances []TrialBalance
 			for rows.Next() {
-				var tb TrialBalance
-				rows.Scan(&tb.TrialBalanceID, &tb.TenantID, &tb.GLAccountCode, &tb.PeriodStart,
-					&tb.PeriodEnd, &tb.OpeningBalanceKobo, &tb.TotalDebitsKobo, &tb.TotalCreditsKobo,
-					&tb.ClosingBalanceKobo, &tb.Currency, &tb.Status)
-				balances = append(balances, tb)
+				var code, status string
+				if rows.Scan(&code, &status) == nil {
+					filedStatus[code] = status
+				}
 			}
-			writeJSON(w, 200, map[string]interface{}{"items": balances, "total": len(balances), "source": "postgres"})
-			return
 		}
 	}
 
-	writeJSON(w, 200, map[string]interface{}{"items": []interface{}{}, "total": 0, "source": "no_db"})
-}
-
-func (app *App) cbnReturns(w http.ResponseWriter, r *http.Request) {
-	// All 20+ CBN monthly returns with status
-	returns := []map[string]interface{}{
-		{"code": "MBR-100", "name": "eFASS Monthly Return - Balance Sheet Assets", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR100"},
-		{"code": "MBR-200", "name": "eFASS Monthly Return - Balance Sheet Liabilities", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR200"},
-		{"code": "MBR-300", "name": "eFASS Monthly Return - Shareholders Equity", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR300"},
-		{"code": "MBR-400", "name": "eFASS Monthly Return - Profit & Loss (Income)", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR400"},
-		{"code": "MBR-500", "name": "eFASS Monthly Return - Profit & Loss (Expenses)", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR500"},
-		{"code": "MBR-600", "name": "Capital Adequacy Return (CAR)", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR600"},
-		{"code": "MBR-700", "name": "Liquidity Ratio Return", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR700"},
-		{"code": "MBR-800", "name": "Sectoral Credit Allocation", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR800"},
-		{"code": "MBR-900", "name": "Maturity Mismatch Report", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "MBR900"},
-		{"code": "PRGL-A", "name": "Prudential Return - Form A (Assets)", "frequency": "monthly", "dueDay": 10, "status": "submitted", "regulator": "CBN", "form": "PRGL-A"},
-		{"code": "PRGL-B", "name": "Prudential Return - Form B (Liabilities)", "frequency": "monthly", "dueDay": 10, "status": "submitted", "regulator": "CBN", "form": "PRGL-B"},
-		{"code": "NDIC-PA", "name": "NDIC Premium Assessment", "frequency": "monthly", "dueDay": 20, "status": "submitted", "regulator": "NDIC", "form": "NDIC-PA"},
-		{"code": "LER", "name": "Large Exposures Return", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "LER"},
-		{"code": "CLR", "name": "Connected Lending Return", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "CLR"},
-		{"code": "SOL", "name": "Single Obligor Limit Return", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "SOL"},
-		{"code": "IRR", "name": "Interest Rate Return", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "IRR"},
-		{"code": "FCE", "name": "Foreign Currency Exposure", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "FCE"},
-		{"code": "SLR", "name": "Staff Loan Return", "frequency": "monthly", "dueDay": 20, "status": "submitted", "regulator": "CBN", "form": "SLR"},
-		{"code": "AMCON", "name": "AMCON Contribution Return", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "AMCON", "form": "AMCON"},
-		{"code": "FFR", "name": "Fraud & Forgery Return", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "FFR"},
-		{"code": "CTR", "name": "Currency Transaction Report (₦5M+)", "frequency": "daily", "dueDay": 1, "status": "submitted", "regulator": "NFIU", "form": "CTR"},
-		{"code": "STR", "name": "Suspicious Transaction Report", "frequency": "as_needed", "dueDay": 3, "status": "submitted", "regulator": "NFIU", "form": "STR"},
-		{"code": "PEP", "name": "PEP Screening Return", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "CBN", "form": "PEP"},
-		{"code": "SCUML", "name": "SCUML Registration Update", "frequency": "monthly", "dueDay": 15, "status": "submitted", "regulator": "SCUML", "form": "SCUML"},
-		{"code": "NSFR", "name": "Basel III Net Stable Funding Ratio", "frequency": "monthly", "dueDay": 20, "status": "submitted", "regulator": "CBN", "form": "NSFR"},
-		{"code": "LCR", "name": "Basel III Liquidity Coverage Ratio", "frequency": "monthly", "dueDay": 20, "status": "submitted", "regulator": "CBN", "form": "LCR"},
+	returns := make([]map[string]interface{}, 0, len(catalogue))
+	for _, d := range catalogue {
+		status := "draft" // never claim "submitted" without a real filing record
+		if s, ok := filedStatus[d.Code]; ok && s != "" {
+			status = s
+		}
+		returns = append(returns, map[string]interface{}{
+			"code": d.Code, "name": d.Name, "frequency": d.Frequency,
+			"dueDay": d.DueDay, "status": status, "regulator": d.Regulator, "form": d.Form,
+		})
 	}
 
 	writeJSON(w, 200, map[string]interface{}{
 		"items":        returns,
 		"total":        len(returns),
+		"statusSource": "cbn_return_filings (default draft when no real filing exists)",
 		"glDataSource": "trialBalances → efassMapping → report",
-		"pipeline": map[string]string{
-			"step1": "Journal entries posted to glAccounts via double-entry",
-			"step2": "Period-close aggregates JEs into trialBalances",
-			"step3": "efassMapping maps GL codes to MBR form lines",
-			"step4": "Report generated from trial balance by mapping",
-			"step5": "eFASS XML/XLSX generated and submitted to CBN portal",
-		},
 	})
 }
 
 func (app *App) efassMapping(w http.ResponseWriter, r *http.Request) {
-	if app.db != nil {
-		rows, err := app.db.Query(`SELECT "glCodeStart", "glCodeEnd", "mbrForm", "mbrLine", "lineName", "reportCategory", "cbnCode" FROM "efassMapping" ORDER BY "mbrForm", "mbrLine"`)
-		if err == nil {
-			defer rows.Close()
-			var mappings []map[string]interface{}
-			for rows.Next() {
-				var start, end, form, name, cat, code string
-				var line int
-				rows.Scan(&start, &end, &form, &line, &name, &cat, &code)
-				mappings = append(mappings, map[string]interface{}{
-					"glCodeStart": start, "glCodeEnd": end, "mbrForm": form,
-					"mbrLine": line, "lineName": name, "reportCategory": cat, "cbnCode": code,
-				})
-			}
-			writeJSON(w, 200, map[string]interface{}{"items": mappings, "total": len(mappings)})
-			return
+	if app.db == nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable"})
+		return
+	}
+	rows, err := app.db.Query(`SELECT "glCodeStart", "glCodeEnd", "mbrForm", "mbrLine", "lineName", "reportCategory", "cbnCode" FROM "efassMapping" ORDER BY "mbrForm", "mbrLine"`)
+	if err != nil {
+		writeJSON(w, 503, map[string]string{"error": "gl_store_query_failed", "detail": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var mappings []map[string]interface{}
+	for rows.Next() {
+		var start, end, form, name, cat, code string
+		var line int
+		if err := rows.Scan(&start, &end, &form, &line, &name, &cat, &code); err == nil {
+			mappings = append(mappings, map[string]interface{}{
+				"glCodeStart": start, "glCodeEnd": end, "mbrForm": form,
+				"mbrLine": line, "lineName": name, "reportCategory": cat, "cbnCode": code,
+			})
 		}
 	}
-	writeJSON(w, 200, map[string]interface{}{"items": []interface{}{}, "total": 0})
+	writeJSON(w, 200, map[string]interface{}{"items": mappings, "total": len(mappings), "source": "postgres"})
 }
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
@@ -636,49 +706,401 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-// ngnToKobo converts a NGN amount to kobo. Only for seed/sample data initialisation.
+// ngnToKobo converts a NGN amount to kobo. Only for seed/demo initialisation.
 func ngnToKobo(ngn int64) int64 { return ngn * 100 }
+
+// ─── DEMO SEED DATA (NEVER served on request paths) ─────────────────────────
+//
+// The sample CoA/EFASS generators below exist ONLY to seed a DEMO tenant into
+// Postgres when the operator explicitly sets SEED_DEMO=true. They are never
+// used as a response fallback. Demo rows are tagged tenantId "DEMO".
 
 func getSampleCoA() []GLAccount {
 	return []GLAccount{
-		{GLAccountCode: "1001", Name: "Cash in Vault - Local Currency", Category: "asset", Subcategory: "cash", BalanceKobo: ngnToKobo(2_850_000_000)},
-		{GLAccountCode: "1005", Name: "Cash Reserve Requirement (CRR)", Category: "asset", Subcategory: "cash_cbn", BalanceKobo: ngnToKobo(18_500_000_000)},
-		{GLAccountCode: "1201", Name: "Treasury Bills (NTBs)", Category: "asset", Subcategory: "investments_govt", BalanceKobo: ngnToKobo(25_000_000_000)},
-		{GLAccountCode: "1301", Name: "Overdrafts - Corporate", Category: "asset", Subcategory: "loans_corporate", BalanceKobo: ngnToKobo(28_000_000_000)},
-		{GLAccountCode: "2101", Name: "Demand Deposits - Current Accounts", Category: "liability", Subcategory: "deposits_demand", BalanceKobo: ngnToKobo(85_000_000_000)},
-		{GLAccountCode: "2102", Name: "Savings Deposits", Category: "liability", Subcategory: "deposits_savings", BalanceKobo: ngnToKobo(45_000_000_000)},
-		{GLAccountCode: "3002", Name: "Issued & Paid-up Capital", Category: "equity", Subcategory: "share_capital", BalanceKobo: ngnToKobo(25_000_000_000)},
-		{GLAccountCode: "4101", Name: "Interest on Loans - Corporate", Category: "income", Subcategory: "interest_loans", BalanceKobo: ngnToKobo(18_500_000_000)},
-		{GLAccountCode: "5101", Name: "Interest on Deposits - Savings", Category: "expense", Subcategory: "interest_deposits", BalanceKobo: ngnToKobo(3_500_000_000)},
-		{GLAccountCode: "5301", Name: "Staff Costs - Salaries", Category: "expense", Subcategory: "staff_costs", BalanceKobo: ngnToKobo(12_000_000_000)},
+		{GLAccountCode: "1001", Name: "DEMO Cash in Vault - Local Currency", Category: "asset", Subcategory: "cash", BalanceKobo: ngnToKobo(2_850_000_000)},
+		{GLAccountCode: "1005", Name: "DEMO Cash Reserve Requirement (CRR)", Category: "asset", Subcategory: "cash_cbn", BalanceKobo: ngnToKobo(18_500_000_000)},
+		{GLAccountCode: "1201", Name: "DEMO Treasury Bills (NTBs)", Category: "asset", Subcategory: "investments_govt", BalanceKobo: ngnToKobo(25_000_000_000)},
+		{GLAccountCode: "2101", Name: "DEMO Demand Deposits - Current Accounts", Category: "liability", Subcategory: "deposits_demand", BalanceKobo: ngnToKobo(85_000_000_000)},
+		{GLAccountCode: "3002", Name: "DEMO Issued & Paid-up Capital", Category: "equity", Subcategory: "share_capital", BalanceKobo: ngnToKobo(25_000_000_000)},
 	}
 }
 
-func getSampleEFASSLines() []EFASSLine {
-	return []EFASSLine{
-		{MBRForm: "MBR100", MBRLine: 1, LineName: "Cash & Balances with Central Bank", ReportCategory: "assets", AmountKobo: ngnToKobo(28_950_000_000), CBNCode: "BS-A-001"},
-		{MBRForm: "MBR100", MBRLine: 2, LineName: "Due from Banks", ReportCategory: "assets", AmountKobo: ngnToKobo(45_500_000_000), CBNCode: "BS-A-002"},
-		{MBRForm: "MBR100", MBRLine: 3, LineName: "Investment Securities", ReportCategory: "assets", AmountKobo: ngnToKobo(75_300_000_000), CBNCode: "BS-A-003"},
-		{MBRForm: "MBR100", MBRLine: 4, LineName: "Loans and Advances (Gross)", ReportCategory: "assets", AmountKobo: ngnToKobo(152_000_000_000), CBNCode: "BS-A-004"},
-		{MBRForm: "MBR100", MBRLine: 5, LineName: "Less: Allowance for Loan Losses", ReportCategory: "assets", AmountKobo: -ngnToKobo(14_000_000_000), CBNCode: "BS-A-005"},
-		{MBRForm: "MBR200", MBRLine: 1, LineName: "Deposits from Customers", ReportCategory: "liabilities", AmountKobo: ngnToKobo(211_200_000_000), CBNCode: "BS-L-001"},
-		{MBRForm: "MBR200", MBRLine: 2, LineName: "Due to Banks & Borrowings", ReportCategory: "liabilities", AmountKobo: ngnToKobo(39_000_000_000), CBNCode: "BS-L-002"},
-		{MBRForm: "MBR300", MBRLine: 1, LineName: "Share Capital", ReportCategory: "equity", AmountKobo: ngnToKobo(40_000_000_000), CBNCode: "BS-E-001"},
-		{MBRForm: "MBR300", MBRLine: 3, LineName: "Reserves", ReportCategory: "equity", AmountKobo: ngnToKobo(28_900_000_000), CBNCode: "BS-E-003"},
-		{MBRForm: "MBR400", MBRLine: 1, LineName: "Interest & Similar Income", ReportCategory: "income", AmountKobo: ngnToKobo(37_330_000_000), CBNCode: "PL-I-001"},
-		{MBRForm: "MBR400", MBRLine: 2, LineName: "Fees & Commission Income", ReportCategory: "income", AmountKobo: ngnToKobo(15_770_000_000), CBNCode: "PL-I-002"},
-		{MBRForm: "MBR500", MBRLine: 1, LineName: "Interest & Similar Expense", ReportCategory: "expenses", AmountKobo: ngnToKobo(15_000_000_000), CBNCode: "PL-E-001"},
-		{MBRForm: "MBR500", MBRLine: 3, LineName: "Operating Expenses", ReportCategory: "expenses", AmountKobo: ngnToKobo(28_000_000_000), CBNCode: "PL-E-003"},
+// seedDemoData inserts clearly-labelled DEMO rows. Called from main() only
+// when SEED_DEMO=true.
+func (app *App) seedDemoData() {
+	if app.db == nil {
+		log.Printf("[gl-engine-go] SEED_DEMO=true but postgres unavailable; cannot seed")
+		return
 	}
+	log.Printf("[gl-engine-go] WARNING: SEED_DEMO=true — inserting DEMO chart of accounts (tenantId=DEMO). Never enable in production.")
+	for _, a := range getSampleCoA() {
+		if _, err := app.db.Exec(`INSERT INTO "glAccounts"
+			("glAccountCode", "tenantId", "name", "category", "subcategory", "currency", "balance_kobo", "status", "isControlAccount")
+			VALUES ($1, 'DEMO', $2, $3, $4, 'NGN', $5, 'active', 0)
+			ON CONFLICT ("glAccountCode", "tenantId") DO NOTHING`,
+			a.GLAccountCode, a.Name, a.Category, a.Subcategory, a.BalanceKobo); err != nil {
+			log.Printf("[gl-engine-go] demo seed failed for %s: %v", a.GLAccountCode, err)
+		}
+	}
+}
+
+// ── MIDDLEWARE: JWT Validation (JWKS / RS256) ───────────────────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func jwtRealmURL() string {
+	return getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
+	go func() {
+		for range time.Tick(5 * time.Minute) {
+			fetchJWKS(jwtRealmURL())
+		}
+	}()
+}
+
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + expiry). Fail-closed: no token is accepted on structure
+// alone.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":"gl-engine-go"}`)
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"malformed token","service":"gl-engine-go"}`)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
+//
+// gl-engine's outbox schema: (id, topic, key, payload, idempotency_key,
+// created_at, status['pending'|'published']). Rows are marked 'published'
+// ONLY after a confirmed Kafka produce; failures stay 'pending' for retry.
+
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
+
+func (app *App) startOutboxRelay(ctx context.Context, brokers string) {
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				app.relayOutbox(brokers)
+			}
+		}
+	}()
+}
+
+func (app *App) relayOutbox(brokers string) {
+	if app.db == nil {
+		return
+	}
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain pending for retry", err)
+		return
+	}
+	rows, err := app.db.Query(`SELECT id, topic, key, payload FROM outbox WHERE status = 'pending' ORDER BY created_at LIMIT 100`)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	var publishedIDs []string
+	for rows.Next() {
+		var id, topic, key string
+		var payload []byte
+		if err := rows.Scan(&id, &topic, &key, &payload); err != nil {
+			continue
+		}
+		msg := &sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(key),
+			Value: sarama.ByteEncoder(payload),
+		}
+		if _, _, err := producer.SendMessage(msg); err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving pending for retry", id, err)
+			continue
+		}
+		publishedIDs = append(publishedIDs, id)
+	}
+	for _, id := range publishedIDs {
+		if _, err := app.db.Exec(`UPDATE outbox SET status = 'published' WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
+	}
+	if len(publishedIDs) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka", len(publishedIDs))
+	}
+}
+
+// --- Rate Limiting ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64 = 0
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// --- Production Hardening ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+var appInstance *App
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	if appInstance != nil {
+		appInstance.health(w, r)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "healthy", "service": "gl-engine-go"})
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if appInstance == nil || appInstance.db == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": "database not initialized"})
+		return
+	}
+	if err := appInstance.db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"gl-engine-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"gl-engine-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"gl-engine-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// listHandler lists GL accounts (used by tests and /v1/gl/accounts alias).
+func listHandler(w http.ResponseWriter, r *http.Request) {
+	if appInstance == nil {
+		writeJSON(w, 503, map[string]string{"error": "not initialized"})
+		return
+	}
+	appInstance.listGLAccounts(w, r)
 }
 
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
 func main() {
 	app := NewApp()
+	appInstance = app
+
+	if os.Getenv("SEED_DEMO") == "true" {
+		app.seedDemoData()
+	}
+
+	startJWKSRefresh()
+
+	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	app.startOutboxRelay(relayCtx, kafkaBrokers)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", app.health)
+	mux.HandleFunc("/health", app.health)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+	})
+	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/v1/gl/accounts", app.listGLAccounts)
 	mux.HandleFunc("/v1/gl/journal", app.postJournal)
 	mux.HandleFunc("/v1/gl/trial-balance", app.listTrialBalance)
@@ -687,11 +1109,16 @@ func main() {
 	mux.HandleFunc("/v1/gl/efass/mapping", app.efassMapping)
 	mux.HandleFunc("/v1/gl/cbn-returns", app.cbnReturns)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8090"
+	port := getEnv("PORT", "8090")
+
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
-	log.Printf("GL Engine (Go) listening on :%s — 14 middleware connected", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Printf("GL Engine (Go) listening on :%s", port)
+	log.Fatal(server.ListenAndServe())
 }
