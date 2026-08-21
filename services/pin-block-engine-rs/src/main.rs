@@ -4,6 +4,14 @@ use serde_json::json;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use pbkdf2::pbkdf2_hmac;
+use rand::RngCore;
+use sha2::Sha256;
+
+const PBKDF2_ITERATIONS: u32 = 310_000;
+const SALT_LEN: usize = 16;
+const HASH_LEN: usize = 32;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct PinBlock {
     id: String,
@@ -56,42 +64,49 @@ struct AppState {
 
 impl AppState {
     fn new() -> Self {
-        let blocks = vec![
-            PinBlock {
-                id: "PB-001".into(), format: "ISO-0".into(),
-                pan_truncated: "****5678".into(), block_hex: "0412AC7B3E8F0000".into(),
-                algorithm: "3DES".into(), key_id: "ZPK-001".into(),
-                created_at: "2026-05-09T10:30:00Z".into(),
-            },
-            PinBlock {
-                id: "PB-002".into(), format: "ISO-3".into(),
-                pan_truncated: "****9012".into(), block_hex: "3417D2A4F9C10000".into(),
-                algorithm: "AES-256".into(), key_id: "ZPK-002".into(),
-                created_at: "2026-05-09T11:15:00Z".into(),
-            },
-        ];
-        let hashes = vec![
-            PinHashRecord {
-                id: "PH-001".into(), account_number: "0012345678".into(),
-                algorithm: "PBKDF2-SHA256".into(),
-                hash_hex: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8".into(),
-                salt: "a3f9c2b1e8d47056".into(), iterations: 310000,
-                created_at: "2026-05-09T10:00:00Z".into(),
-            },
-            PinHashRecord {
-                id: "PH-002".into(), account_number: "3034567890".into(),
-                algorithm: "Argon2id".into(),
-                hash_hex: "7b94d4e2f1a80c63b9e5d02741f8a9c3d6b2e7f4a1c8d5b3e0f7a2c9d6b4e1f8".into(),
-                salt: "c7d3e9f2a4b6c8d1".into(), iterations: 3,
-                created_at: "2026-05-09T11:00:00Z".into(),
-            },
-        ];
+        // No seeded/fake records: state starts empty and only real operations populate it.
         AppState {
             start_time: Instant::now(),
-            pin_blocks: Arc::new(RwLock::new(blocks)),
-            pin_hashes: Arc::new(RwLock::new(hashes)),
+            pin_blocks: Arc::new(RwLock::new(Vec::new())),
+            pin_hashes: Arc::new(RwLock::new(Vec::new())),
         }
     }
+}
+
+fn now_utc() -> String {
+    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 { return None; }
+    (0..s.len()).step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
+/// Constant-time byte comparison to avoid timing oracles on PIN hashes.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// PBKDF2-HMAC-SHA256 with a cryptographically secure random salt.
+fn pbkdf2_hash_pin(pin: &str, salt: &[u8], iterations: u32) -> Vec<u8> {
+    let mut out = vec![0u8; HASH_LEN];
+    pbkdf2_hmac::<Sha256>(pin.as_bytes(), salt, iterations, &mut out);
+    out
+}
+
+fn valid_pin(pin: &str) -> bool {
+    pin.len() >= 4 && pin.len() <= 12 && pin.chars().all(|c| c.is_ascii_digit())
 }
 
 async fn healthz(state: web::Data<AppState>) -> HttpResponse {
@@ -99,12 +114,9 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
         "service": "pin-block-engine-rs",
         "status": "healthy",
         "uptime_secs": state.start_time.elapsed().as_secs(),
-        "capabilities": ["iso-0-format", "iso-3-format", "3des-encryption", "aes256-encryption",
-                         "pbkdf2-hashing", "argon2id-hashing", "pin-verification"],
-        "middleware": {
-            "postgres": "pin_security_db",
-            "redis": "pin-block-engine_cache",
-            "temporal": "PinBlockWorkflow"
+        "capabilities": ["pbkdf2-hmac-sha256-hashing", "pin-verification"],
+        "hsm": {
+            "pin_block_encoding": "unavailable — no HSM/3DES backend configured; /v1/pin/blocks/encode fails closed with 503"
         }
     }))
 }
@@ -114,21 +126,25 @@ async fn list_blocks(state: web::Data<AppState>) -> HttpResponse {
     HttpResponse::Ok().json(json!({"items": *blocks, "total": blocks.len()}))
 }
 
-async fn encode_pin_block(state: web::Data<AppState>, body: web::Json<EncodeRequest>) -> HttpResponse {
+async fn encode_pin_block(_state: web::Data<AppState>, body: web::Json<EncodeRequest>) -> HttpResponse {
+    // Validate inputs, then fail closed: there is no HSM/3DES backend in this
+    // service, so a real ISO-0/ISO-3 PIN block cannot be produced. Returning a
+    // fabricated block would be a security-critical fake, so we return 503.
     let format = body.format.clone().unwrap_or_else(|| "ISO-0".into());
-    let key_id = body.key_id.clone().unwrap_or_else(|| "ZPK-001".into());
-    let pan_last4 = &body.pan[body.pan.len().saturating_sub(4)..];
-    let block = PinBlock {
-        id: format!("PB-{:03}", state.pin_blocks.read().unwrap().len() + 1),
-        format: format.clone(),
-        pan_truncated: format!("****{}", pan_last4),
-        block_hex: format!("{:016X}", body.pin.len() as u64 * 0x0412AC7B3E8F),
-        algorithm: if key_id.contains("ZPK-002") { "AES-256".into() } else { "3DES".into() },
-        key_id: key_id.clone(),
-        created_at: "2026-05-20T00:00:00Z".into(),
-    };
-    state.pin_blocks.write().unwrap().push(block.clone());
-    HttpResponse::Created().json(json!({"id": block.id, "format": block.format, "keyId": key_id, "encoded": true}))
+    if format != "ISO-0" && format != "ISO-3" {
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "unsupported_pin_block_format"}));
+    }
+    if body.pan.len() < 12 || !body.pan.chars().all(|c| c.is_ascii_digit()) {
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "invalid_pan"}));
+    }
+    if !valid_pin(&body.pin) {
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "invalid_pin"}));
+    }
+    HttpResponse::ServiceUnavailable().json(json!({
+        "error": "hsm_unavailable",
+        "detail": "PIN block encoding requires an HSM (3DES/AES under ZPK); no HSM backend is configured",
+        "encoded": false
+    }))
 }
 
 async fn list_hashes(state: web::Data<AppState>) -> HttpResponse {
@@ -137,27 +153,57 @@ async fn list_hashes(state: web::Data<AppState>) -> HttpResponse {
 }
 
 async fn hash_pin(state: web::Data<AppState>, body: web::Json<HashRequest>) -> HttpResponse {
+    if !valid_pin(&body.pin) {
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "invalid_pin", "detail": "PIN must be 4-12 ASCII digits"}));
+    }
     let algo = body.algorithm.clone().unwrap_or_else(|| "PBKDF2-SHA256".into());
+    if algo != "PBKDF2-SHA256" {
+        return HttpResponse::UnprocessableEntity().json(json!({"error": "unsupported_algorithm", "supported": ["PBKDF2-SHA256"]}));
+    }
+    let mut salt = [0u8; SALT_LEN];
+    rand::rngs::OsRng.fill_bytes(&mut salt);
+    let hash = pbkdf2_hash_pin(&body.pin, &salt, PBKDF2_ITERATIONS);
     let rec = PinHashRecord {
-        id: format!("PH-{:03}", state.pin_hashes.read().unwrap().len() + 1),
+        id: format!("PH-{}", uuid::Uuid::new_v4()),
         account_number: body.account_number.clone(),
         algorithm: algo.clone(),
-        hash_hex: format!("{:064x}", body.pin.len() as u128 * 0x5e884898da28047151d0e56f8dc62927u128),
-        salt: "generated_salt_hex".into(),
-        iterations: if algo == "Argon2id" { 3 } else { 310000 },
-        created_at: "2026-05-20T00:00:00Z".into(),
+        hash_hex: hex_encode(&hash),
+        salt: hex_encode(&salt),
+        iterations: PBKDF2_ITERATIONS,
+        created_at: now_utc(),
     };
     state.pin_hashes.write().unwrap().push(rec.clone());
     HttpResponse::Created().json(json!({"id": rec.id, "algorithm": algo, "hashStored": true}))
 }
 
 async fn verify_pin(state: web::Data<AppState>, body: web::Json<VerifyRequest>) -> HttpResponse {
-    let hashes = state.pin_hashes.read().unwrap();
-    let found = hashes.iter().any(|h| h.id == body.hash_id);
-    if !found {
-        return HttpResponse::NotFound().json(json!({"error": "hash record not found"}));
+    if !valid_pin(&body.pin) {
+        // Fail closed: an invalid candidate PIN is never verified.
+        return HttpResponse::Ok().json(json!({"hashId": body.hash_id, "verified": false, "reason": "invalid_pin_format"}));
     }
-    HttpResponse::Ok().json(json!({"hashId": body.hash_id, "verified": true, "matchedAt": "2026-05-20T00:00:00Z"}))
+    let rec = {
+        let hashes = state.pin_hashes.read().unwrap();
+        hashes.iter().find(|h| h.id == body.hash_id).cloned()
+    };
+    let rec = match rec {
+        Some(r) => r,
+        None => return HttpResponse::NotFound().json(json!({"error": "hash record not found"})),
+    };
+    let salt = match hex_decode(&rec.salt) {
+        Some(s) => s,
+        None => return HttpResponse::InternalServerError().json(json!({"error": "corrupt_hash_record"})),
+    };
+    let expected = match hex_decode(&rec.hash_hex) {
+        Some(h) => h,
+        None => return HttpResponse::InternalServerError().json(json!({"error": "corrupt_hash_record"})),
+    };
+    let actual = pbkdf2_hash_pin(&body.pin, &salt, rec.iterations);
+    let verified = ct_eq(&actual, &expected);
+    HttpResponse::Ok().json(json!({
+        "hashId": body.hash_id,
+        "verified": verified,
+        "matchedAt": if verified { json!(now_utc()) } else { json!(null) },
+    }))
 }
 
 async fn get_stats(state: web::Data<AppState>) -> HttpResponse {
@@ -170,7 +216,6 @@ async fn get_stats(state: web::Data<AppState>) -> HttpResponse {
     HttpResponse::Ok().json(json!({
         "pinBlocksEncoded": blocks.len(),
         "pinHashesStored": hashes.len(),
-        "formatBreakdown": {"ISO-0": 1, "ISO-3": 1},
         "algorithmBreakdown": algo_counts,
     }))
 }
@@ -191,46 +236,4 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/pin/verify", web::post().to(verify_pin))
             .route("/v1/pin/stats", web::get().to(get_stats))
     }).bind(format!("0.0.0.0:{}", port))?.run().await
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }
