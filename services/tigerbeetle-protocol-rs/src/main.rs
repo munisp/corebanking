@@ -7,11 +7,12 @@ use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::env;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 #[derive(Clone)]
-struct AppState { start_time: Instant     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+struct AppState { start_time: Instant, db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -78,23 +79,89 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     }))
 }
 
-async fn list_accounts() -> HttpResponse {
-    let accounts = vec![
-        json!({"id": "TB-ACC-001", "ledger": 1, "code": 1001, "debitsPending": 0, "debitsPosted": 450000000000_u64, "creditsPending": 0, "creditsPosted": 500000000000_u64, "flags": ["debits_must_not_exceed_credits"], "description": "Customer Deposits Pool"}),
-        json!({"id": "TB-ACC-002", "ledger": 1, "code": 2001, "debitsPending": 0, "debitsPosted": 150000000000_u64, "creditsPending": 50000000000_u64, "creditsPosted": 200000000000_u64, "flags": [], "description": "Loan Disbursement Account"}),
-        json!({"id": "TB-ACC-003", "ledger": 2, "code": 4001, "debitsPending": 0, "debitsPosted": 0, "creditsPending": 0, "creditsPosted": 35000000000_u64, "flags": ["credits_must_not_exceed_debits"], "description": "Fee Income"}),
-        json!({"id": "TB-ACC-004", "ledger": 1, "code": 1101, "debitsPending": 0, "debitsPosted": 80000000000_u64, "creditsPending": 0, "creditsPosted": 75000000000_u64, "flags": [], "description": "NIBSS Clearing Account"}),
-    ];
-    HttpResponse::Ok().json(json!({"accounts": accounts, "total": 4}))
+// ─── TigerBeetle access policy ──────────────────────────────────────────────
+// Money movement MUST go through a real TigerBeetle cluster client. This
+// service has no TigerBeetle client dependency wired, so write endpoints
+// (create_transfer / commit_pending / void_pending) FAIL FAST with 503 rather
+// than fabricating posted/committed ledger results.
+// Read endpoints serve the Postgres CDC mirror tables (tb_accounts /
+// tb_transfers); when the mirror is unavailable they also fail fast with 503.
+fn tigerbeetle_unavailable() -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({
+        "success": false,
+        "error": "tigerbeetle_unavailable",
+        "detail": "no TigerBeetle cluster client is wired in this service; refusing to fabricate ledger postings",
+    }))
 }
 
-async fn list_transfers() -> HttpResponse {
-    let transfers = vec![
-        json!({"id": "TB-TXN-001", "debitAccountId": "TB-ACC-001", "creditAccountId": "TB-ACC-004", "amount": 50000000_u64, "ledger": 1, "code": 101, "flags": ["linked"], "status": "posted", "timestamp": "2026-05-09T14:30:00Z"}),
-        json!({"id": "TB-TXN-002", "debitAccountId": "TB-ACC-004", "creditAccountId": "TB-ACC-001", "amount": 45000000_u64, "ledger": 1, "code": 102, "flags": [], "status": "posted", "timestamp": "2026-05-09T14:31:00Z"}),
-        json!({"id": "TB-TXN-003", "debitAccountId": "TB-ACC-001", "creditAccountId": "TB-ACC-002", "amount": 25000000000_u64, "ledger": 1, "code": 201, "flags": ["two_phase_commit"], "pendingId": "TB-PEND-001", "status": "pending", "timestamp": "2026-05-09T15:00:00Z"}),
-    ];
-    HttpResponse::Ok().json(json!({"transfers": transfers, "total": 3}))
+async fn list_accounts(state: web::Data<AppState>) -> HttpResponse {
+    let client = match &state.db_client {
+        Some(c) => c.clone(),
+        None => return tigerbeetle_unavailable(),
+    };
+    let rows = client.query(
+        "SELECT id, ledger, code, debits_pending, debits_posted, credits_pending, credits_posted, flags, description FROM tb_accounts ORDER BY id",
+        &[],
+    ).await;
+    match rows {
+        Ok(rows) => {
+            let accounts: Vec<serde_json::Value> = rows.iter().map(|r| {
+                let flags: Vec<String> = r.get::<usize, Vec<String>>(7);
+                json!({
+                    "id": r.get::<usize, String>(0),
+                    "ledger": r.get::<usize, i32>(1),
+                    "code": r.get::<usize, i32>(2),
+                    "debitsPending": r.get::<usize, i64>(3),
+                    "debitsPosted": r.get::<usize, i64>(4),
+                    "creditsPending": r.get::<usize, i64>(5),
+                    "creditsPosted": r.get::<usize, i64>(6),
+                    "flags": flags,
+                    "description": r.get::<usize, String>(8),
+                })
+            }).collect();
+            HttpResponse::Ok().json(json!({"accounts": accounts, "total": accounts.len()}))
+        }
+        Err(e) => {
+            eprintln!("[tigerbeetle-protocol-rs] tb_accounts query failed: {}", e);
+            tigerbeetle_unavailable()
+        }
+    }
+}
+
+async fn list_transfers(state: web::Data<AppState>) -> HttpResponse {
+    let client = match &state.db_client {
+        Some(c) => c.clone(),
+        None => return tigerbeetle_unavailable(),
+    };
+    let rows = client.query(
+        "SELECT id, debit_account_id, credit_account_id, amount, ledger, code, flags, pending_id, status, created_at FROM tb_transfers ORDER BY created_at DESC LIMIT 500",
+        &[],
+    ).await;
+    match rows {
+        Ok(rows) => {
+            let transfers: Vec<serde_json::Value> = rows.iter().map(|r| {
+                let flags: Vec<String> = r.get::<usize, Vec<String>>(6);
+                let pending: Option<String> = r.get(7);
+                json!({
+                    "id": r.get::<usize, String>(0),
+                    "debitAccountId": r.get::<usize, String>(1),
+                    "creditAccountId": r.get::<usize, String>(2),
+                    "amount": r.get::<usize, i64>(3),
+                    "ledger": r.get::<usize, i32>(4),
+                    "code": r.get::<usize, i32>(5),
+                    "flags": flags,
+                    "pendingId": pending,
+                    "status": r.get::<usize, String>(8),
+                    "timestamp": r.get::<usize, String>(9),
+                })
+            }).collect();
+            HttpResponse::Ok().json(json!({"transfers": transfers, "total": transfers.len()}))
+        }
+        Err(e) => {
+            eprintln!("[tigerbeetle-protocol-rs] tb_transfers query failed: {}", e);
+            tigerbeetle_unavailable()
+        }
+    }
 }
 
 async fn create_transfer(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -102,15 +169,9 @@ async fn create_transfer(req: actix_web::HttpRequest, state: web::Data<AppState>
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let _ = sanitize_input("");
-    HttpResponse::Created().json(json!({
-        "success": true,
-        "transferId": format!("TB-TXN-{}", chrono_placeholder()),
-        "status": "posted",
-        "debitAccountId": body.get("debitAccountId"),
-        "creditAccountId": body.get("creditAccountId"),
-        "amount": body.get("amount"),
-    }))
+    // A transfer is money movement: without a real TigerBeetle client we must
+    // not pretend the ledger accepted it.
+    tigerbeetle_unavailable()
 }
 
 async fn commit_pending(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -118,25 +179,7 @@ async fn commit_pending(req: actix_web::HttpRequest, state: web::Data<AppState>,
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let _result_data = json!({"endpoint": "create_transfer"});
-    db_persist(&state, "create_transfer", &_result_data).await;
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("tigerbeetle-protocol-rs: upstream call ok"),
-        Err(e) => eprintln!("tigerbeetle-protocol-rs: upstream call failed: {}", e),
-    }
-    let _result_data = json!({"endpoint": "commit_pending"});
-    db_persist(&state, "commit_pending", &_result_data).await;
-
-
-    HttpResponse::Ok().json(json!({
-        "success": true,
-        "action": "commit",
-        "pendingId": body.get("pendingId"),
-        "status": "posted",
-        "twoPhaseResult": "committed"
-    }))
+    tigerbeetle_unavailable()
 }
 
 async fn void_pending(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -144,16 +187,7 @@ async fn void_pending(req: actix_web::HttpRequest, state: web::Data<AppState>, b
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let _result_data = json!({"endpoint": "void_pending"});
-    db_persist(&state, "void_pending", &_result_data).await;
-
-    HttpResponse::Ok().json(json!({
-        "success": true,
-        "action": "void",
-        "pendingId": body.get("pendingId"),
-        "status": "voided",
-        "twoPhaseResult": "voided"
-    }))
+    tigerbeetle_unavailable()
 }
 
 fn chrono_placeholder() -> String { format!("{:06}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_micros()) }
@@ -460,11 +494,11 @@ fn mtls_config() -> (bool, String, String, String) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8116".to_string());
-    let state = AppState { start_time: Instant::now() };
     println!("TigerBeetle Protocol Engine (Rust) on :{} — accounts + transfers + 2PC", port);
-        let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
-        start_grpc_server("tigerbeetle-protocol-rs", 10367);
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
+    let db_client = if !db_url.is_empty() { init_db(&db_url).await.map(std::sync::Arc::new) } else { None };
+    let state = AppState { start_time: Instant::now(), db_client };
+    start_grpc_server("tigerbeetle-protocol-rs", 10367);
     HttpServer::new(move || {
         App::new()
                 .wrap(
@@ -521,36 +555,26 @@ mod tests {
 
     #[test]
     fn test_healthz_exists() {
-        // Verify healthz compiles and is callable
-        // Domain function: healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse
         assert!(true, "healthz should be defined");
     }
 
     #[test]
     fn test_list_accounts_exists() {
-        // Verify list_accounts compiles and is callable
-        // Domain function: list_accounts() -> HttpResponse
         assert!(true, "list_accounts should be defined");
     }
 
     #[test]
     fn test_list_transfers_exists() {
-        // Verify list_transfers compiles and is callable
-        // Domain function: list_transfers() -> HttpResponse
         assert!(true, "list_transfers should be defined");
     }
 
     #[test]
     fn test_create_transfer_exists() {
-        // Verify create_transfer compiles and is callable
-        // Domain function: create_transfer(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse
         assert!(true, "create_transfer should be defined");
     }
 
     #[test]
     fn test_commit_pending_exists() {
-        // Verify commit_pending compiles and is callable
-        // Domain function: commit_pending(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse
         assert!(true, "commit_pending should be defined");
     }
     #[test]
@@ -568,46 +592,4 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }
