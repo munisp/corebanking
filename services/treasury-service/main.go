@@ -465,13 +465,21 @@ func (s *TreasuryServer) cancelFXDealHandler(w http.ResponseWriter, r *http.Requ
 
 func (s *TreasuryServer) getFXRatesHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	rates := s.fxService.GetFXRates(tenantID)
+	rates, err := s.fxService.GetFXRates(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"rates": rates})
 }
 
 func (s *TreasuryServer) getFXPnLHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r)
-	pnl := s.fxService.GetFXPnL(tenantID)
+	pnl, err := s.fxService.GetFXPnL(tenantID)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	respondJSON(w, http.StatusOK, pnl)
 }
 
