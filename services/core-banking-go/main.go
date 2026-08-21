@@ -457,7 +457,7 @@ func interestCalcHandler(w http.ResponseWriter, r *http.Request) {
 	jsonResp(w, 200, map[string]interface{}{"interest": math.Round(interest*100) / 100, "balance": req.Balance, "rate": req.Rate, "days": req.Days})
 }
 
-// ── Middleware ─────────────────────────────────────────────────────────────
+// ── Middleware ──────────────────────────────────────────────────────────────
 
 func countingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
