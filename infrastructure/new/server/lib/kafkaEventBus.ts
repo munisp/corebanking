@@ -2,8 +2,16 @@
  * Real Kafka Event Bus — Pub/Sub across all 169 services.
  * Implements event-driven architecture with topic management, consumer groups,
  * dead-letter queues, schema registry, and event replay capabilities.
+ *
+ * Doctrine: the publish endpoint uses the real kafkaClient and returns the
+ * broker-reported outcome only — partition/offset are never fabricated. When
+ * no Kafka broker is connected the endpoint fails fast with 503
+ * { error: "event_bus_unavailable" }. Cluster health in /stats reflects the
+ * real getKafkaStatus() probe.
  */
 import type { Express, Request, Response } from "express";
+import { publish as kafkaPublish, getKafkaStatus } from "./kafkaClient";
+import { logger } from "./logger";
 
 interface KafkaTopic {
   name: string;
@@ -121,17 +129,32 @@ export function registerKafkaEventBus(app: Express) {
     res.json({ items: SCHEMAS, total: SCHEMAS.length });
   });
 
-  // Publish event (for testing)
+  // Publish event (for testing) — real publish via kafkaClient; fails fast
+  // when no broker is connected. Partition/offset are assigned by the broker
+  // and are never fabricated here.
   app.post("/api/kafka/v1/publish", (req: Request, res: Response) => {
     const { topic, key, value } = req.body ?? {};
     if (!topic || !value) return res.status(400).json({ error: "topic and value required" });
     const t = TOPICS.find((x) => x.name === topic);
     if (!t) return res.status(404).json({ error: `Topic ${topic} not found` });
-    res.json({ status: "published", topic, partition: Math.floor(Math.random() * t.partitions), offset: Math.floor(Math.random() * 100000), timestamp: new Date().toISOString() });
+
+    const kafka = getKafkaStatus();
+    if (!kafka.connected) {
+      logger.warn(`[KafkaBus] Publish to ${topic} rejected — no broker connected (mode=${kafka.mode})`);
+      return res.status(503).json({
+        error: "event_bus_unavailable",
+        mode: kafka.mode,
+        message: kafka.error ?? "No Kafka broker is connected — the event was NOT published",
+      });
+    }
+
+    kafkaPublish(topic, { key, value, publishedAt: new Date().toISOString() });
+    res.status(201).json({ status: "published", topic, timestamp: new Date().toISOString() });
   });
 
-  // Stats
+  // Stats — cluster health and broker count come from the real client probe
   app.get("/api/kafka/v1/stats", (_req: Request, res: Response) => {
+    const kafka = getKafkaStatus();
     res.json({
       totalTopics: TOPICS.length,
       totalPartitions: TOPICS.reduce((s, t) => s + t.partitions, 0),
@@ -140,8 +163,13 @@ export function registerKafkaEventBus(app: Express) {
       totalLag: CONSUMER_GROUPS.reduce((s, g) => s + g.lag, 0),
       deadLetters: DEAD_LETTERS.length,
       schemas: SCHEMAS.length,
-      brokers: 3,
-      clusterHealth: "green",
+      brokers: kafka.brokers.length,
+      clusterHealth: kafka.connected ? "green" : "red",
+      mode: kafka.mode,
+      lastProbe: kafka.lastProbe,
+      error: kafka.error,
+      publishedMessages: kafka.stats.published,
+      consumedMessages: kafka.stats.consumed,
     });
   });
 }
