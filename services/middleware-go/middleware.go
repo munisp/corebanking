@@ -6,11 +6,15 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
@@ -414,6 +418,9 @@ type KeycloakClient struct {
 	introspectEndpoint string
 	jwksURI            string
 	httpClient         *http.Client
+	jwksMu             sync.Mutex
+	jwksKeys           map[string]*rsa.PublicKey
+	jwksFetchedAt      time.Time
 }
 
 func NewKeycloakClient() *KeycloakClient {
@@ -487,42 +494,138 @@ func (k *KeycloakClient) ValidateToken(token string) (*TokenClaims, error) {
 		}
 	}
 
-	// Offline JWT payload decode
+	// Offline path: only acceptable with an RS256 signature verified against the
+	// realm JWKS. If the signature cannot be verified, fail closed.
+	return k.verifyOfflineJWT(token)
+}
+
+type jwksKeySet struct {
+	Keys []struct {
+		Kty string `json:"kty"`
+		Kid string `json:"kid"`
+		Use string `json:"use"`
+		Alg string `json:"alg"`
+		N   string `json:"n"`
+		E   string `json:"e"`
+	} `json:"keys"`
+}
+
+// rsaKeyForKid returns the RSA public key for the given key ID, refreshing the
+// cached JWKS when stale or when the kid is unknown. Fails closed when the JWKS
+// endpoint is unavailable.
+func (k *KeycloakClient) rsaKeyForKid(kid string) (*rsa.PublicKey, error) {
+	k.jwksMu.Lock()
+	fresh := len(k.jwksKeys) > 0 && time.Since(k.jwksFetchedAt) < 5*time.Minute
+	cached, hit := k.jwksKeys[kid]
+	k.jwksMu.Unlock()
+	if fresh && hit {
+		return cached, nil
+	}
+	if k.jwksURI == "" {
+		return nil, fmt.Errorf("keycloak jwks_uri unavailable; cannot verify token offline")
+	}
+	resp, err := k.httpClient.Get(k.jwksURI)
+	if err != nil {
+		return nil, fmt.Errorf("fetch jwks: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch jwks: unexpected status %d", resp.StatusCode)
+	}
+	var set jwksKeySet
+	if err := json.NewDecoder(resp.Body).Decode(&set); err != nil {
+		return nil, fmt.Errorf("decode jwks: %w", err)
+	}
+	keys := make(map[string]*rsa.PublicKey, len(set.Keys))
+	for _, jk := range set.Keys {
+		if jk.Kty != "RSA" || jk.N == "" || jk.E == "" {
+			continue
+		}
+		nBytes, err := base64.RawURLEncoding.DecodeString(jk.N)
+		if err != nil {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(jk.E)
+		if err != nil {
+			continue
+		}
+		eInt := new(big.Int).SetBytes(eBytes)
+		if !eInt.IsInt64() || eInt.Int64() < 3 || eInt.Int64() > 1<<31 {
+			continue
+		}
+		keys[jk.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: int(eInt.Int64())}
+	}
+	k.jwksMu.Lock()
+	k.jwksKeys = keys
+	k.jwksFetchedAt = time.Now()
+	k.jwksMu.Unlock()
+	key, ok := keys[kid]
+	if !ok {
+		return nil, fmt.Errorf("no jwks key found for kid %q", kid)
+	}
+	return key, nil
+}
+
+// verifyOfflineJWT parses a JWT, verifies its RS256 signature against the
+// realm JWKS (kid-matched) and enforces expiration. Any failure is an error;
+// no claims are ever granted without a verified signature.
+func (k *KeycloakClient) verifyOfflineJWT(token string) (*TokenClaims, error) {
 	parts := strings.Split(token, ".")
-	if len(parts) == 3 {
-		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-		if err == nil {
-			var claims map[string]any
-			if json.Unmarshal(payload, &claims) == nil {
-				roles := []string{}
-				if ra, ok := claims["realm_access"].(map[string]any); ok {
-					if r, ok := ra["roles"].([]any); ok {
-						for _, role := range r {
-							roles = append(roles, fmt.Sprintf("%v", role))
-						}
-					}
-				}
-				if len(roles) == 0 {
-					roles = []string{"operator"}
-				}
-				expFloat, _ := claims["exp"].(float64)
-				return &TokenClaims{
-					Sub:       fmt.Sprintf("%v", claims["sub"]),
-					Email:     fmt.Sprintf("%v", claims["email"]),
-					Roles:     roles,
-					TenantID:  envOr("TENANT_ID", "54bank-platform-prod"),
-					ExpiresAt: int64(expFloat),
-				}, nil
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("malformed jwt: expected 3 segments")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("malformed jwt header: %w", err)
+	}
+	var header struct {
+		Alg string `json:"alg"`
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("malformed jwt header: %w", err)
+	}
+	if header.Alg != "RS256" {
+		return nil, fmt.Errorf("unsupported jwt alg %q", header.Alg)
+	}
+	key, err := k.rsaKeyForKid(header.Kid)
+	if err != nil {
+		return nil, fmt.Errorf("jwt key resolution failed: %w", err)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("malformed jwt signature: %w", err)
+	}
+	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, sum[:], sig); err != nil {
+		return nil, fmt.Errorf("jwt signature verification failed: %w", err)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("malformed jwt payload: %w", err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("malformed jwt claims: %w", err)
+	}
+	expFloat, ok := claims["exp"].(float64)
+	if !ok || time.Now().Unix() >= int64(expFloat) {
+		return nil, fmt.Errorf("jwt expired or missing exp claim")
+	}
+	roles := []string{}
+	if ra, ok := claims["realm_access"].(map[string]any); ok {
+		if r, ok := ra["roles"].([]any); ok {
+			for _, role := range r {
+				roles = append(roles, fmt.Sprintf("%v", role))
 			}
 		}
 	}
-
 	return &TokenClaims{
-		Sub:       "user-default",
-		Email:     "operator@54bank.app",
-		Roles:     []string{"operator", "admin"},
+		Sub:       fmt.Sprintf("%v", claims["sub"]),
+		Email:     fmt.Sprintf("%v", claims["email"]),
+		Roles:     roles,
 		TenantID:  envOr("TENANT_ID", "54bank-platform-prod"),
-		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		ExpiresAt: int64(expFloat),
 	}, nil
 }
 
@@ -584,7 +687,7 @@ func (p *PermifyClient) connect() {
 			return
 		}
 	}
-	log.Printf("[permify] Connection failed, using allow-all fallback")
+	log.Printf("[permify] Connection failed; permission checks will DENY by default (fail-closed)")
 }
 
 func (p *PermifyClient) doPost(path string, body any) (map[string]any, error) {
@@ -603,31 +706,37 @@ func (p *PermifyClient) doPost(path string, body any) (map[string]any, error) {
 	return result, nil
 }
 
+// Check evaluates a permission against Permify. It is fail-closed: any error
+// (Permify unreachable, HTTP error, malformed response) results in a denial
+// with a non-nil error.
 func (p *PermifyClient) Check(ctx context.Context, check PermissionCheck) (bool, error) {
-	if p.connected {
-		entityParts := strings.SplitN(check.Entity, ":", 2)
-		subParts := strings.SplitN(check.Subject, ":", 2)
-		entityType, entityID := entityParts[0], ""
-		if len(entityParts) > 1 {
-			entityID = entityParts[1]
-		}
-		subType, subID := subParts[0], ""
-		if len(subParts) > 1 {
-			subID = subParts[1]
-		}
-		result, err := p.doPost(fmt.Sprintf("/v1/tenants/%s/permissions/check", p.TenantID), map[string]any{
-			"metadata": map[string]any{"snap_token": "", "schema_version": "", "depth": 20},
-			"entity":   map[string]any{"type": entityType, "id": entityID},
-			"permission": check.Permission,
-			"subject":   map[string]any{"type": subType, "id": subID, "relation": ""},
-		})
-		if err == nil {
-			if can, ok := result["can"].(string); ok {
-				return can == "CHECK_RESULT_ALLOWED", nil
-			}
-		}
+	if !p.connected {
+		return false, fmt.Errorf("permify unavailable; denying permission %q on %q", check.Permission, check.Entity)
 	}
-	return true, nil // allow-all fallback
+	entityParts := strings.SplitN(check.Entity, ":", 2)
+	subParts := strings.SplitN(check.Subject, ":", 2)
+	entityType, entityID := entityParts[0], ""
+	if len(entityParts) > 1 {
+		entityID = entityParts[1]
+	}
+	subType, subID := subParts[0], ""
+	if len(subParts) > 1 {
+		subID = subParts[1]
+	}
+	result, err := p.doPost(fmt.Sprintf("/v1/tenants/%s/permissions/check", p.TenantID), map[string]any{
+		"metadata":   map[string]any{"snap_token": "", "schema_version": "", "depth": 20},
+		"entity":     map[string]any{"type": entityType, "id": entityID},
+		"permission": check.Permission,
+		"subject":    map[string]any{"type": subType, "id": subID, "relation": ""},
+	})
+	if err != nil {
+		return false, fmt.Errorf("permify check failed: %w", err)
+	}
+	can, ok := result["can"].(string)
+	if !ok {
+		return false, fmt.Errorf("permify check: malformed response (missing 'can')")
+	}
+	return can == "CHECK_RESULT_ALLOWED", nil
 }
 
 func (p *PermifyClient) WriteRelation(ctx context.Context, entity, relation, subject string) error {
@@ -674,11 +783,11 @@ func (p *PermifyClient) Health() string {
 // ── APISIX ─────────────────────────────────────────────────────────────────────
 
 type APISIXClient struct {
-	AdminURL   string
-	AdminKey   string
-	GatewayURL string
-	connected  bool
-	httpClient *http.Client
+	AdminURL    string
+	AdminKey    string
+	GatewayURL  string
+	connected   bool
+	httpClient  *http.Client
 	localRoutes map[string]RouteConfig
 	mu          sync.Mutex
 }
