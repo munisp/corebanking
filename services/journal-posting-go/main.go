@@ -452,9 +452,14 @@ func relayOutbox(brokers string, topic string) {
 	if len(ids) == 0 {
 		return
 	}
-	// Mark as published — only events confirmed by Kafka above
+	// Mark as published — only events confirmed by Kafka above. If the UPDATE
+	// fails the event stays unpublished and will be re-published on the next
+	// relay tick (duplicate-safe), so the error is logged loudly, never
+	// silently dropped — and never crashes the relay.
 	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v — event remains unpublished and will be retried", id, err)
+		}
 	}
 	log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
 }

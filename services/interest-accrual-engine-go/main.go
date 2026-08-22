@@ -122,13 +122,41 @@ func loadEligibleAccounts(ctx context.Context) ([]accrualAccount, error) {
 }
 
 // postAccrualJournal writes a balanced double-entry journal (debit + credit)
-// and updates GL balances atomically. Returns the journal entry id.
-func postAccrualJournal(ctx context.Context, tenantID, jeID, narration string, acc accrualAccount, product AccrualProduct, amountKobo int64, postingDate time.Time) error {
+// and updates GL balances atomically. The (tenant_id, account_id,
+// accrual_date) idempotency claim is inserted in the SAME transaction, so a
+// replayed batch is a no-op: it returns alreadyPosted=true with the existing
+// journal entry id and amount instead of posting a second journal.
+func postAccrualJournal(ctx context.Context, tenantID, jeID, narration string, acc accrualAccount, product AccrualProduct, amountKobo int64, postingDate time.Time, accrualDate string) (alreadyPosted bool, existingJE string, existingKobo int64, err error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, "", 0, err
 	}
 	defer tx.Rollback()
+
+	// Atomic idempotency claim: first writer wins; a conflict means this
+	// account was already accrued for this tenant/date.
+	var claimedJE string
+	claimErr := tx.QueryRowContext(ctx,
+		`INSERT INTO accrual_postings (tenant_id, account_id, accrual_date, journal_entry_id, accrued_kobo)
+		 VALUES ($1,$2,$3,$4,$5)
+		 ON CONFLICT (tenant_id, account_id, accrual_date) DO NOTHING
+		 RETURNING journal_entry_id`,
+		tenantID, acc.ID, accrualDate, jeID, amountKobo).Scan(&claimedJE)
+	if claimErr == sql.ErrNoRows {
+		// Replay: return the previously recorded result, post nothing.
+		var prevJE string
+		var prevKobo int64
+		if qerr := tx.QueryRowContext(ctx,
+			`SELECT journal_entry_id, accrued_kobo FROM accrual_postings
+			 WHERE tenant_id=$1 AND account_id=$2 AND accrual_date=$3`,
+			tenantID, acc.ID, accrualDate).Scan(&prevJE, &prevKobo); qerr != nil {
+			return false, "", 0, fmt.Errorf("accrual replay lookup failed: %w", qerr)
+		}
+		return true, prevJE, prevKobo, nil
+	}
+	if claimErr != nil {
+		return false, "", 0, fmt.Errorf("accrual idempotency claim failed: %w", claimErr)
+	}
 
 	legs := []struct{ code, typ string }{{product.GLDebit, "debit"}, {product.GLCredit, "credit"}}
 	for _, leg := range legs {
@@ -136,7 +164,7 @@ func postAccrualJournal(ctx context.Context, tenantID, jeID, narration string, a
 			("entryId", "tenantId", "accountId", "glAccountCode", "type", "amount_kobo", "currency", "narration", "transactionRef", "postingDate", "valueDate")
 			VALUES ($1,$2,$3,$4,$5,$6,'NGN',$7,$8,$9,$9)`,
 			jeID+"-"+leg.typ, tenantID, acc.ID, leg.code, leg.typ, amountKobo, narration, jeID, postingDate); err != nil {
-			return fmt.Errorf("journal insert (%s) failed: %w", leg.typ, err)
+			return false, "", 0, fmt.Errorf("journal insert (%s) failed: %w", leg.typ, err)
 		}
 		var balSQL string
 		if leg.typ == "debit" {
@@ -145,15 +173,61 @@ func postAccrualJournal(ctx context.Context, tenantID, jeID, narration string, a
 			balSQL = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" - $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
 		}
 		if _, err := tx.ExecContext(ctx, balSQL, amountKobo, leg.code); err != nil {
-			return fmt.Errorf("GL balance update (%s) failed: %w", leg.typ, err)
+			return false, "", 0, fmt.Errorf("GL balance update (%s) failed: %w", leg.typ, err)
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return false, "", 0, err
+	}
+	return false, jeID, amountKobo, nil
+}
+
+// jwtClaims extracts the verified JWT claims placed on the request context by
+// jwtAuthMiddleware. Returns nil when absent (fail-closed callers reject).
+func jwtClaims(r *http.Request) map[string]interface{} {
+	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
+	return claims
+}
+
+// claimsHaveServiceRole enforces that only service accounts / admins may
+// trigger a state-changing accrual batch.
+func claimsHaveServiceRole(claims map[string]interface{}) bool {
+	hasRole := func(v interface{}) bool {
+		roles, ok := v.([]interface{})
+		if !ok {
+			return false
+		}
+		for _, role := range roles {
+			if s, ok := role.(string); ok && (s == "service" || s == "admin" || s == "accrual-service") {
+				return true
+			}
+		}
+		return false
+	}
+	if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
+		if hasRole(ra["roles"]) {
+			return true
+		}
+	}
+	return hasRole(claims["roles"])
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied query/body parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func runAccrualBatch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "GET" {
-		writeJSON(w, 405, map[string]string{"error": "POST required"})
+	// State-changing endpoint: POST only — never trigger an accrual via GET.
+	if r.Method != "POST" {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, 405, map[string]string{"error": "method_not_allowed", "detail": "accrual is state-changing; POST required"})
 		return
 	}
 	if db == nil {
@@ -161,20 +235,56 @@ func runAccrualBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := r.Context()
-	tenantID := r.URL.Query().Get("tenantId")
-	if tenantID == "" {
-		tenantID = "tenant-lagos-main"
+	// Authorization: a verified token with a service/admin role is required.
+	claims := jwtClaims(r)
+	if claims == nil {
+		writeJSON(w, 401, map[string]string{"error": "unauthorized"})
+		return
 	}
-	businessDate := time.Now().Format("2006-01-02")
-
-	accounts, err := loadEligibleAccounts(ctx)
-	if err != nil {
-		writeJSON(w, 503, map[string]string{"error": "accrual_source_unavailable", "detail": err.Error()})
+	if !claimsHaveServiceRole(claims) {
+		writeJSON(w, 403, map[string]string{"error": "forbidden", "detail": "accrual batches require a service or admin role"})
+		return
+	}
+	// Tenant comes ONLY from verified JWT claims — never caller-controlled.
+	tenantID := tenantFromClaims(claims)
+	if tenantID == "" {
+		writeJSON(w, 403, map[string]string{"error": "forbidden", "detail": "token carries no tenant claim"})
 		return
 	}
 
-	batchID := fmt.Sprintf("BATCH-ACCRUAL-%s-%d", businessDate, time.Now().UnixNano())
+	// businessDate: caller may request a past/current date; it is validated
+	// and never future-dated. Default is derived server-side.
+	var reqBody struct {
+		BusinessDate string `json:"businessDate"`
+	}
+	json.NewDecoder(r.Body).Decode(&reqBody) // empty body is fine
+	businessDate := time.Now().Format("2006-01-02")
+	postingDate := time.Now()
+	if reqBody.BusinessDate != "" {
+		d, err := time.Parse("2006-01-02", reqBody.BusinessDate)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "invalid businessDate (want YYYY-MM-DD)"})
+			return
+		}
+		if reqBody.BusinessDate > businessDate {
+			writeJSON(w, 400, map[string]string{"error": "businessDate must not be future-dated"})
+			return
+		}
+		businessDate = reqBody.BusinessDate
+		postingDate = d
+	}
+
+	ctx := r.Context()
+	accounts, err := loadEligibleAccounts(ctx)
+	if err != nil {
+		log.Printf("[%s] eligible accounts query failed: %v", serviceName, err)
+		writeJSON(w, 503, map[string]string{"error": "accrual_source_unavailable"})
+		return
+	}
+
+	// Deterministic batch id: a replay of the same tenant/date maps to the
+	// same batch and each account-level posting is a claimed no-op.
+	batchID := fmt.Sprintf("BATCH-ACCRUAL-%s-%s", tenantID, businessDate)
 	batch := AccrualBatchResult{
 		BatchID:      batchID,
 		BusinessDate: businessDate,
@@ -198,7 +308,7 @@ func runAccrualBatch(w http.ResponseWriter, r *http.Request) {
 		if daily <= 0 {
 			continue
 		}
-		jeID := fmt.Sprintf("JE-ACCRUAL-%s-%03d", businessDate, entryNum)
+		jeID := fmt.Sprintf("JE-ACCRUAL-%s-%s-%03d", tenantID, businessDate, entryNum)
 		entryNum++
 		narration := fmt.Sprintf("Daily accrual %s - %s", acc.ProductType, acc.Name)
 
@@ -207,10 +317,18 @@ func runAccrualBatch(w http.ResponseWriter, r *http.Request) {
 			AccruedKobo: daily, GLDebitCode: product.GLDebit, GLCreditCode: product.GLCredit,
 			JournalEntry: jeID,
 		}
-		if err := postAccrualJournal(ctx, tenantID, jeID, narration, acc, product, daily, time.Now()); err != nil {
+		already, prevJE, prevKobo, err := postAccrualJournal(ctx, tenantID, jeID, narration, acc, product, daily, postingDate, businessDate)
+		if err != nil {
 			log.Printf("[%s] journal posting failed for %s: %v", serviceName, acc.ID, err)
 			res.Status = "failed"
 			batch.Failed++
+		} else if already {
+			// Idempotent replay: report the existing posting, change nothing.
+			res.Status = "already_posted"
+			res.JournalEntry = prevJE
+			res.AccruedKobo = prevKobo
+			batch.Posted++
+			batch.TotalAccruedKobo += prevKobo
 		} else {
 			res.Status = "posted" // only after the GL tx committed
 			batch.Posted++
@@ -223,10 +341,13 @@ func runAccrualBatch(w http.ResponseWriter, r *http.Request) {
 		batch.Status = "failed"
 	}
 
-	// Persist the batch run record.
+	// Persist the batch run record (replay-safe: same batch id per tenant/date).
 	if _, err := db.ExecContext(ctx,
 		`INSERT INTO accrual_batches (batch_id, business_date, tenant_id, total_accounts, posted, failed, total_accrued_kobo, status)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		 ON CONFLICT (batch_id) DO UPDATE SET
+			posted = EXCLUDED.posted, failed = EXCLUDED.failed,
+			total_accrued_kobo = EXCLUDED.total_accrued_kobo, status = EXCLUDED.status`,
 		batchID, businessDate, tenantID, batch.TotalAccounts, batch.Posted, batch.Failed, batch.TotalAccruedKobo, batch.Status); err != nil {
 		log.Printf("[%s] batch record insert failed: %v", serviceName, err)
 	}
@@ -519,6 +640,18 @@ func initSchema() {
 			total_accrued_kobo BIGINT NOT NULL,
 			status VARCHAR(20) NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		// Idempotency fence: one accrual posting per tenant/account/date.
+		// Claimed atomically (INSERT ... ON CONFLICT DO NOTHING) inside the
+		// journal-posting transaction, so replays are no-ops.
+		`CREATE TABLE IF NOT EXISTS accrual_postings (
+			tenant_id VARCHAR(64) NOT NULL,
+			account_id VARCHAR(64) NOT NULL,
+			accrual_date DATE NOT NULL,
+			journal_entry_id VARCHAR(96) NOT NULL,
+			accrued_kobo BIGINT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (tenant_id, account_id, accrual_date)
 		)`,
 	}
 	for _, s := range stmts {

@@ -713,5 +713,15 @@ func main() {
 		log.Printf("WARNING: NIBSS_BASE_URL not set — name-enquiry and funds-transfer will return 503 (responseCode 96)")
 	}
 	log.Printf("NIBSS/NIP Engine (Go) on :%s — ISO 8583 + Direct Debit", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	// Slowloris hardening: explicit server timeouts (ReadHeader/Read/Write/Idle).
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	log.Fatal(server.ListenAndServe())
 }

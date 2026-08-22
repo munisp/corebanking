@@ -112,16 +112,27 @@ type ReportTotals struct {
 	LiquidityRatio       float64 `json:"liquidityRatio"` // ratio (%) — not money, stays float
 }
 
+// JournalLine is one leg of a double-entry journal. Amounts are integer
+// minor units (kobo) — a JSON number with a fractional part fails decode.
+type JournalLine struct {
+	AccountID     string `json:"accountId"`
+	GLAccountCode string `json:"glAccountCode"`
+	Type          string `json:"type"`        // debit | credit
+	AmountKobo    int64  `json:"amount_kobo"` // kobo integer — never float, must be > 0
+	Narration     string `json:"narration"`
+}
+
 type PostJournalRequest struct {
-	TenantID       string `json:"tenantId"`
-	AccountID      string `json:"accountId"`
-	GLAccountCode  string `json:"glAccountCode"`
-	Type           string `json:"type"`
-	AmountKobo     int64  `json:"amount_kobo"` // kobo integer — never float
-	Currency       string `json:"currency"`
-	Narration      string `json:"narration"`
-	TransactionRef string `json:"transactionRef"`
-	BatchID        string `json:"batchId,omitempty"`
+	TenantID       string        `json:"tenantId"`
+	AccountID      string        `json:"accountId"`     // legacy single-line field
+	GLAccountCode  string        `json:"glAccountCode"` // legacy single-line field
+	Type           string        `json:"type"`          // legacy single-line field
+	AmountKobo     int64         `json:"amount_kobo"`   // legacy single-line field
+	Currency       string        `json:"currency"`
+	Narration      string        `json:"narration"`
+	TransactionRef string        `json:"transactionRef"`
+	BatchID        string        `json:"batchId,omitempty"`
+	Lines          []JournalLine `json:"lines,omitempty"`
 }
 
 type PeriodCloseRequest struct {
@@ -261,6 +272,29 @@ func (app *App) listGLAccounts(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// maxJournalLines caps lines per journal to keep sum overflow impossible.
+const maxJournalLines = 1000
+
+// maxLineAmountKobo bounds one journal line (₦90 trillion) so that
+// maxJournalLines × maxLineAmountKobo cannot overflow int64.
+const maxLineAmountKobo = int64(9_000_000_000_000_000)
+
+// journalBatchID derives a deterministic idempotency/batch key: sha256 over
+// the natural business keys of the journal (tenant, transaction ref, lines).
+func journalBatchID(tenantID, transactionRef, currency string, lines []JournalLine) string {
+	h := sha256.New()
+	h.Write([]byte(tenantID))
+	h.Write([]byte{0})
+	h.Write([]byte(transactionRef))
+	h.Write([]byte{0})
+	h.Write([]byte(currency))
+	for _, l := range lines {
+		h.Write([]byte{0})
+		fmt.Fprintf(h, "%s|%s|%s|%d|%s", l.AccountID, l.GLAccountCode, l.Type, l.AmountKobo, l.Narration)
+	}
+	return fmt.Sprintf("JB-%x", h.Sum(nil))[:34]
+}
+
 func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 	var req PostJournalRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -268,12 +302,66 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.AmountKobo <= 0 {
-		writeJSON(w, 400, map[string]string{"error": "amount_kobo must be positive"})
+	// Legacy single-line form is folded into the lines slice so every journal
+	// goes through the same double-entry validation.
+	lines := req.Lines
+	if len(lines) == 0 && (req.GLAccountCode != "" || req.Type != "" || req.AmountKobo != 0) {
+		lines = []JournalLine{{
+			AccountID:     req.AccountID,
+			GLAccountCode: req.GLAccountCode,
+			Type:          req.Type,
+			AmountKobo:    req.AmountKobo,
+			Narration:     req.Narration,
+		}}
+	}
+
+	// ── Balanced-entry validation (double-entry invariant) ─────────────
+	if len(lines) < 2 {
+		writeJSON(w, 400, map[string]string{
+			"error":  "unbalanced_journal",
+			"detail": "a journal requires at least two lines whose debits equal credits; one-sided postings are rejected",
+		})
 		return
 	}
-	if req.Type != "debit" && req.Type != "credit" {
-		writeJSON(w, 400, map[string]string{"error": "type must be debit or credit"})
+	if len(lines) > maxJournalLines {
+		writeJSON(w, 400, map[string]string{"error": "too_many_lines", "detail": "journal exceeds maximum line count"})
+		return
+	}
+	if req.Currency == "" {
+		writeJSON(w, 400, map[string]string{"error": "currency is required"})
+		return
+	}
+	var totalDebits, totalCredits int64
+	for i, l := range lines {
+		if l.GLAccountCode == "" {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("line %d: glAccountCode is required", i)})
+			return
+		}
+		if l.Type != "debit" && l.Type != "credit" {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("line %d: type must be debit or credit", i)})
+			return
+		}
+		// Integer minor units: zero and negative amounts are rejected; a
+		// fractional JSON number never reaches here (decode into int64 fails).
+		if l.AmountKobo <= 0 {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("line %d: amount_kobo must be a positive integer", i)})
+			return
+		}
+		if l.AmountKobo > maxLineAmountKobo {
+			writeJSON(w, 400, map[string]string{"error": fmt.Sprintf("line %d: amount_kobo exceeds per-line maximum", i)})
+			return
+		}
+		if l.Type == "debit" {
+			totalDebits += l.AmountKobo
+		} else {
+			totalCredits += l.AmountKobo
+		}
+	}
+	if totalDebits != totalCredits {
+		writeJSON(w, 400, map[string]string{
+			"error":  "unbalanced_journal",
+			"detail": fmt.Sprintf("debit total %d kobo != credit total %d kobo — journal NOT posted", totalDebits, totalCredits),
+		})
 		return
 	}
 	if app.db == nil {
@@ -281,84 +369,117 @@ func (app *App) postJournal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entryID := fmt.Sprintf("JE-%s-%d", req.GLAccountCode, time.Now().UnixNano())
+	// Deterministic batch id: sha256 over the natural business keys, so an
+	// exact replay maps to the same journal instead of double-posting.
+	batchID := req.BatchID
+	if batchID == "" {
+		batchID = journalBatchID(req.TenantID, req.TransactionRef, req.Currency, lines)
+	}
+	idemKey := req.TransactionRef
+	if idemKey == "" {
+		idemKey = batchID
+	}
 	now := time.Now()
 
-	entry := JournalEntry{
-		EntryID:        entryID,
-		TenantID:       req.TenantID,
-		AccountID:      req.AccountID,
-		GLAccountCode:  req.GLAccountCode,
-		Type:           req.Type,
-		AmountKobo:     req.AmountKobo,
-		Currency:       req.Currency,
-		Narration:      req.Narration,
-		TransactionRef: req.TransactionRef,
-		PostingDate:    now,
-		ValueDate:      now,
+	outboxEvent := map[string]interface{}{
+		"event":            "journal.posted",
+		"batch_id":         batchID,
+		"lines":            len(lines),
+		"total_debit_kobo": totalDebits,
+		"currency":         req.Currency,
+		"tenant_id":        req.TenantID,
+		"transaction_ref":  req.TransactionRef,
+		"timestamp":        now.Format(time.RFC3339),
 	}
+	outboxID := fmt.Sprintf("OBX-%s", batchID)
+	outboxPayload, _ := json.Marshal(outboxEvent)
 
-	// Journal insert + balance update + outbox row in ONE transaction: either
-	// the posting fully happens or nothing is recorded.
+	// Idempotency claim + journal inserts + balance updates in ONE
+	// transaction: either the posting fully happens or nothing is recorded.
 	tx, err := app.db.BeginTx(r.Context(), nil)
 	if err != nil {
-		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable", "detail": err.Error()})
+		log.Printf("[gl-engine-go] journal tx begin failed: %v", err)
+		writeJSON(w, 503, map[string]string{"error": "gl_store_unavailable"})
 		return
 	}
 	defer tx.Rollback()
 
-	if _, err := tx.Exec(`INSERT INTO "journalEntries"
-		("entryId", "tenantId", "accountId", "glAccountCode", "type", "amount_kobo", "currency", "narration", "transactionRef", "postingDate", "valueDate")
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		entry.EntryID, entry.TenantID, entry.AccountID, entry.GLAccountCode,
-		entry.Type, entry.AmountKobo, entry.Currency, entry.Narration,
-		entry.TransactionRef, entry.PostingDate, entry.ValueDate); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "journal_insert_failed", "detail": err.Error()})
-		return
-	}
-
-	var balanceOp string
-	if entry.Type == "debit" {
-		balanceOp = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" + $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
-	} else {
-		balanceOp = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" - $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
-	}
-	if _, err := tx.Exec(balanceOp, entry.AmountKobo, entry.GLAccountCode); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "balance_update_failed", "detail": err.Error()})
-		return
-	}
-
-	outboxEvent := map[string]interface{}{
-		"event":       "journal.posted",
-		"entry_id":    entryID,
-		"gl_code":     req.GLAccountCode,
-		"type":        req.Type,
-		"amount_kobo": req.AmountKobo,
-		"currency":    req.Currency,
-		"tenant_id":   req.TenantID,
-		"account_id":  req.AccountID,
-		"timestamp":   now.Format(time.RFC3339),
-	}
-	outboxID := fmt.Sprintf("OBX-%s", entryID)
-	outboxPayload, _ := json.Marshal(outboxEvent)
-	if _, err := tx.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
+	// Atomic idempotency claim on the natural key: a replayed request inserts
+	// nothing (ON CONFLICT DO NOTHING) and is reported as a replay instead of
+	// posting a second journal.
+	var claimedID string
+	claimErr := tx.QueryRow(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
 		VALUES ($1, $2, $3, $4, $5, $6, 'pending')
-		ON CONFLICT (idempotency_key) DO NOTHING`,
-		outboxID, "gl.journal.posted", entryID, outboxPayload, req.TransactionRef, now); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "outbox_insert_failed", "detail": err.Error()})
+		ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`,
+		outboxID, "gl.journal.posted", batchID, outboxPayload, idemKey, now).Scan(&claimedID)
+	if claimErr == sql.ErrNoRows {
+		writeJSON(w, 200, map[string]interface{}{
+			"status":  "idempotent_replay",
+			"batchId": batchID,
+			"detail":  "transactionRef already posted — no duplicate journal created",
+		})
 		return
+	}
+	if claimErr != nil {
+		log.Printf("[gl-engine-go] journal idempotency claim failed: %v", claimErr)
+		writeJSON(w, 500, map[string]string{"error": "journal_post_failed"})
+		return
+	}
+
+	entries := make([]JournalEntry, 0, len(lines))
+	for i, l := range lines {
+		entryID := fmt.Sprintf("%s-%03d", batchID, i)
+		if _, err := tx.Exec(`INSERT INTO "journalEntries"
+			("entryId", "tenantId", "accountId", "glAccountCode", "type", "amount_kobo", "currency", "narration", "transactionRef", "batchId", "postingDate", "valueDate")
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			entryID, req.TenantID, l.AccountID, l.GLAccountCode,
+			l.Type, l.AmountKobo, req.Currency, l.Narration,
+			req.TransactionRef, batchID, now, now); err != nil {
+			log.Printf("[gl-engine-go] journal line insert failed: %v", err)
+			writeJSON(w, 500, map[string]string{"error": "journal_post_failed"})
+			return
+		}
+		var balanceOp string
+		if l.Type == "debit" {
+			balanceOp = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" + $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
+		} else {
+			balanceOp = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" - $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
+		}
+		if _, err := tx.Exec(balanceOp, l.AmountKobo, l.GLAccountCode); err != nil {
+			log.Printf("[gl-engine-go] balance update failed: %v", err)
+			writeJSON(w, 500, map[string]string{"error": "journal_post_failed"})
+			return
+		}
+		entries = append(entries, JournalEntry{
+			EntryID:        entryID,
+			TenantID:       req.TenantID,
+			AccountID:      l.AccountID,
+			GLAccountCode:  l.GLAccountCode,
+			Type:           l.Type,
+			AmountKobo:     l.AmountKobo,
+			Currency:       req.Currency,
+			Narration:      l.Narration,
+			TransactionRef: req.TransactionRef,
+			BatchID:        &batchID,
+			PostingDate:    now,
+			ValueDate:      now,
+		})
 	}
 
 	if err := tx.Commit(); err != nil {
-		writeJSON(w, 500, map[string]string{"error": "commit_failed", "detail": err.Error()})
+		log.Printf("[gl-engine-go] journal commit failed: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "journal_post_failed"})
 		return
 	}
 
 	// Honest response: only what actually happened. The outbox relay publishes
 	// to Kafka asynchronously and flips status to 'published' on success.
 	writeJSON(w, 201, map[string]interface{}{
-		"entry":  entry,
-		"outbox": map[string]string{"id": outboxID, "status": "pending", "topic": "gl.journal.posted"},
+		"batchId":         batchID,
+		"entries":         entries,
+		"totalDebitKobo":  totalDebits,
+		"totalCreditKobo": totalCredits,
+		"outbox":          map[string]string{"id": outboxID, "status": "pending", "topic": "gl.journal.posted"},
 		"persisted": map[string]string{
 			"journalEntries": "inserted",
 			"glAccounts":     "balance_updated",
@@ -378,7 +499,11 @@ func (app *App) periodClose(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Aggregate journal entries into trial balance for the period
+	// Aggregate journal entries into trial balance for the period. Opening and
+	// closing balances are derived ONLY from journal history (sum of signed
+	// postings before / within the window) — never from the live glAccounts
+	// balance, which includes out-of-period movements. If journal history is
+	// unavailable the close fails (503) rather than reporting live figures.
 	query := `
 		INSERT INTO "trialBalances" ("trialBalanceId", "tenantId", "glAccountCode", "periodStart", "periodEnd",
 			"opening_balance_kobo", "total_debits_kobo", "total_credits_kobo", "closing_balance_kobo", "currency", "status")
@@ -388,19 +513,21 @@ func (app *App) periodClose(w http.ResponseWriter, r *http.Request) {
 			je."glAccountCode",
 			$2::timestamp,
 			$3::timestamp,
-			COALESCE(gl."balance_kobo", 0) - COALESCE(SUM(CASE WHEN je."type" = 'debit' THEN je."amount_kobo" ELSE -je."amount_kobo" END), 0),
-			COALESCE(SUM(CASE WHEN je."type" = 'debit' THEN je."amount_kobo" ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN je."type" = 'credit' THEN je."amount_kobo" ELSE 0 END), 0),
-			COALESCE(gl."balance_kobo", 0),
-			COALESCE(gl."currency", 'NGN'),
+			COALESCE(SUM(CASE WHEN je."postingDate" < $2::timestamp
+				THEN CASE WHEN je."type" = 'debit' THEN je."amount_kobo" ELSE -je."amount_kobo" END END), 0),
+			COALESCE(SUM(CASE WHEN je."postingDate" >= $2::timestamp AND je."type" = 'debit' THEN je."amount_kobo" ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN je."postingDate" >= $2::timestamp AND je."type" = 'credit' THEN je."amount_kobo" ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN je."type" = 'debit' THEN je."amount_kobo" ELSE -je."amount_kobo" END), 0),
+			COALESCE(MIN(gl."currency"), 'NGN'),
 			'closed'
 		FROM "journalEntries" je
-		LEFT JOIN "glAccounts" gl ON gl."glAccountCode" = je."glAccountCode"
+		LEFT JOIN "glAccounts" gl ON gl."glAccountCode" = je."glAccountCode" AND gl."tenantId" = je."tenantId"
 		WHERE je."tenantId" = $1
-			AND je."postingDate" >= $2::timestamp
 			AND je."postingDate" <= $3::timestamp
-		GROUP BY je."glAccountCode", gl."balance_kobo", gl."currency"
+		GROUP BY je."glAccountCode"
+		HAVING COUNT(*) FILTER (WHERE je."postingDate" >= $2::timestamp) > 0
 		ON CONFLICT ("trialBalanceId") DO UPDATE SET
+			"opening_balance_kobo" = EXCLUDED."opening_balance_kobo",
 			"total_debits_kobo" = EXCLUDED."total_debits_kobo",
 			"total_credits_kobo" = EXCLUDED."total_credits_kobo",
 			"closing_balance_kobo" = EXCLUDED."closing_balance_kobo",
@@ -408,7 +535,8 @@ func (app *App) periodClose(w http.ResponseWriter, r *http.Request) {
 
 	result, err := app.db.Exec(query, req.TenantID, req.PeriodStart, req.PeriodEnd)
 	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": "period_close_failed", "detail": err.Error()})
+		log.Printf("[gl-engine-go] period close failed (journal history unavailable): %v", err)
+		writeJSON(w, 503, map[string]string{"error": "journal_history_unavailable", "detail": "period NOT closed — cannot derive balances from journal history; refusing to report live balances as period figures"})
 		return
 	}
 	affected, _ := result.RowsAffected()
@@ -453,10 +581,19 @@ func (app *App) generateEFASS(w http.ResponseWriter, r *http.Request) {
 
 	// Pull from trial balance using eFASS mapping — regulatory figures come
 	// ONLY from real closed trial balances.
+	//
+	// Sign convention: trial-balance closing balances are stored debit-positive
+	// (debits minus credits). The mapping's 'negate' convention flips the sign
+	// of DEBIT-normal accounts (asset/expense) only. Credit-normal accounts
+	// (liability/equity/income) are validated against their GL category and are
+	// NEVER inverted by the mapping — negating them would double-invert the
+	// reported figure.
 	query := `
 		SELECT m."mbrForm", m."mbrLine", m."lineName", m."reportCategory", m."cbnCode",
 			COALESCE(SUM(
-				CASE WHEN m."signConvention" = 'negate' THEN -tb."closing_balance_kobo"
+				CASE WHEN m."signConvention" = 'negate'
+					AND COALESCE(gl."category", '') IN ('asset', 'expense')
+					THEN -tb."closing_balance_kobo"
 				ELSE tb."closing_balance_kobo" END
 			), 0) as amount
 		FROM "efassMapping" m
@@ -464,6 +601,8 @@ func (app *App) generateEFASS(w http.ResponseWriter, r *http.Request) {
 			AND tb."glAccountCode" <= m."glCodeEnd"
 			AND tb."tenantId" = $1
 			AND TO_CHAR(tb."periodEnd", 'YYYY-MM') = $2
+		LEFT JOIN "glAccounts" gl ON gl."glAccountCode" = tb."glAccountCode"
+			AND gl."tenantId" = tb."tenantId"
 		GROUP BY m."mbrForm", m."mbrLine", m."lineName", m."reportCategory", m."cbnCode"
 		ORDER BY m."mbrForm", m."mbrLine"`
 

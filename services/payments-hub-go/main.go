@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -310,31 +311,99 @@ type cachedResponse struct {
 	Body   []byte `json:"body"`
 }
 
-func idempotencyGet(key string) (cachedResponse, bool) {
-	ctx := context.Background()
+// idempotencyGet returns the cached SUCCESS response for a key. Every
+// network-controlled Redis MGet element is bounds- and type-checked before
+// use — a malformed element never panics the process.
+func idempotencyGet(ctx context.Context, key string) (cachedResponse, bool) {
 	prefix := "idempotency:" + key
 	if redisClient != nil {
 		vals, err := redisClient.MGet(ctx, prefix+":status", prefix+":body").Result()
-		if err != nil || vals[0] == nil {
+		if err != nil || len(vals) < 2 || vals[0] == nil || vals[1] == nil {
 			return cachedResponse{}, false
 		}
-		status, _ := strconv.Atoi(vals[0].(string))
-		body := []byte(vals[1].(string))
-		return cachedResponse{Status: status, Body: body}, true
+		statusStr, ok := vals[0].(string)
+		if !ok {
+			return cachedResponse{}, false
+		}
+		bodyStr, ok := vals[1].(string)
+		if !ok {
+			return cachedResponse{}, false
+		}
+		status, err := strconv.Atoi(statusStr)
+		if err != nil || status <= 0 {
+			return cachedResponse{}, false
+		}
+		return cachedResponse{Status: status, Body: []byte(bodyStr)}, true
 	}
 	if db != nil {
 		var status int
 		var body []byte
-		err := db.QueryRow("SELECT status_code, response_body FROM payments_hub_idempotency WHERE idempotency_key = $1 AND expires_at > NOW()", key).Scan(&status, &body)
-		if err == nil {
+		err := db.QueryRowContext(ctx, "SELECT status_code, response_body FROM payments_hub_idempotency WHERE idempotency_key = $1 AND status_code > 0 AND expires_at > NOW()", key).Scan(&status, &body)
+		if err == nil && status > 0 {
 			return cachedResponse{Status: status, Body: body}, true
 		}
 	}
 	return cachedResponse{}, false
 }
 
-func idempotencySet(key string, status int, body []byte, ttl time.Duration) {
-	ctx := context.Background()
+// idempotencyAcquire atomically claims an idempotency key before any work is
+// done (no check-then-act race):
+//   - Redis: SET lock NX PX — only one caller wins the in-flight slot.
+//   - Postgres fallback: INSERT an in-flight row (status_code = 0)
+//     ON CONFLICT DO NOTHING in one statement.
+//
+// Returns replay != nil when a completed success response already exists,
+// acquired=true when this request owns the key, or an error when the
+// idempotency store itself is unavailable (fail fast — money path).
+func idempotencyAcquire(ctx context.Context, key string) (replay *cachedResponse, acquired bool, err error) {
+	if redisClient != nil {
+		prefix := "idempotency:" + key
+		token := fmt.Sprintf("%08X", secureRandUint32())
+		ok, serr := redisClient.SetNX(ctx, prefix+":lock", token, 30*time.Second).Result()
+		if serr != nil {
+			return nil, false, fmt.Errorf("idempotency store error")
+		}
+		if !ok {
+			// Key already claimed: replay the completed response if there is
+			// one, otherwise the caller must treat it as in-flight (409).
+			if cached, found := idempotencyGet(ctx, key); found {
+				return &cached, false, nil
+			}
+			return nil, false, nil
+		}
+		// Claim won, but a previous request may have completed and released
+		// the lock — check the completed cache before executing (replay).
+		if cached, found := idempotencyGet(ctx, key); found {
+			redisClient.Del(ctx, prefix+":lock")
+			return &cached, false, nil
+		}
+		return nil, true, nil
+	}
+	if db != nil {
+		var claimed string
+		cerr := db.QueryRowContext(ctx,
+			`INSERT INTO payments_hub_idempotency (idempotency_key, status_code, response_body, expires_at)
+			 VALUES ($1, 0, $2, NOW() + interval '24 hours')
+			 ON CONFLICT (idempotency_key) DO NOTHING RETURNING idempotency_key`,
+			key, []byte("{}")).Scan(&claimed) // status_code=0 marks in-flight; "{}" is valid for bytea and jsonb
+		if cerr == nil {
+			return nil, true, nil
+		}
+		if cerr != sql.ErrNoRows {
+			log.Printf("[%s] idempotency claim failed: %v", serviceName, cerr)
+			return nil, false, fmt.Errorf("idempotency store error")
+		}
+		// Conflict: completed response or in-flight?
+		if cached, found := idempotencyGet(ctx, key); found {
+			return &cached, false, nil
+		}
+		return nil, false, nil
+	}
+	return nil, false, fmt.Errorf("idempotency store not configured")
+}
+
+// idempotencyComplete caches a SUCCESSFUL response and releases the claim.
+func idempotencyComplete(ctx context.Context, key string, status int, body []byte, ttl time.Duration) {
 	prefix := "idempotency:" + key
 	if redisClient != nil {
 		pipe := redisClient.Pipeline()
@@ -343,11 +412,30 @@ func idempotencySet(key string, status int, body []byte, ttl time.Duration) {
 		if _, err := pipe.Exec(ctx); err != nil {
 			log.Printf("[%s] Redis idempotency SET error: %v", serviceName, err)
 		}
+		redisClient.Del(ctx, prefix+":lock")
 		return
 	}
 	if db != nil {
-		db.Exec("INSERT INTO payments_hub_idempotency (idempotency_key, status_code, response_body, expires_at) VALUES ($1, $2, $3, NOW() + $4::interval) ON CONFLICT (idempotency_key) DO NOTHING",
-			key, status, body, fmt.Sprintf("%d seconds", int(ttl.Seconds())))
+		if _, err := db.ExecContext(ctx,
+			"UPDATE payments_hub_idempotency SET status_code = $2, response_body = $3, expires_at = NOW() + $4::interval WHERE idempotency_key = $1",
+			key, status, body, fmt.Sprintf("%d seconds", int(ttl.Seconds()))); err != nil {
+			log.Printf("[%s] idempotency completion failed: %v", serviceName, err)
+		}
+	}
+}
+
+// idempotencyAbandon releases the claim WITHOUT caching: failed requests are
+// never cached, so a retry after a transient failure executes for real.
+func idempotencyAbandon(ctx context.Context, key string) {
+	if redisClient != nil {
+		redisClient.Del(ctx, "idempotency:"+key+":lock")
+		return
+	}
+	if db != nil {
+		if _, err := db.ExecContext(ctx,
+			"DELETE FROM payments_hub_idempotency WHERE idempotency_key = $1 AND status_code = 0", key); err != nil {
+			log.Printf("[%s] idempotency abandon failed: %v", serviceName, err)
+		}
 	}
 }
 
@@ -378,16 +466,39 @@ func idempotencyMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if cached, ok := idempotencyGet(key); ok {
+		// Request-scoped context (never context.Background()) for the claim.
+		claimCtx, claimCancel := context.WithTimeout(r.Context(), 10*time.Second)
+		replay, acquired, err := idempotencyAcquire(claimCtx, key)
+		claimCancel()
+		if err != nil {
+			atomic.AddUint64(&errorCount, 1)
+			respondJSON(w, 503, map[string]interface{}{"error": "idempotency store unavailable — request NOT executed"})
+			return
+		}
+		if replay != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Idempotent-Replayed", "true")
-			w.WriteHeader(cached.Status)
-			w.Write(cached.Body)
+			w.WriteHeader(replay.Status)
+			w.Write(replay.Body)
+			return
+		}
+		if !acquired {
+			// A request with this key is in flight right now — reject rather
+			// than double-execute.
+			respondJSON(w, 409, map[string]interface{}{"error": "a request with this idempotency key is already in flight"})
 			return
 		}
 		rec := &responseRecorder{ResponseWriter: w, status: 200}
 		next.ServeHTTP(rec, r)
-		idempotencySet(key, rec.status, rec.body.Bytes(), 24*time.Hour)
+		// Cache ONLY successful responses; failures release the claim so the
+		// client can retry instead of replaying a cached failure.
+		doneCtx, doneCancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer doneCancel()
+		if rec.status >= 200 && rec.status < 300 {
+			idempotencyComplete(doneCtx, key, rec.status, rec.body.Bytes(), 24*time.Hour)
+		} else {
+			idempotencyAbandon(doneCtx, key)
+		}
 	})
 }
 
@@ -465,6 +576,22 @@ func routePayment(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 400, map[string]interface{}{"error": "invalid request body"})
 		return
 	}
+	// Live amount validation (was dead code): amount_kobo is integer minor
+	// units — must be present, finite, integral, positive and within the CBN
+	// bound. Any fractional kobo (sub-minor-unit) value is rejected.
+	rawAmt, present := body["amount_kobo"]
+	amtF, isNum := rawAmt.(float64)
+	if !present || !isNum || math.IsNaN(amtF) || math.IsInf(amtF, 0) || amtF != math.Trunc(amtF) || amtF <= 0 {
+		atomic.AddUint64(&errorCount, 1)
+		respondJSON(w, 400, map[string]interface{}{"error": "amount_kobo must be a positive integer (minor units)"})
+		return
+	}
+	if err := validateAmount(amtF / 100.0); err != nil {
+		atomic.AddUint64(&errorCount, 1)
+		respondJSON(w, 400, map[string]interface{}{"error": "invalid amount", "detail": err.Error()})
+		return
+	}
+	body["amount_kobo"] = int64(amtF)
 	paymentID := fmt.Sprintf("PMT-%08X", secureRandUint32())
 	idempKey := r.Header.Get("X-Idempotency-Key")
 	if idempKey == "" {
@@ -787,15 +914,28 @@ func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), 30*time.Second)
 }
 
-// Gzip compression middleware for responses > 1KB
+// Gzip compression middleware. The Content-Encoding: gzip header is set ONLY
+// when the body is actually compressed through a gzip.Writer — never a bare
+// header on an uncompressed payload.
+type gzipResponseWriter struct {
+	http.ResponseWriter
+	gw *gzip.Writer
+}
+
+func (g *gzipResponseWriter) Write(b []byte) (int, error) { return g.gw.Write(b) }
+
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
 			return
 		}
+		gw := gzip.NewWriter(w)
+		defer gw.Close()
 		w.Header().Set("Content-Encoding", "gzip")
-		next.ServeHTTP(w, r)
+		w.Header().Del("Content-Length")
+		w.Header().Add("Vary", "Accept-Encoding")
+		next.ServeHTTP(&gzipResponseWriter{ResponseWriter: w, gw: gw}, r)
 	})
 }
 
@@ -1035,7 +1175,8 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 	registerRoutes(mux)
 	handler := idempotencyMiddleware(rateLimitMiddleware(authMiddleware(mux)))
-	server := &http.Server{Addr: ":" + port, Handler: corsMiddleware(handler)}
+	// Slowloris hardening: full server timeouts (ReadHeader/Read/Write/Idle).
+	server := newSecureServer(":"+port, corsMiddleware(gzipMiddleware(handler)))
 	go func() {
 		log.Printf("[payments-hub-go] Starting on :%s", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

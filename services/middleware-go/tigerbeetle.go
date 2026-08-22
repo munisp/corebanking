@@ -289,6 +289,12 @@ func pairEntries(txn *LedgerTransaction) ([]tbclient.Transfer, error) {
 }
 
 func (l *TigerBeetleLedger) PostTransaction(txn LedgerTransaction) (*LedgerTransaction, error) {
+	// The write lock is taken BEFORE any access to l.accounts/l.entries/l.txns
+	// — the map is also written below (balance refresh) and must never be
+	// read concurrently (fatal concurrent map read/write).
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	// Validate balanced entries before touching the cluster.
 	var totalDebit, totalCredit int64
 	for _, entry := range txn.Entries {
@@ -304,9 +310,6 @@ func (l *TigerBeetleLedger) PostTransaction(txn LedgerTransaction) (*LedgerTrans
 	if totalDebit <= 0 {
 		return nil, fmt.Errorf("transaction amount must be positive")
 	}
-
-	l.mu.Lock()
-	defer l.mu.Unlock()
 
 	if l.client == nil {
 		return nil, ErrTigerBeetleUnavailable
@@ -367,6 +370,9 @@ func (l *TigerBeetleLedger) GetAccount(id string) (*LedgerAccount, error) {
 		l.mu.RUnlock()
 		return nil, fmt.Errorf("account %s not found", id)
 	}
+	// Copy the metadata struct while still under the read lock: the writer
+	// (PostTransaction balance refresh) mutates *meta in place.
+	acct := *meta
 	client := l.client
 	l.mu.RUnlock()
 
@@ -374,7 +380,6 @@ func (l *TigerBeetleLedger) GetAccount(id string) (*LedgerAccount, error) {
 		return nil, ErrTigerBeetleUnavailable
 	}
 
-	acct := *meta
 	bal, err := client.GetAccountBalanceFull(context.Background(), ledgerAccountUint128(id))
 	if err != nil {
 		return nil, fmt.Errorf("tigerbeetle balance lookup for %s: %w", id, err)
