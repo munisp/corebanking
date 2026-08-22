@@ -13,11 +13,17 @@ package main
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -237,8 +243,186 @@ func nibssFundsTransferPath() string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// JWT AUTHENTICATION (Keycloak JWKS / RS256, fail-closed)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[auth] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[auth] JWKS fetch returned HTTP %d", resp.StatusCode)
+		return
+	}
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[auth] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil || len(nBytes) == 0 {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil || len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[auth] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
+	go func() {
+		for range time.Tick(5 * time.Minute) {
+			fetchJWKS(jwtRealmURL())
+		}
+	}()
+}
+
+// verifyBearerToken performs full RS256 verification against the realm JWKS.
+// Any verification problem (malformed token, unknown key, bad signature,
+// missing/expired exp) is an error — the caller rejects with 401.
+func verifyBearerToken(token string) (map[string]interface{}, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid token header encoding")
+	}
+	var header struct {
+		Kid string `json:"kid"`
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+		return nil, fmt.Errorf("invalid token header")
+	}
+	if header.Alg != "RS256" {
+		return nil, fmt.Errorf("unsupported token algorithm %q", header.Alg)
+	}
+	jwtCache.mu.RLock()
+	pub, ok := jwtCache.keys[header.Kid]
+	jwtCache.mu.RUnlock()
+	if !ok {
+		// Unknown key — refresh once (key rotation) and retry.
+		fetchJWKS(jwtRealmURL())
+		jwtCache.mu.RLock()
+		pub, ok = jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("unknown signing key")
+		}
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid signature encoding")
+	}
+	hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+		return nil, fmt.Errorf("invalid signature")
+	}
+	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid claims encoding")
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+		return nil, fmt.Errorf("invalid claims")
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("token missing exp claim")
+	}
+	if time.Now().Unix() >= int64(exp) {
+		return nil, fmt.Errorf("token expired")
+	}
+	return claims, nil
+}
+
+// jwtAuthMiddleware wraps money-path handlers with real JWT verification.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			respondJSON(w, 401, map[string]string{"error": "unauthorized", "detail": "missing bearer token"})
+			return
+		}
+		claims, err := verifyBearerToken(strings.TrimPrefix(auth, "Bearer "))
+		if err != nil {
+			respondJSON(w, 401, map[string]string{"error": "unauthorized", "detail": err.Error()})
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			r.Header.Set("X-User-Id", sub)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// sessionIDFromIdempotencyKey derives a deterministic 30-digit NIP session ID
+// from the caller-supplied Idempotency-Key (sha256). Retries with the same
+// key map to the same session ID instead of a fresh time-based ID.
+func sessionIDFromIdempotencyKey(key string) string {
+	sum := sha256.Sum256([]byte("54bank/nibss-nip/session/" + key))
+	var digits [30]byte
+	for i := range digits {
+		digits[i] = '0' + sum[i]%(10)
+	}
+	return string(digits[:])
+}
+
+// findTransactionBySessionID returns a previously recorded transaction with
+// the given session ID, if any (idempotent-replay detection).
+func findTransactionBySessionID(sessionID string) (NIPTransaction, bool) {
+	mu.RLock()
+	defer mu.RUnlock()
+	for _, txn := range nipTransactions {
+		if txn.SessionID == sessionID {
+			return txn, true
+		}
+	}
+	return NIPTransaction{}, false
+}
 
 func newSessionID() string {
 	return fmt.Sprintf("%026d", time.Now().UnixNano())
@@ -279,8 +463,20 @@ func handleNameEnquiry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// When an Idempotency-Key is supplied, the session ID is derived from it
+	// (sha256) and a replay returns the recorded enquiry result.
+	sessionID := newSessionID()
+	if key := strings.TrimSpace(r.Header.Get("Idempotency-Key")); key != "" {
+		sessionID = sessionIDFromIdempotencyKey(key)
+		if existing, ok := findTransactionBySessionID(sessionID); ok {
+			w.Header().Set("X-Idempotent-Replayed", "true")
+			respondJSON(w, 200, existing)
+			return
+		}
+	}
+
 	txn := NIPTransaction{
-		SessionID: newSessionID(),
+		SessionID: sessionID,
 		Type:      "nameEnquiry", SourceBank: "54link-dev", SourceBankCode: "054",
 		DestBankCode: req.DestBankCode, DestAccount: req.AccountNo,
 		Status: "processing", ChannelCode: req.ChannelCode, MTI: "0200",
@@ -348,8 +544,24 @@ func handleFundsTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A funds transfer is state-changing: it REQUIRES an Idempotency-Key.
+	// The NIP session ID is derived from the key (sha256), so a client retry
+	// (or a replayed request) collapses onto the same session ID and returns
+	// the recorded outcome instead of executing a duplicate NIP transfer.
+	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempKey == "" {
+		respondJSON(w, 400, map[string]string{"error": "Idempotency-Key header is required for funds transfers", "responseCode": "30"})
+		return
+	}
+	sessionID := sessionIDFromIdempotencyKey(idempKey)
+	if existing, ok := findTransactionBySessionID(sessionID); ok {
+		w.Header().Set("X-Idempotent-Replayed", "true")
+		respondJSON(w, 200, existing)
+		return
+	}
+
 	txn := NIPTransaction{
-		SessionID: newSessionID(),
+		SessionID: sessionID,
 		Type:      "fundsTransfer", SourceBank: "54link-dev", SourceBankCode: "054",
 		SourceAccount: req.SourceAccount, DestBankCode: req.DestBankCode,
 		DestAccount: req.DestAccount, Amount: req.Amount, Narration: req.Narration,
@@ -486,9 +698,11 @@ func main() {
 	if port == "" {
 		port = "8111"
 	}
+	startJWKSRefresh()
 	http.HandleFunc("/healthz", handleHealthz)
-	http.HandleFunc("/v1/nip/name-enquiry", handleNameEnquiry)
-	http.HandleFunc("/v1/nip/funds-transfer", handleFundsTransfer)
+	// Money-path endpoints require a verified RS256 Bearer token (fail-closed).
+	http.Handle("/v1/nip/name-enquiry", jwtAuthMiddleware(http.HandlerFunc(handleNameEnquiry)))
+	http.Handle("/v1/nip/funds-transfer", jwtAuthMiddleware(http.HandlerFunc(handleFundsTransfer)))
 	http.HandleFunc("/v1/nip/tsq", handleTSQ)
 	http.HandleFunc("/v1/nip/transactions", handleTransactions)
 	http.HandleFunc("/v1/nip/mandates", handleMandates)
