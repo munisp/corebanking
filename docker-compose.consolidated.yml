@@ -18,8 +18,8 @@ version: "3.9"
 
 x-common-env: &common-env
   # ── Database (URL-style) ──────────────────────────────────────────────────────
-  DATABASE_URL: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking"
-  DATABASE_URI: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking"
+  DATABASE_URL: "postgresql://doadmin:${DB_PASSWORD:?DB_PASSWORD must be set in the environment}@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking"
+  DATABASE_URI: "postgresql://doadmin:${DB_PASSWORD:?DB_PASSWORD must be set in the environment}@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking"
   DATABASE_POOL_SIZE: "3"
   DATABASE_MAX_OVERFLOW: "2"
   DATABASE_POOL_TIMEOUT: "30"
@@ -29,13 +29,13 @@ x-common-env: &common-env
   DB_PORT: "25060"
   DB_NAME: link_core_banking
   DB_USER: doadmin
-  DB_PASSWORD: AVNS_MSy6CW3EGXnA8wJgkLv
+  DB_PASSWORD: "${DB_PASSWORD:?DB_PASSWORD must be set in the environment}"
   # ── Cache ─────────────────────────────────────────────────────────────────────
   REDIS_URL: redis-master.redis.svc.cluster.local:6379
   REDIS_ADDRESS: redis-master.redis.svc.cluster.local:6379
   REDIS_HOST: redis-master.redis.svc.cluster.local
   REDIS_PORT: "6379"
-  REDIS_PASSWORD: 3phHSv7qbAuZLb2pi9FWED2X
+  REDIS_PASSWORD: "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in the environment}"
   # ── Messaging ─────────────────────────────────────────────────────────────────
   KAFKA_BROKERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
   KAFKA_BOOTSTRAP_SERVERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc:9092
@@ -55,7 +55,7 @@ x-common-env: &common-env
   KEYCLOAK_URL: https://keycloak.servers.upi.dev
   KEYCLOAK_BASE_URL: https://keycloak.servers.upi.dev
   KEYCLOAK_ADMIN_USERNAME: admin
-  KEYCLOAK_ADMIN_PASSWORD: "0lQ09=4+Wcpi)DW"
+  KEYCLOAK_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD must be set in the environment}"
   DEFAULT_KEYCLOAK_REALM: 54link
   AUTH_ENFORCER_URL: "http://auth-enforcer-rs.54link-dev.svc.cluster.local:8314"
   ALLOWED_ORIGINS: "*"
