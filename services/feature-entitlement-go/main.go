@@ -4,25 +4,32 @@
 package main
 
 import (
-	"github.com/IBM/sarama"
-	_ "github.com/lib/pq"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
+	"bufio"
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/IBM/sarama"
+	_ "github.com/lib/pq"
+	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
-	"database/sql"
-	"bytes"
 
 	"net"
-
 )
 
 var serviceName = "feature-entitlement-go"
@@ -32,20 +39,20 @@ var serviceName = "feature-entitlement-go"
 // ═══════════════════════════════════════════════════════════════════════════════
 
 type PricingTier struct {
-	ID              string          `json:"id"`
-	Name            string          `json:"name"`
-	Type            string          `json:"type"` // tenant | white_label
-	MonthlyFeeNGN   int64           `json:"monthlyFeeNGN"`
-	AnnualFeeNGN    int64           `json:"annualFeeNGN"`
-	SetupFeeNGN     int64           `json:"setupFeeNGN"`
-	MaxUsers        int             `json:"maxUsers"`
-	MaxBranches     int             `json:"maxBranches"`
-	MaxTPS          int             `json:"maxTPS"`
-	SLAUptime       string          `json:"slaUptime"`
-	SupportLevel    string          `json:"supportLevel"`
-	Features        []string        `json:"features"`
-	GrowthFeatures  []string        `json:"growthFeatures"`
-	AddOns          []AddOn         `json:"addOns"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Type           string   `json:"type"` // tenant | white_label
+	MonthlyFeeNGN  int64    `json:"monthlyFeeNGN"`
+	AnnualFeeNGN   int64    `json:"annualFeeNGN"`
+	SetupFeeNGN    int64    `json:"setupFeeNGN"`
+	MaxUsers       int      `json:"maxUsers"`
+	MaxBranches    int      `json:"maxBranches"`
+	MaxTPS         int      `json:"maxTPS"`
+	SLAUptime      string   `json:"slaUptime"`
+	SupportLevel   string   `json:"supportLevel"`
+	Features       []string `json:"features"`
+	GrowthFeatures []string `json:"growthFeatures"`
+	AddOns         []AddOn  `json:"addOns"`
 }
 
 type AddOn struct {
@@ -68,7 +75,7 @@ var tenantTiers = []PricingTier{
 			"billing", "multi_tenant",
 		},
 		GrowthFeatures: []string{"chatbot", "smart_savings", "virtual_cards", "qr_payments", "bnpl", "investments", "remittances", "gamification"},
-		AddOns: []AddOn{},
+		AddOns:         []AddOn{},
 	},
 	{
 		ID: "TIER-COMMERCIAL", Name: "Commercial", Type: "tenant",
@@ -112,7 +119,7 @@ var tenantTiers = []PricingTier{
 		ID: "TIER-STARTER", Name: "Starter (MFB/Fintech)", Type: "tenant",
 		MonthlyFeeNGN: 1_500_000, AnnualFeeNGN: 15_000_000, SetupFeeNGN: 3_000_000,
 		MaxUsers: 5_000, MaxBranches: 10, MaxTPS: 500, SLAUptime: "99.5%", SupportLevel: "email_only",
-		Features: []string{"core_banking", "payments", "mobile_money", "lending", "accounting", "billing"},
+		Features:       []string{"core_banking", "payments", "mobile_money", "lending", "accounting", "billing"},
 		GrowthFeatures: []string{"chatbot"},
 		AddOns: []AddOn{
 			{Feature: "smart_savings", MonthlyFee: 500_000, Description: "Smart savings & goals"},
@@ -139,7 +146,7 @@ var whiteLabelTiers = []PricingTier{
 			"billing", "multi_tenant",
 		},
 		GrowthFeatures: []string{"chatbot", "smart_savings", "virtual_cards", "qr_payments", "bnpl", "investments", "remittances", "gamification"},
-		AddOns: []AddOn{},
+		AddOns:         []AddOn{},
 	},
 	{
 		ID: "WL-GOLD", Name: "Gold Partner", Type: "white_label",
@@ -162,7 +169,7 @@ var whiteLabelTiers = []PricingTier{
 		ID: "WL-SILVER", Name: "Silver Partner", Type: "white_label",
 		MonthlyFeeNGN: 8_000_000, AnnualFeeNGN: 80_000_000, SetupFeeNGN: 20_000_000,
 		MaxUsers: 50_000, MaxBranches: 0, MaxTPS: 5_000, SLAUptime: "99.9%", SupportLevel: "business_hours",
-		Features: []string{"core_banking", "payments", "cards_digital", "mobile_money", "lending", "billing"},
+		Features:       []string{"core_banking", "payments", "cards_digital", "mobile_money", "lending", "billing"},
 		GrowthFeatures: []string{"chatbot", "smart_savings", "qr_payments"},
 		AddOns: []AddOn{
 			{Feature: "virtual_cards", MonthlyFee: 2_000_000, Description: "Virtual card issuance"},
@@ -441,12 +448,12 @@ func purchaseAddOn(w http.ResponseWriter, r *http.Request) {
 	storeMu.Unlock()
 
 	respondJSON(w, map[string]interface{}{
-		"success":       true,
-		"feature":       req.Feature,
-		"addOnFee":      addOnFee,
+		"success":        true,
+		"feature":        req.Feature,
+		"addOnFee":       addOnFee,
 		"newMonthlyBill": ent.MonthlyBill,
-		"activatedBy":   req.Operator,
-		"middleware":    middlewareStatus(),
+		"activatedBy":    req.Operator,
+		"middleware":     middlewareStatus(),
 	})
 }
 
@@ -494,14 +501,14 @@ func upgradeTier(w http.ResponseWriter, r *http.Request) {
 	storeMu.Unlock()
 
 	respondJSON(w, map[string]interface{}{
-		"success":      true,
-		"tenantId":     req.TenantID,
-		"previousTier": oldTier,
-		"newTier":      newTier.Name,
+		"success":        true,
+		"tenantId":       req.TenantID,
+		"previousTier":   oldTier,
+		"newTier":        newTier.Name,
 		"newMonthlyBill": newTier.MonthlyFeeNGN,
-		"newFeatures":  ent.EnabledFeatures,
-		"upgradedBy":   req.Operator,
-		"middleware":   middlewareStatus(),
+		"newFeatures":    ent.EnabledFeatures,
+		"upgradedBy":     req.Operator,
+		"middleware":     middlewareStatus(),
 	})
 }
 
@@ -602,10 +609,12 @@ func respondJSON(w http.ResponseWriter, data interface{}) {
 	dbData, _ := json.Marshal(map[string]string{"service": "feature_entitlement_go", "action": "respondJSON"})
 	if dbErr := dbInsert(fmt.Sprintf("feature_entitlement_go-%d", time.Now().UnixNano()), "feature_entitlement_go", "default", "active", dbData); dbErr != nil {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-	cacheSet("feature_entitlement_list", "", 1) // invalidate cache on write
+		cacheSet("feature_entitlement_list", "", 1) // invalidate cache on write
 	}
 	csURL := os.Getenv("CORE_BANKING_URL")
-	if csURL == "" { csURL = "http://core-banking-go:8080" }
+	if csURL == "" {
+		csURL = "http://core-banking-go:8080"
+	}
 	if _, csErr := callService("POST", csURL+"/v1/notify", map[string]interface{}{"source": "feature_entitlement_go", "action": "respondJSON"}); csErr != nil {
 		log.Printf("[%s] upstream call failed: %v", serviceName, csErr)
 	}
@@ -625,55 +634,53 @@ func healthz(w http.ResponseWriter, r *http.Request) {
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"feature-entitlement-go"}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"feature-entitlement-go"}`)
 }
 
 func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"alive":true}`)
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"feature-entitlement-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"feature-entitlement-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"feature-entitlement-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"feature-entitlement-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"feature-entitlement-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"feature-entitlement-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
-
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
 }
 
 type responseWriter struct {
-    http.ResponseWriter
-    status int
+	http.ResponseWriter
+	status int
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
-
 
 // --- Database Layer ---
 var db *sql.DB
@@ -718,9 +725,13 @@ func dbList(service string, limit int) ([]map[string]interface{}, error) {
 			return result, nil
 		}
 	}
-	if db == nil { return nil, fmt.Errorf("no db") }
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
 	rows, err := db.Query("SELECT id, type, status, data, created_at FROM service_records WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var items []map[string]interface{}
 	for rows.Next() {
@@ -732,11 +743,12 @@ func dbList(service string, limit int) ([]map[string]interface{}, error) {
 }
 
 func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil { return fmt.Errorf("no db") }
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
 	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
 	return err
 }
-
 
 // --- JWT Auth Middleware ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
@@ -757,37 +769,58 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 // --- Inter-Service Communication with Circuit Breaker ---
-var _cbFailures int
-var _cbOpen bool
-var _cbLastFail time.Time
+var _cbFailures atomic.Int64
+var _cbOpen atomic.Bool
+var _cbLastFailUnix atomic.Int64
 
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
-	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
+	if _cbOpen.Load() && time.Since(time.Unix(0, _cbLastFailUnix.Load())) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	if _cbOpen { _cbOpen = false; _cbFailures = 0 }
+	if _cbOpen.Load() {
+		_cbOpen.Store(false)
+		_cbFailures.Store(0)
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 { time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond) }
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+		}
 		var req *http.Request
 		if body != nil {
 			j, _ := json.Marshal(body)
-		j = []byte(sanitizeInput(string(j)))
+			j = []byte(sanitizeInput(string(j)))
 			req, _ = http.NewRequest(method, url, bytes.NewBuffer(j))
 		} else {
 			req, _ = http.NewRequest(method, url, nil)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
-		if err != nil { lastErr = err; _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		if err != nil {
+			lastErr = err
+			_cbFailures.Add(1)
+			_cbLastFailUnix.Store(time.Now().UnixNano())
+			if _cbFailures.Load() >= 5 {
+				_cbOpen.Store(true)
+			}
+			continue
+		}
 		defer resp.Body.Close()
-		if resp.StatusCode >= 500 { lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode); _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode)
+			_cbFailures.Add(1)
+			_cbLastFailUnix.Store(time.Now().UnixNano())
+			if _cbFailures.Load() >= 5 {
+				_cbOpen.Store(true)
+			}
+			continue
+		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
-		_cbFailures = 0; _cbOpen = false
+		_cbFailures.Store(0)
+		_cbOpen.Store(false)
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
@@ -820,38 +853,125 @@ func init() {
 	}
 }
 
-func cacheGet(key string) (string, bool) {
+// redisConn dials Redis and returns the connection plus a buffered reader with
+// a hard deadline (M-23: no partial reads against the raw socket).
+func redisConn() (net.Conn, *bufio.Reader, error) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
-	defer conn.Close()
-	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
-	resp := string(buf[:n])
-	if resp[0] == '$' && resp[1] != '-' {
-		// Parse bulk string response
-		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+	if err != nil {
+		return nil, nil, err
 	}
-	return "", false
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	return conn, bufio.NewReader(conn), nil
+}
+
+// writeRESPCommand serializes args as a RESP multi-bulk request.
+func writeRESPCommand(w *bufio.Writer, args ...string) {
+	fmt.Fprintf(w, "*%d\r\n", len(args))
+	for _, a := range args {
+		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(a), a)
+	}
+	w.Flush()
+}
+
+// readRESPReply parses one RESP reply: simple string, error, integer, bulk
+// string (length-prefixed read), or multi-bulk (recursive). Redis error
+// replies are returned as Go errors.
+func readRESPReply(r *bufio.Reader) (interface{}, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	if len(line) < 3 || !strings.HasSuffix(line, "\r\n") {
+		return nil, fmt.Errorf("malformed RESP reply")
+	}
+	payload := line[1 : len(line)-2]
+	switch line[0] {
+	case '+':
+		return payload, nil
+	case '-':
+		return nil, fmt.Errorf("redis error: %s", payload)
+	case ':':
+		n, err := strconv.ParseInt(payload, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("malformed integer reply: %v", err)
+		}
+		return n, nil
+	case '$':
+		n, err := strconv.Atoi(payload)
+		if err != nil {
+			return nil, fmt.Errorf("malformed bulk length: %v", err)
+		}
+		if n < 0 {
+			return nil, nil // nil bulk string
+		}
+		buf := make([]byte, n+2) // payload + trailing CRLF
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		return string(buf[:n]), nil
+	case '*':
+		n, err := strconv.Atoi(payload)
+		if err != nil {
+			return nil, fmt.Errorf("malformed multi-bulk length: %v", err)
+		}
+		if n < 0 {
+			return nil, nil
+		}
+		items := make([]interface{}, 0, n)
+		for i := 0; i < n; i++ {
+			it, err := readRESPReply(r)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, it)
+		}
+		return items, nil
+	}
+	return nil, fmt.Errorf("unknown RESP type byte %q", line[0])
+}
+
+func cacheGet(key string) (string, bool) {
+	conn, rd, err := redisConn()
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+	wr := bufio.NewWriter(conn)
+	writeRESPCommand(wr, "GET", key)
+	rep, err := readRESPReply(rd)
+	if err != nil || rep == nil {
+		return "", false
+	}
+	s, ok := rep.(string)
+	return s, ok
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
+	conn, rd, err := redisConn()
+	if err != nil {
+		return
+	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
-		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
+	wr := bufio.NewWriter(conn)
+	writeRESPCommand(wr, "SET", key, value, "EX", strconv.Itoa(ttlSeconds))
+	if _, err := readRESPReply(rd); err != nil { // detects -ERR replies
+		log.Printf("[%s] cacheSet(%s) failed: %v", serviceName, key, err)
+	}
 }
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	if os.Getenv("TLS_ENABLED") != "true" {
+		return false, "", ""
+	}
 	cert := os.Getenv("TLS_CERT_PATH")
 	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
-	if key == "" { key = "/etc/54bank/certs/service.key" }
+	if cert == "" {
+		cert = "/etc/54bank/certs/service.crt"
+	}
+	if key == "" {
+		key = "/etc/54bank/certs/service.key"
+	}
 	return true, cert, key
 }
 
@@ -899,13 +1019,12 @@ func sanitizeInput(s string) string {
 	return s
 }
 
-
 var _rlTokens int64 = 100
 var _rlLastRefill int64 = 0
 
 func rlAllow() bool {
 	nowr := time.Now().UnixMilli()
-	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
 		atomic.StoreInt64(&_rlTokens, 100)
 		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
@@ -927,15 +1046,18 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 func validateEntitlement(tenantPlan string, featureName string) (bool, string) {
 	plans := map[string][]string{
-		"starter": {"core_banking", "savings", "transfers"},
+		"starter":      {"core_banking", "savings", "transfers"},
 		"professional": {"core_banking", "savings", "transfers", "loans", "cards", "forex"},
-		"enterprise": {"core_banking", "savings", "transfers", "loans", "cards", "forex", "trade_finance", "treasury", "open_banking"},
+		"enterprise":   {"core_banking", "savings", "transfers", "loans", "cards", "forex", "trade_finance", "treasury", "open_banking"},
 	}
 	features := plans[tenantPlan]
-	for _, f := range features { if f == featureName { return true, "Feature available" } }
+	for _, f := range features {
+		if f == featureName {
+			return true, "Feature available"
+		}
+	}
 	return false, fmt.Sprintf("Feature '%s' not available on %s plan", featureName, tenantPlan)
 }
 func computePlanUpgradeValue(currentPlan, targetPlan string, remainingDays int) float64 {
@@ -944,164 +1066,174 @@ func computePlanUpgradeValue(currentPlan, targetPlan string, remainingDays int) 
 	return dailyDiff * float64(remainingDays)
 }
 
-
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
+	failures    int
+	lastFailure time.Time
+	threshold   int
+	resetAfter  time.Duration
+	mu          sync.Mutex
 }
 
 func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2
-            return true
-        }
-        return false
-    }
-    return true
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures >= cb.threshold {
+		if time.Since(cb.lastFailure) > cb.resetAfter {
+			cb.failures = cb.threshold / 2
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures > 0 {
+		cb.failures--
+	}
 }
 
 func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
 }
 
 var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
 
 func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
-        }
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        req.Header.Set("X-Source-Service", serviceName)
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+	if !_cb.allow() {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+		}
+		var req *http.Request
+		if body != nil {
+			jsonData, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Source-Service", serviceName)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cb.recordFailure()
+			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			_cb.recordFailure()
+			continue
+		}
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cb.recordSuccess()
+		return result, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
 // --- Alerting ---
 type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
+	rules []alertRule
+	mu    sync.RWMutex
 }
 
 type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
+	Name      string
+	Metric    string
+	Threshold float64
+	Severity  string
 }
 
 var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
+	rules: []alertRule{
+		{"high_error_rate", "error_rate", 0.05, "critical"},
+		{"high_latency", "p99_latency_ms", 5000, "warning"},
+		{"db_connection_failures", "db_failures", 3, "critical"},
+	},
 }
 
 func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
+	var fired []map[string]interface{}
+	errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+	if errRate > 0.05 {
+		fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+	}
+	return fired
 }
 
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Graceful Degradation ---
 type degradationState struct {
-    dbAvailable    bool
-    cacheAvailable bool
-    upstreamOK     map[string]bool
-    mu             sync.RWMutex
+	dbAvailable    bool
+	cacheAvailable bool
+	upstreamOK     map[string]bool
+	mu             sync.RWMutex
 }
 
 var _degrade = &degradationState{
-    dbAvailable:    true,
-    cacheAvailable: true,
-    upstreamOK:     make(map[string]bool),
+	dbAvailable:    true,
+	cacheAvailable: true,
+	upstreamOK:     make(map[string]bool),
 }
 
 func (d *degradationState) setDB(ok bool) {
-    d.mu.Lock()
-    defer d.mu.Unlock()
-    d.dbAvailable = ok
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.dbAvailable = ok
 }
 
 func (d *degradationState) isDBAvailable() bool {
-    d.mu.RLock()
-    defer d.mu.RUnlock()
-    return d.dbAvailable
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.dbAvailable
 }
 
 func (d *degradationState) setUpstream(name string, ok bool) {
-    d.mu.Lock()
-    defer d.mu.Unlock()
-    d.upstreamOK[name] = ok
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.upstreamOK[name] = ok
 }
 
 func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
-    _degrade.mu.RLock()
-    defer _degrade.mu.RUnlock()
-    jsonResp(w, 200, map[string]interface{}{
-        "service":        serviceName,
-        "db_available":   _degrade.dbAvailable,
-        "cache_available": _degrade.cacheAvailable,
-        "upstreams":      _degrade.upstreamOK,
-        "mode":           func() string { if _degrade.dbAvailable { return "normal" }; return "degraded" }(),
-    })
+	_degrade.mu.RLock()
+	defer _degrade.mu.RUnlock()
+	jsonResp(w, 200, map[string]interface{}{
+		"service":         serviceName,
+		"db_available":    _degrade.dbAvailable,
+		"cache_available": _degrade.cacheAvailable,
+		"upstreams":       _degrade.upstreamOK,
+		"mode": func() string {
+			if _degrade.dbAvailable {
+				return "normal"
+			}
+			return "degraded"
+		}(),
+	})
 }
-
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
@@ -1136,9 +1268,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -1146,12 +1282,55 @@ func fetchJWKS(realmURL string) {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
+// expectedIssuer returns the expected JWT issuer: KEYCLOAK_ISSUER when set,
+// otherwise KEYCLOAK_REALM_URL. Empty means issuer validation is skipped
+// (a startup warning is logged by warnIfAuthUnconfigured).
+func expectedIssuer() string {
+	if iss := os.Getenv("KEYCLOAK_ISSUER"); iss != "" {
+		return iss
+	}
+	return os.Getenv("KEYCLOAK_REALM_URL")
+}
+
+// audienceMatches checks the expected audience against the JWT aud claim,
+// which may be a string or an array of strings.
+func audienceMatches(aud interface{}, expected string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == expected
+	case []interface{}:
+		for _, a := range v {
+			if a == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func init() {
+	warnIfAuthUnconfigured()
+}
+
+func warnIfAuthUnconfigured() {
+	if os.Getenv("KEYCLOAK_ISSUER") == "" && os.Getenv("KEYCLOAK_REALM_URL") == "" {
+		log.Printf("WARNING: KEYCLOAK_ISSUER/KEYCLOAK_REALM_URL unset - JWT iss claim will NOT be validated")
+	}
+	if os.Getenv("EXPECTED_AUDIENCE") == "" {
+		log.Printf("WARNING: EXPECTED_AUDIENCE unset - JWT aud claim will NOT be validated")
+	}
+}
+
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	// Initial JWKS fetch
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -1176,7 +1355,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -1214,10 +1395,50 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}
+		// Validate issuer/audience when configured (M-55)
+		if iss := expectedIssuer(); iss != "" {
+			if claims["iss"] != iss {
+				http.Error(w, `{"error":"invalid issuer"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		if aud := os.Getenv("EXPECTED_AUDIENCE"); aud != "" {
+			if !audienceMatches(claims["aud"], aud) {
+				http.Error(w, `{"error":"invalid audience"}`, http.StatusUnauthorized)
+				return
+			}
+		}
 		// Pass claims in context
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// enforceTenantClaim cross-checks a client-supplied tenant identifier against
+// the verified JWT claims (C-15). When the token carries a tenant (or
+// tenant_id) claim and it does not match the requested tenant, the request is
+// rejected with 403 and false is returned. Tokens without a tenant claim
+// (e.g. service accounts) are allowed.
+func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
+	if requestedTenant == "" {
+		return true
+	}
+	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
+	if claims == nil {
+		return true
+	}
+	claimTenant, _ := claims["tenant"].(string)
+	if claimTenant == "" {
+		claimTenant, _ = claims["tenant_id"].(string)
+	}
+	if claimTenant == "" {
+		return true
+	}
+	if claimTenant != requestedTenant {
+		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 // ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
@@ -1238,7 +1459,9 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 
 	// Events are marked published ONLY after a confirmed Kafka produce.
 	producer, err := getKafkaProducer(brokers)
@@ -1248,14 +1471,18 @@ func relayOutbox(brokers string, topic string) {
 	}
 
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
 		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
 			Topic: topic,
 			Key:   sarama.StringEncoder(aggID),
@@ -1267,7 +1494,9 @@ func relayOutbox(brokers string, topic string) {
 		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
+	if len(ids) == 0 {
+		return
+	}
 	for _, id := range ids {
 		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
 			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
@@ -1300,15 +1529,13 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 	return kafkaProducer, nil
 }
 
-
-
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8107"
 	}
 	initDB()
-mux := http.NewServeMux()
+	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
 	mux.HandleFunc("/livez", livezHandler)
@@ -1332,28 +1559,28 @@ mux := http.NewServeMux()
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[feature-entitlement-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[feature-entitlement-go] Server stopped gracefully")
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Println("[feature-entitlement-go] Shutdown signal received")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[feature-entitlement-go] Server stopped gracefully")
 }
 
-func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
+func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, data) }
 
 // jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
 // scripts/fix-go-wire-jwt.py).

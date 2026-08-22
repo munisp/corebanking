@@ -128,7 +128,7 @@ func main() {
 			"middleware": map[string]interface{}{
 				"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"cp.sweep.executed", "cp.pool.created", "cp.balance.update"}},
 				"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"cp:pools", "cp:balances", "cp:sweep_schedules"}},
-				"postgres":    map[string]interface{}{"url": envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": []string{"cp_pools", "cp_child_accounts", "cp_sweep_transactions"}},
+				"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"cp_pools", "cp_child_accounts", "cp_sweep_transactions"}},
 				"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"cp-sweeps", "cp-audit"}},
 				"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "cash-pooling-service"},
 				"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"cash_pool", "sweep_transaction"}},

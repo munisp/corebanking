@@ -13,7 +13,7 @@ var port = getEnv("PORT", "8221")
 var middlewareConfig = map[string]interface{}{
 	"kafka":       map[string]string{"broker": getEnv("KAFKA_BROKER", "localhost:9092"), "topics": "mandate.created,mandate.activated,mandate.executed,mandate.cancelled"},
 	"redis":       map[string]string{"url": getEnv("REDIS_URL", "redis://localhost:6379"), "purpose": "mandate-cache,execution-tracker"},
-	"postgres":    map[string]string{"url": getEnv("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": "mandates,mandate_executions,mandate_disputes"},
+	"postgres":    map[string]string{"url": os.Getenv("DATABASE_URL"), "tables": "mandates,mandate_executions,mandate_disputes"},
 	"opensearch":  map[string]string{"url": getEnv("OPENSEARCH_URL", "http://localhost:9200"), "index": "mandate-history"},
 	"keycloak":    map[string]string{"url": getEnv("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "role": "operations-officer"},
 	"permify":     map[string]string{"url": getEnv("PERMIFY_URL", "http://localhost:3476"), "schema": "mandate:create,mandate:activate,mandate:cancel,mandate:dispute"},

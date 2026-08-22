@@ -526,9 +526,36 @@ func traceMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// corsAllowedOrigins returns the configured CORS allowlist. When
+// CORS_ALLOWED_ORIGINS is unset, cross-origin requests are denied (no
+// Access-Control-Allow-Origin header is ever emitted, and never "*").
+func corsAllowedOrigins() []string {
+	raw := os.Getenv("CORS_ALLOWED_ORIGINS")
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, o := range strings.Split(raw, ",") {
+		o = strings.TrimSpace(o)
+		if o == "" || o == "*" { // never allow wildcard origins on the posting service
+			continue
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		if origin := r.Header.Get("Origin"); origin != "" {
+			for _, allowed := range corsAllowedOrigins() {
+				if allowed == origin {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Set("Vary", "Origin")
+					break
+				}
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
 		if r.Method == "OPTIONS" {

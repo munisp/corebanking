@@ -3,7 +3,6 @@
 package main
 
 import (
-	"github.com/IBM/sarama"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -11,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/IBM/sarama"
 	"log"
 	"net/http"
 	"os"
@@ -20,32 +20,34 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/lib/pq"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	_ "github.com/lib/pq"
 	"math/big"
 	"strings"
 )
 
-
 func secureRandHex(n int) string { b := make([]byte, n); rand.Read(b); return hex.EncodeToString(b) }
+
 var semaphore = make(chan struct{}, 100)
+
 func acquireSem() { semaphore <- struct{}{} }
 func releaseSem() { <-semaphore }
+
 var serviceName = "dlp-gateway-go"
 var eventBus = newEventBus("security.insider-threat", "dlp-gateway")
 var startTime = time.Now()
 
 type DLPRule struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Pattern     string `json:"pattern"`
-	MaxRecords  int    `json:"max_records"`
-	MaxBytes    int64  `json:"max_bytes"`
-	WindowMins  int    `json:"window_minutes"`
-	Action      string `json:"action"`
-	Severity    string `json:"severity"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Pattern    string `json:"pattern"`
+	MaxRecords int    `json:"max_records"`
+	MaxBytes   int64  `json:"max_bytes"`
+	WindowMins int    `json:"window_minutes"`
+	Action     string `json:"action"`
+	Severity   string `json:"severity"`
 }
 
 type AccessWindow struct {
@@ -58,17 +60,17 @@ type AccessWindow struct {
 }
 
 type DLPEvent struct {
-	ID         string    `json:"id"`
-	RuleID     string    `json:"rule_id"`
-	RuleName   string    `json:"rule_name"`
-	ActorID    string    `json:"actor_id"`
-	ActorIP    string    `json:"actor_ip"`
-	Action     string    `json:"action"`
-	Details    string    `json:"details"`
-	DataVolume int64     `json:"data_volume"`
-	RecordCount int      `json:"record_count"`
-	Blocked    bool      `json:"blocked"`
-	Timestamp  time.Time `json:"timestamp"`
+	ID          string    `json:"id"`
+	RuleID      string    `json:"rule_id"`
+	RuleName    string    `json:"rule_name"`
+	ActorID     string    `json:"actor_id"`
+	ActorIP     string    `json:"actor_ip"`
+	Action      string    `json:"action"`
+	Details     string    `json:"details"`
+	DataVolume  int64     `json:"data_volume"`
+	RecordCount int       `json:"record_count"`
+	Blocked     bool      `json:"blocked"`
+	Timestamp   time.Time `json:"timestamp"`
 }
 
 var (
@@ -86,7 +88,9 @@ var (
 )
 
 func initSchema() {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, q := range []string{
@@ -109,7 +113,9 @@ func initSchema() {
 }
 
 func dbLoadWindow(actorID string) *AccessWindow {
-	if db == nil { return nil }
+	if db == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	row := db.QueryRowContext(ctx, `SELECT actor_id, query_count, bytes_read, records_read, pii_access, window_start FROM dlp_access_windows WHERE actor_id=$1`, actorID)
@@ -121,7 +127,9 @@ func dbLoadWindow(actorID string) *AccessWindow {
 }
 
 func dbSaveWindow(w *AccessWindow) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	db.ExecContext(ctx, `INSERT INTO dlp_access_windows (actor_id, query_count, bytes_read, records_read, pii_access, window_start)
@@ -131,7 +139,9 @@ func dbSaveWindow(w *AccessWindow) {
 }
 
 func dbSaveEvent(e *DLPEvent) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	db.ExecContext(ctx, `INSERT INTO dlp_events (id, rule_id, rule_name, actor_id, actor_ip, action, details, data_volume, record_count, blocked, timestamp) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
@@ -139,16 +149,22 @@ func dbSaveEvent(e *DLPEvent) {
 }
 
 func dbListEvents() []DLPEvent {
-	if db == nil { return nil }
+	if db == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `SELECT id, COALESCE(rule_id,''), COALESCE(rule_name,''), actor_id, COALESCE(actor_ip,''), action, details, data_volume, record_count, blocked, timestamp FROM dlp_events ORDER BY timestamp DESC LIMIT 1000`)
-	if err != nil { return nil }
+	if err != nil {
+		return nil
+	}
 	defer rows.Close()
 	var result []DLPEvent
 	for rows.Next() {
 		var e DLPEvent
-		if rows.Scan(&e.ID, &e.RuleID, &e.RuleName, &e.ActorID, &e.ActorIP, &e.Action, &e.Details, &e.DataVolume, &e.RecordCount, &e.Blocked, &e.Timestamp) != nil { continue }
+		if rows.Scan(&e.ID, &e.RuleID, &e.RuleName, &e.ActorID, &e.ActorIP, &e.Action, &e.Details, &e.DataVolume, &e.RecordCount, &e.Blocked, &e.Timestamp) != nil {
+			continue
+		}
 		result = append(result, e)
 	}
 	return result
@@ -162,11 +178,15 @@ func checkAccess(actorID, actorIP, dataType string, recordCount int, bytesReques
 	if window == nil {
 		window = &AccessWindow{ActorID: actorID, WindowStart: now}
 	}
-	if now.Sub(window.WindowStart) > time.Hour { *window = AccessWindow{ActorID: actorID, WindowStart: now} }
+	if now.Sub(window.WindowStart) > time.Hour {
+		*window = AccessWindow{ActorID: actorID, WindowStart: now}
+	}
 	window.QueryCount++
 	window.BytesRead += bytesRequested
 	window.RecordsRead += recordCount
-	if containsPII { window.PIIAccess++ }
+	if containsPII {
+		window.PIIAccess++
+	}
 
 	var events []DLPEvent
 	blocked := false
@@ -174,14 +194,21 @@ func checkAccess(actorID, actorIP, dataType string, recordCount int, bytesReques
 		var triggered bool
 		var details string
 		if window.RecordsRead > rule.MaxRecords {
-			triggered = true; details = fmt.Sprintf("Records %d exceed limit %d in window", window.RecordsRead, rule.MaxRecords)
+			triggered = true
+			details = fmt.Sprintf("Records %d exceed limit %d in window", window.RecordsRead, rule.MaxRecords)
 		}
 		if window.BytesRead > rule.MaxBytes {
-			triggered = true; details = fmt.Sprintf("Bytes %d exceed limit %d in window", window.BytesRead, rule.MaxBytes)
+			triggered = true
+			details = fmt.Sprintf("Bytes %d exceed limit %d in window", window.BytesRead, rule.MaxBytes)
 		}
 		if triggered {
 			isBlocked := rule.Action == "block"
-			if isBlocked { blocked = true; atomic.AddUint64(&blockedCount, 1) } else { atomic.AddUint64(&alertCount, 1) }
+			if isBlocked {
+				blocked = true
+				atomic.AddUint64(&blockedCount, 1)
+			} else {
+				atomic.AddUint64(&alertCount, 1)
+			}
 			evt := DLPEvent{
 				ID: fmt.Sprintf("DLP-EVT-%s", secureRandHex(8)), RuleID: rule.ID, RuleName: rule.Name,
 				ActorID: actorID, ActorIP: actorIP, Action: rule.Action, Details: details,
@@ -200,28 +227,43 @@ func checkAccess(actorID, actorIP, dataType string, recordCount int, bytesReques
 }
 
 func handleCheckAccess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
-	var body struct {
-		ActorID string `json:"actor_id"`; DataType string `json:"data_type"`
-		RecordCount int `json:"record_count"`; BytesRequested int64 `json:"bytes_requested"`
-		ContainsPII bool `json:"contains_pii"`
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil { http.Error(w, "invalid JSON", 400); return }
+	var body struct {
+		ActorID        string `json:"actor_id"`
+		DataType       string `json:"data_type"`
+		RecordCount    int    `json:"record_count"`
+		BytesRequested int64  `json:"bytes_requested"`
+		ContainsPII    bool   `json:"contains_pii"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", 400)
+		return
+	}
 	allowed, events := checkAccess(body.ActorID, r.RemoteAddr, body.DataType, body.RecordCount, body.BytesRequested, body.ContainsPII)
 	status := 200
-	if !allowed { status = 403 }
-	w.Header().Set("Content-Type", "application/json"); w.WriteHeader(status)
+	if !allowed {
+		status = 403
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(map[string]interface{}{"allowed": allowed, "events": events})
 }
 
 func handleListEvents(w http.ResponseWriter, r *http.Request) {
 	events := dbListEvents()
-	if events == nil { events = make([]DLPEvent, 0) }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(events)
+	if events == nil {
+		events = make([]DLPEvent, 0)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(events)
 }
 
 func handleListRules(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(rules)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(rules)
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -234,22 +276,78 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-var healthyFlag int32 = 1; var lastActivity int64
-func healthzHandler(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]interface{}{"status": "healthy", "service": serviceName}) }
-func livezHandler(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "alive"}) }
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if db == nil { w.WriteHeader(503); json.NewEncoder(w).Encode(map[string]string{"status": "not_ready"}); return }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
-}
-func startWatchdog() { atomic.StoreInt64(&lastActivity, time.Now().Unix()); go func() { for { time.Sleep(15*time.Second); if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 60 { atomic.StoreInt32(&healthyFlag, 0) } else { atomic.StoreInt32(&healthyFlag, 1) } } }() }
-func recordActivity() { atomic.StoreInt64(&lastActivity, time.Now().Unix()) }
-type EventBusImpl struct { topic, source string; mu sync.Mutex; events []map[string]interface{} }
-func newEventBus(topic, source string) *EventBusImpl { return &EventBusImpl{topic: topic, source: source, events: make([]map[string]interface{}, 0)} }
-func (eb *EventBusImpl) Emit(eventType string, payload map[string]interface{}) { eb.mu.Lock(); defer eb.mu.Unlock(); eb.events = append(eb.events, map[string]interface{}{"event_type": eventType, "source": eb.source, "topic": eb.topic, "timestamp": time.Now().Format(time.RFC3339), "payload": payload}); log.Printf("[EventBus] %s -> %s", eb.topic, eventType) }
-func loggingMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { recordActivity(); start := time.Now(); next.ServeHTTP(w, r); log.Printf("[%s] %s %s %s", serviceName, r.Method, r.URL.Path, time.Since(start)) }) }
-func rateLimitMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { acquireSem(); defer releaseSem(); next.ServeHTTP(w, r) }) }
-func panicMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { defer func() { if err := recover(); err != nil { log.Printf("[PANIC] %v", err); http.Error(w, "internal error", 500) } }(); next.ServeHTTP(w, r) }) }
+var healthyFlag int32 = 1
+var lastActivity int64
 
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "healthy", "service": serviceName})
+}
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+}
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not_ready"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+func startWatchdog() {
+	atomic.StoreInt64(&lastActivity, time.Now().Unix())
+	go func() {
+		for {
+			time.Sleep(15 * time.Second)
+			if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 60 {
+				atomic.StoreInt32(&healthyFlag, 0)
+			} else {
+				atomic.StoreInt32(&healthyFlag, 1)
+			}
+		}
+	}()
+}
+func recordActivity() { atomic.StoreInt64(&lastActivity, time.Now().Unix()) }
+
+type EventBusImpl struct {
+	topic, source string
+	mu            sync.Mutex
+	events        []map[string]interface{}
+}
+
+func newEventBus(topic, source string) *EventBusImpl {
+	return &EventBusImpl{topic: topic, source: source, events: make([]map[string]interface{}, 0)}
+}
+func (eb *EventBusImpl) Emit(eventType string, payload map[string]interface{}) {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	eb.events = append(eb.events, map[string]interface{}{"event_type": eventType, "source": eb.source, "topic": eb.topic, "timestamp": time.Now().Format(time.RFC3339), "payload": payload})
+	log.Printf("[EventBus] %s -> %s", eb.topic, eventType)
+}
+func loggingMW(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordActivity()
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("[%s] %s %s %s", serviceName, r.Method, r.URL.Path, time.Since(start))
+	})
+}
+func rateLimitMW(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { acquireSem(); defer releaseSem(); next.ServeHTTP(w, r) })
+}
+func panicMW(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[PANIC] %v", err)
+				http.Error(w, "internal error", 500)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
@@ -284,9 +382,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -294,12 +396,55 @@ func fetchJWKS(realmURL string) {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
+// expectedIssuer returns the expected JWT issuer: KEYCLOAK_ISSUER when set,
+// otherwise KEYCLOAK_REALM_URL. Empty means issuer validation is skipped
+// (a startup warning is logged by warnIfAuthUnconfigured).
+func expectedIssuer() string {
+	if iss := os.Getenv("KEYCLOAK_ISSUER"); iss != "" {
+		return iss
+	}
+	return os.Getenv("KEYCLOAK_REALM_URL")
+}
+
+// audienceMatches checks the expected audience against the JWT aud claim,
+// which may be a string or an array of strings.
+func audienceMatches(aud interface{}, expected string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == expected
+	case []interface{}:
+		for _, a := range v {
+			if a == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func init() {
+	warnIfAuthUnconfigured()
+}
+
+func warnIfAuthUnconfigured() {
+	if os.Getenv("KEYCLOAK_ISSUER") == "" && os.Getenv("KEYCLOAK_REALM_URL") == "" {
+		log.Printf("WARNING: KEYCLOAK_ISSUER/KEYCLOAK_REALM_URL unset - JWT iss claim will NOT be validated")
+	}
+	if os.Getenv("EXPECTED_AUDIENCE") == "" {
+		log.Printf("WARNING: EXPECTED_AUDIENCE unset - JWT aud claim will NOT be validated")
+	}
+}
+
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	// Initial JWKS fetch
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -324,7 +469,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -362,10 +509,50 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}
+		// Validate issuer/audience when configured (M-55)
+		if iss := expectedIssuer(); iss != "" {
+			if claims["iss"] != iss {
+				http.Error(w, `{"error":"invalid issuer"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		if aud := os.Getenv("EXPECTED_AUDIENCE"); aud != "" {
+			if !audienceMatches(claims["aud"], aud) {
+				http.Error(w, `{"error":"invalid audience"}`, http.StatusUnauthorized)
+				return
+			}
+		}
 		// Pass claims in context
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// enforceTenantClaim cross-checks a client-supplied tenant identifier against
+// the verified JWT claims (C-15). When the token carries a tenant (or
+// tenant_id) claim and it does not match the requested tenant, the request is
+// rejected with 403 and false is returned. Tokens without a tenant claim
+// (e.g. service accounts) are allowed.
+func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
+	if requestedTenant == "" {
+		return true
+	}
+	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
+	if claims == nil {
+		return true
+	}
+	claimTenant, _ := claims["tenant"].(string)
+	if claimTenant == "" {
+		claimTenant, _ = claims["tenant_id"].(string)
+	}
+	if claimTenant == "" {
+		return true
+	}
+	if claimTenant != requestedTenant {
+		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 // ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
@@ -386,7 +573,9 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 
 	// Events are marked published ONLY after a confirmed Kafka produce.
 	producer, err := getKafkaProducer(brokers)
@@ -396,14 +585,18 @@ func relayOutbox(brokers string, topic string) {
 	}
 
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
 		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
 			Topic: topic,
 			Key:   sarama.StringEncoder(aggID),
@@ -415,7 +608,9 @@ func relayOutbox(brokers string, topic string) {
 		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
+	if len(ids) == 0 {
+		return
+	}
 	for _, id := range ids {
 		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
 			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
@@ -448,31 +643,53 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 	return kafkaProducer, nil
 }
 
-
-
 func main() {
-	port := os.Getenv("PORT"); if port == "" { port = "8080" }
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL != "" {
-		var err error; db, err = sql.Open("postgres", dbURL)
-		if err != nil { log.Printf("[dlp] DB: %v", err)
+		var err error
+		db, err = sql.Open("postgres", dbURL)
+		if err != nil {
+			log.Printf("[dlp] DB: %v", err)
 		} else {
-			db.SetMaxOpenConns(25); db.SetMaxIdleConns(5); db.SetConnMaxLifetime(5*time.Minute)
-			if err := db.Ping(); err != nil { log.Printf("[dlp] DB ping: %v", err) } else { initSchema() }
+			db.SetMaxOpenConns(25)
+			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(5 * time.Minute)
+			if err := db.Ping(); err != nil {
+				log.Printf("[dlp] DB ping: %v", err)
+			} else {
+				initSchema()
+			}
 		}
-	} else { log.Println("[dlp] WARNING: DATABASE_URL not set") }
+	} else {
+		log.Println("[dlp] WARNING: DATABASE_URL not set")
+	}
 	startWatchdog()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthzHandler); mux.HandleFunc("/livez", livezHandler); mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/healthz", healthzHandler)
+	mux.HandleFunc("/livez", livezHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
 	mux.Handle("/api/v1/dlp/check", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCheckAccess)))
 	mux.Handle("/api/v1/dlp/events", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleListEvents)))
 	mux.Handle("/api/v1/dlp/rules", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleListRules)))
 	mux.Handle("/api/v1/dlp/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 	handler := panicMW(rateLimitMW(loggingMW(mux)))
 	srv := &http.Server{Addr: ":" + port, Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
-	go func() { log.Printf("[dlp-gateway] Starting on :%s", port); if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatal(err) } }()
-	quit := make(chan os.Signal, 1); signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM); <-quit
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second); defer cancel(); srv.Shutdown(ctx)
+	go func() {
+		log.Printf("[dlp-gateway] Starting on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
 }
 
 // jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by

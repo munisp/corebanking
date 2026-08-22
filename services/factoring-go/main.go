@@ -44,7 +44,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"factoring.invoices","factoring.payments","factoring.settlements"}, "usage": "event streaming"},
 			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"factoring-go:cache"}},
-			"postgres":    map[string]interface{}{"url": envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": []string{"factoring_deals","factoring_invoices","factoring_payments"}},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"factoring_deals","factoring_invoices","factoring_payments"}},
 			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"factoring-deals","factoring-audit"}},
 			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "factoring-go"},
 			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"factoring-go"}},

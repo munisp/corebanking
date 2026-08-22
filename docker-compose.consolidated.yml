@@ -39,10 +39,10 @@ x-common-env: &common-env
   # ── Messaging ─────────────────────────────────────────────────────────────────
   KAFKA_BROKERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc.cluster.local:9092
   KAFKA_BOOTSTRAP_SERVERS: mojaloop-kafka-cluster-kafka-bootstrap.kafka.svc:9092
-  KAFKA_SECURITY_PROTOCOL: PLAINTEXT
-  KAFKA_SASL_MECHANISM: ""
-  KAFKA_SASL_USERNAME: ""
-  KAFKA_SASL_PASSWORD: ""
+  KAFKA_SECURITY_PROTOCOL: SASL_SSL
+  KAFKA_SASL_MECHANISM: "${KAFKA_SASL_MECHANISM:?KAFKA_SASL_MECHANISM must be set in the environment (e.g. SCRAM-SHA-512)}"
+  KAFKA_SASL_USERNAME: "${KAFKA_SASL_USERNAME:?KAFKA_SASL_USERNAME must be set in the environment}"
+  KAFKA_SASL_PASSWORD: "${KAFKA_SASL_PASSWORD:?KAFKA_SASL_PASSWORD must be set in the environment}"
   FLUVIO_ENDPOINT: fluvio:9003
   FLUVIO_ADDR: fluvio:9003
   # ── Dapr ──────────────────────────────────────────────────────────────────────
@@ -58,7 +58,7 @@ x-common-env: &common-env
   KEYCLOAK_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD:?KEYCLOAK_ADMIN_PASSWORD must be set in the environment}"
   DEFAULT_KEYCLOAK_REALM: 54link
   AUTH_ENFORCER_URL: "http://auth-enforcer-rs.54link-dev.svc.cluster.local:8314"
-  ALLOWED_ORIGINS: "*"
+  ALLOWED_ORIGINS: "${ALLOWED_ORIGINS:?ALLOWED_ORIGINS must be set to a comma-separated allowlist of dashboard domains (no wildcard)}"
   # ── Permify (AuthZ) ───────────────────────────────────────────────────────────
   PERMIFY_URL: http://permify.permify.svc.cluster.local:3476
   PERMIFY_HOST: permify.54link-dev.svc.cluster.local

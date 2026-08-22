@@ -324,7 +324,7 @@ func main() {
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"
+		log.Fatal("[salary-processing-go] DATABASE_URL must be set; no default DSN is provided (credentials must come from the environment)")
 	}
 
 	db, err := pgxpool.New(ctx, dbURL)

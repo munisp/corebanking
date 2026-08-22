@@ -120,7 +120,7 @@ func main() {
 			"middleware": map[string]interface{}{
 				"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"ob.consent.created", "ob.consent.revoked", "ob.payment.initiated", "ob.account.accessed"}},
 				"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"ob:consents", "ob:tpp_certs", "ob:rate_limits", "ob:tokens"}},
-				"postgres":    map[string]interface{}{"url": envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": []string{"ob_consents", "ob_tpps", "ob_api_endpoints", "ob_access_logs"}},
+				"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"ob_consents", "ob_tpps", "ob_api_endpoints", "ob_access_logs"}},
 				"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"ob-access-logs", "ob-consent-audit", "ob-api-metrics"}},
 				"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank-openbanking", "client": "open-banking-service"},
 				"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"ob_consent", "ob_tpp", "ob_api_access"}},

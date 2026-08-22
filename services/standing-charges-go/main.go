@@ -42,7 +42,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka": map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092")},
 			"redis": map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379")},
-			"postgres": map[string]interface{}{"url": envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db")},
+			"postgres": map[string]interface{}{"url": os.Getenv("DATABASE_URL")},
 			"opensearch": map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200")},
 			"keycloak": map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank"},
 			"permify": map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476")},
@@ -74,6 +74,12 @@ func getStats(w http.ResponseWriter, _ *http.Request) {
 }
 
 func main() {
+	// Fail fast: DATABASE_URL must come from the environment.
+	// No credential-bearing default DSN is shipped (M-04).
+	if os.Getenv("DATABASE_URL") == "" {
+		fmt.Fprintln(os.Stderr, "[standing-charges-go] FATAL: DATABASE_URL is not set; refusing to start with a default DSN")
+		os.Exit(1)
+	}
 	port := envOr("PORT", "8197")
 	http.HandleFunc("/healthz", healthz)
 	http.HandleFunc("/v1/standing-charges-go/list", listItems)

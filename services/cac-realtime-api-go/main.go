@@ -13,7 +13,7 @@ var middlewareConfig = map[string]interface{}{
 	"dapr": map[string]interface{}{"app_id": "cac-realtime-api-go", "url": envOr("DAPR_URL", "http://localhost:3500")},
 	"fluvio": map[string]interface{}{"url": envOr("FLUVIO_URL", "localhost:9003"), "topics": []string{"cac-verification-stream", "cac-monitoring-stream"}},
 	"temporal": map[string]interface{}{"url": envOr("TEMPORAL_URL", "localhost:7233"), "namespace": "cac-verification", "workflows": []string{"CACSearchWorkflow", "DirectorVerificationWorkflow", "AnnualReturnMonitorWorkflow"}},
-	"postgres": map[string]interface{}{"url": envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": []string{"cac_companies", "cac_directors", "cac_annual_returns", "cac_monitoring"}},
+	"postgres": map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"cac_companies", "cac_directors", "cac_annual_returns", "cac_monitoring"}},
 	"keycloak": map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client_id": "cac-realtime-api"},
 	"permify": map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "schema": "cac_api"},
 	"redis": map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "keys": []string{"cac:company:{rc}", "cac:director:{bvn}", "cac:annual-return:{rc}"}},

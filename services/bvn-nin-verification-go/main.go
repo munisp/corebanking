@@ -50,14 +50,14 @@ func env(key, def string) string {
 }
 
 var (
-	bvnAPIURL    = os.Getenv("BVN_API_URL")
-	bvnAPIKey    = os.Getenv("BVN_API_KEY")
-	ninAPIURL    = os.Getenv("NIN_API_URL")
-	ninAPIKey    = os.Getenv("NIN_API_KEY")
-	databaseURL  = os.Getenv("DATABASE_URL")
-	daprURL      = env("DAPR_URL", "http://localhost:3500")
-	daprPubsub   = env("DAPR_PUBSUB", "bvn-nin-pubsub")
-	cacheTTLHrs  = func() time.Duration {
+	bvnAPIURL   = os.Getenv("BVN_API_URL")
+	bvnAPIKey   = os.Getenv("BVN_API_KEY")
+	ninAPIURL   = os.Getenv("NIN_API_URL")
+	ninAPIKey   = os.Getenv("NIN_API_KEY")
+	databaseURL = os.Getenv("DATABASE_URL")
+	daprURL     = env("DAPR_URL", "http://localhost:3500")
+	daprPubsub  = env("DAPR_PUBSUB", "bvn-nin-pubsub")
+	cacheTTLHrs = func() time.Duration {
 		h, _ := strconv.Atoi(env("VERIFICATION_CACHE_TTL_HOURS", "24"))
 		if h <= 0 {
 			h = 24
@@ -88,22 +88,22 @@ type BVNVerification struct {
 }
 
 type NINVerification struct {
-	NIN           string  `json:"nin"`
-	FirstName     string  `json:"firstName"`
-	MiddleName    string  `json:"middleName"`
-	LastName      string  `json:"lastName"`
-	DOB           string  `json:"dateOfBirth"`
-	Phone         string  `json:"phoneNumber"`
-	Gender        string  `json:"gender"`
-	Address       string  `json:"residentialAddress"`
-	BirthState    string  `json:"birthState"`
-	BVNLinked     bool    `json:"bvnLinked"`
-	LinkedBVN     string  `json:"linkedBVN"`
-	Verified      bool    `json:"verified"`
-	MatchScore    float64 `json:"nameMatchScore"`
-	VerifiedAt    string  `json:"verifiedAt"`
-	APIProvider   string  `json:"apiProvider"`
-	ResponseTime  int     `json:"responseTimeMs"`
+	NIN          string  `json:"nin"`
+	FirstName    string  `json:"firstName"`
+	MiddleName   string  `json:"middleName"`
+	LastName     string  `json:"lastName"`
+	DOB          string  `json:"dateOfBirth"`
+	Phone        string  `json:"phoneNumber"`
+	Gender       string  `json:"gender"`
+	Address      string  `json:"residentialAddress"`
+	BirthState   string  `json:"birthState"`
+	BVNLinked    bool    `json:"bvnLinked"`
+	LinkedBVN    string  `json:"linkedBVN"`
+	Verified     bool    `json:"verified"`
+	MatchScore   float64 `json:"nameMatchScore"`
+	VerifiedAt   string  `json:"verifiedAt"`
+	APIProvider  string  `json:"apiProvider"`
+	ResponseTime int     `json:"responseTimeMs"`
 }
 
 type BVNNINLinkage struct {
@@ -133,7 +133,9 @@ type ttlCache struct {
 func newTTLCache() *ttlCache {
 	c := &ttlCache{entries: make(map[string]cacheEntry)}
 	go func() {
-		for range time.Tick(30 * time.Minute) {
+		ticker := time.NewTicker(30 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
 			c.evict()
 		}
 	}()

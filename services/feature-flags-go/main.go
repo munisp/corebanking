@@ -1,42 +1,47 @@
 package main
 
 import (
-	"github.com/IBM/sarama"
 	"bytes"
+	"context"
 	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math"
+	"github.com/IBM/sarama"
+	_ "github.com/lib/pq"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
-	"database/sql"
-	_ "github.com/lib/pq"
-	"strings"
-		"os/signal"
 	"syscall"
-	"context"
-	"crypto/rsa"
-	"crypto/sha256"
+	"time"
 )
 
 var db *sql.DB
-
 
 // Concurrency limiter prevents goroutine explosion
 var semaphore = make(chan struct{}, 100)
 
 func acquireSem() { semaphore <- struct{}{} }
 func releaseSem() { <-semaphore }
+
 var PORT = "8097"
-func init() { if p := os.Getenv("PORT"); p != "" { PORT = p } }
+
+func init() {
+	if p := os.Getenv("PORT"); p != "" {
+		PORT = p
+	}
+}
 
 type FeatureFlag struct {
 	Name              string   `json:"name"`
@@ -51,14 +56,21 @@ type FeatureFlag struct {
 
 var flags = sync.Map{}
 
-
 func isEnabled(flagName, userID, tenantID, role string) bool {
 	v, ok := flags.Load(flagName)
-	if !ok { return false }
+	if !ok {
+		return false
+	}
 	ff := v.(FeatureFlag)
-	if !ff.Enabled { return false }
-	if ff.RolloutPercentage >= 100 { return true }
-	if ff.RolloutPercentage <= 0 { return false }
+	if !ff.Enabled {
+		return false
+	}
+	if ff.RolloutPercentage >= 100 {
+		return true
+	}
+	if ff.RolloutPercentage <= 0 {
+		return false
+	}
 	// Deterministic rollout based on userID hash
 	if userID != "" {
 		n, _ := rand.Int(rand.Reader, big.NewInt(100))
@@ -70,7 +82,7 @@ func isEnabled(flagName, userID, tenantID, role string) bool {
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-		eventBus.Emit("feature-flags.processed", map[string]interface{}{"status": "success"})
+	eventBus.Emit("feature-flags.processed", map[string]interface{}{"status": "success"})
 	json.NewEncoder(w).Encode(data)
 }
 
@@ -111,13 +123,14 @@ func handleToggle(w http.ResponseWriter, r *http.Request) {
 	}
 	ff := v.(FeatureFlag)
 	ff.Enabled = body.Enabled
-	if body.Rollout > 0 { ff.RolloutPercentage = body.Rollout }
+	if body.Rollout > 0 {
+		ff.RolloutPercentage = body.Rollout
+	}
 	ff.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
 	flags.Store(body.Name, ff)
 	log.Printf("[FF] Toggled: %s enabled=%v rollout=%d%%", body.Name, ff.Enabled, ff.RolloutPercentage)
 	respondJSON(w, 200, map[string]interface{}{"status": "updated", "flag": ff})
 }
-
 
 // ─── Idempotency Middleware ─────────────────────────────────────────────────
 var idempotencyCache = struct {
@@ -162,7 +175,9 @@ func idempotencyMiddleware(next http.Handler) http.Handler {
 			idempotencyCache.Lock()
 			defer idempotencyCache.Unlock()
 			for k, v := range idempotencyCache.entries {
-				if time.Since(v.createdAt) > 24*time.Hour { delete(idempotencyCache.entries, k) }
+				if time.Since(v.createdAt) > 24*time.Hour {
+					delete(idempotencyCache.entries, k)
+				}
 			}
 		}()
 	})
@@ -174,9 +189,14 @@ type idempotencyRecorder struct {
 	body       []byte
 }
 
-func (r *idempotencyRecorder) WriteHeader(code int) { r.statusCode = code; r.ResponseWriter.WriteHeader(code) }
-func (r *idempotencyRecorder) Write(b []byte) (int, error) { r.body = append(r.body, b...); return r.ResponseWriter.Write(b) }
-
+func (r *idempotencyRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+func (r *idempotencyRecorder) Write(b []byte) (int, error) {
+	r.body = append(r.body, b...)
+	return r.ResponseWriter.Write(b)
+}
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -199,16 +219,19 @@ func corsMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 // --- Monetary Safety (kobo precision) ---
 type AmountKobo = int64
 
 func nairaToKobo(naira float64) AmountKobo { return AmountKobo(math.Round(naira * 100)) }
 func koboToNaira(kobo AmountKobo) float64  { return float64(kobo) / 100.0 }
-func roundNaira(amount float64) float64 { return math.Round(amount*100) / 100 }
+func roundNaira(amount float64) float64    { return math.Round(amount*100) / 100 }
 func validateAmount(amount float64) error {
-	if amount < 0 { return fmt.Errorf("amount must be non-negative") }
-	if amount > 999_999_999_999.99 { return fmt.Errorf("exceeds CBN max limit") }
+	if amount < 0 {
+		return fmt.Errorf("amount must be non-negative")
+	}
+	if amount > 999_999_999_999.99 {
+		return fmt.Errorf("exceeds CBN max limit")
+	}
 	return nil
 }
 
@@ -226,7 +249,7 @@ var auditLog []AuditEntry
 
 func appendAudit(action, recordID, actor, details string) {
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", secureRandUint32()),
+		ID:     fmt.Sprintf("AUD-%08X", secureRandUint32()),
 		Action: action, RecordID: recordID, Actor: actor,
 		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
 	})
@@ -237,8 +260,12 @@ func appendAudit(action, recordID, actor, details string) {
 func tracingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" { traceID = r.Header.Get("traceparent") }
-		if traceID == "" { traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid()) }
+		if traceID == "" {
+			traceID = r.Header.Get("traceparent")
+		}
+		if traceID == "" {
+			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
+		}
 		w.Header().Set("X-Trace-Id", traceID)
 		r.Header.Set("X-Trace-Id", traceID)
 		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
@@ -248,6 +275,7 @@ func tracingMiddleware(next http.Handler) http.Handler {
 
 // --- Circuit Breaker ---
 type circuitBreakerState int
+
 const (
 	cbClosed circuitBreakerState = iota
 	cbOpen
@@ -267,7 +295,9 @@ var (
 )
 
 func cbAllow() bool {
-	if cbState == cbClosed { return true }
+	if cbState == cbClosed {
+		return true
+	}
 	if cbState == cbOpen && time.Now().Unix()-atomic.LoadInt64(&cbLastFail) > cbTimeout {
 		cbState = cbHalfOpen
 		return true
@@ -279,44 +309,57 @@ func cbRecordSuccess() { atomic.StoreUint64(&cbFailCount, 0); cbState = cbClosed
 func cbRecordFailure() {
 	atomic.AddUint64(&cbFailCount, 1)
 	atomic.StoreInt64(&cbLastFail, time.Now().Unix())
-	if atomic.LoadUint64(&cbFailCount) >= cbThreshold { cbState = cbOpen }
+	if atomic.LoadUint64(&cbFailCount) >= cbThreshold {
+		cbState = cbOpen
+	}
 }
 
 // --- Observability (OpenTelemetry) ---
 var otelEndpoint = os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
 
 func initTracing() {
-	if otelEndpoint == "" { return }
+	if otelEndpoint == "" {
+		return
+	}
 	log.Printf("[%s] OTEL tracing configured: %s", serviceName, otelEndpoint)
 }
 
 // --- Retry with Exponential Backoff ---
 func retryWithBackoff(maxRetries int, fn func() error) error {
 	for i := 0; i < maxRetries; i++ {
-		if err := fn(); err == nil { return nil }
+		if err := fn(); err == nil {
+			return nil
+		}
 		backoff := time.Duration(1<<uint(i)) * 100 * time.Millisecond
-		if backoff > 5*time.Second { backoff = 5 * time.Second }
+		if backoff > 5*time.Second {
+			backoff = 5 * time.Second
+		}
 		time.Sleep(backoff)
 	}
 	return fmt.Errorf("max retries (%d) exceeded", maxRetries)
 }
 
-
 func secureRandUint32() uint32 {
 	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil { return uint32(time.Now().UnixNano()) }
+	if _, err := rand.Read(b); err != nil {
+		return uint32(time.Now().UnixNano())
+	}
 	return uint32(b[0])<<24 | uint32(b[1])<<16 | uint32(b[2])<<8 | uint32(b[3])
 }
 
 func sanitizeLogEntry(msg string) string {
 	msg = strings.ReplaceAll(msg, "\n", " ")
 	msg = strings.ReplaceAll(msg, "\r", " ")
-	if len(msg) > 2000 { msg = msg[:2000] }
+	if len(msg) > 2000 {
+		msg = msg[:2000]
+	}
 	return msg
 }
 
 func maskPII(value, fieldType string) string {
-	if len(value) < 4 { return "***" }
+	if len(value) < 4 {
+		return "***"
+	}
 	switch fieldType {
 	case "bvn":
 		return value[:3] + "****" + value[len(value)-4:]
@@ -324,7 +367,9 @@ func maskPII(value, fieldType string) string {
 		return value[:4] + "****" + value[len(value)-2:]
 	case "email":
 		parts := strings.SplitN(value, "@", 2)
-		if len(parts) == 2 { return parts[0][:1] + "***@" + parts[1] }
+		if len(parts) == 2 {
+			return parts[0][:1] + "***@" + parts[1]
+		}
 		return "***"
 	default:
 		return value[:2] + strings.Repeat("*", len(value)-4) + value[len(value)-2:]
@@ -348,18 +393,27 @@ var (
 	requestCount int64
 	errorCount   int64
 )
+
 func incRequests() { counterMu.Lock(); requestCount++; counterMu.Unlock() }
 func incErrors()   { counterMu.Lock(); errorCount++; counterMu.Unlock() }
 
 func initDB() *sql.DB {
 	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" { return nil }
+	if dsn == "" {
+		return nil
+	}
 	db, err := sql.Open("postgres", dsn)
-	if err != nil { log.Printf("DB connection failed: %v", err); return nil }
+	if err != nil {
+		log.Printf("DB connection failed: %v", err)
+		return nil
+	}
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
-	if err := db.Ping(); err != nil { log.Printf("DB ping failed: %v", err); return nil }
+	if err := db.Ping(); err != nil {
+		log.Printf("DB ping failed: %v", err)
+		return nil
+	}
 	return db
 }
 
@@ -462,8 +516,12 @@ func newSecureServer(addr string, handler http.Handler) *http.Server {
 
 func sanitizeError(err error) string {
 	errStr := err.Error()
-	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") { return "internal error" }
-	if len(errStr) > 200 { return "internal error" }
+	if strings.Contains(errStr, "/") || strings.Contains(errStr, "\\") {
+		return "internal error"
+	}
+	if len(errStr) > 200 {
+		return "internal error"
+	}
 	return errStr
 }
 
@@ -534,7 +592,6 @@ func sanitizeHeader(value string) string {
 	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(value)
 }
 
-
 // panicRecoveryMiddleware catches panics and returns 500 instead of crashing
 func panicRecoveryMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -550,17 +607,24 @@ func panicRecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 // validateJWTExpiry checks JWT token expiry claim
 func validateJWTExpiry(tokenStr string) bool {
 	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 { return false }
+	if len(parts) != 3 {
+		return false
+	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	var claims map[string]interface{}
-	if err := json.Unmarshal(payload, &claims); err != nil { return false }
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return false
+	}
 	exp, ok := claims["exp"].(float64)
-	if !ok { return false }
+	if !ok {
+		return false
+	}
 	return time.Now().Unix() < int64(exp)
 }
 
@@ -598,7 +662,6 @@ func watchdogHealthy() bool {
 	return elapsed < 60000
 }
 
-
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
 type jwksCache struct {
@@ -632,9 +695,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -642,12 +709,55 @@ func fetchJWKS(realmURL string) {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
+// expectedIssuer returns the expected JWT issuer: KEYCLOAK_ISSUER when set,
+// otherwise KEYCLOAK_REALM_URL. Empty means issuer validation is skipped
+// (a startup warning is logged by warnIfAuthUnconfigured).
+func expectedIssuer() string {
+	if iss := os.Getenv("KEYCLOAK_ISSUER"); iss != "" {
+		return iss
+	}
+	return os.Getenv("KEYCLOAK_REALM_URL")
+}
+
+// audienceMatches checks the expected audience against the JWT aud claim,
+// which may be a string or an array of strings.
+func audienceMatches(aud interface{}, expected string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == expected
+	case []interface{}:
+		for _, a := range v {
+			if a == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func init() {
+	warnIfAuthUnconfigured()
+}
+
+func warnIfAuthUnconfigured() {
+	if os.Getenv("KEYCLOAK_ISSUER") == "" && os.Getenv("KEYCLOAK_REALM_URL") == "" {
+		log.Printf("WARNING: KEYCLOAK_ISSUER/KEYCLOAK_REALM_URL unset - JWT iss claim will NOT be validated")
+	}
+	if os.Getenv("EXPECTED_AUDIENCE") == "" {
+		log.Printf("WARNING: EXPECTED_AUDIENCE unset - JWT aud claim will NOT be validated")
+	}
+}
+
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	// Initial JWKS fetch
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -672,7 +782,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -710,10 +822,50 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}
+		// Validate issuer/audience when configured (M-55)
+		if iss := expectedIssuer(); iss != "" {
+			if claims["iss"] != iss {
+				http.Error(w, `{"error":"invalid issuer"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		if aud := os.Getenv("EXPECTED_AUDIENCE"); aud != "" {
+			if !audienceMatches(claims["aud"], aud) {
+				http.Error(w, `{"error":"invalid audience"}`, http.StatusUnauthorized)
+				return
+			}
+		}
 		// Pass claims in context
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// enforceTenantClaim cross-checks a client-supplied tenant identifier against
+// the verified JWT claims (C-15). When the token carries a tenant (or
+// tenant_id) claim and it does not match the requested tenant, the request is
+// rejected with 403 and false is returned. Tokens without a tenant claim
+// (e.g. service accounts) are allowed.
+func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
+	if requestedTenant == "" {
+		return true
+	}
+	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
+	if claims == nil {
+		return true
+	}
+	claimTenant, _ := claims["tenant"].(string)
+	if claimTenant == "" {
+		claimTenant, _ = claims["tenant_id"].(string)
+	}
+	if claimTenant == "" {
+		return true
+	}
+	if claimTenant != requestedTenant {
+		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 // ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
@@ -734,7 +886,9 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 
 	// Events are marked published ONLY after a confirmed Kafka produce.
 	producer, err := getKafkaProducer(brokers)
@@ -744,14 +898,18 @@ func relayOutbox(brokers string, topic string) {
 	}
 
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
 		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
 			Topic: topic,
 			Key:   sarama.StringEncoder(aggID),
@@ -763,7 +921,9 @@ func relayOutbox(brokers string, topic string) {
 		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
+	if len(ids) == 0 {
+		return
+	}
 	for _, id := range ids {
 		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
 			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
@@ -796,8 +956,6 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 	return kafkaProducer, nil
 }
 
-
-
 func main() {
 	db = initDB()
 
@@ -811,15 +969,15 @@ func main() {
 		w.WriteHeader(200)
 		w.Write([]byte(`{"status":"ready"}`))
 	})
-		mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{"requests": requestCount, "errors": errorCount})
 	})
-mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/healthz", handleHealthz)
 	mux.Handle("/v1/feature-flags/flags", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
 	mux.Handle("/v1/feature-flags/flags/check", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCheck)))
 	mux.Handle("/v1/feature-flags/flags/toggle", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleToggle)))
-	server := &http.Server{Addr: ":"+PORT, Handler: corsMiddleware(rateLimitMiddleware(mux))}
+	server := &http.Server{Addr: ":" + PORT, Handler: corsMiddleware(rateLimitMiddleware(mux))}
 	go func() {
 		log.Printf("[feature-flags-go] Starting on :%s", PORT)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

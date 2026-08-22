@@ -17,7 +17,7 @@ var port = getEnv("PORT", "8222")
 var middlewareConfig = map[string]interface{}{
 	"kafka":       map[string]string{"broker": getEnv("KAFKA_BROKER", "localhost:9092"), "topics": "cif.created,cif.updated,cif.address-verified,cif.kyc-refreshed"},
 	"redis":       map[string]string{"url": getEnv("REDIS_URL", "redis://localhost:6379"), "purpose": "cif-cache,address-geocode-cache"},
-	"postgres":    map[string]string{"url": getEnv("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": "customers,addresses,contacts,relationships,kyc_documents"},
+	"postgres":    map[string]string{"url": os.Getenv("DATABASE_URL"), "tables": "customers,addresses,contacts,relationships,kyc_documents"},
 	"opensearch":  map[string]string{"url": getEnv("OPENSEARCH_URL", "http://localhost:9200"), "index": "customer-search"},
 	"keycloak":    map[string]string{"url": getEnv("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "role": "customer-service,kyc-officer"},
 	"permify":     map[string]string{"url": getEnv("PERMIFY_URL", "http://localhost:3476"), "schema": "cif:create,cif:update,cif:view-pii,cif:merge"},
@@ -318,7 +318,10 @@ func main() {
 	godotenv.Load()
 	ctx := context.Background()
 
-	dbURL := getEnv("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db")
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("[cif-management-go] DATABASE_URL must be set; no default DSN is provided (credentials must come from the environment)")
+	}
 	db, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)

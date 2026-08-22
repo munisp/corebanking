@@ -72,7 +72,7 @@ func (s *ExpenseService) healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092")},
 			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379")},
-			"postgres":    map[string]interface{}{"url": envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db")},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL")},
 			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200")},
 			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank"},
 			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476")},
@@ -185,7 +185,7 @@ func main() {
 	godotenv.Load()
 	ctx := context.Background()
 
-	dbURL := envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db")
+	dbURL := os.Getenv("DATABASE_URL")
 	db, err := pgxpool.New(ctx, dbURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)

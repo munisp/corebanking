@@ -46,18 +46,18 @@ type VerificationRequest struct {
 }
 
 type VerificationResult struct {
-	ID         string  `json:"id"`
-	Type       string  `json:"type"`
-	MaskedID   string  `json:"maskedId"`
-	Verified   *bool   `json:"verified"` // nil = unknown (provider unavailable)
-	Status     string  `json:"status"`   // verified | not_verified | provider_unavailable
-	FirstName  string  `json:"firstName,omitempty"`
-	LastName   string  `json:"lastName,omitempty"`
-	DOB        string  `json:"dateOfBirth,omitempty"`
-	NameMatch  float64 `json:"nameMatchScore,omitempty"`
-	Provider   string  `json:"provider"`
-	ProviderRef string `json:"providerRef,omitempty"`
-	VerifiedAt string  `json:"verifiedAt,omitempty"`
+	ID          string  `json:"id"`
+	Type        string  `json:"type"`
+	MaskedID    string  `json:"maskedId"`
+	Verified    *bool   `json:"verified"` // nil = unknown (provider unavailable)
+	Status      string  `json:"status"`   // verified | not_verified | provider_unavailable
+	FirstName   string  `json:"firstName,omitempty"`
+	LastName    string  `json:"lastName,omitempty"`
+	DOB         string  `json:"dateOfBirth,omitempty"`
+	NameMatch   float64 `json:"nameMatchScore,omitempty"`
+	Provider    string  `json:"provider"`
+	ProviderRef string  `json:"providerRef,omitempty"`
+	VerifiedAt  string  `json:"verifiedAt,omitempty"`
 }
 
 var bvnRegex = regexp.MustCompile(`^\d{11}$`)
@@ -449,7 +449,9 @@ func jwtRealmURL() string {
 func startJWKSRefresh() {
 	go fetchJWKS(jwtRealmURL())
 	go func() {
-		for range time.Tick(5 * time.Minute) {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
 			fetchJWKS(jwtRealmURL())
 		}
 	}()

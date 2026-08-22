@@ -38,7 +38,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"syndication.facilities","syndication.drawdowns","syndication.participations"}, "usage": "event streaming"},
 			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"syndicated-loans-go:cache"}},
-			"postgres":    map[string]interface{}{"url": envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": []string{"syndicated_facilities","loan_participants","drawdown_schedules"}},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"syndicated_facilities","loan_participants","drawdown_schedules"}},
 			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"syndicated-loans","syndication-audit"}},
 			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "syndicated-loans-go"},
 			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"syndicated-loans-go"}},

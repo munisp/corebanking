@@ -45,7 +45,7 @@ func healthz(w http.ResponseWriter, _ *http.Request) {
 		"middleware": map[string]interface{}{
 			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"remittance.inbound","remittance.outbound","remittance.compliance"}, "usage": "event streaming"},
 			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"remittance-go:cache"}},
-			"postgres":    map[string]interface{}{"url": envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": []string{"remittance_transactions","remittance_corridors","agent_networks"}},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"remittance_transactions","remittance_corridors","agent_networks"}},
 			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"remittance-transactions","remittance-compliance"}},
 			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "remittance-go"},
 			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"remittance-go"}},
