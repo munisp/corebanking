@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
@@ -11,6 +13,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -89,18 +92,163 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// ── JWT Validation (JWKS / RS256, fail-closed) ──────────────────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+// jwtRealmURL resolves the Keycloak realm URL whose JWKS endpoint signs the
+// Bearer tokens accepted by this service.
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[%s] JWKS fetch failed: %v", serviceName, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[%s] JWKS fetch returned HTTP %d", serviceName, resp.StatusCode)
+		return
+	}
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[%s] JWKS decode failed: %v", serviceName, err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil || len(nBytes) == 0 {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil || len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[%s] JWKS refreshed: %d keys", serviceName, len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
+	go func() {
+		for range time.Tick(5 * time.Minute) {
+			fetchJWKS(jwtRealmURL())
+		}
+	}()
+}
+
+// verifyBearerToken performs full RS256 verification of a JWT against the
+// realm JWKS (signature + kid + alg + expiry). Any verification problem is an
+// error — callers must reject the request (fail-closed).
+func verifyBearerToken(token string) (map[string]interface{}, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid token header encoding")
+	}
+	var header struct {
+		Kid string `json:"kid"`
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+		return nil, fmt.Errorf("invalid token header")
+	}
+	if header.Alg != "RS256" {
+		return nil, fmt.Errorf("unsupported token algorithm %q", header.Alg)
+	}
+	jwtCache.mu.RLock()
+	pub, ok := jwtCache.keys[header.Kid]
+	jwtCache.mu.RUnlock()
+	if !ok {
+		// Key unknown — refresh once and retry (key rotation).
+		fetchJWKS(jwtRealmURL())
+		jwtCache.mu.RLock()
+		pub, ok = jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("unknown signing key")
+		}
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid signature encoding")
+	}
+	hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+		return nil, fmt.Errorf("invalid signature")
+	}
+	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid claims encoding")
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+		return nil, fmt.Errorf("invalid claims")
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("token missing exp claim")
+	}
+	if time.Now().Unix() >= int64(exp) {
+		return nil, fmt.Errorf("token expired")
+	}
+	return claims, nil
+}
+
+// authMiddleware requires a valid Keycloak-issued RS256 Bearer token on every
+// non-health route. It NEVER accepts a token on structure alone: any
+// verification problem (no keys fetched, unknown kid, bad signature, expiry)
+// yields 401.
 func authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
+		if r.URL.Path == "/health" || r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		auth := r.Header.Get("Authorization")
 		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			respondJSON(w, 401, map[string]interface{}{"error": "unauthorized"})
+			respondJSON(w, 401, map[string]interface{}{"error": "unauthorized", "detail": "missing bearer token"})
 			return
 		}
-		r.Header.Set("X-User-Id", "validated")
+		claims, err := verifyBearerToken(strings.TrimPrefix(auth, "Bearer "))
+		if err != nil {
+			atomic.AddUint64(&errorCount, 1)
+			respondJSON(w, 401, map[string]interface{}{"error": "unauthorized", "detail": err.Error()})
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			r.Header.Set("X-User-Id", sub)
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -192,7 +340,7 @@ func idempotencySet(key string, status int, body []byte, ttl time.Duration) {
 		pipe := redisClient.Pipeline()
 		pipe.Set(ctx, prefix+":status", strconv.Itoa(status), ttl)
 		pipe.Set(ctx, prefix+":body", string(body), ttl)
-		if _, err := pipe.Exec(ctx); err != nil {
+		if _, err := pipe.Exec(); err != nil {
 			log.Printf("[%s] Redis idempotency SET error: %v", serviceName, err)
 		}
 		return
@@ -350,6 +498,14 @@ func routePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// Forward the caller's verified Bearer token: the NIP engine authenticates
+	// /v1/nip/funds-transfer and rejects unauthenticated calls.
+	if authz := r.Header.Get("Authorization"); authz != "" {
+		req.Header.Set("Authorization", authz)
+	}
+	// The NIP engine requires an Idempotency-Key on funds transfers and
+	// derives its session ID from it — replays collapse to one transfer.
+	req.Header.Set("Idempotency-Key", idempKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		atomic.AddUint64(&errorCount, 1)
@@ -626,35 +782,6 @@ func requestIDMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func validateJWTExpiry(tokenStr string) bool {
-	parts := strings.Split(tokenStr, ".")
-	if len(parts) != 3 {
-		return false
-	}
-	// Decode payload (base64url)
-	payload := parts[1]
-	// Add padding if needed
-	switch len(payload) % 4 {
-	case 2:
-		payload += "=="
-	case 3:
-		payload += "="
-	}
-	decoded, err := base64.URLEncoding.DecodeString(payload)
-	if err != nil {
-		return false
-	}
-	var claims map[string]interface{}
-	if err := json.Unmarshal(decoded, &claims); err != nil {
-		return false
-	}
-	exp, ok := claims["exp"].(float64)
-	if !ok {
-		return false
-	}
-	return time.Now().Unix() < int64(exp)
-}
-
 // Handler context with timeout prevents hung requests
 func handlerContext(r *http.Request) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(r.Context(), 30*time.Second)
@@ -900,6 +1027,7 @@ func main() {
 	}
 	initDB()
 	initRedis()
+	startJWKSRefresh()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
