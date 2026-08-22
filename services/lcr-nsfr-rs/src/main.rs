@@ -93,11 +93,197 @@ fn nsfr_json(n: &NsfrRow) -> serde_json::Value {
     })
 }
 
+// --- JWT Auth Check (fail-closed; N-2 remediation) ---
+// Raw-socket variant of the canonical C-10 pattern (see jwt-validator-rs /
+// gl-engine-rs), extended to RS256: tokens are verified against the Keycloak JWKS
+// (KEYCLOAK_JWKS_URL, or derived from KEYCLOAK_REALM_URL) with a 300s cache and a
+// 5s fetch timeout (blocking client, matching falkordb-graph-engine-rs); HS256 via
+// JWT_SECRET is supported when JWKS is not configured. 401 on
+// missing/malformed/expired/unknown-kid tokens; 503 when the verification backend
+// (JWKS endpoint or JWT_SECRET) is unavailable.
+
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
+}
+
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
+        }
+    }
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
+        }
+        _ => None,
+    }
+}
+
+fn jwks_unavailable(detail: &str) -> (u16, String) {
+    (503, serde_json::json!({"error": "jwks_unavailable", "detail": detail}).to_string())
+}
+
+fn unauthorized(detail: &str) -> (u16, String) {
+    (401, serde_json::json!({"error": detail}).to_string())
+}
+
+fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, (u16, String)> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => return Err(jwks_unavailable("no JWKS endpoint configured")),
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
+            }
+        }
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| jwks_unavailable("client init failed"))?;
+    let resp = client.get(&url).send().map_err(|_| jwks_unavailable("fetch failed"))?;
+    if !resp.status().is_success() {
+        return Err(jwks_unavailable("upstream returned error status"));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().map_err(|_| jwks_unavailable("malformed JWKS payload"))?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
+}
+
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
+        }
+    }
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
+    }
+}
+
+fn verify_jwt_token(token: &str) -> Result<serde_json::Value, (u16, String)> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| unauthorized("malformed token header"))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(unauthorized("missing kid")),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks()?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks()?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => return Err(unauthorized("unknown kid")),
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| unauthorized("invalid jwk"))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(unauthorized("invalid or expired token")),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err((503, serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    }).to_string()))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(unauthorized("invalid or expired token")),
+            }
+        }
+        other => Err(unauthorized(&format!("unsupported alg {:?}", other))),
+    }
+}
+
+/// Extract a header value from the raw HTTP request text (case-insensitive name).
+fn raw_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    for line in request.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim());
+            }
+        }
+    }
+    None
+}
+
+/// Fail-closed JWT gate for the raw TcpListener dispatch. Returns Ok(claims) or
+/// Err((status, body)) ready to be written to the socket.
+fn check_jwt(request: &str, path: &str) -> Result<serde_json::Value, (u16, String)> {
+    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
+        return Ok(serde_json::json!({}));
+    }
+    let header = match raw_header(request, "Authorization") {
+        Some(h) => h,
+        None => return Err(unauthorized("missing Authorization header")),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(unauthorized("invalid auth header")),
+    };
+    verify_jwt_token(token)
+}
+
 fn handle_request(request: &str) -> (u16, String) {
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 { return (400, r#"{"error":"Bad request"}"#.to_string()); }
     let path = parts[1];
+
+    // N-2: fail-closed JWT auth on every route except health probes.
+    if let Err(e) = check_jwt(request, path) {
+        return e;
+    }
 
     if path == "/healthz" {
         let db_ok = with_db(|c| c.query_one("SELECT 1", &[]).map(|_| ()).map_err(|e| e.to_string())).is_ok();
