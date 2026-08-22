@@ -1,4 +1,5 @@
 use axum::{routing::{get, post}, Json, Router};
+use axum::response::IntoResponse;
 use chrono::{DateTime, Timelike, Utc};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,196 @@ struct HealthOutput {
     mode: String,
 }
 
+// ── JWT Auth (fail-closed; R4-V5-rust remediation) ──
+// Canonical verifier aligned with the repaired fleet: RS256 via Keycloak JWKS
+// (KEYCLOAK_JWKS_URL or derived from KEYCLOAK_REALM_URL, 300s cache, 5s fetch
+// timeout) with HS256 JWT_SECRET fallback; exp/nbf always validated, iss/aud
+// validated when JWT_EXPECTED_ISS / JWT_EXPECTED_AUD are set. 401 on
+// missing/malformed/expired tokens; 503 when no verification backend is
+// available. Verified claims are stored in request extensions.
+
+fn jwt_err(status: axum::http::StatusCode, body: serde_json::Value) -> axum::response::Response {
+    (status, axum::Json(body)).into_response()
+}
+
+#[derive(Debug, Clone)]
+struct VerifiedClaims(serde_json::Value);
+
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
+}
+
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
+        }
+    }
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
+        }
+        _ => None,
+    }
+}
+
+async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, axum::response::Response> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => {
+            return Err(jwt_err(axum::http::StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                "error": "jwt_validation_unavailable",
+                "detail": "no JWKS endpoint configured"
+            })))
+        }
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
+            }
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| jwt_err(axum::http::StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "client init failed"
+        })))?;
+    let resp = client.get(&url).send().await.map_err(|_| {
+        jwt_err(axum::http::StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({"error": "jwks_unavailable"}))
+    })?;
+    if !resp.status().is_success() {
+        return Err(jwt_err(axum::http::StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "upstream returned error status"
+        })));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
+        jwt_err(axum::http::StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "malformed JWKS payload"
+        }))
+    })?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
+}
+
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
+        }
+    }
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
+    }
+}
+
+async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, axum::response::Response> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "malformed token header"})))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "missing kid"}))),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks().await?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks().await?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => {
+                            return Err(jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "unknown kid"})))
+                        }
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "invalid jwk"})))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(jwt_err(axum::http::StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    })))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        other => Err(jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({
+            "error": format!("unsupported alg {:?}", other)
+        }))),
+    }
+}
+
+async fn check_jwt(headers: &axum::http::HeaderMap) -> Result<serde_json::Value, axum::response::Response> {
+    let header = match headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(jwt_err(axum::http::StatusCode::UNAUTHORIZED, serde_json::json!({"error": "invalid auth header"}))),
+    };
+    verify_jwt_token(token).await
+}
+
+async fn jwt_auth_middleware(mut req: axum::extract::Request, next: axum::middleware::Next) -> axum::response::Response {
+    match check_jwt(req.headers()).await {
+        Ok(claims) => {
+            req.extensions_mut().insert(VerifiedClaims(claims));
+            next.run(req).await
+        }
+        Err(resp) => resp,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -94,7 +285,7 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
-        .route("/evaluate", post(evaluate_handler));
+        .route("/evaluate", post(evaluate_handler).route_layer(axum::middleware::from_fn(jwt_auth_middleware)));
 
     let addr: SocketAddr = format!("{}:{}", args.host, args.port)
         .parse()
