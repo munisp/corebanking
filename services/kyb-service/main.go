@@ -44,14 +44,14 @@ func ev(k, d string) string {
 }
 
 var (
-	port               = ev("PORT", "9166")
-	databaseURL        = ev("DATABASE_URL", "")
-	daprHost           = ev("DAPR_HOST", "localhost")
-	daprPort           = ev("DAPR_HTTP_PORT", "3500")
-	daprPubsub         = ev("DAPR_PUBSUB_NAME", "pubsub")
-	sanctionsURL       = ev("SANCTIONS_SCREENING_URL", "http://sanctions-screening-service:8283")
-	cacAppID           = ev("CAC_SERVICE_APP_ID", "cac-realtime-api-go")
-	bvnAppID           = ev("BVN_SERVICE_APP_ID", "bvn-nin-verification-go")
+	port         = ev("PORT", "9166")
+	databaseURL  = ev("DATABASE_URL", "")
+	daprHost     = ev("DAPR_HOST", "localhost")
+	daprPort     = ev("DAPR_HTTP_PORT", "3500")
+	daprPubsub   = ev("DAPR_PUBSUB_NAME", "pubsub")
+	sanctionsURL = ev("SANCTIONS_SCREENING_URL", "http://sanctions-screening-service:8283")
+	cacAppID     = ev("CAC_SERVICE_APP_ID", "cac-realtime-api-go")
+	bvnAppID     = ev("BVN_SERVICE_APP_ID", "bvn-nin-verification-go")
 )
 
 func daprInvokeURL(appID, path string) string {
@@ -296,9 +296,9 @@ func listApplications(tid string) ([]KYBApplication, error) {
 // ── External verification calls ────────────────────────────────────────────────
 
 type CACDirector struct {
-	Name  string `json:"name"`
-	BVN   string `json:"bvn"`
-	Role  string `json:"role"`
+	Name string `json:"name"`
+	BVN  string `json:"bvn"`
+	Role string `json:"role"`
 }
 
 type CACCompany struct {
@@ -321,13 +321,13 @@ type BVNResult struct {
 }
 
 type verificationSummary struct {
-	CACVerified    bool          `json:"cac_verified"`
-	FIRSVerified   bool          `json:"firs_verified"`
-	SanctionsClear bool          `json:"sanctions_clear"`
-	RiskLevel      string        `json:"risk_level"`
-	Directors      []CACDirector `json:"directors"`
+	CACVerified    bool            `json:"cac_verified"`
+	FIRSVerified   bool            `json:"firs_verified"`
+	SanctionsClear bool            `json:"sanctions_clear"`
+	RiskLevel      string          `json:"risk_level"`
+	Directors      []CACDirector   `json:"directors"`
 	DirectorBVNs   map[string]bool `json:"director_bvns"`
-	SanctionHits   []string      `json:"sanction_hits"`
+	SanctionHits   []string        `json:"sanction_hits"`
 }
 
 func verifyCAC(rcNumber, tenantID string) (*CACCompany, bool) {
@@ -519,18 +519,18 @@ func handleApplications(w http.ResponseWriter, r *http.Request) {
 			docs = json.RawMessage("{}")
 		}
 		app := &KYBApplication{
-			ID:           newID(),
-			BusinessName: req.BusinessName,
-			RCNumber:     req.RCNumber,
-			TIN:          req.TIN,
-			Status:       "draft",
-			SanctionsClear: true,
-			RiskLevel:    "unknown",
-			Documents:    docs,
-			Directors:    json.RawMessage("[]"),
+			ID:                 newID(),
+			BusinessName:       req.BusinessName,
+			RCNumber:           req.RCNumber,
+			TIN:                req.TIN,
+			Status:             "draft",
+			SanctionsClear:     true,
+			RiskLevel:          "unknown",
+			Documents:          docs,
+			Directors:          json.RawMessage("[]"),
 			VerificationDetail: json.RawMessage("{}"),
-			TenantID:     tid,
-			SubmittedBy:  keycloakID(r),
+			TenantID:           tid,
+			SubmittedBy:        keycloakID(r),
 		}
 		if err := insertApplication(app); err != nil {
 			log.Printf("[kyb] insert error: %v", err)
@@ -654,9 +654,9 @@ func handleApprove(w http.ResponseWriter, r *http.Request, app *KYBApplication, 
 	}
 	updated, _ := getApplication(app.ID, tid)
 	writeJSON(w, 200, map[string]interface{}{
-		"message":          "First approval recorded. A different officer must call /finalize to complete.",
-		"application":      updated,
-		"first_approver":   approver,
+		"message":        "First approval recorded. A different officer must call /finalize to complete.",
+		"application":    updated,
+		"first_approver": approver,
 	})
 }
 
@@ -794,9 +794,9 @@ func main() {
 			code = 503
 		}
 		writeJSON(w, code, map[string]interface{}{
-			"service":  "kyb-service",
-			"status":   status,
-			"db":       dbOK,
+			"service": "kyb-service",
+			"status":  status,
+			"db":      dbOK,
 		})
 	})
 

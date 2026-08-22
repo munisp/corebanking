@@ -48,16 +48,16 @@ var (
 type NotificationType string
 
 const (
-	NotificationTypeTransaction    NotificationType = "transaction"
-	NotificationTypeTransfer       NotificationType = "transfer"
-	NotificationTypePayment        NotificationType = "payment"
-	NotificationTypeLoan           NotificationType = "loan"
-	NotificationTypeAlert          NotificationType = "alert"
-	NotificationTypePromotion      NotificationType = "promotion"
-	NotificationTypeSystem         NotificationType = "system"
-	NotificationTypeKYC            NotificationType = "kyc"
-	NotificationTypeSecurity       NotificationType = "security"
-	NotificationTypeAccountUpdate  NotificationType = "account_update"
+	NotificationTypeTransaction   NotificationType = "transaction"
+	NotificationTypeTransfer      NotificationType = "transfer"
+	NotificationTypePayment       NotificationType = "payment"
+	NotificationTypeLoan          NotificationType = "loan"
+	NotificationTypeAlert         NotificationType = "alert"
+	NotificationTypePromotion     NotificationType = "promotion"
+	NotificationTypeSystem        NotificationType = "system"
+	NotificationTypeKYC           NotificationType = "kyc"
+	NotificationTypeSecurity      NotificationType = "security"
+	NotificationTypeAccountUpdate NotificationType = "account_update"
 )
 
 // NotificationPriority represents notification priority
@@ -72,19 +72,19 @@ const (
 
 // Notification represents a notification message
 type Notification struct {
-	ID          string                 `json:"id"`
-	UserID      string                 `json:"user_id"`
-	TenantID    string                 `json:"tenant_id,omitempty"`
-	Type        NotificationType       `json:"type"`
-	Priority    NotificationPriority   `json:"priority"`
-	Title       string                 `json:"title"`
-	Body        string                 `json:"body"`
-	Data        map[string]interface{} `json:"data,omitempty"`
-	ActionURL   string                 `json:"action_url,omitempty"`
-	ImageURL    string                 `json:"image_url,omitempty"`
-	Read        bool                   `json:"read"`
-	CreatedAt   time.Time              `json:"created_at"`
-	ExpiresAt   *time.Time             `json:"expires_at,omitempty"`
+	ID        string                 `json:"id"`
+	UserID    string                 `json:"user_id"`
+	TenantID  string                 `json:"tenant_id,omitempty"`
+	Type      NotificationType       `json:"type"`
+	Priority  NotificationPriority   `json:"priority"`
+	Title     string                 `json:"title"`
+	Body      string                 `json:"body"`
+	Data      map[string]interface{} `json:"data,omitempty"`
+	ActionURL string                 `json:"action_url,omitempty"`
+	ImageURL  string                 `json:"image_url,omitempty"`
+	Read      bool                   `json:"read"`
+	CreatedAt time.Time              `json:"created_at"`
+	ExpiresAt *time.Time             `json:"expires_at,omitempty"`
 }
 
 // WebSocketClient represents a connected WebSocket client

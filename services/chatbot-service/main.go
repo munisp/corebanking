@@ -20,13 +20,13 @@ type ChatbotServer struct {
 }
 
 type ChatRequest struct {
-	TenantID     string                 `json:"tenant_id"`
-	CustomerID   string                 `json:"customer_id"`
-	SessionID    string                 `json:"session_id"`
-	Message      string                 `json:"message"`
-	Channel      string                 `json:"channel"` // web, mobile, whatsapp, telegram
-	Context      map[string]interface{} `json:"context,omitempty"`
-	Language     string                 `json:"language,omitempty"`
+	TenantID   string                 `json:"tenant_id"`
+	CustomerID string                 `json:"customer_id"`
+	SessionID  string                 `json:"session_id"`
+	Message    string                 `json:"message"`
+	Channel    string                 `json:"channel"` // web, mobile, whatsapp, telegram
+	Context    map[string]interface{} `json:"context,omitempty"`
+	Language   string                 `json:"language,omitempty"`
 }
 
 type ChatResponse struct {
@@ -68,32 +68,32 @@ func (s *ChatbotServer) setupRoutes() {
 	s.router.Handle("/metrics", promhttp.Handler())
 
 	api := s.router.PathPrefix("/api/v1").Subrouter()
-	
+
 	// Chat endpoints
 	api.HandleFunc("/chatbot/chat", s.chatHandler).Methods("POST")
 	api.HandleFunc("/chatbot/session/{sessionId}", s.getSessionHandler).Methods("GET")
 	api.HandleFunc("/chatbot/session/{sessionId}/end", s.endSessionHandler).Methods("POST")
 	api.HandleFunc("/chatbot/session/{sessionId}/history", s.getHistoryHandler).Methods("GET")
-	
+
 	// Intent management
 	api.HandleFunc("/chatbot/intents", s.getIntentsHandler).Methods("GET")
 	api.HandleFunc("/chatbot/intents", s.createIntentHandler).Methods("POST")
 	api.HandleFunc("/chatbot/intents/{intentId}", s.updateIntentHandler).Methods("PUT")
 	api.HandleFunc("/chatbot/intents/{intentId}", s.deleteIntentHandler).Methods("DELETE")
-	
+
 	// Training
 	api.HandleFunc("/chatbot/train", s.trainHandler).Methods("POST")
 	api.HandleFunc("/chatbot/train/status", s.getTrainingStatusHandler).Methods("GET")
-	
+
 	// Analytics
 	api.HandleFunc("/chatbot/analytics/conversations", s.getConversationAnalyticsHandler).Methods("GET")
 	api.HandleFunc("/chatbot/analytics/intents", s.getIntentAnalyticsHandler).Methods("GET")
 	api.HandleFunc("/chatbot/analytics/satisfaction", s.getSatisfactionHandler).Methods("GET")
-	
+
 	// Handoff to human
 	api.HandleFunc("/chatbot/handoff", s.requestHandoffHandler).Methods("POST")
 	api.HandleFunc("/chatbot/handoff/{sessionId}/accept", s.acceptHandoffHandler).Methods("POST")
-	
+
 	// Webhooks for external channels
 	api.HandleFunc("/chatbot/webhook/whatsapp", s.whatsappWebhookHandler).Methods("POST")
 	api.HandleFunc("/chatbot/webhook/telegram", s.telegramWebhookHandler).Methods("POST")
@@ -196,7 +196,7 @@ func (s *ChatbotServer) createIntentHandler(w http.ResponseWriter, r *http.Reque
 func (s *ChatbotServer) updateIntentHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	intentID := vars["intentId"]
-	
+
 	var req IntentConfig
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -309,7 +309,7 @@ func (s *ChatbotServer) requestHandoffHandler(w http.ResponseWriter, r *http.Req
 func (s *ChatbotServer) acceptHandoffHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["sessionId"]
-	
+
 	var req struct {
 		AgentID string `json:"agent_id"`
 	}
@@ -423,17 +423,17 @@ func NewChatbotEngine() *ChatbotEngine {
 func (e *ChatbotEngine) ProcessMessage(req ChatRequest) (*ChatResponse, error) {
 	intent := "balance_inquiry"
 	response := "Your current balance is NGN 50,000.00"
-	
+
 	if req.Message == "" {
 		response = "Hello! How can I help you today?"
 		intent = "greeting"
 	}
-	
+
 	return &ChatResponse{
-		SessionID:  req.SessionID,
-		Response:   response,
-		Intent:     intent,
-		Confidence: 0.95,
+		SessionID:    req.SessionID,
+		Response:     response,
+		Intent:       intent,
+		Confidence:   0.95,
 		QuickReplies: []string{"Check Balance", "Transfer Money", "Pay Bills", "Talk to Agent"},
 	}, nil
 }
@@ -486,9 +486,9 @@ func (e *ChatbotEngine) GetTrainingStatus(tenantID string) (map[string]interface
 
 func (e *ChatbotEngine) GetConversationAnalytics(tenantID string) (map[string]interface{}, error) {
 	return map[string]interface{}{
-		"total_conversations": 1000,
+		"total_conversations":  1000,
 		"avg_duration_seconds": 120,
-		"resolution_rate": 0.85,
+		"resolution_rate":      0.85,
 	}, nil
 }
 

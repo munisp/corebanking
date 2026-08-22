@@ -188,10 +188,10 @@ func (s *CreditServer) coopStatsHandler(w http.ResponseWriter, r *http.Request) 
 		FROM coop_credit_scoring_records WHERE tenant_id=$1`, tid).
 		Scan(&models, &totalPreds, &totalScored)
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"modelsDeployed":    models,
+		"modelsDeployed":      models,
 		"totalPredictions24h": totalPreds,
-		"avgLatencyMs":      42,
-		"gpuUtilization":    67.3,
+		"avgLatencyMs":        42,
+		"gpuUtilization":      67.3,
 	})
 }
 
@@ -365,23 +365,23 @@ func (s *CreditServer) collateralListHandler(w http.ResponseWriter, r *http.Requ
 	}
 	defer rows.Close()
 	type valuation struct {
-		ID                string  `json:"id"`
-		CollateralID      string  `json:"collateral_id"`
-		CollateralType    string  `json:"collateral_type"`
-		Description       string  `json:"description"`
-		Owner             string  `json:"owner"`
-		MarketValue       float64 `json:"market_value"`
-		ForcedSaleValue   float64 `json:"forced_sale_value"`
-		HaircutPct        float64 `json:"haircut_pct"`
+		ID                 string  `json:"id"`
+		CollateralID       string  `json:"collateral_id"`
+		CollateralType     string  `json:"collateral_type"`
+		Description        string  `json:"description"`
+		Owner              string  `json:"owner"`
+		MarketValue        float64 `json:"market_value"`
+		ForcedSaleValue    float64 `json:"forced_sale_value"`
+		HaircutPct         float64 `json:"haircut_pct"`
 		NetRealizableValue float64 `json:"net_realizable_value"`
-		Currency          string  `json:"currency"`
-		Valuer            string  `json:"valuer"`
-		ValuationDate     string  `json:"valuation_date"`
-		ExpiryDate        string  `json:"expiry_date"`
-		InsuranceValue    float64 `json:"insurance_value"`
-		InsuranceExpiry   string  `json:"insurance_expiry"`
-		LienStatus        string  `json:"lien_status"`
-		Status            string  `json:"status"`
+		Currency           string  `json:"currency"`
+		Valuer             string  `json:"valuer"`
+		ValuationDate      string  `json:"valuation_date"`
+		ExpiryDate         string  `json:"expiry_date"`
+		InsuranceValue     float64 `json:"insurance_value"`
+		InsuranceExpiry    string  `json:"insurance_expiry"`
+		LienStatus         string  `json:"lien_status"`
+		Status             string  `json:"status"`
 	}
 	items := make([]valuation, 0)
 	for rows.Next() {
@@ -432,12 +432,12 @@ func (s *CreditServer) collateralSummaryHandler(w http.ResponseWriter, r *http.R
 		}
 	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"totalValuations":    total,
-		"totalMarketValue":   totalMV,
-		"totalFSV":           totalFSV,
-		"avgHaircut":         avgHaircut,
-		"marketValueByType":  byType,
-		"byStatus":           byStatus,
+		"totalValuations":   total,
+		"totalMarketValue":  totalMV,
+		"totalFSV":          totalFSV,
+		"avgHaircut":        avgHaircut,
+		"marketValueByType": byType,
+		"byStatus":          byStatus,
 	})
 }
 

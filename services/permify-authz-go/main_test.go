@@ -234,7 +234,10 @@ func TestStats(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestNumericMatch(t *testing.T) {
-	cases := []struct{ cond, val string; want bool }{
+	cases := []struct {
+		cond, val string
+		want      bool
+	}{
 		{">10000000", "15000000", true},
 		{">10000000", "5000000", false},
 		{"<2", "1", true},

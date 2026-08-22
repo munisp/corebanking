@@ -251,14 +251,14 @@ func ObservabilityHandler(hm *HealthMonitor) http.HandlerFunc {
 
 // Trace context for distributed tracing
 type TraceContext struct {
-	TraceID       string    `json:"traceId"`
-	SpanID        string    `json:"spanId"`
-	ParentSpanID  string    `json:"parentSpanId,omitempty"`
-	ServiceName   string    `json:"serviceName"`
-	OperationName string    `json:"operationName"`
-	StartTime     time.Time `json:"startTime"`
-	Duration      int64     `json:"durationMs"`
-	Status        string    `json:"status"`
+	TraceID       string            `json:"traceId"`
+	SpanID        string            `json:"spanId"`
+	ParentSpanID  string            `json:"parentSpanId,omitempty"`
+	ServiceName   string            `json:"serviceName"`
+	OperationName string            `json:"operationName"`
+	StartTime     time.Time         `json:"startTime"`
+	Duration      int64             `json:"durationMs"`
+	Status        string            `json:"status"`
 	Tags          map[string]string `json:"tags,omitempty"`
 }
 

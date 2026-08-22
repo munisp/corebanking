@@ -16,9 +16,9 @@ import (
 
 // LakehouseClient handles communication with the lakehouse API
 type LakehouseClient struct {
-	httpClient   *http.Client
-	baseURL      string
-	apiKey       string
+	httpClient *http.Client
+	baseURL    string
+	apiKey     string
 }
 
 // NewLakehouseClient creates a new lakehouse client
@@ -27,7 +27,7 @@ func NewLakehouseClient() *LakehouseClient {
 	if baseURL == "" {
 		baseURL = "http://lakehouse-api:8000"
 	}
-	
+
 	return &LakehouseClient{
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
@@ -58,26 +58,26 @@ func (c *LakehouseClient) IngestNDVIData(ctx context.Context, ndviRecords []NDVI
 	data := make([]map[string]interface{}, len(ndviRecords))
 	for i, record := range ndviRecords {
 		data[i] = map[string]interface{}{
-			"id":                record.ID,
-			"farm_id":           record.FarmID,
-			"polygon_id":        record.PolygonID,
-			"capture_date":      record.CaptureDate.Format(time.RFC3339),
-			"satellite_source":  record.SatelliteSource,
-			"ndvi_mean":         record.NDVIMean,
-			"ndvi_min":          record.NDVIMin,
-			"ndvi_max":          record.NDVIMax,
-			"ndvi_std_dev":      record.NDVIStdDev,
-			"health_status":     record.HealthStatus,
-			"cloud_coverage":    record.CloudCoverage,
-			"growth_stage":      record.GrowthStage,
-			"expected_ndvi":     record.ExpectedNDVI,
-			"ndvi_deviation":    record.NDVIDeviation,
-			"alert_triggered":   record.AlertTriggered,
-			"created_at":        record.CreatedAt.Format(time.RFC3339),
+			"id":                  record.ID,
+			"farm_id":             record.FarmID,
+			"polygon_id":          record.PolygonID,
+			"capture_date":        record.CaptureDate.Format(time.RFC3339),
+			"satellite_source":    record.SatelliteSource,
+			"ndvi_mean":           record.NDVIMean,
+			"ndvi_min":            record.NDVIMin,
+			"ndvi_max":            record.NDVIMax,
+			"ndvi_std_dev":        record.NDVIStdDev,
+			"health_status":       record.HealthStatus,
+			"cloud_coverage":      record.CloudCoverage,
+			"growth_stage":        record.GrowthStage,
+			"expected_ndvi":       record.ExpectedNDVI,
+			"ndvi_deviation":      record.NDVIDeviation,
+			"alert_triggered":     record.AlertTriggered,
+			"created_at":          record.CreatedAt.Format(time.RFC3339),
 			"ingestion_timestamp": time.Now().Format(time.RFC3339),
 		}
 	}
-	
+
 	return c.writeToDelta(ctx, "bronze.agriculture_ndvi", data, "append")
 }
 
@@ -86,20 +86,20 @@ func (c *LakehouseClient) IngestIoTReadings(ctx context.Context, readings []Sens
 	data := make([]map[string]interface{}, len(readings))
 	for i, reading := range readings {
 		data[i] = map[string]interface{}{
-			"id":              reading.ID,
-			"sensor_id":       reading.SensorID,
-			"farm_id":         reading.FarmID,
-			"reading_type":    reading.ReadingType,
-			"value":           reading.Value,
-			"unit":            reading.Unit,
-			"quality":         reading.Quality,
-			"timestamp":       reading.Timestamp.Format(time.RFC3339),
-			"alert_triggered": reading.AlertTriggered,
-			"alert_type":      reading.AlertType,
+			"id":                  reading.ID,
+			"sensor_id":           reading.SensorID,
+			"farm_id":             reading.FarmID,
+			"reading_type":        reading.ReadingType,
+			"value":               reading.Value,
+			"unit":                reading.Unit,
+			"quality":             reading.Quality,
+			"timestamp":           reading.Timestamp.Format(time.RFC3339),
+			"alert_triggered":     reading.AlertTriggered,
+			"alert_type":          reading.AlertType,
 			"ingestion_timestamp": time.Now().Format(time.RFC3339),
 		}
 	}
-	
+
 	return c.writeToDelta(ctx, "bronze.agriculture_iot_readings", data, "append")
 }
 
@@ -108,24 +108,24 @@ func (c *LakehouseClient) IngestSoilAnalysis(ctx context.Context, analyses []Soi
 	data := make([]map[string]interface{}, len(analyses))
 	for i, analysis := range analyses {
 		data[i] = map[string]interface{}{
-			"id":              analysis.ID,
-			"farm_id":         analysis.FarmID,
-			"sample_date":     analysis.SampleDate.Format(time.RFC3339),
-			"sample_location": analysis.SampleLocation,
-			"gps_coordinates": analysis.GPSCoordinates,
-			"soil_type":       analysis.SoilType,
-			"ph":              analysis.pH,
-			"nitrogen":        analysis.Nitrogen,
-			"phosphorus":      analysis.Phosphorus,
-			"potassium":       analysis.Potassium,
-			"organic_matter":  analysis.OrganicMatter,
-			"moisture":        analysis.Moisture,
-			"soil_health":     analysis.SoilHealth,
-			"created_at":      analysis.CreatedAt.Format(time.RFC3339),
+			"id":                  analysis.ID,
+			"farm_id":             analysis.FarmID,
+			"sample_date":         analysis.SampleDate.Format(time.RFC3339),
+			"sample_location":     analysis.SampleLocation,
+			"gps_coordinates":     analysis.GPSCoordinates,
+			"soil_type":           analysis.SoilType,
+			"ph":                  analysis.pH,
+			"nitrogen":            analysis.Nitrogen,
+			"phosphorus":          analysis.Phosphorus,
+			"potassium":           analysis.Potassium,
+			"organic_matter":      analysis.OrganicMatter,
+			"moisture":            analysis.Moisture,
+			"soil_health":         analysis.SoilHealth,
+			"created_at":          analysis.CreatedAt.Format(time.RFC3339),
 			"ingestion_timestamp": time.Now().Format(time.RFC3339),
 		}
 	}
-	
+
 	return c.writeToDelta(ctx, "bronze.agriculture_soil_analysis", data, "append")
 }
 
@@ -134,20 +134,20 @@ func (c *LakehouseClient) IngestWeatherData(ctx context.Context, weatherData []W
 	data := make([]map[string]interface{}, len(weatherData))
 	for i, weather := range weatherData {
 		data[i] = map[string]interface{}{
-			"station_id":      weather.StationID,
-			"farm_id":         weather.FarmID,
-			"temperature":     weather.Temperature,
-			"humidity":        weather.Humidity,
-			"rainfall":        weather.Rainfall,
-			"wind_speed":      weather.WindSpeed,
-			"wind_direction":  weather.WindDirection,
-			"solar_radiation": weather.SolarRadiation,
-			"pressure":        weather.Pressure,
-			"timestamp":       weather.Timestamp.Format(time.RFC3339),
+			"station_id":          weather.StationID,
+			"farm_id":             weather.FarmID,
+			"temperature":         weather.Temperature,
+			"humidity":            weather.Humidity,
+			"rainfall":            weather.Rainfall,
+			"wind_speed":          weather.WindSpeed,
+			"wind_direction":      weather.WindDirection,
+			"solar_radiation":     weather.SolarRadiation,
+			"pressure":            weather.Pressure,
+			"timestamp":           weather.Timestamp.Format(time.RFC3339),
 			"ingestion_timestamp": time.Now().Format(time.RFC3339),
 		}
 	}
-	
+
 	return c.writeToDelta(ctx, "bronze.agriculture_weather", data, "append")
 }
 
@@ -156,23 +156,23 @@ func (c *LakehouseClient) IngestYieldEstimates(ctx context.Context, estimates []
 	data := make([]map[string]interface{}, len(estimates))
 	for i, estimate := range estimates {
 		data[i] = map[string]interface{}{
-			"id":               estimate.ID,
-			"farm_id":          estimate.FarmID,
-			"loan_id":          estimate.LoanID,
-			"crop_type":        estimate.CropType,
-			"estimation_date":  estimate.EstimationDate.Format(time.RFC3339),
-			"growth_stage":     estimate.GrowthStage,
-			"days_to_harvest":  estimate.DaysToHarvest,
-			"estimated_yield":  estimate.EstimatedYield,
-			"yield_confidence": estimate.YieldConfidence,
-			"historical_avg":   estimate.HistoricalAvg,
-			"yield_variance":   estimate.YieldVariance,
-			"methodology":      estimate.Methodology,
-			"created_at":       estimate.CreatedAt.Format(time.RFC3339),
+			"id":                  estimate.ID,
+			"farm_id":             estimate.FarmID,
+			"loan_id":             estimate.LoanID,
+			"crop_type":           estimate.CropType,
+			"estimation_date":     estimate.EstimationDate.Format(time.RFC3339),
+			"growth_stage":        estimate.GrowthStage,
+			"days_to_harvest":     estimate.DaysToHarvest,
+			"estimated_yield":     estimate.EstimatedYield,
+			"yield_confidence":    estimate.YieldConfidence,
+			"historical_avg":      estimate.HistoricalAvg,
+			"yield_variance":      estimate.YieldVariance,
+			"methodology":         estimate.Methodology,
+			"created_at":          estimate.CreatedAt.Format(time.RFC3339),
 			"ingestion_timestamp": time.Now().Format(time.RFC3339),
 		}
 	}
-	
+
 	return c.writeToDelta(ctx, "bronze.agriculture_yield_estimates", data, "append")
 }
 
@@ -183,7 +183,7 @@ func (c *LakehouseClient) IngestFarmPolygons(ctx context.Context, polygons []Far
 		// Convert coordinates to WKT
 		wktPolygon := coordinatesToWKT(polygon.Coordinates)
 		coordsJSON, _ := json.Marshal(polygon.Coordinates)
-		
+
 		data[i] = map[string]interface{}{
 			"polygon_id":          polygon.ID,
 			"farm_id":             polygon.FarmID,
@@ -202,7 +202,7 @@ func (c *LakehouseClient) IngestFarmPolygons(ctx context.Context, polygons []Far
 			"ingestion_timestamp": time.Now().Format(time.RFC3339),
 		}
 	}
-	
+
 	return c.writeToDelta(ctx, "bronze.agriculture_farm_polygons", data, "overwrite")
 }
 
@@ -211,7 +211,7 @@ func coordinatesToWKT(coords [][]float64) string {
 	if len(coords) == 0 {
 		return ""
 	}
-	
+
 	var wkt string
 	for i, coord := range coords {
 		if i > 0 {
@@ -221,7 +221,7 @@ func coordinatesToWKT(coords [][]float64) string {
 	}
 	// Close the polygon
 	wkt += fmt.Sprintf(", %f %f", coords[0][0], coords[0][1])
-	
+
 	return fmt.Sprintf("POLYGON((%s))", wkt)
 }
 
@@ -232,35 +232,35 @@ func (c *LakehouseClient) writeToDelta(ctx context.Context, tableName string, da
 		Data:      data,
 		Mode:      mode,
 	}
-	
+
 	jsonBody, err := json.Marshal(req)
 	if err != nil {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
-	
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
 		c.baseURL+"/api/v1/delta/write",
 		bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
-	
+
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("write failed with status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	return nil
 }
 
@@ -327,44 +327,44 @@ func (c *LakehouseClient) getFeatures(ctx context.Context, featureService string
 		FeatureService: featureService,
 		EntityRows:     entityRows,
 	}
-	
+
 	jsonBody, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
 		c.baseURL+"/api/v1/features/get",
 		bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
-	
+
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("feature request failed with status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	var featureResp FeatureResponse
 	if err := json.NewDecoder(resp.Body).Decode(&featureResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	if len(featureResp.Features) > 0 {
 		return featureResp.Features[0], nil
 	}
-	
+
 	return nil, nil
 }
 
@@ -380,9 +380,9 @@ type GeospatialQueryRequest struct {
 
 // GeospatialQueryResponse represents a geospatial query response
 type GeospatialQueryResponse struct {
-	Status    string                   `json:"status"`
-	QueryType string                   `json:"query_type"`
-	Results   map[string]interface{}   `json:"results"`
+	Status    string                 `json:"status"`
+	QueryType string                 `json:"query_type"`
+	Results   map[string]interface{} `json:"results"`
 }
 
 // PointInPolygonQuery finds which farm polygon contains a given point
@@ -395,7 +395,7 @@ func (c *LakehouseClient) PointInPolygonQuery(ctx context.Context, lat, lng floa
 		},
 		Dataset: "farm_polygons",
 	}
-	
+
 	return c.executeGeospatialQuery(ctx, req)
 }
 
@@ -412,7 +412,7 @@ func (c *LakehouseClient) DistanceQuery(ctx context.Context, lat, lng float64, m
 			"max_distance_km": maxDistanceKm,
 		},
 	}
-	
+
 	return c.executeGeospatialQuery(ctx, req)
 }
 
@@ -426,7 +426,7 @@ func (c *LakehouseClient) SpatialJoinQuery(ctx context.Context, polygonWKT strin
 		},
 		Dataset: targetDataset,
 	}
-	
+
 	return c.executeGeospatialQuery(ctx, req)
 }
 
@@ -436,35 +436,35 @@ func (c *LakehouseClient) executeGeospatialQuery(ctx context.Context, req Geospa
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
 		c.baseURL+"/api/v1/geospatial/query",
 		bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
-	
+
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("geospatial query failed with status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	var queryResp GeospatialQueryResponse
 	if err := json.NewDecoder(resp.Body).Decode(&queryResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	return &queryResp, nil
 }
 
@@ -490,46 +490,46 @@ func (c *LakehouseClient) ExecuteQuery(ctx context.Context, query string, engine
 	if engine == "" {
 		engine = "clickhouse"
 	}
-	
+
 	req := QueryRequest{
 		Query:  query,
 		Engine: engine,
 		Format: "json",
 	}
-	
+
 	jsonBody, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	
+
 	httpReq, err := http.NewRequestWithContext(ctx, "POST",
 		c.baseURL+"/api/v1/query",
 		bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	httpReq.Header.Set("Content-Type", "application/json")
 	if c.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
 	}
-	
+
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("query failed with status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	var queryResp QueryResponse
 	if err := json.NewDecoder(resp.Body).Decode(&queryResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	return &queryResp, nil
 }
 
@@ -549,7 +549,7 @@ func (c *LakehouseClient) GetNDVITrends(ctx context.Context, farmID string, days
 		AND capture_date >= now() - INTERVAL %d DAY
 		ORDER BY capture_date DESC
 	`, farmID, days)
-	
+
 	return c.ExecuteQuery(ctx, query, "clickhouse")
 }
 
@@ -570,7 +570,7 @@ func (c *LakehouseClient) GetYieldHistory(ctx context.Context, farmID string) (*
 		ORDER BY estimation_date DESC
 		LIMIT 50
 	`, farmID)
-	
+
 	return c.ExecuteQuery(ctx, query, "clickhouse")
 }
 
@@ -589,7 +589,7 @@ func (c *LakehouseClient) GetRegionalStatistics(ctx context.Context, tenantID st
 		FROM gold.agriculture_farm_health
 		WHERE tenant_id = '%s'
 	`, tenantID)
-	
+
 	return c.ExecuteQuery(ctx, query, "clickhouse")
 }
 
@@ -601,12 +601,12 @@ func (c *LakehouseClient) HealthCheck(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return false, fmt.Errorf("health check failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	return resp.StatusCode == http.StatusOK, nil
 }

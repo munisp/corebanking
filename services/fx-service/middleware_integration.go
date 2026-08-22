@@ -29,20 +29,20 @@ type TBTransfer struct {
 }
 
 const (
-	LedgerFX          = 70
-	LedgerFXNGN       = 71
-	LedgerFXUSD       = 72
-	LedgerFXGBP       = 73
-	LedgerFXEUR       = 74
-	LedgerFXPosition  = 75
+	LedgerFX         = 70
+	LedgerFXNGN      = 71
+	LedgerFXUSD      = 72
+	LedgerFXGBP      = 73
+	LedgerFXEUR      = 74
+	LedgerFXPosition = 75
 
-	CodeFXPurchase     = 8001
-	CodeFXSale         = 8002
-	CodeFXTransfer     = 8003
-	CodeFXSettlement   = 8004
-	CodeFXHedge        = 8005
-	CodeFXRevaluation  = 8006
-	CodeFXSpread       = 8007
+	CodeFXPurchase    = 8001
+	CodeFXSale        = 8002
+	CodeFXTransfer    = 8003
+	CodeFXSettlement  = 8004
+	CodeFXHedge       = 8005
+	CodeFXRevaluation = 8006
+	CodeFXSpread      = 8007
 )
 
 func NewTigerBeetleClient(baseURL string) *TigerBeetleClient {
@@ -151,12 +151,12 @@ type KafkaProducer struct {
 }
 
 type FXEvent struct {
-	EventID      string                 `json:"event_id"`
-	EventType    string                 `json:"event_type"`
-	TransactionID string                `json:"transaction_id"`
-	CustomerID   string                 `json:"customer_id,omitempty"`
-	Timestamp    time.Time              `json:"timestamp"`
-	Data         map[string]interface{} `json:"data"`
+	EventID       string                 `json:"event_id"`
+	EventType     string                 `json:"event_type"`
+	TransactionID string                 `json:"transaction_id"`
+	CustomerID    string                 `json:"customer_id,omitempty"`
+	Timestamp     time.Time              `json:"timestamp"`
+	Data          map[string]interface{} `json:"data"`
 }
 
 const (
@@ -285,12 +285,12 @@ func NewIntegratedFXService(config FXServiceConfig) *IntegratedFXService {
 }
 
 type FXQuote struct {
-	QuoteID      string  `json:"quote_id"`
-	FromCurrency string  `json:"from_currency"`
-	ToCurrency   string  `json:"to_currency"`
-	FromAmount   float64 `json:"from_amount"`
-	ToAmount     float64 `json:"to_amount"`
-	Rate         float64 `json:"rate"`
+	QuoteID      string    `json:"quote_id"`
+	FromCurrency string    `json:"from_currency"`
+	ToCurrency   string    `json:"to_currency"`
+	FromAmount   float64   `json:"from_amount"`
+	ToAmount     float64   `json:"to_amount"`
+	Rate         float64   `json:"rate"`
 	ExpiresAt    time.Time `json:"expires_at"`
 }
 

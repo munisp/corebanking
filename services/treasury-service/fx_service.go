@@ -41,15 +41,15 @@ type FXRate struct {
 
 // FXService handles foreign exchange operations
 type FXService struct {
-	tenantID    string
-	deals       map[string]*FXDeal
-	counter     int
-	mu          sync.RWMutex
-	db          *sql.DB
-	httpClient  *http.Client
-	ratesMu     sync.RWMutex
-	rates       map[string]FXRate // last real quotes fetched from the rate source
-	ratesAsOf   time.Time
+	tenantID   string
+	deals      map[string]*FXDeal
+	counter    int
+	mu         sync.RWMutex
+	db         *sql.DB
+	httpClient *http.Client
+	ratesMu    sync.RWMutex
+	rates      map[string]FXRate // last real quotes fetched from the rate source
+	ratesAsOf  time.Time
 }
 
 func fxRateSourceURL() string { return os.Getenv("FX_RATES_URL") }
@@ -230,15 +230,15 @@ func (s *FXService) computePositions(tenantID string) []*FXPosition {
 			avgRate = a.costNumerator / float64(a.long)
 		}
 		pos := &FXPosition{
-			PositionID:   tenantID + "-" + ccy,
-			TenantID:     tenantID,
-			Currency:     ccy,
-			LongPosition: a.long,
+			PositionID:    tenantID + "-" + ccy,
+			TenantID:      tenantID,
+			Currency:      ccy,
+			LongPosition:  a.long,
 			ShortPosition: a.short,
-			NetPosition:  a.long - a.short,
-			AvgRate:      avgRate,
-			Status:       "within_limit",
-			UpdatedAt:    time.Now(),
+			NetPosition:   a.long - a.short,
+			AvgRate:       avgRate,
+			Status:        "within_limit",
+			UpdatedAt:     time.Now(),
 		}
 		// Unrealized PnL only from a real rate quote; otherwise left zero and
 		// flagged via metadata on the PnL endpoint.
@@ -531,6 +531,7 @@ func (s *FXService) GetFXRates(tenantID string) (map[string]interface{}, error) 
 // GetFXPnL computes P&L from real deals and real rates:
 //   - unrealized: net open position × (current real mid − avg acquisition rate)
 //   - realized: FIFO-matched settled sells minus the cost of matched buys
+//
 // Returns error when rates are required but no real rate has ever been fetched.
 func (s *FXService) GetFXPnL(tenantID string) (map[string]interface{}, error) {
 	s.mu.RLock()

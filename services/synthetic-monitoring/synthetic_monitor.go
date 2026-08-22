@@ -70,37 +70,37 @@ func init() {
 
 // SyntheticConfig holds configuration for synthetic monitoring
 type SyntheticConfig struct {
-	BaseURL           string
-	AuthServiceURL    string
-	PaymentServiceURL string
+	BaseURL            string
+	AuthServiceURL     string
+	PaymentServiceURL  string
 	TransferServiceURL string
-	BillPayServiceURL string
-	USSDServiceURL    string
-	MobileAPIURL      string
-	TestInterval      time.Duration
-	Timeout           time.Duration
-	TestUserEmail     string
-	TestUserPassword  string
-	TestAccountID     string
-	AlertWebhookURL   string
+	BillPayServiceURL  string
+	USSDServiceURL     string
+	MobileAPIURL       string
+	TestInterval       time.Duration
+	Timeout            time.Duration
+	TestUserEmail      string
+	TestUserPassword   string
+	TestAccountID      string
+	AlertWebhookURL    string
 }
 
 // DefaultSyntheticConfig returns sensible defaults
 func DefaultSyntheticConfig() SyntheticConfig {
 	return SyntheticConfig{
-		BaseURL:           os.Getenv("BASE_URL"),
-		AuthServiceURL:    os.Getenv("AUTH_SERVICE_URL"),
-		PaymentServiceURL: os.Getenv("PAYMENT_SERVICE_URL"),
+		BaseURL:            os.Getenv("BASE_URL"),
+		AuthServiceURL:     os.Getenv("AUTH_SERVICE_URL"),
+		PaymentServiceURL:  os.Getenv("PAYMENT_SERVICE_URL"),
 		TransferServiceURL: os.Getenv("TRANSFER_SERVICE_URL"),
-		BillPayServiceURL: os.Getenv("BILLPAY_SERVICE_URL"),
-		USSDServiceURL:    os.Getenv("USSD_SERVICE_URL"),
-		MobileAPIURL:      os.Getenv("MOBILE_API_URL"),
-		TestInterval:      time.Minute * 5,
-		Timeout:           time.Second * 30,
-		TestUserEmail:     os.Getenv("SYNTHETIC_TEST_USER_EMAIL"),
-		TestUserPassword:  os.Getenv("SYNTHETIC_TEST_USER_PASSWORD"),
-		TestAccountID:     os.Getenv("SYNTHETIC_TEST_ACCOUNT_ID"),
-		AlertWebhookURL:   os.Getenv("ALERT_WEBHOOK_URL"),
+		BillPayServiceURL:  os.Getenv("BILLPAY_SERVICE_URL"),
+		USSDServiceURL:     os.Getenv("USSD_SERVICE_URL"),
+		MobileAPIURL:       os.Getenv("MOBILE_API_URL"),
+		TestInterval:       time.Minute * 5,
+		Timeout:            time.Second * 30,
+		TestUserEmail:      os.Getenv("SYNTHETIC_TEST_USER_EMAIL"),
+		TestUserPassword:   os.Getenv("SYNTHETIC_TEST_USER_PASSWORD"),
+		TestAccountID:      os.Getenv("SYNTHETIC_TEST_ACCOUNT_ID"),
+		AlertWebhookURL:    os.Getenv("ALERT_WEBHOOK_URL"),
 	}
 }
 
@@ -122,13 +122,13 @@ type TestJourney struct {
 
 // TestResult represents the result of a test run
 type TestResult struct {
-	JourneyName  string                 `json:"journey_name"`
-	StepName     string                 `json:"step_name"`
-	Success      bool                   `json:"success"`
-	Duration     time.Duration          `json:"duration"`
-	Error        string                 `json:"error,omitempty"`
-	Timestamp    time.Time              `json:"timestamp"`
-	Metadata     map[string]interface{} `json:"metadata,omitempty"`
+	JourneyName string                 `json:"journey_name"`
+	StepName    string                 `json:"step_name"`
+	Success     bool                   `json:"success"`
+	Duration    time.Duration          `json:"duration"`
+	Error       string                 `json:"error,omitempty"`
+	Timestamp   time.Time              `json:"timestamp"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // SyntheticMonitor manages synthetic monitoring
@@ -357,10 +357,10 @@ func (sm *SyntheticMonitor) createBillPaymentJourney() TestJourney {
 				Execute: func(ctx context.Context, state map[string]interface{}) error {
 					url := sm.config.BillPayServiceURL + "/api/v1/bills/validate"
 					body := map[string]interface{}{
-						"biller_code":    "AIRTIME_MTN",
-						"customer_id":    "08012345678",
-						"amount":         100.00,
-						"dry_run":        true,
+						"biller_code": "AIRTIME_MTN",
+						"customer_id": "08012345678",
+						"amount":      100.00,
+						"dry_run":     true,
 					}
 					jsonBody, _ := json.Marshal(body)
 

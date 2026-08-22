@@ -13,11 +13,12 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -25,6 +26,17 @@ import (
 
 	"net"
 )
+
+// cryptoRandUint32 returns a cryptographically secure random uint32 for
+// record and audit identifiers (L-06/L-16-residual: math/rand IDs are
+// predictable and collision-prone).
+func cryptoRandUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		log.Fatalf("crypto/rand unavailable: %v", err)
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "credit-facility-go"
 
@@ -162,7 +174,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("CRE-%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("CRE-%08X", cryptoRandUint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -187,7 +199,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -220,7 +232,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -464,7 +476,9 @@ func fetchJWKS(realmURL string) {
 func startJWKSRefresh() {
 	go fetchJWKS(jwtRealmURL())
 	go func() {
-		for range time.Tick(5 * time.Minute) {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
 			fetchJWKS(jwtRealmURL())
 		}
 	}()

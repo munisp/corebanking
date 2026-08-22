@@ -58,38 +58,38 @@ var (
 
 // SavingsGoal represents a savings goal
 type SavingsGoal struct {
-	ID              string          `json:"id"`
-	UserID          string          `json:"user_id"`
-	Name            string          `json:"name"`
-	Description     string          `json:"description,omitempty"`
-	TargetAmount    float64         `json:"target_amount"`
-	CurrentAmount   float64         `json:"current_amount"`
-	Currency        string          `json:"currency"`
-	Category        GoalCategory    `json:"category"`
-	TargetDate      time.Time       `json:"target_date"`
-	ImageURL        string          `json:"image_url,omitempty"`
-	Status          GoalStatus      `json:"status"`
-	AutoSave        *AutoSaveConfig `json:"auto_save,omitempty"`
-	Contributions   []Contribution  `json:"contributions,omitempty"`
-	Milestones      []Milestone     `json:"milestones,omitempty"`
-	CreatedAt       time.Time       `json:"created_at"`
-	CompletedAt     *time.Time      `json:"completed_at,omitempty"`
+	ID            string          `json:"id"`
+	UserID        string          `json:"user_id"`
+	Name          string          `json:"name"`
+	Description   string          `json:"description,omitempty"`
+	TargetAmount  float64         `json:"target_amount"`
+	CurrentAmount float64         `json:"current_amount"`
+	Currency      string          `json:"currency"`
+	Category      GoalCategory    `json:"category"`
+	TargetDate    time.Time       `json:"target_date"`
+	ImageURL      string          `json:"image_url,omitempty"`
+	Status        GoalStatus      `json:"status"`
+	AutoSave      *AutoSaveConfig `json:"auto_save,omitempty"`
+	Contributions []Contribution  `json:"contributions,omitempty"`
+	Milestones    []Milestone     `json:"milestones,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	CompletedAt   *time.Time      `json:"completed_at,omitempty"`
 }
 
 // GoalCategory represents goal categories
 type GoalCategory string
 
 const (
-	CategoryEmergency   GoalCategory = "emergency"
-	CategoryVacation    GoalCategory = "vacation"
-	CategoryEducation   GoalCategory = "education"
-	CategoryHome        GoalCategory = "home"
-	CategoryCar         GoalCategory = "car"
-	CategoryWedding     GoalCategory = "wedding"
-	CategoryBusiness    GoalCategory = "business"
-	CategoryRetirement  GoalCategory = "retirement"
-	CategoryGadget      GoalCategory = "gadget"
-	CategoryOther       GoalCategory = "other"
+	CategoryEmergency  GoalCategory = "emergency"
+	CategoryVacation   GoalCategory = "vacation"
+	CategoryEducation  GoalCategory = "education"
+	CategoryHome       GoalCategory = "home"
+	CategoryCar        GoalCategory = "car"
+	CategoryWedding    GoalCategory = "wedding"
+	CategoryBusiness   GoalCategory = "business"
+	CategoryRetirement GoalCategory = "retirement"
+	CategoryGadget     GoalCategory = "gadget"
+	CategoryOther      GoalCategory = "other"
 )
 
 // GoalStatus represents goal status
@@ -104,11 +104,11 @@ const (
 
 // AutoSaveConfig represents automatic savings configuration
 type AutoSaveConfig struct {
-	Enabled     bool      `json:"enabled"`
-	Amount      float64   `json:"amount"`
-	Frequency   string    `json:"frequency"` // daily, weekly, monthly
-	SourceAccount string  `json:"source_account"`
-	NextRunDate time.Time `json:"next_run_date"`
+	Enabled       bool      `json:"enabled"`
+	Amount        float64   `json:"amount"`
+	Frequency     string    `json:"frequency"` // daily, weekly, monthly
+	SourceAccount string    `json:"source_account"`
+	NextRunDate   time.Time `json:"next_run_date"`
 }
 
 // Contribution represents a contribution to a goal
@@ -121,35 +121,35 @@ type Contribution struct {
 
 // Milestone represents a goal milestone
 type Milestone struct {
-	Percentage int       `json:"percentage"`
-	Reached    bool      `json:"reached"`
+	Percentage int        `json:"percentage"`
+	Reached    bool       `json:"reached"`
 	ReachedAt  *time.Time `json:"reached_at,omitempty"`
-	Reward     *Reward   `json:"reward,omitempty"`
+	Reward     *Reward    `json:"reward,omitempty"`
 }
 
 // Achievement represents a user achievement
 type Achievement struct {
-	ID          string           `json:"id"`
-	Name        string           `json:"name"`
-	Description string           `json:"description"`
+	ID          string              `json:"id"`
+	Name        string              `json:"name"`
+	Description string              `json:"description"`
 	Category    AchievementCategory `json:"category"`
-	Icon        string           `json:"icon"`
-	Points      int              `json:"points"`
-	Rarity      AchievementRarity `json:"rarity"`
+	Icon        string              `json:"icon"`
+	Points      int                 `json:"points"`
+	Rarity      AchievementRarity   `json:"rarity"`
 	Criteria    AchievementCriteria `json:"criteria"`
-	UnlockedAt  *time.Time       `json:"unlocked_at,omitempty"`
+	UnlockedAt  *time.Time          `json:"unlocked_at,omitempty"`
 }
 
 // AchievementCategory represents achievement categories
 type AchievementCategory string
 
 const (
-	AchievementCategorySavings     AchievementCategory = "savings"
+	AchievementCategorySavings      AchievementCategory = "savings"
 	AchievementCategoryTransactions AchievementCategory = "transactions"
-	AchievementCategoryStreak      AchievementCategory = "streak"
-	AchievementCategoryGoals       AchievementCategory = "goals"
-	AchievementCategoryReferral    AchievementCategory = "referral"
-	AchievementCategoryLoyalty     AchievementCategory = "loyalty"
+	AchievementCategoryStreak       AchievementCategory = "streak"
+	AchievementCategoryGoals        AchievementCategory = "goals"
+	AchievementCategoryReferral     AchievementCategory = "referral"
+	AchievementCategoryLoyalty      AchievementCategory = "loyalty"
 )
 
 // AchievementRarity represents achievement rarity
@@ -172,18 +172,18 @@ type AchievementCriteria struct {
 
 // UserProgress represents a user's gamification progress
 type UserProgress struct {
-	UserID           string        `json:"user_id"`
-	TotalPoints      int           `json:"total_points"`
-	Level            int           `json:"level"`
-	LevelName        string        `json:"level_name"`
-	PointsToNextLevel int          `json:"points_to_next_level"`
-	CurrentStreak    int           `json:"current_streak"`
-	LongestStreak    int           `json:"longest_streak"`
-	LastSaveDate     *time.Time    `json:"last_save_date,omitempty"`
-	Achievements     []Achievement `json:"achievements"`
-	Badges           []Badge       `json:"badges"`
-	Rewards          []Reward      `json:"rewards"`
-	Stats            UserStats     `json:"stats"`
+	UserID            string        `json:"user_id"`
+	TotalPoints       int           `json:"total_points"`
+	Level             int           `json:"level"`
+	LevelName         string        `json:"level_name"`
+	PointsToNextLevel int           `json:"points_to_next_level"`
+	CurrentStreak     int           `json:"current_streak"`
+	LongestStreak     int           `json:"longest_streak"`
+	LastSaveDate      *time.Time    `json:"last_save_date,omitempty"`
+	Achievements      []Achievement `json:"achievements"`
+	Badges            []Badge       `json:"badges"`
+	Rewards           []Reward      `json:"rewards"`
+	Stats             UserStats     `json:"stats"`
 }
 
 // UserStats represents user statistics
@@ -221,27 +221,27 @@ type Reward struct {
 type RewardType string
 
 const (
-	RewardTypeCashback    RewardType = "cashback"
-	RewardTypePoints      RewardType = "points"
+	RewardTypeCashback      RewardType = "cashback"
+	RewardTypePoints        RewardType = "points"
 	RewardTypeInterestBoost RewardType = "interest_boost"
-	RewardTypeFeeWaiver   RewardType = "fee_waiver"
-	RewardTypeVoucher     RewardType = "voucher"
+	RewardTypeFeeWaiver     RewardType = "fee_waiver"
+	RewardTypeVoucher       RewardType = "voucher"
 )
 
 // RewardStatus represents reward status
 type RewardStatus string
 
 const (
-	RewardStatusPending  RewardStatus = "pending"
+	RewardStatusPending   RewardStatus = "pending"
 	RewardStatusAvailable RewardStatus = "available"
-	RewardStatusClaimed  RewardStatus = "claimed"
-	RewardStatusExpired  RewardStatus = "expired"
+	RewardStatusClaimed   RewardStatus = "claimed"
+	RewardStatusExpired   RewardStatus = "expired"
 )
 
 // Leaderboard represents a leaderboard
 type Leaderboard struct {
-	Type    string            `json:"type"`
-	Period  string            `json:"period"`
+	Type    string             `json:"type"`
+	Period  string             `json:"period"`
 	Entries []LeaderboardEntry `json:"entries"`
 }
 
@@ -257,27 +257,27 @@ type LeaderboardEntry struct {
 
 // Challenge represents a savings challenge
 type Challenge struct {
-	ID          string          `json:"id"`
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	Type        ChallengeType   `json:"type"`
-	Target      float64         `json:"target"`
-	Reward      Reward          `json:"reward"`
-	StartDate   time.Time       `json:"start_date"`
-	EndDate     time.Time       `json:"end_date"`
-	Participants int            `json:"participants"`
-	Status      ChallengeStatus `json:"status"`
+	ID           string          `json:"id"`
+	Name         string          `json:"name"`
+	Description  string          `json:"description"`
+	Type         ChallengeType   `json:"type"`
+	Target       float64         `json:"target"`
+	Reward       Reward          `json:"reward"`
+	StartDate    time.Time       `json:"start_date"`
+	EndDate      time.Time       `json:"end_date"`
+	Participants int             `json:"participants"`
+	Status       ChallengeStatus `json:"status"`
 }
 
 // ChallengeType represents challenge types
 type ChallengeType string
 
 const (
-	ChallengeTypeSaveAmount   ChallengeType = "save_amount"
-	ChallengeTypeSaveStreak   ChallengeType = "save_streak"
-	ChallengeTypeNoSpend      ChallengeType = "no_spend"
-	ChallengeTypeRoundUp      ChallengeType = "round_up"
-	ChallengeTypeCommunity    ChallengeType = "community"
+	ChallengeTypeSaveAmount ChallengeType = "save_amount"
+	ChallengeTypeSaveStreak ChallengeType = "save_streak"
+	ChallengeTypeNoSpend    ChallengeType = "no_spend"
+	ChallengeTypeRoundUp    ChallengeType = "round_up"
+	ChallengeTypeCommunity  ChallengeType = "community"
 )
 
 // ChallengeStatus represents challenge status
@@ -667,28 +667,28 @@ func (s *GamificationService) GetActiveChallenges(ctx context.Context) ([]*Chall
 	// Implementation would return active challenges
 	return []*Challenge{
 		{
-			ID:          "challenge1",
-			Name:        "30-Day Savings Sprint",
-			Description: "Save at least ₦1,000 every day for 30 days",
-			Type:        ChallengeTypeSaveStreak,
-			Target:      30,
-			Reward:      Reward{Type: RewardTypeCashback, Value: 5},
-			StartDate:   time.Now(),
-			EndDate:     time.Now().AddDate(0, 1, 0),
+			ID:           "challenge1",
+			Name:         "30-Day Savings Sprint",
+			Description:  "Save at least ₦1,000 every day for 30 days",
+			Type:         ChallengeTypeSaveStreak,
+			Target:       30,
+			Reward:       Reward{Type: RewardTypeCashback, Value: 5},
+			StartDate:    time.Now(),
+			EndDate:      time.Now().AddDate(0, 1, 0),
 			Participants: 1250,
-			Status:      ChallengeStatusActive,
+			Status:       ChallengeStatusActive,
 		},
 		{
-			ID:          "challenge2",
-			Name:        "Round-Up Champion",
-			Description: "Enable round-up savings and save ₦10,000 from round-ups",
-			Type:        ChallengeTypeRoundUp,
-			Target:      10000,
-			Reward:      Reward{Type: RewardTypePoints, Value: 500},
-			StartDate:   time.Now(),
-			EndDate:     time.Now().AddDate(0, 0, 14),
+			ID:           "challenge2",
+			Name:         "Round-Up Champion",
+			Description:  "Enable round-up savings and save ₦10,000 from round-ups",
+			Type:         ChallengeTypeRoundUp,
+			Target:       10000,
+			Reward:       Reward{Type: RewardTypePoints, Value: 500},
+			StartDate:    time.Now(),
+			EndDate:      time.Now().AddDate(0, 0, 14),
 			Participants: 890,
-			Status:      ChallengeStatusActive,
+			Status:       ChallengeStatusActive,
 		},
 	}, nil
 }

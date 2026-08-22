@@ -973,7 +973,9 @@ func jwtRealmURL() string {
 func startJWKSRefresh() {
 	go fetchJWKS(jwtRealmURL())
 	go func() {
-		for range time.Tick(5 * time.Minute) {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
 			fetchJWKS(jwtRealmURL())
 		}
 	}()

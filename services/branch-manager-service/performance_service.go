@@ -129,41 +129,41 @@ func (s *PerformanceService) GetPerformance(tenantID, branchID, period string) *
 
 	// Return default performance if none found
 	return &BranchPerformance{
-		PerformanceID:        uuid.New().String(),
-		TenantID:             tenantID,
-		BranchID:             branchID,
-		Period:               period,
-		Date:                 time.Now(),
-		TotalTransactions:    150,
-		DepositCount:         75,
-		WithdrawalCount:      50,
-		TransferCount:        25,
-		TotalDepositAmount:   25000000000,
+		PerformanceID:         uuid.New().String(),
+		TenantID:              tenantID,
+		BranchID:              branchID,
+		Period:                period,
+		Date:                  time.Now(),
+		TotalTransactions:     150,
+		DepositCount:          75,
+		WithdrawalCount:       50,
+		TransferCount:         25,
+		TotalDepositAmount:    25000000000,
 		TotalWithdrawalAmount: 15000000000,
-		TotalTransferAmount:  5000000000,
-		NewAccountsOpened:    5,
-		AccountsClosed:       1,
-		ActiveAccounts:       1500,
-		DormantAccounts:      50,
-		LoanApplications:     10,
-		LoansApproved:        7,
-		LoansDisbursed:       5,
-		TotalDisbursedAmount: 50000000000,
-		NPLCount:             3,
-		NPLAmount:            5000000000,
-		CustomersServed:      120,
-		AvgWaitTime:          8.5,
-		AvgServiceTime:       12.3,
-		CustomerSatisfaction: 4.2,
-		FeeIncome:            500000000,
-		InterestIncome:       2000000000,
-		TotalRevenue:         2500000000,
-		CashPosition:         100000000000,
-		VaultBalance:         50000000000,
-		ATMUptime:            99.5,
-		SystemUptime:         99.9,
-		CreatedAt:            time.Now(),
-		UpdatedAt:            time.Now(),
+		TotalTransferAmount:   5000000000,
+		NewAccountsOpened:     5,
+		AccountsClosed:        1,
+		ActiveAccounts:        1500,
+		DormantAccounts:       50,
+		LoanApplications:      10,
+		LoansApproved:         7,
+		LoansDisbursed:        5,
+		TotalDisbursedAmount:  50000000000,
+		NPLCount:              3,
+		NPLAmount:             5000000000,
+		CustomersServed:       120,
+		AvgWaitTime:           8.5,
+		AvgServiceTime:        12.3,
+		CustomerSatisfaction:  4.2,
+		FeeIncome:             500000000,
+		InterestIncome:        2000000000,
+		TotalRevenue:          2500000000,
+		CashPosition:          100000000000,
+		VaultBalance:          50000000000,
+		ATMUptime:             99.5,
+		SystemUptime:          99.9,
+		CreatedAt:             time.Now(),
+		UpdatedAt:             time.Now(),
 	}
 }
 
@@ -186,13 +186,13 @@ func (s *PerformanceService) ComparePerformance(tenantID, branchID, compareTo, p
 		"current":    current,
 		"comparison": comparison,
 		"metrics": map[string]interface{}{
-			"transactionsDiff":    current.TotalTransactions - comparison.TotalTransactions,
-			"depositsDiff":        current.TotalDepositAmount - comparison.TotalDepositAmount,
-			"withdrawalsDiff":     current.TotalWithdrawalAmount - comparison.TotalWithdrawalAmount,
-			"newAccountsDiff":     current.NewAccountsOpened - comparison.NewAccountsOpened,
-			"customersDiff":       current.CustomersServed - comparison.CustomersServed,
-			"satisfactionDiff":    current.CustomerSatisfaction - comparison.CustomerSatisfaction,
-			"revenueDiff":         current.TotalRevenue - comparison.TotalRevenue,
+			"transactionsDiff": current.TotalTransactions - comparison.TotalTransactions,
+			"depositsDiff":     current.TotalDepositAmount - comparison.TotalDepositAmount,
+			"withdrawalsDiff":  current.TotalWithdrawalAmount - comparison.TotalWithdrawalAmount,
+			"newAccountsDiff":  current.NewAccountsOpened - comparison.NewAccountsOpened,
+			"customersDiff":    current.CustomersServed - comparison.CustomersServed,
+			"satisfactionDiff": current.CustomerSatisfaction - comparison.CustomerSatisfaction,
+			"revenueDiff":      current.TotalRevenue - comparison.TotalRevenue,
 		},
 	}
 }
@@ -220,7 +220,7 @@ func (s *PerformanceService) GetQueueStatus(tenantID, branchID string) map[strin
 // GetDailyReport returns daily report
 func (s *PerformanceService) GetDailyReport(tenantID, branchID, date string) map[string]interface{} {
 	perf := s.GetDailyPerformance(tenantID, branchID, date)
-	
+
 	return map[string]interface{}{
 		"reportType": "daily",
 		"date":       date,
@@ -235,10 +235,10 @@ func (s *PerformanceService) GetDailyReport(tenantID, branchID, date string) map
 			"customerSatisfaction": perf.CustomerSatisfaction,
 		},
 		"cashPosition": map[string]interface{}{
-			"opening":  perf.CashPosition - perf.TotalDepositAmount + perf.TotalWithdrawalAmount,
-			"closing":  perf.CashPosition,
-			"cashIn":   perf.TotalDepositAmount,
-			"cashOut":  perf.TotalWithdrawalAmount,
+			"opening": perf.CashPosition - perf.TotalDepositAmount + perf.TotalWithdrawalAmount,
+			"closing": perf.CashPosition,
+			"cashIn":  perf.TotalDepositAmount,
+			"cashOut": perf.TotalWithdrawalAmount,
 		},
 		"generatedAt": time.Now().Format(time.RFC3339),
 	}
@@ -284,9 +284,9 @@ func (s *PerformanceService) GetMonthlyReport(tenantID, branchID, month, year st
 			"totalRevenue":      10000000000,
 		},
 		"targetAchievement": map[string]interface{}{
-			"deposits":     85.5,
-			"newAccounts":  92.0,
-			"revenue":      78.3,
+			"deposits":    85.5,
+			"newAccounts": 92.0,
+			"revenue":     78.3,
 		},
 		"weeklyTrend": []map[string]interface{}{
 			{"week": 1, "transactions": 750, "deposits": 125000000000},
@@ -301,29 +301,29 @@ func (s *PerformanceService) GetMonthlyReport(tenantID, branchID, month, year st
 // GetStaffPerformanceReport returns staff performance report
 func (s *PerformanceService) GetStaffPerformanceReport(tenantID, branchID, period string, staffService *StaffService) map[string]interface{} {
 	staff := staffService.ListStaff(tenantID, branchID, "", "active")
-	
+
 	var staffMetrics []map[string]interface{}
 	for _, st := range staff {
 		staffMetrics = append(staffMetrics, map[string]interface{}{
-			"staffID":              st.StaffID,
-			"name":                 st.FirstName + " " + st.LastName,
-			"role":                 st.Role,
-			"transactionsHandled":  45,
-			"customersServed":      40,
-			"avgServiceTime":       10.5,
-			"customerRating":       4.3,
-			"attendanceRate":       98.0,
+			"staffID":             st.StaffID,
+			"name":                st.FirstName + " " + st.LastName,
+			"role":                st.Role,
+			"transactionsHandled": 45,
+			"customersServed":     40,
+			"avgServiceTime":      10.5,
+			"customerRating":      4.3,
+			"attendanceRate":      98.0,
 		})
 	}
 
 	return map[string]interface{}{
-		"reportType":   "staff_performance",
-		"period":       period,
-		"branchID":     branchID,
-		"totalStaff":   len(staff),
-		"staffMetrics": staffMetrics,
+		"reportType":    "staff_performance",
+		"period":        period,
+		"branchID":      branchID,
+		"totalStaff":    len(staff),
+		"staffMetrics":  staffMetrics,
 		"topPerformers": staffMetrics[:min(3, len(staffMetrics))],
-		"generatedAt":  time.Now().Format(time.RFC3339),
+		"generatedAt":   time.Now().Format(time.RFC3339),
 	}
 }
 

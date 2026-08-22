@@ -20,13 +20,13 @@ import (
 
 // TigerBeetle uses 128-bit IDs and fixed-size accounts/transfers
 type TBAccount struct {
-	ID            string `json:"id"`
-	DebitsPending int64  `json:"debitsPending"`
-	CreditsPending int64 `json:"creditsPending"`
-	DebitsPosted  int64  `json:"debitsPosted"`
-	CreditsPosted int64  `json:"creditsPosted"`
-	Ledger        uint32 `json:"ledger"`
-	Code          uint16 `json:"code"`
+	ID             string `json:"id"`
+	DebitsPending  int64  `json:"debitsPending"`
+	CreditsPending int64  `json:"creditsPending"`
+	DebitsPosted   int64  `json:"debitsPosted"`
+	CreditsPosted  int64  `json:"creditsPosted"`
+	Ledger         uint32 `json:"ledger"`
+	Code           uint16 `json:"code"`
 }
 
 type TBTransfer struct {
@@ -43,12 +43,12 @@ type TBTransfer struct {
 // --- Batch Submitter ---
 
 type BatchSubmitter struct {
-	mu          sync.Mutex
-	transfers   []TBTransfer
-	maxBatch    int
-	submitted   int64
-	failed      int64
-	tbAddr      string
+	mu        sync.Mutex
+	transfers []TBTransfer
+	maxBatch  int
+	submitted int64
+	failed    int64
+	tbAddr    string
 }
 
 func NewBatchSubmitter(maxBatch int) *BatchSubmitter {

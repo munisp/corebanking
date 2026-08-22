@@ -44,8 +44,8 @@ func (s *ALMService) initializeDefaultData(tenantID string) {
 			},
 			{
 				Bucket:        "31-90d",
-				Assets:        80000000000,  // 80B
-				Liabilities:   70000000000,  // 70B
+				Assets:        80000000000, // 80B
+				Liabilities:   70000000000, // 70B
 				Gap:           10000000000,
 				CumulativeGap: -10000000000,
 				GapRatio:      14.29,
@@ -91,10 +91,10 @@ func (s *ALMService) initializeDefaultData(tenantID string) {
 		Currency:         "NGN",
 		DurationGap:      0.85,
 		ModifiedDuration: 2.5,
-		BPVAssets:        125000000, // 125M per bp
-		BPVLiabilities:   100000000, // 100M per bp
-		NetBPV:           25000000,  // 25M per bp
-		EaR:              2500000000, // 2.5B at risk (100bp shock)
+		BPVAssets:        125000000,   // 125M per bp
+		BPVLiabilities:   100000000,   // 100M per bp
+		NetBPV:           25000000,    // 25M per bp
+		EaR:              2500000000,  // 2.5B at risk (100bp shock)
 		EVE:              50000000000, // 50B economic value
 		Status:           "moderate",
 		CreatedAt:        time.Now(),

@@ -5,27 +5,38 @@
 package main
 
 import (
+	"context"
 	_ "github.com/lib/pq"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 
+	"bytes"
+	"crypto/rand"
+	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
-	"database/sql"
-	"bytes"
-	"strings"
 
 	"net"
-
 )
+
+// cryptoRandUint32 returns a cryptographically secure random uint32 for
+// record and audit identifiers (L-06/L-16-residual: math/rand IDs are
+// predictable and collision-prone).
+func cryptoRandUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		log.Fatalf("crypto/rand unavailable: %v", err)
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "atm-management-go"
 
@@ -34,15 +45,15 @@ var startTime = time.Now()
 // ─── Domain Types ───────────────────────────────────────────────────────────
 
 type Record struct {
-	ID          string                 `json:"id"`
-	Type        string                 `json:"type"`
-	Status      string                 `json:"status"`
-	Data        map[string]interface{} `json:"data"`
-	CreatedAt   string                 `json:"createdAt"`
-	UpdatedAt   string                 `json:"updatedAt"`
-	CreatedBy   string                 `json:"createdBy,omitempty"`
-	TenantID    string                 `json:"tenantId,omitempty"`
-	Version     int                    `json:"version"`
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Status    string                 `json:"status"`
+	Data      map[string]interface{} `json:"data"`
+	CreatedAt string                 `json:"createdAt"`
+	UpdatedAt string                 `json:"updatedAt"`
+	CreatedBy string                 `json:"createdBy,omitempty"`
+	TenantID  string                 `json:"tenantId,omitempty"`
+	Version   int                    `json:"version"`
 }
 
 type AuditEntry struct {
@@ -55,12 +66,12 @@ type AuditEntry struct {
 }
 
 type DomainStats struct {
-	TotalRecords    int                    `json:"totalRecords"`
-	ActiveRecords   int                    `json:"activeRecords"`
-	PendingRecords  int                    `json:"pendingRecords"`
-	ProcessedToday  int                    `json:"processedToday"`
-	Domain          string                 `json:"domain"`
-	Metrics         map[string]interface{} `json:"metrics"`
+	TotalRecords   int                    `json:"totalRecords"`
+	ActiveRecords  int                    `json:"activeRecords"`
+	PendingRecords int                    `json:"pendingRecords"`
+	ProcessedToday int                    `json:"processedToday"`
+	Domain         string                 `json:"domain"`
+	Metrics        map[string]interface{} `json:"metrics"`
 }
 
 var (
@@ -70,7 +81,7 @@ var (
 		{ID: "ATM-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Banking Ops", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
 		{ID: "ATM-003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Banking Ops", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
 	}
-	auditLog = []AuditEntry{}
+	auditLog    = []AuditEntry{}
 	domainStats = DomainStats{
 		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
 		Domain: "Banking Ops",
@@ -94,7 +105,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"service": "atm-management-go", "status": "healthy", "version": "2.0.0",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
-		"domain": "Atm Management — Banking Ops",
+		"domain":      "Atm Management — Banking Ops",
 		"middleware": map[string]string{
 			"kafka":      "atm-management.events, atm-management.audit",
 			"postgres":   "atm_management_records",
@@ -141,12 +152,17 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheSet("atm_management_list", "", 1) // invalidate list cache on write
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 	// Inter-service call: core_banking
 	_upstreamURL := os.Getenv("CORE_BANKING_URL")
-	if _upstreamURL == "" { _upstreamURL = "http://localhost:8100" }
+	if _upstreamURL == "" {
+		_upstreamURL = "http://localhost:8100"
+	}
 	_result, _err := callService("POST", _upstreamURL+"/v1/transactions", nil)
 	if _err != nil {
 		log.Printf("atm-management-go: core_banking failed: %v", _err)
@@ -154,12 +170,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		log.Printf("atm-management-go: core_banking ok: %v", _result)
 	}
 
-
 	mu.Lock()
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("ATM-%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("ATM-%08X", cryptoRandUint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -169,7 +184,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		TenantID:  getString(body, "tenantId"),
 		Version:   1,
 	}
-	if rec.Type == "" { rec.Type = "primary" }
+	if rec.Type == "" {
+		rec.Type = "primary"
+	}
 	records = append(records, rec)
 	domainStats.TotalRecords = len(records)
 
@@ -181,7 +198,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -190,7 +207,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
+	if r.Method != "POST" && r.Method != "PUT" {
+		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
@@ -200,14 +220,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
-			if s := getString(body, "status"); s != "" { records[i].Status = s }
+			if s := getString(body, "status"); s != "" {
+				records[i].Status = s
+			}
 			for k, v := range body {
-				if k != "id" { records[i].Data[k] = v }
+				if k != "id" {
+					records[i].Data[k] = v
+				}
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -226,7 +250,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
 
-
 func handleAudit(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -237,10 +260,15 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	domainStats.TotalRecords = len(records)
-	active := 0; pending := 0
+	active := 0
+	pending := 0
 	for _, r := range records {
-		if r.Status == "active" || r.Status == "completed" { active++ }
-		if r.Status == "pending" || r.Status == "processing" { pending++ }
+		if r.Status == "active" || r.Status == "completed" {
+			active++
+		}
+		if r.Status == "pending" || r.Status == "processing" {
+			pending++
+		}
 	}
 	domainStats.ActiveRecords = active
 	domainStats.PendingRecords = pending
@@ -248,97 +276,98 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok { return v }
+	if v, ok := m[key].(string); ok {
+		return v
+	}
 	return ""
 }
 
-
 func atm_managementComputeScore(value float64, weight float64, threshold float64) float64 {
-    score := value * weight
-    if score > threshold { score = threshold }
-    return score
+	score := value * weight
+	if score > threshold {
+		score = threshold
+	}
+	return score
 }
 
 func atm_managementValidateRequest(data map[string]interface{}) map[string]interface{} {
-    errors := []string{}
-    required := []string{"id", "type"}
-    for _, field := range required {
-        if _, ok := data[field]; !ok {
-            errors = append(errors, field + " is required")
-        }
-    }
-    return map[string]interface{}{"valid": len(errors) == 0, "errors": errors}
+	errors := []string{}
+	required := []string{"id", "type"}
+	for _, field := range required {
+		if _, ok := data[field]; !ok {
+			errors = append(errors, field+" is required")
+		}
+	}
+	return map[string]interface{}{"valid": len(errors) == 0, "errors": errors}
 }
 
 func atm_managementScoreHandler(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        Value     float64 `json:"value"`
-        Weight    float64 `json:"weight"`
-        Threshold float64 `json:"threshold"`
-    }
-    json.NewDecoder(r.Body).Decode(&req)
-    score := atm_managementComputeScore(req.Value, req.Weight, req.Threshold)
-    respondJSON(w, 200, map[string]interface{}{"score": score})
+	var req struct {
+		Value     float64 `json:"value"`
+		Weight    float64 `json:"weight"`
+		Threshold float64 `json:"threshold"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	score := atm_managementComputeScore(req.Value, req.Weight, req.Threshold)
+	respondJSON(w, 200, map[string]interface{}{"score": score})
 }
 
 func atm_managementValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
-    var body map[string]interface{}
-    json.NewDecoder(r.Body).Decode(&body)
-    result := atm_managementValidateRequest(body)
-    respondJSON(w, 200, result)
+	var body map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&body)
+	result := atm_managementValidateRequest(body)
+	respondJSON(w, 200, result)
 }
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"atm-management-go"}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"atm-management-go"}`)
 }
 
 func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"alive":true}`)
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"atm-management-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"atm-management-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"atm-management-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"atm-management-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"atm-management-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"atm-management-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
-
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
 }
 
 type responseWriter struct {
-    http.ResponseWriter
-    status int
+	http.ResponseWriter
+	status int
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
-
 
 // --- Database Layer ---
 var db *sql.DB
@@ -376,9 +405,13 @@ func initDB() {
 }
 
 func dbList(service string, limit int) ([]map[string]interface{}, error) {
-	if db == nil { return nil, fmt.Errorf("no db") }
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
 	rows, err := db.Query("SELECT id, type, status, data, created_at FROM service_records WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var items []map[string]interface{}
 	for rows.Next() {
@@ -390,11 +423,12 @@ func dbList(service string, limit int) ([]map[string]interface{}, error) {
 }
 
 func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil { return fmt.Errorf("no db") }
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
 	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
 	return err
 }
-
 
 // --- JWT Auth Middleware ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
@@ -415,7 +449,6 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 // --- Inter-Service Communication with Circuit Breaker ---
 var _cbFailures int
 var _cbOpen bool
@@ -425,11 +458,16 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	if _cbOpen { _cbOpen = false; _cbFailures = 0 }
+	if _cbOpen {
+		_cbOpen = false
+		_cbFailures = 0
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 { time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond) }
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+		}
 		var req *http.Request
 		if body != nil {
 			j, _ := json.Marshal(body)
@@ -439,23 +477,57 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
-		if err != nil { lastErr = err; _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		if err != nil {
+			lastErr = err
+			_cbFailures++
+			_cbLastFail = time.Now()
+			if _cbFailures >= 5 {
+				_cbOpen = true
+			}
+			continue
+		}
 		defer resp.Body.Close()
-		if resp.StatusCode >= 500 { lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode); _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode)
+			_cbFailures++
+			_cbLastFail = time.Now()
+			if _cbFailures >= 5 {
+				_cbOpen = true
+			}
+			continue
+		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
-		_cbFailures = 0; _cbOpen = false
+		_cbFailures = 0
+		_cbOpen = false
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
 }
 
+// sanitizeLogValue strips CR/LF and other control characters from
+// client-supplied values (e.g. trace headers) before they reach log
+// statements, preventing log injection/forgery (L-18). Output length is
+// bounded to keep log lines small.
+func sanitizeLogValue(s string) string {
+	const maxLen = 128
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
+		traceID := sanitizeLogValue(r.Header.Get("X-Trace-Id"))
 		if traceID == "" {
-			traceID = r.Header.Get("traceparent")
+			traceID = sanitizeLogValue(r.Header.Get("traceparent"))
 		}
 		if traceID == "" {
 			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
@@ -479,24 +551,32 @@ func init() {
 
 func cacheGet(key string) (string, bool) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
+	if err != nil {
+		return "", false
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
+	if err != nil || n < 3 {
+		return "", false
+	}
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
 		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+		if len(parts) >= 3 {
+			return parts[1], true
+		}
 	}
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
 		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
@@ -504,11 +584,17 @@ func cacheSet(key, value string, ttlSeconds int) {
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	if os.Getenv("TLS_ENABLED") != "true" {
+		return false, "", ""
+	}
 	cert := os.Getenv("TLS_CERT_PATH")
 	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
-	if key == "" { key = "/etc/54bank/certs/service.key" }
+	if cert == "" {
+		cert = "/etc/54bank/certs/service.crt"
+	}
+	if key == "" {
+		key = "/etc/54bank/certs/service.key"
+	}
 	return true, cert, key
 }
 
@@ -556,13 +642,12 @@ func sanitizeInput(s string) string {
 	return s
 }
 
-
 var _rlTokens int64 = 100
 var _rlLastRefill int64 = 0
 
 func rlAllow() bool {
 	nowr := time.Now().UnixMilli()
-	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
 		atomic.StoreInt64(&_rlTokens, 100)
 		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
@@ -586,7 +671,9 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" { port = "9317" }
+	if port == "" {
+		port = "9317"
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
@@ -605,23 +692,23 @@ func main() {
 	mux.HandleFunc("/v1/atm-management/validate", atm_managementValidateRequestHandler)
 	log.Printf("Atm Management v2.0 (Banking Ops) on :%s", port)
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[atm-management-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[atm-management-go] Server stopped gracefully")
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Println("[atm-management-go] Shutdown signal received")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[atm-management-go] Server stopped gracefully")
 }

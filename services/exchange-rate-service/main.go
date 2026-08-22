@@ -44,7 +44,7 @@ func main() {
 			"status":      "healthy",
 			"uptime_secs": int(time.Since(startTime).Seconds()),
 			"middleware": map[string]string{
-				"redis": "rate_cache (TTL 60s)",
+				"redis":      "rate_cache (TTL 60s)",
 				"fxProvider": getEnv("FX_PROVIDER_URL", "https://api.currencybeacon.com"),
 			},
 		})
@@ -88,10 +88,10 @@ func main() {
 
 	mux.HandleFunc("/v1/rates/stats", func(w http.ResponseWriter, _ *http.Request) {
 		respondJSON(w, 200, map[string]interface{}{
-			"supportedPairs":    len(rates),
-			"conversionsToday":  48200,
-			"cacheHitRatePct":   94.7,
-			"lastRefreshAt":     time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339),
+			"supportedPairs":   len(rates),
+			"conversionsToday": 48200,
+			"cacheHitRatePct":  94.7,
+			"lastRefreshAt":    time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339),
 		})
 	})
 

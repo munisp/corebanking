@@ -41,28 +41,28 @@ const (
 
 // TierConfig holds configuration for a pricing tier
 type TierConfig struct {
-	Tier              PricingTier `json:"tier"`
-	Name              string      `json:"name"`
-	Description       string      `json:"description"`
-	MonthlyFee        float64     `json:"monthly_fee"`
-	VANsIncluded      int         `json:"vans_included"`
-	MaxVANsPerMonth   int         `json:"max_vans_per_month"`
-	RequestsPerMinute int         `json:"requests_per_minute"`
-	CreationFee       float64     `json:"creation_fee"`
+	Tier              PricingTier  `json:"tier"`
+	Name              string       `json:"name"`
+	Description       string       `json:"description"`
+	MonthlyFee        float64      `json:"monthly_fee"`
+	VANsIncluded      int          `json:"vans_included"`
+	MaxVANsPerMonth   int          `json:"max_vans_per_month"`
+	RequestsPerMinute int          `json:"requests_per_minute"`
+	CreationFee       float64      `json:"creation_fee"`
 	TransactionFee    FeeStructure `json:"transaction_fee"`
 	SweepFee          FeeStructure `json:"sweep_fee"`
-	WebhookRetries    int         `json:"webhook_retries"`
-	SupportLevel      string      `json:"support_level"`
-	Features          []string    `json:"features"`
+	WebhookRetries    int          `json:"webhook_retries"`
+	SupportLevel      string       `json:"support_level"`
+	Features          []string     `json:"features"`
 }
 
 // FeeStructure defines how fees are calculated
 type FeeStructure struct {
-	Type       string  `json:"type"` // "flat", "percentage", "tiered"
-	FlatAmount float64 `json:"flat_amount,omitempty"`
-	Percentage float64 `json:"percentage,omitempty"`
-	MinFee     float64 `json:"min_fee,omitempty"`
-	MaxFee     float64 `json:"max_fee,omitempty"`
+	Type       string    `json:"type"` // "flat", "percentage", "tiered"
+	FlatAmount float64   `json:"flat_amount,omitempty"`
+	Percentage float64   `json:"percentage,omitempty"`
+	MinFee     float64   `json:"min_fee,omitempty"`
+	MaxFee     float64   `json:"max_fee,omitempty"`
 	Tiers      []FeeTier `json:"tiers,omitempty"`
 }
 
@@ -76,34 +76,34 @@ type FeeTier struct {
 
 // VANFee represents a calculated fee
 type VANFee struct {
-	FeeID       string    `json:"fee_id"`
-	VANID       string    `json:"van_id,omitempty"`
-	TenantID    string    `json:"tenant_id"`
-	CustomerID  string    `json:"customer_id"`
-	FeeType     FeeType   `json:"fee_type"`
-	Amount      float64   `json:"amount"`
-	Currency    string    `json:"currency"`
-	Description string    `json:"description"`
-	Reference   string    `json:"reference,omitempty"`
-	Status      string    `json:"status"` // pending, charged, failed, waived
-	CreatedAt   time.Time `json:"created_at"`
+	FeeID       string     `json:"fee_id"`
+	VANID       string     `json:"van_id,omitempty"`
+	TenantID    string     `json:"tenant_id"`
+	CustomerID  string     `json:"customer_id"`
+	FeeType     FeeType    `json:"fee_type"`
+	Amount      float64    `json:"amount"`
+	Currency    string     `json:"currency"`
+	Description string     `json:"description"`
+	Reference   string     `json:"reference,omitempty"`
+	Status      string     `json:"status"` // pending, charged, failed, waived
+	CreatedAt   time.Time  `json:"created_at"`
 	ChargedAt   *time.Time `json:"charged_at,omitempty"`
 }
 
 // TenantSubscription represents a tenant's VAN subscription
 type TenantSubscription struct {
-	SubscriptionID   string      `json:"subscription_id"`
-	TenantID         string      `json:"tenant_id"`
-	Tier             PricingTier `json:"tier"`
-	Status           string      `json:"status"` // active, suspended, cancelled
-	VANsUsed         int         `json:"vans_used"`
-	VANsLimit        int         `json:"vans_limit"`
-	BillingCycleStart time.Time  `json:"billing_cycle_start"`
-	BillingCycleEnd   time.Time  `json:"billing_cycle_end"`
-	MonthlyFee       float64     `json:"monthly_fee"`
-	CustomPricing    *CustomPricing `json:"custom_pricing,omitempty"`
-	CreatedAt        time.Time   `json:"created_at"`
-	UpdatedAt        time.Time   `json:"updated_at"`
+	SubscriptionID    string         `json:"subscription_id"`
+	TenantID          string         `json:"tenant_id"`
+	Tier              PricingTier    `json:"tier"`
+	Status            string         `json:"status"` // active, suspended, cancelled
+	VANsUsed          int            `json:"vans_used"`
+	VANsLimit         int            `json:"vans_limit"`
+	BillingCycleStart time.Time      `json:"billing_cycle_start"`
+	BillingCycleEnd   time.Time      `json:"billing_cycle_end"`
+	MonthlyFee        float64        `json:"monthly_fee"`
+	CustomPricing     *CustomPricing `json:"custom_pricing,omitempty"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
 }
 
 // CustomPricing for enterprise tier
@@ -204,20 +204,20 @@ func (ms *MonetizationService) initializeTierConfigs() {
 			Tier:              TierBasic,
 			Name:              "Basic",
 			Description:       "For small businesses and startups",
-			MonthlyFee:        5000.00,  // ₦5,000/month
+			MonthlyFee:        5000.00, // ₦5,000/month
 			VANsIncluded:      100,
 			MaxVANsPerMonth:   100,
 			RequestsPerMinute: 60,
-			CreationFee:       50.00,    // ₦50 per VAN
+			CreationFee:       50.00, // ₦50 per VAN
 			TransactionFee: FeeStructure{
 				Type:       "percentage",
-				Percentage: 0.5,          // 0.5%
-				MinFee:     10.00,        // Min ₦10
-				MaxFee:     500.00,       // Max ₦500
+				Percentage: 0.5,    // 0.5%
+				MinFee:     10.00,  // Min ₦10
+				MaxFee:     500.00, // Max ₦500
 			},
 			SweepFee: FeeStructure{
 				Type:       "flat",
-				FlatAmount: 25.00,        // ₦25 per sweep
+				FlatAmount: 25.00, // ₦25 per sweep
 			},
 			WebhookRetries: 3,
 			SupportLevel:   "email",
@@ -236,16 +236,16 @@ func (ms *MonetizationService) initializeTierConfigs() {
 			VANsIncluded:      1000,
 			MaxVANsPerMonth:   1000,
 			RequestsPerMinute: 300,
-			CreationFee:       25.00,    // ₦25 per VAN (50% discount)
+			CreationFee:       25.00, // ₦25 per VAN (50% discount)
 			TransactionFee: FeeStructure{
 				Type:       "percentage",
-				Percentage: 0.3,          // 0.3%
-				MinFee:     5.00,         // Min ₦5
-				MaxFee:     300.00,       // Max ₦300
+				Percentage: 0.3,    // 0.3%
+				MinFee:     5.00,   // Min ₦5
+				MaxFee:     300.00, // Max ₦300
 			},
 			SweepFee: FeeStructure{
 				Type:       "flat",
-				FlatAmount: 15.00,        // ₦15 per sweep
+				FlatAmount: 15.00, // ₦15 per sweep
 			},
 			WebhookRetries: 5,
 			SupportLevel:   "priority",
@@ -266,20 +266,20 @@ func (ms *MonetizationService) initializeTierConfigs() {
 			VANsIncluded:      10000,
 			MaxVANsPerMonth:   10000,
 			RequestsPerMinute: 1000,
-			CreationFee:       10.00,     // ₦10 per VAN (80% discount)
+			CreationFee:       10.00, // ₦10 per VAN (80% discount)
 			TransactionFee: FeeStructure{
-				Type:       "tiered",
+				Type: "tiered",
 				Tiers: []FeeTier{
 					{MinAmount: 0, MaxAmount: 100000, Percentage: 0.2, FlatFee: 0},
 					{MinAmount: 100000, MaxAmount: 1000000, Percentage: 0.15, FlatFee: 0},
 					{MinAmount: 1000000, MaxAmount: math.MaxFloat64, Percentage: 0.1, FlatFee: 0},
 				},
-				MinFee: 2.00,            // Min ₦2
-				MaxFee: 200.00,          // Max ₦200
+				MinFee: 2.00,   // Min ₦2
+				MaxFee: 200.00, // Max ₦200
 			},
 			SweepFee: FeeStructure{
 				Type:       "flat",
-				FlatAmount: 10.00,        // ₦10 per sweep
+				FlatAmount: 10.00, // ₦10 per sweep
 			},
 			WebhookRetries: 10,
 			SupportLevel:   "dedicated",
@@ -298,14 +298,14 @@ func (ms *MonetizationService) initializeTierConfigs() {
 			Tier:              TierEnterprise,
 			Name:              "Enterprise",
 			Description:       "Custom pricing for large organizations",
-			MonthlyFee:        0,         // Custom pricing
-			VANsIncluded:      0,         // Unlimited
-			MaxVANsPerMonth:   0,         // Unlimited
-			RequestsPerMinute: 0,         // Unlimited
-			CreationFee:       0,         // Custom
+			MonthlyFee:        0, // Custom pricing
+			VANsIncluded:      0, // Unlimited
+			MaxVANsPerMonth:   0, // Unlimited
+			RequestsPerMinute: 0, // Unlimited
+			CreationFee:       0, // Custom
 			TransactionFee:    FeeStructure{Type: "custom"},
 			SweepFee:          FeeStructure{Type: "custom"},
-			WebhookRetries:    0,         // Unlimited
+			WebhookRetries:    0, // Unlimited
 			SupportLevel:      "enterprise",
 			Features: []string{
 				"Unlimited VANs",
@@ -785,10 +785,10 @@ func (ms *MonetizationService) HandleCalculateFee(w http.ResponseWriter, r *http
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"fee_type":   req.FeeType,
-		"amount":     req.Amount,
-		"fee":        fee,
-		"currency":   "NGN",
+		"fee_type": req.FeeType,
+		"amount":   req.Amount,
+		"fee":      fee,
+		"currency": "NGN",
 	})
 }
 

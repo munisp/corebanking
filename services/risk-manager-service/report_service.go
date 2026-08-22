@@ -46,8 +46,8 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 				"nplRatio":      3.2,
 			},
 			"marketRisk": map[string]interface{}{
-				"totalVaR":     5300000000,
-				"utilization":  53.0,
+				"totalVaR":    5300000000,
+				"utilization": 53.0,
 			},
 			"operationalRisk": map[string]interface{}{
 				"openIncidents": 3,
@@ -72,11 +72,11 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		ApprovedAt:  &approvedAt,
 		SubmittedAt: &submittedAt,
 		Content: map[string]interface{}{
-			"executiveSummary": "Risk profile remains within appetite...",
-			"creditRisk":       map[string]interface{}{},
-			"marketRisk":       map[string]interface{}{},
-			"operationalRisk":  map[string]interface{}{},
-			"capitalAdequacy":  map[string]interface{}{},
+			"executiveSummary":  "Risk profile remains within appetite...",
+			"creditRisk":        map[string]interface{}{},
+			"marketRisk":        map[string]interface{}{},
+			"operationalRisk":   map[string]interface{}{},
+			"capitalAdequacy":   map[string]interface{}{},
 			"stressTestResults": map[string]interface{}{},
 		},
 		Metadata:  make(map[string]interface{}),
@@ -98,16 +98,16 @@ func (s *ReportService) initializeDefaultData(tenantID string) {
 		SubmittedAt: &submittedAt,
 		Content: map[string]interface{}{
 			"capitalAdequacy": map[string]interface{}{
-				"tier1Ratio":  13.88,
-				"totalRatio":  18.50,
-				"compliant":   true,
+				"tier1Ratio": 13.88,
+				"totalRatio": 18.50,
+				"compliant":  true,
 			},
 			"creditRisk": map[string]interface{}{
-				"nplRatio":           3.2,
-				"provisionCoverage":  125.0,
+				"nplRatio":          3.2,
+				"provisionCoverage": 125.0,
 			},
 			"liquidityRisk": map[string]interface{}{
-				"lcr": 125.0,
+				"lcr":  125.0,
 				"nsfr": 115.0,
 			},
 		},

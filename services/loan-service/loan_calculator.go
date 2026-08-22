@@ -13,32 +13,32 @@ type LoanCalcResult struct {
 	ID                 string        `json:"id"`
 	CustomerName       string        `json:"customerName,omitempty"`
 	LoanType           string        `json:"loanType"`
-	PrincipalKobo      int64         `json:"principal_kobo"`        // kobo integer — never float
-	AnnualRate         float64       `json:"annualRate"`            // percentage ratio — stays float
+	PrincipalKobo      int64         `json:"principal_kobo"` // kobo integer — never float
+	AnnualRate         float64       `json:"annualRate"`     // percentage ratio — stays float
 	TenorMonths        int           `json:"tenorMonths"`
 	RepaymentType      string        `json:"repaymentType"`
-	MonthlyPaymentKobo int64         `json:"monthly_payment_kobo"`  // kobo integer
-	TotalInterestKobo  int64         `json:"total_interest_kobo"`   // kobo integer
-	TotalRepaymentKobo int64         `json:"total_repayment_kobo"`  // kobo integer
-	EffectiveRate      float64       `json:"effectiveRate"`         // percentage ratio — stays float
+	MonthlyPaymentKobo int64         `json:"monthly_payment_kobo"` // kobo integer
+	TotalInterestKobo  int64         `json:"total_interest_kobo"`  // kobo integer
+	TotalRepaymentKobo int64         `json:"total_repayment_kobo"` // kobo integer
+	EffectiveRate      float64       `json:"effectiveRate"`        // percentage ratio — stays float
 	Schedule           []Installment `json:"schedule,omitempty"`
 	CreatedAt          time.Time     `json:"createdAt"`
 }
 
 type Installment struct {
-	Month               int   `json:"month"`
-	OpeningBalanceKobo  int64 `json:"opening_balance_kobo"` // kobo integer
-	EMIKobo             int64 `json:"emi_kobo"`             // kobo integer
-	PrincipalKobo       int64 `json:"principal_kobo"`       // kobo integer
-	InterestKobo        int64 `json:"interest_kobo"`        // kobo integer
-	ClosingBalanceKobo  int64 `json:"closing_balance_kobo"` // kobo integer
+	Month              int   `json:"month"`
+	OpeningBalanceKobo int64 `json:"opening_balance_kobo"` // kobo integer
+	EMIKobo            int64 `json:"emi_kobo"`             // kobo integer
+	PrincipalKobo      int64 `json:"principal_kobo"`       // kobo integer
+	InterestKobo       int64 `json:"interest_kobo"`        // kobo integer
+	ClosingBalanceKobo int64 `json:"closing_balance_kobo"` // kobo integer
 }
 
 var (
-	lcMu         sync.RWMutex
-	lcCalcs      []LoanCalcResult
-	lcCounter    int64
-	validLoanTypes = map[string]bool{"mortgage": true, "education": true, "agriculture": true, "personal": true, "auto": true, "murabaha": true, "ijara": true, "general": true}
+	lcMu            sync.RWMutex
+	lcCalcs         []LoanCalcResult
+	lcCounter       int64
+	validLoanTypes  = map[string]bool{"mortgage": true, "education": true, "agriculture": true, "personal": true, "auto": true, "murabaha": true, "ijara": true, "general": true}
 	validRepayTypes = map[string]bool{"equal_installment": true, "reducing_balance": true, "bullet": true, "balloon": true}
 )
 
@@ -250,13 +250,13 @@ func getSchedule(c *gin.Context) {
 	}
 	_, totalIntKobo, totalRepayKobo, schedule := calculateEMIKobo(req.PrincipalKobo, req.AnnualRate, req.TenorMonths, req.RepaymentType)
 	c.JSON(http.StatusOK, gin.H{
-		"principal_kobo":      req.PrincipalKobo,
-		"annualRate":          req.AnnualRate,
-		"tenorMonths":         req.TenorMonths,
-		"repaymentType":       req.RepaymentType,
-		"total_interest_kobo": totalIntKobo,
+		"principal_kobo":       req.PrincipalKobo,
+		"annualRate":           req.AnnualRate,
+		"tenorMonths":          req.TenorMonths,
+		"repaymentType":        req.RepaymentType,
+		"total_interest_kobo":  totalIntKobo,
 		"total_repayment_kobo": totalRepayKobo,
-		"installments":        schedule,
+		"installments":         schedule,
 	})
 }
 
@@ -312,8 +312,8 @@ func checkAffordability(c *gin.Context) {
 		MonthlyExpenseKobo int64   `json:"monthly_expense_kobo"` // kobo integer
 		ExistingEMIKobo    int64   `json:"existing_emi_kobo"`    // kobo integer
 		DesiredTenor       int     `json:"desiredTenor"`
-		AnnualRate         float64 `json:"annualRate"`           // percentage — stays float
-		DTILimit           float64 `json:"dtiLimit"`             // percentage — stays float
+		AnnualRate         float64 `json:"annualRate"` // percentage — stays float
+		DTILimit           float64 `json:"dtiLimit"`   // percentage — stays float
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid JSON"})
@@ -327,7 +327,7 @@ func checkAffordability(c *gin.Context) {
 		req.DTILimit = 40.0
 	}
 	// DTI computation uses float for ratio math — result rounded to kobo at output boundary
-	incomeF  := float64(req.MonthlyIncomeKobo)
+	incomeF := float64(req.MonthlyIncomeKobo)
 	expenseF := float64(req.MonthlyExpenseKobo)
 	existingF := float64(req.ExistingEMIKobo)
 	maxDTIF := incomeF*req.DTILimit/100 - existingF

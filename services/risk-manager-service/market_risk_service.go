@@ -156,16 +156,16 @@ func (s *MarketRiskService) GetVaR(tenantID string) map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"totalVaR":          totalVaR,
-		"totalES":           totalES,
-		"totalStressVaR":    totalStressVaR,
-		"byPortfolio":       portfolioVaR,
-		"varLimit":          varLimit,
-		"utilization":       utilization,
-		"status":            status,
-		"confidence":        99.0,
-		"horizon":           1,
-		"timestamp":         time.Now().Format(time.RFC3339),
+		"totalVaR":       totalVaR,
+		"totalES":        totalES,
+		"totalStressVaR": totalStressVaR,
+		"byPortfolio":    portfolioVaR,
+		"varLimit":       varLimit,
+		"utilization":    utilization,
+		"status":         status,
+		"confidence":     99.0,
+		"horizon":        1,
+		"timestamp":      time.Now().Format(time.RFC3339),
 	}
 }
 
@@ -193,7 +193,7 @@ func (s *MarketRiskService) GetVaRHistory(tenantID string) []map[string]interfac
 func (s *MarketRiskService) GetSensitivityAnalysis(tenantID string) map[string]interface{} {
 	return map[string]interface{}{
 		"interestRate": map[string]interface{}{
-			"basisPointValue": 50000000,  // 50M NGN per bp
+			"basisPointValue": 50000000, // 50M NGN per bp
 			"dv01":            50000000,
 			"pv01":            50000000,
 			"impact100bp":     5000000000,
@@ -204,12 +204,12 @@ func (s *MarketRiskService) GetSensitivityAnalysis(tenantID string) map[string]i
 			"eurSensitivity": 30000000,
 		},
 		"equity": map[string]interface{}{
-			"delta":  0.85,
-			"gamma":  0.02,
-			"vega":   15000000,
+			"delta": 0.85,
+			"gamma": 0.02,
+			"vega":  15000000,
 		},
 		"credit": map[string]interface{}{
-			"cs01":          25000000, // 25M NGN per bp spread
+			"cs01":           25000000, // 25M NGN per bp spread
 			"spreadDuration": 4.5,
 		},
 		"timestamp": time.Now().Format(time.RFC3339),
@@ -221,7 +221,7 @@ func (s *MarketRiskService) GetFXExposure(tenantID string) map[string]interface{
 	return map[string]interface{}{
 		"positions": map[string]interface{}{
 			"USD": map[string]interface{}{
-				"longPosition":  100000000,  // $100M
+				"longPosition":  100000000, // $100M
 				"shortPosition": 80000000,
 				"netPosition":   20000000,
 				"ngnEquivalent": 30000000000, // 30B NGN
@@ -251,18 +251,18 @@ func (s *MarketRiskService) GetFXExposure(tenantID string) map[string]interface{
 func (s *MarketRiskService) GetInterestRateRisk(tenantID string) map[string]interface{} {
 	return map[string]interface{}{
 		"repricing": map[string]interface{}{
-			"0-30days":   150000000000,
-			"31-90days":  100000000000,
-			"91-180days": 80000000000,
+			"0-30days":    150000000000,
+			"31-90days":   100000000000,
+			"91-180days":  80000000000,
 			"181-365days": 60000000000,
-			"over1year":  50000000000,
+			"over1year":   50000000000,
 		},
 		"gapAnalysis": map[string]interface{}{
-			"0-30days":   20000000000,
-			"31-90days":  -10000000000,
-			"91-180days": 5000000000,
+			"0-30days":    20000000000,
+			"31-90days":   -10000000000,
+			"91-180days":  5000000000,
 			"181-365days": -15000000000,
-			"over1year":  10000000000,
+			"over1year":   10000000000,
 		},
 		"duration": map[string]interface{}{
 			"assetDuration":     2.5,
@@ -270,16 +270,16 @@ func (s *MarketRiskService) GetInterestRateRisk(tenantID string) map[string]inte
 			"durationGap":       0.7,
 		},
 		"nii": map[string]interface{}{
-			"baseNII":          50000000000,
-			"niiAt100bpUp":     52500000000,
-			"niiAt100bpDown":   47500000000,
-			"niiSensitivity":   5.0,
+			"baseNII":        50000000000,
+			"niiAt100bpUp":   52500000000,
+			"niiAt100bpDown": 47500000000,
+			"niiSensitivity": 5.0,
 		},
 		"eve": map[string]interface{}{
-			"baseEVE":          200000000000,
-			"eveAt100bpUp":     195000000000,
-			"eveAt100bpDown":   205000000000,
-			"eveSensitivity":   2.5,
+			"baseEVE":        200000000000,
+			"eveAt100bpUp":   195000000000,
+			"eveAt100bpDown": 205000000000,
+			"eveSensitivity": 2.5,
 		},
 		"timestamp": time.Now().Format(time.RFC3339),
 	}

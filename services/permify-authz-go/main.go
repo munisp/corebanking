@@ -102,7 +102,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
 			fetchJWKS(realmURL)
 		}
 	}()
@@ -325,10 +327,10 @@ func numericMatch(cond, actualStr string) bool {
 // ---------------------------------------------------------------------------
 
 type permifyCheckReq struct {
-	Metadata permifyMeta   `json:"metadata"`
-	Entity   permifyEntity `json:"entity"`
-	Permission string      `json:"permission"`
-	Subject  permifySubject `json:"subject"`
+	Metadata   permifyMeta    `json:"metadata"`
+	Entity     permifyEntity  `json:"entity"`
+	Permission string         `json:"permission"`
+	Subject    permifySubject `json:"subject"`
 }
 
 type permifyMeta struct {
@@ -453,7 +455,7 @@ func resolveTenant(r *http.Request, bodyTenant string) string {
 
 type RoleEntry struct {
 	Name        string   `json:"name"`
-	Entity      string   `json:"entity"`      // "platform" | "tenants"
+	Entity      string   `json:"entity"` // "platform" | "tenants"
 	Description string   `json:"description"`
 	Permissions []string `json:"permissions"` // permission names this role grants
 }

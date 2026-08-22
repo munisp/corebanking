@@ -22,22 +22,22 @@ import (
 // --- Configuration ---
 
 type Config struct {
-	Port                string
-	MojaloopURL         string
-	MySQLDSN            string
-	MaxConcurrency      int
-	BatchSize           int
+	Port                    string
+	MojaloopURL             string
+	MySQLDSN                string
+	MaxConcurrency          int
+	BatchSize               int
 	CircuitBreakerThreshold int
 	CircuitBreakerTimeout   time.Duration
 }
 
 func loadConfig() Config {
 	return Config{
-		Port:                envOr("PORT", "8090"),
-		MojaloopURL:         envOr("MOJALOOP_URL", "http://mojaloop-switch:4003"),
-		MySQLDSN:            envOr("MYSQL_DSN", "central_ledger:password@tcp(proxysql:6033)/central_ledger"),
-		MaxConcurrency:      1000,
-		BatchSize:           500,
+		Port:                    envOr("PORT", "8090"),
+		MojaloopURL:             envOr("MOJALOOP_URL", "http://mojaloop-switch:4003"),
+		MySQLDSN:                envOr("MYSQL_DSN", "central_ledger:password@tcp(proxysql:6033)/central_ledger"),
+		MaxConcurrency:          1000,
+		BatchSize:               500,
 		CircuitBreakerThreshold: 50,
 		CircuitBreakerTimeout:   30 * time.Second,
 	}
@@ -102,23 +102,23 @@ func (cb *CircuitBreaker) RecordFailure() {
 // --- Transfer Batch Processor ---
 
 type Transfer struct {
-	TransferID    string `json:"transferId"`
-	PayerFSP      string `json:"payerFsp"`
-	PayeeFSP      string `json:"payeeFsp"`
-	AmountKobo    int64  `json:"amountKobo"`
-	Currency      string `json:"currency"`
+	TransferID     string `json:"transferId"`
+	PayerFSP       string `json:"payerFsp"`
+	PayeeFSP       string `json:"payeeFsp"`
+	AmountKobo     int64  `json:"amountKobo"`
+	Currency       string `json:"currency"`
 	IdempotencyKey string `json:"idempotencyKey"`
 }
 
 type BatchProcessor struct {
-	mu       sync.Mutex
-	batch    []Transfer
-	size     int
-	client   *http.Client
-	url      string
-	cb       *CircuitBreaker
-	sent     int64
-	failed   int64
+	mu     sync.Mutex
+	batch  []Transfer
+	size   int
+	client *http.Client
+	url    string
+	cb     *CircuitBreaker
+	sent   int64
+	failed int64
 }
 
 func NewBatchProcessor(batchSize int, url string, cb *CircuitBreaker) *BatchProcessor {
@@ -181,9 +181,9 @@ func (bp *BatchProcessor) flush(batch []Transfer) {
 					"amount":   fmt.Sprintf("%.2f", float64(tr.AmountKobo)/100.0),
 					"currency": tr.Currency,
 				},
-				"ilpPacket":    "placeholder",
-				"condition":    "placeholder",
-				"expiration":   time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339),
+				"ilpPacket":  "placeholder",
+				"condition":  "placeholder",
+				"expiration": time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339),
 			})
 
 			req, _ := http.NewRequest("POST", bp.url+"/transfers", bytes.NewReader(body))

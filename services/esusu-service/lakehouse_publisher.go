@@ -38,8 +38,8 @@ func NewLakehousePublisher() *LakehousePublisher {
 // DeltaWriteRequest represents a request to write to Delta Lake
 type DeltaWriteRequest struct {
 	Topic string                   `json:"topic"`
-	Data      []map[string]interface{} `json:"raw"`
-	Mode      string                   `json:"mode"`
+	Data  []map[string]interface{} `json:"raw"`
+	Mode  string                   `json:"mode"`
 }
 
 // PublishGroupCreated publishes esusu group creation event
@@ -164,8 +164,8 @@ func (p *LakehousePublisher) PublishGroupMetrics(ctx context.Context, groupID st
 func (p *LakehousePublisher) writeToDelta(ctx context.Context, tableName string, data []map[string]interface{}, mode string) error {
 	req := DeltaWriteRequest{
 		Topic: tableName,
-		Data:      data,
-		Mode:      mode,
+		Data:  data,
+		Mode:  mode,
 	}
 
 	jsonBody, err := json.Marshal(req)

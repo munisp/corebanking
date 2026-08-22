@@ -157,13 +157,13 @@ func handlePolicies(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("x-tenant-id")
 
 	var req struct {
-		FarmerID    string  `json:"farmerId"`
-		CropType    string  `json:"cropType"`
-		CoverageUSD float64 `json:"coverageUsd"`
-		PremiumUSD  float64 `json:"premiumUsd"`
-		TriggerIndex string `json:"triggerIndex"`
-		SeasonStart string  `json:"seasonStart"`
-		SeasonEnd   string  `json:"seasonEnd"`
+		FarmerID     string  `json:"farmerId"`
+		CropType     string  `json:"cropType"`
+		CoverageUSD  float64 `json:"coverageUsd"`
+		PremiumUSD   float64 `json:"premiumUsd"`
+		TriggerIndex string  `json:"triggerIndex"`
+		SeasonStart  string  `json:"seasonStart"`
+		SeasonEnd    string  `json:"seasonEnd"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondErr(w, 400, "invalid request body")

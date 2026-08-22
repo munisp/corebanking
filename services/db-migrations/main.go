@@ -6,18 +6,30 @@ package main
 
 import (
 	"context"
-	"os/signal"
-	"syscall"
-	"sync/atomic"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 )
+
+// cryptoRandUint32 returns a cryptographically secure random uint32 for
+// record and audit identifiers (L-06/L-16-residual: math/rand IDs are
+// predictable and collision-prone).
+func cryptoRandUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		log.Fatalf("crypto/rand unavailable: %v", err)
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var startTime = time.Now()
 var (
@@ -49,15 +61,15 @@ func (rw *responseWriter) WriteHeader(code int) {
 // ─── Domain Types ───────────────────────────────────────────────────────────
 
 type Record struct {
-	ID          string                 `json:"id"`
-	Type        string                 `json:"type"`
-	Status      string                 `json:"status"`
-	Data        map[string]interface{} `json:"data"`
-	CreatedAt   string                 `json:"createdAt"`
-	UpdatedAt   string                 `json:"updatedAt"`
-	CreatedBy   string                 `json:"createdBy,omitempty"`
-	TenantID    string                 `json:"tenantId,omitempty"`
-	Version     int                    `json:"version"`
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Status    string                 `json:"status"`
+	Data      map[string]interface{} `json:"data"`
+	CreatedAt string                 `json:"createdAt"`
+	UpdatedAt string                 `json:"updatedAt"`
+	CreatedBy string                 `json:"createdBy,omitempty"`
+	TenantID  string                 `json:"tenantId,omitempty"`
+	Version   int                    `json:"version"`
 }
 
 type AuditEntry struct {
@@ -70,12 +82,12 @@ type AuditEntry struct {
 }
 
 type DomainStats struct {
-	TotalRecords    int                    `json:"totalRecords"`
-	ActiveRecords   int                    `json:"activeRecords"`
-	PendingRecords  int                    `json:"pendingRecords"`
-	ProcessedToday  int                    `json:"processedToday"`
-	Domain          string                 `json:"domain"`
-	Metrics         map[string]interface{} `json:"metrics"`
+	TotalRecords   int                    `json:"totalRecords"`
+	ActiveRecords  int                    `json:"activeRecords"`
+	PendingRecords int                    `json:"pendingRecords"`
+	ProcessedToday int                    `json:"processedToday"`
+	Domain         string                 `json:"domain"`
+	Metrics        map[string]interface{} `json:"metrics"`
 }
 
 var (
@@ -85,7 +97,7 @@ var (
 		{ID: "DB--002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Infrastructure/Data", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
 		{ID: "DB--003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Infrastructure/Data", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
 	}
-	auditLog = []AuditEntry{}
+	auditLog    = []AuditEntry{}
 	domainStats = DomainStats{
 		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
 		Domain: "Infrastructure/Data",
@@ -109,7 +121,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"service": "db-migrations", "status": "healthy", "version": "2.0.0",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
-		"domain": "Db Migrations — Infrastructure/Data",
+		"domain":      "Db Migrations — Infrastructure/Data",
 		"middleware": map[string]string{
 			"kafka":      "db-migrations.events, db-migrations.audit",
 			"postgres":   "db_migrations_records",
@@ -135,7 +147,10 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
@@ -143,7 +158,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("DB--%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("DB--%08X", cryptoRandUint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -153,12 +168,14 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		TenantID:  getString(body, "tenantId"),
 		Version:   1,
 	}
-	if rec.Type == "" { rec.Type = "primary" }
+	if rec.Type == "" {
+		rec.Type = "primary"
+	}
 	records = append(records, rec)
 	domainStats.TotalRecords = len(records)
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -167,7 +184,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
+	if r.Method != "POST" && r.Method != "PUT" {
+		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
@@ -177,14 +197,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
-			if s := getString(body, "status"); s != "" { records[i].Status = s }
+			if s := getString(body, "status"); s != "" {
+				records[i].Status = s
+			}
 			for k, v := range body {
-				if k != "id" { records[i].Data[k] = v }
+				if k != "id" {
+					records[i].Data[k] = v
+				}
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -203,7 +227,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
 
-
 func handleAudit(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -214,10 +237,15 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	domainStats.TotalRecords = len(records)
-	active := 0; pending := 0
+	active := 0
+	pending := 0
 	for _, r := range records {
-		if r.Status == "active" || r.Status == "completed" { active++ }
-		if r.Status == "pending" || r.Status == "processing" { pending++ }
+		if r.Status == "active" || r.Status == "completed" {
+			active++
+		}
+		if r.Status == "pending" || r.Status == "processing" {
+			pending++
+		}
 	}
 	domainStats.ActiveRecords = active
 	domainStats.PendingRecords = pending
@@ -225,13 +253,17 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok { return v }
+	if v, ok := m[key].(string); ok {
+		return v
+	}
 	return ""
 }
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" { port = "9345" }
+	if port == "" {
+		port = "9345"
+	}
 	http.HandleFunc("/healthz", handleHealthz)
 	http.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 200, map[string]interface{}{"ready": true, "service": "db-migrations"})

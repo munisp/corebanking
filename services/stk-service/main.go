@@ -70,14 +70,14 @@ func (p *HTTPSMSProvider) SendSMS(ctx context.Context, phone string, message str
 }
 
 type STKServer struct {
-	router          *mux.Router
-	db              *pgxpool.Pool
-	bankingService  *STKBankingService
-	accountService  string
-	paymentService  string
-	ledgerService   string
-	fraudService    string
-	httpClient      *http.Client
+	router         *mux.Router
+	db             *pgxpool.Pool
+	bankingService *STKBankingService
+	accountService string
+	paymentService string
+	ledgerService  string
+	fraudService   string
+	httpClient     *http.Client
 }
 
 const legacyDefaultPinSecret = "default-pin-secret-change-in-production"
@@ -181,12 +181,12 @@ type STKPushResponse struct {
 }
 
 type STKCallback struct {
-	TransactionID string  `json:"transactionId"`
-	ResultCode    int     `json:"resultCode"`
-	ResultDesc    string  `json:"resultDesc"`
-	Amount        float64 `json:"amount"`
-	PhoneNumber   string  `json:"phoneNumber"`
-	TransactionDate string `json:"transactionDate"`
+	TransactionID   string  `json:"transactionId"`
+	ResultCode      int     `json:"resultCode"`
+	ResultDesc      string  `json:"resultDesc"`
+	Amount          float64 `json:"amount"`
+	PhoneNumber     string  `json:"phoneNumber"`
+	TransactionDate string  `json:"transactionDate"`
 }
 
 func (s *STKServer) stkPushHandler(w http.ResponseWriter, r *http.Request) {

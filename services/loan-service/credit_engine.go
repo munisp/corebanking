@@ -321,14 +321,14 @@ func CalculateInterestRate(loanAmount float64) float64 {
 	var extraRate float64
 
 	switch {
-		case loanAmount <= 1000:
-			extraRate = 0
-		case loanAmount <= 10000:
-			extraRate = 1.5
-		case loanAmount <= 50000:
-			extraRate = 2.5
-		default:
-			extraRate = 4.0
+	case loanAmount <= 1000:
+		extraRate = 0
+	case loanAmount <= 10000:
+		extraRate = 1.5
+	case loanAmount <= 50000:
+		extraRate = 2.5
+	default:
+		extraRate = 4.0
 	}
 
 	// You can add some fine-tuning formula, e.g., logarithmic or percentage-based

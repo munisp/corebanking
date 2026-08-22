@@ -141,7 +141,7 @@ func (s *ScheduleService) GetWeeklySchedule(tenantID, branchID, startDate string
 	}
 
 	end := start.AddDate(0, 0, 7)
-	
+
 	weeklySchedule := make(map[string][]*StaffSchedule)
 	for i := 0; i < 7; i++ {
 		day := start.AddDate(0, 0, i)
@@ -187,7 +187,7 @@ func (s *ScheduleService) GenerateSchedule(tenantID, branchID, userID, startDate
 	}
 
 	var schedules []*StaffSchedule
-	
+
 	for d := start; !d.After(end); d = d.AddDate(0, 0, 1) {
 		// Skip weekends
 		if d.Weekday() == time.Saturday || d.Weekday() == time.Sunday {
@@ -196,7 +196,7 @@ func (s *ScheduleService) GenerateSchedule(tenantID, branchID, userID, startDate
 
 		for i, st := range staff {
 			var shiftType, startTime, endTime, position string
-			
+
 			// Rotate shifts
 			if i%2 == 0 {
 				shiftType = "morning"
@@ -240,7 +240,7 @@ func (s *ScheduleService) GenerateSchedule(tenantID, branchID, userID, startDate
 			s.mu.Lock()
 			s.schedules[schedule.ScheduleID] = schedule
 			s.mu.Unlock()
-			
+
 			schedules = append(schedules, schedule)
 		}
 	}

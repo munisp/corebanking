@@ -78,49 +78,49 @@ type ERPNextResponse struct {
 }
 
 type ERPNextBankAccount struct {
-	Name            string  `json:"name"`
-	AccountName     string  `json:"account_name"`
-	Account         string  `json:"account"`
-	BankAccountNo   string  `json:"bank_account_no"`
-	Bank            string  `json:"bank"`
-	BankAccountType string  `json:"bank_account_type"`
+	Name             string `json:"name"`
+	AccountName      string `json:"account_name"`
+	Account          string `json:"account"`
+	BankAccountNo    string `json:"bank_account_no"`
+	Bank             string `json:"bank"`
+	BankAccountType  string `json:"bank_account_type"`
 	IsCompanyAccount int    `json:"is_company_account"`
-	IsDefault       int     `json:"is_default"`
-	Company         string  `json:"company"`
-	Currency        string  `json:"account_currency"`
+	IsDefault        int    `json:"is_default"`
+	Company          string `json:"company"`
+	Currency         string `json:"account_currency"`
 }
 
 type ERPNextBankTransaction struct {
-	Name              string    `json:"name"`
-	Date              string    `json:"date"`
-	BankAccount       string    `json:"bank_account"`
-	Deposit           float64   `json:"deposit"`
-	Withdrawal        float64   `json:"withdrawal"`
-	Currency          string    `json:"currency"`
-	Description       string    `json:"description"`
-	ReferenceNumber   string    `json:"reference_number"`
-	TransactionType   string    `json:"transaction_type"`
-	Status            string    `json:"status"`
-	UnallocatedAmount float64   `json:"unallocated_amount"`
-	AllocatedAmount   float64   `json:"allocated_amount"`
+	Name              string  `json:"name"`
+	Date              string  `json:"date"`
+	BankAccount       string  `json:"bank_account"`
+	Deposit           float64 `json:"deposit"`
+	Withdrawal        float64 `json:"withdrawal"`
+	Currency          string  `json:"currency"`
+	Description       string  `json:"description"`
+	ReferenceNumber   string  `json:"reference_number"`
+	TransactionType   string  `json:"transaction_type"`
+	Status            string  `json:"status"`
+	UnallocatedAmount float64 `json:"unallocated_amount"`
+	AllocatedAmount   float64 `json:"allocated_amount"`
 }
 
 type ERPNextPaymentEntry struct {
-	Name            string  `json:"name"`
-	PaymentType     string  `json:"payment_type"`
-	PostingDate     string  `json:"posting_date"`
-	Company         string  `json:"company"`
-	ModeOfPayment   string  `json:"mode_of_payment"`
-	PartyType       string  `json:"party_type"`
-	Party           string  `json:"party"`
-	PartyName       string  `json:"party_name"`
-	PaidFrom        string  `json:"paid_from"`
-	PaidTo          string  `json:"paid_to"`
-	PaidAmount      float64 `json:"paid_amount"`
-	ReceivedAmount  float64 `json:"received_amount"`
-	ReferenceNo     string  `json:"reference_no"`
-	ReferenceDate   string  `json:"reference_date"`
-	Status          string  `json:"status"`
+	Name           string  `json:"name"`
+	PaymentType    string  `json:"payment_type"`
+	PostingDate    string  `json:"posting_date"`
+	Company        string  `json:"company"`
+	ModeOfPayment  string  `json:"mode_of_payment"`
+	PartyType      string  `json:"party_type"`
+	Party          string  `json:"party"`
+	PartyName      string  `json:"party_name"`
+	PaidFrom       string  `json:"paid_from"`
+	PaidTo         string  `json:"paid_to"`
+	PaidAmount     float64 `json:"paid_amount"`
+	ReceivedAmount float64 `json:"received_amount"`
+	ReferenceNo    string  `json:"reference_no"`
+	ReferenceDate  string  `json:"reference_date"`
+	Status         string  `json:"status"`
 }
 
 type ERPNextSalesInvoice struct {
@@ -149,19 +149,19 @@ type ERPNextPurchaseInvoice struct {
 }
 
 type ERPNextJournalEntry struct {
-	Name        string                    `json:"name"`
-	PostingDate string                    `json:"posting_date"`
-	Company     string                    `json:"company"`
-	VoucherType string                    `json:"voucher_type"`
-	TotalDebit  float64                   `json:"total_debit"`
-	TotalCredit float64                   `json:"total_credit"`
-	Accounts    []ERPNextJournalAccount   `json:"accounts"`
+	Name        string                  `json:"name"`
+	PostingDate string                  `json:"posting_date"`
+	Company     string                  `json:"company"`
+	VoucherType string                  `json:"voucher_type"`
+	TotalDebit  float64                 `json:"total_debit"`
+	TotalCredit float64                 `json:"total_credit"`
+	Accounts    []ERPNextJournalAccount `json:"accounts"`
 }
 
 type ERPNextJournalAccount struct {
-	Account       string  `json:"account"`
-	PartyType     string  `json:"party_type"`
-	Party         string  `json:"party"`
+	Account                 string  `json:"account"`
+	PartyType               string  `json:"party_type"`
+	Party                   string  `json:"party"`
 	DebitInAccountCurrency  float64 `json:"debit_in_account_currency"`
 	CreditInAccountCurrency float64 `json:"credit_in_account_currency"`
 }
@@ -198,7 +198,7 @@ func (c *ERPNextClient) GetBankAccounts(ctx context.Context) ([]ERPNextBankAccou
 func (c *ERPNextClient) GetBankTransactions(ctx context.Context, bankAccount string, fromDate, toDate string) ([]ERPNextBankTransaction, error) {
 	filters := url.QueryEscape(fmt.Sprintf(`[["bank_account","=","%s"],["date",">=","%s"],["date","<=","%s"]]`, bankAccount, fromDate, toDate))
 	endpoint := fmt.Sprintf("/api/resource/Bank Transaction?fields=[\"*\"]&filters=%s&limit_page_length=0", filters)
-	
+
 	resp, err := c.doRequest(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -217,7 +217,7 @@ func (c *ERPNextClient) GetBankTransactions(ctx context.Context, bankAccount str
 func (c *ERPNextClient) GetPaymentEntries(ctx context.Context, fromDate, toDate string) ([]ERPNextPaymentEntry, error) {
 	filters := url.QueryEscape(fmt.Sprintf(`[["posting_date",">=","%s"],["posting_date","<=","%s"]]`, fromDate, toDate))
 	endpoint := fmt.Sprintf("/api/resource/Payment Entry?fields=[\"*\"]&filters=%s&limit_page_length=0", filters)
-	
+
 	resp, err := c.doRequest(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -241,7 +241,7 @@ func (c *ERPNextClient) GetSalesInvoices(ctx context.Context, status string) ([]
 		filters = url.QueryEscape(`[["outstanding_amount",">",0]]`)
 	}
 	endpoint := fmt.Sprintf("/api/resource/Sales Invoice?fields=[\"*\"]&filters=%s&limit_page_length=0", filters)
-	
+
 	resp, err := c.doRequest(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -265,7 +265,7 @@ func (c *ERPNextClient) GetPurchaseInvoices(ctx context.Context, status string) 
 		filters = url.QueryEscape(`[["outstanding_amount",">",0]]`)
 	}
 	endpoint := fmt.Sprintf("/api/resource/Purchase Invoice?fields=[\"*\"]&filters=%s&limit_page_length=0", filters)
-	
+
 	resp, err := c.doRequest(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -284,7 +284,7 @@ func (c *ERPNextClient) GetPurchaseInvoices(ctx context.Context, status string) 
 func (c *ERPNextClient) GetAccounts(ctx context.Context, company string) ([]ERPNextAccount, error) {
 	filters := url.QueryEscape(fmt.Sprintf(`[["company","=","%s"]]`, company))
 	endpoint := fmt.Sprintf("/api/resource/Account?fields=[\"*\"]&filters=%s&limit_page_length=0", filters)
-	
+
 	resp, err := c.doRequest(ctx, "GET", endpoint, nil)
 	if err != nil {
 		return nil, err
@@ -421,12 +421,12 @@ func (c *ERPNextClient) CancelDocument(ctx context.Context, doctype, name string
 }
 
 type ERPNextWebhook struct {
-	Name          string `json:"name"`
-	WebhookDoctype string `json:"webhook_doctype"`
+	Name            string `json:"name"`
+	WebhookDoctype  string `json:"webhook_doctype"`
 	WebhookDocevent string `json:"webhook_docevent"`
-	RequestURL    string `json:"request_url"`
-	RequestMethod string `json:"request_method"`
-	Enabled       int    `json:"enabled"`
+	RequestURL      string `json:"request_url"`
+	RequestMethod   string `json:"request_method"`
+	Enabled         int    `json:"enabled"`
 }
 
 func (c *ERPNextClient) CreateWebhook(ctx context.Context, webhook ERPNextWebhook) (*ERPNextWebhook, error) {

@@ -850,9 +850,15 @@ type APISIXClient struct {
 }
 
 func NewAPISIXClient() *APISIXClient {
+	// H-23-residual: fail closed — never fall back to a static default admin
+	// key. The service refuses to start without APISIX_ADMIN_KEY.
+	adminKey := os.Getenv("APISIX_ADMIN_KEY")
+	if adminKey == "" {
+		log.Fatalf("APISIX_ADMIN_KEY is not set; refusing to start with a default APISIX admin key")
+	}
 	a := &APISIXClient{
 		AdminURL:    envOr("APISIX_ADMIN_URL", "http://apisix-admin:9180"),
-		AdminKey:    envOr("APISIX_ADMIN_KEY", "change-me-in-production"),
+		AdminKey:    adminKey,
 		GatewayURL:  envOr("APISIX_PUBLIC_URL", "https://api.54bank.app/gateway"),
 		connected:   false,
 		httpClient:  &http.Client{Timeout: 5 * time.Second},

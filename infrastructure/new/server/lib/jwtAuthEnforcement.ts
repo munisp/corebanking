@@ -42,7 +42,19 @@ interface RouteProtection {
 }
 
 const JWT_CONFIG: JWTConfig = {
-  issuer: process.env.KEYCLOAK_ISSUER ?? "https://identity.54bank.app/realms/54bank",
+  // N-10-followup: fail-closed — the expected token issuer must be supplied
+  // via the KEYCLOAK_ISSUER env var. No hardcoded identity-host default:
+  // module load throws when unset so tokens can never be validated against
+  // an attacker-influenced or stale default issuer.
+  issuer: (() => {
+    const issuer = process.env.KEYCLOAK_ISSUER;
+    if (!issuer) {
+      throw new Error(
+        "[AUTH] KEYCLOAK_ISSUER is not set — refusing to initialize JWT enforcement without an explicit token issuer (fail-closed)"
+      );
+    }
+    return issuer;
+  })(),
   audience: process.env.KEYCLOAK_AUDIENCE ?? "54bank-platform",
   realm: "54bank",
   // N-10: the JWKS endpoint must be supplied via the KEYCLOAK_JWKS_URL env var.

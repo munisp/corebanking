@@ -53,10 +53,10 @@ type LakehouseQueryRequest struct {
 }
 
 type LakehouseQueryResponse struct {
-	Columns []string                 `json:"columns"`
-	Rows    []map[string]interface{} `json:"rows"`
-	RowCount int                     `json:"row_count"`
-	Duration float64                 `json:"duration_ms"`
+	Columns  []string                 `json:"columns"`
+	Rows     []map[string]interface{} `json:"rows"`
+	RowCount int                      `json:"row_count"`
+	Duration float64                  `json:"duration_ms"`
 }
 
 func (c *LakehouseClient) PublishEvent(ctx context.Context, event LakehouseEvent) error {

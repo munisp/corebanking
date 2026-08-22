@@ -77,12 +77,12 @@ func readyHandler(service *UnifiedSearchService) http.HandlerFunc {
 		}
 
 		response := map[string]interface{}{
-			"status":             map[bool]string{true: "ready", false: "degraded"}[ready],
-			"service":            "search-service",
-			"opensearch_url":     service.opensearchURL,
-			"opensearch_state":   dependencyState,
-			"index_queue_depth":  len(service.indexQueue),
-			"timestamp":          time.Now().UTC().Format(time.RFC3339),
+			"status":            map[bool]string{true: "ready", false: "degraded"}[ready],
+			"service":           "search-service",
+			"opensearch_url":    service.opensearchURL,
+			"opensearch_state":  dependencyState,
+			"index_queue_depth": len(service.indexQueue),
+			"timestamp":         time.Now().UTC().Format(time.RFC3339),
 		}
 		if err != nil {
 			response["detail"] = err.Error()
@@ -113,10 +113,10 @@ func bootstrapHandler(service *UnifiedSearchService) http.HandlerFunc {
 		if err := json.Unmarshal(payload, &envelope); err == nil && len(envelope.Records) > 0 {
 			count := queueSeedRecords(service, envelope.Records)
 			writeJSON(w, http.StatusAccepted, map[string]interface{}{
-				"status":          "bootstrap-queued",
-				"service":         "search-service",
+				"status":           "bootstrap-queued",
+				"service":          "search-service",
 				"queued_documents": count,
-				"seed_file":       seedPath,
+				"seed_file":        seedPath,
 			})
 			return
 		}
@@ -207,26 +207,26 @@ func normalizeSeedIndex(value string) string {
 	value = strings.ReplaceAll(value, "-", "_")
 	value = strings.ReplaceAll(value, " ", "_")
 	mapping := map[string]string{
-		"customer":       IndexCustomers,
-		"customers":      IndexCustomers,
-		"account":        IndexAccounts,
-		"accounts":       IndexAccounts,
-		"transaction":    IndexTransactions,
-		"transactions":   IndexTransactions,
-		"loan":           IndexLoans,
-		"loans":          IndexLoans,
-		"dispute":        IndexDisputes,
-		"disputes":       IndexDisputes,
-		"document":       IndexDocuments,
-		"documents":      IndexDocuments,
-		"employee":       IndexEmployees,
-		"employees":      IndexEmployees,
-		"product":        IndexProducts,
-		"products":       IndexProducts,
-		"notification":   IndexNotifications,
-		"notifications":  IndexNotifications,
-		"trade_finance":  IndexTradeFinance,
-		"tradefinance":   IndexTradeFinance,
+		"customer":      IndexCustomers,
+		"customers":     IndexCustomers,
+		"account":       IndexAccounts,
+		"accounts":      IndexAccounts,
+		"transaction":   IndexTransactions,
+		"transactions":  IndexTransactions,
+		"loan":          IndexLoans,
+		"loans":         IndexLoans,
+		"dispute":       IndexDisputes,
+		"disputes":      IndexDisputes,
+		"document":      IndexDocuments,
+		"documents":     IndexDocuments,
+		"employee":      IndexEmployees,
+		"employees":     IndexEmployees,
+		"product":       IndexProducts,
+		"products":      IndexProducts,
+		"notification":  IndexNotifications,
+		"notifications": IndexNotifications,
+		"trade_finance": IndexTradeFinance,
+		"tradefinance":  IndexTradeFinance,
 	}
 	if mapped, ok := mapping[value]; ok {
 		return mapped

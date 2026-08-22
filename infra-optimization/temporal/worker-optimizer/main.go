@@ -2,6 +2,7 @@
 // Manages and tunes Temporal worker fleet for maximum workflow throughput.
 // Provides dynamic concurrency adjustment based on system load.
 package main
+
 import (
 	"context"
 	"encoding/json"
@@ -16,14 +17,14 @@ import (
 )
 
 type WorkerProfile struct {
-	TaskQueue           string `json:"taskQueue"`
-	MaxConcurrentActs   int    `json:"maxConcurrentActivities"`
-	MaxConcurrentWFs    int    `json:"maxConcurrentWorkflows"`
-	ActPollers          int    `json:"activityPollers"`
-	WFPollers           int    `json:"workflowPollers"`
-	RateLimit           int    `json:"rateLimit"`
-	StickyTimeout       string `json:"stickyTimeout"`
-	Description         string `json:"description"`
+	TaskQueue         string `json:"taskQueue"`
+	MaxConcurrentActs int    `json:"maxConcurrentActivities"`
+	MaxConcurrentWFs  int    `json:"maxConcurrentWorkflows"`
+	ActPollers        int    `json:"activityPollers"`
+	WFPollers         int    `json:"workflowPollers"`
+	RateLimit         int    `json:"rateLimit"`
+	StickyTimeout     string `json:"stickyTimeout"`
+	Description       string `json:"description"`
 }
 
 func getWorkerProfiles() []WorkerProfile {
@@ -42,11 +43,11 @@ func getWorkerProfiles() []WorkerProfile {
 }
 
 type TemporalNamespace struct {
-	Name                string `json:"name"`
-	RetentionDays       int    `json:"retentionDays"`
-	HistoryArchival     string `json:"historyArchival"`
-	VisibilityArchival  string `json:"visibilityArchival"`
-	Description         string `json:"description"`
+	Name               string `json:"name"`
+	RetentionDays      int    `json:"retentionDays"`
+	HistoryArchival    string `json:"historyArchival"`
+	VisibilityArchival string `json:"visibilityArchival"`
+	Description        string `json:"description"`
 }
 
 func getNamespaces() []TemporalNamespace {

@@ -73,23 +73,23 @@ func getKYCStatus(ctx context.Context, entityID string) string {
 
 // Invoice represents a trade invoice
 type Invoice struct {
-	ID              string
-	TenantID        string
-	InvoiceNumber   string
-	SupplierID      string
-	BuyerID         string
-	InvoiceDate     time.Time
-	DueDate         time.Time
-	InvoiceAmount   float64
-	Currency        string
-	Status          string // "pending", "verified", "discounted", "paid", "overdue"
-	PaymentTerms    int    // days
-	GoodsDescription string
-	PurchaseOrderRef string
+	ID                 string
+	TenantID           string
+	InvoiceNumber      string
+	SupplierID         string
+	BuyerID            string
+	InvoiceDate        time.Time
+	DueDate            time.Time
+	InvoiceAmount      float64
+	Currency           string
+	Status             string // "pending", "verified", "discounted", "paid", "overdue"
+	PaymentTerms       int    // days
+	GoodsDescription   string
+	PurchaseOrderRef   string
 	VerificationStatus string // "pending", "verified", "rejected"
-	VerifiedBy      string
-	VerifiedAt      *time.Time
-	CreatedAt       time.Time
+	VerifiedBy         string
+	VerifiedAt         *time.Time
+	CreatedAt          time.Time
 }
 
 // InvoiceDiscounting represents a discounting transaction
@@ -115,18 +115,18 @@ type InvoiceDiscounting struct {
 
 // Supplier represents a supplier in the supply chain
 type Supplier struct {
-	ID              string
-	TenantID        string
-	BusinessName    string
-	RegistrationNo  string
-	TaxID           string
-	BankAccount     string
-	CreditRating    string // "AAA", "AA", "A", "BBB", "BB", "B"
-	CreditLimit     float64
+	ID                string
+	TenantID          string
+	BusinessName      string
+	RegistrationNo    string
+	TaxID             string
+	BankAccount       string
+	CreditRating      string // "AAA", "AA", "A", "BBB", "BB", "B"
+	CreditLimit       float64
 	OutstandingAmount float64
-	Status          string // "active", "suspended", "blocked"
-	KYCVerified     bool
-	CreatedAt       time.Time
+	Status            string // "active", "suspended", "blocked"
+	KYCVerified       bool
+	CreatedAt         time.Time
 }
 
 // Buyer represents a buyer in the supply chain
@@ -147,12 +147,12 @@ type Buyer struct {
 
 // PaymentRecord represents buyer's payment history
 type PaymentRecord struct {
-	InvoiceID   string
-	Amount      float64
-	DueDate     time.Time
-	PaidDate    time.Time
-	DaysLate    int
-	Status      string // "on_time", "late", "defaulted"
+	InvoiceID string
+	Amount    float64
+	DueDate   time.Time
+	PaidDate  time.Time
+	DaysLate  int
+	Status    string // "on_time", "late", "defaulted"
 }
 
 // ==================== INVOICE VERIFIER ====================
@@ -344,7 +344,7 @@ func (d *DiscountingEngine) CalculateDiscounting(
 	supplier *Supplier,
 	buyer *Buyer,
 ) (*InvoiceDiscounting, error) {
-	
+
 	// Validate invoice is verified
 	if invoice.VerificationStatus != "verified" {
 		return nil, fmt.Errorf("invoice must be verified before discounting")
@@ -576,9 +576,9 @@ func (de *DisbursementEngine) executeBankTransfer(accountNumber string, amount f
 		return false, fmt.Errorf("payments rail returned status %d", resp.StatusCode)
 	}
 	var result struct {
-		Success       *bool  `json:"success"`
-		Status        string `json:"status"`
-		TransferID    string `json:"transferId"`
+		Success    *bool  `json:"success"`
+		Status     string `json:"status"`
+		TransferID string `json:"transferId"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return false, fmt.Errorf("payments rail returned invalid JSON: %w", err)
@@ -738,7 +738,7 @@ func (epc *EarlyPaymentCalculator) CalculateEarlyPaymentDiscount(
 	paymentDate time.Time,
 	discountRate float64,
 ) float64 {
-	
+
 	// Calculate days early
 	daysEarly := int(dueDate.Sub(paymentDate).Hours() / 24)
 

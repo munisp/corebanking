@@ -550,8 +550,12 @@ func (s *AgriculturalService) ListFarmers(w http.ResponseWriter, r *http.Request
 	tenantID := r.Header.Get("X-Tenant-ID")
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 10 }
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
 	offset := (page - 1) * limit
 
 	var total int
@@ -638,8 +642,12 @@ func (s *AgriculturalService) ListFarms(w http.ResponseWriter, r *http.Request) 
 	tenantID := r.Header.Get("X-Tenant-ID")
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 10 }
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
 	offset := (page - 1) * limit
 
 	var total int
@@ -1000,8 +1008,12 @@ func (s *AgriculturalService) ListLoans(w http.ResponseWriter, r *http.Request) 
 	tenantID := r.Header.Get("X-Tenant-ID")
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 10 }
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
 	offset := (page - 1) * limit
 
 	var total int
@@ -1822,26 +1834,26 @@ func (s *AgriculturalService) GetRiskAnalytics(w http.ResponseWriter, r *http.Re
 // ==================== PARTNERS & PROGRAMS ====================
 
 type Program struct {
-	ID              string    `json:"id"`
-	TenantID        string    `json:"tenant_id"`
-	Name            string    `json:"name"`
-	ProgramType     string    `json:"program_type"` // ABP, AGSMEIS, CACS, ACGSF, custom
-	Description     string    `json:"description"`
-	FundingSource   string    `json:"funding_source"`
-	MaxLoanAmount   float64   `json:"max_loan_amount"`
-	InterestRate    float64   `json:"interest_rate"`
-	TenorDays       int       `json:"tenor_days"`
-	TargetFarmers   int       `json:"target_farmers"`
-	EligibilityCriteria []string `json:"eligibility_criteria"`
-	Status          string    `json:"status"` // active, paused, closed
-	StartDate       time.Time `json:"start_date"`
-	EndDate         *time.Time `json:"end_date"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID                  string     `json:"id"`
+	TenantID            string     `json:"tenant_id"`
+	Name                string     `json:"name"`
+	ProgramType         string     `json:"program_type"` // ABP, AGSMEIS, CACS, ACGSF, custom
+	Description         string     `json:"description"`
+	FundingSource       string     `json:"funding_source"`
+	MaxLoanAmount       float64    `json:"max_loan_amount"`
+	InterestRate        float64    `json:"interest_rate"`
+	TenorDays           int        `json:"tenor_days"`
+	TargetFarmers       int        `json:"target_farmers"`
+	EligibilityCriteria []string   `json:"eligibility_criteria"`
+	Status              string     `json:"status"` // active, paused, closed
+	StartDate           time.Time  `json:"start_date"`
+	EndDate             *time.Time `json:"end_date"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 func (s *AgriculturalService) ListCooperatives(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT id, tenant_id, name, registration_no, state, lga, member_count, total_farm_size, 
 		credit_limit, outstanding_loan, repayment_rate, status, created_at
@@ -1855,8 +1867,8 @@ func (s *AgriculturalService) ListCooperatives(w http.ResponseWriter, r *http.Re
 	cooperatives := make([]Cooperative, 0)
 	for rows.Next() {
 		var c Cooperative
-		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.RegistrationNo, &c.State, &c.LGA, 
-			&c.MemberCount, &c.TotalFarmSize, &c.CreditLimit, &c.OutstandingLoan, 
+		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.RegistrationNo, &c.State, &c.LGA,
+			&c.MemberCount, &c.TotalFarmSize, &c.CreditLimit, &c.OutstandingLoan,
 			&c.RepaymentRate, &c.Status, &c.CreatedAt)
 		if err != nil {
 			continue
@@ -1874,7 +1886,7 @@ func (s *AgriculturalService) ListCooperatives(w http.ResponseWriter, r *http.Re
 
 func (s *AgriculturalService) ListPartners(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT id, tenant_id, name, partner_type, contact_name, contact_phone, email, address, rating, total_deals, status, created_at
 		FROM partners WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
@@ -1890,7 +1902,7 @@ func (s *AgriculturalService) ListPartners(w http.ResponseWriter, r *http.Reques
 		var rating float64
 		var totalDeals int
 		var createdAt time.Time
-		err := rows.Scan(&id, &tenantID, &name, &partnerType, &contactName, &contactPhone, 
+		err := rows.Scan(&id, &tenantID, &name, &partnerType, &contactName, &contactPhone,
 			&email, &address, &rating, &totalDeals, &status, &createdAt)
 		if err != nil {
 			continue
@@ -1912,7 +1924,7 @@ func (s *AgriculturalService) ListPartners(w http.ResponseWriter, r *http.Reques
 
 func (s *AgriculturalService) RegisterPartner(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	var partner map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&partner); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -1928,7 +1940,7 @@ func (s *AgriculturalService) RegisterPartner(w http.ResponseWriter, r *http.Req
 	_, err := s.db.ExecContext(r.Context(),
 		`INSERT INTO partners (id, tenant_id, name, partner_type, contact_name, contact_phone, email, address, rating, total_deals, status, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-		partnerID, tenantID, partner["name"], partner["partner_type"], partner["contact_name"], 
+		partnerID, tenantID, partner["name"], partner["partner_type"], partner["contact_name"],
 		partner["contact_phone"], partner["email"], partner["address"], 0.0, 0, "active", time.Now())
 
 	if err != nil {
@@ -1949,7 +1961,7 @@ func (s *AgriculturalService) GetPartner(w http.ResponseWriter, r *http.Request)
 	var rating float64
 	var totalDeals int
 	var createdAt time.Time
-	
+
 	err := s.db.QueryRowContext(r.Context(),
 		`SELECT id, tenant_id, name, partner_type, contact_name, contact_phone, email, address, rating, total_deals, status, created_at
 		FROM partners WHERE id = $1`, partnerID).Scan(&id, &tenantID, &name, &partnerType,
@@ -1971,7 +1983,7 @@ func (s *AgriculturalService) GetPartner(w http.ResponseWriter, r *http.Request)
 
 func (s *AgriculturalService) ListPrograms(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT id, tenant_id, name, program_type, description, funding_source, max_loan_amount, interest_rate, 
 		tenor_days, target_farmers, status, start_date, end_date, created_at
@@ -1985,7 +1997,7 @@ func (s *AgriculturalService) ListPrograms(w http.ResponseWriter, r *http.Reques
 	programs := make([]Program, 0)
 	for rows.Next() {
 		var p Program
-		err := rows.Scan(&p.ID, &p.TenantID, &p.Name, &p.ProgramType, &p.Description, &p.FundingSource, 
+		err := rows.Scan(&p.ID, &p.TenantID, &p.Name, &p.ProgramType, &p.Description, &p.FundingSource,
 			&p.MaxLoanAmount, &p.InterestRate, &p.TenorDays, &p.TargetFarmers, &p.Status, &p.StartDate, &p.EndDate, &p.CreatedAt)
 		if err != nil {
 			continue
@@ -2003,7 +2015,7 @@ func (s *AgriculturalService) ListPrograms(w http.ResponseWriter, r *http.Reques
 
 func (s *AgriculturalService) CreateProgram(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	var program Program
 	if err := json.NewDecoder(r.Body).Decode(&program); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)

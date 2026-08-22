@@ -52,10 +52,10 @@ var (
 type CompressionAlgorithm string
 
 const (
-	AlgoNone  CompressionAlgorithm = "none"
-	AlgoGzip  CompressionAlgorithm = "gzip"
-	AlgoLZ4   CompressionAlgorithm = "lz4"
-	AlgoZstd  CompressionAlgorithm = "zstd"
+	AlgoNone CompressionAlgorithm = "none"
+	AlgoGzip CompressionAlgorithm = "gzip"
+	AlgoLZ4  CompressionAlgorithm = "lz4"
+	AlgoZstd CompressionAlgorithm = "zstd"
 )
 
 // NetworkType represents network connection types
@@ -100,63 +100,63 @@ type CompressedPayload struct {
 
 // NetworkConfig holds network-specific compression settings
 type NetworkConfig struct {
-	Algorithm        CompressionAlgorithm
-	Level            CompressionLevel
+	Algorithm         CompressionAlgorithm
+	Level             CompressionLevel
 	MinSizeToCompress int
-	MaxPayloadSize   int
-	ChunkSize        int
+	MaxPayloadSize    int
+	ChunkSize         int
 }
 
 // DefaultNetworkConfigs provides optimal settings for each network type
 var DefaultNetworkConfigs = map[NetworkType]NetworkConfig{
 	Network2G: {
-		Algorithm:        AlgoLZ4,  // Fast decompression, good for slow CPUs
-		Level:            LevelBest,
-		MinSizeToCompress: 100,     // Compress even small payloads
-		MaxPayloadSize:   10240,    // 10KB max for 2G
-		ChunkSize:        1024,     // 1KB chunks
+		Algorithm:         AlgoLZ4, // Fast decompression, good for slow CPUs
+		Level:             LevelBest,
+		MinSizeToCompress: 100,   // Compress even small payloads
+		MaxPayloadSize:    10240, // 10KB max for 2G
+		ChunkSize:         1024,  // 1KB chunks
 	},
 	NetworkEdge: {
-		Algorithm:        AlgoLZ4,
-		Level:            LevelBest,
+		Algorithm:         AlgoLZ4,
+		Level:             LevelBest,
 		MinSizeToCompress: 100,
-		MaxPayloadSize:   20480,    // 20KB
-		ChunkSize:        2048,
+		MaxPayloadSize:    20480, // 20KB
+		ChunkSize:         2048,
 	},
 	NetworkGPRS: {
-		Algorithm:        AlgoLZ4,
-		Level:            LevelBest,
+		Algorithm:         AlgoLZ4,
+		Level:             LevelBest,
 		MinSizeToCompress: 100,
-		MaxPayloadSize:   10240,
-		ChunkSize:        1024,
+		MaxPayloadSize:    10240,
+		ChunkSize:         1024,
 	},
 	Network3G: {
-		Algorithm:        AlgoGzip,
-		Level:            LevelDefault,
+		Algorithm:         AlgoGzip,
+		Level:             LevelDefault,
 		MinSizeToCompress: 500,
-		MaxPayloadSize:   102400,   // 100KB
-		ChunkSize:        8192,
+		MaxPayloadSize:    102400, // 100KB
+		ChunkSize:         8192,
 	},
 	Network4G: {
-		Algorithm:        AlgoZstd,  // Best ratio
-		Level:            LevelDefault,
+		Algorithm:         AlgoZstd, // Best ratio
+		Level:             LevelDefault,
 		MinSizeToCompress: 1024,
-		MaxPayloadSize:   1048576,  // 1MB
-		ChunkSize:        65536,
+		MaxPayloadSize:    1048576, // 1MB
+		ChunkSize:         65536,
 	},
 	Network5G: {
-		Algorithm:        AlgoZstd,
-		Level:            LevelFastest,
+		Algorithm:         AlgoZstd,
+		Level:             LevelFastest,
 		MinSizeToCompress: 4096,
-		MaxPayloadSize:   10485760, // 10MB
-		ChunkSize:        262144,
+		MaxPayloadSize:    10485760, // 10MB
+		ChunkSize:         262144,
 	},
 	NetworkWifi: {
-		Algorithm:        AlgoZstd,
-		Level:            LevelFastest,
+		Algorithm:         AlgoZstd,
+		Level:             LevelFastest,
 		MinSizeToCompress: 4096,
-		MaxPayloadSize:   10485760,
-		ChunkSize:        262144,
+		MaxPayloadSize:    10485760,
+		ChunkSize:         262144,
 	},
 }
 
@@ -302,12 +302,12 @@ func (c *PayloadCompressor) CompressForNetwork(data []byte, networkType NetworkT
 // compressGzip compresses using gzip
 func (c *PayloadCompressor) compressGzip(data []byte, level CompressionLevel) ([]byte, error) {
 	var buf bytes.Buffer
-	
+
 	writer := c.gzipPool.Get().(*gzip.Writer)
 	defer c.gzipPool.Put(writer)
-	
+
 	writer.Reset(&buf)
-	
+
 	// Set compression level
 	var gzipLevel int
 	switch level {
@@ -318,20 +318,20 @@ func (c *PayloadCompressor) compressGzip(data []byte, level CompressionLevel) ([
 	default:
 		gzipLevel = gzip.DefaultCompression
 	}
-	
+
 	newWriter, err := gzip.NewWriterLevel(&buf, gzipLevel)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	if _, err := newWriter.Write(data); err != nil {
 		return nil, err
 	}
-	
+
 	if err := newWriter.Close(); err != nil {
 		return nil, err
 	}
-	
+
 	return buf.Bytes(), nil
 }
 
@@ -342,37 +342,37 @@ func (c *PayloadCompressor) decompressGzip(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer reader.Close()
-	
+
 	return io.ReadAll(reader)
 }
 
 // compressLZ4 compresses using LZ4
 func (c *PayloadCompressor) compressLZ4(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
-	
+
 	writer := c.lz4Pool.Get().(*lz4.Writer)
 	defer c.lz4Pool.Put(writer)
-	
+
 	writer.Reset(&buf)
-	
+
 	if _, err := writer.Write(data); err != nil {
 		return nil, err
 	}
-	
+
 	if err := writer.Close(); err != nil {
 		return nil, err
 	}
-	
+
 	return buf.Bytes(), nil
 }
 
 // decompressLZ4 decompresses LZ4 data
 func (c *PayloadCompressor) decompressLZ4(data []byte, originalSize int) ([]byte, error) {
 	reader := lz4.NewReader(bytes.NewReader(data))
-	
+
 	result := make([]byte, 0, originalSize)
 	buf := make([]byte, 4096)
-	
+
 	for {
 		n, err := reader.Read(buf)
 		if n > 0 {
@@ -385,7 +385,7 @@ func (c *PayloadCompressor) decompressLZ4(data []byte, originalSize int) ([]byte
 			return nil, err
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -410,10 +410,10 @@ func calculateChecksum(data []byte) string {
 
 // ChunkedPayload represents a payload split into chunks for unreliable networks
 type ChunkedPayload struct {
-	TotalChunks int               `json:"total_chunks"`
-	ChunkSize   int               `json:"chunk_size"`
-	PayloadID   string            `json:"payload_id"`
-	Chunks      []PayloadChunk    `json:"chunks"`
+	TotalChunks int            `json:"total_chunks"`
+	ChunkSize   int            `json:"chunk_size"`
+	PayloadID   string         `json:"payload_id"`
+	Chunks      []PayloadChunk `json:"chunks"`
 }
 
 // PayloadChunk represents a single chunk
@@ -518,9 +518,9 @@ func CompressionMiddleware(compressor *PayloadCompressor) func(http.Handler) htt
 
 			// Check if client supports compression
 			acceptEncoding := r.Header.Get("Accept-Encoding")
-			if !strings.Contains(acceptEncoding, "gzip") && 
-			   !strings.Contains(acceptEncoding, "lz4") &&
-			   !strings.Contains(acceptEncoding, "zstd") {
+			if !strings.Contains(acceptEncoding, "gzip") &&
+				!strings.Contains(acceptEncoding, "lz4") &&
+				!strings.Contains(acceptEncoding, "zstd") {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -579,14 +579,14 @@ type DeltaPayload struct {
 func (c *PayloadCompressor) ComputeDelta(oldData, newData []byte) (*DeltaPayload, error) {
 	// Simple XOR-based delta for demonstration
 	// In production, use a proper diff algorithm like bsdiff
-	
+
 	maxLen := len(newData)
 	if len(oldData) > maxLen {
 		maxLen = len(oldData)
 	}
 
 	delta := make([]byte, maxLen+4) // +4 for length prefix
-	
+
 	// Store new data length
 	delta[0] = byte(len(newData) >> 24)
 	delta[1] = byte(len(newData) >> 16)
@@ -665,7 +665,7 @@ func (c *PayloadCompressor) ApplyDelta(oldData []byte, delta *DeltaPayload) ([]b
 // AdaptiveCompression selects the best algorithm based on data characteristics
 func (c *PayloadCompressor) AdaptiveCompression(data []byte, networkType NetworkType) (*CompressedPayload, error) {
 	config := DefaultNetworkConfigs[networkType]
-	
+
 	// For very slow networks, always use LZ4 (fastest decompression)
 	if networkType == Network2G || networkType == NetworkGPRS || networkType == NetworkEdge {
 		return c.Compress(data, AlgoLZ4, LevelBest)

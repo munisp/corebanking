@@ -57,11 +57,11 @@ func (m *MiddlewareIntegration) PublishRiskEvent(eventType string, payload inter
 // PublishCreditRiskEvent publishes credit risk events
 func (m *MiddlewareIntegration) PublishCreditRiskEvent(action string, risk *CreditRisk) error {
 	return m.PublishRiskEvent("credit_risk."+action, map[string]interface{}{
-		"riskID":         risk.RiskID,
-		"entityType":     risk.EntityType,
-		"entityID":       risk.EntityID,
-		"exposureAmount": risk.ExposureAmount,
-		"riskRating":     risk.RiskRating,
+		"riskID":          risk.RiskID,
+		"entityType":      risk.EntityType,
+		"entityID":        risk.EntityID,
+		"exposureAmount":  risk.ExposureAmount,
+		"riskRating":      risk.RiskRating,
 		"watchlistStatus": risk.WatchlistStatus,
 	})
 }
@@ -69,11 +69,11 @@ func (m *MiddlewareIntegration) PublishCreditRiskEvent(action string, risk *Cred
 // PublishOperationalRiskEvent publishes operational risk events
 func (m *MiddlewareIntegration) PublishOperationalRiskEvent(action string, risk *OperationalRisk) error {
 	return m.PublishRiskEvent("operational_risk."+action, map[string]interface{}{
-		"riskID":      risk.RiskID,
-		"eventType":   risk.EventType,
-		"severity":    risk.Severity,
-		"grossLoss":   risk.GrossLoss,
-		"status":      risk.Status,
+		"riskID":    risk.RiskID,
+		"eventType": risk.EventType,
+		"severity":  risk.Severity,
+		"grossLoss": risk.GrossLoss,
+		"status":    risk.Status,
 	})
 }
 
@@ -90,13 +90,13 @@ func (m *MiddlewareIntegration) PublishMarketRiskEvent(action string, risk *Mark
 // PublishLimitBreachEvent publishes limit breach events
 func (m *MiddlewareIntegration) PublishLimitBreachEvent(limit *RiskLimit) error {
 	return m.PublishRiskEvent("limit.breach", map[string]interface{}{
-		"limitID":     limit.LimitID,
-		"limitName":   limit.LimitName,
-		"limitType":   limit.LimitType,
-		"limitValue":  limit.LimitValue,
+		"limitID":      limit.LimitID,
+		"limitName":    limit.LimitName,
+		"limitType":    limit.LimitType,
+		"limitValue":   limit.LimitValue,
 		"currentUsage": limit.CurrentUsage,
-		"utilization": limit.Utilization,
-		"status":      limit.Status,
+		"utilization":  limit.Utilization,
+		"status":       limit.Status,
 	})
 }
 
@@ -152,14 +152,14 @@ func (m *MiddlewareIntegration) publishToKafka(topic string, event interface{}) 
 // PostProvisionToLedger posts provision entries to TigerBeetle
 func (m *MiddlewareIntegration) PostProvisionToLedger(riskID string, provisionAmount int64, currency string) error {
 	entry := map[string]interface{}{
-		"id":          fmt.Sprintf("prov-%s-%d", riskID, time.Now().UnixNano()),
-		"debitAccount": "provision_expense",
+		"id":            fmt.Sprintf("prov-%s-%d", riskID, time.Now().UnixNano()),
+		"debitAccount":  "provision_expense",
 		"creditAccount": "loan_loss_provision",
-		"amount":       provisionAmount,
-		"currency":     currency,
-		"reference":    riskID,
-		"tenantID":     m.tenantID,
-		"timestamp":    time.Now().Format(time.RFC3339),
+		"amount":        provisionAmount,
+		"currency":      currency,
+		"reference":     riskID,
+		"tenantID":      m.tenantID,
+		"timestamp":     time.Now().Format(time.RFC3339),
 	}
 
 	return m.postToTigerBeetle("/transfers", entry)
@@ -168,13 +168,13 @@ func (m *MiddlewareIntegration) PostProvisionToLedger(riskID string, provisionAm
 // PostCapitalChargeToLedger posts capital charge entries
 func (m *MiddlewareIntegration) PostCapitalChargeToLedger(riskType string, amount int64) error {
 	entry := map[string]interface{}{
-		"id":           fmt.Sprintf("cap-%s-%d", riskType, time.Now().UnixNano()),
-		"debitAccount": "capital_charge_" + riskType,
+		"id":            fmt.Sprintf("cap-%s-%d", riskType, time.Now().UnixNano()),
+		"debitAccount":  "capital_charge_" + riskType,
 		"creditAccount": "regulatory_capital",
-		"amount":       amount,
-		"currency":     "NGN",
-		"tenantID":     m.tenantID,
-		"timestamp":    time.Now().Format(time.RFC3339),
+		"amount":        amount,
+		"currency":      "NGN",
+		"tenantID":      m.tenantID,
+		"timestamp":     time.Now().Format(time.RFC3339),
 	}
 
 	return m.postToTigerBeetle("/transfers", entry)
@@ -334,7 +334,7 @@ func (m *MiddlewareIntegration) SendRiskAlert(alertType, severity, message strin
 
 // SendLimitBreachAlert sends limit breach alert
 func (m *MiddlewareIntegration) SendLimitBreachAlert(limit *RiskLimit) error {
-	message := fmt.Sprintf("Risk limit '%s' has been breached. Current utilization: %.2f%%, Limit: %d", 
+	message := fmt.Sprintf("Risk limit '%s' has been breached. Current utilization: %.2f%%, Limit: %d",
 		limit.LimitName, limit.Utilization, limit.LimitValue)
 	return m.SendRiskAlert("Limit Breach", "HIGH", message, []string{"risk-team@54bank.com", "cro@54bank.com"})
 }
@@ -381,16 +381,16 @@ func (m *MiddlewareIntegration) PublishToLakehouse(table string, data interface{
 // PublishCreditRiskAnalytics publishes credit risk data to Lakehouse
 func (m *MiddlewareIntegration) PublishCreditRiskAnalytics(risk *CreditRisk) error {
 	return m.PublishToLakehouse("risk_credit", map[string]interface{}{
-		"riskID":           risk.RiskID,
-		"entityType":       risk.EntityType,
-		"entityID":         risk.EntityID,
-		"exposureAmount":   risk.ExposureAmount,
-		"pd":               risk.PD,
-		"lgd":              risk.LGD,
-		"expectedLoss":     risk.ExpectedLoss,
-		"riskRating":       risk.RiskRating,
-		"watchlistStatus":  risk.WatchlistStatus,
-		"provisionAmount":  risk.ProvisionAmount,
+		"riskID":             risk.RiskID,
+		"entityType":         risk.EntityType,
+		"entityID":           risk.EntityID,
+		"exposureAmount":     risk.ExposureAmount,
+		"pd":                 risk.PD,
+		"lgd":                risk.LGD,
+		"expectedLoss":       risk.ExpectedLoss,
+		"riskRating":         risk.RiskRating,
+		"watchlistStatus":    risk.WatchlistStatus,
+		"provisionAmount":    risk.ProvisionAmount,
 		"collateralCoverage": risk.CollateralCoverage,
 	})
 }

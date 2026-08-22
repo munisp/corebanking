@@ -70,9 +70,9 @@ func main() {
 func healthz(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"service": "telegram-service", "status": "healthy",
-		"uptime_secs": int(time.Since(startTime).Seconds()),
+		"uptime_secs":   int(time.Since(startTime).Seconds()),
 		"botApiVersion": "7.0",
-		"capabilities": []string{"webhook", "send_message", "banking_commands"},
+		"capabilities":  []string{"webhook", "send_message", "banking_commands"},
 	})
 }
 

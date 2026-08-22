@@ -57,11 +57,11 @@ type Account struct {
 	Metadata          map[string]interface{} `json:"metadata,omitempty"`
 	CreatedAt         time.Time              `json:"created_at"`
 	UpdatedAt         time.Time              `json:"updated_at"`
-	
+
 	// Optional balance fields (populated when include_balance=true in query)
-	CurrentBalance    *int64 `json:"current_balance,omitempty"`
-	DebitBalance      *int64 `json:"debit_balance,omitempty"`
-	CreditBalance     *int64 `json:"credit_balance,omitempty"`
+	CurrentBalance *int64 `json:"current_balance,omitempty"`
+	DebitBalance   *int64 `json:"debit_balance,omitempty"`
+	CreditBalance  *int64 `json:"credit_balance,omitempty"`
 }
 
 type AccountBalance struct {

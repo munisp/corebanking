@@ -74,20 +74,20 @@ func TestFXRates(t *testing.T) {
 // TestFXConversion tests currency conversion
 func TestFXConversion(t *testing.T) {
 	tests := []struct {
-		name   string
-		input  FXConversionInput
+		name    string
+		input   FXConversionInput
 		wantErr bool
 	}{
 		{
 			name: "valid conversion",
 			input: FXConversionInput{
-				TenantID:       "tenant-001",
-				CustomerID:     "cust-001",
+				TenantID:        "tenant-001",
+				CustomerID:      "cust-001",
 				SourceAccountID: "acc-ngn-001",
-				DestAccountID:  "acc-usd-001",
-				SourceCurrency: "NGN",
-				DestCurrency:   "USD",
-				SourceAmount:   1000000,
+				DestAccountID:   "acc-usd-001",
+				SourceCurrency:  "NGN",
+				DestCurrency:    "USD",
+				SourceAmount:    1000000,
 			},
 			wantErr: false,
 		},
@@ -120,9 +120,9 @@ func TestFXConversion(t *testing.T) {
 func TestFXLimits(t *testing.T) {
 	t.Run("within daily limit", func(t *testing.T) {
 		customer := FXCustomer{
-			ID:          "cust-001",
-			DailyLimit:  10000, // USD
-			DailyUsed:   5000,
+			ID:         "cust-001",
+			DailyLimit: 10000, // USD
+			DailyUsed:  5000,
 		}
 
 		allowed := checkFXLimit(customer, 3000)
@@ -133,9 +133,9 @@ func TestFXLimits(t *testing.T) {
 
 	t.Run("exceeds daily limit", func(t *testing.T) {
 		customer := FXCustomer{
-			ID:          "cust-001",
-			DailyLimit:  10000,
-			DailyUsed:   8000,
+			ID:         "cust-001",
+			DailyLimit: 10000,
+			DailyUsed:  8000,
 		}
 
 		allowed := checkFXLimit(customer, 5000)
@@ -297,15 +297,15 @@ func TestFXHistory(t *testing.T) {
 // ============================================
 
 type FXQuote struct {
-	ID           string
+	ID             string
 	SourceCurrency string
-	DestCurrency string
-	SourceAmount int64
-	DestAmount   int64
-	Rate         float64
-	Fee          int64
-	ExpiresAt    time.Time
-	Provider     string
+	DestCurrency   string
+	SourceAmount   int64
+	DestAmount     int64
+	Rate           float64
+	Fee            int64
+	ExpiresAt      time.Time
+	Provider       string
 }
 
 type FXConversionInput struct {

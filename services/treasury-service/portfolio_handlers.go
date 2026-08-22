@@ -13,21 +13,21 @@ import (
 // PortfolioItem is a customer investment portfolio entry (stocks, bonds, mutual funds, real estate).
 // Distinct from the institutional Investment type used in treasury operations.
 type PortfolioItem struct {
-	ID            string    `json:"id"`
-	CustomerID    string    `json:"customer_id"`
-	TenantID      string    `json:"tenant_id"`
-	InvestmentType string   `json:"investment_type"`
-	Name          string    `json:"name"`
-	Symbol        string    `json:"symbol"`
-	Units         float64   `json:"units"`
-	PurchasePrice float64   `json:"purchase_price"`
-	CurrentPrice  float64   `json:"current_price"`
-	TotalValue    float64   `json:"total_value"`
-	ProfitLoss    float64   `json:"profit_loss"`
-	Status        string    `json:"status"`
-	PurchaseDate  string    `json:"purchase_date"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+	ID             string    `json:"id"`
+	CustomerID     string    `json:"customer_id"`
+	TenantID       string    `json:"tenant_id"`
+	InvestmentType string    `json:"investment_type"`
+	Name           string    `json:"name"`
+	Symbol         string    `json:"symbol"`
+	Units          float64   `json:"units"`
+	PurchasePrice  float64   `json:"purchase_price"`
+	CurrentPrice   float64   `json:"current_price"`
+	TotalValue     float64   `json:"total_value"`
+	ProfitLoss     float64   `json:"profit_loss"`
+	Status         string    `json:"status"`
+	PurchaseDate   string    `json:"purchase_date"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 type portfolioStore struct {

@@ -170,7 +170,7 @@ type NAICPolicy struct {
 	FarmerContribution float64   `json:"farmer_contribution"`
 	PolicyStartDate    time.Time `json:"policy_start_date"`
 	PolicyEndDate      time.Time `json:"policy_end_date"`
-	Status           string    `json:"status"` // RECORDED, SUBMITTED, ACTIVE, EXPIRED, CLAIMED, CANCELLED
+	Status             string    `json:"status"` // RECORDED, SUBMITTED, ACTIVE, EXPIRED, CLAIMED, CANCELLED
 	LinkedLoanID       string    `json:"linked_loan_id"`
 	CreatedAt          time.Time `json:"created_at"`
 }

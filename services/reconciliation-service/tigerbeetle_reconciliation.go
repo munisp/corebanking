@@ -920,13 +920,13 @@ func (s *TigerBeetleReconciliationService) handleOverview(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"asOf": time.Now().Format(time.RFC3339),
 			"latestSnapshot": gin.H{
-				"snapshotId":       "none",
-				"state":            "idle",
-				"discrepancyCount": 0,
+				"snapshotId":        "none",
+				"state":             "idle",
+				"discrepancyCount":  0,
 				"autoResolvedCount": 0,
 				"manualReviewCount": 0,
-				"lastRunAt":        nil,
-				"summary":          "No reconciliation run has been executed yet.",
+				"lastRunAt":         nil,
+				"summary":           "No reconciliation run has been executed yet.",
 			},
 			"discrepancies": []Discrepancy{},
 		})
@@ -970,29 +970,29 @@ func (s *TigerBeetleReconciliationService) handleOverview(c *gin.Context) {
 		}
 		discrepancies = append(discrepancies, gin.H{
 			"discrepancyId": disc.ID,
-			"accountId": disc.AccountID,
-			"tenantId": disc.TenantID,
-			"type": disc.Type,
-			"severity": disc.Severity,
-			"difference": disc.Difference,
-			"description": disc.Description,
-			"status": disc.Status,
-			"autoResolved": disc.AutoResolved,
-			"createdAt": disc.CreatedAt.Format(time.RFC3339),
+			"accountId":     disc.AccountID,
+			"tenantId":      disc.TenantID,
+			"type":          disc.Type,
+			"severity":      disc.Severity,
+			"difference":    disc.Difference,
+			"description":   disc.Description,
+			"status":        disc.Status,
+			"autoResolved":  disc.AutoResolved,
+			"createdAt":     disc.CreatedAt.Format(time.RFC3339),
 		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"asOf": time.Now().Format(time.RFC3339),
 		"latestSnapshot": gin.H{
-			"snapshotId":        latestSnapshot.SnapshotID,
-			"state":             latestSnapshot.State,
-			"discrepancyCount":  latestSnapshot.DiscrepancyCount,
-			"autoResolvedCount": latestSnapshot.AutoResolvedCount,
-			"manualReviewCount": manualReviewCount,
+			"snapshotId":         latestSnapshot.SnapshotID,
+			"state":              latestSnapshot.State,
+			"discrepancyCount":   latestSnapshot.DiscrepancyCount,
+			"autoResolvedCount":  latestSnapshot.AutoResolvedCount,
+			"manualReviewCount":  manualReviewCount,
 			"accountsReconciled": latestSnapshot.AccountsReconciled,
-			"lastRunAt":         latestSnapshot.LastRunAt.Format(time.RFC3339),
-			"summary":           fmt.Sprintf("Latest reconciliation run %s processed %d accounts and found %d discrepancies.", latestSnapshot.SnapshotID, latestSnapshot.AccountsReconciled, latestSnapshot.DiscrepancyCount),
+			"lastRunAt":          latestSnapshot.LastRunAt.Format(time.RFC3339),
+			"summary":            fmt.Sprintf("Latest reconciliation run %s processed %d accounts and found %d discrepancies.", latestSnapshot.SnapshotID, latestSnapshot.AccountsReconciled, latestSnapshot.DiscrepancyCount),
 		},
 		"discrepancies": discrepancies,
 	})

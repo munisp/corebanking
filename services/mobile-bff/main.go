@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
@@ -39,7 +38,6 @@ func init() {
 	prometheus.MustRegister(bffRequestsTotal)
 	prometheus.MustRegister(bffLatency)
 	prometheus.MustRegister(upstreamLatency)
-	rand.Seed(time.Now().UnixNano())
 }
 
 type Config struct {

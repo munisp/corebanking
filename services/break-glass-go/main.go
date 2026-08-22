@@ -34,35 +34,37 @@ func secureRandHex(n int) string {
 }
 
 var semaphore = make(chan struct{}, 100)
+
 func acquireSem() { semaphore <- struct{}{} }
 func releaseSem() { <-semaphore }
+
 var serviceName = "break-glass-go"
 var eventBus = newEventBus("security.insider-threat", "break-glass")
 var startTime = time.Now()
 
 type BreakGlassEvent struct {
-	ID             string    `json:"id"`
-	RequestorID    string    `json:"requestor_id"`
-	Resource       string    `json:"resource"`
-	Reason         string    `json:"reason"`
-	Severity       string    `json:"severity"`
-	Status         string    `json:"status"`
-	SessionToken   string    `json:"session_token"`
-	IncidentID     string    `json:"incident_id"`
-	IPAddress      string    `json:"ip_address"`
+	ID               string             `json:"id"`
+	RequestorID      string             `json:"requestor_id"`
+	Resource         string             `json:"resource"`
+	Reason           string             `json:"reason"`
+	Severity         string             `json:"severity"`
+	Status           string             `json:"status"`
+	SessionToken     string             `json:"session_token"`
+	IncidentID       string             `json:"incident_id"`
+	IPAddress        string             `json:"ip_address"`
 	ActionsPerformed []BreakGlassAction `json:"actions_performed"`
-	CreatedAt      time.Time `json:"created_at"`
-	ClosedAt       time.Time `json:"closed_at,omitempty"`
-	ReviewedBy     string    `json:"reviewed_by,omitempty"`
-	ReviewNotes    string    `json:"review_notes,omitempty"`
+	CreatedAt        time.Time          `json:"created_at"`
+	ClosedAt         time.Time          `json:"closed_at,omitempty"`
+	ReviewedBy       string             `json:"reviewed_by,omitempty"`
+	ReviewNotes      string             `json:"review_notes,omitempty"`
 }
 
 type BreakGlassAction struct {
-	Timestamp   time.Time `json:"timestamp"`
-	Operation   string    `json:"operation"`
-	Target      string    `json:"target"`
-	Result      string    `json:"result"`
-	Checksum    string    `json:"checksum"`
+	Timestamp time.Time `json:"timestamp"`
+	Operation string    `json:"operation"`
+	Target    string    `json:"target"`
+	Result    string    `json:"result"`
+	Checksum  string    `json:"checksum"`
 }
 
 var (
@@ -72,7 +74,9 @@ var (
 )
 
 func initSchema() {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, q := range []string{
@@ -97,7 +101,9 @@ func initSchema() {
 }
 
 func dbSaveEvent(evt *BreakGlassEvent) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	actionsJSON, _ := json.Marshal(evt.ActionsPerformed)
@@ -110,7 +116,9 @@ func dbSaveEvent(evt *BreakGlassEvent) {
 }
 
 func dbLoadEvent(id string) *BreakGlassEvent {
-	if db == nil { return nil }
+	if db == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	row := db.QueryRowContext(ctx, `SELECT id, requestor_id, resource, reason, severity, status, COALESCE(session_token,''), COALESCE(incident_id,''), COALESCE(ip_address,''), actions_performed, created_at, closed_at, COALESCE(reviewed_by,''), COALESCE(review_notes,'') FROM break_glass_events WHERE id=$1`, id)
@@ -121,31 +129,46 @@ func dbLoadEvent(id string) *BreakGlassEvent {
 		return nil
 	}
 	json.Unmarshal([]byte(actionsJSON), &evt.ActionsPerformed)
-	if closedAt.Valid { evt.ClosedAt = closedAt.Time }
+	if closedAt.Valid {
+		evt.ClosedAt = closedAt.Time
+	}
 	return &evt
 }
 
 func dbListEvents() []*BreakGlassEvent {
-	if db == nil { return nil }
+	if db == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `SELECT id, requestor_id, resource, reason, severity, status, COALESCE(session_token,''), COALESCE(incident_id,''), COALESCE(ip_address,''), actions_performed, created_at, closed_at, COALESCE(reviewed_by,''), COALESCE(review_notes,'') FROM break_glass_events ORDER BY created_at DESC LIMIT 1000`)
-	if err != nil { return nil }
+	if err != nil {
+		return nil
+	}
 	defer rows.Close()
 	var result []*BreakGlassEvent
 	for rows.Next() {
 		var evt BreakGlassEvent
 		var actionsJSON string
 		var closedAt sql.NullTime
-		if rows.Scan(&evt.ID, &evt.RequestorID, &evt.Resource, &evt.Reason, &evt.Severity, &evt.Status, &evt.SessionToken, &evt.IncidentID, &evt.IPAddress, &actionsJSON, &evt.CreatedAt, &closedAt, &evt.ReviewedBy, &evt.ReviewNotes) != nil { continue }
+		if rows.Scan(&evt.ID, &evt.RequestorID, &evt.Resource, &evt.Reason, &evt.Severity, &evt.Status, &evt.SessionToken, &evt.IncidentID, &evt.IPAddress, &actionsJSON, &evt.CreatedAt, &closedAt, &evt.ReviewedBy, &evt.ReviewNotes) != nil {
+			continue
+		}
 		json.Unmarshal([]byte(actionsJSON), &evt.ActionsPerformed)
-		if closedAt.Valid { evt.ClosedAt = closedAt.Time }
+		if closedAt.Valid {
+			evt.ClosedAt = closedAt.Time
+		}
 		result = append(result, &evt)
 	}
 	return result
 }
 
-func nullTime(t time.Time) interface{} { if t.IsZero() { return nil }; return t }
+func nullTime(t time.Time) interface{} {
+	if t.IsZero() {
+		return nil
+	}
+	return t
+}
 
 // ── MIDDLEWARE: JWT Validation (RS256 via Keycloak JWKS) ────────────────────
 // Break-glass is an emergency privileged-access surface: every non-health
@@ -190,9 +213,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -205,7 +232,11 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -230,7 +261,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -280,24 +313,36 @@ func breakGlassAllowedRoles() map[string]bool {
 	if v := os.Getenv("BREAK_GLASS_REQUIRED_ROLES"); v != "" {
 		roles := map[string]bool{}
 		for _, r := range strings.Split(v, ",") {
-			if r = strings.TrimSpace(r); r != "" { roles[r] = true }
+			if r = strings.TrimSpace(r); r != "" {
+				roles[r] = true
+			}
 		}
-		if len(roles) > 0 { return roles }
+		if len(roles) > 0 {
+			return roles
+		}
 	}
 	// Default: only explicit break-glass or platform admin roles.
 	return map[string]bool{"break-glass": true, "break-glass-admin": true, "admin": true}
 }
 
 func jwtClaims(r *http.Request) map[string]interface{} {
-	if c, ok := r.Context().Value("jwt_claims").(map[string]interface{}); ok { return c }
+	if c, ok := r.Context().Value("jwt_claims").(map[string]interface{}); ok {
+		return c
+	}
 	return nil
 }
 
 func tokenSubject(r *http.Request) string {
 	claims := jwtClaims(r)
-	if claims == nil { return "" }
-	if sub, ok := claims["sub"].(string); ok { return sub }
-	if p, ok := claims["preferred_username"].(string); ok { return p }
+	if claims == nil {
+		return ""
+	}
+	if sub, ok := claims["sub"].(string); ok {
+		return sub
+	}
+	if p, ok := claims["preferred_username"].(string); ok {
+		return p
+	}
 	return ""
 }
 
@@ -306,16 +351,22 @@ func claimsHaveRole(claims map[string]interface{}, allowed map[string]bool) bool
 	if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
 		if roles, ok := ra["roles"].([]interface{}); ok {
 			for _, role := range roles {
-				if s, ok := role.(string); ok && allowed[s] { return true }
+				if s, ok := role.(string); ok && allowed[s] {
+					return true
+				}
 			}
 		}
 	}
 	if roles, ok := claims["roles"].([]interface{}); ok {
 		for _, role := range roles {
-			if s, ok := role.(string); ok && allowed[s] { return true }
+			if s, ok := role.(string); ok && allowed[s] {
+				return true
+			}
 		}
 	}
-	if role, ok := claims["role"].(string); ok && allowed[role] { return true }
+	if role, ok := claims["role"].(string); ok && allowed[role] {
+		return true
+	}
 	return false
 }
 
@@ -356,7 +407,9 @@ func auditBreakGlass(actor, action, eventID, reason string) error {
 		"audit_id": id, "action": action, "actor": actor,
 		"event_id": eventID, "reason": reason, "at": now.Format(time.RFC3339Nano),
 	})
-	if db == nil { return nil }
+	if db == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := db.ExecContext(ctx,
@@ -395,8 +448,12 @@ func logBreakGlassAction(eventID, operation, target, result string) error {
 	mu.Lock()
 	defer mu.Unlock()
 	evt := dbLoadEvent(eventID)
-	if evt == nil { return fmt.Errorf("break-glass event %s not found", eventID) }
-	if evt.Status != "active" { return fmt.Errorf("break-glass event %s is %s", eventID, evt.Status) }
+	if evt == nil {
+		return fmt.Errorf("break-glass event %s not found", eventID)
+	}
+	if evt.Status != "active" {
+		return fmt.Errorf("break-glass event %s is %s", eventID, evt.Status)
+	}
 	now := time.Now()
 	checksumData := fmt.Sprintf("%s|%s|%s", operation, target, now.Format(time.RFC3339Nano))
 	h := sha256.Sum256([]byte(checksumData))
@@ -411,7 +468,9 @@ func closeBreakGlass(eventID, reviewerID, notes string) error {
 	mu.Lock()
 	defer mu.Unlock()
 	evt := dbLoadEvent(eventID)
-	if evt == nil { return fmt.Errorf("break-glass event %s not found", eventID) }
+	if evt == nil {
+		return fmt.Errorf("break-glass event %s not found", eventID)
+	}
 	evt.Status = "under_review"
 	evt.ClosedAt = time.Now()
 	evt.ReviewedBy = reviewerID
@@ -422,55 +481,122 @@ func closeBreakGlass(eventID, reviewerID, notes string) error {
 }
 
 func handleActivate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
-	var body struct { RequestorID string `json:"requestor_id"`; Resource string `json:"resource"`; Reason string `json:"reason"`; Severity string `json:"severity"` }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil { http.Error(w, "invalid JSON", 400); return }
-	if body.Reason == "" { http.Error(w, `{"error":"reason is required"}`, 400); return }
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var body struct {
+		RequestorID string `json:"requestor_id"`
+		Resource    string `json:"resource"`
+		Reason      string `json:"reason"`
+		Severity    string `json:"severity"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", 400)
+		return
+	}
+	if body.Reason == "" {
+		http.Error(w, `{"error":"reason is required"}`, 400)
+		return
+	}
 	// Identity comes from verified JWT claims, never client-supplied fields.
 	requestorID := tokenSubject(r)
-	if requestorID == "" { http.Error(w, `{"error":"unauthorized"}`, 401); return }
-	evt, err := activateBreakGlass(requestorID, body.Resource, body.Reason, body.Severity, r.RemoteAddr)
-	if err != nil { http.Error(w, err.Error(), 400); return }
-	if err := auditBreakGlass(requestorID, "activate", evt.ID, body.Reason); err != nil {
-		http.Error(w, `{"error":"internal error"}`, 500); return
+	if requestorID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, 401)
+		return
 	}
-	w.Header().Set("Content-Type", "application/json"); w.WriteHeader(201); json.NewEncoder(w).Encode(evt)
+	evt, err := activateBreakGlass(requestorID, body.Resource, body.Reason, body.Severity, r.RemoteAddr)
+	if err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if err := auditBreakGlass(requestorID, "activate", evt.ID, body.Reason); err != nil {
+		http.Error(w, `{"error":"internal error"}`, 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	json.NewEncoder(w).Encode(evt)
 }
 
 func handleLogAction(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
-	var body struct { EventID string `json:"event_id"`; Operation string `json:"operation"`; Target string `json:"target"`; Result string `json:"result"` }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil { http.Error(w, "invalid JSON", 400); return }
-	if err := logBreakGlassAction(body.EventID, body.Operation, body.Target, body.Result); err != nil { http.Error(w, err.Error(), 400); return }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "logged"})
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var body struct {
+		EventID   string `json:"event_id"`
+		Operation string `json:"operation"`
+		Target    string `json:"target"`
+		Result    string `json:"result"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", 400)
+		return
+	}
+	if err := logBreakGlassAction(body.EventID, body.Operation, body.Target, body.Result); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "logged"})
 }
 
 func handleClose(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
-	var body struct { EventID string `json:"event_id"`; ReviewerID string `json:"reviewer_id"`; Reason string `json:"reason"`; Notes string `json:"notes"` }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil { http.Error(w, "invalid JSON", 400); return }
-	if body.Reason == "" { http.Error(w, `{"error":"reason is required"}`, 400); return }
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var body struct {
+		EventID    string `json:"event_id"`
+		ReviewerID string `json:"reviewer_id"`
+		Reason     string `json:"reason"`
+		Notes      string `json:"notes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid JSON", 400)
+		return
+	}
+	if body.Reason == "" {
+		http.Error(w, `{"error":"reason is required"}`, 400)
+		return
+	}
 	// Identity comes from verified JWT claims, never client-supplied fields.
 	reviewerID := tokenSubject(r)
-	if reviewerID == "" { http.Error(w, `{"error":"unauthorized"}`, 401); return }
-	if err := auditBreakGlass(reviewerID, "close", body.EventID, body.Reason); err != nil {
-		http.Error(w, `{"error":"internal error"}`, 500); return
+	if reviewerID == "" {
+		http.Error(w, `{"error":"unauthorized"}`, 401)
+		return
 	}
-	if err := closeBreakGlass(body.EventID, reviewerID, body.Notes); err != nil { http.Error(w, err.Error(), 400); return }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "closed"})
+	if err := auditBreakGlass(reviewerID, "close", body.EventID, body.Reason); err != nil {
+		http.Error(w, `{"error":"internal error"}`, 500)
+		return
+	}
+	if err := closeBreakGlass(body.EventID, reviewerID, body.Notes); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "closed"})
 }
 
 func handleListEvents(w http.ResponseWriter, r *http.Request) {
 	result := dbListEvents()
-	if result == nil { result = make([]*BreakGlassEvent, 0) }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(result)
+	if result == nil {
+		result = make([]*BreakGlassEvent, 0)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	events := dbListEvents()
 	active, closed, totalActions := 0, 0, 0
 	for _, e := range events {
-		if e.Status == "active" { active++ } else { closed++ }
+		if e.Status == "active" {
+			active++
+		} else {
+			closed++
+		}
 		totalActions += len(e.ActionsPerformed)
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -480,46 +606,113 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-var healthyFlag int32 = 1; var lastActivity int64
+var healthyFlag int32 = 1
+var lastActivity int64
+
 func healthzHandler(w http.ResponseWriter, r *http.Request) {
-	if atomic.LoadInt32(&healthyFlag) == 0 { w.WriteHeader(503) }
+	if atomic.LoadInt32(&healthyFlag) == 0 {
+		w.WriteHeader(503)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"status": "healthy", "service": serviceName, "uptime": int(time.Since(startTime).Seconds())})
 }
-func livezHandler(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "alive"}) }
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+}
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if db == nil { w.WriteHeader(503); json.NewEncoder(w).Encode(map[string]string{"status": "not_ready", "reason": "database not connected"}); return }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+	if db == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not_ready", "reason": "database not connected"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
 
-func startWatchdog() { atomic.StoreInt64(&lastActivity, time.Now().Unix()); go func() { for { time.Sleep(15*time.Second); if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 60 { atomic.StoreInt32(&healthyFlag, 0) } else { atomic.StoreInt32(&healthyFlag, 1) } } }() }
+func startWatchdog() {
+	atomic.StoreInt64(&lastActivity, time.Now().Unix())
+	go func() {
+		for {
+			time.Sleep(15 * time.Second)
+			if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 60 {
+				atomic.StoreInt32(&healthyFlag, 0)
+			} else {
+				atomic.StoreInt32(&healthyFlag, 1)
+			}
+		}
+	}()
+}
 func recordActivity() { atomic.StoreInt64(&lastActivity, time.Now().Unix()) }
 
-type EventBusImpl struct { topic, source string; mu sync.Mutex; events []map[string]interface{} }
-func newEventBus(topic, source string) *EventBusImpl { return &EventBusImpl{topic: topic, source: source, events: make([]map[string]interface{}, 0)} }
+type EventBusImpl struct {
+	topic, source string
+	mu            sync.Mutex
+	events        []map[string]interface{}
+}
+
+func newEventBus(topic, source string) *EventBusImpl {
+	return &EventBusImpl{topic: topic, source: source, events: make([]map[string]interface{}, 0)}
+}
 func (eb *EventBusImpl) Emit(eventType string, payload map[string]interface{}) {
-	eb.mu.Lock(); defer eb.mu.Unlock()
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
 	eb.events = append(eb.events, map[string]interface{}{"event_type": eventType, "source": eb.source, "topic": eb.topic, "timestamp": time.Now().Format(time.RFC3339), "payload": payload})
 	log.Printf("[EventBus] %s -> %s: %v", eb.topic, eventType, payload)
 }
-func loggingMiddleware(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { recordActivity(); start := time.Now(); next.ServeHTTP(w, r); log.Printf("[%s] %s %s %s", serviceName, r.Method, r.URL.Path, time.Since(start)) }) }
-func rateLimitMiddleware(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { acquireSem(); defer releaseSem(); next.ServeHTTP(w, r) }) }
-func panicRecoveryMiddleware(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { defer func() { if err := recover(); err != nil { log.Printf("[PANIC] %v", err); http.Error(w, "internal error", 500) } }(); next.ServeHTTP(w, r) }) }
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordActivity()
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("[%s] %s %s %s", serviceName, r.Method, r.URL.Path, time.Since(start))
+	})
+}
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { acquireSem(); defer releaseSem(); next.ServeHTTP(w, r) })
+}
+func panicRecoveryMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[PANIC] %v", err)
+				http.Error(w, "internal error", 500)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
 
 func main() {
-	port := os.Getenv("PORT"); if port == "" { port = "8080" }
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL != "" {
-		var err error; db, err = sql.Open("postgres", dbURL)
-		if err != nil { log.Printf("[break-glass] DB connection failed: %v", err)
+		var err error
+		db, err = sql.Open("postgres", dbURL)
+		if err != nil {
+			log.Printf("[break-glass] DB connection failed: %v", err)
 		} else {
-			db.SetMaxOpenConns(25); db.SetMaxIdleConns(5); db.SetConnMaxLifetime(5*time.Minute)
-			if err := db.Ping(); err != nil { log.Printf("[break-glass] DB ping failed: %v", err) } else { log.Println("[break-glass] Connected to PostgreSQL"); initSchema() }
+			db.SetMaxOpenConns(25)
+			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(5 * time.Minute)
+			if err := db.Ping(); err != nil {
+				log.Printf("[break-glass] DB ping failed: %v", err)
+			} else {
+				log.Println("[break-glass] Connected to PostgreSQL")
+				initSchema()
+			}
 		}
-	} else { log.Println("[break-glass] WARNING: DATABASE_URL not set") }
+	} else {
+		log.Println("[break-glass] WARNING: DATABASE_URL not set")
+	}
 	startWatchdog()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthzHandler); mux.HandleFunc("/livez", livezHandler); mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/healthz", healthzHandler)
+	mux.HandleFunc("/livez", livezHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
 	mux.Handle("/api/v1/break-glass/activate", secure(handleActivate))
 	mux.Handle("/api/v1/break-glass/log-action", secure(handleLogAction))
 	mux.Handle("/api/v1/break-glass/close", secure(handleClose))
@@ -527,7 +720,16 @@ func main() {
 	mux.Handle("/api/v1/break-glass/stats", secure(handleStats))
 	handler := panicRecoveryMiddleware(rateLimitMiddleware(loggingMiddleware(mux)))
 	srv := &http.Server{Addr: ":" + port, Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
-	go func() { log.Printf("[break-glass] Starting on :%s", port); if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatal(err) } }()
-	quit := make(chan os.Signal, 1); signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM); <-quit
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second); defer cancel(); srv.Shutdown(ctx)
+	go func() {
+		log.Printf("[break-glass] Starting on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
 }

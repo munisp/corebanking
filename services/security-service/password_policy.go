@@ -33,12 +33,12 @@ type PasswordPolicyConfig struct {
 	MinSpecialChars    int  `json:"min_special_chars"`
 
 	// Pattern restrictions
-	DisallowSequential    bool `json:"disallow_sequential"`    // abc, 123, etc.
-	DisallowRepeating     bool `json:"disallow_repeating"`     // aaa, 111, etc.
-	DisallowUserInfo      bool `json:"disallow_user_info"`     // email, name, phone
-	DisallowCommonWords   bool `json:"disallow_common_words"`  // password, 123456, etc.
-	MaxRepeatingChars     int  `json:"max_repeating_chars"`    // max consecutive same chars
-	MaxSequentialChars    int  `json:"max_sequential_chars"`   // max sequential chars
+	DisallowSequential  bool `json:"disallow_sequential"`   // abc, 123, etc.
+	DisallowRepeating   bool `json:"disallow_repeating"`    // aaa, 111, etc.
+	DisallowUserInfo    bool `json:"disallow_user_info"`    // email, name, phone
+	DisallowCommonWords bool `json:"disallow_common_words"` // password, 123456, etc.
+	MaxRepeatingChars   int  `json:"max_repeating_chars"`   // max consecutive same chars
+	MaxSequentialChars  int  `json:"max_sequential_chars"`  // max sequential chars
 
 	// History and expiry
 	PasswordHistoryCount int `json:"password_history_count"` // number of previous passwords to check
@@ -46,8 +46,8 @@ type PasswordPolicyConfig struct {
 	MinPasswordAgeDays   int `json:"min_password_age_days"`  // minimum days before password can be changed
 
 	// Lockout settings (handled by session_manager but configured here)
-	MaxFailedAttempts    int `json:"max_failed_attempts"`
-	LockoutDurationMins  int `json:"lockout_duration_mins"`
+	MaxFailedAttempts   int `json:"max_failed_attempts"`
+	LockoutDurationMins int `json:"lockout_duration_mins"`
 
 	// Special characters allowed
 	AllowedSpecialChars string `json:"allowed_special_chars"`

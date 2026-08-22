@@ -16,39 +16,39 @@ func TestNotificationCreation(t *testing.T) {
 		{
 			name: "valid SMS notification",
 			input: NotificationInput{
-				TenantID:    "tenant-001",
-				CustomerID:  "cust-001",
-				Type:        "SMS",
-				Recipient:   "08012345678",
-				Subject:     "",
-				Message:     "Your OTP is 123456",
-				Priority:    "HIGH",
+				TenantID:   "tenant-001",
+				CustomerID: "cust-001",
+				Type:       "SMS",
+				Recipient:  "08012345678",
+				Subject:    "",
+				Message:    "Your OTP is 123456",
+				Priority:   "HIGH",
 			},
 			wantErr: false,
 		},
 		{
 			name: "valid email notification",
 			input: NotificationInput{
-				TenantID:    "tenant-001",
-				CustomerID:  "cust-001",
-				Type:        "EMAIL",
-				Recipient:   "user@example.com",
-				Subject:     "Account Statement",
-				Message:     "Please find your statement attached",
-				Priority:    "NORMAL",
+				TenantID:   "tenant-001",
+				CustomerID: "cust-001",
+				Type:       "EMAIL",
+				Recipient:  "user@example.com",
+				Subject:    "Account Statement",
+				Message:    "Please find your statement attached",
+				Priority:   "NORMAL",
 			},
 			wantErr: false,
 		},
 		{
 			name: "valid push notification",
 			input: NotificationInput{
-				TenantID:    "tenant-001",
-				CustomerID:  "cust-001",
-				Type:        "PUSH",
-				Recipient:   "device-token-123",
-				Subject:     "Transaction Alert",
-				Message:     "You received NGN 10,000",
-				Priority:    "HIGH",
+				TenantID:   "tenant-001",
+				CustomerID: "cust-001",
+				Type:       "PUSH",
+				Recipient:  "device-token-123",
+				Subject:    "Transaction Alert",
+				Message:    "You received NGN 10,000",
+				Priority:   "HIGH",
 			},
 			wantErr: false,
 		},
@@ -189,10 +189,10 @@ func TestNotificationPriority(t *testing.T) {
 func TestNotificationRetry(t *testing.T) {
 	t.Run("should retry on failure", func(t *testing.T) {
 		notification := Notification{
-			ID:          "1",
-			RetryCount:  0,
-			MaxRetries:  3,
-			Status:      "FAILED",
+			ID:         "1",
+			RetryCount: 0,
+			MaxRetries: 3,
+			Status:     "FAILED",
 		}
 
 		if !shouldRetry(notification) {
@@ -202,10 +202,10 @@ func TestNotificationRetry(t *testing.T) {
 
 	t.Run("should not retry when max reached", func(t *testing.T) {
 		notification := Notification{
-			ID:          "1",
-			RetryCount:  3,
-			MaxRetries:  3,
-			Status:      "FAILED",
+			ID:         "1",
+			RetryCount: 3,
+			MaxRetries: 3,
+			Status:     "FAILED",
 		}
 
 		if shouldRetry(notification) {
@@ -232,34 +232,34 @@ func TestNotificationRetry(t *testing.T) {
 // TestNotificationChannelSelection tests channel selection
 func TestNotificationChannelSelection(t *testing.T) {
 	tests := []struct {
-		name            string
+		name             string
 		notificationType string
-		preferences     CustomerPreferences
-		expectedChannel string
+		preferences      CustomerPreferences
+		expectedChannel  string
 	}{
 		{
-			name:            "SMS when preferred",
+			name:             "SMS when preferred",
 			notificationType: "TRANSACTION_ALERT",
-			preferences:     CustomerPreferences{PreferredChannel: "SMS", SMSEnabled: true},
-			expectedChannel: "SMS",
+			preferences:      CustomerPreferences{PreferredChannel: "SMS", SMSEnabled: true},
+			expectedChannel:  "SMS",
 		},
 		{
-			name:            "fallback to email when SMS disabled",
+			name:             "fallback to email when SMS disabled",
 			notificationType: "TRANSACTION_ALERT",
-			preferences:     CustomerPreferences{PreferredChannel: "SMS", SMSEnabled: false, EmailEnabled: true},
-			expectedChannel: "EMAIL",
+			preferences:      CustomerPreferences{PreferredChannel: "SMS", SMSEnabled: false, EmailEnabled: true},
+			expectedChannel:  "EMAIL",
 		},
 		{
-			name:            "push for marketing when enabled",
+			name:             "push for marketing when enabled",
 			notificationType: "MARKETING",
-			preferences:     CustomerPreferences{PreferredChannel: "PUSH", PushEnabled: true, MarketingEnabled: true},
-			expectedChannel: "PUSH",
+			preferences:      CustomerPreferences{PreferredChannel: "PUSH", PushEnabled: true, MarketingEnabled: true},
+			expectedChannel:  "PUSH",
 		},
 		{
-			name:            "no channel when marketing disabled",
+			name:             "no channel when marketing disabled",
 			notificationType: "MARKETING",
-			preferences:     CustomerPreferences{PreferredChannel: "PUSH", PushEnabled: true, MarketingEnabled: false},
-			expectedChannel: "",
+			preferences:      CustomerPreferences{PreferredChannel: "PUSH", PushEnabled: true, MarketingEnabled: false},
+			expectedChannel:  "",
 		},
 	}
 
@@ -328,7 +328,7 @@ func TestBulkNotification(t *testing.T) {
 
 	t.Run("rate limiting", func(t *testing.T) {
 		limiter := NewRateLimiter(100, time.Second)
-		
+
 		allowed := 0
 		for i := 0; i < 150; i++ {
 			if limiter.Allow() {

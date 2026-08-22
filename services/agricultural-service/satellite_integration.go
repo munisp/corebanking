@@ -17,13 +17,13 @@ import (
 
 // SatelliteIntegrationService handles real satellite data retrieval
 type SatelliteIntegrationService struct {
-	httpClient      *http.Client
-	planetAPIKey    string
-	sentinelClientID string
+	httpClient           *http.Client
+	planetAPIKey         string
+	sentinelClientID     string
 	sentinelClientSecret string
-	sentinelToken   string
-	sentinelTokenExpiry time.Time
-	lakehouseURL    string
+	sentinelToken        string
+	sentinelTokenExpiry  time.Time
+	lakehouseURL         string
 }
 
 // NewSatelliteIntegrationService creates a new satellite integration service
@@ -100,36 +100,36 @@ func (s *SatelliteIntegrationService) authenticateSentinel(ctx context.Context) 
 	}
 
 	authURL := "https://services.sentinel-hub.com/oauth/token"
-	
+
 	data := fmt.Sprintf("grant_type=client_credentials&client_id=%s&client_secret=%s",
 		s.sentinelClientID, s.sentinelClientSecret)
-	
+
 	req, err := http.NewRequestWithContext(ctx, "POST", authURL, bytes.NewBufferString(data))
 	if err != nil {
 		return fmt.Errorf("failed to create auth request: %w", err)
 	}
-	
+
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("sentinel auth request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("sentinel auth failed with status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	var authResp SentinelAuthResponse
 	if err := json.NewDecoder(resp.Body).Decode(&authResp); err != nil {
 		return fmt.Errorf("failed to decode auth response: %w", err)
 	}
-	
+
 	s.sentinelToken = authResp.AccessToken
 	s.sentinelTokenExpiry = time.Now().Add(time.Duration(authResp.ExpiresIn-60) * time.Second)
-	
+
 	return nil
 }
 
@@ -138,7 +138,7 @@ func (s *SatelliteIntegrationService) GetNDVIFromSentinel(ctx context.Context, b
 	if err := s.authenticateSentinel(ctx); err != nil {
 		return nil, fmt.Errorf("authentication failed: %w", err)
 	}
-	
+
 	// NDVI calculation evalscript
 	evalscript := `
 //VERSION=3
@@ -168,7 +168,7 @@ function evaluatePixel(sample) {
   };
 }
 `
-	
+
 	requestBody := map[string]interface{}{
 		"input": map[string]interface{}{
 			"bounds": map[string]interface{}{
@@ -200,34 +200,34 @@ function evaluatePixel(sample) {
 		},
 		"evalscript": evalscript,
 	}
-	
+
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	
-	req, err := http.NewRequestWithContext(ctx, "POST", 
-		"https://services.sentinel-hub.com/api/v1/process", 
+
+	req, err := http.NewRequestWithContext(ctx, "POST",
+		"https://services.sentinel-hub.com/api/v1/process",
 		bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	req.Header.Set("Authorization", "Bearer "+s.sentinelToken)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sentinel request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("sentinel request failed with status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	// Process the response (in production, this would parse the GeoTIFF)
 	// For now, we'll return calculated statistics
 	return &SentinelNDVIResponse{
@@ -246,13 +246,13 @@ func (s *SatelliteIntegrationService) GetStatisticsFromSentinel(ctx context.Cont
 	if err := s.authenticateSentinel(ctx); err != nil {
 		return nil, fmt.Errorf("authentication failed: %w", err)
 	}
-	
+
 	// Statistical API request
 	requestBody := map[string]interface{}{
 		"input": map[string]interface{}{
 			"bounds": map[string]interface{}{
 				"geometry": map[string]interface{}{
-					"type": "Polygon",
+					"type":        "Polygon",
 					"coordinates": polygonWKT,
 				},
 			},
@@ -303,34 +303,34 @@ function evaluatePixel(sample) {
 			},
 		},
 	}
-	
+
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	
+
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		"https://services.sentinel-hub.com/api/v1/statistics",
 		bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	req.Header.Set("Authorization", "Bearer "+s.sentinelToken)
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("statistics request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	// Parse response and return statistics
 	var statsResp map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&statsResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	return &SentinelNDVIResponse{
 		NDVIMean:      0.62,
 		NDVIMin:       0.30,
@@ -355,15 +355,15 @@ type PlanetSearchResponse struct {
 	Features []struct {
 		ID         string `json:"id"`
 		Properties struct {
-			AcquiredDate   string  `json:"acquired"`
-			CloudCover     float64 `json:"cloud_cover"`
-			PixelRes       float64 `json:"pixel_resolution"`
-			SatelliteID    string  `json:"satellite_id"`
-			ViewAngle      float64 `json:"view_angle"`
+			AcquiredDate string  `json:"acquired"`
+			CloudCover   float64 `json:"cloud_cover"`
+			PixelRes     float64 `json:"pixel_resolution"`
+			SatelliteID  string  `json:"satellite_id"`
+			ViewAngle    float64 `json:"view_angle"`
 		} `json:"properties"`
 		Geometry struct {
-			Type        string          `json:"type"`
-			Coordinates [][][]float64   `json:"coordinates"`
+			Type        string        `json:"type"`
+			Coordinates [][][]float64 `json:"coordinates"`
 		} `json:"geometry"`
 	} `json:"features"`
 }
@@ -371,7 +371,7 @@ type PlanetSearchResponse struct {
 // SearchPlanetImagery searches for available Planet imagery
 func (s *SatelliteIntegrationService) SearchPlanetImagery(ctx context.Context, bbox []float64, startDate, endDate time.Time) (*PlanetSearchResponse, error) {
 	searchURL := "https://api.planet.com/data/v1/quick-search"
-	
+
 	// Build search filter
 	filter := map[string]interface{}{
 		"type": "AndFilter",
@@ -401,61 +401,61 @@ func (s *SatelliteIntegrationService) SearchPlanetImagery(ctx context.Context, b
 			},
 		},
 	}
-	
+
 	requestBody := PlanetSearchRequest{
 		ItemTypes: []string{"PSScene", "SkySatCollect"},
 		Filter:    filter,
 	}
-	
+
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
-	
+
 	req, err := http.NewRequestWithContext(ctx, "POST", searchURL, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	req.SetBasicAuth(s.planetAPIKey, "")
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("planet search failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("planet search failed with status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	var searchResp PlanetSearchResponse
 	if err := json.NewDecoder(resp.Body).Decode(&searchResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	return &searchResp, nil
 }
 
 // ActivatePlanetAsset activates a Planet asset for download
 func (s *SatelliteIntegrationService) ActivatePlanetAsset(ctx context.Context, itemID, itemType, assetType string) (string, error) {
 	activateURL := fmt.Sprintf("https://api.planet.com/data/v1/item-types/%s/items/%s/assets", itemType, itemID)
-	
+
 	req, err := http.NewRequestWithContext(ctx, "GET", activateURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	req.SetBasicAuth(s.planetAPIKey, "")
-	
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("planet asset request failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	var assets map[string]struct {
 		Status   string `json:"status"`
 		Location string `json:"location"`
@@ -463,20 +463,20 @@ func (s *SatelliteIntegrationService) ActivatePlanetAsset(ctx context.Context, i
 			Activate string `json:"activate"`
 		} `json:"_links"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&assets); err != nil {
 		return "", fmt.Errorf("failed to decode assets: %w", err)
 	}
-	
+
 	asset, ok := assets[assetType]
 	if !ok {
 		return "", fmt.Errorf("asset type %s not found", assetType)
 	}
-	
+
 	if asset.Status == "active" {
 		return asset.Location, nil
 	}
-	
+
 	// Activate the asset
 	if asset.Links.Activate != "" {
 		activateReq, err := http.NewRequestWithContext(ctx, "POST", asset.Links.Activate, nil)
@@ -484,14 +484,14 @@ func (s *SatelliteIntegrationService) ActivatePlanetAsset(ctx context.Context, i
 			return "", fmt.Errorf("failed to create activate request: %w", err)
 		}
 		activateReq.SetBasicAuth(s.planetAPIKey, "")
-		
+
 		activateResp, err := s.httpClient.Do(activateReq)
 		if err != nil {
 			return "", fmt.Errorf("activation failed: %w", err)
 		}
 		activateResp.Body.Close()
 	}
-	
+
 	return "", fmt.Errorf("asset activation in progress, check back later")
 }
 
@@ -509,7 +509,7 @@ func (s *SatelliteIntegrationService) IngestNDVIToLakehouse(ctx context.Context,
 	if s.lakehouseURL == "" {
 		s.lakehouseURL = "http://lakehouse-api:8000"
 	}
-	
+
 	record := map[string]interface{}{
 		"farm_id":             farmID,
 		"capture_date":        ndviData.CaptureDate.Format(time.RFC3339),
@@ -523,38 +523,38 @@ func (s *SatelliteIntegrationService) IngestNDVIToLakehouse(ctx context.Context,
 		"ingestion_timestamp": time.Now().Format(time.RFC3339),
 		"source":              "satellite_integration",
 	}
-	
+
 	ingestReq := LakehouseIngestRequest{
 		TableName: "bronze.agriculture_ndvi",
 		Data:      []map[string]interface{}{record},
 		Mode:      "append",
 	}
-	
+
 	jsonBody, err := json.Marshal(ingestReq)
 	if err != nil {
 		return fmt.Errorf("failed to marshal ingest request: %w", err)
 	}
-	
+
 	req, err := http.NewRequestWithContext(ctx, "POST",
 		s.lakehouseURL+"/api/v1/delta/write",
 		bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return fmt.Errorf("failed to create ingest request: %w", err)
 	}
-	
+
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("lakehouse ingest failed: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("lakehouse ingest failed with status %d: %s", resp.StatusCode, string(body))
 	}
-	
+
 	return nil
 }
 
@@ -578,14 +578,14 @@ func classifyNDVIHealthStatus(ndvi float64) string {
 
 // FarmSatelliteAnalysis represents complete satellite analysis for a farm
 type FarmSatelliteAnalysis struct {
-	FarmID            string              `json:"farm_id"`
-	PolygonID         string              `json:"polygon_id"`
-	AnalysisDate      time.Time           `json:"analysis_date"`
-	NDVIAnalysis      *SentinelNDVIResponse `json:"ndvi_analysis"`
-	AreaVerification  *AreaVerification   `json:"area_verification"`
-	CropClassification *CropClassResult   `json:"crop_classification"`
-	RiskAssessment    *RiskAssessment     `json:"risk_assessment"`
-	Recommendations   []string            `json:"recommendations"`
+	FarmID             string                `json:"farm_id"`
+	PolygonID          string                `json:"polygon_id"`
+	AnalysisDate       time.Time             `json:"analysis_date"`
+	NDVIAnalysis       *SentinelNDVIResponse `json:"ndvi_analysis"`
+	AreaVerification   *AreaVerification     `json:"area_verification"`
+	CropClassification *CropClassResult      `json:"crop_classification"`
+	RiskAssessment     *RiskAssessment       `json:"risk_assessment"`
+	Recommendations    []string              `json:"recommendations"`
 }
 
 // AreaVerification represents satellite-based area verification
@@ -598,30 +598,30 @@ type AreaVerification struct {
 
 // CropClassResult represents crop classification results
 type CropClassResult struct {
-	DeclaredCrop    string             `json:"declared_crop"`
-	DetectedCrop    string             `json:"detected_crop"`
-	Confidence      float64            `json:"confidence"`
-	MatchStatus     string             `json:"match_status"`
-	Alternatives    []CropProbability  `json:"alternatives"`
+	DeclaredCrop string            `json:"declared_crop"`
+	DetectedCrop string            `json:"detected_crop"`
+	Confidence   float64           `json:"confidence"`
+	MatchStatus  string            `json:"match_status"`
+	Alternatives []CropProbability `json:"alternatives"`
 }
 
 // RiskAssessment represents satellite-derived risk assessment
 type RiskAssessment struct {
-	OverallRisk     string  `json:"overall_risk"`
-	DroughtRisk     float64 `json:"drought_risk"`
-	FloodRisk       float64 `json:"flood_risk"`
-	PestRisk        float64 `json:"pest_risk"`
-	YieldRisk       float64 `json:"yield_risk"`
+	OverallRisk string  `json:"overall_risk"`
+	DroughtRisk float64 `json:"drought_risk"`
+	FloodRisk   float64 `json:"flood_risk"`
+	PestRisk    float64 `json:"pest_risk"`
+	YieldRisk   float64 `json:"yield_risk"`
 }
 
 // AnalyzeFarm performs comprehensive satellite analysis for a farm
 func (s *SatelliteIntegrationService) AnalyzeFarm(ctx context.Context, farmID string, polygon FarmPolygon) (*FarmSatelliteAnalysis, error) {
 	// Calculate bounding box from polygon
 	bbox := calculateBBox(polygon.Coordinates)
-	
+
 	endDate := time.Now()
 	startDate := endDate.AddDate(0, 0, -30) // Last 30 days
-	
+
 	// Get NDVI data from Sentinel
 	ndviData, err := s.GetNDVIFromSentinel(ctx, bbox, startDate, endDate)
 	if err != nil {
@@ -636,11 +636,11 @@ func (s *SatelliteIntegrationService) AnalyzeFarm(ctx context.Context, farmID st
 			Source:        "Sentinel-2-L2A-Fallback",
 		}
 	}
-	
+
 	// Calculate area verification
 	satelliteArea := polygon.DeclaredArea * (0.95 + (float64(time.Now().UnixNano()%100) / 1000))
 	variance := ((satelliteArea - polygon.DeclaredArea) / polygon.DeclaredArea) * 100
-	
+
 	areaVerification := &AreaVerification{
 		DeclaredArea:    polygon.DeclaredArea,
 		SatelliteArea:   satelliteArea,
@@ -650,7 +650,7 @@ func (s *SatelliteIntegrationService) AnalyzeFarm(ctx context.Context, farmID st
 	if math.Abs(variance) > 10 {
 		areaVerification.Status = "FLAGGED"
 	}
-	
+
 	// Crop classification (simplified)
 	cropClass := &CropClassResult{
 		DeclaredCrop: "MAIZE",
@@ -662,7 +662,7 @@ func (s *SatelliteIntegrationService) AnalyzeFarm(ctx context.Context, farmID st
 			{CropType: "MILLET", Probability: 4.3},
 		},
 	}
-	
+
 	// Risk assessment based on NDVI
 	riskAssessment := &RiskAssessment{
 		OverallRisk: "LOW",
@@ -671,7 +671,7 @@ func (s *SatelliteIntegrationService) AnalyzeFarm(ctx context.Context, farmID st
 		PestRisk:    12.0,
 		YieldRisk:   20.0,
 	}
-	
+
 	if ndviData.NDVIMean < 0.4 {
 		riskAssessment.OverallRisk = "HIGH"
 		riskAssessment.DroughtRisk = 65.0
@@ -681,27 +681,27 @@ func (s *SatelliteIntegrationService) AnalyzeFarm(ctx context.Context, farmID st
 		riskAssessment.DroughtRisk = 40.0
 		riskAssessment.YieldRisk = 45.0
 	}
-	
+
 	// Generate recommendations
 	recommendations := generateRecommendations(ndviData, areaVerification, riskAssessment)
-	
+
 	analysis := &FarmSatelliteAnalysis{
-		FarmID:            farmID,
-		PolygonID:         polygon.ID,
-		AnalysisDate:      time.Now(),
-		NDVIAnalysis:      ndviData,
-		AreaVerification:  areaVerification,
+		FarmID:             farmID,
+		PolygonID:          polygon.ID,
+		AnalysisDate:       time.Now(),
+		NDVIAnalysis:       ndviData,
+		AreaVerification:   areaVerification,
 		CropClassification: cropClass,
-		RiskAssessment:    riskAssessment,
-		Recommendations:   recommendations,
+		RiskAssessment:     riskAssessment,
+		Recommendations:    recommendations,
 	}
-	
+
 	// Ingest to lakehouse
 	if err := s.IngestNDVIToLakehouse(ctx, farmID, ndviData); err != nil {
 		// Log but don't fail the analysis
 		fmt.Printf("Warning: Failed to ingest to lakehouse: %v\n", err)
 	}
-	
+
 	return analysis, nil
 }
 
@@ -710,10 +710,10 @@ func calculateBBox(coords [][]float64) []float64 {
 	if len(coords) == 0 {
 		return []float64{0, 0, 0, 0}
 	}
-	
+
 	minLng, maxLng := coords[0][0], coords[0][0]
 	minLat, maxLat := coords[0][1], coords[0][1]
-	
+
 	for _, coord := range coords {
 		if coord[0] < minLng {
 			minLng = coord[0]
@@ -728,14 +728,14 @@ func calculateBBox(coords [][]float64) []float64 {
 			maxLat = coord[1]
 		}
 	}
-	
+
 	return []float64{minLng, minLat, maxLng, maxLat}
 }
 
 // generateRecommendations generates actionable recommendations based on analysis
 func generateRecommendations(ndvi *SentinelNDVIResponse, area *AreaVerification, risk *RiskAssessment) []string {
 	var recommendations []string
-	
+
 	// NDVI-based recommendations
 	if ndvi.NDVIMean < 0.4 {
 		recommendations = append(recommendations, "URGENT: Crop health is critical. Immediate field inspection recommended.")
@@ -743,12 +743,12 @@ func generateRecommendations(ndvi *SentinelNDVIResponse, area *AreaVerification,
 	} else if ndvi.NDVIMean < 0.5 {
 		recommendations = append(recommendations, "Crop health is below optimal. Monitor closely for the next 2 weeks.")
 	}
-	
+
 	// Area verification recommendations
 	if area.Status == "FLAGGED" {
 		recommendations = append(recommendations, fmt.Sprintf("Area variance of %.1f%% detected. Physical verification recommended.", area.VariancePercent))
 	}
-	
+
 	// Risk-based recommendations
 	if risk.DroughtRisk > 50 {
 		recommendations = append(recommendations, "High drought risk detected. Consider drought-resistant crop varieties for next season.")
@@ -759,10 +759,10 @@ func generateRecommendations(ndvi *SentinelNDVIResponse, area *AreaVerification,
 	if risk.PestRisk > 40 {
 		recommendations = append(recommendations, "Elevated pest risk. Schedule preventive pest management activities.")
 	}
-	
+
 	if len(recommendations) == 0 {
 		recommendations = append(recommendations, "Farm conditions are optimal. Continue current management practices.")
 	}
-	
+
 	return recommendations
 }

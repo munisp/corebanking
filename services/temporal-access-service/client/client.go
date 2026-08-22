@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sony/gobreaker"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/sony/gobreaker"
 )
 
 var (
@@ -91,15 +91,15 @@ type AccessCheckRequest struct {
 
 // AccessContext provides runtime context
 type AccessContext struct {
-	IPAddress      string                 `json:"ip_address,omitempty"`
-	DeviceID       string                 `json:"device_id,omitempty"`
-	MFAVerified    bool                   `json:"mfa_verified"`
-	LivenessScore  *float64               `json:"liveness_score,omitempty"`
-	Timestamp      time.Time              `json:"timestamp"`
-	Location       *Location              `json:"location,omitempty"`
-	RiskScore      *float64               `json:"risk_score,omitempty"`
-	Amount         *float64               `json:"amount,omitempty"`
-	Metadata       map[string]interface{} `json:"metadata,omitempty"`
+	IPAddress     string                 `json:"ip_address,omitempty"`
+	DeviceID      string                 `json:"device_id,omitempty"`
+	MFAVerified   bool                   `json:"mfa_verified"`
+	LivenessScore *float64               `json:"liveness_score,omitempty"`
+	Timestamp     time.Time              `json:"timestamp"`
+	Location      *Location              `json:"location,omitempty"`
+	RiskScore     *float64               `json:"risk_score,omitempty"`
+	Amount        *float64               `json:"amount,omitempty"`
+	Metadata      map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // Location represents geographic location
@@ -137,7 +137,7 @@ func (c *Client) CheckAccess(ctx context.Context, req AccessCheckRequest) (*Acce
 
 	if err != nil {
 		temporalAccessChecksTotal.WithLabelValues(c.serviceName, "error").Inc()
-		
+
 		// Fail-open: allow access if service is unavailable (optional)
 		if c.failOpen {
 			return &AccessCheckResponse{
@@ -145,7 +145,7 @@ func (c *Client) CheckAccess(ctx context.Context, req AccessCheckRequest) (*Acce
 				Reason:  "temporal access service unavailable (fail-open)",
 			}, nil
 		}
-		
+
 		return &AccessCheckResponse{
 			Allowed: false,
 			Reason:  "temporal access service unavailable",
@@ -153,7 +153,7 @@ func (c *Client) CheckAccess(ctx context.Context, req AccessCheckRequest) (*Acce
 	}
 
 	response := result.(*AccessCheckResponse)
-	
+
 	if response.Allowed {
 		temporalAccessChecksTotal.WithLabelValues(c.serviceName, "allowed").Inc()
 	} else {

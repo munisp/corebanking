@@ -67,11 +67,11 @@ func main() {
 
 	mux.HandleFunc("/v1/rails/stats", func(w http.ResponseWriter, _ *http.Request) {
 		respondJSON(w, 200, map[string]interface{}{
-			"totalRoutedToday":   48200,
-			"nipVolume":          38000,
-			"neftVolume":         4200,
-			"rtgsVolume":         200,
-			"swiftVolume":        12,
+			"totalRoutedToday":     48200,
+			"nipVolume":            38000,
+			"neftVolume":           4200,
+			"rtgsVolume":           200,
+			"swiftVolume":          12,
 			"avgRoutingDecisionMs": 8,
 		})
 	})

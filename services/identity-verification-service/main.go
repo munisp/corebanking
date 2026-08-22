@@ -34,11 +34,11 @@ func main() {
 			"status":  "ready",
 			"service": serviceName,
 			"defaults": map[string]string{
-				"provider_url":    defaultProviderURL,
-				"provider_key":    defaultProviderKey,
-				"tenant_id":       defaultTenantID,
-				"webhook_secret":  defaultWebhookSecret,
-				"seed_file":       seedFile,
+				"provider_url":   defaultProviderURL,
+				"provider_key":   defaultProviderKey,
+				"tenant_id":      defaultTenantID,
+				"webhook_secret": defaultWebhookSecret,
+				"seed_file":      seedFile,
 			},
 		})
 	})
@@ -47,11 +47,11 @@ func main() {
 			"status":  "bootstrap-ready",
 			"service": serviceName,
 			"defaults": map[string]string{
-				"provider_url":    defaultProviderURL,
-				"provider_key":    defaultProviderKey,
-				"tenant_id":       defaultTenantID,
-				"webhook_secret":  defaultWebhookSecret,
-				"seed_file":       seedFile,
+				"provider_url":   defaultProviderURL,
+				"provider_key":   defaultProviderKey,
+				"tenant_id":      defaultTenantID,
+				"webhook_secret": defaultWebhookSecret,
+				"seed_file":      seedFile,
 			},
 		})
 	})

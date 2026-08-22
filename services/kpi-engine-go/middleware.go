@@ -1,6 +1,7 @@
 // kpi-engine-go/middleware.go — Full middleware integration for KPI computation
 // Integrates: Kafka, Dapr, Fluvio, Temporal, Postgres, Keycloak, Permify,
-//             Redis, Mojaloop, OpenSearch, OpenAppSec, APISIX, TigerBeetle, Lakehouse
+//
+//	Redis, Mojaloop, OpenSearch, OpenAppSec, APISIX, TigerBeetle, Lakehouse
 package main
 
 import (
@@ -16,12 +17,12 @@ import (
 // ─── MIDDLEWARE STATUS TRACKING ─────────────────────────────────────────────
 
 type MiddlewareStatus struct {
-	Name       string `json:"name"`
-	Status     string `json:"status"` // connected, degraded, disconnected
-	Latency    string `json:"latency_ms"`
-	LastCheck  string `json:"last_check"`
-	Endpoint   string `json:"endpoint"`
-	KPISource  string `json:"kpi_source"` // what KPI data this middleware provides
+	Name      string `json:"name"`
+	Status    string `json:"status"` // connected, degraded, disconnected
+	Latency   string `json:"latency_ms"`
+	LastCheck string `json:"last_check"`
+	Endpoint  string `json:"endpoint"`
+	KPISource string `json:"kpi_source"` // what KPI data this middleware provides
 }
 
 type MiddlewareIntegration struct {
@@ -119,15 +120,15 @@ func probeHTTP(endpoint string) string {
 // ─── KAFKA INTEGRATION ──────────────────────────────────────────────────────
 
 type KafkaKPIEvent struct {
-	EventType  string      `json:"event_type"` // kpi.computed, kpi.breach, kpi.trend
-	Role       string      `json:"role"`
-	MetricID   string      `json:"metric_id,omitempty"`
-	Value      float64     `json:"value,omitempty"`
-	Threshold  float64     `json:"threshold,omitempty"`
-	Status     string      `json:"status"`
-	Timestamp  string      `json:"timestamp"`
-	Source     string      `json:"source"`
-	Payload    interface{} `json:"payload,omitempty"`
+	EventType string      `json:"event_type"` // kpi.computed, kpi.breach, kpi.trend
+	Role      string      `json:"role"`
+	MetricID  string      `json:"metric_id,omitempty"`
+	Value     float64     `json:"value,omitempty"`
+	Threshold float64     `json:"threshold,omitempty"`
+	Status    string      `json:"status"`
+	Timestamp string      `json:"timestamp"`
+	Source    string      `json:"source"`
+	Payload   interface{} `json:"payload,omitempty"`
 }
 
 func publishKPIEvent(event KafkaKPIEvent) {
@@ -324,24 +325,24 @@ func fetchOpenAppSecMetrics() OpenAppSecMetrics {
 // ─── LAKEHOUSE + SEDONA INTEGRATION ────────────────────────────────────────
 
 type LakehouseKPIs struct {
-	MaterializedViews  int    `json:"materialized_views"`
-	LastRefresh        string `json:"last_refresh"`
-	SedonaEnabled      bool   `json:"sedona_enabled"`
-	GeospatialQueries  int    `json:"geospatial_queries_today"`
-	IcebergSnapshots   int    `json:"iceberg_snapshots"`
-	DataFreshnessMs    int    `json:"data_freshness_ms"`
-	StorageUsedGB      float64 `json:"storage_used_gb"`
+	MaterializedViews int     `json:"materialized_views"`
+	LastRefresh       string  `json:"last_refresh"`
+	SedonaEnabled     bool    `json:"sedona_enabled"`
+	GeospatialQueries int     `json:"geospatial_queries_today"`
+	IcebergSnapshots  int     `json:"iceberg_snapshots"`
+	DataFreshnessMs   int     `json:"data_freshness_ms"`
+	StorageUsedGB     float64 `json:"storage_used_gb"`
 }
 
 func fetchLakehouseKPIs() LakehouseKPIs {
 	return LakehouseKPIs{
-		MaterializedViews:  15,
-		LastRefresh:        time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339),
-		SedonaEnabled:      true,
-		GeospatialQueries:  234,
-		IcebergSnapshots:   48,
-		DataFreshnessMs:    5000,
-		StorageUsedGB:      45.8,
+		MaterializedViews: 15,
+		LastRefresh:       time.Now().Add(-5 * time.Minute).UTC().Format(time.RFC3339),
+		SedonaEnabled:     true,
+		GeospatialQueries: 234,
+		IcebergSnapshots:  48,
+		DataFreshnessMs:   5000,
+		StorageUsedGB:     45.8,
 	}
 }
 
@@ -350,25 +351,25 @@ func fetchLakehouseKPIs() LakehouseKPIs {
 func middlewareStatusHandler(w http.ResponseWriter, r *http.Request) {
 	mi := NewMiddlewareIntegration()
 	statuses := mi.ProbeAll()
-	
+
 	connected := 0
 	for _, s := range statuses {
 		if s.Status == "connected" {
 			connected++
 		}
 	}
-	
+
 	jsonResp(w, 200, map[string]interface{}{
 		"middleware":         statuses,
-		"total":             len(statuses),
-		"connected":         connected,
-		"disconnected":      len(statuses) - connected,
-		"health_percentage": float64(connected) / float64(len(statuses)) * 100,
-		"mojaloop_kpis":     fetchMojaloopKPIs(),
-		"apisix_metrics":    fetchAPISIXMetrics(),
-		"tigerbeetle_kpis":  fetchTigerBeetleKPIs(),
+		"total":              len(statuses),
+		"connected":          connected,
+		"disconnected":       len(statuses) - connected,
+		"health_percentage":  float64(connected) / float64(len(statuses)) * 100,
+		"mojaloop_kpis":      fetchMojaloopKPIs(),
+		"apisix_metrics":     fetchAPISIXMetrics(),
+		"tigerbeetle_kpis":   fetchTigerBeetleKPIs(),
 		"openappsec_metrics": fetchOpenAppSecMetrics(),
-		"lakehouse_kpis":    fetchLakehouseKPIs(),
-		"timestamp":         time.Now().UTC().Format(time.RFC3339),
+		"lakehouse_kpis":     fetchLakehouseKPIs(),
+		"timestamp":          time.Now().UTC().Format(time.RFC3339),
 	})
 }

@@ -16,50 +16,50 @@ import (
 
 // USSDMenu represents a USSD menu structure
 type USSDMenu struct {
-	ID          string       `json:"id"`
-	Code        string       `json:"code"`
-	Title       map[string]string `json:"title"` // Multi-language
-	Options     []USSDOption `json:"options"`
-	ParentMenu  string       `json:"parent_menu,omitempty"`
-	RequiresAuth bool        `json:"requires_auth"`
+	ID           string            `json:"id"`
+	Code         string            `json:"code"`
+	Title        map[string]string `json:"title"` // Multi-language
+	Options      []USSDOption      `json:"options"`
+	ParentMenu   string            `json:"parent_menu,omitempty"`
+	RequiresAuth bool              `json:"requires_auth"`
 }
 
 // USSDOption represents a menu option
 type USSDOption struct {
-	Number      int               `json:"number"`
-	Label       map[string]string `json:"label"` // Multi-language
-	Action      string            `json:"action"` // navigate, api_call, input
-	Target      string            `json:"target"` // menu_id or api_endpoint
-	InputType   string            `json:"input_type,omitempty"` // amount, phone, text, pin
+	Number    int               `json:"number"`
+	Label     map[string]string `json:"label"`                // Multi-language
+	Action    string            `json:"action"`               // navigate, api_call, input
+	Target    string            `json:"target"`               // menu_id or api_endpoint
+	InputType string            `json:"input_type,omitempty"` // amount, phone, text, pin
 }
 
 // InclusiveUSSDSession tracks user session state
 type InclusiveUSSDSession struct {
-	SessionID     string                 `json:"session_id"`
-	MSISDN        string                 `json:"msisdn"`
-	FarmerID      string                 `json:"farmer_id,omitempty"`
-	Language      string                 `json:"language"`
-	CurrentMenu   string                 `json:"current_menu"`
-	MenuHistory   []string               `json:"menu_history"`
-	InputData     map[string]interface{} `json:"input_data"`
-	Authenticated bool                   `json:"authenticated"`
-	StartedAt     time.Time              `json:"started_at"`
-	LastActivityAt time.Time             `json:"last_activity_at"`
+	SessionID      string                 `json:"session_id"`
+	MSISDN         string                 `json:"msisdn"`
+	FarmerID       string                 `json:"farmer_id,omitempty"`
+	Language       string                 `json:"language"`
+	CurrentMenu    string                 `json:"current_menu"`
+	MenuHistory    []string               `json:"menu_history"`
+	InputData      map[string]interface{} `json:"input_data"`
+	Authenticated  bool                   `json:"authenticated"`
+	StartedAt      time.Time              `json:"started_at"`
+	LastActivityAt time.Time              `json:"last_activity_at"`
 }
 
 // InclusiveIVRFlow represents an IVR call flow
 type InclusiveIVRFlow struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	Language    string     `json:"language"`
-	Prompts     []IVRPrompt `json:"prompts"`
-	EntryPoint  string     `json:"entry_point"`
+	ID         string      `json:"id"`
+	Name       string      `json:"name"`
+	Language   string      `json:"language"`
+	Prompts    []IVRPrompt `json:"prompts"`
+	EntryPoint string      `json:"entry_point"`
 }
 
 // IVRPrompt represents a voice prompt
 type IVRPrompt struct {
 	ID            string            `json:"id"`
-	AudioFile     map[string]string `json:"audio_file"` // Language -> file path
+	AudioFile     map[string]string `json:"audio_file"`     // Language -> file path
 	TextToSpeech  map[string]string `json:"text_to_speech"` // Fallback TTS
 	ExpectedInput string            `json:"expected_input"` // dtmf, speech, none
 	ValidInputs   []string          `json:"valid_inputs,omitempty"`
@@ -70,17 +70,17 @@ type IVRPrompt struct {
 
 // FarmerUSSDProfile simplified farmer view for USSD
 type FarmerUSSDProfile struct {
-	FarmerID        string  `json:"farmer_id"`
-	Name            string  `json:"name"`
-	Phone           string  `json:"phone"`
-	Language        string  `json:"language"`
-	CreditLimit     float64 `json:"credit_limit"`
-	CurrentBalance  float64 `json:"current_balance"`
-	NextPaymentDate string  `json:"next_payment_date"`
+	FarmerID          string  `json:"farmer_id"`
+	Name              string  `json:"name"`
+	Phone             string  `json:"phone"`
+	Language          string  `json:"language"`
+	CreditLimit       float64 `json:"credit_limit"`
+	CurrentBalance    float64 `json:"current_balance"`
+	NextPaymentDate   string  `json:"next_payment_date"`
 	NextPaymentAmount float64 `json:"next_payment_amount"`
-	RepaymentStreak int     `json:"repayment_streak"`
-	ActiveLoans     int     `json:"active_loans"`
-	ActiveVouchers  int     `json:"active_vouchers"`
+	RepaymentStreak   int     `json:"repayment_streak"`
+	ActiveLoans       int     `json:"active_loans"`
+	ActiveVouchers    int     `json:"active_vouchers"`
 }
 
 // SeasonPlan simplified seasonal plan for farmer
@@ -108,34 +108,34 @@ type SimplifiedLoanStatus struct {
 
 // PriceAdvisory market price information
 type PriceAdvisory struct {
-	CommodityType   string    `json:"commodity_type"`
-	Region          string    `json:"region"`
-	CurrentPrice    float64   `json:"current_price"`
-	PriceChange     float64   `json:"price_change_percent"`
-	Trend           string    `json:"trend"` // up, down, stable
-	Recommendation  string    `json:"recommendation"`
-	BestMarkets     []string  `json:"best_markets"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	CommodityType  string    `json:"commodity_type"`
+	Region         string    `json:"region"`
+	CurrentPrice   float64   `json:"current_price"`
+	PriceChange    float64   `json:"price_change_percent"`
+	Trend          string    `json:"trend"` // up, down, stable
+	Recommendation string    `json:"recommendation"`
+	BestMarkets    []string  `json:"best_markets"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // PlantingAdvisory agricultural advice
 type PlantingAdvisory struct {
-	Region          string   `json:"region"`
-	Season          string   `json:"season"`
+	Region           string   `json:"region"`
+	Season           string   `json:"season"`
 	RecommendedCrops []string `json:"recommended_crops"`
-	PlantingWindow  string   `json:"planting_window"`
-	WeatherOutlook  string   `json:"weather_outlook"`
-	InputsNeeded    []string `json:"inputs_needed"`
-	Tips            []string `json:"tips"`
+	PlantingWindow   string   `json:"planting_window"`
+	WeatherOutlook   string   `json:"weather_outlook"`
+	InputsNeeded     []string `json:"inputs_needed"`
+	Tips             []string `json:"tips"`
 }
 
 // Supported languages
 var supportedLanguages = map[string]string{
-	"en": "English",
-	"ha": "Hausa",
-	"yo": "Yoruba",
-	"ig": "Igbo",
-	"ff": "Fulfulde",
+	"en":  "English",
+	"ha":  "Hausa",
+	"yo":  "Yoruba",
+	"ig":  "Igbo",
+	"ff":  "Fulfulde",
 	"pcm": "Pidgin",
 }
 
@@ -177,7 +177,7 @@ var agricultureUSSDMenus = map[string]USSDMenu{
 			{Number: 2, Label: map[string]string{"en": "Outstanding Loan", "ha": "Bashin da ake bi"}, Action: "api_call", Target: "/api/v1/agriculture/ussd/outstanding"},
 			{Number: 0, Label: map[string]string{"en": "Back", "ha": "Koma"}, Action: "navigate", Target: "main"},
 		},
-		ParentMenu: "main",
+		ParentMenu:   "main",
 		RequiresAuth: true,
 	},
 	"voucher": {
@@ -192,7 +192,7 @@ var agricultureUSSDMenus = map[string]USSDMenu{
 			{Number: 2, Label: map[string]string{"en": "Check Voucher Balance"}, Action: "api_call", Target: "/api/v1/agriculture/ussd/voucher-balance"},
 			{Number: 0, Label: map[string]string{"en": "Back"}, Action: "navigate", Target: "main"},
 		},
-		ParentMenu: "main",
+		ParentMenu:   "main",
 		RequiresAuth: true,
 	},
 	"language": {
@@ -222,31 +222,31 @@ func handleUSSDRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	var request struct {
 		SessionID string `json:"session_id"`
 		MSISDN    string `json:"msisdn"`
 		Input     string `json:"input"`
 		MenuID    string `json:"menu_id,omitempty"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Get or create session
 	language := "en" // Default, would be retrieved from session
 	menuID := request.MenuID
 	if menuID == "" {
 		menuID = "main"
 	}
-	
+
 	menu, exists := agricultureUSSDMenus[menuID]
 	if !exists {
 		menu = agricultureUSSDMenus["main"]
 	}
-	
+
 	// Build response
 	response := menu.Title[language] + "\n"
 	for _, opt := range menu.Options {
@@ -256,12 +256,12 @@ func handleUSSDRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		response += fmt.Sprintf("%d. %s\n", opt.Number, label)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"session_id": request.SessionID,
-		"response":   response,
-		"menu_id":    menuID,
+		"session_id":  request.SessionID,
+		"response":    response,
+		"menu_id":     menuID,
 		"end_session": false,
 	})
 }
@@ -272,22 +272,22 @@ func handleUSSDFarmerProfile(w http.ResponseWriter, r *http.Request) {
 	if language == "" {
 		language = "en"
 	}
-	
+
 	// Mock farmer profile - in production, this would query the database
 	profile := FarmerUSSDProfile{
-		FarmerID:        "FRM-12345",
-		Name:            "Adamu Ibrahim",
-		Phone:           msisdn,
-		Language:        language,
-		CreditLimit:     500000,
-		CurrentBalance:  150000,
-		NextPaymentDate: "2025-02-15",
+		FarmerID:          "FRM-12345",
+		Name:              "Adamu Ibrahim",
+		Phone:             msisdn,
+		Language:          language,
+		CreditLimit:       500000,
+		CurrentBalance:    150000,
+		NextPaymentDate:   "2025-02-15",
 		NextPaymentAmount: 25000,
-		RepaymentStreak: 5,
-		ActiveLoans:     1,
-		ActiveVouchers:  2,
+		RepaymentStreak:   5,
+		ActiveLoans:       1,
+		ActiveVouchers:    2,
 	}
-	
+
 	// Format for USSD display
 	var ussdText string
 	switch language {
@@ -301,7 +301,7 @@ func handleUSSDFarmerProfile(w http.ResponseWriter, r *http.Request) {
 		ussdText = fmt.Sprintf("Welcome %s!\nCredit Limit: N%.0f\nOutstanding: N%.0f\nNext Payment: N%.0f (%s)\nRepayment Streak: %d seasons",
 			profile.Name, profile.CreditLimit, profile.CurrentBalance, profile.NextPaymentAmount, profile.NextPaymentDate, profile.RepaymentStreak)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"profile":   profile,
@@ -315,7 +315,7 @@ func handleUSSDLoanStatus(w http.ResponseWriter, r *http.Request) {
 	if language == "" {
 		language = "en"
 	}
-	
+
 	// Mock loan status
 	loan := SimplifiedLoanStatus{
 		LoanID:          "LN-2024-001",
@@ -326,7 +326,7 @@ func handleUSSDLoanStatus(w http.ResponseWriter, r *http.Request) {
 		NextPaymentDate: "2025-02-15",
 		DaysUntilDue:    45,
 	}
-	
+
 	var ussdText string
 	switch language {
 	case "ha":
@@ -336,9 +336,9 @@ func handleUSSDLoanStatus(w http.ResponseWriter, r *http.Request) {
 		ussdText = fmt.Sprintf("Loan Status\nPrincipal: N%.0f\nOutstanding: N%.0f\nNext Payment: N%.0f\nDue: %s\n%d days left",
 			loan.Principal, loan.Outstanding, loan.NextPayment, loan.NextPaymentDate, loan.DaysUntilDue)
 	}
-	
+
 	_ = msisdn // Would be used to look up farmer
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"loan":      loan,
@@ -350,7 +350,7 @@ func handleUSSDPriceAdvisory(w http.ResponseWriter, r *http.Request) {
 	commodity := r.URL.Query().Get("commodity")
 	region := r.URL.Query().Get("region")
 	language := r.URL.Query().Get("lang")
-	
+
 	if commodity == "" {
 		commodity = "maize"
 	}
@@ -360,7 +360,7 @@ func handleUSSDPriceAdvisory(w http.ResponseWriter, r *http.Request) {
 	if language == "" {
 		language = "en"
 	}
-	
+
 	// Mock price advisory
 	advisory := PriceAdvisory{
 		CommodityType:  commodity,
@@ -372,7 +372,7 @@ func handleUSSDPriceAdvisory(w http.ResponseWriter, r *http.Request) {
 		BestMarkets:    []string{"Dawanau Market, Kano", "Bodija Market, Ibadan"},
 		UpdatedAt:      time.Now(),
 	}
-	
+
 	var ussdText string
 	switch language {
 	case "ha":
@@ -382,7 +382,7 @@ func handleUSSDPriceAdvisory(w http.ResponseWriter, r *http.Request) {
 		ussdText = fmt.Sprintf("%s Price\nCurrent: N%.0f/tonne\nChange: +%.1f%%\nAdvice: %s",
 			commodity, advisory.CurrentPrice, advisory.PriceChange, advisory.Recommendation)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"advisory":  advisory,
@@ -393,29 +393,29 @@ func handleUSSDPriceAdvisory(w http.ResponseWriter, r *http.Request) {
 func handleUSSDPlantingAdvisory(w http.ResponseWriter, r *http.Request) {
 	region := r.URL.Query().Get("region")
 	language := r.URL.Query().Get("lang")
-	
+
 	if region == "" {
 		region = "north"
 	}
 	if language == "" {
 		language = "en"
 	}
-	
+
 	// Mock planting advisory
 	advisory := PlantingAdvisory{
-		Region:          region,
-		Season:          "2025-wet",
+		Region:           region,
+		Season:           "2025-wet",
 		RecommendedCrops: []string{"Maize", "Rice", "Sorghum"},
-		PlantingWindow:  "May 15 - June 30",
-		WeatherOutlook:  "Normal to above-normal rainfall expected",
-		InputsNeeded:    []string{"NPK fertilizer", "Improved seeds", "Herbicides"},
+		PlantingWindow:   "May 15 - June 30",
+		WeatherOutlook:   "Normal to above-normal rainfall expected",
+		InputsNeeded:     []string{"NPK fertilizer", "Improved seeds", "Herbicides"},
 		Tips: []string{
 			"Plant early to maximize rainfall",
 			"Use certified seeds for better yields",
 			"Apply fertilizer 3 weeks after planting",
 		},
 	}
-	
+
 	var ussdText string
 	switch language {
 	case "ha":
@@ -425,7 +425,7 @@ func handleUSSDPlantingAdvisory(w http.ResponseWriter, r *http.Request) {
 		ussdText = fmt.Sprintf("Planting Advisory\nSeason: %s\nCrops: %s\nPlanting: %s\nOutlook: %s",
 			advisory.Season, "Maize, Rice, Sorghum", advisory.PlantingWindow, advisory.WeatherOutlook)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"advisory":  advisory,
@@ -436,11 +436,11 @@ func handleUSSDPlantingAdvisory(w http.ResponseWriter, r *http.Request) {
 func handleUSSDSeasonPlan(w http.ResponseWriter, r *http.Request) {
 	msisdn := r.URL.Query().Get("msisdn")
 	language := r.URL.Query().Get("lang")
-	
+
 	if language == "" {
 		language = "en"
 	}
-	
+
 	// Mock season plan
 	plan := SeasonPlan{
 		Season:          "2025-wet",
@@ -452,7 +452,7 @@ func handleUSSDSeasonPlan(w http.ResponseWriter, r *http.Request) {
 		ExpectedYield:   4.5,
 		ExpectedIncome:  450000,
 	}
-	
+
 	var ussdText string
 	switch language {
 	case "ha":
@@ -462,9 +462,9 @@ func handleUSSDSeasonPlan(w http.ResponseWriter, r *http.Request) {
 		ussdText = fmt.Sprintf("Season Plan\nCrop: %s\nPlanting: %s\nHarvest: %s\nLoan: N%.0f\nExpected Income: N%.0f",
 			plan.CropType, plan.PlantingDate, plan.ExpectedHarvest, plan.LoanAmount, plan.ExpectedIncome)
 	}
-	
+
 	_ = msisdn // Would be used to look up farmer
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"plan":      plan,
@@ -477,7 +477,7 @@ func handleUSSDVoucherRedeem(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	var request struct {
 		MSISDN      string  `json:"msisdn"`
 		VoucherCode string  `json:"voucher_code"`
@@ -485,19 +485,19 @@ func handleUSSDVoucherRedeem(w http.ResponseWriter, r *http.Request) {
 		Amount      float64 `json:"amount"`
 		Language    string  `json:"language"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	if request.Language == "" {
 		request.Language = "en"
 	}
-	
+
 	// Mock redemption
 	remainingBalance := 50000.0 // Would be calculated
-	
+
 	var ussdText string
 	switch request.Language {
 	case "ha":
@@ -507,7 +507,7 @@ func handleUSSDVoucherRedeem(w http.ResponseWriter, r *http.Request) {
 		ussdText = fmt.Sprintf("Voucher Redeemed!\nAmount: N%.0f\nRemaining: N%.0f\nThank you for using 54Bank",
 			request.Amount, remainingBalance)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":           true,
@@ -523,7 +523,7 @@ func handleUSSDMakePayment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	var request struct {
 		MSISDN   string  `json:"msisdn"`
 		LoanID   string  `json:"loan_id"`
@@ -531,19 +531,19 @@ func handleUSSDMakePayment(w http.ResponseWriter, r *http.Request) {
 		PIN      string  `json:"pin"`
 		Language string  `json:"language"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	if request.Language == "" {
 		request.Language = "en"
 	}
-	
+
 	// Mock payment processing
 	newOutstanding := 125000.0 // Would be calculated
-	
+
 	var ussdText string
 	switch request.Language {
 	case "ha":
@@ -553,7 +553,7 @@ func handleUSSDMakePayment(w http.ResponseWriter, r *http.Request) {
 		ussdText = fmt.Sprintf("Payment Received!\nAmount: N%.0f\nNew Outstanding: N%.0f\nThank you!",
 			request.Amount, newOutstanding)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":         true,
@@ -569,7 +569,7 @@ func handleIVRFlow(w http.ResponseWriter, r *http.Request) {
 	if language == "" {
 		language = "en"
 	}
-	
+
 	// Return IVR flow definition
 	flow := InclusiveIVRFlow{
 		ID:       "agri-main",
@@ -613,7 +613,7 @@ func handleIVRFlow(w http.ResponseWriter, r *http.Request) {
 		},
 		EntryPoint: "welcome",
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"flow":                flow,
@@ -624,21 +624,21 @@ func handleIVRFlow(w http.ResponseWriter, r *http.Request) {
 func handleSetLanguage(w http.ResponseWriter, r *http.Request) {
 	msisdn := r.URL.Query().Get("msisdn")
 	language := r.URL.Query().Get("lang")
-	
+
 	if language == "" {
 		http.Error(w, "lang parameter is required", http.StatusBadRequest)
 		return
 	}
-	
+
 	langName, exists := supportedLanguages[language]
 	if !exists {
 		http.Error(w, "Unsupported language", http.StatusBadRequest)
 		return
 	}
-	
+
 	// In production, this would update the farmer's language preference
 	_ = msisdn
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success":  true,

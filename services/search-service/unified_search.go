@@ -461,7 +461,7 @@ func (s *UnifiedSearchService) initializeIndices() {
 	}
 
 	for indexName, mapping := range indices {
-			_ = s.createIndex(context.Background(), indexName, mapping)
+		_ = s.createIndex(context.Background(), indexName, mapping)
 
 	}
 }

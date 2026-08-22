@@ -46,37 +46,37 @@ var (
 type STKMenuID string
 
 const (
-	MenuMain          STKMenuID = "MAIN"
-	MenuBalance       STKMenuID = "BAL"
-	MenuTransfer      STKMenuID = "TRF"
-	MenuAirtime       STKMenuID = "AIR"
-	MenuBills         STKMenuID = "BILL"
-	MenuAgent         STKMenuID = "AGENT"
-	MenuStatement     STKMenuID = "STMT"
-	MenuSettings      STKMenuID = "SET"
-	MenuHelp          STKMenuID = "HELP"
+	MenuMain      STKMenuID = "MAIN"
+	MenuBalance   STKMenuID = "BAL"
+	MenuTransfer  STKMenuID = "TRF"
+	MenuAirtime   STKMenuID = "AIR"
+	MenuBills     STKMenuID = "BILL"
+	MenuAgent     STKMenuID = "AGENT"
+	MenuStatement STKMenuID = "STMT"
+	MenuSettings  STKMenuID = "SET"
+	MenuHelp      STKMenuID = "HELP"
 )
 
 // STKCommand represents an STK command from the SIM
 type STKCommand struct {
-	CommandID    string            `json:"command_id"`
-	IMSI         string            `json:"imsi"`         // SIM identifier
-	MSISDN       string            `json:"msisdn"`       // Phone number
-	MenuID       STKMenuID         `json:"menu_id"`
-	Selection    string            `json:"selection"`
-	InputData    string            `json:"input_data"`
-	SessionData  map[string]string `json:"session_data"`
-	Timestamp    time.Time         `json:"timestamp"`
+	CommandID   string            `json:"command_id"`
+	IMSI        string            `json:"imsi"`   // SIM identifier
+	MSISDN      string            `json:"msisdn"` // Phone number
+	MenuID      STKMenuID         `json:"menu_id"`
+	Selection   string            `json:"selection"`
+	InputData   string            `json:"input_data"`
+	SessionData map[string]string `json:"session_data"`
+	Timestamp   time.Time         `json:"timestamp"`
 }
 
 // STKResponse represents response to send to SIM
 type STKResponse struct {
-	ResponseType string      `json:"response_type"` // MENU, INPUT, DISPLAY, END
-	Title        string      `json:"title"`
-	Items        []STKItem   `json:"items,omitempty"`
-	InputPrompt  string      `json:"input_prompt,omitempty"`
-	InputType    string      `json:"input_type,omitempty"` // TEXT, PIN, PHONE, AMOUNT
-	DisplayText  string      `json:"display_text,omitempty"`
+	ResponseType string            `json:"response_type"` // MENU, INPUT, DISPLAY, END
+	Title        string            `json:"title"`
+	Items        []STKItem         `json:"items,omitempty"`
+	InputPrompt  string            `json:"input_prompt,omitempty"`
+	InputType    string            `json:"input_type,omitempty"` // TEXT, PIN, PHONE, AMOUNT
+	DisplayText  string            `json:"display_text,omitempty"`
 	SessionData  map[string]string `json:"session_data"`
 }
 
@@ -145,7 +145,7 @@ func (s *STKBankingService) ProcessSTKCommand(ctx context.Context, cmd *STKComma
 		stkSessionsTotal.WithLabelValues("new", "created").Inc()
 	}
 	session.LastAccess = time.Now()
-	
+
 	// Merge session data from command
 	if cmd.SessionData != nil {
 		for k, v := range cmd.SessionData {

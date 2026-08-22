@@ -66,12 +66,12 @@ type ScoreEntityResult struct {
 }
 
 type RiskPortfolio struct {
-	TotalAssessments    int                `json:"totalAssessments"`
-	TotalEAD            float64            `json:"totalEAD"`
-	TotalRWA            float64            `json:"totalRWA"`
-	TotalExpectedLoss   float64            `json:"totalExpectedLoss"`
-	RWAByType           map[string]float64 `json:"rwaByType"`
-	CountByIFRS9Stage   map[string]int     `json:"countByIFRS9Stage"`
+	TotalAssessments  int                `json:"totalAssessments"`
+	TotalEAD          float64            `json:"totalEAD"`
+	TotalRWA          float64            `json:"totalRWA"`
+	TotalExpectedLoss float64            `json:"totalExpectedLoss"`
+	RWAByType         map[string]float64 `json:"rwaByType"`
+	CountByIFRS9Stage map[string]int     `json:"countByIFRS9Stage"`
 }
 
 // ==================== CREDIT BUREAU TYPES ====================
@@ -131,12 +131,12 @@ type ScoreCheckResult struct {
 }
 
 type CreditBureauStats struct {
-	TotalReports     int                `json:"totalReports"`
-	AverageScore     float64            `json:"averageScore"`
-	TotalOutstanding float64            `json:"totalOutstanding"`
-	TotalOverdue     float64            `json:"totalOverdue"`
-	ByScoreBand      map[string]int     `json:"byScoreBand"`
-	ByBureau         map[string]int     `json:"byBureau"`
+	TotalReports     int            `json:"totalReports"`
+	AverageScore     float64        `json:"averageScore"`
+	TotalOutstanding float64        `json:"totalOutstanding"`
+	TotalOverdue     float64        `json:"totalOverdue"`
+	ByScoreBand      map[string]int `json:"byScoreBand"`
+	ByBureau         map[string]int `json:"byBureau"`
 }
 
 // ==================== CREDIT FACILITY TYPES ====================
@@ -180,14 +180,14 @@ type CreditFacility struct {
 }
 
 type FacilityStats struct {
-	TotalFacilities int                `json:"totalFacilities"`
-	TotalLimit      float64            `json:"totalLimit"`
-	TotalUtilized   float64            `json:"totalUtilized"`
-	TotalAvailable  float64            `json:"totalAvailable"`
-	AvgUtilization  float64            `json:"avgUtilization"`
-	Breached        int                `json:"breached"`
-	NearBreach      int                `json:"nearBreach"`
-	ByType          map[string]int     `json:"byType"`
+	TotalFacilities int            `json:"totalFacilities"`
+	TotalLimit      float64        `json:"totalLimit"`
+	TotalUtilized   float64        `json:"totalUtilized"`
+	TotalAvailable  float64        `json:"totalAvailable"`
+	AvgUtilization  float64        `json:"avgUtilization"`
+	Breached        int            `json:"breached"`
+	NearBreach      int            `json:"nearBreach"`
+	ByType          map[string]int `json:"byType"`
 }
 
 // ==================== SERVER ====================
@@ -572,7 +572,7 @@ func (s *CreditServer) scoreCheckHandler(w http.ResponseWriter, r *http.Request)
 		CreditScore: &cr.CreditScore, ScoreBand: cr.ScoreBand,
 		TotalOutstanding: cr.TotalOutstanding, TotalOverdue: cr.TotalOverdue,
 		PerformingPercentage: cr.PerformingPercentage,
-		Recommendation: rec,
+		Recommendation:       rec,
 	})
 }
 

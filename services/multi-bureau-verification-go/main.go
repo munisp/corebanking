@@ -19,6 +19,8 @@ import (
 	"sync/atomic"
 	"syscall"
 
+	crand "crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -30,6 +32,17 @@ import (
 
 	"net"
 )
+
+// cryptoRandUint32 returns a cryptographically secure random uint32 for
+// record and audit identifiers (L-06/L-16-residual: math/rand IDs are
+// predictable and collision-prone).
+func cryptoRandUint32() uint32 {
+	var b [4]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		log.Fatalf("crypto/rand unavailable: %v", err)
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "multi-bureau-verification-go"
 
@@ -187,7 +200,7 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 	}
 
 	check := MultiBureauCheck{
-		ID:              fmt.Sprintf("MBV-%08X", rand.Uint32()),
+		ID:              fmt.Sprintf("MBV-%08X", cryptoRandUint32()),
 		CustomerID:      getString(body, "customerId"),
 		IDNumber:        idNumber,
 		IDType:          getString(body, "idType"),
@@ -577,12 +590,29 @@ func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant 
 	return true
 }
 
+// sanitizeLogValue strips CR/LF and other control characters from
+// client-supplied values (e.g. trace headers) before they reach log
+// statements, preventing log injection/forgery (L-18). Output length is
+// bounded to keep log lines small.
+func sanitizeLogValue(s string) string {
+	const maxLen = 128
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
+		traceID := sanitizeLogValue(r.Header.Get("X-Trace-Id"))
 		if traceID == "" {
-			traceID = r.Header.Get("traceparent")
+			traceID = sanitizeLogValue(r.Header.Get("traceparent"))
 		}
 		if traceID == "" {
 			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())

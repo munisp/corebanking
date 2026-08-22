@@ -90,17 +90,17 @@ func (s *PortfolioService) GetPortfolioSummary(tenantID, rmID string) map[string
 	portfolio := s.GetPortfolio(tenantID, rmID)
 
 	return map[string]interface{}{
-		"totalCustomers":  portfolio.TotalCustomers,
-		"totalBalance":    portfolio.TotalBalance,
-		"totalRevenue":    portfolio.TotalRevenue,
-		"totalProducts":   portfolio.TotalProducts,
-		"averageNPS":      portfolio.AverageNPS,
-		"churnRate":       portfolio.ChurnRate,
-		"crossSellRatio":  portfolio.CrossSellRatio,
-		"targetRevenue":   portfolio.TargetRevenue,
-		"actualRevenue":   portfolio.ActualRevenue,
-		"achievement":     portfolio.Achievement,
-		"timestamp":       time.Now().Format(time.RFC3339),
+		"totalCustomers": portfolio.TotalCustomers,
+		"totalBalance":   portfolio.TotalBalance,
+		"totalRevenue":   portfolio.TotalRevenue,
+		"totalProducts":  portfolio.TotalProducts,
+		"averageNPS":     portfolio.AverageNPS,
+		"churnRate":      portfolio.ChurnRate,
+		"crossSellRatio": portfolio.CrossSellRatio,
+		"targetRevenue":  portfolio.TargetRevenue,
+		"actualRevenue":  portfolio.ActualRevenue,
+		"achievement":    portfolio.Achievement,
+		"timestamp":      time.Now().Format(time.RFC3339),
 	}
 }
 
@@ -192,14 +192,14 @@ func (s *PortfolioService) GetPortfolioTargets(tenantID, rmID string) map[string
 			"achievement": 93.3,
 		},
 		"nps": map[string]interface{}{
-			"target":  75.0,
-			"actual":  72.5,
-			"status":  "below_target",
+			"target": 75.0,
+			"actual": 72.5,
+			"status": "below_target",
 		},
 		"churn": map[string]interface{}{
-			"target":  3.0,
-			"actual":  2.5,
-			"status":  "on_target",
+			"target": 3.0,
+			"actual": 2.5,
+			"status": "on_target",
 		},
 		"timestamp": time.Now().Format(time.RFC3339),
 	}

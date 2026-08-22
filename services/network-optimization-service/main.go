@@ -501,11 +501,11 @@ func (s *NetworkOptimizationService) ImageOptimize(c *gin.Context) {
 	// Return optimization parameters for client-side optimization
 	// In production, could also do server-side image optimization
 	c.JSON(http.StatusOK, gin.H{
-		"original_url": imageURL,
-		"quality":      profile.ImageQuality,
-		"max_width":    s.getMaxImageWidth(networkType),
-		"format":       s.getOptimalImageFormat(networkType),
-		"lazy_load":    profile.ProgressiveLoad,
+		"original_url":   imageURL,
+		"quality":        profile.ImageQuality,
+		"max_width":      s.getMaxImageWidth(networkType),
+		"format":         s.getOptimalImageFormat(networkType),
+		"lazy_load":      profile.ProgressiveLoad,
 		"text_only_mode": profile.TextOnlyMode,
 	})
 }

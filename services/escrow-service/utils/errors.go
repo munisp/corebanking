@@ -12,14 +12,14 @@ type ErrorResponse struct {
 }
 
 var ErrorCodes = map[string]string{
-	"bad_request":         "ESCROW_4001",
-	"not_found":           "ESCROW_4040",
-	"internal_error":      "ESCROW_5000",
-	"van_service_error":   "ESCROW_5001",
-	"validation_failed":   "ESCROW_4002",
-	"decode_error":        "ESCROW_4003",
-	"marshal_error":       "ESCROW_5002",
-	"update_failed":       "ESCROW_4041",
+	"bad_request":       "ESCROW_4001",
+	"not_found":         "ESCROW_4040",
+	"internal_error":    "ESCROW_5000",
+	"van_service_error": "ESCROW_5001",
+	"validation_failed": "ESCROW_4002",
+	"decode_error":      "ESCROW_4003",
+	"marshal_error":     "ESCROW_5002",
+	"update_failed":     "ESCROW_4041",
 }
 
 func SendError(c *gin.Context, code, message string, status int, details interface{}) {

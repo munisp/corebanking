@@ -15,7 +15,7 @@ import (
 
 func main() {
 	godotenv.Load()
-	
+
 	if err := InitDB(); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}

@@ -13,11 +13,12 @@ import (
 	"syscall"
 
 	"bytes"
+	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
 	"strings"
@@ -26,6 +27,17 @@ import (
 
 	"net"
 )
+
+// cryptoRandUint32 returns a cryptographically secure random uint32 for
+// record and audit identifiers (L-06/L-16-residual: math/rand IDs are
+// predictable and collision-prone).
+func cryptoRandUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		log.Fatalf("crypto/rand unavailable: %v", err)
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "secrets-vault-go"
 
@@ -152,7 +164,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("SEC-%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("SEC-%08X", cryptoRandUint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -176,7 +188,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -221,7 +233,7 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -447,7 +459,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
 			fetchJWKS(realmURL)
 		}
 	}()
@@ -697,12 +711,29 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
 }
 
+// sanitizeLogValue strips CR/LF and other control characters from
+// client-supplied values (e.g. trace headers) before they reach log
+// statements, preventing log injection/forgery (L-18). Output length is
+// bounded to keep log lines small.
+func sanitizeLogValue(s string) string {
+	const maxLen = 128
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
+		traceID := sanitizeLogValue(r.Header.Get("X-Trace-Id"))
 		if traceID == "" {
-			traceID = r.Header.Get("traceparent")
+			traceID = sanitizeLogValue(r.Header.Get("traceparent"))
 		}
 		if traceID == "" {
 			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())

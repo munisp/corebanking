@@ -25,21 +25,21 @@ type SWIFTMessage struct {
 }
 
 type SyndicatedLC struct {
-	ID              string  `json:"id"`
-	LeadBankBIC     string  `json:"leadBankBIC"`
+	ID              string            `json:"id"`
+	LeadBankBIC     string            `json:"leadBankBIC"`
 	Participants    []ParticipantBank `json:"participants"`
-	TotalAmount     float64 `json:"totalAmount"`
-	Currency        string  `json:"currency"`
-	BeneficiaryName string  `json:"beneficiaryName"`
-	ExpiryDate      string  `json:"expiryDate"`
-	Status          string  `json:"status"`
+	TotalAmount     float64           `json:"totalAmount"`
+	Currency        string            `json:"currency"`
+	BeneficiaryName string            `json:"beneficiaryName"`
+	ExpiryDate      string            `json:"expiryDate"`
+	Status          string            `json:"status"`
 }
 
 type ParticipantBank struct {
-	BIC        string  `json:"bic"`
-	SharePct   float64 `json:"sharePercent"`
-	Amount     float64 `json:"amount"`
-	Confirmed  bool    `json:"confirmed"`
+	BIC       string  `json:"bic"`
+	SharePct  float64 `json:"sharePercent"`
+	Amount    float64 `json:"amount"`
+	Confirmed bool    `json:"confirmed"`
 }
 
 type TradeInsurance struct {
@@ -54,30 +54,30 @@ type TradeInsurance struct {
 }
 
 type DocumentaryCollection struct {
-	ID            string  `json:"id"`
-	ExporterID    string  `json:"exporterId"`
-	ImporterID    string  `json:"importerId"`
-	CollectionType string `json:"collectionType"` // D/P (documents against payment), D/A (documents against acceptance)
-	Amount        float64 `json:"amount"`
-	Currency      string  `json:"currency"`
-	Documents     []string `json:"documents"`
-	Status        string  `json:"status"` // presented, accepted, paid, refused
+	ID             string   `json:"id"`
+	ExporterID     string   `json:"exporterId"`
+	ImporterID     string   `json:"importerId"`
+	CollectionType string   `json:"collectionType"` // D/P (documents against payment), D/A (documents against acceptance)
+	Amount         float64  `json:"amount"`
+	Currency       string   `json:"currency"`
+	Documents      []string `json:"documents"`
+	Status         string   `json:"status"` // presented, accepted, paid, refused
 }
 
 type BankGuarantee struct {
-	ID              string   `json:"id"`
-	GuaranteeType   string   `json:"guaranteeType"`
-	ApplicantName   string   `json:"applicantName"`
-	BeneficiaryName string   `json:"beneficiaryName"`
-	Amount          float64  `json:"amount"`
-	Currency        string   `json:"currency"`
-	ExpiryDate      string   `json:"expiryDate"`
-	Status          string   `json:"status"`
-	CreatedAt       string   `json:"createdAt"`
-	UpdatedAt       string   `json:"updatedAt"`
-	CommissionRate  float64  `json:"commissionRate"`
-	CommissionAmount float64 `json:"commissionAmount"`
-	Middleware      []string `json:"middleware"`
+	ID               string   `json:"id"`
+	GuaranteeType    string   `json:"guaranteeType"`
+	ApplicantName    string   `json:"applicantName"`
+	BeneficiaryName  string   `json:"beneficiaryName"`
+	Amount           float64  `json:"amount"`
+	Currency         string   `json:"currency"`
+	ExpiryDate       string   `json:"expiryDate"`
+	Status           string   `json:"status"`
+	CreatedAt        string   `json:"createdAt"`
+	UpdatedAt        string   `json:"updatedAt"`
+	CommissionRate   float64  `json:"commissionRate"`
+	CommissionAmount float64  `json:"commissionAmount"`
+	Middleware       []string `json:"middleware"`
 }
 
 type GuaranteeClaim struct {
@@ -88,12 +88,12 @@ type GuaranteeClaim struct {
 }
 
 var (
-	tfEnhMu        sync.RWMutex
-	swiftMsgs      []SWIFTMessage
-	syndLCs        []SyndicatedLC
-	tradeIns       []TradeInsurance
-	docCollections []DocumentaryCollection
-	enhGuarantees  []BankGuarantee
+	tfEnhMu         sync.RWMutex
+	swiftMsgs       []SWIFTMessage
+	syndLCs         []SyndicatedLC
+	tradeIns        []TradeInsurance
+	docCollections  []DocumentaryCollection
+	enhGuarantees   []BankGuarantee
 	guaranteeClaims []GuaranteeClaim
 )
 

@@ -12,7 +12,7 @@ type Customer struct {
 	CompanyName     string                 `json:"companyName"`
 	Email           string                 `json:"email"`
 	Phone           string                 `json:"phone"`
-	Segment         string                 `json:"segment"` // mass, affluent, hnwi, private, corporate, sme
+	Segment         string                 `json:"segment"`         // mass, affluent, hnwi, private, corporate, sme
 	RelationshipAge int                    `json:"relationshipAge"` // months
 	TotalBalance    int64                  `json:"totalBalance"`
 	TotalProducts   int                    `json:"totalProducts"`
@@ -31,43 +31,43 @@ type Customer struct {
 
 // Portfolio represents RM's customer portfolio
 type Portfolio struct {
-	PortfolioID     string    `json:"portfolioID"`
-	TenantID        string    `json:"tenantID"`
-	RMID            string    `json:"rmID"`
-	TotalCustomers  int       `json:"totalCustomers"`
-	TotalBalance    int64     `json:"totalBalance"`
-	TotalRevenue    int64     `json:"totalRevenue"`
-	TotalProducts   int       `json:"totalProducts"`
-	AverageNPS      float64   `json:"averageNPS"`
-	ChurnRate       float64   `json:"churnRate"`
-	CrossSellRatio  float64   `json:"crossSellRatio"`
-	TargetRevenue   int64     `json:"targetRevenue"`
-	ActualRevenue   int64     `json:"actualRevenue"`
-	Achievement     float64   `json:"achievement"`
-	CreatedAt       time.Time `json:"createdAt"`
-	UpdatedAt       time.Time `json:"updatedAt"`
+	PortfolioID    string    `json:"portfolioID"`
+	TenantID       string    `json:"tenantID"`
+	RMID           string    `json:"rmID"`
+	TotalCustomers int       `json:"totalCustomers"`
+	TotalBalance   int64     `json:"totalBalance"`
+	TotalRevenue   int64     `json:"totalRevenue"`
+	TotalProducts  int       `json:"totalProducts"`
+	AverageNPS     float64   `json:"averageNPS"`
+	ChurnRate      float64   `json:"churnRate"`
+	CrossSellRatio float64   `json:"crossSellRatio"`
+	TargetRevenue  int64     `json:"targetRevenue"`
+	ActualRevenue  int64     `json:"actualRevenue"`
+	Achievement    float64   `json:"achievement"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 // Opportunity represents a sales opportunity
 type Opportunity struct {
-	OpportunityID   string                 `json:"opportunityID"`
-	TenantID        string                 `json:"tenantID"`
-	CustomerID      string                 `json:"customerID"`
-	CustomerName    string                 `json:"customerName"`
-	ProductType     string                 `json:"productType"` // loan, deposit, card, insurance, investment
-	ProductName     string                 `json:"productName"`
-	ExpectedValue   int64                  `json:"expectedValue"`
-	Probability     float64                `json:"probability"`
-	WeightedValue   int64                  `json:"weightedValue"`
-	Stage           string                 `json:"stage"` // lead, qualified, proposal, negotiation, closed_won, closed_lost
-	Source          string                 `json:"source"` // referral, campaign, cross_sell, walk_in, digital
-	AssignedRM      string                 `json:"assignedRM"`
-	ExpectedClose   time.Time              `json:"expectedClose"`
-	ActualClose     *time.Time             `json:"actualClose"`
-	Notes           string                 `json:"notes"`
-	Metadata        map[string]interface{} `json:"metadata"`
-	CreatedAt       time.Time              `json:"createdAt"`
-	UpdatedAt       time.Time              `json:"updatedAt"`
+	OpportunityID string                 `json:"opportunityID"`
+	TenantID      string                 `json:"tenantID"`
+	CustomerID    string                 `json:"customerID"`
+	CustomerName  string                 `json:"customerName"`
+	ProductType   string                 `json:"productType"` // loan, deposit, card, insurance, investment
+	ProductName   string                 `json:"productName"`
+	ExpectedValue int64                  `json:"expectedValue"`
+	Probability   float64                `json:"probability"`
+	WeightedValue int64                  `json:"weightedValue"`
+	Stage         string                 `json:"stage"`  // lead, qualified, proposal, negotiation, closed_won, closed_lost
+	Source        string                 `json:"source"` // referral, campaign, cross_sell, walk_in, digital
+	AssignedRM    string                 `json:"assignedRM"`
+	ExpectedClose time.Time              `json:"expectedClose"`
+	ActualClose   *time.Time             `json:"actualClose"`
+	Notes         string                 `json:"notes"`
+	Metadata      map[string]interface{} `json:"metadata"`
+	CreatedAt     time.Time              `json:"createdAt"`
+	UpdatedAt     time.Time              `json:"updatedAt"`
 }
 
 // Activity represents customer interaction activity
@@ -131,22 +131,22 @@ type Campaign struct {
 
 // RelationshipManager represents an RM
 type RelationshipManager struct {
-	RMID           string    `json:"rmID"`
-	TenantID       string    `json:"tenantID"`
-	EmployeeID     string    `json:"employeeID"`
-	FirstName      string    `json:"firstName"`
-	LastName       string    `json:"lastName"`
-	Email          string    `json:"email"`
-	Phone          string    `json:"phone"`
-	Role           string    `json:"role"` // rm, senior_rm, team_lead, manager
-	Segment        string    `json:"segment"` // retail, corporate, sme, hnwi, private
-	BranchID       string    `json:"branchID"`
-	TargetRevenue  int64     `json:"targetRevenue"`
-	ActualRevenue  int64     `json:"actualRevenue"`
-	CustomerCount  int       `json:"customerCount"`
-	Status         string    `json:"status"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	RMID          string    `json:"rmID"`
+	TenantID      string    `json:"tenantID"`
+	EmployeeID    string    `json:"employeeID"`
+	FirstName     string    `json:"firstName"`
+	LastName      string    `json:"lastName"`
+	Email         string    `json:"email"`
+	Phone         string    `json:"phone"`
+	Role          string    `json:"role"`    // rm, senior_rm, team_lead, manager
+	Segment       string    `json:"segment"` // retail, corporate, sme, hnwi, private
+	BranchID      string    `json:"branchID"`
+	TargetRevenue int64     `json:"targetRevenue"`
+	ActualRevenue int64     `json:"actualRevenue"`
+	CustomerCount int       `json:"customerCount"`
+	Status        string    `json:"status"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 // RMDashboard represents the RM dashboard
@@ -154,11 +154,11 @@ type RMDashboard struct {
 	Date time.Time `json:"date"`
 
 	// Portfolio
-	TotalCustomers    int     `json:"totalCustomers"`
-	TotalBalance      int64   `json:"totalBalance"`
-	TotalRevenue      int64   `json:"totalRevenue"`
-	RevenueTarget     int64   `json:"revenueTarget"`
-	Achievement       float64 `json:"achievement"`
+	TotalCustomers int     `json:"totalCustomers"`
+	TotalBalance   int64   `json:"totalBalance"`
+	TotalRevenue   int64   `json:"totalRevenue"`
+	RevenueTarget  int64   `json:"revenueTarget"`
+	Achievement    float64 `json:"achievement"`
 
 	// Pipeline
 	TotalOpportunities int   `json:"totalOpportunities"`
@@ -171,13 +171,13 @@ type RMDashboard struct {
 	PendingFollowUps   int `json:"pendingFollowUps"`
 
 	// Cross-sell
-	Recommendations    int     `json:"recommendations"`
-	ConversionRate     float64 `json:"conversionRate"`
+	Recommendations int     `json:"recommendations"`
+	ConversionRate  float64 `json:"conversionRate"`
 
 	// Customer Health
-	AtRiskCustomers    int     `json:"atRiskCustomers"`
-	DormantCustomers   int     `json:"dormantCustomers"`
-	AverageNPS         float64 `json:"averageNPS"`
+	AtRiskCustomers  int     `json:"atRiskCustomers"`
+	DormantCustomers int     `json:"dormantCustomers"`
+	AverageNPS       float64 `json:"averageNPS"`
 }
 
 // Request/Response types

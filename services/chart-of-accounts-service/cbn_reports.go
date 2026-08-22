@@ -9,31 +9,31 @@ import (
 type CBNReportType string
 
 const (
-	CBNReportSFP                    CBNReportType = "SFP"
-	CBNReportProfitLoss             CBNReportType = "PL"
-	CBNReportComprehensiveIncome    CBNReportType = "CI"
-	CBNReportChangesInEquity        CBNReportType = "CE"
-	CBNReportCashFlows              CBNReportType = "CF"
-	CBNReportCapitalAdequacy        CBNReportType = "CAR"
-	CBNReportLiquidityRatio         CBNReportType = "LR"
-	CBNReportCreditRisk             CBNReportType = "CR"
-	CBNReportMarketRisk             CBNReportType = "MR"
-	CBNReportOperationalRisk        CBNReportType = "OR"
-	CBNReportLargeExposures         CBNReportType = "LE"
-	CBNReportRelatedParty           CBNReportType = "RP"
-	CBNReportSectoralCredit         CBNReportType = "SC"
-	CBNReportMaturityProfile        CBNReportType = "MP"
+	CBNReportSFP                     CBNReportType = "SFP"
+	CBNReportProfitLoss              CBNReportType = "PL"
+	CBNReportComprehensiveIncome     CBNReportType = "CI"
+	CBNReportChangesInEquity         CBNReportType = "CE"
+	CBNReportCashFlows               CBNReportType = "CF"
+	CBNReportCapitalAdequacy         CBNReportType = "CAR"
+	CBNReportLiquidityRatio          CBNReportType = "LR"
+	CBNReportCreditRisk              CBNReportType = "CR"
+	CBNReportMarketRisk              CBNReportType = "MR"
+	CBNReportOperationalRisk         CBNReportType = "OR"
+	CBNReportLargeExposures          CBNReportType = "LE"
+	CBNReportRelatedParty            CBNReportType = "RP"
+	CBNReportSectoralCredit          CBNReportType = "SC"
+	CBNReportMaturityProfile         CBNReportType = "MP"
 	CBNReportInterestRateSensitivity CBNReportType = "IRS"
-	CBNReportForeignCurrency        CBNReportType = "FC"
-	CBNReportOffBalanceSheet        CBNReportType = "OBS"
-	CBNReportNPLAnalysis            CBNReportType = "NPL"
-	CBNReportLoanLossProvisioning   CBNReportType = "LLP"
-	CBNReportInvestmentPortfolio    CBNReportType = "IP"
-	CBNReportDepositComposition     CBNReportType = "DC"
-	CBNReportBranchNetwork          CBNReportType = "BN"
-	CBNReportEBanking               CBNReportType = "EB"
-	CBNReportAML                    CBNReportType = "AML"
-	CBNReportFinancialInclusion     CBNReportType = "FI"
+	CBNReportForeignCurrency         CBNReportType = "FC"
+	CBNReportOffBalanceSheet         CBNReportType = "OBS"
+	CBNReportNPLAnalysis             CBNReportType = "NPL"
+	CBNReportLoanLossProvisioning    CBNReportType = "LLP"
+	CBNReportInvestmentPortfolio     CBNReportType = "IP"
+	CBNReportDepositComposition      CBNReportType = "DC"
+	CBNReportBranchNetwork           CBNReportType = "BN"
+	CBNReportEBanking                CBNReportType = "EB"
+	CBNReportAML                     CBNReportType = "AML"
+	CBNReportFinancialInclusion      CBNReportType = "FI"
 )
 
 type CBNReport struct {
@@ -51,11 +51,11 @@ type CBNReport struct {
 }
 
 type CBNReportSection struct {
-	Code        string              `json:"code"`
-	Name        string              `json:"name"`
-	Items       []CBNReportItem     `json:"items"`
-	Subtotal    int64               `json:"subtotal"`
-	SubSections []CBNReportSection  `json:"sub_sections,omitempty"`
+	Code        string             `json:"code"`
+	Name        string             `json:"name"`
+	Items       []CBNReportItem    `json:"items"`
+	Subtotal    int64              `json:"subtotal"`
+	SubSections []CBNReportSection `json:"sub_sections,omitempty"`
 }
 
 type CBNReportItem struct {

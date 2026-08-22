@@ -15,23 +15,23 @@ import (
 
 // APISIX Gateway Configuration
 type APIGatewayConfig struct {
-	ServiceName     string            `json:"service_name"`
-	UpstreamURL     string            `json:"upstream_url"`
-	Routes          []GatewayRoute    `json:"routes"`
-	Plugins         []GatewayPlugin   `json:"plugins"`
-	RateLimiting    RateLimitConfig   `json:"rate_limiting"`
-	Authentication  AuthConfig        `json:"authentication"`
+	ServiceName    string          `json:"service_name"`
+	UpstreamURL    string          `json:"upstream_url"`
+	Routes         []GatewayRoute  `json:"routes"`
+	Plugins        []GatewayPlugin `json:"plugins"`
+	RateLimiting   RateLimitConfig `json:"rate_limiting"`
+	Authentication AuthConfig      `json:"authentication"`
 }
 
 type GatewayRoute struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	URI         string   `json:"uri"`
-	Methods     []string `json:"methods"`
-	Upstream    string   `json:"upstream"`
-	Plugins     []string `json:"plugins"`
-	Priority    int      `json:"priority"`
-	Status      string   `json:"status"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	URI      string   `json:"uri"`
+	Methods  []string `json:"methods"`
+	Upstream string   `json:"upstream"`
+	Plugins  []string `json:"plugins"`
+	Priority int      `json:"priority"`
+	Status   string   `json:"status"`
 }
 
 type GatewayPlugin struct {
@@ -54,26 +54,26 @@ type AuthConfig struct {
 
 // IVR/Voice Flow for low-literacy farmers
 type IVRFlow struct {
-	ID              string     `json:"id"`
-	FlowName        string     `json:"flow_name"`
-	Language        string     `json:"language"` // en, ha, yo, ig
-	Description     string     `json:"description"`
-	EntryPoint      string     `json:"entry_point"`
-	Nodes           []IVRNode  `json:"nodes"`
-	Status          string     `json:"status"`
-	CreatedAt       time.Time  `json:"created_at"`
+	ID          string    `json:"id"`
+	FlowName    string    `json:"flow_name"`
+	Language    string    `json:"language"` // en, ha, yo, ig
+	Description string    `json:"description"`
+	EntryPoint  string    `json:"entry_point"`
+	Nodes       []IVRNode `json:"nodes"`
+	Status      string    `json:"status"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type IVRNode struct {
-	ID              string      `json:"id"`
-	NodeType        string      `json:"node_type"` // MENU, INPUT, PLAY, TRANSFER, API_CALL
-	Prompt          string      `json:"prompt"`
-	PromptAudioURL  string      `json:"prompt_audio_url"`
-	Options         []IVROption `json:"options"`
-	NextNode        string      `json:"next_node"`
-	TimeoutSeconds  int         `json:"timeout_seconds"`
-	MaxRetries      int         `json:"max_retries"`
-	APIEndpoint     string      `json:"api_endpoint,omitempty"`
+	ID             string      `json:"id"`
+	NodeType       string      `json:"node_type"` // MENU, INPUT, PLAY, TRANSFER, API_CALL
+	Prompt         string      `json:"prompt"`
+	PromptAudioURL string      `json:"prompt_audio_url"`
+	Options        []IVROption `json:"options"`
+	NextNode       string      `json:"next_node"`
+	TimeoutSeconds int         `json:"timeout_seconds"`
+	MaxRetries     int         `json:"max_retries"`
+	APIEndpoint    string      `json:"api_endpoint,omitempty"`
 }
 
 type IVROption struct {
@@ -85,17 +85,17 @@ type IVROption struct {
 
 // IVR Session tracking
 type IVRSession struct {
-	ID              string    `json:"id"`
-	CallerID        string    `json:"caller_id"`
-	FarmerID        string    `json:"farmer_id"`
-	FlowID          string    `json:"flow_id"`
-	CurrentNode     string    `json:"current_node"`
-	Language        string    `json:"language"`
+	ID              string                 `json:"id"`
+	CallerID        string                 `json:"caller_id"`
+	FarmerID        string                 `json:"farmer_id"`
+	FlowID          string                 `json:"flow_id"`
+	CurrentNode     string                 `json:"current_node"`
+	Language        string                 `json:"language"`
 	SessionData     map[string]interface{} `json:"session_data"`
-	StartTime       time.Time `json:"start_time"`
-	EndTime         *time.Time `json:"end_time"`
-	Status          string    `json:"status"` // ACTIVE, COMPLETED, ABANDONED
-	TransactionType string    `json:"transaction_type"`
+	StartTime       time.Time              `json:"start_time"`
+	EndTime         *time.Time             `json:"end_time"`
+	Status          string                 `json:"status"` // ACTIVE, COMPLETED, ABANDONED
+	TransactionType string                 `json:"transaction_type"`
 }
 
 // Agent App Integration
@@ -120,16 +120,16 @@ type AgentProfile struct {
 
 // Offline Farmer Registration
 type OfflineFarmerRegistration struct {
-	ID              string    `json:"id"`
-	AgentID         string    `json:"agent_id"`
+	ID               string                 `json:"id"`
+	AgentID          string                 `json:"agent_id"`
 	RegistrationData map[string]interface{} `json:"registration_data"`
-	GPSCoordinates  string    `json:"gps_coordinates"`
-	Photos          []string  `json:"photos"`
-	Signature       string    `json:"signature"`
-	CapturedAt      time.Time `json:"captured_at"`
-	SyncedAt        *time.Time `json:"synced_at"`
-	SyncStatus      string    `json:"sync_status"` // PENDING, SYNCED, FAILED
-	ValidationErrors []string `json:"validation_errors"`
+	GPSCoordinates   string                 `json:"gps_coordinates"`
+	Photos           []string               `json:"photos"`
+	Signature        string                 `json:"signature"`
+	CapturedAt       time.Time              `json:"captured_at"`
+	SyncedAt         *time.Time             `json:"synced_at"`
+	SyncStatus       string                 `json:"sync_status"` // PENDING, SYNCED, FAILED
+	ValidationErrors []string               `json:"validation_errors"`
 }
 
 // Farm Visit Record
@@ -156,36 +156,36 @@ type FarmVisit struct {
 
 // Channel Performance Tracking
 type ChannelPerformance struct {
-	ChannelType     string    `json:"channel_type"` // USSD, IVR, AGENT, MOBILE, WEB
-	TenantID        string    `json:"tenant_id"`
-	Period          string    `json:"period"`
-	TotalTransactions int     `json:"total_transactions"`
-	SuccessfulTransactions int `json:"successful_transactions"`
-	FailedTransactions int    `json:"failed_transactions"`
-	AverageResponseTime float64 `json:"average_response_time"` // seconds
-	UniqueUsers     int       `json:"unique_users"`
-	NewRegistrations int      `json:"new_registrations"`
-	LoanApplications int      `json:"loan_applications"`
-	Repayments      int       `json:"repayments"`
-	BalanceInquiries int      `json:"balance_inquiries"`
+	ChannelType            string  `json:"channel_type"` // USSD, IVR, AGENT, MOBILE, WEB
+	TenantID               string  `json:"tenant_id"`
+	Period                 string  `json:"period"`
+	TotalTransactions      int     `json:"total_transactions"`
+	SuccessfulTransactions int     `json:"successful_transactions"`
+	FailedTransactions     int     `json:"failed_transactions"`
+	AverageResponseTime    float64 `json:"average_response_time"` // seconds
+	UniqueUsers            int     `json:"unique_users"`
+	NewRegistrations       int     `json:"new_registrations"`
+	LoanApplications       int     `json:"loan_applications"`
+	Repayments             int     `json:"repayments"`
+	BalanceInquiries       int     `json:"balance_inquiries"`
 }
 
 // Partner/Channel Tagging
 type ChannelPartner struct {
-	ID              string    `json:"id"`
-	TenantID        string    `json:"tenant_id"`
-	PartnerCode     string    `json:"partner_code"`
-	PartnerName     string    `json:"partner_name"`
-	PartnerType     string    `json:"partner_type"` // COOPERATIVE, NGO, GOVERNMENT, AGGREGATOR
-	ContactPerson   string    `json:"contact_person"`
-	Phone           string    `json:"phone"`
-	Email           string    `json:"email"`
-	CommissionRate  float64   `json:"commission_rate"`
-	TotalReferrals  int       `json:"total_referrals"`
-	ActiveLoans     int       `json:"active_loans"`
-	TotalDisbursed  float64   `json:"total_disbursed"`
-	Status          string    `json:"status"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID             string    `json:"id"`
+	TenantID       string    `json:"tenant_id"`
+	PartnerCode    string    `json:"partner_code"`
+	PartnerName    string    `json:"partner_name"`
+	PartnerType    string    `json:"partner_type"` // COOPERATIVE, NGO, GOVERNMENT, AGGREGATOR
+	ContactPerson  string    `json:"contact_person"`
+	Phone          string    `json:"phone"`
+	Email          string    `json:"email"`
+	CommissionRate float64   `json:"commission_rate"`
+	TotalReferrals int       `json:"total_referrals"`
+	ActiveLoans    int       `json:"active_loans"`
+	TotalDisbursed float64   `json:"total_disbursed"`
+	Status         string    `json:"status"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 // Distribution Channels Service
@@ -206,7 +206,7 @@ func (s *DistributionChannelsService) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/channels/gateway/routes/{route_id}", s.UpdateGatewayRoute).Methods("PUT")
 	r.HandleFunc("/api/v1/channels/gateway/routes/{route_id}", s.DeleteGatewayRoute).Methods("DELETE")
 	r.HandleFunc("/api/v1/channels/gateway/health", s.CheckGatewayHealth).Methods("GET")
-	
+
 	// IVR/Voice Flows
 	r.HandleFunc("/api/v1/channels/ivr/flows", s.ListIVRFlows).Methods("GET")
 	r.HandleFunc("/api/v1/channels/ivr/flows", s.CreateIVRFlow).Methods("POST")
@@ -217,7 +217,7 @@ func (s *DistributionChannelsService) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/channels/ivr/sessions/{session_id}", s.GetIVRSession).Methods("GET")
 	r.HandleFunc("/api/v1/channels/ivr/sessions/{session_id}/input", s.ProcessIVRInput).Methods("POST")
 	r.HandleFunc("/api/v1/channels/ivr/sessions/{session_id}/end", s.EndIVRSession).Methods("POST")
-	
+
 	// Agent App
 	r.HandleFunc("/api/v1/channels/agents", s.ListAgents).Methods("GET")
 	r.HandleFunc("/api/v1/channels/agents", s.RegisterAgent).Methods("POST")
@@ -225,26 +225,26 @@ func (s *DistributionChannelsService) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/channels/agents/{agent_id}", s.UpdateAgent).Methods("PUT")
 	r.HandleFunc("/api/v1/channels/agents/{agent_id}/sync", s.SyncAgentData).Methods("POST")
 	r.HandleFunc("/api/v1/channels/agents/{agent_id}/offline-data", s.GetOfflineData).Methods("GET")
-	
+
 	// Offline Registrations
 	r.HandleFunc("/api/v1/channels/offline/registrations", s.ListOfflineRegistrations).Methods("GET")
 	r.HandleFunc("/api/v1/channels/offline/registrations", s.SubmitOfflineRegistration).Methods("POST")
 	r.HandleFunc("/api/v1/channels/offline/registrations/{reg_id}", s.GetOfflineRegistration).Methods("GET")
 	r.HandleFunc("/api/v1/channels/offline/registrations/{reg_id}/sync", s.SyncOfflineRegistration).Methods("POST")
 	r.HandleFunc("/api/v1/channels/offline/registrations/bulk-sync", s.BulkSyncRegistrations).Methods("POST")
-	
+
 	// Farm Visits
 	r.HandleFunc("/api/v1/channels/visits", s.ListFarmVisits).Methods("GET")
 	r.HandleFunc("/api/v1/channels/visits", s.RecordFarmVisit).Methods("POST")
 	r.HandleFunc("/api/v1/channels/visits/{visit_id}", s.GetFarmVisit).Methods("GET")
 	r.HandleFunc("/api/v1/channels/visits/{visit_id}/photos", s.UploadVisitPhotos).Methods("POST")
 	r.HandleFunc("/api/v1/channels/visits/bulk-sync", s.BulkSyncVisits).Methods("POST")
-	
+
 	// Channel Performance
 	r.HandleFunc("/api/v1/channels/performance", s.GetChannelPerformance).Methods("GET")
 	r.HandleFunc("/api/v1/channels/performance/by-channel", s.GetPerformanceByChannel).Methods("GET")
 	r.HandleFunc("/api/v1/channels/performance/trends", s.GetPerformanceTrends).Methods("GET")
-	
+
 	// Partners
 	r.HandleFunc("/api/v1/channels/partners", s.ListPartners).Methods("GET")
 	r.HandleFunc("/api/v1/channels/partners", s.RegisterPartner).Methods("POST")
@@ -300,17 +300,17 @@ func (s *DistributionChannelsService) CreateGatewayRoute(w http.ResponseWriter, 
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	
+
 	req.ID = fmt.Sprintf("route-%d", time.Now().Unix())
 	req.Status = "ACTIVE"
-	
+
 	json.NewEncoder(w).Encode(req)
 }
 
 func (s *DistributionChannelsService) UpdateGatewayRoute(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	routeID := vars["route_id"]
-	
+
 	json.NewEncoder(w).Encode(map[string]string{
 		"route_id": routeID,
 		"status":   "updated",
@@ -320,7 +320,7 @@ func (s *DistributionChannelsService) UpdateGatewayRoute(w http.ResponseWriter, 
 func (s *DistributionChannelsService) DeleteGatewayRoute(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	routeID := vars["route_id"]
-	
+
 	json.NewEncoder(w).Encode(map[string]string{
 		"route_id": routeID,
 		"status":   "deleted",
@@ -329,12 +329,12 @@ func (s *DistributionChannelsService) DeleteGatewayRoute(w http.ResponseWriter, 
 
 func (s *DistributionChannelsService) CheckGatewayHealth(w http.ResponseWriter, r *http.Request) {
 	health := map[string]interface{}{
-		"status":      "healthy",
-		"uptime":      "99.99%",
-		"latency_ms":  5,
+		"status":             "healthy",
+		"uptime":             "99.99%",
+		"latency_ms":         5,
 		"active_connections": 150,
-		"routes_active": 5,
-		"last_check":  time.Now(),
+		"routes_active":      5,
+		"last_check":         time.Now(),
 	}
 	json.NewEncoder(w).Encode(health)
 }
@@ -342,7 +342,7 @@ func (s *DistributionChannelsService) CheckGatewayHealth(w http.ResponseWriter, 
 // IVR Flow Handlers
 func (s *DistributionChannelsService) ListIVRFlows(w http.ResponseWriter, r *http.Request) {
 	language := r.URL.Query().Get("language")
-	
+
 	flows := []IVRFlow{
 		{
 			ID:          "IVR-MAIN-EN",
@@ -377,7 +377,7 @@ func (s *DistributionChannelsService) ListIVRFlows(w http.ResponseWriter, r *htt
 			Status:      "ACTIVE",
 		},
 	}
-	
+
 	if language != "" {
 		filtered := []IVRFlow{}
 		for _, f := range flows {
@@ -387,7 +387,7 @@ func (s *DistributionChannelsService) ListIVRFlows(w http.ResponseWriter, r *htt
 		}
 		flows = filtered
 	}
-	
+
 	json.NewEncoder(w).Encode(flows)
 }
 
@@ -397,18 +397,18 @@ func (s *DistributionChannelsService) CreateIVRFlow(w http.ResponseWriter, r *ht
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	
+
 	req.ID = fmt.Sprintf("IVR-%d", time.Now().Unix())
 	req.Status = "ACTIVE"
 	req.CreatedAt = time.Now()
-	
+
 	json.NewEncoder(w).Encode(req)
 }
 
 func (s *DistributionChannelsService) GetIVRFlow(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	flowID := vars["flow_id"]
-	
+
 	flow := IVRFlow{
 		ID:          flowID,
 		FlowName:    "Main Menu - English",
@@ -439,9 +439,9 @@ func (s *DistributionChannelsService) GetIVRFlow(w http.ResponseWriter, r *http.
 				TimeoutSeconds: 5,
 			},
 			{
-				ID:             "REPAYMENT",
-				NodeType:       "MENU",
-				Prompt:         "Press 1 to make a repayment via bank transfer, 2 for USSD payment, 3 to speak to an agent.",
+				ID:       "REPAYMENT",
+				NodeType: "MENU",
+				Prompt:   "Press 1 to make a repayment via bank transfer, 2 for USSD payment, 3 to speak to an agent.",
 				Options: []IVROption{
 					{DTMFKey: "1", Description: "Bank Transfer", NextNode: "BANK_TRANSFER"},
 					{DTMFKey: "2", Description: "USSD Payment", NextNode: "USSD_PAYMENT"},
@@ -458,7 +458,7 @@ func (s *DistributionChannelsService) GetIVRFlow(w http.ResponseWriter, r *http.
 func (s *DistributionChannelsService) UpdateIVRFlow(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	flowID := vars["flow_id"]
-	
+
 	json.NewEncoder(w).Encode(map[string]string{
 		"flow_id": flowID,
 		"status":  "updated",
@@ -467,7 +467,7 @@ func (s *DistributionChannelsService) UpdateIVRFlow(w http.ResponseWriter, r *ht
 
 func (s *DistributionChannelsService) ListIVRSessions(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.URL.Query().Get("tenant_id")
-	
+
 	sessions := []IVRSession{
 		{
 			ID:              "SESSION-001",
@@ -481,7 +481,7 @@ func (s *DistributionChannelsService) ListIVRSessions(w http.ResponseWriter, r *
 			TransactionType: "BALANCE_INQUIRY",
 		},
 	}
-	
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"tenant_id": tenantID,
 		"sessions":  sessions,
@@ -493,12 +493,12 @@ func (s *DistributionChannelsService) StartIVRSession(w http.ResponseWriter, r *
 		CallerID string `json:"caller_id"`
 		Language string `json:"language"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	
+
 	session := IVRSession{
 		ID:          fmt.Sprintf("SESSION-%d", time.Now().Unix()),
 		CallerID:    req.CallerID,
@@ -509,14 +509,14 @@ func (s *DistributionChannelsService) StartIVRSession(w http.ResponseWriter, r *
 		StartTime:   time.Now(),
 		Status:      "ACTIVE",
 	}
-	
+
 	json.NewEncoder(w).Encode(session)
 }
 
 func (s *DistributionChannelsService) GetIVRSession(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["session_id"]
-	
+
 	session := IVRSession{
 		ID:          sessionID,
 		CallerID:    "+2348012345678",
@@ -530,12 +530,12 @@ func (s *DistributionChannelsService) GetIVRSession(w http.ResponseWriter, r *ht
 func (s *DistributionChannelsService) ProcessIVRInput(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["session_id"]
-	
+
 	var req struct {
 		DTMFInput string `json:"dtmf_input"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	
+
 	result := map[string]interface{}{
 		"session_id":   sessionID,
 		"input":        req.DTMFInput,
@@ -549,7 +549,7 @@ func (s *DistributionChannelsService) ProcessIVRInput(w http.ResponseWriter, r *
 func (s *DistributionChannelsService) EndIVRSession(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	sessionID := vars["session_id"]
-	
+
 	now := time.Now()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"session_id": sessionID,
@@ -562,38 +562,38 @@ func (s *DistributionChannelsService) EndIVRSession(w http.ResponseWriter, r *ht
 // Agent App Handlers
 func (s *DistributionChannelsService) ListAgents(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.URL.Query().Get("tenant_id")
-	
+
 	agents := []AgentProfile{
 		{
-			ID:             "AGENT-001",
-			TenantID:       tenantID,
-			AgentCode:      "AGT-KN-001",
-			AgentName:      "Musa Ibrahim",
-			Phone:          "+2348023456789",
-			State:          "Kano",
-			LGA:            "Kano Municipal",
-			AgentType:      "FIELD_AGENT",
-			AssignedArea:   "Kano Central",
+			ID:              "AGENT-001",
+			TenantID:        tenantID,
+			AgentCode:       "AGT-KN-001",
+			AgentName:       "Musa Ibrahim",
+			Phone:           "+2348023456789",
+			State:           "Kano",
+			LGA:             "Kano Municipal",
+			AgentType:       "FIELD_AGENT",
+			AssignedArea:    "Kano Central",
 			AssignedFarmers: []string{"FARMER-001", "FARMER-002", "FARMER-003"},
-			LastSync:       time.Now().Add(-2 * time.Hour),
-			Status:         "ACTIVE",
+			LastSync:        time.Now().Add(-2 * time.Hour),
+			Status:          "ACTIVE",
 		},
 		{
-			ID:             "AGENT-002",
-			TenantID:       tenantID,
-			AgentCode:      "AGT-KD-001",
-			AgentName:      "Amina Yusuf",
-			Phone:          "+2348034567890",
-			State:          "Kaduna",
-			LGA:            "Zaria",
-			AgentType:      "COOPERATIVE_LEADER",
-			AssignedArea:   "Zaria North",
+			ID:              "AGENT-002",
+			TenantID:        tenantID,
+			AgentCode:       "AGT-KD-001",
+			AgentName:       "Amina Yusuf",
+			Phone:           "+2348034567890",
+			State:           "Kaduna",
+			LGA:             "Zaria",
+			AgentType:       "COOPERATIVE_LEADER",
+			AssignedArea:    "Zaria North",
 			AssignedFarmers: []string{"FARMER-004", "FARMER-005"},
-			LastSync:       time.Now().Add(-30 * time.Minute),
-			Status:         "ACTIVE",
+			LastSync:        time.Now().Add(-30 * time.Minute),
+			Status:          "ACTIVE",
 		},
 	}
-	
+
 	json.NewEncoder(w).Encode(agents)
 }
 
@@ -603,19 +603,19 @@ func (s *DistributionChannelsService) RegisterAgent(w http.ResponseWriter, r *ht
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	
+
 	req.ID = fmt.Sprintf("AGENT-%d", time.Now().Unix())
 	req.AgentCode = fmt.Sprintf("AGT-%s-%03d", req.State[:2], time.Now().Unix()%1000)
 	req.Status = "ACTIVE"
 	req.CreatedAt = time.Now()
-	
+
 	json.NewEncoder(w).Encode(req)
 }
 
 func (s *DistributionChannelsService) GetAgent(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	agentID := vars["agent_id"]
-	
+
 	agent := AgentProfile{
 		ID:        agentID,
 		AgentCode: "AGT-KN-001",
@@ -629,7 +629,7 @@ func (s *DistributionChannelsService) GetAgent(w http.ResponseWriter, r *http.Re
 func (s *DistributionChannelsService) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	agentID := vars["agent_id"]
-	
+
 	json.NewEncoder(w).Encode(map[string]string{
 		"agent_id": agentID,
 		"status":   "updated",
@@ -639,13 +639,13 @@ func (s *DistributionChannelsService) UpdateAgent(w http.ResponseWriter, r *http
 func (s *DistributionChannelsService) SyncAgentData(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	agentID := vars["agent_id"]
-	
+
 	var req struct {
 		Registrations []OfflineFarmerRegistration `json:"registrations"`
 		Visits        []FarmVisit                 `json:"visits"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	
+
 	result := map[string]interface{}{
 		"agent_id":              agentID,
 		"registrations_synced":  len(req.Registrations),
@@ -659,7 +659,7 @@ func (s *DistributionChannelsService) SyncAgentData(w http.ResponseWriter, r *ht
 func (s *DistributionChannelsService) GetOfflineData(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	agentID := vars["agent_id"]
-	
+
 	offlineData := map[string]interface{}{
 		"agent_id": agentID,
 		"farmers": []map[string]interface{}{
@@ -680,11 +680,11 @@ func (s *DistributionChannelsService) GetOfflineData(w http.ResponseWriter, r *h
 func (s *DistributionChannelsService) ListOfflineRegistrations(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agent_id")
 	status := r.URL.Query().Get("status")
-	
+
 	registrations := []OfflineFarmerRegistration{
 		{
-			ID:         "REG-001",
-			AgentID:    agentID,
+			ID:      "REG-001",
+			AgentID: agentID,
 			RegistrationData: map[string]interface{}{
 				"name":  "New Farmer",
 				"phone": "+2348045678901",
@@ -695,7 +695,7 @@ func (s *DistributionChannelsService) ListOfflineRegistrations(w http.ResponseWr
 			SyncStatus:     "PENDING",
 		},
 	}
-	
+
 	if status != "" {
 		filtered := []OfflineFarmerRegistration{}
 		for _, reg := range registrations {
@@ -705,7 +705,7 @@ func (s *DistributionChannelsService) ListOfflineRegistrations(w http.ResponseWr
 		}
 		registrations = filtered
 	}
-	
+
 	json.NewEncoder(w).Encode(registrations)
 }
 
@@ -715,18 +715,18 @@ func (s *DistributionChannelsService) SubmitOfflineRegistration(w http.ResponseW
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	
+
 	req.ID = fmt.Sprintf("REG-%d", time.Now().Unix())
 	req.SyncStatus = "PENDING"
 	req.CapturedAt = time.Now()
-	
+
 	json.NewEncoder(w).Encode(req)
 }
 
 func (s *DistributionChannelsService) GetOfflineRegistration(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	regID := vars["reg_id"]
-	
+
 	reg := OfflineFarmerRegistration{
 		ID:         regID,
 		SyncStatus: "PENDING",
@@ -737,7 +737,7 @@ func (s *DistributionChannelsService) GetOfflineRegistration(w http.ResponseWrit
 func (s *DistributionChannelsService) SyncOfflineRegistration(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	regID := vars["reg_id"]
-	
+
 	now := time.Now()
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"registration_id": regID,
@@ -752,7 +752,7 @@ func (s *DistributionChannelsService) BulkSyncRegistrations(w http.ResponseWrite
 		RegistrationIDs []string `json:"registration_ids"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	
+
 	result := map[string]interface{}{
 		"total":     len(req.RegistrationIDs),
 		"synced":    len(req.RegistrationIDs),
@@ -766,7 +766,7 @@ func (s *DistributionChannelsService) BulkSyncRegistrations(w http.ResponseWrite
 func (s *DistributionChannelsService) ListFarmVisits(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agent_id")
 	farmerID := r.URL.Query().Get("farmer_id")
-	
+
 	visits := []FarmVisit{
 		{
 			ID:             "VISIT-001",
@@ -785,7 +785,7 @@ func (s *DistributionChannelsService) ListFarmVisits(w http.ResponseWriter, r *h
 			SyncStatus:     "SYNCED",
 		},
 	}
-	
+
 	json.NewEncoder(w).Encode(visits)
 }
 
@@ -795,18 +795,18 @@ func (s *DistributionChannelsService) RecordFarmVisit(w http.ResponseWriter, r *
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	
+
 	req.ID = fmt.Sprintf("VISIT-%d", time.Now().Unix())
 	req.SyncStatus = "PENDING"
 	req.CreatedAt = time.Now()
-	
+
 	json.NewEncoder(w).Encode(req)
 }
 
 func (s *DistributionChannelsService) GetFarmVisit(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	visitID := vars["visit_id"]
-	
+
 	visit := FarmVisit{
 		ID:            visitID,
 		VisitType:     "MONITORING",
@@ -819,10 +819,10 @@ func (s *DistributionChannelsService) GetFarmVisit(w http.ResponseWriter, r *htt
 func (s *DistributionChannelsService) UploadVisitPhotos(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	visitID := vars["visit_id"]
-	
+
 	// In production, this would handle multipart file upload
 	result := map[string]interface{}{
-		"visit_id":      visitID,
+		"visit_id":        visitID,
 		"photos_uploaded": 3,
 		"photo_urls": []string{
 			"/photos/visits/VISIT-001/photo1.jpg",
@@ -838,7 +838,7 @@ func (s *DistributionChannelsService) BulkSyncVisits(w http.ResponseWriter, r *h
 		Visits []FarmVisit `json:"visits"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	
+
 	result := map[string]interface{}{
 		"total":     len(req.Visits),
 		"synced":    len(req.Visits),
@@ -851,7 +851,7 @@ func (s *DistributionChannelsService) BulkSyncVisits(w http.ResponseWriter, r *h
 // Channel Performance Handlers
 func (s *DistributionChannelsService) GetChannelPerformance(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.URL.Query().Get("tenant_id")
-	
+
 	performance := map[string]interface{}{
 		"tenant_id":   tenantID,
 		"report_date": time.Now(),
@@ -874,28 +874,28 @@ func (s *DistributionChannelsService) GetChannelPerformance(w http.ResponseWrite
 
 func (s *DistributionChannelsService) GetPerformanceByChannel(w http.ResponseWriter, r *http.Request) {
 	channel := r.URL.Query().Get("channel")
-	
+
 	performance := ChannelPerformance{
-		ChannelType:           channel,
-		TotalTransactions:     8000,
+		ChannelType:            channel,
+		TotalTransactions:      8000,
 		SuccessfulTransactions: 7800,
-		FailedTransactions:    200,
-		AverageResponseTime:   2.5,
-		UniqueUsers:           1500,
-		NewRegistrations:      100,
-		LoanApplications:      200,
-		Repayments:            500,
-		BalanceInquiries:      3000,
+		FailedTransactions:     200,
+		AverageResponseTime:    2.5,
+		UniqueUsers:            1500,
+		NewRegistrations:       100,
+		LoanApplications:       200,
+		Repayments:             500,
+		BalanceInquiries:       3000,
 	}
 	json.NewEncoder(w).Encode(performance)
 }
 
 func (s *DistributionChannelsService) GetPerformanceTrends(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.URL.Query().Get("tenant_id")
-	
+
 	trends := []map[string]interface{}{}
 	baseDate := time.Now()
-	
+
 	for i := 11; i >= 0; i-- {
 		month := baseDate.AddDate(0, -i, 0)
 		trends = append(trends, map[string]interface{}{
@@ -908,7 +908,7 @@ func (s *DistributionChannelsService) GetPerformanceTrends(w http.ResponseWriter
 			"success_rate": 95.0 + float64(i)*0.2,
 		})
 	}
-	
+
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"tenant_id": tenantID,
 		"trends":    trends,
@@ -918,7 +918,7 @@ func (s *DistributionChannelsService) GetPerformanceTrends(w http.ResponseWriter
 // Partner Handlers
 func (s *DistributionChannelsService) ListPartners(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.URL.Query().Get("tenant_id")
-	
+
 	partners := []ChannelPartner{
 		{
 			ID:             "PARTNER-001",
@@ -949,7 +949,7 @@ func (s *DistributionChannelsService) ListPartners(w http.ResponseWriter, r *htt
 			Status:         "ACTIVE",
 		},
 	}
-	
+
 	json.NewEncoder(w).Encode(partners)
 }
 
@@ -959,19 +959,19 @@ func (s *DistributionChannelsService) RegisterPartner(w http.ResponseWriter, r *
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
-	
+
 	req.ID = fmt.Sprintf("PARTNER-%d", time.Now().Unix())
 	req.PartnerCode = fmt.Sprintf("%s-%d", req.PartnerType[:4], time.Now().Unix()%10000)
 	req.Status = "ACTIVE"
 	req.CreatedAt = time.Now()
-	
+
 	json.NewEncoder(w).Encode(req)
 }
 
 func (s *DistributionChannelsService) GetPartner(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	partnerID := vars["partner_id"]
-	
+
 	partner := ChannelPartner{
 		ID:          partnerID,
 		PartnerName: "Kano Rice Farmers Cooperative",
@@ -984,16 +984,16 @@ func (s *DistributionChannelsService) GetPartner(w http.ResponseWriter, r *http.
 func (s *DistributionChannelsService) GetPartnerPerformance(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	partnerID := vars["partner_id"]
-	
+
 	performance := map[string]interface{}{
-		"partner_id":       partnerID,
-		"report_date":      time.Now(),
-		"total_referrals":  150,
-		"active_loans":     120,
-		"total_disbursed":  600000000,
+		"partner_id":        partnerID,
+		"report_date":       time.Now(),
+		"total_referrals":   150,
+		"active_loans":      120,
+		"total_disbursed":   600000000,
 		"total_outstanding": 450000000,
-		"npl_ratio":        3.0,
-		"repayment_rate":   97.0,
+		"npl_ratio":         3.0,
+		"repayment_rate":    97.0,
 		"commission_earned": 9000000,
 		"monthly_trend": []map[string]interface{}{
 			{"month": "2024-10", "referrals": 15, "disbursed": 75000000},

@@ -21,21 +21,21 @@ var db *sql.DB
 // ─── Models ──────────────────────────────────────────────────────────────────
 
 type BNPLApplication struct {
-	ID               int64   `json:"id,omitempty"`
-	ApplicationID    string  `json:"application_id"`
-	TenantID         string  `json:"tenant_id"`
-	ApplicantID      string  `json:"applicant_id"`
-	MerchantID       string  `json:"merchant_id"`
-	PurchaseAmount   float64 `json:"purchase_amount" binding:"required,gt=0"`
-	InstallmentCount int     `json:"installment_count" binding:"required,min=1,max=12"`
-	InstallmentAmount float64 `json:"installment_amount,omitempty"`
-	InterestRate     float64 `json:"interest_rate,omitempty"`
-	ProductDescription string `json:"product_description"`
-	Status           string  `json:"status,omitempty"`
-	CreditScore      int     `json:"credit_score,omitempty"`
-	BVNVerified      bool    `json:"bvn_verified,omitempty"`
-	CreatedAt        string  `json:"created_at,omitempty"`
-	UpdatedAt        string  `json:"updated_at,omitempty"`
+	ID                 int64   `json:"id,omitempty"`
+	ApplicationID      string  `json:"application_id"`
+	TenantID           string  `json:"tenant_id"`
+	ApplicantID        string  `json:"applicant_id"`
+	MerchantID         string  `json:"merchant_id"`
+	PurchaseAmount     float64 `json:"purchase_amount" binding:"required,gt=0"`
+	InstallmentCount   int     `json:"installment_count" binding:"required,min=1,max=12"`
+	InstallmentAmount  float64 `json:"installment_amount,omitempty"`
+	InterestRate       float64 `json:"interest_rate,omitempty"`
+	ProductDescription string  `json:"product_description"`
+	Status             string  `json:"status,omitempty"`
+	CreditScore        int     `json:"credit_score,omitempty"`
+	BVNVerified        bool    `json:"bvn_verified,omitempty"`
+	CreatedAt          string  `json:"created_at,omitempty"`
+	UpdatedAt          string  `json:"updated_at,omitempty"`
 }
 
 type BNPLRepayment struct {

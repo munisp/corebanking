@@ -24,7 +24,7 @@ func NewLakehousePublisher() *LakehousePublisher {
 		baseURL = "http://lakehouse-api:8000"
 	}
 	return &LakehousePublisher{
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		httpClient:  &http.Client{Timeout: 60 * time.Second},
 		baseURL:     baseURL,
 		apiKey:      os.Getenv("LAKEHOUSE_API_KEY"),
 		serviceName: "search-service",

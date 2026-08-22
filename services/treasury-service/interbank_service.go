@@ -276,23 +276,23 @@ func (s *InterbankService) GetInterbankPosition(tenantID string) map[string]inte
 func (s *InterbankService) GetInterbankRates(tenantID string) map[string]interface{} {
 	return map[string]interface{}{
 		"overnight": map[string]float64{
-			"bid":  17.0,
+			"bid":   17.0,
 			"offer": 18.0,
 		},
 		"7day": map[string]float64{
-			"bid":  17.5,
+			"bid":   17.5,
 			"offer": 18.5,
 		},
 		"30day": map[string]float64{
-			"bid":  18.0,
+			"bid":   18.0,
 			"offer": 19.0,
 		},
 		"90day": map[string]float64{
-			"bid":  18.5,
+			"bid":   18.5,
 			"offer": 19.5,
 		},
-		"nibor": 18.25,
-		"mpr":   18.0,
+		"nibor":     18.25,
+		"mpr":       18.0,
 		"timestamp": time.Now().Format(time.RFC3339),
 	}
 }

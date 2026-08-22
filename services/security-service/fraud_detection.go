@@ -16,59 +16,59 @@ import (
 type FraudRuleType string
 
 const (
-	RuleLargeTransaction     FraudRuleType = "large_transaction"
-	RuleUnusualAmount        FraudRuleType = "unusual_amount"
-	RuleUnusualTime          FraudRuleType = "unusual_time"
-	RuleNewRecipient         FraudRuleType = "new_recipient"
-	RuleHighVelocity         FraudRuleType = "high_velocity"
-	RuleRoundAmount          FraudRuleType = "round_amount"
-	RuleNewDevice            FraudRuleType = "new_device"
-	RuleNewIP                FraudRuleType = "new_ip"
-	RuleImpossibleTravel     FraudRuleType = "impossible_travel"
-	RuleRapidSuccession      FraudRuleType = "rapid_succession"
-	RuleDormantAccount       FraudRuleType = "dormant_account"
-	RuleMultipleRecipients   FraudRuleType = "multiple_recipients"
-	RuleUnusualChannel       FraudRuleType = "unusual_channel"
-	RuleHighRiskCountry      FraudRuleType = "high_risk_country"
-	RulePatternAnomaly       FraudRuleType = "pattern_anomaly"
+	RuleLargeTransaction   FraudRuleType = "large_transaction"
+	RuleUnusualAmount      FraudRuleType = "unusual_amount"
+	RuleUnusualTime        FraudRuleType = "unusual_time"
+	RuleNewRecipient       FraudRuleType = "new_recipient"
+	RuleHighVelocity       FraudRuleType = "high_velocity"
+	RuleRoundAmount        FraudRuleType = "round_amount"
+	RuleNewDevice          FraudRuleType = "new_device"
+	RuleNewIP              FraudRuleType = "new_ip"
+	RuleImpossibleTravel   FraudRuleType = "impossible_travel"
+	RuleRapidSuccession    FraudRuleType = "rapid_succession"
+	RuleDormantAccount     FraudRuleType = "dormant_account"
+	RuleMultipleRecipients FraudRuleType = "multiple_recipients"
+	RuleUnusualChannel     FraudRuleType = "unusual_channel"
+	RuleHighRiskCountry    FraudRuleType = "high_risk_country"
+	RulePatternAnomaly     FraudRuleType = "pattern_anomaly"
 )
 
 // FraudAction represents the action to take when fraud is detected
 type FraudAction string
 
 const (
-	ActionAllow           FraudAction = "allow"
-	ActionAllowWithMFA    FraudAction = "allow_with_mfa"
-	ActionHoldForReview   FraudAction = "hold_for_review"
-	ActionBlock           FraudAction = "block"
-	ActionAlertOnly       FraudAction = "alert_only"
+	ActionAllow         FraudAction = "allow"
+	ActionAllowWithMFA  FraudAction = "allow_with_mfa"
+	ActionHoldForReview FraudAction = "hold_for_review"
+	ActionBlock         FraudAction = "block"
+	ActionAlertOnly     FraudAction = "alert_only"
 )
 
 // FraudRule represents a configurable fraud detection rule
 type FraudRule struct {
-	ID          string        `json:"id"`
-	Type        FraudRuleType `json:"type"`
-	Name        string        `json:"name"`
-	Description string        `json:"description"`
-	Enabled     bool          `json:"enabled"`
-	Weight      int           `json:"weight"`      // Risk score contribution (0-100)
-	Threshold   float64       `json:"threshold"`   // Rule-specific threshold
-	Action      FraudAction   `json:"action"`      // Default action when triggered
+	ID          string                 `json:"id"`
+	Type        FraudRuleType          `json:"type"`
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	Enabled     bool                   `json:"enabled"`
+	Weight      int                    `json:"weight"`     // Risk score contribution (0-100)
+	Threshold   float64                `json:"threshold"`  // Rule-specific threshold
+	Action      FraudAction            `json:"action"`     // Default action when triggered
 	Parameters  map[string]interface{} `json:"parameters"` // Rule-specific parameters
 }
 
 // FraudDetectionConfig holds the fraud detection configuration
 type FraudDetectionConfig struct {
-	Enabled              bool        `json:"enabled"`
-	Rules                []FraudRule `json:"rules"`
-	BlockThreshold       int         `json:"block_threshold"`       // Risk score to auto-block
-	ReviewThreshold      int         `json:"review_threshold"`      // Risk score to flag for review
-	MFAThreshold         int         `json:"mfa_threshold"`         // Risk score to require MFA
-	AlertThreshold       int         `json:"alert_threshold"`       // Risk score to generate alert
-	MaxRiskScore         int         `json:"max_risk_score"`        // Maximum possible risk score
-	EnableMLScoring      bool        `json:"enable_ml_scoring"`     // Use ML model for scoring
-	MLServiceURL         string      `json:"ml_service_url"`        // URL of ML scoring service
-	MLTimeoutMs          int         `json:"ml_timeout_ms"`         // Timeout for ML service calls
+	Enabled         bool        `json:"enabled"`
+	Rules           []FraudRule `json:"rules"`
+	BlockThreshold  int         `json:"block_threshold"`   // Risk score to auto-block
+	ReviewThreshold int         `json:"review_threshold"`  // Risk score to flag for review
+	MFAThreshold    int         `json:"mfa_threshold"`     // Risk score to require MFA
+	AlertThreshold  int         `json:"alert_threshold"`   // Risk score to generate alert
+	MaxRiskScore    int         `json:"max_risk_score"`    // Maximum possible risk score
+	EnableMLScoring bool        `json:"enable_ml_scoring"` // Use ML model for scoring
+	MLServiceURL    string      `json:"ml_service_url"`    // URL of ML scoring service
+	MLTimeoutMs     int         `json:"ml_timeout_ms"`     // Timeout for ML service calls
 }
 
 // DefaultFraudRules provides the default set of fraud detection rules
@@ -242,34 +242,34 @@ var DefaultFraudRules = []FraudRule{
 
 // DefaultFraudConfig provides default fraud detection configuration
 var DefaultFraudConfig = FraudDetectionConfig{
-	Enabled:          true,
-	Rules:            DefaultFraudRules,
-	BlockThreshold:   80,
-	ReviewThreshold:  60,
-	MFAThreshold:     40,
-	AlertThreshold:   30,
-	MaxRiskScore:     100,
-	EnableMLScoring:  false,
-	MLServiceURL:     "http://localhost:8081/api/v1/fraud/score",
-	MLTimeoutMs:      500,
+	Enabled:         true,
+	Rules:           DefaultFraudRules,
+	BlockThreshold:  80,
+	ReviewThreshold: 60,
+	MFAThreshold:    40,
+	AlertThreshold:  30,
+	MaxRiskScore:    100,
+	EnableMLScoring: false,
+	MLServiceURL:    "http://localhost:8081/api/v1/fraud/score",
+	MLTimeoutMs:     500,
 }
 
 // FraudCheckRequest represents a request to check for fraud
 type FraudCheckRequest struct {
-	UserID          string          `json:"user_id"`
-	TenantID        string          `json:"tenant_id"`
-	TransactionID   string          `json:"transaction_id"`
-	Amount          float64         `json:"amount"`
-	Currency        string          `json:"currency"`
-	TransactionType TransactionType `json:"transaction_type"`
-	Channel         Channel         `json:"channel"`
-	RecipientID     string          `json:"recipient_id"`
-	RecipientType   string          `json:"recipient_type"`
-	DeviceID        string          `json:"device_id"`
-	DeviceInfo      string          `json:"device_info"`
-	IPAddress       string          `json:"ip_address"`
-	Location        *GeoLocation    `json:"location,omitempty"`
-	Timestamp       time.Time       `json:"timestamp"`
+	UserID          string                 `json:"user_id"`
+	TenantID        string                 `json:"tenant_id"`
+	TransactionID   string                 `json:"transaction_id"`
+	Amount          float64                `json:"amount"`
+	Currency        string                 `json:"currency"`
+	TransactionType TransactionType        `json:"transaction_type"`
+	Channel         Channel                `json:"channel"`
+	RecipientID     string                 `json:"recipient_id"`
+	RecipientType   string                 `json:"recipient_type"`
+	DeviceID        string                 `json:"device_id"`
+	DeviceInfo      string                 `json:"device_info"`
+	IPAddress       string                 `json:"ip_address"`
+	Location        *GeoLocation           `json:"location,omitempty"`
+	Timestamp       time.Time              `json:"timestamp"`
 	Metadata        map[string]interface{} `json:"metadata,omitempty"`
 }
 
@@ -283,28 +283,28 @@ type GeoLocation struct {
 
 // FraudCheckResult represents the result of a fraud check
 type FraudCheckResult struct {
-	TransactionID   string                 `json:"transaction_id"`
-	RiskScore       int                    `json:"risk_score"`
-	RiskLevel       string                 `json:"risk_level"` // low, medium, high, critical
-	Action          FraudAction            `json:"action"`
-	TriggeredRules  []TriggeredRule        `json:"triggered_rules"`
-	RequiresMFA     bool                   `json:"requires_mfa"`
-	RequiresReview  bool                   `json:"requires_review"`
-	Blocked         bool                   `json:"blocked"`
-	Reasons         []string               `json:"reasons"`
-	MLScore         *float64               `json:"ml_score,omitempty"`
-	ProcessingTime  time.Duration          `json:"processing_time"`
-	Timestamp       time.Time              `json:"timestamp"`
+	TransactionID  string          `json:"transaction_id"`
+	RiskScore      int             `json:"risk_score"`
+	RiskLevel      string          `json:"risk_level"` // low, medium, high, critical
+	Action         FraudAction     `json:"action"`
+	TriggeredRules []TriggeredRule `json:"triggered_rules"`
+	RequiresMFA    bool            `json:"requires_mfa"`
+	RequiresReview bool            `json:"requires_review"`
+	Blocked        bool            `json:"blocked"`
+	Reasons        []string        `json:"reasons"`
+	MLScore        *float64        `json:"ml_score,omitempty"`
+	ProcessingTime time.Duration   `json:"processing_time"`
+	Timestamp      time.Time       `json:"timestamp"`
 }
 
 // TriggeredRule represents a fraud rule that was triggered
 type TriggeredRule struct {
-	RuleID      string      `json:"rule_id"`
-	RuleType    FraudRuleType `json:"rule_type"`
-	RuleName    string      `json:"rule_name"`
-	Weight      int         `json:"weight"`
-	Action      FraudAction `json:"action"`
-	Details     string      `json:"details"`
+	RuleID   string        `json:"rule_id"`
+	RuleType FraudRuleType `json:"rule_type"`
+	RuleName string        `json:"rule_name"`
+	Weight   int           `json:"weight"`
+	Action   FraudAction   `json:"action"`
+	Details  string        `json:"details"`
 }
 
 // FraudDetectionEngine manages fraud detection
@@ -603,16 +603,16 @@ func (fde *FraudDetectionEngine) evaluateRule(rule FraudRule, req FraudCheckRequ
 
 // UserPatterns holds a user's transaction patterns
 type UserPatterns struct {
-	AvgAmount        float64
-	StdDevAmount     float64
-	AvgTxPerDay      float64
-	TypicalHours     []int
-	TypicalChannels  []string
-	KnownRecipients  []string
-	KnownDevices     []string
-	KnownIPs         []string
-	LastActivityAt   *time.Time
-	LastLocation     *GeoLocation
+	AvgAmount       float64
+	StdDevAmount    float64
+	AvgTxPerDay     float64
+	TypicalHours    []int
+	TypicalChannels []string
+	KnownRecipients []string
+	KnownDevices    []string
+	KnownIPs        []string
+	LastActivityAt  *time.Time
+	LastLocation    *GeoLocation
 }
 
 func (fde *FraudDetectionEngine) getUserPatterns(userID, tenantID string) (*UserPatterns, error) {

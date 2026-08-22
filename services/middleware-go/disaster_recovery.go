@@ -11,14 +11,14 @@ import (
 // E4: Disaster Recovery — Backup scheduling, point-in-time recovery, failover config
 
 type BackupConfig struct {
-	Strategy         string `json:"strategy"`     // full, incremental, differential
-	Schedule         string `json:"schedule"`      // cron expression
-	RetentionDays    int    `json:"retentionDays"`
-	EncryptionKey    string `json:"encryptionKey,omitempty"`
-	TargetLocation   string `json:"targetLocation"` // s3://bucket/path
-	WALArchiving     bool   `json:"walArchiving"`
-	PGBaseBackup     bool   `json:"pgbasebackup"`
-	CompressBackups  bool   `json:"compressBackups"`
+	Strategy        string `json:"strategy"` // full, incremental, differential
+	Schedule        string `json:"schedule"` // cron expression
+	RetentionDays   int    `json:"retentionDays"`
+	EncryptionKey   string `json:"encryptionKey,omitempty"`
+	TargetLocation  string `json:"targetLocation"` // s3://bucket/path
+	WALArchiving    bool   `json:"walArchiving"`
+	PGBaseBackup    bool   `json:"pgbasebackup"`
+	CompressBackups bool   `json:"compressBackups"`
 }
 
 type BackupRecord struct {
@@ -34,11 +34,11 @@ type BackupRecord struct {
 }
 
 type FailoverConfig struct {
-	Mode           string `json:"mode"`      // active-passive, active-active
+	Mode           string `json:"mode"` // active-passive, active-active
 	PrimaryRegion  string `json:"primaryRegion"`
 	StandbyRegion  string `json:"standbyRegion"`
-	RPOMinutes     int    `json:"rpoMinutes"`    // Recovery Point Objective
-	RTOMinutes     int    `json:"rtoMinutes"`     // Recovery Time Objective
+	RPOMinutes     int    `json:"rpoMinutes"` // Recovery Point Objective
+	RTOMinutes     int    `json:"rtoMinutes"` // Recovery Time Objective
 	AutoFailover   bool   `json:"autoFailover"`
 	HealthCheckSec int    `json:"healthCheckIntervalSeconds"`
 	ReplicationLag int64  `json:"replicationLagMs"`
@@ -54,12 +54,12 @@ type DisasterRecoveryManager struct {
 func NewDRManager() *DisasterRecoveryManager {
 	return &DisasterRecoveryManager{
 		config: BackupConfig{
-			Strategy:       "incremental",
-			Schedule:       "0 2 * * *", // 2 AM daily
-			RetentionDays:  30,
-			TargetLocation: "s3://54bank-backups/postgres",
-			WALArchiving:   true,
-			PGBaseBackup:   true,
+			Strategy:        "incremental",
+			Schedule:        "0 2 * * *", // 2 AM daily
+			RetentionDays:   30,
+			TargetLocation:  "s3://54bank-backups/postgres",
+			WALArchiving:    true,
+			PGBaseBackup:    true,
 			CompressBackups: true,
 		},
 		failover: FailoverConfig{
@@ -101,11 +101,11 @@ func (dr *DisasterRecoveryManager) GetStatus() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"backupConfig":  dr.config,
+		"backupConfig":   dr.config,
 		"failoverConfig": dr.failover,
-		"lastBackup":    lastBackup,
-		"totalBackups":  len(dr.backups),
-		"status":        "operational",
+		"lastBackup":     lastBackup,
+		"totalBackups":   len(dr.backups),
+		"status":         "operational",
 	}
 }
 

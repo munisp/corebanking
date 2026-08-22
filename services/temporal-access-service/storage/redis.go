@@ -312,7 +312,7 @@ func (s *RedisStore) SaveDelegation(ctx context.Context, delegation *models.Dele
 	}
 
 	key := fmt.Sprintf("delegation:%s", delegation.ID)
-	
+
 	// Set TTL if expires
 	var ttl time.Duration
 	if delegation.ExpiresAt != nil {
@@ -394,7 +394,7 @@ func (s *RedisStore) SaveAuditLog(ctx context.Context, log *models.AuditLog) err
 	// Use sorted set with timestamp as score
 	key := fmt.Sprintf("audit:%s", log.TenantID)
 	score := float64(log.Timestamp.Unix())
-	
+
 	if err := s.client.ZAdd(ctx, key, redis.Z{
 		Score:  score,
 		Member: data,
@@ -411,7 +411,7 @@ func (s *RedisStore) SaveAuditLog(ctx context.Context, log *models.AuditLog) err
 // GetAuditLogs retrieves audit logs for a tenant
 func (s *RedisStore) GetAuditLogs(ctx context.Context, tenantID string, start, end time.Time, limit int) ([]*models.AuditLog, error) {
 	key := fmt.Sprintf("audit:%s", tenantID)
-	
+
 	results, err := s.client.ZRevRangeByScore(ctx, key, &redis.ZRangeBy{
 		Min:   fmt.Sprintf("%d", start.Unix()),
 		Max:   fmt.Sprintf("%d", end.Unix()),

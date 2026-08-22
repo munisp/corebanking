@@ -15,10 +15,10 @@ import (
 )
 
 type ConnectivityServer struct {
-	router          *mux.Router
-	imageOptimizer  *AdaptiveImageOptimizer
+	router            *mux.Router
+	imageOptimizer    *AdaptiveImageOptimizer
 	payloadCompressor *PayloadCompressor
-	offlinePIN      *OfflinePINVerifier
+	offlinePIN        *OfflinePINVerifier
 }
 
 type OptimizeImageRequest struct {
@@ -31,17 +31,17 @@ type OptimizeImageRequest struct {
 }
 
 type OptimizeImageResponse struct {
-	OptimizedURL    string `json:"optimized_url,omitempty"`
-	OptimizedBase64 string `json:"optimized_base64,omitempty"`
-	OriginalSize    int    `json:"original_size"`
-	OptimizedSize   int    `json:"optimized_size"`
+	OptimizedURL     string  `json:"optimized_url,omitempty"`
+	OptimizedBase64  string  `json:"optimized_base64,omitempty"`
+	OriginalSize     int     `json:"original_size"`
+	OptimizedSize    int     `json:"optimized_size"`
 	CompressionRatio float64 `json:"compression_ratio"`
 }
 
 type CompressPayloadRequest struct {
-	Data        interface{} `json:"data"`
-	Algorithm   string      `json:"algorithm"` // gzip, brotli, lz4
-	Level       int         `json:"level,omitempty"`
+	Data      interface{} `json:"data"`
+	Algorithm string      `json:"algorithm"` // gzip, brotli, lz4
+	Level     int         `json:"level,omitempty"`
 }
 
 type CompressPayloadResponse struct {
@@ -74,18 +74,18 @@ type SyncQueueRequest struct {
 }
 
 type SyncQueueResponse struct {
-	Processed   int                      `json:"processed"`
-	Failed      int                      `json:"failed"`
-	Results     []map[string]interface{} `json:"results"`
-	SyncedAt    string                   `json:"synced_at"`
+	Processed int                      `json:"processed"`
+	Failed    int                      `json:"failed"`
+	Results   []map[string]interface{} `json:"results"`
+	SyncedAt  string                   `json:"synced_at"`
 }
 
 func NewConnectivityServer() *ConnectivityServer {
 	server := &ConnectivityServer{
-		router:          mux.NewRouter(),
-		imageOptimizer:  NewAdaptiveImageOptimizer(),
+		router:            mux.NewRouter(),
+		imageOptimizer:    NewAdaptiveImageOptimizer(),
 		payloadCompressor: NewPayloadCompressor(),
-		offlinePIN:      NewOfflinePINVerifier(),
+		offlinePIN:        NewOfflinePINVerifier(),
 	}
 	server.setupRoutes()
 	return server
@@ -97,28 +97,28 @@ func (s *ConnectivityServer) setupRoutes() {
 	s.router.Handle("/metrics", promhttp.Handler())
 
 	api := s.router.PathPrefix("/api/v1").Subrouter()
-	
+
 	// Image optimization for low bandwidth
 	api.HandleFunc("/connectivity/image/optimize", s.optimizeImageHandler).Methods("POST")
 	api.HandleFunc("/connectivity/image/quality", s.detectQualityHandler).Methods("POST")
-	
+
 	// Payload compression
 	api.HandleFunc("/connectivity/compress", s.compressPayloadHandler).Methods("POST")
 	api.HandleFunc("/connectivity/decompress", s.decompressPayloadHandler).Methods("POST")
-	
+
 	// Offline PIN verification
 	api.HandleFunc("/connectivity/offline/pin/setup", s.setupOfflinePINHandler).Methods("POST")
 	api.HandleFunc("/connectivity/offline/pin/verify", s.verifyOfflinePINHandler).Methods("POST")
 	api.HandleFunc("/connectivity/offline/pin/sync", s.syncOfflinePINHandler).Methods("POST")
-	
+
 	// Offline transaction queue
 	api.HandleFunc("/connectivity/offline/queue", s.getOfflineQueueHandler).Methods("GET")
 	api.HandleFunc("/connectivity/offline/queue/sync", s.syncOfflineQueueHandler).Methods("POST")
-	
+
 	// Network quality detection
 	api.HandleFunc("/connectivity/network/quality", s.detectNetworkQualityHandler).Methods("GET")
 	api.HandleFunc("/connectivity/network/optimize", s.getOptimalSettingsHandler).Methods("GET")
-	
+
 	// Delta sync for minimal data transfer
 	api.HandleFunc("/connectivity/delta/generate", s.generateDeltaHandler).Methods("POST")
 	api.HandleFunc("/connectivity/delta/apply", s.applyDeltaHandler).Methods("POST")
@@ -298,17 +298,17 @@ func (s *ConnectivityServer) detectNetworkQualityHandler(w http.ResponseWriter, 
 
 func (s *ConnectivityServer) getOptimalSettingsHandler(w http.ResponseWriter, r *http.Request) {
 	bandwidth := r.URL.Query().Get("bandwidth")
-	
+
 	settings := map[string]interface{}{
-		"image_quality":      "low",
-		"compression":        "brotli",
-		"compression_level":  9,
-		"batch_size":         5,
-		"sync_interval_ms":   30000,
-		"enable_delta_sync":  true,
-		"prefetch_enabled":   false,
+		"image_quality":     "low",
+		"compression":       "brotli",
+		"compression_level": 9,
+		"batch_size":        5,
+		"sync_interval_ms":  30000,
+		"enable_delta_sync": true,
+		"prefetch_enabled":  false,
 	}
-	
+
 	if bandwidth == "high" {
 		settings["image_quality"] = "high"
 		settings["compression_level"] = 1
@@ -316,7 +316,7 @@ func (s *ConnectivityServer) getOptimalSettingsHandler(w http.ResponseWriter, r 
 		settings["sync_interval_ms"] = 5000
 		settings["prefetch_enabled"] = true
 	}
-	
+
 	json.NewEncoder(w).Encode(settings)
 }
 

@@ -231,12 +231,12 @@ func (s *LimitService) GetUtilization(tenantID string) map[string]interface{} {
 		}
 
 		byType[limit.LimitType] = append(byType[limit.LimitType], map[string]interface{}{
-			"limitID":     limit.LimitID,
-			"limitName":   limit.LimitName,
-			"limitValue":  limit.LimitValue,
+			"limitID":      limit.LimitID,
+			"limitName":    limit.LimitName,
+			"limitValue":   limit.LimitValue,
 			"currentUsage": limit.CurrentUsage,
-			"utilization": limit.Utilization,
-			"status":      limit.Status,
+			"utilization":  limit.Utilization,
+			"status":       limit.Status,
 		})
 	}
 

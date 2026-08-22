@@ -17,10 +17,10 @@ import (
 // Integrates with NIMET (Nigerian Meteorological Agency) and OpenWeather APIs
 
 type WeatherService struct {
-	db              *sql.DB
-	nimetAPIKey     string
-	openWeatherKey  string
-	httpClient      *http.Client
+	db             *sql.DB
+	nimetAPIKey    string
+	openWeatherKey string
+	httpClient     *http.Client
 }
 
 func NewWeatherService(db *sql.DB) *WeatherService {
@@ -96,31 +96,31 @@ func (s *WeatherService) handleGetLoanWeatherRisk(w http.ResponseWriter, r *http
 
 // WeatherData represents weather information for agricultural planning
 type WeatherData struct {
-	Location        string    `json:"location"`
-	State           string    `json:"state"`
-	LGA             string    `json:"lga"`
-	DataDate        time.Time `json:"data_date"`
-	RainfallMM      float64   `json:"rainfall_mm"`
-	Temperature     float64   `json:"temperature_celsius"`
-	Humidity        float64   `json:"humidity_percent"`
-	WindSpeed       float64   `json:"wind_speed_kmh"`
-	Pressure        float64   `json:"pressure_hpa"`
-	CloudCover      int       `json:"cloud_cover_percent"`
-	UVIndex         float64   `json:"uv_index"`
-	Season          string    `json:"season"`
-	ForecastRisk    string    `json:"forecast_risk"`
-	FarmingAdvice   string    `json:"farming_advice"`
-	DataSource      string    `json:"data_source"`
+	Location      string    `json:"location"`
+	State         string    `json:"state"`
+	LGA           string    `json:"lga"`
+	DataDate      time.Time `json:"data_date"`
+	RainfallMM    float64   `json:"rainfall_mm"`
+	Temperature   float64   `json:"temperature_celsius"`
+	Humidity      float64   `json:"humidity_percent"`
+	WindSpeed     float64   `json:"wind_speed_kmh"`
+	Pressure      float64   `json:"pressure_hpa"`
+	CloudCover    int       `json:"cloud_cover_percent"`
+	UVIndex       float64   `json:"uv_index"`
+	Season        string    `json:"season"`
+	ForecastRisk  string    `json:"forecast_risk"`
+	FarmingAdvice string    `json:"farming_advice"`
+	DataSource    string    `json:"data_source"`
 }
 
 // WeatherForecast represents multi-day forecast
 type WeatherForecast struct {
-	Location    string        `json:"location"`
-	State       string        `json:"state"`
-	GeneratedAt time.Time     `json:"generated_at"`
+	Location    string         `json:"location"`
+	State       string         `json:"state"`
+	GeneratedAt time.Time      `json:"generated_at"`
 	DailyData   []DailyWeather `json:"daily_data"`
-	SeasonInfo  SeasonInfo    `json:"season_info"`
-	RiskSummary RiskSummary   `json:"risk_summary"`
+	SeasonInfo  SeasonInfo     `json:"season_info"`
+	RiskSummary RiskSummary    `json:"risk_summary"`
 }
 
 type DailyWeather struct {
@@ -135,12 +135,12 @@ type DailyWeather struct {
 }
 
 type SeasonInfo struct {
-	CurrentSeason     string    `json:"current_season"`
-	SeasonStart       time.Time `json:"season_start"`
-	SeasonEnd         time.Time `json:"season_end"`
-	DaysRemaining     int       `json:"days_remaining"`
-	PlantingWindow    bool      `json:"planting_window_open"`
-	HarvestWindow     bool      `json:"harvest_window_open"`
+	CurrentSeason  string    `json:"current_season"`
+	SeasonStart    time.Time `json:"season_start"`
+	SeasonEnd      time.Time `json:"season_end"`
+	DaysRemaining  int       `json:"days_remaining"`
+	PlantingWindow bool      `json:"planting_window_open"`
+	HarvestWindow  bool      `json:"harvest_window_open"`
 }
 
 type RiskSummary struct {
@@ -154,49 +154,49 @@ type RiskSummary struct {
 
 // Nigerian states with their agricultural zones
 var NigerianStates = map[string]struct {
-	Zone           string
-	AgroZone       string
-	RainySeasonStart int // Month
-	RainySeasonEnd   int // Month
+	Zone             string
+	AgroZone         string
+	RainySeasonStart int     // Month
+	RainySeasonEnd   int     // Month
 	AverageRainfall  float64 // mm per year
 }{
-	"Lagos":     {"South-West", "Rainforest", 3, 11, 1600},
-	"Kano":      {"North-West", "Sudan Savanna", 5, 9, 800},
-	"Kaduna":    {"North-West", "Guinea Savanna", 4, 10, 1100},
-	"Oyo":       {"South-West", "Derived Savanna", 3, 11, 1300},
-	"Rivers":    {"South-South", "Mangrove/Rainforest", 3, 11, 2400},
-	"Benue":     {"North-Central", "Guinea Savanna", 4, 10, 1200},
-	"Plateau":   {"North-Central", "Montane", 4, 10, 1400},
-	"Sokoto":    {"North-West", "Sahel Savanna", 6, 9, 600},
-	"Borno":     {"North-East", "Sahel Savanna", 6, 9, 500},
-	"Adamawa":   {"North-East", "Sudan Savanna", 5, 10, 900},
-	"Niger":     {"North-Central", "Guinea Savanna", 4, 10, 1100},
-	"Kebbi":     {"North-West", "Sudan Savanna", 5, 9, 700},
-	"Zamfara":   {"North-West", "Sudan Savanna", 5, 9, 800},
-	"Katsina":   {"North-West", "Sudan Savanna", 5, 9, 750},
-	"Jigawa":    {"North-West", "Sudan Savanna", 5, 9, 700},
-	"Bauchi":    {"North-East", "Sudan Savanna", 5, 10, 900},
-	"Gombe":     {"North-East", "Sudan Savanna", 5, 10, 850},
-	"Yobe":      {"North-East", "Sahel Savanna", 6, 9, 550},
-	"Taraba":    {"North-East", "Guinea Savanna", 4, 10, 1100},
-	"Nasarawa":  {"North-Central", "Guinea Savanna", 4, 10, 1200},
-	"Kogi":      {"North-Central", "Derived Savanna", 4, 10, 1300},
-	"Kwara":     {"North-Central", "Derived Savanna", 4, 10, 1200},
-	"Ogun":      {"South-West", "Rainforest", 3, 11, 1400},
-	"Ondo":      {"South-West", "Rainforest", 3, 11, 1800},
-	"Osun":      {"South-West", "Derived Savanna", 3, 11, 1300},
-	"Ekiti":     {"South-West", "Rainforest", 3, 11, 1500},
-	"Edo":       {"South-South", "Rainforest", 3, 11, 2000},
-	"Delta":     {"South-South", "Mangrove/Rainforest", 3, 11, 2500},
-	"Bayelsa":   {"South-South", "Mangrove", 3, 11, 3000},
+	"Lagos":       {"South-West", "Rainforest", 3, 11, 1600},
+	"Kano":        {"North-West", "Sudan Savanna", 5, 9, 800},
+	"Kaduna":      {"North-West", "Guinea Savanna", 4, 10, 1100},
+	"Oyo":         {"South-West", "Derived Savanna", 3, 11, 1300},
+	"Rivers":      {"South-South", "Mangrove/Rainforest", 3, 11, 2400},
+	"Benue":       {"North-Central", "Guinea Savanna", 4, 10, 1200},
+	"Plateau":     {"North-Central", "Montane", 4, 10, 1400},
+	"Sokoto":      {"North-West", "Sahel Savanna", 6, 9, 600},
+	"Borno":       {"North-East", "Sahel Savanna", 6, 9, 500},
+	"Adamawa":     {"North-East", "Sudan Savanna", 5, 10, 900},
+	"Niger":       {"North-Central", "Guinea Savanna", 4, 10, 1100},
+	"Kebbi":       {"North-West", "Sudan Savanna", 5, 9, 700},
+	"Zamfara":     {"North-West", "Sudan Savanna", 5, 9, 800},
+	"Katsina":     {"North-West", "Sudan Savanna", 5, 9, 750},
+	"Jigawa":      {"North-West", "Sudan Savanna", 5, 9, 700},
+	"Bauchi":      {"North-East", "Sudan Savanna", 5, 10, 900},
+	"Gombe":       {"North-East", "Sudan Savanna", 5, 10, 850},
+	"Yobe":        {"North-East", "Sahel Savanna", 6, 9, 550},
+	"Taraba":      {"North-East", "Guinea Savanna", 4, 10, 1100},
+	"Nasarawa":    {"North-Central", "Guinea Savanna", 4, 10, 1200},
+	"Kogi":        {"North-Central", "Derived Savanna", 4, 10, 1300},
+	"Kwara":       {"North-Central", "Derived Savanna", 4, 10, 1200},
+	"Ogun":        {"South-West", "Rainforest", 3, 11, 1400},
+	"Ondo":        {"South-West", "Rainforest", 3, 11, 1800},
+	"Osun":        {"South-West", "Derived Savanna", 3, 11, 1300},
+	"Ekiti":       {"South-West", "Rainforest", 3, 11, 1500},
+	"Edo":         {"South-South", "Rainforest", 3, 11, 2000},
+	"Delta":       {"South-South", "Mangrove/Rainforest", 3, 11, 2500},
+	"Bayelsa":     {"South-South", "Mangrove", 3, 11, 3000},
 	"Cross River": {"South-South", "Rainforest", 3, 11, 2800},
-	"Akwa Ibom": {"South-South", "Rainforest", 3, 11, 2500},
-	"Abia":      {"South-East", "Rainforest", 3, 11, 2200},
-	"Imo":       {"South-East", "Rainforest", 3, 11, 2000},
-	"Anambra":   {"South-East", "Derived Savanna", 3, 11, 1800},
-	"Enugu":     {"South-East", "Derived Savanna", 3, 11, 1700},
-	"Ebonyi":    {"South-East", "Derived Savanna", 3, 11, 1800},
-	"FCT":       {"North-Central", "Guinea Savanna", 4, 10, 1200},
+	"Akwa Ibom":   {"South-South", "Rainforest", 3, 11, 2500},
+	"Abia":        {"South-East", "Rainforest", 3, 11, 2200},
+	"Imo":         {"South-East", "Rainforest", 3, 11, 2000},
+	"Anambra":     {"South-East", "Derived Savanna", 3, 11, 1800},
+	"Enugu":       {"South-East", "Derived Savanna", 3, 11, 1700},
+	"Ebonyi":      {"South-East", "Derived Savanna", 3, 11, 1800},
+	"FCT":         {"North-Central", "Guinea Savanna", 4, 10, 1200},
 }
 
 // GetCurrentWeather fetches current weather for a location
@@ -368,10 +368,10 @@ func (s *WeatherService) getSimulatedWeather(state, lga string) (*WeatherData, e
 
 	now := time.Now()
 	month := int(now.Month())
-	
+
 	// Determine if in rainy or dry season
 	inRainySeason := month >= stateInfo.RainySeasonStart && month <= stateInfo.RainySeasonEnd
-	
+
 	var rainfall, temperature, humidity float64
 	var season string
 
@@ -661,7 +661,7 @@ func (s *WeatherService) GetWeatherRiskForLoan(ctx context.Context, state, cropT
 
 	// Check if planting is in optimal season
 	inRainySeason := plantingMonth >= stateInfo.RainySeasonStart && plantingMonth <= stateInfo.RainySeasonEnd
-	
+
 	if cropData.WaterRequirement == "high" && !inRainySeason {
 		risk.RiskLevel = "High"
 		risk.RiskScore = 70

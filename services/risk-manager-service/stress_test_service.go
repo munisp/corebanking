@@ -139,10 +139,12 @@ func (s *StressTestService) CreateTest(tenantID, userID string, req *CreateStres
 
 // RunTest runs a stress test against the REAL portfolio baseline.
 // Parametric impact model (explicit, documented assumptions):
-//   interestRateShock (bp): 0.025% of the loan book per bp (≈2.5y duration)
-//   ngnDepreciation (%):    30% pass-through on the real FX exposure per %
-//   nplIncrease (%):        50% LGD on the shocked share of the loan book
-//   gdpDecline (%):         20% of the loan book per % of GDP decline
+//
+//	interestRateShock (bp): 0.025% of the loan book per bp (≈2.5y duration)
+//	ngnDepreciation (%):    30% pass-through on the real FX exposure per %
+//	nplIncrease (%):        50% LGD on the shocked share of the loan book
+//	gdpDecline (%):         20% of the loan book per % of GDP decline
+//
 // Status thresholds (CBN): >=15% passed, >=10% warning, else failed.
 func (s *StressTestService) RunTest(tenantID, testID, userID string) (*StressTest, error) {
 	s.mu.Lock()
@@ -283,14 +285,14 @@ func (s *StressTestService) GetResults(tenantID string) map[string]interface{} {
 		}
 
 		results = append(results, map[string]interface{}{
-			"testID":          test.TestID,
-			"testName":        test.TestName,
-			"scenario":        test.Scenario,
-			"baselineRatio":   test.CapitalRatio,
-			"stressedRatio":   test.StressedRatio,
-			"capitalImpact":   test.CapitalImpact,
-			"status":          test.Status,
-			"runDate":         test.RunDate.Format("2006-01-02"),
+			"testID":        test.TestID,
+			"testName":      test.TestName,
+			"scenario":      test.Scenario,
+			"baselineRatio": test.CapitalRatio,
+			"stressedRatio": test.StressedRatio,
+			"capitalImpact": test.CapitalImpact,
+			"status":        test.Status,
+			"runDate":       test.RunDate.Format("2006-01-02"),
 		})
 	}
 

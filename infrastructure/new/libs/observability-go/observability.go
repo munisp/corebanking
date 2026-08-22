@@ -12,21 +12,21 @@ import (
 )
 
 type Metrics struct {
-	RequestCount   uint64 `json:"request_count"`
-	ErrorCount     uint64 `json:"error_count"`
-	AvgLatencyUs   int64  `json:"avg_latency_us"`
-	P99LatencyUs   int64  `json:"p99_latency_us"`
-	ActiveConns    int32  `json:"active_connections"`
-	UptimeSeconds  int64  `json:"uptime_seconds"`
-	GoRoutines     int    `json:"goroutines"`
-	HeapAllocMB    float64 `json:"heap_alloc_mb"`
-	GCPauseMs      float64 `json:"gc_pause_ms"`
+	RequestCount  uint64  `json:"request_count"`
+	ErrorCount    uint64  `json:"error_count"`
+	AvgLatencyUs  int64   `json:"avg_latency_us"`
+	P99LatencyUs  int64   `json:"p99_latency_us"`
+	ActiveConns   int32   `json:"active_connections"`
+	UptimeSeconds int64   `json:"uptime_seconds"`
+	GoRoutines    int     `json:"goroutines"`
+	HeapAllocMB   float64 `json:"heap_alloc_mb"`
+	GCPauseMs     float64 `json:"gc_pause_ms"`
 }
 
 var (
-	startTime     = time.Now()
-	totalLatency  int64
-	maxLatency    int64
+	startTime    = time.Now()
+	totalLatency int64
+	maxLatency   int64
 )
 
 func CollectMetrics(requestCount, errorCount *uint64) Metrics {
@@ -70,7 +70,9 @@ func NewLogger(service string) *StructuredLogger {
 
 func (l *StructuredLogger) With(key string, value interface{}) *StructuredLogger {
 	copy := &StructuredLogger{service: l.service, fields: make(map[string]interface{})}
-	for k, v := range l.fields { copy.fields[k] = v }
+	for k, v := range l.fields {
+		copy.fields[k] = v
+	}
 	copy.fields[key] = value
 	return copy
 }
@@ -82,7 +84,9 @@ func (l *StructuredLogger) log(level string, msg string) {
 		"service":   l.service,
 		"message":   msg,
 	}
-	for k, v := range l.fields { entry[k] = v }
+	for k, v := range l.fields {
+		entry[k] = v
+	}
 	data, _ := json.Marshal(entry)
 	fmt.Fprintln(os.Stderr, string(data))
 }
