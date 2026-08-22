@@ -44,16 +44,34 @@ def generate_token(
         )
 
 
-@token_router.get("/validate/{token}")
+def _bearer_token(authorization: str) -> str:
+    """Extract the token from the Authorization header.
+
+    Tokens are accepted ONLY via the Authorization: Bearer header — never via
+    URL path or query parameters (M-43), which leak into logs, browser history
+    and upstream access logs."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise_http_exception_handler(
+            status_code=401,
+            message="Missing or invalid Authorization header.",
+            code="AUTH-TOKEN-INT-4010",
+        )
+    return authorization[len("Bearer "):].strip()
+
+
+@token_router.get("/validate")
 def validate_token(
-    token: str,
+    authorization: str = Header(..., alias="authorization"),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
     keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
 ):
-    """Validate access token route handler."""
+    """Validate access token route handler.
+
+    Token MUST be presented in the Authorization header (never in the URL)."""
 
     try:
+        token = _bearer_token(authorization)
         context = Context(
             tenant_id=tenant_id,
             keycloak_realm=keycloak_realm,
@@ -81,16 +99,20 @@ def validate_token(
         )
 
 
-@token_router.post("/refresh/{token}")
+@token_router.post("/refresh")
 def refresh_access_token(
-    token: str,
+    authorization: str = Header(..., alias="authorization"),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
     keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
 ):
-    """Refresh access token route handler"""
+    """Refresh access token route handler.
+
+    Refresh token MUST be presented in the Authorization header (never in the
+    URL)."""
 
     try:
+        token = _bearer_token(authorization)
         context = Context(
             tenant_id=tenant_id,
             keycloak_realm=keycloak_realm,

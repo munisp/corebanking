@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -77,12 +80,44 @@ type STKServer struct {
 	httpClient      *http.Client
 }
 
+const legacyDefaultPinSecret = "default-pin-secret-change-in-production"
+
+// loadPinHMACSecret resolves the HMAC secret protecting customer PINs.
+// Fail closed: the secret MUST come from the STK_PIN_HMAC_SECRET environment
+// variable and must not equal the historical hardcoded default. In production
+// the service refuses to boot otherwise; outside production an ephemeral
+// random secret is generated with a loud warning so dev/test still boots
+// without shipping a known secret.
+func loadPinHMACSecret() string {
+	secret := os.Getenv("STK_PIN_HMAC_SECRET")
+	if secret != "" && secret != legacyDefaultPinSecret {
+		return secret
+	}
+	env := strings.ToLower(getEnv("ENVIRONMENT", getEnv("APP_ENV", "production")))
+	isProd := env == "production" || env == "prod"
+	if secret == legacyDefaultPinSecret {
+		if isProd {
+			log.Fatal("[stk-service] FATAL: STK_PIN_HMAC_SECRET is set to the known insecure hardcoded default; refusing to start")
+		}
+		log.Printf("[stk-service] WARNING: STK_PIN_HMAC_SECRET equals the insecure default; generating ephemeral secret (non-production only)")
+	} else if isProd {
+		log.Fatal("[stk-service] FATAL: STK_PIN_HMAC_SECRET is not set; refusing to start in production")
+	} else {
+		log.Printf("[stk-service] WARNING: STK_PIN_HMAC_SECRET not set; generating ephemeral random secret (non-production only)")
+	}
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("[stk-service] FATAL: cannot generate ephemeral PIN secret: %v", err)
+	}
+	return hex.EncodeToString(b)
+}
+
 func NewSTKServer(db *pgxpool.Pool) *STKServer {
 	smsProvider := NewHTTPSMSProvider(
 		getEnv("SMS_SERVICE_URL", "http://notification-service:8080"),
 		getEnv("SMS_API_KEY", ""),
 	)
-	pinSecret := getEnv("PIN_SECRET", "default-pin-secret-change-in-production")
+	pinSecret := loadPinHMACSecret()
 
 	server := &STKServer{
 		router:         mux.NewRouter(),

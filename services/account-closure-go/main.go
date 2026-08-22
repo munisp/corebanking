@@ -5,7 +5,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -381,7 +380,7 @@ func listRecords(w http.ResponseWriter, r *http.Request) {
 	query := `SELECT id, status, created_at FROM accounts WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		internalError(w, "listRecords query", err)
 		return
 	}
 	defer rows.Close()
@@ -420,7 +419,7 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		`INSERT INTO accounts (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		internalError(w, "createRecord insert", err)
 		return
 	}
 
@@ -444,7 +443,7 @@ func getRecord(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		internalError(w, "getRecord query", err)
 		return
 	}
 
@@ -467,7 +466,7 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	_, err := db.ExecContext(r.Context(),
 		`UPDATE accounts SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		internalError(w, "updateRecord update", err)
 		return
 	}
 
@@ -484,7 +483,7 @@ func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
 	_, err := db.ExecContext(r.Context(),
 		`UPDATE accounts SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		internalError(w, "deleteRecord update", err)
 		return
 	}
 
@@ -504,10 +503,18 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// internalError logs the full error server-side and returns a generic body so
+// database/internal details are never leaked to clients (M-47).
+func internalError(w http.ResponseWriter, op string, err error) {
+	log.Printf("[account-closure-go] %s failed: %v", op, err)
+	http.Error(w, `{"error":"internal error"}`, http.StatusInternalServerError)
+}
+
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
 	if err := db.Ping(); err != nil {
+		log.Printf("[account-closure-go] readiness check failed: %v", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready"})
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")

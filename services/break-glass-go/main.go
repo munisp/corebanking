@@ -4,16 +4,21 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -79,6 +84,10 @@ func initSchema() {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			closed_at TIMESTAMPTZ, reviewed_by TEXT, review_notes TEXT)`,
 		`CREATE INDEX IF NOT EXISTS idx_bg_status ON break_glass_events(status)`,
+		`CREATE TABLE IF NOT EXISTS break_glass_audit_log (
+			id TEXT PRIMARY KEY, event_id TEXT, actor TEXT NOT NULL,
+			action TEXT NOT NULL, reason TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
 	} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			log.Printf("[break-glass] schema: %v", err)
@@ -138,6 +147,228 @@ func dbListEvents() []*BreakGlassEvent {
 
 func nullTime(t time.Time) interface{} { if t.IsZero() { return nil }; return t }
 
+// ── MIDDLEWARE: JWT Validation (RS256 via Keycloak JWKS) ────────────────────
+// Break-glass is an emergency privileged-access surface: every non-health
+// route MUST be authenticated and authorized. Fail closed on any error.
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+var jwksHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+func fetchJWKS(realmURL string) {
+	resp, err := jwksHTTPClient.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 { continue }
+		var eInt int
+		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+		jwtCache.keys[k.Kid] = pub
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
+	// Initial JWKS fetch
+	go fetchJWKS(realmURL)
+	// Refresh every 5 minutes
+	go func() {
+		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+	}()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip health endpoints
+		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			return
+		}
+		token := auth[7:]
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			return
+		}
+		// Decode header for kid
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct { Kid string `json:"kid"` }
+		json.Unmarshal(headerBytes, &header)
+
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			// Try refresh
+			fetchJWKS(realmURL)
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		// Verify signature (RS256)
+		signingInput := parts[0] + "." + parts[1]
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(signingInput))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+		// Decode claims
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		// Check expiry
+		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		// Pass claims in context
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// ── Break-glass role authorization ──────────────────────────────────────────
+
+func breakGlassAllowedRoles() map[string]bool {
+	if v := os.Getenv("BREAK_GLASS_REQUIRED_ROLES"); v != "" {
+		roles := map[string]bool{}
+		for _, r := range strings.Split(v, ",") {
+			if r = strings.TrimSpace(r); r != "" { roles[r] = true }
+		}
+		if len(roles) > 0 { return roles }
+	}
+	// Default: only explicit break-glass or platform admin roles.
+	return map[string]bool{"break-glass": true, "break-glass-admin": true, "admin": true}
+}
+
+func jwtClaims(r *http.Request) map[string]interface{} {
+	if c, ok := r.Context().Value("jwt_claims").(map[string]interface{}); ok { return c }
+	return nil
+}
+
+func tokenSubject(r *http.Request) string {
+	claims := jwtClaims(r)
+	if claims == nil { return "" }
+	if sub, ok := claims["sub"].(string); ok { return sub }
+	if p, ok := claims["preferred_username"].(string); ok { return p }
+	return ""
+}
+
+func claimsHaveRole(claims map[string]interface{}, allowed map[string]bool) bool {
+	// Keycloak realm_access.roles
+	if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
+		if roles, ok := ra["roles"].([]interface{}); ok {
+			for _, role := range roles {
+				if s, ok := role.(string); ok && allowed[s] { return true }
+			}
+		}
+	}
+	if roles, ok := claims["roles"].([]interface{}); ok {
+		for _, role := range roles {
+			if s, ok := role.(string); ok && allowed[s] { return true }
+		}
+	}
+	if role, ok := claims["role"].(string); ok && allowed[role] { return true }
+	return false
+}
+
+func requireBreakGlassRole(next http.Handler) http.Handler {
+	allowed := breakGlassAllowedRoles()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims := jwtClaims(r)
+		if claims == nil {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		if !claimsHaveRole(claims, allowed) {
+			log.Printf("[break-glass] DENIED: subject=%q lacks break-glass role", tokenSubject(r))
+			http.Error(w, `{"error":"forbidden"}`, http.StatusForbidden)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// secure wires the full auth chain for privileged break-glass routes.
+func secure(h http.HandlerFunc) http.Handler {
+	return jwtMiddleware(jwtRealmURL(), requireBreakGlassRole(h))
+}
+
+// ── Mandatory audit logging (who / when / why) ──────────────────────────────
+
+// auditBreakGlass writes a tamper-evident audit entry for a break-glass
+// lifecycle transition. Auditing is MANDATORY: if the database is configured
+// and the audit insert fails, an error is returned so the caller fails the
+// request rather than performing privileged actions unaudited.
+func auditBreakGlass(actor, action, eventID, reason string) error {
+	id := fmt.Sprintf("BGA-%d-%s", time.Now().UnixNano(), secureRandHex(4))
+	now := time.Now()
+	log.Printf("[BREAK-GLASS-AUDIT] id=%s action=%s actor=%s event=%s reason=%q at=%s",
+		id, action, actor, eventID, reason, now.Format(time.RFC3339Nano))
+	eventBus.Emit("break-glass.audit", map[string]interface{}{
+		"audit_id": id, "action": action, "actor": actor,
+		"event_id": eventID, "reason": reason, "at": now.Format(time.RFC3339Nano),
+	})
+	if db == nil { return nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO break_glass_audit_log (id, event_id, actor, action, reason, created_at) VALUES ($1,$2,$3,$4,$5,$6)`,
+		id, eventID, actor, action, reason, now)
+	if err != nil {
+		log.Printf("[BREAK-GLASS-AUDIT] CRITICAL: audit insert failed: %v", err)
+		return fmt.Errorf("audit logging failed")
+	}
+	return nil
+}
+
 func activateBreakGlass(requestorID, resource, reason, severity, ip string) (*BreakGlassEvent, error) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -194,8 +425,15 @@ func handleActivate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
 	var body struct { RequestorID string `json:"requestor_id"`; Resource string `json:"resource"`; Reason string `json:"reason"`; Severity string `json:"severity"` }
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil { http.Error(w, "invalid JSON", 400); return }
-	evt, err := activateBreakGlass(body.RequestorID, body.Resource, body.Reason, body.Severity, r.RemoteAddr)
+	if body.Reason == "" { http.Error(w, `{"error":"reason is required"}`, 400); return }
+	// Identity comes from verified JWT claims, never client-supplied fields.
+	requestorID := tokenSubject(r)
+	if requestorID == "" { http.Error(w, `{"error":"unauthorized"}`, 401); return }
+	evt, err := activateBreakGlass(requestorID, body.Resource, body.Reason, body.Severity, r.RemoteAddr)
 	if err != nil { http.Error(w, err.Error(), 400); return }
+	if err := auditBreakGlass(requestorID, "activate", evt.ID, body.Reason); err != nil {
+		http.Error(w, `{"error":"internal error"}`, 500); return
+	}
 	w.Header().Set("Content-Type", "application/json"); w.WriteHeader(201); json.NewEncoder(w).Encode(evt)
 }
 
@@ -209,9 +447,16 @@ func handleLogAction(w http.ResponseWriter, r *http.Request) {
 
 func handleClose(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
-	var body struct { EventID string `json:"event_id"`; ReviewerID string `json:"reviewer_id"`; Notes string `json:"notes"` }
+	var body struct { EventID string `json:"event_id"`; ReviewerID string `json:"reviewer_id"`; Reason string `json:"reason"`; Notes string `json:"notes"` }
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil { http.Error(w, "invalid JSON", 400); return }
-	if err := closeBreakGlass(body.EventID, body.ReviewerID, body.Notes); err != nil { http.Error(w, err.Error(), 400); return }
+	if body.Reason == "" { http.Error(w, `{"error":"reason is required"}`, 400); return }
+	// Identity comes from verified JWT claims, never client-supplied fields.
+	reviewerID := tokenSubject(r)
+	if reviewerID == "" { http.Error(w, `{"error":"unauthorized"}`, 401); return }
+	if err := auditBreakGlass(reviewerID, "close", body.EventID, body.Reason); err != nil {
+		http.Error(w, `{"error":"internal error"}`, 500); return
+	}
+	if err := closeBreakGlass(body.EventID, reviewerID, body.Notes); err != nil { http.Error(w, err.Error(), 400); return }
 	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "closed"})
 }
 
@@ -275,11 +520,11 @@ func main() {
 	startWatchdog()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthzHandler); mux.HandleFunc("/livez", livezHandler); mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/api/v1/break-glass/activate", handleActivate)
-	mux.HandleFunc("/api/v1/break-glass/log-action", handleLogAction)
-	mux.HandleFunc("/api/v1/break-glass/close", handleClose)
-	mux.HandleFunc("/api/v1/break-glass/events", handleListEvents)
-	mux.HandleFunc("/api/v1/break-glass/stats", handleStats)
+	mux.Handle("/api/v1/break-glass/activate", secure(handleActivate))
+	mux.Handle("/api/v1/break-glass/log-action", secure(handleLogAction))
+	mux.Handle("/api/v1/break-glass/close", secure(handleClose))
+	mux.Handle("/api/v1/break-glass/events", secure(handleListEvents))
+	mux.Handle("/api/v1/break-glass/stats", secure(handleStats))
 	handler := panicRecoveryMiddleware(rateLimitMiddleware(loggingMiddleware(mux)))
 	srv := &http.Server{Addr: ":" + port, Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
 	go func() { log.Printf("[break-glass] Starting on :%s", port); if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatal(err) } }()

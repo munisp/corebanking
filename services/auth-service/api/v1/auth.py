@@ -12,7 +12,7 @@ from schemas.v1 import (
 )
 from database import get_session
 from services import AuthService
-from utils import create_logger, UserRole
+from utils import create_logger, UserRole, get_client_ip
 from utils.errors import raise_http_exception_handler
 from utils.auth_middleware import get_current_user
 
@@ -95,7 +95,8 @@ def login(
 
         device_info = {
             "user_agent": request.headers.get("user-agent", ""),
-            "ip_address": request.client.host if request.client else None,
+            # M-44: direct peer IP; XFF honored only from trusted proxies.
+            "ip_address": get_client_ip(request),
             "device_fingerprint": request.headers.get("x-device-fingerprint", ""),
         }
 

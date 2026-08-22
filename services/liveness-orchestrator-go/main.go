@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
@@ -48,6 +49,10 @@ type Challenge struct {
 	Score     float64 `json:"score"`
 	Attempts  int     `json:"attempts"`
 	StartedAt string  `json:"startedAt,omitempty"`
+	// Nonce is a single-use, CSPRNG-generated value bound to the session ID,
+	// challenge ID and subject (H-19 replay protection). It is rotated after
+	// every failed attempt.
+	Nonce     string  `json:"nonce,omitempty"`
 }
 
 type LivenessSession struct {
@@ -198,9 +203,101 @@ func generateChallenges(count int) []Challenge {
 			ID:     fmt.Sprintf("CH-%d-%d", time.Now().UnixNano(), i),
 			Type:   pool[i],
 			Status: "pending",
+			Nonce:  generateNonce(),
 		})
 	}
 	return out
+}
+
+// ─── Challenge nonce binding (H-19 replay protection) ───────────────────────
+//
+// Every challenge carries a single-use nonce bound to (session ID, challenge
+// ID, subject). The nonce is stored at challenge creation and consumed
+// atomically at submission; reuse is rejected. Postgres is the store of
+// record (multi-replica safe). When no database is configured (single-process
+// mode) an in-memory binding map provides the same guarantee locally.
+
+var (
+	noncesMu      sync.Mutex
+	nonceBindings = map[string]string{} // nonce -> sessionID|challengeID|customerID (db == nil mode only)
+)
+
+func generateNonce() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("[%s] crypto/rand unavailable: %v", serviceName, err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func nonceBinding(sessionID, challengeID, customerID string) string {
+	return sessionID + "|" + challengeID + "|" + customerID
+}
+
+// storeChallengeNonce records a freshly issued nonce. With a database, the
+// primary key guarantees global uniqueness; a collision is an error.
+func storeChallengeNonce(nonce, sessionID, challengeID, customerID string) error {
+	if db == nil {
+		noncesMu.Lock()
+		nonceBindings[nonce] = nonceBinding(sessionID, challengeID, customerID)
+		noncesMu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO liveness_challenge_nonces (nonce, session_id, challenge_id, customer_id) VALUES ($1,$2,$3,$4)`,
+		nonce, sessionID, challengeID, customerID)
+	return err
+}
+
+// consumeChallengeNonce atomically marks a nonce used, enforcing single-use
+// and binding to session ID + challenge ID + subject. Returns false on
+// replay, unknown nonce, or binding mismatch (fail closed on store errors).
+func consumeChallengeNonce(nonce, sessionID, challengeID, customerID string) bool {
+	if nonce == "" {
+		return false
+	}
+	if db == nil {
+		key := nonceBinding(sessionID, challengeID, customerID)
+		noncesMu.Lock()
+		defer noncesMu.Unlock()
+		binding, ok := nonceBindings[nonce]
+		if !ok || binding != key {
+			return false
+		}
+		delete(nonceBindings, nonce)
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := db.ExecContext(ctx,
+		`UPDATE liveness_challenge_nonces SET consumed_at = NOW()
+		 WHERE nonce = $1 AND session_id = $2 AND challenge_id = $3 AND customer_id = $4 AND consumed_at IS NULL`,
+		nonce, sessionID, challengeID, customerID)
+	if err != nil {
+		log.Printf("[%s] nonce consume failed (fail closed): %v", serviceName, err)
+		return false
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return false
+	}
+	return true
+}
+
+// rotateChallengeNonce issues a fresh single-use nonce for a challenge after
+// a failed attempt so legitimate retries remain possible while replays of a
+// consumed nonce stay rejected. Fail closed: on store error the challenge is
+// left without a usable nonce and the submission is rejected.
+func rotateChallengeNonce(session *LivenessSession, challengeIdx int) (string, bool) {
+	newNonce := generateNonce()
+	if err := storeChallengeNonce(newNonce, session.ID, session.Challenges[challengeIdx].ID, session.CustomerID); err != nil {
+		log.Printf("[%s] nonce rotation failed: %v", serviceName, err)
+		return "", false
+	}
+	session.Challenges[challengeIdx].Nonce = newNonce
+	return newNonce, true
 }
 
 // ─── Event Publishing (outbox; relay publishes to Kafka) ────────────────────
@@ -304,6 +401,16 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	session.ChallengesTotal = len(session.Challenges)
 	session.KafkaEventID = publishEvent("session_created", session.ID, body.CustomerID, body.TenantID, nil)
 
+	// H-19: bind each challenge nonce to this session + subject. Fail closed:
+	// if the nonce store is unavailable the session is not usable.
+	for i := range session.Challenges {
+		if err := storeChallengeNonce(session.Challenges[i].Nonce, session.ID, session.Challenges[i].ID, session.CustomerID); err != nil {
+			log.Printf("[%s] failed to store challenge nonce: %v", serviceName, err)
+			respondJSON(w, 503, map[string]string{"error": "challenge nonce store unavailable"})
+			return
+		}
+	}
+
 	sessionsMu.Lock()
 	sessions[session.ID] = session
 	sessionsMu.Unlock()
@@ -381,6 +488,7 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SessionID   string `json:"sessionId"`
 		ChallengeID string `json:"challengeId"`
+		Nonce       string `json:"nonce"`
 		FrameBase64 string `json:"frameBase64"`
 		FrameIndex  int    `json:"frameIndex"`
 	}
@@ -391,6 +499,29 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 	sessionsMu.Unlock()
 	if !exists {
 		respondJSON(w, 404, map[string]string{"error": "session not found"})
+		return
+	}
+
+	// H-19: locate the challenge and consume the single-use nonce BEFORE any
+	// engine work. Replay, unknown nonce, or session/subject mismatch => reject.
+	challengeIdx := -1
+	for i := range session.Challenges {
+		if session.Challenges[i].ID == body.ChallengeID {
+			challengeIdx = i
+			break
+		}
+	}
+	if challengeIdx < 0 {
+		respondJSON(w, 404, map[string]string{"error": "challenge not found"})
+		return
+	}
+	if session.Challenges[challengeIdx].Status != "pending" {
+		respondJSON(w, 409, map[string]string{"error": "challenge already completed"})
+		return
+	}
+	if !consumeChallengeNonce(body.Nonce, session.ID, body.ChallengeID, session.CustomerID) {
+		log.Printf("[%s] rejected replayed/invalid nonce for session=%s challenge=%s", serviceName, session.ID, body.ChallengeID)
+		respondJSON(w, 401, map[string]string{"error": "invalid_or_reused_nonce"})
 		return
 	}
 
@@ -407,9 +538,15 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 		stats.EngineErrors++
 		stats.mu.Unlock()
 		log.Printf("[%s] inference engine error: %v", serviceName, err)
+		// The submitted nonce is consumed; rotate so a legitimate retry is
+		// still possible with a fresh single-use nonce.
+		sessionsMu.Lock()
+		nextNonce, _ := rotateChallengeNonce(session, challengeIdx)
+		sessionsMu.Unlock()
 		respondJSON(w, 503, map[string]interface{}{
 			"error": "inference_engine_unavailable", "isLive": false,
 			"sessionStatus": "failed", "detail": err.Error(),
+			"nextNonce": nextNonce,
 		})
 		return
 	}
@@ -444,6 +581,14 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 		session.Verdict = "SPOOF"
 		session.CompletedAt = time.Now().UTC().Format(time.RFC3339)
 	}
+	// H-19: failed attempts consume the submitted nonce; rotate so the next
+	// legitimate attempt uses a fresh single-use nonce and replays stay dead.
+	var nextNonce string
+	if session.Challenges[challengeIdx].Status == "pending" {
+		if n, ok := rotateChallengeNonce(session, challengeIdx); ok {
+			nextNonce = n
+		}
+	}
 	respSession := *session
 	sessionsMu.Unlock()
 
@@ -460,6 +605,7 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 		"sessionStatus": respSession.Status,
 		"overallScore":  respSession.OverallScore,
 		"passThreshold": passThreshold,
+		"nextNonce":     nextNonce,
 	})
 }
 
@@ -471,6 +617,7 @@ func handleSubmitChallenge(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		SessionID      string   `json:"sessionId"`
 		ChallengeID    string   `json:"challengeId"`
+		Nonce          string   `json:"nonce"`
 		ReferenceFrame string   `json:"referenceFrame"`
 		ActionFrames   []string `json:"actionFrames"`
 		ChallengeType  string   `json:"challengeType"`
@@ -480,10 +627,33 @@ func handleSubmitChallenge(w http.ResponseWriter, r *http.Request) {
 	json.NewDecoder(r.Body).Decode(&body)
 
 	sessionsMu.Lock()
-	_, exists := sessions[body.SessionID]
+	session, exists := sessions[body.SessionID]
 	sessionsMu.Unlock()
 	if !exists {
 		respondJSON(w, 404, map[string]string{"error": "session not found"})
+		return
+	}
+
+	// H-19: the challenge must belong to this session, be pending, and carry a
+	// valid single-use nonce bound to session ID + subject.
+	challengeIdx := -1
+	for i := range session.Challenges {
+		if session.Challenges[i].ID == body.ChallengeID {
+			challengeIdx = i
+			break
+		}
+	}
+	if challengeIdx < 0 {
+		respondJSON(w, 404, map[string]string{"error": "challenge not found"})
+		return
+	}
+	if session.Challenges[challengeIdx].Status != "pending" {
+		respondJSON(w, 409, map[string]string{"error": "challenge already completed"})
+		return
+	}
+	if !consumeChallengeNonce(body.Nonce, session.ID, body.ChallengeID, session.CustomerID) {
+		log.Printf("[%s] rejected replayed/invalid nonce for session=%s challenge=%s", serviceName, session.ID, body.ChallengeID)
+		respondJSON(w, 401, map[string]string{"error": "invalid_or_reused_nonce"})
 		return
 	}
 
@@ -500,18 +670,30 @@ func handleSubmitChallenge(w http.ResponseWriter, r *http.Request) {
 		stats.EngineErrors++
 		stats.mu.Unlock()
 		log.Printf("[%s] motion analysis error: %v", serviceName, err)
+		// Rotate the consumed nonce so a legitimate retry can use a fresh one.
+		sessionsMu.Lock()
+		nextNonce, _ := rotateChallengeNonce(session, challengeIdx)
+		sessionsMu.Unlock()
 		respondJSON(w, 503, map[string]interface{}{
 			"error": "inference_engine_unavailable", "isLive": false, "detail": err.Error(),
+			"nextNonce": nextNonce,
 		})
 		return
 	}
 	isLive, _ := engineBool(engineResp, "isLive", "is_live", "passed")
 	score, _ := engineFloat(engineResp, "score", "motionScore", "motion_score")
 
+	// H-19: rotate the nonce after every submission; the consumed value can
+	// never be replayed.
+	sessionsMu.Lock()
+	nextNonce, _ := rotateChallengeNonce(session, challengeIdx)
+	sessionsMu.Unlock()
+
 	respondJSON(w, 200, map[string]interface{}{
 		"challengeId": body.ChallengeID,
 		"isLive":      isLive,
 		"score":       score,
+		"nextNonce":   nextNonce,
 	})
 }
 
@@ -1079,6 +1261,19 @@ func initSchema() {
 		similarity_score REAL,
 		payload JSONB,
 		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Fatalf("schema init failed: %v", err)
+	}
+
+	// Single-use challenge nonces (H-19 replay protection)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS liveness_challenge_nonces (
+		nonce VARCHAR(64) PRIMARY KEY,
+		session_id VARCHAR(64) NOT NULL,
+		challenge_id VARCHAR(64) NOT NULL,
+		customer_id VARCHAR(128) NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		consumed_at TIMESTAMPTZ
 	)`)
 	if err != nil {
 		log.Fatalf("schema init failed: %v", err)
