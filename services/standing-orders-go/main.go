@@ -187,14 +187,33 @@ func startScheduler(ctx context.Context) {
 	}()
 }
 
+// executeDueStandingOrders atomically CLAIMS each due order (UPDATE ... SET
+// status='running' WHERE status='active' ... RETURNING) before executing it.
+// Concurrent scheduler instances can never execute the same order twice: the
+// claim only succeeds for the instance that flips the row first. Orders left
+// in 'running' by a crashed scheduler are reclaimed after a grace period.
+// The schedule (next_execution_at) advances ONLY after a confirmed rail
+// execution; failures are recorded and retried on the next poll.
 func executeDueStandingOrders() {
 	if db == nil {
 		return
 	}
-	rows, err := db.Query(`SELECT id, account_id, beneficiary_id, amount, narration, frequency, execution_count, max_executions, end_date
-		FROM standing_orders WHERE status = 'active' AND next_execution_at IS NOT NULL AND next_execution_at <= NOW() LIMIT 50`)
+	// Recover orders stuck in 'running' by a crashed/killed scheduler.
+	if _, err := db.Exec(`UPDATE standing_orders SET status = 'active', updated_at = NOW()
+		WHERE status = 'running' AND updated_at < NOW() - interval '10 minutes'`); err != nil {
+		log.Printf("[scheduler] stale-claim recovery failed: %v", err)
+	}
+
+	// Atomic claim: only rows still 'active' and due are flipped to 'running'
+	// by THIS statement; a concurrent scheduler re-evaluates the predicate
+	// after lock wait and skips rows we claimed.
+	rows, err := db.Query(`UPDATE standing_orders SET status = 'running', updated_at = NOW()
+		WHERE id IN (SELECT id FROM standing_orders
+			WHERE status = 'active' AND next_execution_at IS NOT NULL AND next_execution_at <= NOW()
+			LIMIT 50)
+		RETURNING id, account_id, beneficiary_id, amount, narration, frequency, execution_count, max_executions, end_date`)
 	if err != nil {
-		log.Printf("[scheduler] due orders query failed: %v", err)
+		log.Printf("[scheduler] due orders claim failed: %v", err)
 		return
 	}
 	type dueOrder struct {
@@ -227,40 +246,64 @@ func executeDueStandingOrders() {
 			log.Printf("[scheduler] execution record insert failed for %s: %v", o.id, err)
 		}
 
-		next := nextExecutionAfter(o.frequency, time.Now())
-		newStatus := "active"
-		failureReason := errText
-		if execErr == nil {
-			o.execCount++
-			if o.maxExec > 0 && o.execCount >= o.maxExec {
-				newStatus = "completed"
+		if execErr != nil {
+			// Failure: release the claim WITHOUT advancing the schedule — the
+			// order stays due and is retried on the next poll. The failure is
+			// recorded above and on the order row.
+			if _, err := db.Exec(`UPDATE standing_orders SET
+				status = 'active', failure_reason = $2, updated_at = NOW()
+				WHERE id = $1 AND status = 'running'`,
+				o.id, errText); err != nil {
+				log.Printf("[scheduler] order %s claim release after failure failed: %v", o.id, err)
 			}
-			if o.endDate.Valid && o.endDate.String != "" {
-				if t, err := time.Parse("2006-01-02", o.endDate.String); err == nil && next.After(t) {
-					newStatus = "completed"
-				}
+			log.Printf("[scheduler] order %s execution FAILED (recorded, schedule NOT advanced): %v", o.id, execErr)
+			continue
+		}
+
+		// Confirmed execution: advance the schedule exactly once.
+		next := nextExecutionAfter(o.frequency, time.Now())
+		o.execCount++
+		newStatus := "active"
+		if o.maxExec > 0 && o.execCount >= o.maxExec {
+			newStatus = "completed"
+		}
+		if o.endDate.Valid && o.endDate.String != "" {
+			if t, err := time.Parse("2006-01-02", o.endDate.String); err == nil && next.After(t) {
+				newStatus = "completed"
 			}
 		}
 		if _, err := db.Exec(`UPDATE standing_orders SET
-			status = $2, execution_count = $3, last_executed_at = CASE WHEN $4 = '' THEN last_executed_at ELSE NOW() END,
-			next_execution_at = $5, failure_reason = $4, updated_at = NOW()
-			WHERE id = $1`,
-			o.id, newStatus, o.execCount, failureReason, next); err != nil {
-			log.Printf("[scheduler] order update failed for %s: %v", o.id, err)
-		}
-		if execErr != nil {
-			log.Printf("[scheduler] order %s execution FAILED (recorded): %v", o.id, execErr)
+			status = $2, execution_count = $3, last_executed_at = NOW(),
+			next_execution_at = $4, failure_reason = '', updated_at = NOW()
+			WHERE id = $1 AND status = 'running'`,
+			o.id, newStatus, o.execCount, next); err != nil {
+			log.Printf("[scheduler] order update failed for %s (execution DID succeed at rail, ref=%s): %v", o.id, ref, err)
 		}
 	}
 }
 
+// executeDueScheduledPayments atomically claims each due scheduled payment
+// (UPDATE ... SET status='running' WHERE status='scheduled' ... RETURNING)
+// before executing it, so concurrent schedulers never double-debit. The final
+// status is written only after the rail confirms (executed) or rejects
+// (failed) the transfer.
 func executeDueScheduledPayments() {
 	if db == nil {
 		return
 	}
-	rows, err := db.Query(`SELECT id, account_id, amount, payment_type, reference FROM scheduled_payments
-		WHERE status = 'scheduled' AND scheduled_at <= NOW() LIMIT 50`)
+	// Recover payments stuck in 'running' by a crashed/killed scheduler back
+	// to 'scheduled' so they are retried.
+	if _, err := db.Exec(`UPDATE scheduled_payments SET status = 'scheduled', updated_at = NOW()
+		WHERE status = 'running' AND updated_at < NOW() - interval '10 minutes'`); err != nil {
+		log.Printf("[scheduler] stale-claim recovery (scheduled payments) failed: %v", err)
+	}
+	rows, err := db.Query(`UPDATE scheduled_payments SET status = 'running', updated_at = NOW()
+		WHERE id IN (SELECT id FROM scheduled_payments
+			WHERE status = 'scheduled' AND scheduled_at <= NOW()
+			LIMIT 50)
+		RETURNING id, account_id, amount, payment_type, reference`)
 	if err != nil {
+		log.Printf("[scheduler] scheduled payment claim failed: %v", err)
 		return
 	}
 	type due struct {
@@ -283,7 +326,7 @@ func executeDueScheduledPayments() {
 			status = "failed"
 			log.Printf("[scheduler] scheduled payment %s failed: %v", p.id, err)
 		}
-		if _, uerr := db.Exec(`UPDATE scheduled_payments SET status = $2, updated_at = NOW() WHERE id = $1`, p.id, status); uerr != nil {
+		if _, uerr := db.Exec(`UPDATE scheduled_payments SET status = $2, updated_at = NOW() WHERE id = $1 AND status = 'running'`, p.id, status); uerr != nil {
 			log.Printf("[scheduler] scheduled payment update failed for %s: %v", p.id, uerr)
 		}
 	}
