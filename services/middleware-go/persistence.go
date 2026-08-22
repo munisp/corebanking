@@ -26,7 +26,9 @@ type PgStore struct {
 func NewPgStore(schema string) *PgStore {
 	connStr := os.Getenv("POSTGRES_URL")
 	if connStr == "" {
-		connStr = "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"
+		// M-04: no compiled-in credentials. Without POSTGRES_URL the store
+		// falls back to in-memory (Connect logs and returns nil).
+		log.Printf("[PgStore] POSTGRES_URL not set — database disabled")
 	}
 
 	store := &PgStore{
@@ -168,8 +170,8 @@ func (s *PgStore) Close() {
 // --- Redis Cache Layer ---
 
 type RedisCache struct {
-	url string
-	mu  sync.RWMutex
+	url  string
+	mu   sync.RWMutex
 	data map[string]string
 	ttls map[string]time.Time
 }
@@ -215,9 +217,9 @@ func (c *RedisCache) Delete(key string) {
 // --- OpenSearch integration ---
 
 type SearchIndex struct {
-	url    string
-	mu     sync.RWMutex
-	docs   map[string][]map[string]interface{} // index -> docs
+	url  string
+	mu   sync.RWMutex
+	docs map[string][]map[string]interface{} // index -> docs
 }
 
 func NewSearchIndex() *SearchIndex {

@@ -7,6 +7,10 @@ use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -27,7 +31,10 @@ struct CreateRequest {
 }
 
 struct AppState {
-    db: PgPool,
+    db: Option<PgPool>,
+    buckets: Mutex<HashMap<String, (u64, u64)>>,
+    db_url: Option<String>,
+    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
 fn tokens_available(bucket_size: u64, refill_rate: f64, elapsed_ms: u64, current: u64) -> u64 {
@@ -76,7 +83,7 @@ async fn check_rate(req: actix_web::HttpRequest, body: web::Json<serde_json::Val
     let error_rate = body.get("error_rate").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let latency_p99 = body.get("latency_p99").and_then(|v| v.as_f64()).unwrap_or(100.0);
     let limit = adaptive_limit(base_rate, error_rate, latency_p99);
-    let mut buckets = state.buckets.lock().unwrap();
+    let mut buckets = state.buckets.lock().await;
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     let (tokens, _) = buckets.entry(client_id.to_string()).or_insert((limit, now_ms));
     let allowed = *tokens > 0;
@@ -90,7 +97,7 @@ async fn check_rate(req: actix_web::HttpRequest, body: web::Json<serde_json::Val
 async fn stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    let buckets = state.buckets.lock().unwrap();
+    let buckets = state.buckets.lock().await;
     db_persist(&state, "stats", &json!({"action": "stats"})).await;
     HttpResponse::Ok().json(json!({"active_clients": buckets.len(), "service": "adaptive-rate-limiter-rs"}))
 }
@@ -411,7 +418,15 @@ fn mtls_config() -> (bool, String, String, String) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8200);
+    let db_pool: Option<PgPool> = match std::env::var("DATABASE_URL") {
+        Ok(url) => match PgPoolOptions::new().max_connections(5).acquire_timeout(std::time::Duration::from_secs(5)).connect(&url).await {
+            Ok(pool) => { init_schema(&pool).await; Some(pool) }
+            Err(e) => { eprintln!("[adaptive-rate-limiter-rs] pg pool connect failed: {} — SQL CRUD endpoints will return 503", e); None }
+        },
+        Err(_) => { eprintln!("[adaptive-rate-limiter-rs] DATABASE_URL not set — SQL CRUD endpoints will return 503"); None }
+    };
     let state = web::Data::new(AppState {
+        db: db_pool,
         buckets: Mutex::new(HashMap::new()),
         db_url: std::env::var("DATABASE_URL").ok(),
             db_client: {
@@ -468,6 +483,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/service_configs/{id}", web::get().to(get_record))
             .route("/api/v1/service_configs/{id}", web::put().to(update_record))
             .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .route("/v1/ratelimit/check", web::post().to(check_rate))
+            .route("/v1/ratelimit/stats", web::get().to(stats))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -543,14 +560,113 @@ mod tests {
 
 }
 
+async fn metrics() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "service": "adaptive-rate-limiter-rs",
+        "requests_total": _REQ_COUNT.load(AtomicOrdering::Relaxed),
+        "errors_total": _ERR_COUNT.load(AtomicOrdering::Relaxed),
+    }))
+}
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let tenant_id = req.headers().get("X-Tenant-ID")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
+
+    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "status": r.get::<String, _>("status"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+                })
+            }).collect();
+            let count = records.len();
+            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let tenant_id = body.tenant_id.clone()
+        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
+        .unwrap_or_else(|| "default".to_string());
+
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
+
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
+    )
+    .bind(&tenant_id)
+    .bind(&status)
+    .fetch_one(pool)
+    .await;
+
+    match result {
+        Ok(id) => {
+            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.created")
+                .bind(id.to_string())
+                .bind(&payload)
+                .execute(pool).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let id = path.into_inner();
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
+    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_optional(pool)
+        .await;
+
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
 
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(pool)
         .await;
 
     match result {
@@ -560,7 +676,7 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(pool).await.ok();
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -569,9 +685,13 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     let id = path.into_inner();
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
     sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
+        .execute(pool)
         .await
         .ok();
 
@@ -580,7 +700,7 @@ async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> Ht
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(pool).await.ok();
 
     HttpResponse::NoContent().finish()
 }

@@ -154,7 +154,7 @@ async fn fetch_loan_book(db: &PgPool) -> Result<Vec<LoanExposure>, String> {
 
 // Post a provision journal ONLY via the real GL service. Returns "posted"
 // solely on a confirmed 2xx-ish response; any failure => "not_posted".
-fn post_gl_provision(gl_url: &str, posting: &GLProvisioning) -> String {
+async fn post_gl_provision(gl_url: &str, posting: &GLProvisioning) -> String {
     let body = json!({
         "entryId": posting.entry_id,
         "lines": [
@@ -165,14 +165,19 @@ fn post_gl_provision(gl_url: &str, posting: &GLProvisioning) -> String {
         "postingType": posting.posting_type,
     })
     .to_string();
-    match call_service_sync(&format!("{}/v1/gl/journal-entries", gl_url), &body) {
-        Ok(resp) if !resp.contains("\"error\"") => "posted".to_string(),
-        Ok(resp) => {
+    let url = format!("{}/v1/gl/journal-entries", gl_url);
+    match tokio::task::spawn_blocking(move || call_service_sync(&url, &body)).await {
+        Ok(Ok(resp)) if !resp.contains("\"error\"") => "posted".to_string(),
+        Ok(Ok(resp)) => {
             eprintln!("[ifrs9-ecl-engine-rs] GL post rejected: {}", resp);
             "not_posted".to_string()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("[ifrs9-ecl-engine-rs] GL post failed: {}", e);
+            "not_posted".to_string()
+        }
+        Err(e) => {
+            eprintln!("[ifrs9-ecl-engine-rs] GL post join failed: {}", e);
             "not_posted".to_string()
         }
     }
@@ -223,7 +228,7 @@ async fn compute_ecl_portfolio_async(db: &PgPool) -> Result<ECLPortfolioResult, 
             status: "not_posted".to_string(),
         };
         if !gl_url.is_empty() {
-            posting.status = post_gl_provision(&gl_url, &posting);
+            posting.status = post_gl_provision(&gl_url, &posting).await;
         } else {
             eprintln!("[ifrs9-ecl-engine-rs] GL_ENGINE_URL not set — provisions NOT posted (not_posted)");
         }

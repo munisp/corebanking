@@ -190,7 +190,6 @@ def get_db():
 
 def release_db(conn):
     """Return a connection to the pool."""
-    global _db_pool
     if _db_pool and conn:
         try:
             _db_pool.putconn(conn)
@@ -235,8 +234,8 @@ def init_schema():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_schema()
-    logger.info(f"[document-intelligence-py] ready on :%d", PORT)
-    logger.info(f"[document-intelligence-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+    logger.info("[document-intelligence-py] ready on :%d", PORT)
+    logger.info("[document-intelligence-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
     yield
     if db_conn:
@@ -331,7 +330,7 @@ def validate_jwt(headers):
     if not auth.startswith("Bearer "):
         return None, "Missing Bearer token"
     token = auth[7:]
-    import hmac, hashlib, base64, json as _json, time as _t
+    import hmac, base64, json as _json, time as _t
     def _b64url_decode(s):
         s += "=" * (-len(s) % 4)
         return base64.urlsafe_b64decode(s.encode())
@@ -366,114 +365,100 @@ def validate_jwt(headers):
     return payload, None
 
 # --- Domain Logic ---
-def simulate_paddleocr_extraction(image_b64, doc_type, template):
-    img_size = len(image_b64) if image_b64 else 0
-    seed = int(hashlib.sha256((image_b64 or "empty")[:100].encode()).hexdigest()[:8], 16)
-    confidence = 0.85 + (seed % 12) / 100.0
+def ocr_extract(image_b64, doc_type, template):
+    """Real OCR extraction via the configured upstream OCR pipeline.
 
-    fields = {}
-    for field_name in template.get("fields", []):
-        fields[field_name] = {"value": "", "confidence": confidence - 0.02 + (hash(field_name) % 5) / 100.0,
-            "bbox": [0, 0, 100, 20], "recognized": True}
-
-    text_lines = max(5, img_size // 1000)
-    tables = 1 if doc_type in ("audited_financials", "bank_statement") else 0
-
-    return {
-        "engine": "paddleocr_v4",
-        "config": PADDLEOCR_CONFIG,
-        "text_lines_detected": text_lines,
-        "tables_detected": tables,
-        "layout_regions": [
-            {"type": "text", "bbox": [0, 0, 1, 1], "confidence": confidence},
-        ],
-        "fields": fields,
-        "raw_text": "",
-        "overall_confidence": round(confidence, 4),
-        "processing_ms": 450 + (seed % 800),
-    }
+    No fabricated results: when no OCR pipeline is configured the endpoint
+    fails fast with 501 not_implemented; when the pipeline is unreachable it
+    fails with 503 model_unavailable.
+    """
+    upstream = os.environ.get("OCR_SERVICE_URL", "").strip()
+    if not upstream:
+        raise HTTPException(status_code=501, detail={
+            "error": "not_implemented",
+            "message": "no OCR pipeline configured (set OCR_SERVICE_URL)"})
+    try:
+        return call_service("POST", upstream.rstrip("/") + "/v1/ocr/extract",
+                            {"image_b64": image_b64, "doc_type": doc_type,
+                             "template": template, "config": PADDLEOCR_CONFIG})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={
+            "error": "model_unavailable",
+            "message": f"OCR pipeline unreachable: {e}"})
 
 
-def simulate_vlm_classification(image_b64, expected_class=None):
-    seed = int(hashlib.sha256((image_b64 or "empty")[:100].encode()).hexdigest()[:8], 16)
-    confidence = 0.90 + (seed % 8) / 100.0
+def vlm_classify(image_b64, expected_class=None):
+    """Real VLM document classification/quality/fraud check via upstream model.
 
-    predicted = expected_class or VLM_CONFIG["supported_classes"][seed % len(VLM_CONFIG["supported_classes"])]
-    alternatives = [{"class": c, "confidence": round(0.01 + (hash(c) % 3) / 100, 4)}
-        for c in VLM_CONFIG["supported_classes"] if c != predicted][:3]
-
-    blur_score = (seed % 20) / 100.0
-    quality = "high" if blur_score < 0.1 else "medium" if blur_score < 0.2 else "low"
-
-    fraud_indicators = {}
-    for check in VLM_CONFIG["fraud_checks"]:
-        fraud_indicators[check] = {"detected": False, "confidence": 0.95 + (hash(check) % 5) / 100.0}
-
-    tampering = (seed % 50) == 0
-    if tampering:
-        fraud_indicators["digital_tampering"]["detected"] = True
-
-    return {
-        "engine": "vlm",
-        "model": VLM_CONFIG["model"],
-        "classification": {
-            "predicted_class": predicted,
-            "confidence": round(confidence, 4),
-            "alternatives": alternatives,
-        },
-        "quality_assessment": {
-            "overall_quality": quality,
-            "resolution_adequate": True,
-            "blur_score": round(blur_score, 4),
-            "lighting": "good" if blur_score < 0.15 else "poor",
-            "orientation": "correct",
-            "cropping_adequate": True,
-            "ocr_readable": quality != "low",
-        },
-        "fraud_detection": {
-            "fraud_detected": tampering,
-            "overall_confidence": round(0.95 + (seed % 4) / 100.0, 4),
-            "indicators": fraud_indicators,
-            "recommendation": "reject" if tampering else "accept",
-        },
-    }
+    No fabricated results: 501 when no VLM pipeline is configured, 503 when
+    the pipeline is unreachable.
+    """
+    upstream = os.environ.get("VLM_SERVICE_URL", "").strip()
+    if not upstream:
+        raise HTTPException(status_code=501, detail={
+            "error": "not_implemented",
+            "message": "no VLM pipeline configured (set VLM_SERVICE_URL)"})
+    try:
+        return call_service("POST", upstream.rstrip("/") + "/v1/vlm/classify",
+                            {"image_b64": image_b64,
+                             "expected_class": expected_class,
+                             "config": VLM_CONFIG})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={
+            "error": "model_unavailable",
+            "message": f"VLM pipeline unreachable: {e}"})
 
 
-def simulate_docling_parsing(doc_type, content_b64=None):
-    template_name = doc_type if doc_type in DOCLING_CONFIG["structured_templates"] else "memart"
-    sections = DOCLING_CONFIG["structured_templates"][template_name]
+def docling_parse(doc_type, content_b64=None):
+    """Real structured document parsing via the configured docling service.
 
-    seed = int(hashlib.sha256((content_b64 or "empty")[:50].encode()).hexdigest()[:8], 16)
-    confidence = 0.85 + (seed % 10) / 100.0
+    No fabricated results: 501 when no parsing pipeline is configured, 503
+    when the pipeline is unreachable.
+    """
+    upstream = os.environ.get("DOCLING_SERVICE_URL", "").strip()
+    if not upstream:
+        raise HTTPException(status_code=501, detail={
+            "error": "not_implemented",
+            "message": "no docling pipeline configured (set DOCLING_SERVICE_URL)"})
+    try:
+        return call_service("POST", upstream.rstrip("/") + "/v1/parse",
+                            {"doc_type": doc_type, "content_b64": content_b64,
+                             "config": DOCLING_CONFIG})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={
+            "error": "model_unavailable",
+            "message": f"docling pipeline unreachable: {e}"})
 
-    parsed_sections = {}
-    for section in sections:
-        parsed_sections[section] = {
-            "extracted": True,
-            "confidence": round(confidence - 0.02 + (hash(section) % 5) / 100, 4),
-            "content": f"[Extracted content for {section}]",
-            "page_numbers": [1],
-            "tables": [],
-        }
 
-    return {
-        "engine": "docling",
-        "version": DOCLING_CONFIG["version"],
-        "document_type": doc_type,
-        "template": template_name,
-        "total_pages": 1 + (seed % 50),
-        "sections": parsed_sections,
-        "metadata": {
-            "language": "en",
-            "format": "pdf",
-            "encrypted": False,
-            "scanned": seed % 3 == 0,
-        },
-        "cross_references": [],
-        "tables_extracted": seed % 5,
-        "overall_confidence": round(confidence, 4),
-        "processing_ms": 1200 + (seed % 3000),
-    }
+class _OcrRequest(BaseModel):
+    image_b64: str
+    doc_type: str = "generic"
+    template: Dict[str, Any] = {}
+
+
+class _VlmRequest(BaseModel):
+    image_b64: str
+    expected_class: Optional[str] = None
+
+
+class _ParseRequest(BaseModel):
+    doc_type: str
+    content_b64: Optional[str] = None
+
+
+@app.post("/v1/ocr/extract")
+def ocr_extract_route(req: _OcrRequest):
+    return ocr_extract(req.image_b64, req.doc_type, req.template)
+
+
+@app.post("/v1/vlm/classify")
+def vlm_classify_route(req: _VlmRequest):
+    return vlm_classify(req.image_b64, req.expected_class)
+
+
+@app.post("/v1/docling/parse")
+def docling_parse_route(req: _ParseRequest):
+    return docling_parse(req.doc_type, req.content_b64)
 
 
 
@@ -587,26 +572,6 @@ def grpc_call(target, method, payload, retries=3):
         finally:
             try: sock.close()
             except: pass
-    return None
-
-def call_service(method, url, body=None, retries=3, timeout=15):
-    """HTTP inter-service call with retry + circuit breaker."""
-    if not _grpc_cb.allow():
-        return None
-    import urllib.request, urllib.error
-    for attempt in range(retries):
-        try:
-            data = json.dumps(body).encode() if body else None
-            req = urllib.request.Request(url, data=data, method=method,
-                                         headers={"Content-Type": "application/json"})
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            _grpc_cb.record_success()
-            return json.loads(resp.read())
-        except Exception as e:
-            _grpc_cb.record_failure()
-            if attempt < retries - 1:
-                time.sleep((2 ** attempt) * 0.2)
-            logger.warning(f"HTTP {method} {url} attempt {attempt+1} failed: {e}")
     return None
 
 # gRPC service registry
@@ -767,7 +732,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = urlparse(self.path).path
         length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(length).decode() if isinstance(self.rfile.read(length), bytes) else str(self.rfile.read(length)))) if length > 0 else {}
+        if length > 0:
+            self.rfile.read(length)  # consume request body (payload not used by this handler)
 
         # JWT auth check — real signature verification, fail closed
         claims, err = validate_jwt(dict(self.headers))

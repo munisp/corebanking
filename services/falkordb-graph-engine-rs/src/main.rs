@@ -7,6 +7,10 @@ use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use tokio::sync::Mutex;
+use tokio_postgres::NoTls;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -28,12 +32,147 @@ struct CreateRequest {
 
 struct AppState {
     db: PgPool,
+    entities: Mutex<Vec<EntityNode>>,
+    edges: Mutex<Vec<GraphEdge>>,
+    falkordb: FalkorDBClient,
+    db_url: Option<String>,
+    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EntityNode {
+    entity_id: String,
+    entity_type: String,
+    name: String,
+    #[serde(default)]
+    risk_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GraphEdge {
+    from_id: String,
+    to_id: String,
+    edge_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphQuery {
+    cypher: String,
+    #[serde(default)]
+    params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PathQuery {
+    source_id: String,
+    target_id: String,
+    #[serde(default)]
+    max_hops: Option<u32>,
+}
+
+// Minimal FalkorDB (Redis RESP GRAPH.QUERY) client. Real network call only;
+// errors propagate — no fabricated results.
+struct FalkorDBClient {
+    redis_url: String,
+    graph_name: String,
+}
+
+impl FalkorDBClient {
+    fn execute_query(&self, cypher: &str, _params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(&self.redis_url)
+            .map_err(|e| format!("falkordb connect failed: {}", e))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5))).ok();
+        let g = self.graph_name.as_bytes();
+        let q = cypher.as_bytes();
+        let cmd = format!(
+            "*4\r\n$11\r\nGRAPH.QUERY\r\n${}\r\n{}\r\n${}\r\n{}\r\n$9\r\n--compact\r\n",
+            g.len(), self.graph_name, q.len(), cypher
+        );
+        stream.write_all(cmd.as_bytes()).map_err(|e| format!("falkordb write failed: {}", e))?;
+        let mut buf = vec![0u8; 65536];
+        let n = stream.read(&mut buf).map_err(|e| format!("falkordb read failed: {}", e))?;
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        if text.starts_with('-') {
+            return Err(format!("falkordb error: {}", text.lines().next().unwrap_or("unknown")));
+        }
+        Ok(json!({"raw": text}))
+    }
+}
+
+fn cbn_reporting_threshold_ngn() -> f64 { 5_000_000.0 }
+
+// Idempotent seed for the top-level Chart-of-Accounts classes (static reference data).
+fn falkordb_seed_coa_query() -> Vec<String> {
+    ["Assets", "Liabilities", "Equity", "Income", "Expenses"]
+        .iter()
+        .map(|c| format!("MERGE (e:CoAClass {{entityId: 'coa_{}', name: '{}'}})", c.to_lowercase(), c))
+        .collect()
+}
+
+// Simple bounded-depth cycle detection over the in-memory edge list.
+fn detect_circular_transactions(edges: &[GraphEdge]) -> Vec<Vec<String>> {
+    let mut adj: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for e in edges {
+        adj.entry(e.from_id.as_str()).or_default().push(e.to_id.as_str());
+    }
+    let mut cycles: Vec<Vec<String>> = Vec::new();
+    let mut seen: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
+    for start in adj.keys() {
+        let start = *start;
+        let mut stack: Vec<(&str, Vec<&str>)> = vec![(start, vec![start])];
+        while let Some((node, path)) = stack.pop() {
+            if path.len() > 6 { continue; }
+            if let Some(nexts) = adj.get(node) {
+                for n in nexts {
+                    if *n == start && path.len() >= 2 {
+                        let mut cyc: Vec<String> = path.iter().map(|s| s.to_string()).collect();
+                        cyc.push(n.to_string());
+                        let mut key = cyc.clone();
+                        key.sort();
+                        if seen.insert(key) {
+                            cycles.push(cyc);
+                        }
+                    } else if !path.contains(n) {
+                        let mut p = path.clone();
+                        p.push(n);
+                        stack.push((n, p));
+                    }
+                }
+            }
+        }
+    }
+    cycles
+}
+
+fn compute_entity_centrality(edges: &[GraphEdge]) -> f64 {
+    edges.len() as f64
+}
+
+fn classify_entity_risk(is_pep: bool, is_sanctioned: bool, high_risk_country: bool, circular: usize, centrality: f64) -> (f64, &'static str) {
+    if is_sanctioned { return (1.0, "prohibited"); }
+    let mut score = 0.0f64;
+    if is_pep { score += 0.4; }
+    if high_risk_country { score += 0.3; }
+    if circular > 0 { score += 0.2; }
+    if centrality > 10.0 { score += 0.1; }
+    let score = score.min(1.0);
+    let level = if score >= 0.7 { "high" } else if score >= 0.4 { "medium" } else { "low" };
+    (score, level)
+}
+
+fn compute_transaction_velocity(edges: &[GraphEdge], window_secs: u64) -> f64 {
+    if window_secs == 0 { return 0.0; }
+    edges.len() as f64 / window_secs as f64
 }
 
 // ─── SECURITY / RATE LIMITING / OBSERVABILITY ────────────────────────────────
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
 static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
+static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
+static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 fn sanitize_input(s: &str) -> String {
     s.replace('<', "&lt;").replace('>', "&gt;").replace('\'', "&#39;").replace('"', "&quot;").chars().take(10240).collect()
@@ -76,6 +215,23 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
             "INSERT INTO records (id, service, tenant, status, data, created_at) VALUES ($1, $2, 'default', 'active', $3, NOW()) ON CONFLICT (id) DO UPDATE SET data=$3",
             &[&id, &svc_name, &data.to_string()],
         ).await;
+    }
+}
+
+
+// --- Database Connection ---
+async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
+    match tokio_postgres::connect(db_url, NoTls).await {
+        Ok((client, connection)) => {
+            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
+            let _ = client.execute(
+                "CREATE TABLE IF NOT EXISTS records (
+                    id TEXT PRIMARY KEY, service TEXT NOT NULL, tenant TEXT DEFAULT 'default',
+                    status TEXT DEFAULT 'active', data TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
+                )", &[]).await;
+            Some(client)
+        }
+        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
     }
 }
 
@@ -171,8 +327,8 @@ async fn degradation_status() -> HttpResponse {
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    let entities = state.entities.lock().unwrap();
-    let edges = state.edges.lock().unwrap();
+    let entities = state.entities.lock().await;
+    let edges = state.edges.lock().await;
     let _cbn = cbn_reporting_threshold_ngn();
     HttpResponse::Ok().json(json!({
         "status": "healthy",
@@ -241,7 +397,7 @@ async fn create_entity(req: actix_web::HttpRequest, state: web::Data<AppState>, 
         entity.entity_type, entity.entity_id, entity.name, entity.risk_score.unwrap_or(0.0)
     );
     let _ = state.falkordb.execute_query(&cypher, &json!({}));
-    let mut entities = state.entities.lock().unwrap();
+    let mut entities = state.entities.lock().await;
     entities.push(entity.clone());
     db_persist(&state, "create_entity", &json!({"entityId": entity.entity_id})).await;
     HttpResponse::Created().json(json!({"created": true, "entityId": entity.entity_id}))
@@ -258,7 +414,7 @@ async fn create_edge(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
         edge.from_id, edge.to_id, edge.edge_type
     );
     let _ = state.falkordb.execute_query(&cypher, &json!({}));
-    let mut edges = state.edges.lock().unwrap();
+    let mut edges = state.edges.lock().await;
     edges.push(edge.clone());
     db_persist(&state, "create_edge", &json!({"from": edge.from_id, "to": edge.to_id, "type": edge.edge_type})).await;
     HttpResponse::Created().json(json!({"linked": true, "edgeType": edge.edge_type}))
@@ -267,7 +423,7 @@ async fn create_edge(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
 async fn detect_circular(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let edges = state.edges.lock().unwrap();
+    let edges = state.edges.lock().await;
     let cycles = detect_circular_transactions(&edges);
 
     // Inter-service: notify AML engine
@@ -283,7 +439,7 @@ async fn entity_centrality(req: actix_web::HttpRequest, state: web::Data<AppStat
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
     let entity_id = query.get("entityId").cloned().unwrap_or_default();
-    let edges = state.edges.lock().unwrap();
+    let edges = state.edges.lock().await;
     let entity_edges: Vec<GraphEdge> = edges.iter().filter(|e| e.from_id == entity_id).cloned().collect();
     let centrality = compute_entity_centrality(&entity_edges);
     HttpResponse::Ok().json(json!({"entityId": entity_id, "degreeCentrality": centrality, "connections": entity_edges.len()}))
@@ -344,7 +500,7 @@ async fn transaction_velocity(req: actix_web::HttpRequest, state: web::Data<AppS
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if let Err(resp) = check_jwt(&req) { return resp; }
     let window = query.get("window").and_then(|w| w.parse::<u64>().ok()).unwrap_or(3600);
-    let edges = state.edges.lock().unwrap();
+    let edges = state.edges.lock().await;
     let velocity = compute_transaction_velocity(&edges, window);
     HttpResponse::Ok().json(json!({"velocity": velocity, "windowSeconds": window, "totalEdges": edges.len()}))
 }
@@ -449,6 +605,20 @@ async fn main() -> std::io::Result<()> {
     init_schema(&pool).await;
     log::info!("[falkordb-graph-engine-rs] database connected, schema initialized");
 
+    let db_client = init_db(&database_url).await.map(|c| std::sync::Arc::new(c));
+    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8277);
+    let state = web::Data::new(AppState {
+        db: pool,
+        entities: Mutex::new(Vec::new()),
+        edges: Mutex::new(Vec::new()),
+        falkordb: FalkorDBClient {
+            redis_url: env::var("FALKORDB_URL").unwrap_or_else(|_| "localhost:6379".to_string()),
+            graph_name: env::var("FALKORDB_GRAPH").unwrap_or_else(|_| "bank54".to_string()),
+        },
+        db_url: env::var("DATABASE_URL").ok(),
+        db_client,
+    });
+
     start_grpc_server("falkordb-graph-engine-rs", 10458);
     HttpServer::new(move || {
         App::new()
@@ -461,8 +631,11 @@ async fn main() -> std::io::Result<()> {
                 .add(("X-XSS-Protection", "1; mode=block"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
             )
-            .wrap_fn(move |req, srv| {
-                let trace = trace_id.clone();
+            .wrap_fn(|req, srv| {
+                let trace = req.headers().get("X-Trace-Id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("none")
+                    .to_string();
                 eprintln!("[falkordb-graph-engine-rs] {} {} trace={}", req.method(), req.path(), trace);
                 srv.call(req)
             })
@@ -476,6 +649,15 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/service_configs/{id}", web::get().to(get_record))
             .route("/api/v1/service_configs/{id}", web::put().to(update_record))
             .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .route("/v1/graph/seed", web::post().to(seed_graph))
+            .route("/v1/graph/entities", web::post().to(create_entity))
+            .route("/v1/graph/edges", web::post().to(create_edge))
+            .route("/v1/graph/circular", web::get().to(detect_circular))
+            .route("/v1/graph/centrality", web::get().to(entity_centrality))
+            .route("/v1/graph/risk-classification", web::post().to(risk_classification))
+            .route("/v1/graph/query", web::post().to(query_graph))
+            .route("/v1/graph/path", web::post().to(find_path))
+            .route("/v1/graph/velocity", web::get().to(transaction_velocity))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
@@ -494,6 +676,113 @@ mod tests {
     #[test]
     fn test_rate_limiter() {
         assert!(rl_allow());
+    }
+}
+
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(64) NOT NULL,
+        aggregate_id VARCHAR(128) NOT NULL,
+        payload JSONB NOT NULL,
+        published BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .ok();
+}
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let tenant_id = req.headers().get("X-Tenant-ID")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+
+    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+        .bind(tenant_id)
+        .fetch_all(&data.db)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "status": r.get::<String, _>("status"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+                })
+            }).collect();
+            let count = records.len();
+            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let tenant_id = body.tenant_id.clone()
+        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
+        .unwrap_or_else(|| "default".to_string());
+
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
+    )
+    .bind(&tenant_id)
+    .bind(&status)
+    .fetch_one(&data.db)
+    .await;
+
+    match result {
+        Ok(id) => {
+            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.created")
+                .bind(id.to_string())
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
+
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 

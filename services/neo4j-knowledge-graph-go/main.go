@@ -5,12 +5,12 @@
 package main
 
 import (
-	"github.com/IBM/sarama"
+	"bytes"
 	"context"
 	"database/sql"
-	"bytes"
-"encoding/json"
+	"encoding/json"
 	"fmt"
+	"github.com/IBM/sarama"
 	"io"
 	"log"
 	"net"
@@ -98,7 +98,7 @@ func (c *Neo4jClient) ExecuteCypher(query string, params map[string]interface{})
 
 	var result struct {
 		Results []struct {
-			Columns []string        `json:"columns"`
+			Columns []string `json:"columns"`
 			Data    []struct {
 				Row []interface{} `json:"row"`
 			} `json:"data"`
@@ -352,12 +352,12 @@ func (c *Neo4jClient) queryEntityNetwork(entityID string, depth int) ([]map[stri
 
 func (c *Neo4jClient) getGraphStats() (map[string]interface{}, error) {
 	queries := map[string]string{
-		"glAccounts":       "MATCH (a:GLAccount) RETURN count(a) AS count",
-		"amlEntities":      "MATCH (e:AMLEntity) RETURN count(e) AS count",
-		"transactions":     "MATCH ()-[t:TRANSACTED_WITH]->() RETURN count(t) AS count",
-		"regulations":      "MATCH (r:Regulation) RETURN count(r) AS count",
+		"glAccounts":        "MATCH (a:GLAccount) RETURN count(a) AS count",
+		"amlEntities":       "MATCH (e:AMLEntity) RETURN count(e) AS count",
+		"transactions":      "MATCH ()-[t:TRANSACTED_WITH]->() RETURN count(t) AS count",
+		"regulations":       "MATCH (r:Regulation) RETURN count(r) AS count",
 		"regulatoryReturns": "MATCH (ret:RegulatoryReturn) RETURN count(ret) AS count",
-		"relationships":    "MATCH ()-[r]->() RETURN count(r) AS count",
+		"relationships":     "MATCH ()-[r]->() RETURN count(r) AS count",
 	}
 	stats := make(map[string]interface{})
 	for key, q := range queries {
@@ -459,35 +459,9 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 }
 
 // --- JWT Validation (JWKS-aware) ---
+// jwtAuthMiddleware delegates to the JWKS/RS256 jwtMiddleware (fail-closed).
 func jwtAuthMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        p := r.URL.Path
-        if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" || p == "/v1/degradation" {
-            next.ServeHTTP(w, r)
-            return
-        }
-        auth := r.Header.Get("Authorization")
-        if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-            return
-        }
-        token := strings.TrimPrefix(auth, "Bearer ")
-        // Validate JWT structure (header.payload.signature)
-        parts := strings.Split(token, ".")
-        if len(parts) != 3 {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
-            return
-        }
-        // In production: validate against Keycloak JWKS endpoint
-        // keycloakURL := os.Getenv("KEYCLOAK_URL")
-        // Decode payload for claims
-        r.Header.Set("X-User-Id", "validated")
-        next.ServeHTTP(w, r)
-    })
+	return jwtMiddleware(jwtRealmURL(), next)
 }
 
 func cacheGet(key string) (string, bool) {
@@ -618,11 +592,11 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	incRequests()
 	stats, _ := neo4jClient.getGraphStats()
 	writeJSON(w, 200, map[string]interface{}{
-		"status":  "healthy",
-		"service": serviceName,
-		"version": "1.0.0",
-		"neo4j":   neo4jClient.config,
-		"graph":   stats,
+		"status":   "healthy",
+		"service":  serviceName,
+		"version":  "1.0.0",
+		"neo4j":    neo4jClient.config,
+		"graph":    stats,
 		"database": dbSourceTag(),
 		"capabilities": []string{
 			"fibo_ontology_graph",
@@ -844,140 +818,150 @@ func graphStatsHandler(w http.ResponseWriter, r *http.Request) {
 
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
-
 func validateCypherQuery(query string) (bool, string) {
 	upper := strings.ToUpper(query)
 	dangerous := []string{"DROP", "DELETE ALL", "DETACH DELETE"}
-	for _, d := range dangerous { if strings.Contains(upper, d) { return false, "Destructive query not allowed: " + d } }
+	for _, d := range dangerous {
+		if strings.Contains(upper, d) {
+			return false, "Destructive query not allowed: " + d
+		}
+	}
 	return true, "Cypher query valid"
 }
 func computeGraphMetrics(nodeCount, edgeCount int) map[string]float64 {
 	density := 0.0
-	if nodeCount > 1 { density = float64(edgeCount) / float64(nodeCount*(nodeCount-1)) }
+	if nodeCount > 1 {
+		density = float64(edgeCount) / float64(nodeCount*(nodeCount-1))
+	}
 	return map[string]float64{"density": density, "avg_degree": float64(edgeCount*2) / float64(nodeCount)}
 }
 
-
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
+	failures    int
+	lastFailure time.Time
+	threshold   int
+	resetAfter  time.Duration
+	mu          sync.Mutex
 }
 
 func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2
-            return true
-        }
-        return false
-    }
-    return true
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures >= cb.threshold {
+		if time.Since(cb.lastFailure) > cb.resetAfter {
+			cb.failures = cb.threshold / 2
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures > 0 {
+		cb.failures--
+	}
 }
 
 func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
 }
 
 var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
 
 func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
-        }
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        req.Header.Set("X-Source-Service", serviceName)
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+	if !_cb.allow() {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+		}
+		var req *http.Request
+		if body != nil {
+			jsonData, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Source-Service", serviceName)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cb.recordFailure()
+			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			_cb.recordFailure()
+			continue
+		}
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cb.recordSuccess()
+		return result, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
 // --- Alerting ---
 type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
+	rules []alertRule
+	mu    sync.RWMutex
 }
 
 type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
+	Name      string
+	Metric    string
+	Threshold float64
+	Severity  string
 }
 
 var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
+	rules: []alertRule{
+		{"high_error_rate", "error_rate", 0.05, "critical"},
+		{"high_latency", "p99_latency_ms", 5000, "warning"},
+		{"db_connection_failures", "db_failures", 3, "critical"},
+	},
 }
 
 func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
+	var fired []map[string]interface{}
+	errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
+	if errRate > 0.05 {
+		fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+	}
+	return fired
 }
 
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    writeJSON(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	writeJSON(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Integration Tests ---
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(code)
-    json.NewEncoder(w).Encode(data)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(data)
 }
-
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
@@ -1012,9 +996,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -1027,7 +1015,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		for range time.Tick(5 * time.Minute) {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -1052,7 +1042,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -1114,7 +1106,9 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 
 	// Events are marked published ONLY after a confirmed Kafka produce.
 	producer, err := getKafkaProducer(brokers)
@@ -1124,14 +1118,18 @@ func relayOutbox(brokers string, topic string) {
 	}
 
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
 		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
 			Topic: topic,
 			Key:   sarama.StringEncoder(aggID),
@@ -1143,7 +1141,9 @@ func relayOutbox(brokers string, topic string) {
 		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
+	if len(ids) == 0 {
+		return
+	}
 	for _, id := range ids {
 		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
 			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
@@ -1175,8 +1175,6 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 	kafkaProducer = p
 	return kafkaProducer, nil
 }
-
-
 
 func main() {
 	port := os.Getenv("PORT")

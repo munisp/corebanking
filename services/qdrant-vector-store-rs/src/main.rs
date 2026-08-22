@@ -7,6 +7,10 @@ use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use tokio::sync::Mutex;
+use tokio_postgres::NoTls;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -26,10 +30,76 @@ struct CreateRequest {
     extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VectorPoint {
+    pub id: String,
+    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct UpsertRequest {
     pub collection: String,
     pub points: Vec<VectorPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchRequest {
+    pub collection: String,
+    pub vector: Vec<f32>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResult {
+    pub id: String,
+    pub score: f32,
+    pub payload: serde_json::Value,
+}
+
+// Minimal Qdrant REST client. Real HTTP calls only; errors propagate —
+// no fabricated responses.
+struct QdrantClient {
+    base_url: String,
+}
+
+impl QdrantClient {
+    fn request(&self, method: &str, path: &str, body: &str) -> Result<serde_json::Value, String> {
+        use std::io::{Read, Write};
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
+        let url_parsed = url.strip_prefix("http://").unwrap_or(url.as_str());
+        let (host_port, req_path) = url_parsed.split_once('/').unwrap_or((url_parsed, ""));
+        let host_port = if !host_port.contains(':') { format!("{}:6333", host_port) } else { host_port.to_string() };
+        let mut stream = std::net::TcpStream::connect_timeout(
+            &host_port.parse().map_err(|e| format!("{}", e))?,
+            std::time::Duration::from_secs(5),
+        ).map_err(|e| format!("qdrant connect failed: {}", e))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).ok();
+        let host = host_port.split(':').next().unwrap_or("localhost");
+        let req = format!("{} /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", method, req_path, host, body.len(), body);
+        stream.write_all(req.as_bytes()).map_err(|e| format!("qdrant write failed: {}", e))?;
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).map_err(|e| format!("qdrant read failed: {}", e))?;
+        let status_ok = resp.starts_with("HTTP/1.1 2") || resp.starts_with("HTTP/1.0 2");
+        if !status_ok {
+            return Err(format!("qdrant {} {} failed: {}", method, path, resp.lines().next().unwrap_or("unknown status")));
+        }
+        let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+        serde_json::from_str::<serde_json::Value>(&resp[body_start..])
+            .map_err(|e| format!("qdrant response parse failed: {}", e))
+    }
+
+    fn create_collection(&self, name: &str, vector_size: u32) -> Result<serde_json::Value, String> {
+        let body = json!({"vectors": {"size": vector_size, "distance": "Cosine"}}).to_string();
+        self.request("PUT", &format!("/collections/{}", name), &body)
+    }
+
+    fn upsert_points(&self, collection: &str, points: &[VectorPoint]) -> Result<serde_json::Value, String> {
+        let body = json!({"points": points}).to_string();
+        self.request("PUT", &format!("/collections/{}/points?wait=true", collection), &body)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -129,6 +199,11 @@ fn cbn_reporting_threshold_ngn() -> f64 { 5_000_000.0 }
 
 struct AppState {
     db: PgPool,
+    collections: Mutex<Vec<CollectionConfig>>,
+    points: Mutex<std::collections::HashMap<String, Vec<VectorPoint>>>,
+    qdrant: QdrantClient,
+    db_url: Option<String>,
+    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
 static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -267,8 +342,8 @@ async fn degradation_status() -> HttpResponse {
 
 async fn health(state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    let collections = state.collections.lock().unwrap();
-    let points = state.points.lock().unwrap();
+    let collections = state.collections.lock().await;
+    let points = state.points.lock().await;
     let total_points: usize = points.values().map(|v| v.len()).sum();
     let _cbn = cbn_reporting_threshold_ngn();
     HttpResponse::Ok().json(json!({
@@ -319,12 +394,12 @@ async fn init_collections(state: web::Data<AppState>) -> HttpResponse {
     for cfg in &configs {
         let _ = state.qdrant.create_collection(&cfg.name, cfg.vector_size);
     }
-    let mut collections = state.collections.lock().unwrap();
+    let mut collections = state.collections.lock().await;
     *collections = configs.clone();
 
     // Seed regulatory embeddings
     let reg_points = seed_regulatory_embeddings();
-    let mut points = state.points.lock().unwrap();
+    let mut points = state.points.lock().await;
     points.insert("bank54_regulations".to_string(), reg_points.clone());
 
     let _ = state.qdrant.upsert_points("bank54_regulations", &reg_points);
@@ -340,7 +415,7 @@ async fn upsert_vectors(req: actix_web::HttpRequest, state: web::Data<AppState>,
     let req_data = body.into_inner();
     let count = req_data.points.len();
     let _ = state.qdrant.upsert_points(&req_data.collection, &req_data.points);
-    let mut points = state.points.lock().unwrap();
+    let mut points = state.points.lock().await;
     points.entry(req_data.collection.clone()).or_default().extend(req_data.points);
     db_persist(&state, "upsert_vectors", &json!({"collection": req_data.collection, "count": count})).await;
     HttpResponse::Created().json(json!({"upserted": count, "collection": req_data.collection}))
@@ -354,7 +429,7 @@ async fn semantic_search(req: actix_web::HttpRequest, state: web::Data<AppState>
     let limit = search.limit.unwrap_or(10) as usize;
 
     // In-memory similarity search fallback
-    let points = state.points.lock().unwrap();
+    let points = state.points.lock().await;
     let mut results: Vec<SearchResult> = Vec::new();
     if let Some(collection_points) = points.get(&search.collection) {
         let mut scored: Vec<(f32, &VectorPoint)> = collection_points.iter()
@@ -387,7 +462,7 @@ async fn search_regulations(req: actix_web::HttpRequest, state: web::Data<AppSta
     let limit = body.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
     let query_vec = generate_text_embedding(query_text, 768);
 
-    let points = state.points.lock().unwrap();
+    let points = state.points.lock().await;
     let mut results: Vec<SearchResult> = Vec::new();
     if let Some(reg_points) = points.get("bank54_regulations") {
         let mut scored: Vec<(f32, &VectorPoint)> = reg_points.iter()
@@ -507,6 +582,19 @@ async fn main() -> std::io::Result<()> {
     init_schema(&pool).await;
     log::info!("[qdrant-vector-store-rs] database connected, schema initialized");
 
+    let db_client = init_db(&database_url).await.map(|c| std::sync::Arc::new(c));
+    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8163);
+    let state = web::Data::new(AppState {
+        db: pool,
+        collections: Mutex::new(Vec::new()),
+        points: Mutex::new(std::collections::HashMap::new()),
+        qdrant: QdrantClient {
+            base_url: env::var("QDRANT_URL").unwrap_or_else(|_| "http://localhost:6333".to_string()),
+        },
+        db_url: env::var("DATABASE_URL").ok(),
+        db_client,
+    });
+
     start_grpc_server("qdrant-vector-store-rs", 10443);
     HttpServer::new(move || {
         App::new()
@@ -519,8 +607,11 @@ async fn main() -> std::io::Result<()> {
                 .add(("X-XSS-Protection", "1; mode=block"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
             )
-            .wrap_fn(move |req, srv| {
-                let trace = trace_id.clone();
+            .wrap_fn(|req, srv| {
+                let trace = req.headers().get("X-Trace-Id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("none")
+                    .to_string();
                 eprintln!("[qdrant-vector-store-rs] {} {} trace={}", req.method(), req.path(), trace);
                 srv.call(req)
             })
@@ -535,6 +626,11 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/service_configs/{id}", web::get().to(get_record))
             .route("/api/v1/service_configs/{id}", web::put().to(update_record))
             .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .route("/v1/collections/init", web::post().to(init_collections))
+            .route("/v1/vectors/upsert", web::post().to(upsert_vectors))
+            .route("/v1/vectors/search", web::post().to(semantic_search))
+            .route("/v1/embed", web::post().to(embed_text))
+            .route("/v1/regulations/search", web::post().to(search_regulations))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
@@ -553,6 +649,128 @@ mod tests {
     #[test]
     fn test_rate_limiter() {
         assert!(rl_allow());
+    }
+}
+
+async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
+    match tokio_postgres::connect(db_url, NoTls).await {
+        Ok((client, connection)) => {
+            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
+            let _ = client.execute(
+                "CREATE TABLE IF NOT EXISTS records (
+                    id TEXT PRIMARY KEY, service TEXT NOT NULL, tenant TEXT DEFAULT 'default',
+                    status TEXT DEFAULT 'active', data TEXT, created_at TIMESTAMPTZ DEFAULT NOW()
+                )", &[]).await;
+            Some(client)
+        }
+        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
+    }
+}
+
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_type VARCHAR(64) NOT NULL,
+        aggregate_id VARCHAR(128) NOT NULL,
+        payload JSONB NOT NULL,
+        published BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .ok();
+}
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let tenant_id = req.headers().get("X-Tenant-ID")
+        .and_then(|v| v.to_str().ok()).unwrap_or("");
+
+    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+        .bind(tenant_id)
+        .fetch_all(&data.db)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "status": r.get::<String, _>("status"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+                })
+            }).collect();
+            let count = records.len();
+            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let tenant_id = body.tenant_id.clone()
+        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
+        .unwrap_or_else(|| "default".to_string());
+
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
+    )
+    .bind(&tenant_id)
+    .bind(&status)
+    .fetch_one(&data.db)
+    .await;
+
+    match result {
+        Ok(id) => {
+            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.created")
+                .bind(id.to_string())
+                .bind(&payload)
+                .execute(&data.db).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
+    let id = path.into_inner();
+    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_optional(&data.db)
+        .await;
+
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 

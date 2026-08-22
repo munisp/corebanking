@@ -1436,7 +1436,8 @@ type PostgresClient struct {
 
 func NewPostgresClient() *PostgresClient {
 	return &PostgresClient{
-		ConnectionString: envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"),
+		// M-04: no compiled-in credentials; env-only.
+		ConnectionString: envOr("DATABASE_URL", ""),
 		connected:        false,
 	}
 }

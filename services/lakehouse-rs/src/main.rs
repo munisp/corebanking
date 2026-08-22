@@ -81,8 +81,10 @@ async fn query_lake(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
     // If the request contains a "sql" field, forward it directly to DuckDB
     if let Some(sql) = input.get("sql").and_then(|v| v.as_str()) {
         let payload = json!({"sql": sql, "limit": input.get("limit").and_then(|v| v.as_i64()).unwrap_or(10000)});
-        match call_service_sync(&format!("{}/v1/query", lakehouse_url), &payload.to_string()) {
-            Ok(resp) => {
+        let query_url = format!("{}/v1/query", lakehouse_url);
+        let query_body = payload.to_string();
+        match tokio::task::spawn_blocking(move || call_service_sync(&query_url, &query_body)).await {
+            Ok(Ok(resp)) => {
                 // Parse the HTTP response body (skip headers)
                 let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
                 let body_str = &resp[body_start..];
@@ -96,7 +98,8 @@ async fn query_lake(req: actix_web::HttpRequest, state: web::Data<AppState>, bod
                     }));
                 }
             }
-            Err(e) => eprintln!("lakehouse-rs: DuckDB query failed: {}", e),
+            Ok(Err(e)) => eprintln!("lakehouse-rs: DuckDB query failed: {}", e),
+            Err(e) => eprintln!("lakehouse-rs: DuckDB query join failed: {}", e),
         }
     }
 
@@ -130,8 +133,10 @@ async fn ingest_lake(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
         "records": input.get("records").unwrap_or(&json!([])),
     });
 
-    match call_service_sync(&format!("{}/v1/ingest", lakehouse_url), &payload.to_string()) {
-        Ok(resp) => {
+    let ingest_url = format!("{}/v1/ingest", lakehouse_url);
+    let ingest_body = payload.to_string();
+    match tokio::task::spawn_blocking(move || call_service_sync(&ingest_url, &ingest_body)).await {
+        Ok(Ok(resp)) => {
             let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
             let body_str = &resp[body_start..];
             if let Ok(result) = serde_json::from_str::<serde_json::Value>(body_str) {
@@ -143,7 +148,8 @@ async fn ingest_lake(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
                 }));
             }
         }
-        Err(e) => eprintln!("lakehouse-rs: ingest failed: {}", e),
+        Ok(Err(e)) => eprintln!("lakehouse-rs: ingest failed: {}", e),
+        Err(e) => eprintln!("lakehouse-rs: ingest join failed: {}", e),
     }
 
     HttpResponse::InternalServerError().json(json!({"error": "lakehouse_unreachable"}))
@@ -158,8 +164,10 @@ async fn time_travel(req: actix_web::HttpRequest, _state: web::Data<AppState>, b
     let input = body.into_inner();
     let lakehouse_url = lakehouse_api_url();
 
-    match call_service_sync(&format!("{}/v1/time-travel", lakehouse_url), &input.to_string()) {
-        Ok(resp) => {
+    let tt_url = format!("{}/v1/time-travel", lakehouse_url);
+    let tt_body = input.to_string();
+    match tokio::task::spawn_blocking(move || call_service_sync(&tt_url, &tt_body)).await {
+        Ok(Ok(resp)) => {
             let body_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
             let body_str = &resp[body_start..];
             if let Ok(result) = serde_json::from_str::<serde_json::Value>(body_str) {
@@ -170,7 +178,8 @@ async fn time_travel(req: actix_web::HttpRequest, _state: web::Data<AppState>, b
                 }));
             }
         }
-        Err(e) => eprintln!("lakehouse-rs: time-travel failed: {}", e),
+        Ok(Err(e)) => eprintln!("lakehouse-rs: time-travel failed: {}", e),
+        Err(e) => eprintln!("lakehouse-rs: time-travel join failed: {}", e),
     }
     HttpResponse::InternalServerError().json(json!({"error": "time_travel_failed"}))
 }
