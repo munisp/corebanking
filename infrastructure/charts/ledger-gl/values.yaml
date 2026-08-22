@@ -58,7 +58,10 @@ dapr:
   memory-request: 250Mi
   memory-limit: 1000Mi
 secrets:
-  POSTGRES_URL: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking?sslmode=require"
+  # Postgres connection URL (contains credentials) — NEVER committed. Inject
+  # at deploy time, e.g. helm --set secrets.POSTGRES_URL=... or via an
+  # external secret manager. The chart fails to render if this is empty.
+  POSTGRES_URL: ""
   APP_PORT: "9465"
   PORT_BASE: "9465"
   SERVICE_GROUP: ledger-gl

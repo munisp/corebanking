@@ -7,7 +7,12 @@ import { readEnv } from "../config/readEnv.config";
 async function seedDefaultClient(): Promise<void> {
   try {
     const clientId     = readEnv("DEFAULT_CLIENT_ID",     "54link-orchestrator") as string;
-    const clientSecret = readEnv("DEFAULT_CLIENT_SECRET", "54link-orchestrator-secret") as string;
+    // Fail closed: the client secret must be provided via the environment;
+    // no credential default is ever embedded in source.
+    const clientSecret = readEnv("DEFAULT_CLIENT_SECRET") as string;
+    if (!clientSecret) {
+      throw new Error("DEFAULT_CLIENT_SECRET environment variable must be set to seed the default client");
+    }
 
     const existing = await AppDataSource.manager.findOne(ClientEntity, {
       where: { client_id: clientId },
