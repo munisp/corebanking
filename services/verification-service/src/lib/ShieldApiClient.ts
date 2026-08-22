@@ -5,6 +5,20 @@ import * as https from "https";
 import { InitVerification, IVerifyFace, IVerifyFaceResult } from "../types/verification";
 import { ShieldConfig } from "../types/config";
 
+// H-50: TLS certificate verification is ON by default for this API-key-bearing
+// client. The only opt-out is an explicit development override:
+// ALLOW_INSECURE_TLS=true AND non-production. In production the override is
+// ignored (fail closed) and a loud warning is logged.
+const IS_PRODUCTION = process.env.NODE_ENV === "production" || process.env.ENVIRONMENT === "production";
+const ALLOW_INSECURE_TLS = process.env.ALLOW_INSECURE_TLS === "true" && !IS_PRODUCTION;
+if (process.env.ALLOW_INSECURE_TLS === "true") {
+  logger.warn(
+    ALLOW_INSECURE_TLS
+      ? "[TLS] ALLOW_INSECURE_TLS=true — ShieldApiClient TLS certificate verification DISABLED (non-production override). NEVER use in production."
+      : "[TLS] ALLOW_INSECURE_TLS=true IGNORED in production — ShieldApiClient TLS certificate verification remains ENABLED."
+  );
+}
+
 class ShieldApiClient {
   private _axiosInstance: AxiosInstance;
   private _baseUrl = readEnv("SHIELD_VERIFICATION_BASE_URL");
@@ -19,7 +33,7 @@ class ShieldApiClient {
         "x-api-key": this._apiKey,
       },
       httpsAgent: new https.Agent({
-        rejectUnauthorized: false,
+        rejectUnauthorized: !ALLOW_INSECURE_TLS,
       }),
     });
   }
@@ -34,7 +48,8 @@ class ShieldApiClient {
         callbackUrl: `${readEnv("SHIELD_API_URL")}/notifications/shield`,
       }
     );
-    this._logger.info(`setup_shield_internal_client_response: ${JSON.stringify(response.data)}`);
+    // M-52: never dump raw provider responses (may contain BVN/NIN PII) to logs.
+    this._logger.info(`setup_shield_internal_client_response: status=${response.status}`);
     return response.data;
   }
 
@@ -43,7 +58,7 @@ class ShieldApiClient {
       "/verification/verify-client-verification-session",
       payload
     );
-    this._logger.info(`init_shield_verification_response: ${JSON.stringify(response.data)}`);
+    this._logger.info(`init_shield_verification_response: status=${response.status}`);
   }
 
   async verifyFace(payload: IVerifyFace): Promise<IVerifyFaceResult> {
@@ -51,7 +66,7 @@ class ShieldApiClient {
       "/verification/face-verification",
       payload
     );
-    this._logger.info(`shield_face_verification_response: ${JSON.stringify(response.data)}`);
+    this._logger.info(`shield_face_verification_response: status=${response.status}`);
     return response.data;
   }
 }

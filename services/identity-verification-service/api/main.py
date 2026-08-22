@@ -20,16 +20,104 @@ callers must NOT treat it as a pass.
 
 import os
 import json
+import hmac
+import hashlib
+import base64
+import time
 import httpx
-import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 import structlog
 
 logger = structlog.get_logger()
+
+
+def validate_jwt(authorization: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate a Bearer JWT with real HS256 signature verification (stdlib).
+
+    Mirrors the canonical pattern in services/shared/auth/jwt_validation.py and
+    sibling Python services (e.g. docling-service). FAILS CLOSED: returns
+    (None, reason) whenever the token cannot be cryptographically verified, is
+    expired, is missing exp, or JWT_SECRET is not configured. Never
+    warn-and-allow.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = authorization[7:]
+
+    def _b64url_decode(s: str) -> bytes:
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        payload = json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if time.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
+
+
+async def get_current_tenant(authorization: str = Header(None)) -> str:
+    """Require a valid Bearer JWT and derive the tenant from verified claims.
+
+    H-33: tenant identity comes ONLY from verified token claims — never from a
+    caller-supplied x-tenant-id header, which is attacker-controlled.
+    """
+    claims, err = validate_jwt(authorization or "")
+    if err is not None:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: {err}")
+    tenant_id = claims.get("tenant_id") or claims.get("tenant")
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="Token missing tenant claim")
+    return tenant_id
+
+
+def _mask_identifier(value: Any) -> str:
+    """M-52/M-53: mask government identifiers (BVN/NIN) — last 3 chars only."""
+    if not isinstance(value, str) or not value:
+        return "***"
+    return "***" + value[-3:]
+
+
+def _mask_audit_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of an audit record with BVN/NIN masked in request/response."""
+    masked = dict(record)
+    for section in ("request", "response"):
+        data = record.get(section)
+        if isinstance(data, dict):
+            scrubbed = dict(data)
+            for key in ("nin", "bvn"):
+                if key in scrubbed:
+                    scrubbed[key] = _mask_identifier(scrubbed[key])
+            masked[section] = scrubbed
+    return masked
+
 
 audit_log = []
 
@@ -199,9 +287,13 @@ async def readiness_check():
 
 
 @app.get("/api/v1/verify/audit")
-async def get_verification_audit(limit: int = 50):
+async def get_verification_audit(limit: int = 50, tenant_id: str = Depends(get_current_tenant)):
+    """H-33: requires a verified Bearer JWT; the tenant is derived from verified
+    token claims (not caller-supplied headers) and results are scoped to that
+    tenant only. BVN/NIN values are masked (last 3 chars) in the response."""
     bounded = max(1, min(limit, 200))
-    return {"records": audit_log[-bounded:], "total": min(len(audit_log), bounded)}
+    scoped = [r for r in audit_log if r.get("tenant_id") == tenant_id][-bounded:]
+    return {"records": [_mask_audit_record(r) for r in scoped], "total": len(scoped)}
 
 @app.post("/api/v1/verify/nin")
 async def verify_nin(request: NINVerificationRequest, x_tenant_id: str = Header(...)):

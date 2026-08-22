@@ -271,6 +271,39 @@ function safePositive(value: number) {
   return Math.max(0, value);
 }
 
+// ── M-28: integer minor-unit money helpers ─────────────────────────────────
+// Money values are exposed in major units (numbers) for API compatibility, but
+// every derived computation (sum, percentage, unit-price multiply, tax) is
+// performed in integer minor units (kobo/cents) to eliminate float drift.
+const MINOR_UNIT_SCALE = 100;
+
+/** Convert a major-unit money value to integer minor units (banker's-free, half-up). */
+function toMinorUnits(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.round(value * MINOR_UNIT_SCALE);
+}
+
+/** Convert integer minor units back to a major-unit money value. */
+function fromMinorUnits(minor: number): number {
+  return Math.round(minor) / MINOR_UNIT_SCALE;
+}
+
+/** Add money values exactly (via minor units). */
+function addMoney(a: number, b: number): number {
+  return fromMinorUnits(toMinorUnits(a) + toMinorUnits(b));
+}
+
+/** Sum money values exactly (via minor units). */
+function sumMoney(values: number[]): number {
+  return fromMinorUnits(values.reduce((sum, v) => sum + toMinorUnits(v), 0));
+}
+
+/** Multiply a money amount by a ratio (e.g. percentage / 100), rounded to minor units. */
+function mulMoneyByRatio(amount: number, ratio: number): number {
+  if (!Number.isFinite(ratio)) return 0;
+  return fromMinorUnits(Math.round(toMinorUnits(amount) * ratio));
+}
+
 function toUtcIso(value: Date) {
   return new Date(value.getTime() - value.getTimezoneOffset() * 60_000).toISOString();
 }
@@ -353,23 +386,24 @@ export function calculateRatedAmount(
   let billableUnits = Math.max(0, normalizedQuantity - includedUnits);
   let amountAccrued = 0;
 
+  // M-28: all amount computation below is exact in integer minor units.
   if (line.chargeType === "flat") {
     billableUnits = normalizedQuantity > 0 ? 1 : 0;
-    amountAccrued = normalizedQuantity > 0 ? unitPrice : 0;
+    amountAccrued = normalizedQuantity > 0 ? fromMinorUnits(toMinorUnits(unitPrice)) : 0;
   } else if (line.chargeType === "percentage") {
     const ratio = Number(line.pricingFormula?.ratio ?? 0.01);
-    amountAccrued = normalizedQuantity * ratio;
+    amountAccrued = mulMoneyByRatio(normalizedQuantity, ratio);
     billableUnits = normalizedQuantity;
   } else {
-    amountAccrued = billableUnits * unitPrice;
+    amountAccrued = fromMinorUnits(Math.round(billableUnits * toMinorUnits(unitPrice)));
   }
 
   if (typeof line.minimumCharge === "number") {
-    amountAccrued = Math.max(amountAccrued, safePositive(line.minimumCharge));
+    amountAccrued = Math.max(amountAccrued, fromMinorUnits(toMinorUnits(safePositive(line.minimumCharge))));
   }
 
   if (typeof line.maximumCharge === "number") {
-    amountAccrued = Math.min(amountAccrued, safePositive(line.maximumCharge));
+    amountAccrued = Math.min(amountAccrued, fromMinorUnits(toMinorUnits(safePositive(line.maximumCharge))));
   }
 
   return {
@@ -468,7 +502,7 @@ export function buildAccrualSnapshots(
     const existing = snapshotMap.get(key);
     if (!existing) continue;
     existing.ratedEventCount += 1;
-    existing.accruedAmount += safePositive(rated.amountAccrued);
+    existing.accruedAmount = addMoney(existing.accruedAmount, safePositive(rated.amountAccrued));
     existing.lastRatedAt = rated.ratedAt;
   }
 
@@ -480,14 +514,15 @@ export function buildAccrualSnapshots(
 }
 
 function calculateDiscountAmount(subtotalAmount: number, rule: BillingDiscountRule) {
+  // M-28: discount computed in integer minor units.
   if (rule.discountType === "fixed") {
-    return safePositive(rule.fixedAmount ?? 0);
+    return fromMinorUnits(toMinorUnits(safePositive(rule.fixedAmount ?? 0)));
   }
   if (rule.discountType === "threshold_percentage") {
     const threshold = safePositive(rule.thresholdAmount ?? 0);
     if (subtotalAmount < threshold) return 0;
   }
-  return subtotalAmount * safePositive((rule.percentage ?? 0) / 100);
+  return mulMoneyByRatio(subtotalAmount, safePositive((rule.percentage ?? 0) / 100));
 }
 
 function buildInvoiceNumber(account: BillingAccount, billingPeriodKey: string, index: number) {
@@ -528,7 +563,7 @@ export function buildInvoices(args: {
     const account = args.accounts.find((item) => item.id === billingAccountId);
     if (!account) return;
 
-    const subtotalAmount = accruals.reduce((sum, item) => sum + safePositive(item.accruedAmount), 0);
+    const subtotalAmount = sumMoney(accruals.map((item) => safePositive(item.accruedAmount)));
     const applicableDiscounts = discountRules.filter(
       (rule) =>
         rule.billingAccountId === account.id &&
@@ -560,16 +595,18 @@ export function buildInvoices(args: {
     );
     const minimumCommitAmount = safePositive(minimumCommitOverride?.valueNumber ?? account.minimumCommitAmount);
 
-    const discountAmount = applicableDiscounts.reduce((sum, rule) => sum + calculateDiscountAmount(subtotalAmount, rule), 0);
-    const netAfterDiscounts = Math.max(0, subtotalAmount - discountAmount);
-    const revenueShareAmount = applicableRevenueShares.reduce(
-      (sum, rule) => sum + netAfterDiscounts * safePositive(rule.percentage / 100),
-      0,
+    // M-28: invoice totals derived in integer minor units — discounts, revenue
+    // share, minimum-commit true-up, taxable base, VAT, and grand total are all
+    // exact at kobo precision; no raw float money math.
+    const discountAmount = sumMoney(applicableDiscounts.map((rule) => calculateDiscountAmount(subtotalAmount, rule)));
+    const netAfterDiscounts = Math.max(0, addMoney(subtotalAmount, -discountAmount));
+    const revenueShareAmount = sumMoney(
+      applicableRevenueShares.map((rule) => mulMoneyByRatio(netAfterDiscounts, safePositive(rule.percentage / 100))),
     );
-    const minimumCommitAdjustment = Math.max(0, minimumCommitAmount - Math.max(0, netAfterDiscounts - revenueShareAmount));
-    const taxableBase = Math.max(0, netAfterDiscounts - revenueShareAmount + minimumCommitAdjustment);
-    const taxAmount = taxableBase * (taxRate / 100);
-    const totalAmount = taxableBase + taxAmount;
+    const minimumCommitAdjustment = Math.max(0, addMoney(minimumCommitAmount, -Math.max(0, addMoney(netAfterDiscounts, -revenueShareAmount))));
+    const taxableBase = Math.max(0, addMoney(addMoney(netAfterDiscounts, -revenueShareAmount), minimumCommitAdjustment));
+    const taxAmount = mulMoneyByRatio(taxableBase, taxRate / 100);
+    const totalAmount = addMoney(taxableBase, taxAmount);
     const invoiceId = `BINV-${String(index + 1).padStart(3, "0")}`;
     const dueAt = new Date(new Date(generatedAt).getTime() + (account.invoiceDueDays ?? 14) * 24 * 60 * 60 * 1000).toISOString();
 
@@ -606,7 +643,8 @@ export function buildInvoices(args: {
         productKey: accrual.productKey,
         description: `${accrual.productKey} / ${accrual.meterKey}`,
         quantity: accrual.usageQuantity,
-        unitPrice: accrual.usageQuantity > 0 ? accrual.accruedAmount / accrual.usageQuantity : 0,
+        // M-28: derived unit price rounded to minor units (no raw float division).
+        unitPrice: accrual.usageQuantity > 0 ? fromMinorUnits(Math.round(toMinorUnits(accrual.accruedAmount) / accrual.usageQuantity)) : 0,
         amount: accrual.accruedAmount,
         metadata: { ratedEventCount: accrual.ratedEventCount },
       });
@@ -694,7 +732,7 @@ export function buildBillingDashboard(args: {
   const discountRules = args.discountRules ?? [];
   const revenueShareRules = args.revenueShareRules ?? [];
   const latestPeriod = args.accruals[0]?.billingPeriodKey ?? periodKeyForIso(new Date().toISOString());
-  const totalAccruedAmount = args.accruals.reduce((sum, item) => sum + item.accruedAmount, 0);
+  const totalAccruedAmount = sumMoney(args.accruals.map((item) => item.accruedAmount));
   const ratedEventCount = args.ratedEvents.length;
   const usageEventCount = args.usageEvents.length;
   const unratedEventCount = Math.max(0, usageEventCount - ratedEventCount);
@@ -724,7 +762,7 @@ export function buildBillingDashboard(args: {
       usageEventCount: 0,
       invoiceAmount: 0,
     };
-    existing.accruedAmount += item.accruedAmount;
+    existing.accruedAmount = addMoney(existing.accruedAmount, item.accruedAmount);
     existing.usageEventCount += item.ratedEventCount + item.unratedEventCount;
     liveSeriesMap.set(item.billingPeriodKey, existing);
   });
@@ -735,7 +773,7 @@ export function buildBillingDashboard(args: {
       usageEventCount: 0,
       invoiceAmount: 0,
     };
-    existing.invoiceAmount += item.totalAmount;
+    existing.invoiceAmount = addMoney(existing.invoiceAmount, item.totalAmount);
     liveSeriesMap.set(item.billingPeriodKey, existing);
   });
 
@@ -751,9 +789,11 @@ export function buildBillingDashboard(args: {
       usageEventCount,
       draftInvoiceCount: invoices.filter((item) => item.status === "draft").length,
       pendingApprovalInvoiceCount: invoices.filter((item) => item.status === "pending_approval").length,
-      issuedInvoiceAmount: invoices
-        .filter((item) => item.status === "approved" || item.status === "issued" || item.status === "paid")
-        .reduce((sum, item) => sum + item.totalAmount, 0),
+      issuedInvoiceAmount: sumMoney(
+        invoices
+          .filter((item) => item.status === "approved" || item.status === "issued" || item.status === "paid")
+          .map((item) => item.totalAmount),
+      ),
       topMeters,
       thresholdAlerts,
       liveSeries,

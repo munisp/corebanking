@@ -2,6 +2,7 @@ import * as z from "zod";
 import { PostInitializeKycVerificationValidationSchema } from "../validations/schemas";
 import { IVerifyFaceResult } from "../types/verification";
 import logger from "../config/logger.config";
+import { maskIdentifier } from "../utils/piiMask";
 
 /**
  * Compare the data submitted by the client with the data returned after verification.
@@ -16,7 +17,8 @@ export async function defaultVerifyData(
   logger.info(`[defaultVerifyData] comparing client vs extracted:`);
   logger.info(`[defaultVerifyData]   firstName : "${clientUser.firstName}" vs "${user.firstName}"`);
   logger.info(`[defaultVerifyData]   lastName  : "${clientUser.lastName}" vs "${user.lastName}"`);
-  logger.info(`[defaultVerifyData]   UIN       : "${clientUser.UIN}" vs "${user.nin}"`);
+  // M-52: never log full NIN/UIN — masked (last 3 chars only).
+  logger.info(`[defaultVerifyData]   UIN       : "${maskIdentifier(clientUser.UIN)}" vs "${maskIdentifier(user.nin)}"`);
   logger.info(`[defaultVerifyData]   phone     : "${clientUser.phone}" vs "${user.phone}"`);
   logger.info(`[defaultVerifyData]   dateOfBirth: "${clientUser.dateOfBirth ?? ""}" vs "${user.dateOfBirth}"`);
 

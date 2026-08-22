@@ -68,7 +68,7 @@ const ROUTE_PERMISSIONS: Array<{ pattern: RegExp; roles: string[]; methods: stri
   { pattern: /\/api\/platform\/infra/, roles: ["admin", "super_admin"], methods: ["GET", "POST", "PUT", "DELETE"] },
 ];
 
-function decodeJWT(token: string): JWTPayload | null {
+export function decodeJWT(token: string): JWTPayload | null {
   try {
     const parts = token.split(".");
     if (parts.length !== 3) return null;
@@ -79,7 +79,7 @@ function decodeJWT(token: string): JWTPayload | null {
   }
 }
 
-function isTokenExpired(payload: JWTPayload): boolean {
+export function isTokenExpired(payload: JWTPayload): boolean {
   return Date.now() / 1000 > payload.exp;
 }
 
@@ -103,7 +103,7 @@ const JWKS_TTL_MS = 5 * 60 * 1000;
 
 let jwksCache: { keys: Map<string, crypto.KeyObject>; fetchedAt: number } | null = null;
 
-async function getJwksKeys(): Promise<Map<string, crypto.KeyObject>> {
+export async function getJwksKeys(): Promise<Map<string, crypto.KeyObject>> {
   if (jwksCache && Date.now() - jwksCache.fetchedAt < JWKS_TTL_MS) return jwksCache.keys;
   const res = await fetch(JWKS_URL, { signal: AbortSignal.timeout(5_000) });
   if (!res.ok) throw new Error(`JWKS fetch failed: HTTP ${res.status}`);
@@ -119,7 +119,7 @@ async function getJwksKeys(): Promise<Map<string, crypto.KeyObject>> {
 }
 
 /** Cryptographically verify an RS256 token signature against the realm JWKS. */
-function verifyTokenSignature(token: string, keys: Map<string, crypto.KeyObject>): boolean {
+export function verifyTokenSignature(token: string, keys: Map<string, crypto.KeyObject>): boolean {
   const parts = token.split(".");
   if (parts.length !== 3) return false;
   let header: { alg?: string; kid?: string };

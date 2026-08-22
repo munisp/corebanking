@@ -12,6 +12,8 @@ import {
   VerificationWorkflowStatus,
 } from "../../utils/enums";
 import { workflowRunner } from "../../utils/workflowRunner";
+import { encryptField, lookupHash } from "../../utils/fieldEncryption";
+import { maskIdentifier } from "../../utils/piiMask";
 import { validateRequest } from "../../validations";
 import { PostInitializeKycVerificationValidationSchema } from "../../validations/schemas";
 import {
@@ -35,12 +37,16 @@ export const postInitializeVerification = asyncHandler(async (req, res) => {
 
   const client = req.client!;
 
+  // M-53: identifiers are looked up via their keyed HMAC-SHA256 hash; the stored
+  // value itself is AES-256-GCM encrypted (see utils/fieldEncryption.ts).
+  const uinLookupHash = lookupHash(payload.user.UIN);
+
   // Check if existing verification workflow exists and end it.
   const existingKycVerification = await AppDataSource.manager.findOne(
     KycVerificationWorkflowEntity,
     {
       where: {
-        client_app_user_id: payload.user.UIN,
+        client_app_user_id_hash: uinLookupHash,
         client_id: client.id,
       },
     },
@@ -102,23 +108,28 @@ export const postInitializeVerification = asyncHandler(async (req, res) => {
     await AppDataSource.manager.remove(existingKycVerification);
   }
 
-  logger.info(`[initializeKyc] request — UIN=${payload.user.UIN} provider=${payload.identityProvider} callbackUrl=${client.callback_url ?? "none"} metadata=${JSON.stringify(payload.metadata)}`);
+  // M-52: never log full NIN/UIN — masked (last 3 chars only).
+  logger.info(`[initializeKyc] request — UIN=${maskIdentifier(payload.user.UIN)} provider=${payload.identityProvider} callbackUrl=${client.callback_url ?? "none"} metadata=${JSON.stringify(payload.metadata)}`);
 
   const kycVerification = new KycVerificationWorkflowEntity();
 
   kycVerification.identity_provider =
     payload.identityProvider || KycIdentityProviders.LIVENESS;
   kycVerification.client = client;
-  kycVerification.client_app_user_id = payload.user.UIN;
+  // M-53: store the identifier AES-256-GCM encrypted at rest, plus its keyed
+  // lookup hash for equality queries.
+  kycVerification.client_app_user_id = encryptField(payload.user.UIN);
+  kycVerification.client_app_user_id_hash = uinLookupHash;
 
   try {
     await AppDataSource.manager.save(kycVerification);
     logger.info(`[initializeKyc] entity saved — id=${kycVerification.id} provider=${kycVerification.identity_provider}`);
   } catch (dbError: any) {
     logger.error(`[initializeKyc] DB save failed: ${dbError.message}`);
+    // M-54: generic client-facing error; DB details stay in logs.
     throw new ApiError(
       httpStatus.INTERNAL_SERVER_ERROR,
-      `Failed to save KYC verification record: ${dbError.message}`,
+      "Failed to save KYC verification record.",
       "VER-500-01",
       "verification-service",
     );

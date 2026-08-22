@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -161,6 +164,41 @@ func triggerSyncHandler(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusAccepted, job)
 }
 
+// ── M-58: open-redirect prevention ──────────────────────────────────────────
+// OAuth authorize redirects may ONLY target hosts explicitly configured in the
+// ERPNEXT_ALLOWED_HOSTS env var (comma-separated hostnames; a leading "."
+// entry also matches its subdomains). HTTPS is required so the OAuth state
+// parameter never travels in cleartext. When the allowlist is empty the
+// handler fails closed (no redirect target is permitted).
+
+// isAllowedRedirectTarget reports whether rawURL is a well-formed absolute
+// https:// URL whose host is in the ERPNEXT_ALLOWED_HOSTS allowlist.
+func isAllowedRedirectTarget(rawURL string) bool {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || !parsed.IsAbs() {
+		return false
+	}
+	if parsed.Scheme != "https" {
+		return false
+	}
+	allowed := strings.Split(os.Getenv("ERPNEXT_ALLOWED_HOSTS"), ",")
+	host := strings.ToLower(parsed.Hostname())
+	for _, entry := range allowed {
+		entry = strings.ToLower(strings.TrimSpace(entry))
+		if entry == "" {
+			continue
+		}
+		if strings.HasPrefix(entry, ".") {
+			if strings.HasSuffix(host, entry) {
+				return true
+			}
+		} else if host == entry {
+			return true
+		}
+	}
+	return false
+}
+
 func oauthAuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := getTenantID(r.Context())
 	customerID := getCustomerID(r.Context())
@@ -172,8 +210,22 @@ func oauthAuthorizeHandler(w http.ResponseWriter, r *http.Request) {
 	clientID := r.URL.Query().Get("client_id")
 	redirectURI := r.URL.Query().Get("redirect_uri")
 
+	// M-58: validate both the redirect target (erp_url) and the embedded
+	// redirect_uri against the configured host allowlist. Reject anything else
+	// with 400 — no redirect, no state leakage to unconfigured hosts.
+	if !isAllowedRedirectTarget(erpBaseURL) {
+		http.Error(w, "erp_url is not an allowlisted redirect target", http.StatusBadRequest)
+		return
+	}
+	if redirectURI == "" || !isAllowedRedirectTarget(redirectURI) {
+		http.Error(w, "redirect_uri is not an allowlisted redirect target", http.StatusBadRequest)
+		return
+	}
+
+	// URL-encode every interpolated value to prevent query-parameter smuggling
+	// (e.g. "&" injection appending attacker-controlled parameters).
 	authURL := fmt.Sprintf("%s/api/method/frappe.integrations.oauth2.authorize?client_id=%s&redirect_uri=%s&response_type=code&state=%s",
-		erpBaseURL, clientID, redirectURI, state)
+		strings.TrimRight(erpBaseURL, "/"), url.QueryEscape(clientID), url.QueryEscape(redirectURI), url.QueryEscape(state))
 
 	http.Redirect(w, r, authURL, http.StatusFound)
 }

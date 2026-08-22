@@ -2,6 +2,7 @@
  * Session Manager — session rotation, concurrent session limits, and audit.
  */
 
+import { randomBytes } from "crypto";
 import { logger } from "./logger";
 
 interface Session {
@@ -17,6 +18,11 @@ interface Session {
 }
 
 const sessions = new Map<string, Session>();
+
+// CSPRNG-generated session identifier (256 bits of entropy, URL-safe).
+function newSessionId(): string {
+  return `sess_${randomBytes(32).toString("base64url")}`;
+}
 const MAX_CONCURRENT_SESSIONS = 3;
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const ROTATION_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
@@ -31,7 +37,7 @@ export function createSession(userId: string, role: string, ip: string, userAgen
   }
 
   const session: Session = {
-    id: `sess_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    id: newSessionId(),
     userId,
     role,
     ip,
@@ -54,7 +60,7 @@ export function rotateSession(sessionId: string): Session | null {
   sessions.delete(sessionId);
 
   const rotated: Session = {
-    id: `sess_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+    id: newSessionId(),
     userId: old.userId,
     role: old.role,
     ip: old.ip,

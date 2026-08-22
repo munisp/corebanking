@@ -1,4 +1,4 @@
-import { randomUUID } from "crypto";
+import { randomInt, randomUUID } from "crypto";
 import compression from "compression";
 import cookieParser from "cookie-parser";
 import express, { type Request } from "express";
@@ -1894,6 +1894,21 @@ function asyncHandler(
   };
 }
 
+/**
+ * L-08: Safe pagination parameter parser. Rejects non-numeric input (NaN) and
+ * clamps to [min, max]. Returns null when the raw value is present but not a
+ * finite integer — callers must respond 400 in that case.
+ */
+function parseBoundedInt(
+  raw: unknown,
+  { defaultValue, min, max }: { defaultValue: number; min: number; max: number },
+): number | null {
+  if (raw === undefined || raw === null || raw === "") return defaultValue;
+  const n = typeof raw === "string" && /^\d+$/.test(raw.trim()) ? Number(raw.trim()) : NaN;
+  if (!Number.isFinite(n)) return null;
+  return Math.min(Math.max(n, min), max);
+}
+
 function readRole(req: Request): OperatorRole {
   // SECURITY: the operator role is derived ONLY from verified JWT claims
   // (req.user.role, populated by the auth middleware after HMAC signature
@@ -2094,6 +2109,11 @@ async function fetchWithRetry(input: string, init: RequestInit, attempt = 0): Pr
   const controller = new AbortController();
   const timeoutHandle = setTimeout(() => controller.abort(), upstreamTimeoutMs);
 
+  // L-09: exponential backoff with FULL jitter (uniform random delay between 0 and
+  // the exponential cap) to prevent synchronized retry storms (thundering herd)
+  // against upstream services. randomInt is a CSPRNG.
+  const backoffWithFullJitter = (retryAttempt: number) => randomInt(0, 150 * 2 ** retryAttempt + 1);
+
   try {
     const response = await fetch(input, {
       ...init,
@@ -2101,14 +2121,14 @@ async function fetchWithRetry(input: string, init: RequestInit, attempt = 0): Pr
     });
 
     if (!response.ok && response.status >= 500 && attempt < upstreamRetryCount) {
-      await sleep(150 * (attempt + 1));
+      await sleep(backoffWithFullJitter(attempt));
       return fetchWithRetry(input, init, attempt + 1);
     }
 
     return response;
   } catch (error) {
     if (attempt < upstreamRetryCount) {
-      await sleep(150 * (attempt + 1));
+      await sleep(backoffWithFullJitter(attempt));
       return fetchWithRetry(input, init, attempt + 1);
     }
     throw error;
@@ -2783,7 +2803,13 @@ async function startServer() {
   }
 
   app.disable("x-powered-by");
-  app.set("trust proxy", true);
+  // M-33: Only trust explicitly configured proxy hops. `trust proxy = true` makes
+  // Express believe ANY client-supplied X-Forwarded-For entry, letting attackers
+  // spoof req.ip (used for rate limiting and audit logs). Set TRUST_PROXY_HOPS to
+  // the number of known reverse-proxy hops in front of this app (e.g. 1 for a
+  // single ingress/LB). Default 0: trust nothing — req.ip is the socket peer.
+  const trustProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS ?? "0", 10);
+  app.set("trust proxy", Number.isInteger(trustProxyHops) && trustProxyHops > 0 ? trustProxyHops : false);
 
   // Security: Helmet (comprehensive HTTP security headers)
   app.use(helmet({
@@ -2991,7 +3017,11 @@ async function startServer() {
     }
 
     const now = Date.now();
-    const bucketKey = req.header("x-forwarded-for") || req.ip || "unknown";
+    // M-33: Never key rate-limit buckets on the raw x-forwarded-for header — it is
+    // client-spoofable and trivially defeats limiting. req.ip is only derived from
+    // X-Forwarded-For for hops trusted via `trust proxy` (TRUST_PROXY_HOPS);
+    // otherwise it is the unspoofable socket peer address.
+    const bucketKey = req.ip || req.socket.remoteAddress || "unknown";
     const current = writeRequestBuckets.get(bucketKey);
 
     if (!current || current.resetAt <= now) {
@@ -5133,13 +5163,18 @@ async function startServer() {
 
   // --- Audit trail endpoints (#16) ---
   app.get("/api/platform/audit", (_req, res) => {
+    const auditLimit = parseBoundedInt(_req.query.limit, { defaultValue: 50, min: 1, max: 200 });
+    if (auditLimit === null) {
+      res.status(400).json({ error: "Invalid 'limit' query parameter: must be an integer between 1 and 200" });
+      return;
+    }
     const filters = {
       domain: _req.query.domain as string | undefined,
       userId: _req.query.userId as string | undefined,
       action: _req.query.action as string | undefined,
       from: _req.query.from as string | undefined,
       to: _req.query.to as string | undefined,
-      limit: _req.query.limit ? Number(_req.query.limit) : undefined,
+      limit: auditLimit,
     };
     res.json(auditLog.query(filters));
   });
@@ -5155,7 +5190,11 @@ async function startServer() {
       return;
     }
     const domain = req.query.domain as string | undefined;
-    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+    const limit = parseBoundedInt(req.query.limit, { defaultValue: 50, min: 1, max: 200 });
+    if (limit === null) {
+      res.status(400).json({ error: "Invalid 'limit' query parameter: must be an integer between 1 and 200" });
+      return;
+    }
 
     const searchDomains: { name: string; url: string }[] = [];
     if (!domain || domain === "disputes") searchDomains.push({ name: "disputes", url: `${DISPUTE_SERVICE_URL}/v1/disputes/cases` });
@@ -5507,7 +5546,11 @@ async function startServer() {
 
   app.get("/api/platform/kafka/messages", (req, res) => {
     const topic = req.query.topic as string | undefined;
-    const limit = parseInt(req.query.limit as string) || 50;
+    const limit = parseBoundedInt(req.query.limit, { defaultValue: 50, min: 1, max: 200 });
+    if (limit === null) {
+      res.status(400).json({ error: "Invalid 'limit' query parameter: must be an integer between 1 and 200" });
+      return;
+    }
     res.json({ messages: getRecentMessages(topic, limit) });
   });
   registerKedaAutoscaling(app);
@@ -8008,11 +8051,11 @@ async function startServer() {
     res.json({ valid });
   });
 
-  // C6: Secrets management endpoints
-  app.get("/api/platform/secrets", (_req, res) => {
+  // C6: Secrets management endpoints — restricted to admin role (fail closed).
+  app.get("/api/platform/secrets", requireRole("admin"), (_req, res) => {
     res.json(validateSecrets());
   });
-  app.get("/api/platform/secrets/:name/audit", (req, res) => {
+  app.get("/api/platform/secrets/:name/audit", requireRole("admin"), (req, res) => {
     res.json({ name: req.params.name, entries: [], message: "Audit log available via secrets management API" });
   });
 

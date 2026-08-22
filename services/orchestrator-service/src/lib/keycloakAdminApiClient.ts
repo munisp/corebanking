@@ -1,13 +1,12 @@
 import axios, { Axios } from "axios";
-import * as https from "https";
 import winston from "winston";
 import { readEnv } from "../config/readEnv.config";
 import logger from "../config/logger.config";
+import { createSecureHttpsAgent } from "./secureHttpsAgent";
 import { IKeycloakKeyConfig } from "../types/keycloak";
 
-const httpsAgent = new https.Agent({
-  rejectUnauthorized: false,
-});
+// H-48: TLS verification enabled by default (see lib/secureHttpsAgent.ts).
+const httpsAgent = createSecureHttpsAgent();
 
 export class KeycloakAdminApiClient {
   private static instance: KeycloakAdminApiClient;

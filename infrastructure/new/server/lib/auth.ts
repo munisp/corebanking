@@ -30,7 +30,12 @@ const jwtUtil = {
     const parts = token.split(".");
     if (parts.length !== 3) throw Object.assign(new Error("Invalid token"), { name: "JsonWebTokenError" });
     const sig = crypto.createHmac("sha256", secret).update(`${parts[0]}.${parts[1]}`).digest("base64url");
-    if (sig !== parts[2]) throw Object.assign(new Error("Invalid signature"), { name: "JsonWebTokenError" });
+    // Constant-time comparison to prevent signature timing oracles.
+    const expected = Buffer.from(sig, "utf8");
+    const presented = Buffer.from(parts[2], "utf8");
+    if (expected.length !== presented.length || !crypto.timingSafeEqual(expected, presented)) {
+      throw Object.assign(new Error("Invalid signature"), { name: "JsonWebTokenError" });
+    }
     const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
     if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
       throw Object.assign(new Error("Token expired"), { name: "TokenExpiredError" });

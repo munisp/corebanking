@@ -4,6 +4,7 @@ import { KycWorkflowArgs } from "../types/workflow";
 import { NonRetriableApplicationError } from "../middlewares/error";
 import { IVerifyFaceResult } from "../types/verification";
 import logger from "../config/logger.config";
+import { maskIdentifier } from "../utils/piiMask";
 
 /**
  * Send base64 face to verify against.
@@ -12,7 +13,8 @@ import logger from "../config/logger.config";
 export async function defaultVerifyFace(
   payload: z.infer<typeof PostVerifyKycValidationSchema> & KycWorkflowArgs
 ): Promise<IVerifyFaceResult> {
-  logger.info(`[defaultVerifyFace] start — UIN=${payload.UIN} firstName=${payload.firstName} lastName=${payload.lastName}`);
+  // M-52: never log full NIN/UIN — masked (last 3 chars only).
+  logger.info(`[defaultVerifyFace] start — UIN=${maskIdentifier(payload.UIN)} firstName=${payload.firstName} lastName=${payload.lastName}`);
   logger.info(`[defaultVerifyFace] documents array length=${payload.documents?.length ?? 0}, types=${payload.documents?.map(d => d.type).join(",") ?? "none"}`);
 
   // get face from payload
