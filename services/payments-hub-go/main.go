@@ -252,8 +252,26 @@ func authMiddleware(next http.Handler) http.Handler {
 		if sub, ok := claims["sub"].(string); ok && sub != "" {
 			r.Header.Set("X-User-Id", sub)
 		}
+		// Tenant identity comes ONLY from verified claims; overwrite any
+		// caller-supplied tenant header before invoking the handler.
+		if tenant := tenantFromClaims(claims); tenant != "" {
+			r.Header.Set("X-Tenant-ID", tenant)
+		} else {
+			r.Header.Del("X-Tenant-ID")
+		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 var idempCache sync.Map
@@ -707,7 +725,20 @@ func registerRoutes(mux *http.ServeMux) {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-2: no wildcard origin — echo back the request Origin only when
+		// it is on the CORS_ALLOWED_ORIGINS allowlist (restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Idempotency-Key, X-Tenant-ID")
 		w.Header().Set("Access-Control-Max-Age", "86400")

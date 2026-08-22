@@ -309,7 +309,11 @@ func (s *STKServer) stkCommandHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	port := getEnv("PORT", "8080")
-	dbURL := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/stk_service?sslmode=disable")
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatalf("[stk-service] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
 
 	// Initialize database connection
 	ctx := context.Background()

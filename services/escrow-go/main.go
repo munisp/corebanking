@@ -541,7 +541,12 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
 		var claims map[string]interface{}
 		json.Unmarshal(claimsBytes, &claims)
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}
@@ -643,7 +648,12 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 		var claims map[string]interface{}
 		json.Unmarshal(claimsBytes, &claims)
 		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}

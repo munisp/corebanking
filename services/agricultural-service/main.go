@@ -2070,9 +2070,10 @@ func (s *AgriculturalService) GetProgram(w http.ResponseWriter, r *http.Request)
 
 func main() {
 	// Database connection
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://postgres:postgres@localhost:5432/agricultural_db?sslmode=disable"
+		log.Fatalf("[agricultural-service] DATABASE_URL env var is required; refusing to start with default database credentials")
 	}
 
 	db, err := sql.Open("postgres", dbURL)

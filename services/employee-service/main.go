@@ -191,9 +191,10 @@ func main() {
 	godotenv.Load()
 
 	// Initialize database connection
+	// DATABASE_URI is REQUIRED — no credential-bearing default. Fail fast at startup.
 	dbURL := os.Getenv("DATABASE_URI")
 	if dbURL == "" {
-		dbURL = "postgres://postgres:postgres@localhost:5432/core_banking_employee"
+		log.Fatalf("[employee-service] DATABASE_URI env var is required; refusing to start with default database credentials")
 	}
 
 	db, err := pgxpool.New(ctx, dbURL)

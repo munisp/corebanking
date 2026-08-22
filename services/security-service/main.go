@@ -413,7 +413,11 @@ func (s *Server) queryAuditTrail(c *gin.Context) {
 
 func main() {
 	port := getEnv("PORT", "8080")
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/security_service?sslmode=disable")
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[security-service] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {

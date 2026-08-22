@@ -704,9 +704,10 @@ func (s *CreditServer) facilityStatsHandler(w http.ResponseWriter, r *http.Reque
 // ==================== MAIN ====================
 
 func main() {
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://postgres:postgres@localhost:5432/credit_db?sslmode=disable"
+		log.Fatalf("[credit-service] DATABASE_URL env var is required; refusing to start with default database credentials")
 	}
 
 	db, err := sql.Open("postgres", dbURL)
