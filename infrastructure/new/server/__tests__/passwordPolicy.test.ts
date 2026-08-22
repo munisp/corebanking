@@ -1,56 +1,64 @@
 import { describe, it, expect } from "vitest";
 
-describe("Password Policy", () => {
-  function validatePassword(pw: string) {
-    const errors: string[] = [];
-    if (pw.length < 8) errors.push("min_length");
-    if (!/[A-Z]/.test(pw)) errors.push("uppercase");
-    if (!/[a-z]/.test(pw)) errors.push("lowercase");
-    if (!/\d/.test(pw)) errors.push("digit");
-    if (!/[!@#$%^&*]/.test(pw)) errors.push("special");
-    return { valid: errors.length === 0, errors };
-  }
+// H-40 remediation: the previous version defined its own validatePassword
+// inside the test and asserted against that copy — production could change
+// arbitrarily and the test would stay green. These tests import the real
+// policy module and assert its actual contract.
+import { validatePassword, recordPasswordChange } from "../lib/passwordPolicy";
 
-  it("should accept strong password", () => {
-    expect(validatePassword("Str0ng!Pass").valid).toBe(true);
+describe("Password Policy (production lib/passwordPolicy)", () => {
+  it("accepts a strong password and scores it", () => {
+    const result = validatePassword("Str0ng!Password99");
+    expect(result.valid).toBe(true);
+    expect(result.errors).toHaveLength(0);
+    expect(result.score).toBeGreaterThanOrEqual(60);
+    expect(["strong", "very_strong"]).toContain(result.strength);
   });
 
-  it("should reject short password", () => {
+  it("rejects passwords shorter than 8 characters", () => {
     const result = validatePassword("Ab1!");
     expect(result.valid).toBe(false);
-    expect(result.errors).toContain("min_length");
+    expect(result.errors).toContain("Minimum 8 characters required");
   });
 
-  it("should reject missing uppercase", () => {
-    const result = validatePassword("str0ng!pass");
+  it("rejects passwords without an uppercase letter", () => {
+    const result = validatePassword("str0ng!password");
     expect(result.valid).toBe(false);
-    expect(result.errors).toContain("uppercase");
+    expect(result.errors).toContain("At least one uppercase letter required");
   });
 
-  it("should reject missing digit", () => {
-    const result = validatePassword("StrongPass!");
+  it("rejects passwords without a digit", () => {
+    const result = validatePassword("Strong!Password");
     expect(result.valid).toBe(false);
-    expect(result.errors).toContain("digit");
+    expect(result.errors).toContain("At least one digit required");
   });
 
-  it("should reject missing special char", () => {
-    const result = validatePassword("Str0ngPass1");
+  it("rejects passwords without a special character", () => {
+    const result = validatePassword("Str0ngPassword99");
     expect(result.valid).toBe(false);
-    expect(result.errors).toContain("special");
+    expect(result.errors.some((e) => e.includes("special character"))).toBe(true);
   });
 
-  it("should calculate password strength score", () => {
-    const score = (pw: string) => {
-      let s = 0;
-      if (pw.length >= 8) s += 20;
-      if (pw.length >= 12) s += 10;
-      if (/[A-Z]/.test(pw)) s += 15;
-      if (/[a-z]/.test(pw)) s += 15;
-      if (/\d/.test(pw)) s += 15;
-      if (/[!@#$%^&*]/.test(pw)) s += 15;
-      return s;
-    };
-    expect(score("Str0ng!Password")).toBe(90);
-    expect(score("weak")).toBe(15);
+  it("rejects common passwords even when they meet length/case/digit rules", () => {
+    // "password123" is in the common-password list; any casing must match.
+    const result = validatePassword("Password123");
+    expect(result.valid).toBe(false);
+    expect(result.errors).toContain("This password is too common");
+    expect(result.score).toBeLessThanOrEqual(10);
+  });
+
+  it("prevents reuse of the current password (history)", () => {
+    const userId = "h40-history-user";
+    const pw = "Un1que!Passphrase";
+    expect(validatePassword(pw, userId).valid).toBe(true);
+
+    recordPasswordChange(userId, pw);
+
+    const reuse = validatePassword(pw, userId);
+    expect(reuse.valid).toBe(false);
+    expect(reuse.errors.some((e) => e.includes("used recently"))).toBe(true);
+
+    // A genuinely new password remains acceptable for the same user.
+    expect(validatePassword("An0ther!Passphrase", userId).valid).toBe(true);
   });
 });

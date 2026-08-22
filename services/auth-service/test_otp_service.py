@@ -1,283 +1,283 @@
 """
-OTP Service - Test Examples
-Demonstrates OTP generation and verification functionality
+OTP Service — real unit tests.
+
+H-40 remediation: the previous version of this file printed values and never
+asserted anything (and two of its five "tests" were pure print narratives).
+It also accessed ``otp_data['code']``, which the Redis-backed OTPService
+deliberately no longer returns — the file was both vacuous and stale.
+
+These tests drive the real ``utils.otp_service.OTPService`` against an
+in-memory Redis double and assert the security-critical contract:
+
+- the OTP code is NEVER returned by the API surface (only expires_at)
+- a correct code verifies exactly once (replay is rejected)
+- wrong codes decrement the remaining-attempts counter
+- exceeding MAX_ATTEMPTS destroys the OTP
+- invalidate_otp() wipes both the OTP and the attempt counter
+- get_otp_status() exposes metadata but never the code
 """
 
+import importlib.util
+import sys
+import types
+from datetime import datetime, timezone
+
+# The service module imports the `redis` client library at import time. It is
+# only used through the `_get_redis()` seam, which these tests patch, so a
+# minimal stub is enough when the dependency is unavailable locally.
+if importlib.util.find_spec("redis") is None:  # pragma: no cover
+    _redis_stub = types.ModuleType("redis")
+    _redis_stub.Redis = object  # only referenced as a type annotation
+    _redis_stub.from_url = lambda *a, **k: None  # never called: _get_redis is patched
+    sys.modules.setdefault("redis", _redis_stub)
+
 from utils.otp_service import OTPService
+import utils.otp_service as otp_module
 
 
-def test_otp_generation():
-    """Test OTP generation"""
-    
-    print("=" * 70)
-    print("OTP GENERATION TEST")
-    print("=" * 70)
-    
-    otp_service = OTPService()
-    
-    test_keycloak_id = "9052cbd0-25e3-4712-9fba-d8b792efe428"
-    test_tenant = "bpmgd"
-    test_email = "user@example.com"
-    
-    print(f"\nGenerating OTP for:")
-    print(f"  Email: {test_email}")
-    print(f"  Keycloak ID: {test_keycloak_id}")
-    print(f"  Tenant: {test_tenant}")
-    print(f"  OTP Length: {otp_service.OTP_LENGTH} digits")
-    print(f"  Expiry: {otp_service.OTP_EXPIRY_MINUTES} minutes")
-    print("-" * 70)
-    
-    otp_data = otp_service.generate_otp(
-        keycloak_id=test_keycloak_id,
-        tenant_id=test_tenant,
-        email=test_email
-    )
-    
-    print(f"\n✅ OTP Generated!")
-    print(f"   Code: {otp_data['code']}")
-    print(f"   Expires At: {otp_data['expires_at']}")
-    
-    print("\n" + "=" * 70)
-    
-    return otp_data['code'], test_keycloak_id, test_tenant
+class _FakePipeline:
+    """Minimal transactional pipeline matching the redis-py call surface used."""
+
+    def __init__(self, store):
+        self._store = store
+        self._ops = []
+
+    def hset(self, key, mapping=None):
+        self._ops.append(("hset", key, mapping))
+        return self
+
+    def expire(self, key, seconds):
+        self._ops.append(("expire", key, seconds))
+        return self
+
+    def delete(self, *keys):
+        self._ops.append(("delete", keys, None))
+        return self
+
+    def execute(self):
+        for op, key, val in self._ops:
+            if op == "hset":
+                self._store["hash"].setdefault(key, {}).update(val)
+            elif op == "expire":
+                self._store["ttl"][key] = val
+            elif op == "delete":
+                for k in key:
+                    self._store["hash"].pop(k, None)
+                    self._store["str"].pop(k, None)
+                    self._store["ttl"].pop(k, None)
+        self._ops = []
+        return True
 
 
-def test_otp_verification():
-    """Test OTP verification"""
-    
-    print("\n" + "=" * 70)
-    print("OTP VERIFICATION TEST")
-    print("=" * 70)
-    
-    otp_service = OTPService()
-    
-    # Generate OTP first
-    test_keycloak_id = "abc-123-def-456"
-    test_tenant = "bpmgd"
-    test_email = "test@example.com"
-    
-    otp_data = otp_service.generate_otp(
-        keycloak_id=test_keycloak_id,
-        tenant_id=test_tenant,
-        email=test_email
-    )
-    
-    correct_otp = otp_data['code']
-    print(f"\n✅ OTP Generated: {correct_otp}")
-    
-    # Test 1: Valid OTP
-    print("\n--- Test 1: Valid OTP ---")
-    result = otp_service.verify_otp(
-        keycloak_id=test_keycloak_id,
-        tenant_id=test_tenant,
-        otp_code=correct_otp
-    )
-    print(f"Valid: {result['valid']}")
-    print(f"Message: {result['message']}")
-    
-    # Test 2: Invalid OTP (after valid verification)
-    print("\n--- Test 2: OTP Already Used ---")
-    result = otp_service.verify_otp(
-        keycloak_id=test_keycloak_id,
-        tenant_id=test_tenant,
-        otp_code=correct_otp
-    )
-    print(f"Valid: {result['valid']}")
-    print(f"Message: {result['message']}")
-    
-    # Test 3: Wrong OTP code
-    print("\n--- Test 3: Wrong OTP Code ---")
-    otp_data2 = otp_service.generate_otp(
-        keycloak_id="xyz-789-uvw-012",
-        tenant_id=test_tenant,
-        email="another@example.com"
-    )
-    
-    for i in range(1, 4):
-        print(f"\nAttempt {i}:")
-        result = otp_service.verify_otp(
-            keycloak_id="xyz-789-uvw-012",
-            tenant_id=test_tenant,
-            otp_code="999999"  # Wrong code
-        )
-        print(f"  Valid: {result['valid']}")
-        print(f"  Message: {result['message']}")
-        if 'attempts_remaining' in result:
-            print(f"  Attempts Remaining: {result['attempts_remaining']}")
-    
-    # Test 4: Max attempts exceeded
-    print("\n--- Test 4: Max Attempts Should Be Exceeded ---")
-    result = otp_service.verify_otp(
-        keycloak_id="xyz-789-uvw-012",
-        tenant_id=test_tenant,
-        otp_code="999999"
-    )
-    print(f"Valid: {result['valid']}")
-    print(f"Message: {result['message']}")
-    
-    print("\n" + "=" * 70)
+class FakeRedis:
+    """In-memory stand-in implementing exactly what OTPService uses."""
+
+    def __init__(self):
+        self._store = {"hash": {}, "str": {}, "ttl": {}}
+
+    # pipeline
+    def pipeline(self, transaction=True):
+        return _FakePipeline(self._store)
+
+    # hashes
+    def hset(self, key, field=None, value=None, mapping=None):
+        h = self._store["hash"].setdefault(key, {})
+        if mapping:
+            h.update(mapping)
+        else:
+            h[field] = value
+        return 1
+
+    def hgetall(self, key):
+        return dict(self._store["hash"].get(key, {}))
+
+    def hget(self, key, field):
+        return self._store["hash"].get(key, {}).get(field)
+
+    # strings / counters
+    def incr(self, key):
+        cur = int(self._store["str"].get(key, "0")) + 1
+        self._store["str"][key] = str(cur)
+        return cur
+
+    def get(self, key):
+        return self._store["str"].get(key)
+
+    # keyspace
+    def delete(self, *keys):
+        n = 0
+        for k in keys:
+            for kind in ("hash", "str"):
+                if k in self._store[kind]:
+                    del self._store[kind][k]
+                    n += 1
+            self._store["ttl"].pop(k, None)
+        return n
+
+    def expire(self, key, seconds):
+        self._store["ttl"][key] = seconds
+        return True
+
+    def ttl(self, key):
+        return self._store["ttl"].get(key, -2)
 
 
-def test_login_flow_with_otp():
-    """Simulate login flow with OTP"""
-    
-    print("\n" + "=" * 70)
-    print("LOGIN FLOW WITH OTP STEP-UP")
-    print("=" * 70)
-    
-    print("\n📱 SCENARIO: User logging in from new device")
-    print("-" * 70)
-    
-    print("\n1️⃣ POST /auth/login")
-    print("   Request:")
-    print("   {")
-    print('     "email": "user@example.com",')
-    print('     "password": "correct_password"')
-    print("   }")
-    
-    print("\n   Response (200 OK):")
-    print("   {")
-    print('     "message": "OTP required for verification",')
-    print('     "auth_stepup": true,')
-    print('     "otp_required": true,')
-    print('     "keycloak_id": "9052cbd0-25e3-4712-9fba-d8b792efe428",')
-    print('     "otp_expires_at": "2026-02-07T15:30:00.000000"')
-    print("   }")
-    
-    print("\n   🔐 OTP Generated and Logged:")
-    print("   ==========================================")
-    print("   🔐 OTP GENERATED for user@example.com")
-    print("      Tenant: bpmgd")
-    print("      Keycloak ID: 9052cbd0-25e3-4712-9fba-d8b792efe428")
-    print("      OTP Code: 123456")
-    print("      Expires At: 2026-02-07T15:30:00.000000")
-    print("   ==========================================")
-    
-    print("\n2️⃣ POST /auth/verify-otp")
-    print("   Request:")
-    print("   {")
-    print('     "keycloak_id": "9052cbd0-25e3-4712-9fba-d8b792efe428",')
-    print('     "otp_code": "123456"')
-    print("   }")
-    
-    print("\n   Response (200 OK):")
-    print("   {")
-    print('     "message": "OTP verified successfully. Authentication complete.",')
-    print('     "verified": true,')
-    print('     "keycloak_id": "9052cbd0-25e3-4712-9fba-d8b792efe428",')
-    print('     "email": "user@example.com"')
-    print("   }")
-    
-    print("\n✅ User authenticated successfully!")
-    print("\n" + "=" * 70)
+def _make_service():
+    fake = FakeRedis()
+    # Patch the module-level accessor so OTPService uses the fake.
+    original = otp_module._get_redis
+    otp_module._get_redis = lambda: fake
+    return OTPService(), fake, original
 
 
-def test_trusted_device_flow():
-    """Simulate login from trusted device"""
-    
-    print("\n" + "=" * 70)
-    print("LOGIN FLOW - TRUSTED DEVICE (No OTP)")
-    print("=" * 70)
-    
-    print("\n📱 SCENARIO: User logging in from trusted device")
-    print("-" * 70)
-    
-    print("\n1️⃣ POST /auth/login")
-    print("   Request:")
-    print("   {")
-    print('     "email": "user@example.com",')
-    print('     "password": "correct_password"')
-    print("   }")
-    
-    print("\n   Response (200 OK):")
-    print("   {")
-    print('     "message": "success",')
-    print('     "access_token": "eyJhbGciOiJSUzI1NiIsInR5cC...",')
-    print('     "refresh_token": "eyJhbGciOiJSUzI1NiIsInR5cC...",')
-    print('     "expires_in": 300,')
-    print('     "refresh_expires_in": 1800,')
-    print('     "token_type": "Bearer",')
-    print('     "keycloak_id": "9052cbd0-25e3-4712-9fba-d8b792efe428",')
-    print('     "auth_stepup": false,')
-    print('     "otp_required": false')
-    print("   }")
-    
-    print("\n✅ User authenticated immediately (no OTP required)")
-    print("\n" + "=" * 70)
+def _restore(original):
+    otp_module._get_redis = original
 
 
-def test_otp_error_scenarios():
-    """Test various OTP error scenarios"""
-    
-    print("\n" + "=" * 70)
-    print("OTP ERROR SCENARIOS")
-    print("=" * 70)
-    
-    print("\n--- Scenario 1: OTP Not Found ---")
-    print("POST /auth/verify-otp")
-    print("Response (401):")
-    print('{')
-    print('  "detail": {')
-    print('    "code": "AUTH-OTP-INVALID-4010",')
-    print('    "message": "No OTP found. Please request a new one."')
-    print('  }')
-    print('}')
-    
-    print("\n--- Scenario 2: OTP Expired ---")
-    print("POST /auth/verify-otp")
-    print("Response (401):")
-    print('{')
-    print('  "detail": {')
-    print('    "code": "AUTH-OTP-INVALID-4010",')
-    print('    "message": "OTP has expired. Please request a new one."')
-    print('  }')
-    print('}')
-    
-    print("\n--- Scenario 3: Invalid OTP Code ---")
-    print("POST /auth/verify-otp")
-    print("Response (401):")
-    print('{')
-    print('  "detail": {')
-    print('    "code": "AUTH-OTP-INVALID-4010",')
-    print('    "message": "Invalid OTP code. 2 attempt(s) remaining."')
-    print('  }')
-    print('}')
-    
-    print("\n--- Scenario 4: Max Attempts Exceeded ---")
-    print("POST /auth/verify-otp")
-    print("Response (401):")
-    print('{')
-    print('  "detail": {')
-    print('    "code": "AUTH-OTP-INVALID-4010",')
-    print('    "message": "Maximum verification attempts exceeded. Please request a new OTP."')
-    print('  }')
-    print('}')
-    
-    print("\n" + "=" * 70)
+def _read_code(fake, tenant_id, keycloak_id):
+    """Peek at the stored code (test-only; production API never exposes it)."""
+    key = OTPService._OTP_KEY.format(tenant_id=tenant_id, keycloak_id=keycloak_id)
+    return fake.hgetall(key)["code"]
+
+
+def test_generate_otp_returns_expiry_but_never_the_code():
+    svc, fake, orig = _make_service()
+    try:
+        result = svc.generate_otp("kc-1", "tenant-a", "user@example.com")
+        assert "expires_at" in result, "generate_otp must return expires_at"
+        assert "code" not in result, "generate_otp must NEVER return the OTP code"
+        expires = datetime.fromisoformat(result["expires_at"])
+        assert expires > datetime.now(timezone.utc), "expires_at must be in the future"
+        # The code must exist server-side, be 6 digits, and expire via TTL.
+        code = _read_code(fake, "tenant-a", "kc-1")
+        assert len(code) == svc.OTP_LENGTH and code.isdigit()
+        otp_key = OTPService._OTP_KEY.format(tenant_id="tenant-a", keycloak_id="kc-1")
+        assert fake.ttl(otp_key) == svc.OTP_EXPIRY_SECONDS
+    finally:
+        _restore(orig)
+
+
+def test_verify_correct_otp_exactly_once():
+    svc, fake, orig = _make_service()
+    try:
+        svc.generate_otp("kc-2", "tenant-a", "user@example.com")
+        code = _read_code(fake, "tenant-a", "kc-2")
+
+        first = svc.verify_otp("kc-2", "tenant-a", code)
+        assert first["valid"] is True, f"correct OTP must verify: {first}"
+
+        replay = svc.verify_otp("kc-2", "tenant-a", code)
+        assert replay["valid"] is False, "replayed OTP must be rejected"
+        assert "already used" in replay["message"].lower()
+    finally:
+        _restore(orig)
+
+
+def test_wrong_code_counts_down_attempts_then_locks_out():
+    svc, fake, orig = _make_service()
+    try:
+        svc.generate_otp("kc-3", "tenant-a", "user@example.com")
+        real_code = _read_code(fake, "tenant-a", "kc-3")
+        wrong = "000000" if real_code != "000000" else "111111"
+
+        for attempt in range(1, svc.MAX_ATTEMPTS + 1):
+            res = svc.verify_otp("kc-3", "tenant-a", wrong)
+            assert res["valid"] is False
+            assert res["attempts_remaining"] == svc.MAX_ATTEMPTS - attempt, (
+                f"attempt {attempt}: attempts_remaining={res.get('attempts_remaining')}, "
+                f"want {svc.MAX_ATTEMPTS - attempt}"
+            )
+
+        # One attempt past the limit destroys the OTP entirely.
+        res = svc.verify_otp("kc-3", "tenant-a", wrong)
+        assert res["valid"] is False
+        assert "maximum" in res["message"].lower()
+
+        # Even the CORRECT code must now fail — the OTP is gone.
+        res = svc.verify_otp("kc-3", "tenant-a", real_code)
+        assert res["valid"] is False, "OTP must be destroyed after max attempts"
+        assert "no otp found" in res["message"].lower()
+    finally:
+        _restore(orig)
+
+
+def test_verify_without_enrollment_fails_closed():
+    svc, fake, orig = _make_service()
+    try:
+        res = svc.verify_otp("never-enrolled", "tenant-a", "123456")
+        assert res["valid"] is False
+        assert "no otp found" in res["message"].lower()
+    finally:
+        _restore(orig)
+
+
+def test_otp_is_scoped_per_tenant_and_user():
+    svc, fake, orig = _make_service()
+    try:
+        svc.generate_otp("kc-4", "tenant-a", "user@example.com")
+        code = _read_code(fake, "tenant-a", "kc-4")
+
+        # Same code, wrong tenant → must not verify.
+        assert svc.verify_otp("kc-4", "tenant-b", code)["valid"] is False
+        # Same code, wrong user → must not verify.
+        assert svc.verify_otp("kc-other", "tenant-a", code)["valid"] is False
+        # Right pair verifies.
+        assert svc.verify_otp("kc-4", "tenant-a", code)["valid"] is True
+    finally:
+        _restore(orig)
+
+
+def test_regeneration_resets_attempt_counter():
+    svc, fake, orig = _make_service()
+    try:
+        svc.generate_otp("kc-5", "tenant-a", "user@example.com")
+        real = _read_code(fake, "tenant-a", "kc-5")
+        wrong = "999999" if real != "999999" else "888888"
+        svc.verify_otp("kc-5", "tenant-a", wrong)
+        svc.verify_otp("kc-5", "tenant-a", wrong)
+
+        # A fresh OTP must reset the throttle (delete of the attempt key).
+        svc.generate_otp("kc-5", "tenant-a", "user@example.com")
+        attempt_key = OTPService._ATTEMPT_KEY.format(tenant_id="tenant-a", keycloak_id="kc-5")
+        assert fake.get(attempt_key) is None, "regeneration must reset the attempt counter"
+
+        new_code = _read_code(fake, "tenant-a", "kc-5")
+        assert svc.verify_otp("kc-5", "tenant-a", new_code)["valid"] is True
+    finally:
+        _restore(orig)
+
+
+def test_invalidate_otp_wipes_state():
+    svc, fake, orig = _make_service()
+    try:
+        svc.generate_otp("kc-6", "tenant-a", "user@example.com")
+        code = _read_code(fake, "tenant-a", "kc-6")
+        svc.invalidate_otp("kc-6", "tenant-a")
+        res = svc.verify_otp("kc-6", "tenant-a", code)
+        assert res["valid"] is False, "invalidated OTP must not verify"
+        assert "no otp found" in res["message"].lower()
+    finally:
+        _restore(orig)
+
+
+def test_status_exposes_metadata_but_never_code():
+    svc, fake, orig = _make_service()
+    try:
+        assert svc.get_otp_status("kc-7", "tenant-a") is None, "no OTP → no status"
+        svc.generate_otp("kc-7", "tenant-a", "user@example.com")
+        status = svc.get_otp_status("kc-7", "tenant-a")
+        assert status is not None and status["exists"] is True
+        assert status["verified"] is False
+        assert status["attempts_used"] == 0
+        assert status["ttl_seconds"] > 0
+        assert "code" not in status, "status endpoint must never leak the code"
+    finally:
+        _restore(orig)
 
 
 if __name__ == "__main__":
-    print("\n🔐 OTP SERVICE TEST SUITE\n")
-    
-    test_otp_generation()
-    test_otp_verification()
-    test_login_flow_with_otp()
-    test_trusted_device_flow()
-    test_otp_error_scenarios()
-    
-    print("\n✅ All tests completed!\n")
-    
-    print("=" * 70)
-    print("CONFIGURATION")
-    print("=" * 70)
-    print("\nOTP Settings:")
-    print("  OTP_LENGTH: 6 digits")
-    print("  OTP_EXPIRY: 10 minutes")
-    print("  MAX_VERIFICATION_ATTEMPTS: 3")
-    print("\nAPI Endpoints:")
-    print("  POST /auth/login - Returns OTP requirement if auth_stepup=true")
-    print("  POST /auth/verify-otp - Verifies OTP code")
-    print("\nOTP Delivery:")
-    print("  - Currently: Logged to console (for development)")
-    print("  - Production: Send via SMS/Email service")
-    print("=" * 70)
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
+    for fn in tests:
+        fn()
+        print(f"PASS {fn.__name__}")
+    print(f"\n{len(tests)} tests passed")
