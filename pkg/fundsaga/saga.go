@@ -66,13 +66,20 @@ type SagaState struct {
 	CompletedSteps []string               `json:"completed_steps"` // for compensation tracking
 	Error          string                 `json:"error,omitempty"`
 
+	// StepKeys holds the deterministic idempotency key of every step that
+	// has run (derived from the saga identity + step index). CurrentStepKey
+	// is the key of the step currently executing — money-moving steps use it
+	// as the ledger reference so a retried step replays idempotently.
+	StepKeys       []string `json:"step_keys,omitempty"`
+	CurrentStepKey string   `json:"current_step_key,omitempty"`
+
 	lockRelease func() // held lock release func (not serialized)
 }
 
 // SagaResult is the outcome of a saga execution.
 type SagaResult struct {
 	TransferID string      `json:"transfer_id"`
-	Status     string      `json:"status"` // "completed", "compensated", "failed"
+	Status     string      `json:"status"` // "completed", "compensated", "compensation_failed", "failed"
 	Legs       []LegResult `json:"legs"`
 	Duration   int64       `json:"duration_us"`
 	Error      string      `json:"error,omitempty"`
@@ -86,11 +93,28 @@ type LegResult struct {
 	EntryID      string     `json:"entry_id"`
 }
 
+// stepIdempotencyKey derives the deterministic idempotency key for saga step
+// i from the saga identity (caller-supplied IdempotencyKey when present, else
+// TransferID). Retried sagas with the same identity replay steps under the
+// same keys, so ledger operations yield idempotent-exists instead of
+// duplicates.
+func stepIdempotencyKey(state *SagaState, stepIndex int, stepName string) string {
+	base := state.IdempotencyKey
+	if base == "" {
+		base = state.TransferID
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("54bank/fundsaga/%s/step/%d/%s", base, stepIndex, stepName)))
+	return hex.EncodeToString(sum[:16])
+}
+
 // ExecuteSaga runs steps in order. On failure, compensates in reverse.
 // The returned status is "completed" ONLY when every step succeeded —
 // meaning pending transfers were really created in TigerBeetle and really
-// committed. Any failure yields "compensated" (side effects were undone)
-// or "failed" (nothing to undo) plus a non-nil error.
+// committed. A failure yields "failed" (nothing to undo), "compensated"
+// (every compensation succeeded), or "compensation_failed" (at least one
+// compensation failed — side effects may remain; the error carries the
+// detail) plus a non-nil error. "compensated" is NEVER reported when a
+// compensation errored.
 func ExecuteSaga(ctx context.Context, steps []SagaStep, state *SagaState) (*SagaResult, error) {
 	start := time.Now()
 	result := &SagaResult{
@@ -99,28 +123,38 @@ func ExecuteSaga(ctx context.Context, steps []SagaStep, state *SagaState) (*Saga
 	}
 
 	for i, step := range steps {
+		state.CurrentStepKey = stepIdempotencyKey(state, i, step.Name)
+		state.StepKeys = append(state.StepKeys, state.CurrentStepKey)
 		if err := step.Forward(ctx, state); err != nil {
 			state.Error = fmt.Sprintf("step %d (%s) failed: %v", i, step.Name, err)
 			result.Error = state.Error
 
 			// Compensate in reverse order
 			compensations := 0
+			compFailed := false
 			for j := i - 1; j >= 0; j-- {
 				if steps[j].Compensate != nil {
 					compensations++
+					state.CurrentStepKey = stepIdempotencyKey(state, j, steps[j].Name) + ":compensate"
 					if compErr := steps[j].Compensate(ctx, state); compErr != nil {
-						// Compensation failure is critical — log and continue
+						// Compensation failure is critical — propagate it:
+						// the saga did NOT fully unwind and must not report
+						// "compensated".
+						compFailed = true
 						result.Error += fmt.Sprintf("; compensation step %d (%s) also failed: %v", j, steps[j].Name, compErr)
 					}
 				}
 			}
-			if compensations > 0 {
+			switch {
+			case compFailed:
+				result.Status = "compensation_failed"
+			case compensations > 0:
 				result.Status = "compensated"
-			} else {
+			default:
 				result.Status = "failed"
 			}
 			result.Duration = time.Since(start).Microseconds()
-			return result, fmt.Errorf("saga %s: %s", result.Status, state.Error)
+			return result, fmt.Errorf("saga %s: %s", result.Status, result.Error)
 		}
 		state.CompletedSteps = append(state.CompletedSteps, step.Name)
 	}
@@ -293,17 +327,28 @@ func checkTransferResults(op string, results []tbclient.CreateTransferResult) er
 	return nil
 }
 
+// deterministicTransferID derives a stable TigerBeetle transfer ID from a
+// saga step reference + leg index (sha256, namespaced). A retried saga step
+// resubmits the SAME transfer IDs, so the cluster returns TransferExists
+// instead of applying a duplicate.
+func deterministicTransferID(reference string, index int) tbclient.Uint128 {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("54bank/fundsaga/transfer/%s/%d", reference, index)))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	return tbclient.BytesToUint128(b)
+}
+
 func (b *tigerBeetleLedgerBackend) CreatePendingTransfers(ctx context.Context, transfers []LedgerTransfer, timeoutSecs uint32) ([]string, error) {
 	if len(transfers) == 0 {
 		return nil, fmt.Errorf("no transfers to reserve")
 	}
 	tbTransfers := make([]tbclient.Transfer, 0, len(transfers))
-	for _, t := range transfers {
+	for i, t := range transfers {
 		if t.Amount <= 0 {
 			return nil, fmt.Errorf("transfer amount must be positive: %d kobo", t.Amount)
 		}
 		tbTransfers = append(tbTransfers, tbclient.Transfer{
-			ID:              tbclient.ID(),
+			ID:              deterministicTransferID(t.Reference, i),
 			DebitAccountID:  accountIDToUint128(t.DebitAccountID),
 			CreditAccountID: accountIDToUint128(t.CreditAccountID),
 			Amount:          tbclient.ToUint128(uint64(t.Amount)),
@@ -335,7 +380,11 @@ func (b *tigerBeetleLedgerBackend) postOrVoid(ctx context.Context, pendingIDs []
 		return fmt.Errorf("no pending transfers to %s", map[bool]string{true: "post", false: "void"}[post])
 	}
 	transfers := make([]tbclient.Transfer, 0, len(pendingIDs))
-	for _, hexID := range pendingIDs {
+	op := "void_pending"
+	if post {
+		op = "post_pending"
+	}
+	for i, hexID := range pendingIDs {
 		pid, err := pendingIDToUint128(hexID)
 		if err != nil {
 			return err
@@ -345,7 +394,9 @@ func (b *tigerBeetleLedgerBackend) postOrVoid(ctx context.Context, pendingIDs []
 			flags = tbclient.TransferFlags{Linked: true, PostPendingTransfer: true}
 		}
 		transfers = append(transfers, tbclient.Transfer{
-			ID:        tbclient.ID(),
+			// Deterministic post/void ID: a retried post/void of the same
+			// pending transfer replays idempotently (TransferExists).
+			ID:        deterministicTransferID(op+":"+hexID, i),
 			PendingID: pid,
 			Flags:     flags.ToUint16(),
 		})
@@ -354,10 +405,6 @@ func (b *tigerBeetleLedgerBackend) postOrVoid(ctx context.Context, pendingIDs []
 		transfers[len(transfers)-1].Flags = tbclient.TransferFlags{PostPendingTransfer: true}.ToUint16()
 	} else {
 		transfers[len(transfers)-1].Flags = tbclient.TransferFlags{VoidPendingTransfer: true}.ToUint16()
-	}
-	op := "void_pending"
-	if post {
-		op = "post_pending"
 	}
 	results, err := b.client.CreateTransfers(ctx, transfers)
 	if err != nil {
@@ -383,9 +430,9 @@ func (b *tigerBeetleLedgerBackend) CreateReversalTransfers(ctx context.Context, 
 		return err
 	}
 	tbTransfers := make([]tbclient.Transfer, 0, len(transfers))
-	for _, t := range transfers {
+	for i, t := range transfers {
 		tbTransfers = append(tbTransfers, tbclient.Transfer{
-			ID:              tbclient.ID(),
+			ID:              deterministicTransferID(reference, i),
 			DebitAccountID:  accountIDToUint128(t.DebitAccountID),
 			CreditAccountID: accountIDToUint128(t.CreditAccountID),
 			Amount:          tbclient.ToUint128(uint64(t.Amount)),
@@ -539,6 +586,8 @@ func StepValidateBalances() SagaStep {
 
 // StepCreatePendingTransfer creates real TigerBeetle pending transfers
 // (funds reserved in the cluster). Fails fast when no ledger is configured.
+// The step's idempotency key (saga ID + step index) is the ledger reference,
+// so a retried step yields TransferExists instead of duplicate reservations.
 func StepCreatePendingTransfer() SagaStep {
 	return SagaStep{
 		Name: "create_pending_transfer",
@@ -547,7 +596,11 @@ func StepCreatePendingTransfer() SagaStep {
 			if lb == nil {
 				return ErrLedgerNotConfigured
 			}
-			transfers, err := pairLegs(state.Legs, state.TransferID)
+			reference := state.TransferID
+			if state.CurrentStepKey != "" {
+				reference = state.CurrentStepKey
+			}
+			transfers, err := pairLegs(state.Legs, reference)
 			if err != nil {
 				return err
 			}
@@ -632,7 +685,14 @@ func StepCommitTransfer() SagaStep {
 					Direction: dir, Ledger: leg.Ledger, Code: leg.Code,
 				})
 			}
-			return lb.CreateReversalTransfers(ctx, reversed, fmt.Sprintf("REV-%s", state.TransferID))
+			// Idempotency: the reversal reference is derived from the saga
+			// step key when available, so a retried compensation replays
+			// against the same deterministic ledger transfer IDs.
+			reference := fmt.Sprintf("REV-%s", state.TransferID)
+			if state.CurrentStepKey != "" {
+				reference = "REV-" + state.CurrentStepKey
+			}
+			return lb.CreateReversalTransfers(ctx, reversed, reference)
 		},
 	}
 }

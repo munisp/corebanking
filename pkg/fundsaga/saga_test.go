@@ -3,6 +3,7 @@ package fundsaga
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -79,6 +80,65 @@ func TestSagaCompensation(t *testing.T) {
 	}
 	if compensated[0] != "step2" || compensated[1] != "step1" {
 		t.Errorf("compensation order = %v, want [step2, step1]", compensated)
+	}
+}
+
+func TestSagaCompensationFailurePropagates(t *testing.T) {
+	steps := []SagaStep{
+		{
+			Name:    "step1",
+			Forward: func(ctx context.Context, state *SagaState) error { return nil },
+			Compensate: func(ctx context.Context, state *SagaState) error {
+				return fmt.Errorf("void pending transfer failed: cluster unreachable")
+			},
+		},
+		{
+			Name:       "step2_fails",
+			Forward:    func(ctx context.Context, state *SagaState) error { return fmt.Errorf("boom") },
+			Compensate: nil,
+		},
+	}
+	state := &SagaState{TransferID: "TEST-COMP-FAIL", Metadata: map[string]interface{}{}}
+	result, err := ExecuteSaga(context.Background(), steps, state)
+	if err == nil {
+		t.Fatal("expected saga to fail")
+	}
+	if result.Status != "compensation_failed" {
+		t.Errorf("status = %s, want compensation_failed — a failed compensation must never report compensated", result.Status)
+	}
+	if result.Error == "" || !strings.Contains(result.Error, "compensation step 0") {
+		t.Errorf("error %q should carry the compensation failure detail", result.Error)
+	}
+}
+
+func TestStepIdempotencyKeys(t *testing.T) {
+	state := &SagaState{TransferID: "SAGA-1", Metadata: map[string]interface{}{}}
+	steps := []SagaStep{
+		{Name: "a", Forward: func(ctx context.Context, state *SagaState) error { return nil }},
+		{Name: "b", Forward: func(ctx context.Context, state *SagaState) error { return nil }},
+	}
+	if _, err := ExecuteSaga(context.Background(), steps, state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.StepKeys) != 2 {
+		t.Fatalf("StepKeys = %v, want 2 entries", state.StepKeys)
+	}
+	if state.StepKeys[0] == state.StepKeys[1] {
+		t.Error("step keys must be distinct per step index")
+	}
+	// Deterministic: same saga identity + step index → same key.
+	again := stepIdempotencyKey(&SagaState{TransferID: "SAGA-1"}, 0, "a")
+	if again != state.StepKeys[0] {
+		t.Errorf("step key not deterministic: %s != %s", again, state.StepKeys[0])
+	}
+	// Caller-supplied IdempotencyKey takes precedence over TransferID.
+	k1 := stepIdempotencyKey(&SagaState{TransferID: "SAGA-1", IdempotencyKey: "caller-key"}, 0, "a")
+	k2 := stepIdempotencyKey(&SagaState{TransferID: "SAGA-2", IdempotencyKey: "caller-key"}, 0, "a")
+	if k1 != k2 {
+		t.Error("IdempotencyKey must drive the step key, not the time-based TransferID")
+	}
+	if k1 == state.StepKeys[0] {
+		t.Error("key with IdempotencyKey should differ from TransferID-derived key")
 	}
 }
 
