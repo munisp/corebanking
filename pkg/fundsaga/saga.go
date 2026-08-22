@@ -24,6 +24,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
+	"math/big"
 	"os"
 	"sync"
 	"time"
@@ -45,6 +47,11 @@ type TransferLeg struct {
 	Direction string     `json:"direction"` // "debit" or "credit"
 	Ledger    uint32     `json:"ledger"`
 	Code      uint16     `json:"code"`
+	// Currency is the ISO 4217 currency of the amount ("" means the platform
+	// default, NGN). Balance validation is enforced PER CURRENCY: a leg set
+	// that mixes currencies must balance within each currency — summing NGN
+	// and USD amounts into one numeric total is meaningless and is rejected.
+	Currency string `json:"currency,omitempty"`
 }
 
 // SagaStep is a forward action with its registered compensation.
@@ -197,11 +204,12 @@ type LockBackend interface {
 }
 
 var (
-	backendMu    sync.RWMutex
-	ledger       LedgerBackend
-	lockBackend  LockBackend
-	glPoster     func(ctx context.Context, state *SagaState) error
-	eventEmitter func(ctx context.Context, topic, eventType string, state *SagaState) error
+	backendMu      sync.RWMutex
+	ledger         LedgerBackend
+	lockBackend    LockBackend
+	glPoster       func(ctx context.Context, state *SagaState) error
+	eventEmitter   func(ctx context.Context, topic, eventType string, state *SagaState) error
+	fxRateProvider FXRateProvider
 )
 
 // ErrLedgerNotConfigured is returned by fund-movement steps when no ledger
@@ -211,6 +219,53 @@ var ErrLedgerNotConfigured = fmt.Errorf("fundsaga: TigerBeetle ledger backend no
 // ErrLockBackendNotConfigured is returned when distributed locks are
 // unavailable; fund movement without locking is refused.
 var ErrLockBackendNotConfigured = fmt.Errorf("fundsaga: distributed lock backend not configured (call fundsaga.ConfigureLocks)")
+
+// ErrFXRateSourceNotConfigured is returned when a cross-border saga is built
+// without an FX rate source. Caller-supplied or assumed rates are refused.
+var ErrFXRateSourceNotConfigured = fmt.Errorf("fundsaga: FX rate source not configured — refusing cross-border conversion (call fundsaga.ConfigureFXRateSource)")
+
+// FXRateProvider resolves the FX rate for a currency pair on a value date
+// from an authoritative rate table/service. The rate is expressed in basis
+// points of minor units: receiveMinor = sendMinor * rateBps / 10000.
+// Implementations must return an error when no rate is available — there is
+// no fallback rate.
+type FXRateProvider func(fromCurrency, toCurrency string, valueDate time.Time) (rateBps int64, err error)
+
+// ConfigureFXRateSource installs the FX rate source used by cross-border
+// sagas. Until configured, CrossBorderRemittanceSaga fails fast.
+func ConfigureFXRateSource(p FXRateProvider) {
+	backendMu.Lock()
+	defer backendMu.Unlock()
+	fxRateProvider = p
+}
+
+func currentFXRateProvider() FXRateProvider {
+	backendMu.RLock()
+	defer backendMu.RUnlock()
+	return fxRateProvider
+}
+
+// convertAmountKobo converts amount at rateBps/10000 using arbitrary
+// precision arithmetic. The result must fit int64 and be positive — overflow
+// or round-to-zero is an error, never a silently wrapped/truncated amount.
+func convertAmountKobo(amount AmountKobo, rateBps int64) (AmountKobo, error) {
+	if amount <= 0 {
+		return 0, fmt.Errorf("amount must be positive: %d", amount)
+	}
+	if rateBps <= 0 {
+		return 0, fmt.Errorf("fx rate must be positive: %d bps", rateBps)
+	}
+	prod := new(big.Int).Mul(big.NewInt(int64(amount)), big.NewInt(rateBps))
+	q := new(big.Int).Quo(prod, big.NewInt(10000))
+	if !q.IsInt64() {
+		return 0, fmt.Errorf("fx conversion overflow: %d * %d bps exceeds int64 minor units", int64(amount), rateBps)
+	}
+	out := q.Int64()
+	if out <= 0 {
+		return 0, fmt.Errorf("fx conversion of %d minor units at %d bps rounds to zero", int64(amount), rateBps)
+	}
+	return AmountKobo(out), nil
+}
 
 // ConfigureLedger installs the ledger backend used by all saga steps.
 func ConfigureLedger(b LedgerBackend) {
@@ -450,13 +505,27 @@ func (b *tigerBeetleLedgerBackend) CreateReversalTransfers(ctx context.Context, 
 	return checkTransferResults("reversal", results)
 }
 
+// defaultCurrency is assumed for legs without an explicit currency.
+const defaultCurrency = "NGN"
+
+func legCurrency(leg TransferLeg) string {
+	if leg.Currency == "" {
+		return defaultCurrency
+	}
+	return leg.Currency
+}
+
 // pairLegs decomposes balanced debit/credit legs into individual
-// debit-account → credit-account transfers (waterfall pairing).
+// debit-account → credit-account transfers (waterfall pairing). Legs of
+// different currencies are NEVER paired into one transfer: a single ledger
+// transfer moves one currency, so a cross-currency pair is a construction
+// error and is refused.
 func pairLegs(legs []TransferLeg, reference string) ([]LedgerTransfer, error) {
 	type side struct {
 		accountID string
 		ledger    uint32
 		code      uint16
+		currency  string
 		remaining AmountKobo
 	}
 	var debits, credits []side
@@ -465,9 +534,9 @@ func pairLegs(legs []TransferLeg, reference string) ([]LedgerTransfer, error) {
 			continue
 		}
 		if leg.Direction == "debit" {
-			debits = append(debits, side{leg.AccountID, leg.Ledger, leg.Code, leg.Amount})
+			debits = append(debits, side{leg.AccountID, leg.Ledger, leg.Code, legCurrency(leg), leg.Amount})
 		} else {
-			credits = append(credits, side{leg.AccountID, leg.Ledger, leg.Code, leg.Amount})
+			credits = append(credits, side{leg.AccountID, leg.Ledger, leg.Code, legCurrency(leg), leg.Amount})
 		}
 	}
 	if len(debits) == 0 || len(credits) == 0 {
@@ -476,6 +545,10 @@ func pairLegs(legs []TransferLeg, reference string) ([]LedgerTransfer, error) {
 	var out []LedgerTransfer
 	di, ci := 0, 0
 	for di < len(debits) && ci < len(credits) {
+		if debits[di].currency != credits[ci].currency {
+			return nil, fmt.Errorf("cross-currency pairing refused: debit %s (%s) vs credit %s (%s)",
+				debits[di].accountID, debits[di].currency, credits[ci].accountID, credits[ci].currency)
+		}
 		amt := debits[di].remaining
 		if credits[ci].remaining < amt {
 			amt = credits[ci].remaining
@@ -566,17 +639,37 @@ func StepValidateBalances() SagaStep {
 					return fmt.Errorf("credit amount must be positive: %d kobo", leg.Amount)
 				}
 			}
-			// Validate double-entry: total debits must equal total credits
-			var totalDebit, totalCredit AmountKobo
+			// Validate double-entry PER CURRENCY: debits must equal credits
+			// within each currency. Summing amounts across currencies into one
+			// numeric total is meaningless (a cross-border leg set is balanced
+			// only when every currency balances on its own). Addition is
+			// overflow-checked.
+			type totals struct{ debit, credit AmountKobo }
+			byCurrency := map[string]*totals{}
 			for _, leg := range state.Legs {
+				cur := legCurrency(leg)
+				t := byCurrency[cur]
+				if t == nil {
+					t = &totals{}
+					byCurrency[cur] = t
+				}
 				if leg.Direction == "debit" {
-					totalDebit += leg.Amount
+					if int64(t.debit) > math.MaxInt64-int64(leg.Amount) {
+						return fmt.Errorf("debit total overflow for currency %s", cur)
+					}
+					t.debit += leg.Amount
 				} else {
-					totalCredit += leg.Amount
+					if int64(t.credit) > math.MaxInt64-int64(leg.Amount) {
+						return fmt.Errorf("credit total overflow for currency %s", cur)
+					}
+					t.credit += leg.Amount
 				}
 			}
-			if totalDebit != totalCredit {
-				return fmt.Errorf("double-entry imbalance: debit=%d credit=%d kobo", totalDebit, totalCredit)
+			for _, cur := range sortStrings(mapKeys(byCurrency)) {
+				t := byCurrency[cur]
+				if t.debit != t.credit {
+					return fmt.Errorf("double-entry imbalance in %s: debit=%d credit=%d minor units", cur, t.debit, t.credit)
+				}
 			}
 			return nil
 		},
@@ -830,19 +923,46 @@ func LoanDisbursementSaga(loanAccountID, borrowerID string, principalKobo Amount
 }
 
 // CrossBorderRemittanceSaga handles FX conversion + cross-border settlement.
-func CrossBorderRemittanceSaga(senderID, beneficiaryID string, sendAmountKobo AmountKobo, fxRate int64, receiveCurrency string) ([]SagaStep, *SagaState) {
-	receiveAmountKobo := AmountKobo(int64(sendAmountKobo) * fxRate / 10000) // fxRate in basis points
+//
+// Invariants enforced (H-08):
+//   - The FX rate is resolved from the configured rate source (currency pair +
+//     value date), NEVER taken from the caller. Without a configured rate
+//     source the saga fails fast with ErrFXRateSourceNotConfigured.
+//   - The conversion uses overflow-safe arbitrary-precision arithmetic; the
+//     receive amount must fit int64 and be positive.
+//   - Legs carry explicit currencies: the send side (sender debit + nostro
+//     credit) is NGN, the receive side (vostro debit + beneficiary credit) is
+//     receiveCurrency. Balance validation is enforced per currency, and
+//     pairLegs refuses to pair legs of different currencies into one transfer.
+func CrossBorderRemittanceSaga(senderID, beneficiaryID string, sendAmountKobo AmountKobo, receiveCurrency string) ([]SagaStep, *SagaState, error) {
+	provider := currentFXRateProvider()
+	if provider == nil {
+		return nil, nil, ErrFXRateSourceNotConfigured
+	}
+	if receiveCurrency == "" || receiveCurrency == defaultCurrency {
+		return nil, nil, fmt.Errorf("cross-border saga requires a foreign receive currency, got %q", receiveCurrency)
+	}
+	valueDate := time.Now().UTC().Truncate(24 * time.Hour)
+	fxRate, err := provider(defaultCurrency, receiveCurrency, valueDate)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fx rate lookup %s/%s for %s: %w", defaultCurrency, receiveCurrency, valueDate.Format("2006-01-02"), err)
+	}
+	receiveAmount, err := convertAmountKobo(sendAmountKobo, fxRate)
+	if err != nil {
+		return nil, nil, fmt.Errorf("fx conversion %s->%s: %w", defaultCurrency, receiveCurrency, err)
+	}
 	state := &SagaState{
 		TransferID: fmt.Sprintf("REMIT-%d", time.Now().UnixNano()),
 		Legs: []TransferLeg{
-			{AccountID: senderID, Amount: sendAmountKobo, Direction: "debit", Ledger: 1, Code: 4001},
-			{AccountID: "nostro-" + receiveCurrency, Amount: sendAmountKobo, Direction: "credit", Ledger: 5, Code: 4001},
-			{AccountID: "vostro-" + receiveCurrency, Amount: receiveAmountKobo, Direction: "debit", Ledger: 6, Code: 4001},
-			{AccountID: beneficiaryID, Amount: receiveAmountKobo, Direction: "credit", Ledger: 1, Code: 4001},
+			{AccountID: senderID, Amount: sendAmountKobo, Direction: "debit", Ledger: 1, Code: 4001, Currency: defaultCurrency},
+			{AccountID: "nostro-" + receiveCurrency, Amount: sendAmountKobo, Direction: "credit", Ledger: 5, Code: 4001, Currency: defaultCurrency},
+			{AccountID: "vostro-" + receiveCurrency, Amount: receiveAmount, Direction: "debit", Ledger: 6, Code: 4001, Currency: receiveCurrency},
+			{AccountID: beneficiaryID, Amount: receiveAmount, Direction: "credit", Ledger: 1, Code: 4001, Currency: receiveCurrency},
 		},
 		Metadata: map[string]interface{}{
-			"fx_rate":          fxRate,
-			"send_currency":    "NGN",
+			"fx_rate_bps":      fxRate,
+			"fx_value_date":    valueDate.Format("2006-01-02"),
+			"send_currency":    defaultCurrency,
 			"receive_currency": receiveCurrency,
 		},
 	}
@@ -888,7 +1008,7 @@ func CrossBorderRemittanceSaga(senderID, beneficiaryID string, sendAmountKobo Am
 		StepEmitEvent("banking.payments", "remittance.completed"),
 		StepReleaseLocks(),
 	}
-	return steps, state
+	return steps, state, nil
 }
 
 // FeeCollectionSaga handles batch fee debit + income credit.
@@ -911,6 +1031,16 @@ func FeeCollectionSaga(customerID, feeIncomeAccountID string, feeKobo AmountKobo
 		StepReleaseLocks(),
 	}
 	return steps, state
+}
+
+// mapKeys returns the keys of a string-keyed map (order normalized by the
+// caller via sortStrings where deterministic output is required).
+func mapKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 // sortStrings returns a sorted copy to prevent deadlocks.

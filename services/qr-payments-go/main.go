@@ -1,17 +1,17 @@
 package main
 
 import (
-	"github.com/IBM/sarama"
-	"math/big"
-	"encoding/base64"
-	"crypto/sha256"
-	"crypto/rsa"
+	"context"
 	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
+	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
+	"math/big"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 
 	"encoding/json"
 	"fmt"
@@ -19,13 +19,10 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"net"
-
 )
 
 var serviceName = "qr-payments-go"
@@ -35,15 +32,15 @@ var startTime = time.Now()
 // ─── Domain Types ───────────────────────────────────────────────────────────
 
 type Record struct {
-	ID          string                 `json:"id"`
-	Type        string                 `json:"type"`
-	Status      string                 `json:"status"`
-	Data        map[string]interface{} `json:"data"`
-	CreatedAt   string                 `json:"createdAt"`
-	UpdatedAt   string                 `json:"updatedAt"`
-	CreatedBy   string                 `json:"createdBy,omitempty"`
-	TenantID    string                 `json:"tenantId,omitempty"`
-	Version     int                    `json:"version"`
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Status    string                 `json:"status"`
+	Data      map[string]interface{} `json:"data"`
+	CreatedAt string                 `json:"createdAt"`
+	UpdatedAt string                 `json:"updatedAt"`
+	CreatedBy string                 `json:"createdBy,omitempty"`
+	TenantID  string                 `json:"tenantId,omitempty"`
+	Version   int                    `json:"version"`
 }
 
 type AuditEntry struct {
@@ -56,12 +53,12 @@ type AuditEntry struct {
 }
 
 type DomainStats struct {
-	TotalRecords    int                    `json:"totalRecords"`
-	ActiveRecords   int                    `json:"activeRecords"`
-	PendingRecords  int                    `json:"pendingRecords"`
-	ProcessedToday  int                    `json:"processedToday"`
-	Domain          string                 `json:"domain"`
-	Metrics         map[string]interface{} `json:"metrics"`
+	TotalRecords   int                    `json:"totalRecords"`
+	ActiveRecords  int                    `json:"activeRecords"`
+	PendingRecords int                    `json:"pendingRecords"`
+	ProcessedToday int                    `json:"processedToday"`
+	Domain         string                 `json:"domain"`
+	Metrics        map[string]interface{} `json:"metrics"`
 }
 
 var (
@@ -71,7 +68,7 @@ var (
 		{ID: "QR-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Payments", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
 		{ID: "QR-003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Payments", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
 	}
-	auditLog = []AuditEntry{}
+	auditLog    = []AuditEntry{}
 	domainStats = DomainStats{
 		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
 		Domain: "Payments",
@@ -95,7 +92,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"service": "qr-payments-go", "status": "healthy", "version": "2.0.0",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
-		"domain": "Qr Payments — Payments",
+		"domain":      "Qr Payments — Payments",
 		"middleware": map[string]string{
 			"kafka":      "qrpayments.events, qrpayments.audit",
 			"postgres":   "qrpayments_records",
@@ -142,19 +139,23 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheSet("qr_payments_list", "", 1) // invalidate list cache on write
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 	// Inter-service call: workflow_call
 	_upstreamURL := os.Getenv("CORE_BANKING_URL")
-	if _upstreamURL == "" { _upstreamURL = "http://localhost:8100" }
+	if _upstreamURL == "" {
+		_upstreamURL = "http://localhost:8100"
+	}
 	_result, _err := callService("POST", _upstreamURL+"/v1/transactions", nil)
 	if _err != nil {
 		log.Printf("qr-payments-go: workflow_call failed: %v", _err)
 	} else {
 		log.Printf("qr-payments-go: workflow_call ok: %v", _result)
 	}
-
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -170,7 +171,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		TenantID:  getString(body, "tenantId"),
 		Version:   1,
 	}
-	if rec.Type == "" { rec.Type = "primary" }
+	if rec.Type == "" {
+		rec.Type = "primary"
+	}
 	records = append(records, rec)
 	domainStats.TotalRecords = len(records)
 
@@ -191,7 +194,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
+	if r.Method != "POST" && r.Method != "PUT" {
+		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
@@ -201,9 +207,13 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
-			if s := getString(body, "status"); s != "" { records[i].Status = s }
+			if s := getString(body, "status"); s != "" {
+				records[i].Status = s
+			}
 			for k, v := range body {
-				if k != "id" { records[i].Data[k] = v }
+				if k != "id" {
+					records[i].Data[k] = v
+				}
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
@@ -227,8 +237,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
 
-
-
 func handleAudit(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -239,10 +247,15 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	domainStats.TotalRecords = len(records)
-	active := 0; pending := 0
+	active := 0
+	pending := 0
 	for _, r := range records {
-		if r.Status == "active" || r.Status == "completed" { active++ }
-		if r.Status == "pending" || r.Status == "processing" { pending++ }
+		if r.Status == "active" || r.Status == "completed" {
+			active++
+		}
+		if r.Status == "pending" || r.Status == "processing" {
+			pending++
+		}
 	}
 	domainStats.ActiveRecords = active
 	domainStats.PendingRecords = pending
@@ -250,95 +263,100 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok { return v }
+	if v, ok := m[key].(string); ok {
+		return v
+	}
 	return ""
 }
 
-
 func qr_paymentsComputeFee(amount float64, rate float64, cap_ float64) float64 {
-    fee := amount * rate
-    if fee > cap_ { fee = cap_ }
-    return fee
+	fee := amount * rate
+	if fee > cap_ {
+		fee = cap_
+	}
+	return fee
 }
 
 func qr_paymentsRouteRequest(channel string, amount float64) string {
-    if amount > 1000000 { return "RTGS" }
-    if channel == "mobile" { return "NIP" }
-    return "NIP"
+	if amount > 1000000 {
+		return "RTGS"
+	}
+	if channel == "mobile" {
+		return "NIP"
+	}
+	return "NIP"
 }
 
 func qr_paymentsFeeHandler(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        Amount float64 `json:"amount"`
-        Rate   float64 `json:"rate"`
-        Cap    float64 `json:"cap"`
-    }
-    json.NewDecoder(r.Body).Decode(&req)
-    fee := qr_paymentsComputeFee(req.Amount, req.Rate, req.Cap)
-    respondJSON(w, 200, map[string]interface{}{"fee": fee})
+	var req struct {
+		Amount float64 `json:"amount"`
+		Rate   float64 `json:"rate"`
+		Cap    float64 `json:"cap"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	fee := qr_paymentsComputeFee(req.Amount, req.Rate, req.Cap)
+	respondJSON(w, 200, map[string]interface{}{"fee": fee})
 }
 
 func qr_paymentsRouteHandler(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        Channel string  `json:"channel"`
-        Amount  float64 `json:"amount"`
-    }
-    json.NewDecoder(r.Body).Decode(&req)
-    route := qr_paymentsRouteRequest(req.Channel, req.Amount)
-    respondJSON(w, 200, map[string]interface{}{"route": route})
+	var req struct {
+		Channel string  `json:"channel"`
+		Amount  float64 `json:"amount"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	route := qr_paymentsRouteRequest(req.Channel, req.Amount)
+	respondJSON(w, 200, map[string]interface{}{"route": route})
 }
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"qr-payments-go"}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"qr-payments-go"}`)
 }
 
 func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"alive":true}`)
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"qr-payments-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"qr-payments-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"qr-payments-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"qr-payments-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"qr-payments-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"qr-payments-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
-
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
 }
 
 type responseWriter struct {
-    http.ResponseWriter
-    status int
+	http.ResponseWriter
+	status int
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
-
 
 // --- Database Layer ---
 var db *sql.DB
@@ -369,16 +387,19 @@ func initDB() {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
 	jwtCache.updated = time.Now()
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
-
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256) — fail-closed ────────────────
 
@@ -532,24 +553,32 @@ func init() {
 
 func cacheGet(key string) (string, bool) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
+	if err != nil {
+		return "", false
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
+	if err != nil || n < 3 {
+		return "", false
+	}
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
 		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+		if len(parts) >= 3 {
+			return parts[1], true
+		}
 	}
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
 		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
@@ -557,11 +586,17 @@ func cacheSet(key, value string, ttlSeconds int) {
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	if os.Getenv("TLS_ENABLED") != "true" {
+		return false, "", ""
+	}
 	cert := os.Getenv("TLS_CERT_PATH")
 	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
-	if key == "" { key = "/etc/54bank/certs/service.key" }
+	if cert == "" {
+		cert = "/etc/54bank/certs/service.crt"
+	}
+	if key == "" {
+		key = "/etc/54bank/certs/service.key"
+	}
 	return true, cert, key
 }
 
@@ -624,7 +659,9 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 
 	// Events are marked published ONLY after a confirmed Kafka produce.
 	producer, err := getKafkaProducer(brokers)
@@ -634,14 +671,18 @@ func relayOutbox(brokers string, topic string) {
 	}
 
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
 		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
 			Topic: topic,
 			Key:   sarama.StringEncoder(aggID),
@@ -653,7 +694,9 @@ func relayOutbox(brokers string, topic string) {
 		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
+	if len(ids) == 0 {
+		return
+	}
 	for _, id := range ids {
 		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
 			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
@@ -686,85 +729,11 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 	return kafkaProducer, nil
 }
 
-
-
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("[qr-payments-go] starting on :8864")
-
-	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/qr_payments_go?sslmode=disable")
-	var err error
-	db, err = sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("database connection failed: %v", err)
-	}
-	defer db.Close()
-
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("database ping failed: %v", err)
-	}
-
-	initSchema()
-	log.Printf("[qr-payments-go] database connected, schema initialized")
-
-	// Middleware clients
-	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
-	redisURL := getEnv("REDIS_URL", "localhost:6379")
-	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
-	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
-
-	log.Printf("[qr-payments-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
-		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
-
-	mux := http.NewServeMux()
-
-	// Health endpoints
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
-	})
-	mux.HandleFunc("/metrics", metricsHandler)
-
-	// Domain endpoints
-	mux.HandleFunc("/api/v1/service_configs", domainHandler)
-	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
-
-	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8864"),
-		Handler:      loggingMiddleware(corsMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
-
-	log.Printf("[qr-payments-go] ready on :%s", getEnv("PORT", "8864"))
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Printf("[qr-payments-go] shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
-	log.Printf("[qr-payments-go] stopped")
-}
-
 func initSchema() {
+	if db == nil {
+		log.Printf("[%s] database unavailable — schema init skipped (in-memory mode)", serviceName)
+		return
+	}
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_configs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     config_key VARCHAR(128) NOT NULL,
@@ -964,26 +933,6 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if err := db.Ping(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM service_configs`).Scan(&count)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"service":       "qr-payments-go",
-		"total_records": count,
-	})
-}
-
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -1014,13 +963,12 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-
 var _rlTokens int64 = 100
 var _rlLastRefill int64 = 0
 
 func rlAllow() bool {
 	nowr := time.Now().UnixMilli()
-	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
 		atomic.StoreInt64(&_rlTokens, 100)
 		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
@@ -1042,183 +990,204 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 func validateQRPayment(amount float64, qrType, merchantID string) (bool, string) {
-	if amount <= 0 { return false, "Amount must be positive" }
-	if amount > 500000 { return false, "QR payment limit is ₦500,000" }
+	if amount <= 0 {
+		return false, "Amount must be positive"
+	}
+	if amount > 500000 {
+		return false, "QR payment limit is ₦500,000"
+	}
 	validTypes := map[string]bool{"static": true, "dynamic": true, "emv": true}
-	if !validTypes[qrType] { return false, "Invalid QR type" }
+	if !validTypes[qrType] {
+		return false, "Invalid QR type"
+	}
 	return true, "QR payment approved"
 }
 func computeQRCharge(amount float64) float64 {
 	fee := amount * 0.005
-	if fee > 500 { return 500 }
+	if fee > 500 {
+		return 500
+	}
 	return fee
 }
 
-
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
+	failures    int
+	lastFailure time.Time
+	threshold   int
+	resetAfter  time.Duration
+	mu          sync.Mutex
 }
 
 func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2
-            return true
-        }
-        return false
-    }
-    return true
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures >= cb.threshold {
+		if time.Since(cb.lastFailure) > cb.resetAfter {
+			cb.failures = cb.threshold / 2
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures > 0 {
+		cb.failures--
+	}
 }
 
 func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
 }
 
 var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
 
 func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
-        }
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        req.Header.Set("X-Source-Service", serviceName)
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+	if !_cb.allow() {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+		}
+		var req *http.Request
+		if body != nil {
+			jsonData, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Source-Service", serviceName)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cb.recordFailure()
+			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			_cb.recordFailure()
+			continue
+		}
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cb.recordSuccess()
+		return result, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
 // --- Alerting ---
 type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
+	rules []alertRule
+	mu    sync.RWMutex
 }
 
 type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
+	Name      string
+	Metric    string
+	Threshold float64
+	Severity  string
 }
 
 var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
+	rules: []alertRule{
+		{"high_error_rate", "error_rate", 0.05, "critical"},
+		{"high_latency", "p99_latency_ms", 5000, "warning"},
+		{"db_connection_failures", "db_failures", 3, "critical"},
+	},
 }
 
 func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
+	var fired []map[string]interface{}
+	errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+	if errRate > 0.05 {
+		fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+	}
+	return fired
 }
 
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Graceful Degradation ---
 type degradationState struct {
-    dbAvailable    bool
-    cacheAvailable bool
-    upstreamOK     map[string]bool
-    mu             sync.RWMutex
+	dbAvailable    bool
+	cacheAvailable bool
+	upstreamOK     map[string]bool
+	mu             sync.RWMutex
 }
 
 var _degrade = &degradationState{
-    dbAvailable:    true,
-    cacheAvailable: true,
-    upstreamOK:     make(map[string]bool),
+	dbAvailable:    true,
+	cacheAvailable: true,
+	upstreamOK:     make(map[string]bool),
 }
 
 func (d *degradationState) setDB(ok bool) {
-    d.mu.Lock()
-    defer d.mu.Unlock()
-    d.dbAvailable = ok
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.dbAvailable = ok
 }
 
 func (d *degradationState) isDBAvailable() bool {
-    d.mu.RLock()
-    defer d.mu.RUnlock()
-    return d.dbAvailable
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.dbAvailable
 }
 
 func (d *degradationState) setUpstream(name string, ok bool) {
-    d.mu.Lock()
-    defer d.mu.Unlock()
-    d.upstreamOK[name] = ok
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.upstreamOK[name] = ok
 }
 
 func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
-    _degrade.mu.RLock()
-    defer _degrade.mu.RUnlock()
-    jsonResp(w, 200, map[string]interface{}{
-        "service":        serviceName,
-        "db_available":   _degrade.dbAvailable,
-        "cache_available": _degrade.cacheAvailable,
-        "upstreams":      _degrade.upstreamOK,
-        "mode":           func() string { if _degrade.dbAvailable { return "normal" }; return "degraded" }(),
-    })
+	_degrade.mu.RLock()
+	defer _degrade.mu.RUnlock()
+	jsonResp(w, 200, map[string]interface{}{
+		"service":         serviceName,
+		"db_available":    _degrade.dbAvailable,
+		"cache_available": _degrade.cacheAvailable,
+		"upstreams":       _degrade.upstreamOK,
+		"mode": func() string {
+			if _degrade.dbAvailable {
+				return "normal"
+			}
+			return "degraded"
+		}(),
+	})
 }
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" { port = "9415" }
+	if port == "" {
+		port = "9415"
+	}
 	initDB()
-mux := http.NewServeMux()
+	initSchema()
+	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
 	mux.HandleFunc("/livez", livezHandler)
@@ -1238,29 +1207,48 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/qr-payments/route", qr_paymentsRouteHandler)
 	log.Printf("Qr Payments v2.0 (Payments) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
-	_ = tlsCert
-	_ = tlsKey
-	_ = tlsEnabled
+	if tlsEnabled {
+		// TLS was explicitly requested: never silently serve plaintext.
+		// Fail fast at boot when the keypair is missing or unreadable.
+		if tlsCert == "" || tlsKey == "" {
+			log.Fatalf("[%s] TLS_ENABLED=true but TLS_CERT_PATH/TLS_KEY_PATH are unset — refusing to serve plaintext", serviceName)
+		}
+		if _, err := os.Stat(tlsCert); err != nil {
+			log.Fatalf("[%s] TLS_ENABLED=true but cert %s is unreadable: %v — refusing to serve plaintext", serviceName, tlsCert, err)
+		}
+		if _, err := os.Stat(tlsKey); err != nil {
+			log.Fatalf("[%s] TLS_ENABLED=true but key %s is unreadable: %v — refusing to serve plaintext", serviceName, tlsKey, err)
+		}
+		log.Printf("[%s] TLS enabled (cert: %s)", serviceName, tlsCert)
+	}
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[qr-payments-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[qr-payments-go] Server stopped gracefully")
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		var err error
+		if tlsEnabled {
+			err = server.ListenAndServeTLS(tlsCert, tlsKey)
+		} else {
+			err = server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Println("[qr-payments-go] Shutdown signal received")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("[%s] graceful shutdown error: %v", serviceName, err)
+	}
+	log.Println("[qr-payments-go] Server stopped gracefully")
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

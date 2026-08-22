@@ -324,7 +324,11 @@ func (c *TigerBeetleClient) CreateDisbursementTransfer(
 		return "", err
 	}
 
-	transferID := generateTransferID(tenantID, mortgageID, "DISB")
+	// Deterministic transfer ID over the natural/business keys: a retried
+	// disbursement for the same mortgage maps to the same TigerBeetle
+	// transfer ID, so the cluster answers TransferExists instead of moving
+	// funds twice.
+	transferID := fmt.Sprintf("TF-%s-%s-DISB", tenantID, mortgageID)
 
 	transfer := tb.Transfer{
 		ID:              accountUint128(transferID),
@@ -342,6 +346,57 @@ func (c *TigerBeetleClient) CreateDisbursementTransfer(
 
 	log.Printf("Created disbursement transfer %s for mortgage %s: %.2f NGN (cluster-confirmed)", transferID, mortgageID, amount)
 	return transferID, nil
+}
+
+// ReverseDisbursementTransfer compensates a completed disbursement with the
+// exact mirror transfer (debit the mortgage principal account, credit the
+// bank funds account back). The reversal ID is deterministically derived from
+// the original transfer ID, so a retried compensation is idempotent
+// (TransferExists). An error return means the funds remain moved and MUST be
+// surfaced as compensation_failed by the caller — never swallowed.
+func (c *TigerBeetleClient) ReverseDisbursementTransfer(
+	tenantID string,
+	principalAccountID string,
+	disbursementAccountID string,
+	amount float64,
+	mortgageID string,
+	originalTransferID string,
+) (string, error) {
+	start := time.Now()
+	defer func() {
+		tbTransferLatency.WithLabelValues("disbursement_reversal").Observe(time.Since(start).Seconds())
+	}()
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if !c.connected {
+		return "", c.errNotConnected()
+	}
+
+	amountKobo, err := nairaToKoboU64(amount)
+	if err != nil {
+		return "", err
+	}
+
+	reversalID := originalTransferID + "-REV"
+
+	transfer := tb.Transfer{
+		ID:              accountUint128(reversalID),
+		DebitAccountID:  accountUint128(principalAccountID),    // Take funds back from mortgage principal
+		CreditAccountID: accountUint128(disbursementAccountID), // Return to bank funds account
+		Ledger:          c.ledgerID,
+		Code:            uint16(TransferCodeDisbursement),
+		Amount:          tb.ToUint128(amountKobo),
+	}
+
+	if err := c.createTransfers([]tb.Transfer{transfer}, "disbursement_reversal"); err != nil {
+		return "", err
+	}
+	c.recordHistory(mortgageID, transfer)
+
+	log.Printf("Reversed disbursement transfer %s for mortgage %s via %s (cluster-confirmed)", originalTransferID, mortgageID, reversalID)
+	return reversalID, nil
 }
 
 // paymentAllocation is the schedule-derived waterfall split of a payment.

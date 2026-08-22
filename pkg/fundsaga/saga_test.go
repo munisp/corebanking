@@ -3,6 +3,7 @@ package fundsaga
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 )
@@ -192,25 +193,87 @@ func TestBulkSalarySaga(t *testing.T) {
 }
 
 func TestCrossBorderRemittanceSaga(t *testing.T) {
-	// FX rate: 1 NGN = 0.0013 USD → fxRate = 13 basis points
-	steps, state := CrossBorderRemittanceSaga("sender", "beneficiary", 10000000, 13, "USD")
+	// FX rate: 1 NGN = 0.0013 USD → 13 basis points of minor units, resolved
+	// from the configured rate source (never caller-supplied).
+	ConfigureFXRateSource(testFXRateProvider)
+	defer ConfigureFXRateSource(nil)
+
+	steps, state, err := CrossBorderRemittanceSaga("sender", "beneficiary", 10000000, "USD")
+	if err != nil {
+		t.Fatalf("remittance saga construction failed: %v", err)
+	}
 
 	if len(steps) != 9 {
 		t.Errorf("remittance saga has %d steps, want 9", len(steps))
 	}
 
-	// Verify legs include nostro/vostro
+	// Verify legs include nostro/vostro with explicit per-side currencies
 	hasNostro, hasVostro := false, false
 	for _, leg := range state.Legs {
 		if leg.AccountID == "nostro-USD" {
 			hasNostro = true
+			if leg.Currency != "NGN" {
+				t.Errorf("nostro leg currency = %s, want NGN (send side)", leg.Currency)
+			}
+			if leg.Amount != 10000000 {
+				t.Errorf("nostro leg amount = %d, want 10000000", leg.Amount)
+			}
 		}
 		if leg.AccountID == "vostro-USD" {
 			hasVostro = true
+			if leg.Currency != "USD" {
+				t.Errorf("vostro leg currency = %s, want USD (receive side)", leg.Currency)
+			}
+			// 10000000 kobo * 13 / 10000 = 13000 minor units
+			if leg.Amount != 13000 {
+				t.Errorf("vostro leg amount = %d, want 13000", leg.Amount)
+			}
 		}
 	}
 	if !hasNostro || !hasVostro {
 		t.Error("remittance saga missing nostro/vostro legs")
+	}
+
+	// The leg set must validate: balanced per currency (NGN side and USD side).
+	if err := StepValidateBalances().Forward(context.Background(), state); err != nil {
+		t.Errorf("cross-border legs should balance per currency: %v", err)
+	}
+}
+
+func TestCrossBorderRemittanceSagaFailsFastWithoutRateSource(t *testing.T) {
+	ConfigureFXRateSource(nil)
+	if _, _, err := CrossBorderRemittanceSaga("sender", "beneficiary", 10000000, "USD"); err == nil {
+		t.Fatal("expected fail-fast when no FX rate source is configured")
+	}
+}
+
+func TestPerCurrencyBalanceValidation(t *testing.T) {
+	// Numerically "balanced" but currency-mixed leg set: 100 NGN debit vs
+	// 100 USD credit must NOT pass — totals per currency differ.
+	state := &SagaState{
+		Legs: []TransferLeg{
+			{AccountID: "A", Amount: 100, Direction: "debit", Currency: "NGN"},
+			{AccountID: "B", Amount: 100, Direction: "credit", Currency: "USD"},
+		},
+	}
+	if err := StepValidateBalances().Forward(context.Background(), state); err == nil {
+		t.Error("mixed-currency leg set must fail per-currency balance validation")
+	}
+}
+
+func TestConvertAmountKoboOverflow(t *testing.T) {
+	// Overflow-safe conversion: huge amounts must error, never wrap.
+	if _, err := convertAmountKobo(AmountKobo(math.MaxInt64-1), 90000); err == nil {
+		t.Error("expected overflow error for near-MaxInt64 amount")
+	}
+	// Round-to-zero must error (non-positive receive amount is refused).
+	if _, err := convertAmountKobo(AmountKobo(100), 1); err == nil {
+		t.Error("expected round-to-zero error for tiny converted amount")
+	}
+	// Happy path: 1,000,000 * 13 / 10000 = 1300.
+	got, err := convertAmountKobo(AmountKobo(1000000), 13)
+	if err != nil || got != 1300 {
+		t.Errorf("convertAmountKobo(1000000, 13) = %d, %v; want 1300, nil", got, err)
 	}
 }
 

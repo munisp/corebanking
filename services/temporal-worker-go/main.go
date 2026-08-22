@@ -5,44 +5,55 @@
 package main
 
 import (
+	"context"
 	_ "github.com/lib/pq"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 
+	"bytes"
+	"crypto/rand"
+	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
-	"database/sql"
-	"bytes"
-	"strings"
 
 	"net"
-
 )
 
 var serviceName = "temporal-worker-go"
 
 var startTime = time.Now()
 
+// secureID generates a collision-resistant record/audit ID from the CSPRNG.
+// math/rand IDs are predictable and collide under load; a CSPRNG failure
+// must never fall back to a predictable source, so it is fatal.
+func secureID(prefix string) string {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		log.Fatalf("%s: crypto/rand unavailable, cannot mint secure IDs: %v", serviceName, err)
+	}
+	return fmt.Sprintf("%s-%08X", prefix, binary.BigEndian.Uint32(b[:]))
+}
+
 // ─── Domain Types ───────────────────────────────────────────────────────────
 
 type Record struct {
-	ID          string                 `json:"id"`
-	Type        string                 `json:"type"`
-	Status      string                 `json:"status"`
-	Data        map[string]interface{} `json:"data"`
-	CreatedAt   string                 `json:"createdAt"`
-	UpdatedAt   string                 `json:"updatedAt"`
-	CreatedBy   string                 `json:"createdBy,omitempty"`
-	TenantID    string                 `json:"tenantId,omitempty"`
-	Version     int                    `json:"version"`
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Status    string                 `json:"status"`
+	Data      map[string]interface{} `json:"data"`
+	CreatedAt string                 `json:"createdAt"`
+	UpdatedAt string                 `json:"updatedAt"`
+	CreatedBy string                 `json:"createdBy,omitempty"`
+	TenantID  string                 `json:"tenantId,omitempty"`
+	Version   int                    `json:"version"`
 }
 
 type AuditEntry struct {
@@ -55,12 +66,12 @@ type AuditEntry struct {
 }
 
 type DomainStats struct {
-	TotalRecords    int                    `json:"totalRecords"`
-	ActiveRecords   int                    `json:"activeRecords"`
-	PendingRecords  int                    `json:"pendingRecords"`
-	ProcessedToday  int                    `json:"processedToday"`
-	Domain          string                 `json:"domain"`
-	Metrics         map[string]interface{} `json:"metrics"`
+	TotalRecords   int                    `json:"totalRecords"`
+	ActiveRecords  int                    `json:"activeRecords"`
+	PendingRecords int                    `json:"pendingRecords"`
+	ProcessedToday int                    `json:"processedToday"`
+	Domain         string                 `json:"domain"`
+	Metrics        map[string]interface{} `json:"metrics"`
 }
 
 var (
@@ -70,7 +81,7 @@ var (
 		{ID: "TEM-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Platform/Infra", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
 		{ID: "TEM-003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Platform/Infra", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
 	}
-	auditLog = []AuditEntry{}
+	auditLog    = []AuditEntry{}
 	domainStats = DomainStats{
 		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
 		Domain: "Platform/Infra",
@@ -94,7 +105,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"service": "temporal-worker-go", "status": "healthy", "version": "2.0.0",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
-		"domain": "Temporal Worker — Platform/Infra",
+		"domain":      "Temporal Worker — Platform/Infra",
 		"middleware": map[string]string{
 			"kafka":      "temporal-worker.events, temporal-worker.audit",
 			"postgres":   "temporal_worker_records",
@@ -115,23 +126,34 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(cached))
 		return
 	}
-	// DB-first query with in-memory fallback
+	// DB-first query; on failure return 503 (fail fast) rather than silently
+	// serving a stale/incomplete in-memory fallback as if it were real data.
 	if db != nil {
 		rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT 100", "temporal_worker_go")
-		if err == nil {
-			defer rows.Close()
-			var items []map[string]interface{}
-			for rows.Next() {
-				var id, svc, typ, status, data string
-				var createdAt time.Time
-				if rows.Scan(&id, &svc, &typ, &status, &data, &createdAt) == nil {
-					items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "created_at": createdAt})
-				}
-			}
-			respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
+		if err != nil {
+			log.Printf("temporal-worker-go: DB query failed: %v", err)
+			respondJSON(w, 503, map[string]string{"error": "records store unavailable"})
 			return
 		}
-		log.Printf("temporal-worker-go: DB query failed, falling back to in-memory: %v", err)
+		defer rows.Close()
+		var items []map[string]interface{}
+		for rows.Next() {
+			var id, svc, typ, status, data string
+			var createdAt time.Time
+			if err := rows.Scan(&id, &svc, &typ, &status, &data, &createdAt); err != nil {
+				log.Printf("temporal-worker-go: row scan failed: %v", err)
+				respondJSON(w, 503, map[string]string{"error": "records store unavailable"})
+				return
+			}
+			items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "created_at": createdAt})
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("temporal-worker-go: row iteration failed: %v", err)
+			respondJSON(w, 503, map[string]string{"error": "records store unavailable"})
+			return
+		}
+		respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
+		return
 	}
 	// In-memory fallback
 	mu.Lock()
@@ -141,12 +163,17 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheSet("temporal_worker_list", "", 1) // invalidate list cache on write
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 	// Inter-service call: health_check
 	_upstreamURL := os.Getenv("CORE_BANKING_URL")
-	if _upstreamURL == "" { _upstreamURL = "http://localhost:8100" }
+	if _upstreamURL == "" {
+		_upstreamURL = "http://localhost:8100"
+	}
 	_result, _err := callService("POST", _upstreamURL+"/v1/health", nil)
 	if _err != nil {
 		log.Printf("temporal-worker-go: health_check failed: %v", _err)
@@ -154,12 +181,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		log.Printf("temporal-worker-go: health_check ok: %v", _result)
 	}
 
-
 	mu.Lock()
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("TEM-%08X", rand.Uint32()),
+		ID:        secureID("TEM"),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -169,7 +195,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		TenantID:  getString(body, "tenantId"),
 		Version:   1,
 	}
-	if rec.Type == "" { rec.Type = "primary" }
+	if rec.Type == "" {
+		rec.Type = "primary"
+	}
 	records = append(records, rec)
 	domainStats.TotalRecords = len(records)
 
@@ -181,7 +209,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: secureID("AUD"), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -190,7 +218,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
+	if r.Method != "POST" && r.Method != "PUT" {
+		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
@@ -200,14 +231,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
-			if s := getString(body, "status"); s != "" { records[i].Status = s }
+			if s := getString(body, "status"); s != "" {
+				records[i].Status = s
+			}
 			for k, v := range body {
-				if k != "id" { records[i].Data[k] = v }
+				if k != "id" {
+					records[i].Data[k] = v
+				}
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: secureID("AUD"), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -226,7 +261,6 @@ func handleProcess(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
 
-
 func handleAudit(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -237,10 +271,15 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	domainStats.TotalRecords = len(records)
-	active := 0; pending := 0
+	active := 0
+	pending := 0
 	for _, r := range records {
-		if r.Status == "active" || r.Status == "completed" { active++ }
-		if r.Status == "pending" || r.Status == "processing" { pending++ }
+		if r.Status == "active" || r.Status == "completed" {
+			active++
+		}
+		if r.Status == "pending" || r.Status == "processing" {
+			pending++
+		}
 	}
 	domainStats.ActiveRecords = active
 	domainStats.PendingRecords = pending
@@ -248,97 +287,98 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok { return v }
+	if v, ok := m[key].(string); ok {
+		return v
+	}
 	return ""
 }
 
-
 func temporal_workerComputeScore(value float64, weight float64, threshold float64) float64 {
-    score := value * weight
-    if score > threshold { score = threshold }
-    return score
+	score := value * weight
+	if score > threshold {
+		score = threshold
+	}
+	return score
 }
 
 func temporal_workerValidateRequest(data map[string]interface{}) map[string]interface{} {
-    errors := []string{}
-    required := []string{"id", "type"}
-    for _, field := range required {
-        if _, ok := data[field]; !ok {
-            errors = append(errors, field + " is required")
-        }
-    }
-    return map[string]interface{}{"valid": len(errors) == 0, "errors": errors}
+	errors := []string{}
+	required := []string{"id", "type"}
+	for _, field := range required {
+		if _, ok := data[field]; !ok {
+			errors = append(errors, field+" is required")
+		}
+	}
+	return map[string]interface{}{"valid": len(errors) == 0, "errors": errors}
 }
 
 func temporal_workerScoreHandler(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        Value     float64 `json:"value"`
-        Weight    float64 `json:"weight"`
-        Threshold float64 `json:"threshold"`
-    }
-    json.NewDecoder(r.Body).Decode(&req)
-    score := temporal_workerComputeScore(req.Value, req.Weight, req.Threshold)
-    respondJSON(w, 200, map[string]interface{}{"score": score})
+	var req struct {
+		Value     float64 `json:"value"`
+		Weight    float64 `json:"weight"`
+		Threshold float64 `json:"threshold"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	score := temporal_workerComputeScore(req.Value, req.Weight, req.Threshold)
+	respondJSON(w, 200, map[string]interface{}{"score": score})
 }
 
 func temporal_workerValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
-    var body map[string]interface{}
-    json.NewDecoder(r.Body).Decode(&body)
-    result := temporal_workerValidateRequest(body)
-    respondJSON(w, 200, result)
+	var body map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&body)
+	result := temporal_workerValidateRequest(body)
+	respondJSON(w, 200, result)
 }
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"temporal-worker-go"}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"temporal-worker-go"}`)
 }
 
 func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"alive":true}`)
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"temporal-worker-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"temporal-worker-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"temporal-worker-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"temporal-worker-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"temporal-worker-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"temporal-worker-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
-
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
 }
 
 type responseWriter struct {
-    http.ResponseWriter
-    status int
+	http.ResponseWriter
+	status int
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
-
 
 // --- Database Layer ---
 var db *sql.DB
@@ -376,9 +416,13 @@ func initDB() {
 }
 
 func dbList(service string, limit int) ([]map[string]interface{}, error) {
-	if db == nil { return nil, fmt.Errorf("no db") }
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
 	rows, err := db.Query("SELECT id, type, status, data, created_at FROM service_records WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var items []map[string]interface{}
 	for rows.Next() {
@@ -390,11 +434,12 @@ func dbList(service string, limit int) ([]map[string]interface{}, error) {
 }
 
 func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil { return fmt.Errorf("no db") }
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
 	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
 	return err
 }
-
 
 // --- JWT Auth Middleware ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
@@ -415,7 +460,6 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 // --- Inter-Service Communication with Circuit Breaker ---
 var _cbFailures int
 var _cbOpen bool
@@ -425,27 +469,49 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	if _cbOpen { _cbOpen = false; _cbFailures = 0 }
+	if _cbOpen {
+		_cbOpen = false
+		_cbFailures = 0
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 { time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond) }
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+		}
 		var req *http.Request
 		if body != nil {
 			j, _ := json.Marshal(body)
-		j = []byte(sanitizeInput(string(j)))
+			j = []byte(sanitizeInput(string(j)))
 			req, _ = http.NewRequest(method, url, bytes.NewBuffer(j))
 		} else {
 			req, _ = http.NewRequest(method, url, nil)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
-		if err != nil { lastErr = err; _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		if err != nil {
+			lastErr = err
+			_cbFailures++
+			_cbLastFail = time.Now()
+			if _cbFailures >= 5 {
+				_cbOpen = true
+			}
+			continue
+		}
 		defer resp.Body.Close()
-		if resp.StatusCode >= 500 { lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode); _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode)
+			_cbFailures++
+			_cbLastFail = time.Now()
+			if _cbFailures >= 5 {
+				_cbOpen = true
+			}
+			continue
+		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
-		_cbFailures = 0; _cbOpen = false
+		_cbFailures = 0
+		_cbOpen = false
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
@@ -480,24 +546,32 @@ func init() {
 
 func cacheGet(key string) (string, bool) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
+	if err != nil {
+		return "", false
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
+	if err != nil || n < 3 {
+		return "", false
+	}
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
 		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+		if len(parts) >= 3 {
+			return parts[1], true
+		}
 	}
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
 		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
@@ -505,11 +579,17 @@ func cacheSet(key, value string, ttlSeconds int) {
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	if os.Getenv("TLS_ENABLED") != "true" {
+		return false, "", ""
+	}
 	cert := os.Getenv("TLS_CERT_PATH")
 	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
-	if key == "" { key = "/etc/54bank/certs/service.key" }
+	if cert == "" {
+		cert = "/etc/54bank/certs/service.crt"
+	}
+	if key == "" {
+		key = "/etc/54bank/certs/service.key"
+	}
 	return true, cert, key
 }
 
@@ -557,13 +637,12 @@ func sanitizeInput(s string) string {
 	return s
 }
 
-
 var _rlTokens int64 = 100
 var _rlLastRefill int64 = 0
 
 func rlAllow() bool {
 	nowr := time.Now().UnixMilli()
-	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
 		atomic.StoreInt64(&_rlTokens, 100)
 		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
@@ -585,183 +664,205 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 func validateWorkflowExecution(workflowID, taskQueue string, timeoutSecs int) (bool, string) {
-	if workflowID == "" { return false, "Workflow ID required" }
-	if taskQueue == "" { return false, "Task queue required" }
-	if timeoutSecs > 86400 { return false, "Workflow timeout cannot exceed 24 hours" }
+	if workflowID == "" {
+		return false, "Workflow ID required"
+	}
+	if taskQueue == "" {
+		return false, "Task queue required"
+	}
+	if timeoutSecs > 86400 {
+		return false, "Workflow timeout cannot exceed 24 hours"
+	}
 	return true, "Workflow execution valid"
 }
 func computeRetryBackoff(attempt int, initialDelay float64) float64 {
 	delay := initialDelay
-	for i := 0; i < attempt; i++ { delay *= 2.0 }
-	if delay > 300 { return 300 } // Max 5 minutes
+	for i := 0; i < attempt; i++ {
+		delay *= 2.0
+	}
+	if delay > 300 {
+		return 300
+	} // Max 5 minutes
 	return delay
 }
 
-
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
+	failures    int
+	lastFailure time.Time
+	threshold   int
+	resetAfter  time.Duration
+	mu          sync.Mutex
 }
 
 func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2
-            return true
-        }
-        return false
-    }
-    return true
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures >= cb.threshold {
+		if time.Since(cb.lastFailure) > cb.resetAfter {
+			cb.failures = cb.threshold / 2
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures > 0 {
+		cb.failures--
+	}
 }
 
 func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
 }
 
 var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
 
 func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
-        }
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        req.Header.Set("X-Source-Service", serviceName)
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+	if !_cb.allow() {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+		}
+		var req *http.Request
+		if body != nil {
+			jsonData, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Source-Service", serviceName)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cb.recordFailure()
+			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			_cb.recordFailure()
+			continue
+		}
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cb.recordSuccess()
+		return result, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
 // --- Alerting ---
 type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
+	rules []alertRule
+	mu    sync.RWMutex
 }
 
 type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
+	Name      string
+	Metric    string
+	Threshold float64
+	Severity  string
 }
 
 var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
+	rules: []alertRule{
+		{"high_error_rate", "error_rate", 0.05, "critical"},
+		{"high_latency", "p99_latency_ms", 5000, "warning"},
+		{"db_connection_failures", "db_failures", 3, "critical"},
+	},
 }
 
 func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
+	var fired []map[string]interface{}
+	errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+	if errRate > 0.05 {
+		fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+	}
+	return fired
 }
 
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Graceful Degradation ---
 type degradationState struct {
-    dbAvailable    bool
-    cacheAvailable bool
-    upstreamOK     map[string]bool
-    mu             sync.RWMutex
+	dbAvailable    bool
+	cacheAvailable bool
+	upstreamOK     map[string]bool
+	mu             sync.RWMutex
 }
 
 var _degrade = &degradationState{
-    dbAvailable:    true,
-    cacheAvailable: true,
-    upstreamOK:     make(map[string]bool),
+	dbAvailable:    true,
+	cacheAvailable: true,
+	upstreamOK:     make(map[string]bool),
 }
 
 func (d *degradationState) setDB(ok bool) {
-    d.mu.Lock()
-    defer d.mu.Unlock()
-    d.dbAvailable = ok
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.dbAvailable = ok
 }
 
 func (d *degradationState) isDBAvailable() bool {
-    d.mu.RLock()
-    defer d.mu.RUnlock()
-    return d.dbAvailable
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.dbAvailable
 }
 
 func (d *degradationState) setUpstream(name string, ok bool) {
-    d.mu.Lock()
-    defer d.mu.Unlock()
-    d.upstreamOK[name] = ok
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.upstreamOK[name] = ok
 }
 
 func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
-    _degrade.mu.RLock()
-    defer _degrade.mu.RUnlock()
-    jsonResp(w, 200, map[string]interface{}{
-        "service":        serviceName,
-        "db_available":   _degrade.dbAvailable,
-        "cache_available": _degrade.cacheAvailable,
-        "upstreams":      _degrade.upstreamOK,
-        "mode":           func() string { if _degrade.dbAvailable { return "normal" }; return "degraded" }(),
-    })
+	_degrade.mu.RLock()
+	defer _degrade.mu.RUnlock()
+	jsonResp(w, 200, map[string]interface{}{
+		"service":         serviceName,
+		"db_available":    _degrade.dbAvailable,
+		"cache_available": _degrade.cacheAvailable,
+		"upstreams":       _degrade.upstreamOK,
+		"mode": func() string {
+			if _degrade.dbAvailable {
+				return "normal"
+			}
+			return "degraded"
+		}(),
+	})
 }
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" { port = "9445" }
+	if port == "" {
+		port = "9445"
+	}
 	initDB()
-mux := http.NewServeMux()
+	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
 	mux.HandleFunc("/livez", livezHandler)
@@ -781,29 +882,48 @@ mux := http.NewServeMux()
 	mux.HandleFunc("/v1/temporal-worker/validate", temporal_workerValidateRequestHandler)
 	log.Printf("Temporal Worker v2.0 (Platform/Infra) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
-	_ = tlsCert
-	_ = tlsKey
-	_ = tlsEnabled
+	if tlsEnabled {
+		// TLS was explicitly requested: never silently serve plaintext.
+		// Fail fast at boot when the keypair is missing or unreadable.
+		if tlsCert == "" || tlsKey == "" {
+			log.Fatalf("[%s] TLS_ENABLED=true but TLS_CERT_PATH/TLS_KEY_PATH are unset — refusing to serve plaintext", serviceName)
+		}
+		if _, err := os.Stat(tlsCert); err != nil {
+			log.Fatalf("[%s] TLS_ENABLED=true but cert %s is unreadable: %v — refusing to serve plaintext", serviceName, tlsCert, err)
+		}
+		if _, err := os.Stat(tlsKey); err != nil {
+			log.Fatalf("[%s] TLS_ENABLED=true but key %s is unreadable: %v — refusing to serve plaintext", serviceName, tlsKey, err)
+		}
+		log.Printf("[%s] TLS enabled (cert: %s)", serviceName, tlsCert)
+	}
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[temporal-worker-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[temporal-worker-go] Server stopped gracefully")
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		var err error
+		if tlsEnabled {
+			err = server.ListenAndServeTLS(tlsCert, tlsKey)
+		} else {
+			err = server.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Println("[temporal-worker-go] Shutdown signal received")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("[%s] graceful shutdown error: %v", serviceName, err)
+	}
+	log.Println("[temporal-worker-go] Server stopped gracefully")
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

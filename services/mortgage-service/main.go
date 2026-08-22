@@ -103,7 +103,9 @@ const (
 	StatusOfferIssued         MortgageStatus = "offer_issued"
 	StatusOfferAccepted       MortgageStatus = "offer_accepted"
 	StatusDisbursementPending MortgageStatus = "disbursement_pending"
+	StatusDisbursing          MortgageStatus = "disbursing"
 	StatusDisbursed           MortgageStatus = "disbursed"
+	StatusCompensationFailed  MortgageStatus = "compensation_failed"
 	StatusActive              MortgageStatus = "active"
 	StatusInArrears           MortgageStatus = "in_arrears"
 	StatusDefault             MortgageStatus = "default"
@@ -414,7 +416,18 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	srv.Shutdown(ctx)
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("ERROR: HTTP server shutdown: %v", err)
+	}
+
+	// Stop the event pipeline after in-flight requests drain: halt the
+	// background flusher, flush buffered events with a timeout, then close.
+	// Never return from main with the producer still running.
+	if kafkaClient != nil {
+		if err := kafkaClient.Close(); err != nil {
+			log.Printf("ERROR: Kafka client close (buffered events may be unpublished): %v", err)
+		}
+	}
 }
 
 func registerRoutes(router *gin.Engine) {
@@ -660,7 +673,7 @@ func createMortgageApplication(c *gin.Context) {
 	}
 
 	// Publish event to Kafka
-	kafkaClient.PublishEvent("mortgages.applications", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.created",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -796,7 +809,7 @@ func submitMortgageApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.applications", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -868,7 +881,7 @@ func underwriteApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.underwriting", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.underwriting", MortgageEvent{
 		Type:       "mortgage.underwriting.completed",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -913,7 +926,7 @@ func submitToCreditCommittee(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusCreditCommittee)
 
 	// Publish event for workflow
-	kafkaClient.PublishEvent("mortgages.credit-committee", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.credit-committee", MortgageEvent{
 		Type:       "mortgage.credit_committee.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -974,7 +987,7 @@ func approveApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.approvals", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.approvals", MortgageEvent{
 		Type:       "mortgage.application.approved",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1018,7 +1031,7 @@ func declineApplication(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusDeclined)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.applications", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.declined",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1058,7 +1071,7 @@ func issueOffer(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusOfferIssued)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.offers", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.offers", MortgageEvent{
 		Type:       "mortgage.offer.issued",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1099,7 +1112,7 @@ func acceptOffer(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusOfferAccepted)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.offers", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.offers", MortgageEvent{
 		Type:       "mortgage.offer.accepted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1111,6 +1124,19 @@ func acceptOffer(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "offer_accepted"})
 }
 
+// disburseMortgage runs the disbursement as a saga:
+//
+//  1. CLAIM (atomic): UPDATE ... WHERE status IN (offer_accepted,
+//     disbursement_pending) RETURNING — exactly one concurrent request can
+//     claim the mortgage; the double-disbursement race is closed at the DB.
+//  2. The amount ALWAYS comes from the approved mortgage record returned by
+//     the claim — never from the request body.
+//  3. FORWARD: create the TigerBeetle disbursement transfer (deterministic
+//     transfer ID, idempotent under retry).
+//  4. COMMIT: persist status=disbursed + schedule.
+//  5. COMPENSATION: any post-claim failure reverses the ledger transfer and
+//     rolls the claim back. If the reversal itself fails the mortgage is
+//     marked compensation_failed and an ALERT is logged — never silent.
 func disburseMortgage(c *gin.Context) {
 	start := time.Now()
 	id := c.Param("id")
@@ -1127,23 +1153,59 @@ func disburseMortgage(c *gin.Context) {
 		return
 	}
 
-	app, err := fetchMortgageApplication(id, tenantID)
+	// Step 1 — atomic claim. A nil app with nil error means another request
+	// holds or has completed the disbursement.
+	app, err := claimMortgageForDisbursement(id, tenantID)
 	if err != nil {
-		c.JSON(404, gin.H{"error": "application not found"})
+		log.Printf("ERROR: disbursement claim failed for mortgage %s: %v", id, err)
+		c.JSON(500, gin.H{"error": "failed to initiate disbursement"})
+		return
+	}
+	if app == nil {
+		c.JSON(409, gin.H{"error": "mortgage not ready for disbursement or disbursement already in progress"})
 		return
 	}
 
-	if app.Status != StatusOfferAccepted && app.Status != StatusDisbursementPending {
-		c.JSON(400, gin.H{"error": "mortgage not ready for disbursement"})
-		return
+	// compensate rolls back every side effect of a failed disbursement. A
+	// failed compensation is surfaced as status=compensation_failed + ALERT.
+	compensate := func(transferID string, cause error) {
+		if transferID != "" {
+			if _, rerr := tbClient.ReverseDisbursementTransfer(
+				tenantID, app.PrincipalAccountID, req.DisbursementAccountID,
+				app.ApprovedAmount, app.ID, transferID,
+			); rerr != nil {
+				log.Printf("ALERT: COMPENSATION FAILED for mortgage %s disbursement (transfer %s): reversal error: %v (original failure: %v) — manual reconciliation required",
+					app.ID, transferID, rerr, cause)
+				if merr := markDisbursementCompensationFailed(app.ID, tenantID); merr != nil {
+					log.Printf("ALERT: could not mark mortgage %s compensation_failed: %v", app.ID, merr)
+				}
+				return
+			}
+			log.Printf("Compensated failed disbursement for mortgage %s: reversed transfer %s (cause: %v)", app.ID, transferID, cause)
+		}
+		if rerr := releaseDisbursementClaim(app.ID, tenantID, StatusDisbursementPending); rerr != nil {
+			log.Printf("ALERT: failed to release disbursement claim for mortgage %s: %v", app.ID, rerr)
+			if merr := markDisbursementCompensationFailed(app.ID, tenantID); merr != nil {
+				log.Printf("ALERT: could not mark mortgage %s compensation_failed: %v", app.ID, merr)
+			}
+		}
 	}
 
+	// Step 2 — server-side amount from the approved record. A client-supplied
+	// amount that disagrees is rejected (fail closed), never silently used.
 	disbursementAmount := app.ApprovedAmount
-	if req.DisbursementAmount > 0 {
-		disbursementAmount = req.DisbursementAmount
+	if req.DisbursementAmount > 0 && req.DisbursementAmount != disbursementAmount {
+		compensate("", fmt.Errorf("client-supplied amount %.2f disagrees with approved %.2f", req.DisbursementAmount, disbursementAmount))
+		c.JSON(400, gin.H{"error": "disbursement amount does not match the approved amount"})
+		return
+	}
+	if disbursementAmount <= 0 || app.PrincipalAccountID == "" {
+		compensate("", fmt.Errorf("mortgage %s has no approved amount or principal ledger account", app.ID))
+		c.JSON(400, gin.H{"error": "mortgage has no approved amount or ledger account"})
+		return
 	}
 
-	// Create TigerBeetle transfer for disbursement
+	// Step 3 — forward: move the funds in TigerBeetle.
 	transferID, err := tbClient.CreateDisbursementTransfer(
 		tenantID,
 		app.PrincipalAccountID,
@@ -1152,12 +1214,13 @@ func disburseMortgage(c *gin.Context) {
 		app.ID,
 	)
 	if err != nil {
-		log.Printf("Failed to create disbursement transfer: %v", err)
-		c.JSON(500, gin.H{"error": "failed to process disbursement"})
+		log.Printf("Failed to create disbursement transfer for mortgage %s: %v", app.ID, err)
+		compensate("", err)
+		c.JSON(502, gin.H{"error": "failed to process disbursement"})
 		return
 	}
 
-	// Update application
+	// Step 4 — commit the disbursed state.
 	now := time.Now()
 	maturityDate := now.AddDate(0, app.ApprovedTenorMonths, 0)
 	app.Status = StatusDisbursed
@@ -1168,23 +1231,29 @@ func disburseMortgage(c *gin.Context) {
 	app.MonthlyPayment = calculateMonthlyPayment(disbursementAmount, app.InterestRate, app.ApprovedTenorMonths)
 
 	if err := saveDisbursementDetails(app, transferID); err != nil {
+		compensate(transferID, err)
 		c.JSON(500, gin.H{"error": "failed to save disbursement details"})
 		return
 	}
 
-	// Generate repayment schedule
+	// Generate repayment schedule — a money-path write; failure means the
+	// disbursement terms are uncollectible, so compensate rather than proceed.
 	schedule := generateRepaymentSchedule(app)
 	if err := saveRepaymentSchedule(app.ID, schedule); err != nil {
-		log.Printf("Failed to save repayment schedule: %v", err)
+		log.Printf("Failed to save repayment schedule for mortgage %s: %v", app.ID, err)
+		compensate(transferID, err)
+		c.JSON(500, gin.H{"error": "failed to save repayment schedule"})
+		return
 	}
 
 	// Create escrow account entries
 	if err := setupEscrowAccount(app); err != nil {
-		log.Printf("Failed to setup escrow account: %v", err)
+		log.Printf("ERROR: Failed to setup escrow account for mortgage %s: %v", app.ID, err)
 	}
 
-	// Publish event
-	kafkaClient.PublishEvent("mortgages.disbursements", MortgageEvent{
+	// Publish event — failures are persisted to the outbox for retry, never
+	// silently dropped.
+	if err := kafkaClient.PublishEventReliably("mortgages.disbursements", MortgageEvent{
 		Type:       "mortgage.disbursed",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1196,7 +1265,9 @@ func disburseMortgage(c *gin.Context) {
 			"monthly_payment": app.MonthlyPayment,
 			"maturity_date":   maturityDate,
 		},
-	})
+	}); err != nil {
+		log.Printf("ERROR: disbursement event for mortgage %s could not be published or outboxed: %v", app.ID, err)
+	}
 
 	mortgageDisbursementsTotal.WithLabelValues(string(app.ProductType), tenantID).Inc()
 	mortgageAmountDisbursed.WithLabelValues(string(app.ProductType), tenantID).Add(disbursementAmount)
@@ -1204,17 +1275,15 @@ func disburseMortgage(c *gin.Context) {
 
 	// Record journal entry in Chart of Accounts
 	amountInKobo := int64(disbursementAmount * 100)
-	_, err = coaClient.RecordLoanDisbursement(
+	if _, err := coaClient.RecordLoanDisbursement(
 		tenantID,
 		req.DisbursedBy,
 		"finance_admin",
 		app.ID,
 		amountInKobo,
 		req.DisbursementAccountID,
-	)
-	if err != nil {
-		log.Printf("WARNING: Failed to record journal entry for mortgage disbursement %s: %v", app.ID, err)
-		// Don't fail the disbursement if journal entry fails
+	); err != nil {
+		log.Printf("ERROR: Failed to record journal entry for mortgage disbursement %s: %v — GL reconciliation required", app.ID, err)
 	}
 
 	c.JSON(200, gin.H{
@@ -1251,7 +1320,7 @@ func addPropertyDetails(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.properties", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.properties", MortgageEvent{
 		Type:       "mortgage.property.added",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1325,7 +1394,7 @@ func submitValuation(c *gin.Context) {
 	ltv := app.RequestedAmount / req.MarketValue * 100
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.valuations", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.valuations", MortgageEvent{
 		Type:       "mortgage.valuation.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1379,7 +1448,7 @@ func verifyTitle(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.title-verification", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.title-verification", MortgageEvent{
 		Type:       "mortgage.title.verified",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1430,7 +1499,7 @@ func verifyNHFContribution(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.nhf", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.nhf", MortgageEvent{
 		Type:       "mortgage.nhf.verified",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1637,7 +1706,7 @@ func recordPayment(c *gin.Context) {
 	updateArrearsStatus(id, tenantID)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.payments", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.payments", MortgageEvent{
 		Type:       "mortgage.payment.received",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -1756,7 +1825,7 @@ func processPrepayment(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.prepayments", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.prepayments", MortgageEvent{
 		Type:       "mortgage.prepayment.processed",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -1821,7 +1890,7 @@ func initiateRefinancing(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.refinancing", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.refinancing", MortgageEvent{
 		Type:       "mortgage.refinancing.initiated",
 		MortgageID: newApp.ID,
 		TenantID:   tenantID,
@@ -1912,7 +1981,7 @@ func restructureMortgage(c *gin.Context) {
 	saveRepaymentSchedule(id, newSchedule)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.restructuring", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.restructuring", MortgageEvent{
 		Type:       "mortgage.restructured",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -1965,7 +2034,7 @@ func requestForbearance(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.forbearance", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.forbearance", MortgageEvent{
 		Type:       "mortgage.forbearance.requested",
 		MortgageID: id,
 		TenantID:   tenantID,

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -645,13 +646,21 @@ func (s *EscrowService) CreateContract(ctx context.Context, input CreateContract
 			TigerBeetleID:   s.idGenerator.NextID(),
 		}
 
-		// Verify KYC if user/business ID provided
+		// Verify KYC if user/business ID provided. Fail closed: on a KYC
+		// service error the party stays unverified, but the outage is logged —
+		// never silently swallowed.
 		if partyInput.UserID != nil {
-			verified, level, _ := s.kycService.VerifyUser(ctx, *partyInput.UserID)
+			verified, level, err := s.kycService.VerifyUser(ctx, *partyInput.UserID)
+			if err != nil {
+				log.Printf("ERROR: KYC VerifyUser failed for escrow party (user %s): %v — party recorded as unverified", *partyInput.UserID, err)
+			}
 			party.KYCVerified = verified
 			party.KYCLevel = level
 		} else if partyInput.BusinessID != nil {
-			verified, level, _ := s.kycService.VerifyBusiness(ctx, *partyInput.BusinessID)
+			verified, level, err := s.kycService.VerifyBusiness(ctx, *partyInput.BusinessID)
+			if err != nil {
+				log.Printf("ERROR: KYC VerifyBusiness failed for escrow party (business %s): %v — party recorded as unverified", *partyInput.BusinessID, err)
+			}
 			party.KYCVerified = verified
 			party.KYCLevel = level
 		}
@@ -713,8 +722,13 @@ func (s *EscrowService) CreateContract(ctx context.Context, input CreateContract
 		}
 	}
 
-	// Run fraud check
-	riskScore, alerts, _ := s.fraudService.ScoreEscrow(ctx, contract)
+	// Run fraud check. Fail closed: if the fraud service is unavailable the
+	// contract must NOT be created unscored — a swallowed error here would
+	// silently bypass the fraud gate (riskScore defaults to 0).
+	riskScore, alerts, scoreErr := s.fraudService.ScoreEscrow(ctx, contract)
+	if scoreErr != nil {
+		return nil, fmt.Errorf("fraud scoring unavailable — refusing to create escrow: %w", scoreErr)
+	}
 	if riskScore > 0.8 {
 		return nil, fmt.Errorf("escrow blocked due to high fraud risk: %v", alerts)
 	}

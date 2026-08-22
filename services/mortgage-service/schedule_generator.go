@@ -1,25 +1,26 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"time"
 )
 
 // ScheduleEntry represents a single repayment schedule entry
 type ScheduleEntry struct {
-	PaymentNumber   int        `json:"payment_number"`
-	DueDate         time.Time  `json:"due_date"`
-	PrincipalAmount float64    `json:"principal_amount"`
-	InterestAmount  float64    `json:"interest_amount"`
-	EscrowAmount    float64    `json:"escrow_amount"`
-	TotalAmount     float64    `json:"total_amount"`
-	OpeningBalance  float64    `json:"opening_balance"`
-	ClosingBalance  float64    `json:"closing_balance"`
-	CumulativePrincipal float64 `json:"cumulative_principal"`
-	CumulativeInterest  float64 `json:"cumulative_interest"`
-	Status          string     `json:"status"`
-	PaidDate        *time.Time `json:"paid_date,omitempty"`
-	PaidAmount      float64    `json:"paid_amount,omitempty"`
+	PaymentNumber       int        `json:"payment_number"`
+	DueDate             time.Time  `json:"due_date"`
+	PrincipalAmount     float64    `json:"principal_amount"`
+	InterestAmount      float64    `json:"interest_amount"`
+	EscrowAmount        float64    `json:"escrow_amount"`
+	TotalAmount         float64    `json:"total_amount"`
+	OpeningBalance      float64    `json:"opening_balance"`
+	ClosingBalance      float64    `json:"closing_balance"`
+	CumulativePrincipal float64    `json:"cumulative_principal"`
+	CumulativeInterest  float64    `json:"cumulative_interest"`
+	Status              string     `json:"status"`
+	PaidDate            *time.Time `json:"paid_date,omitempty"`
+	PaidAmount          float64    `json:"paid_amount,omitempty"`
 }
 
 // generateRepaymentSchedule generates a full amortization schedule
@@ -238,36 +239,36 @@ func generateOfferLetter(app *MortgageApplication) *OfferLetter {
 		ApplicationNumber: app.ApplicationNumber,
 		ApplicantName:     app.PrimaryApplicantName,
 		ProductType:       app.ProductType,
-		
+
 		// Loan Terms
-		ApprovedAmount:    app.ApprovedAmount,
-		InterestRate:      app.InterestRate,
-		InterestRateType:  app.InterestRateType,
-		TenorMonths:       app.ApprovedTenorMonths,
-		MonthlyPayment:    roundToKobo(monthlyPayment),
-		TotalRepayment:    roundToKobo(totalRepayment),
-		TotalInterest:     roundToKobo(totalInterest),
-		
+		ApprovedAmount:   app.ApprovedAmount,
+		InterestRate:     app.InterestRate,
+		InterestRateType: app.InterestRateType,
+		TenorMonths:      app.ApprovedTenorMonths,
+		MonthlyPayment:   roundToKobo(monthlyPayment),
+		TotalRepayment:   roundToKobo(totalRepayment),
+		TotalInterest:    roundToKobo(totalInterest),
+
 		// Property
-		PropertyAddress:   app.Property.Address,
-		PropertyValue:     app.Property.MarketValue,
-		LTVRatio:          app.LTVRatio,
-		
+		PropertyAddress: app.Property.Address,
+		PropertyValue:   app.Property.MarketValue,
+		LTVRatio:        app.LTVRatio,
+
 		// Dates
-		OfferDate:         time.Now(),
-		OfferExpiry:       offerExpiry,
-		ExpectedMaturity:  maturityDate,
-		
+		OfferDate:        time.Now(),
+		OfferExpiry:      offerExpiry,
+		ExpectedMaturity: maturityDate,
+
 		// Conditions
-		Conditions:        generateOfferConditions(app),
-		
+		Conditions: generateOfferConditions(app),
+
 		// Fees
-		ProcessingFee:     roundToKobo(app.ApprovedAmount * 0.01), // 1% processing fee
-		LegalFee:          roundToKobo(app.ApprovedAmount * 0.005), // 0.5% legal fee
-		ValuationFee:      50000, // Fixed valuation fee
-		InsurancePremium:  app.Property.InsurancePremium,
-		
-		Status:            "issued",
+		ProcessingFee:    roundToKobo(app.ApprovedAmount * 0.01),  // 1% processing fee
+		LegalFee:         roundToKobo(app.ApprovedAmount * 0.005), // 0.5% legal fee
+		ValuationFee:     50000,                                   // Fixed valuation fee
+		InsurancePremium: app.Property.InsurancePremium,
+
+		Status: "issued",
 	}
 
 	return offer
@@ -280,37 +281,37 @@ type OfferLetter struct {
 	ApplicationNumber string              `json:"application_number"`
 	ApplicantName     string              `json:"applicant_name"`
 	ProductType       MortgageProductType `json:"product_type"`
-	
+
 	// Loan Terms
-	ApprovedAmount    float64   `json:"approved_amount"`
-	InterestRate      float64   `json:"interest_rate"`
-	InterestRateType  string    `json:"interest_rate_type"`
-	TenorMonths       int       `json:"tenor_months"`
-	MonthlyPayment    float64   `json:"monthly_payment"`
-	TotalRepayment    float64   `json:"total_repayment"`
-	TotalInterest     float64   `json:"total_interest"`
-	
+	ApprovedAmount   float64 `json:"approved_amount"`
+	InterestRate     float64 `json:"interest_rate"`
+	InterestRateType string  `json:"interest_rate_type"`
+	TenorMonths      int     `json:"tenor_months"`
+	MonthlyPayment   float64 `json:"monthly_payment"`
+	TotalRepayment   float64 `json:"total_repayment"`
+	TotalInterest    float64 `json:"total_interest"`
+
 	// Property
-	PropertyAddress   string    `json:"property_address"`
-	PropertyValue     float64   `json:"property_value"`
-	LTVRatio          float64   `json:"ltv_ratio"`
-	
+	PropertyAddress string  `json:"property_address"`
+	PropertyValue   float64 `json:"property_value"`
+	LTVRatio        float64 `json:"ltv_ratio"`
+
 	// Dates
-	OfferDate         time.Time `json:"offer_date"`
-	OfferExpiry       time.Time `json:"offer_expiry"`
-	ExpectedMaturity  time.Time `json:"expected_maturity"`
-	
+	OfferDate        time.Time `json:"offer_date"`
+	OfferExpiry      time.Time `json:"offer_expiry"`
+	ExpectedMaturity time.Time `json:"expected_maturity"`
+
 	// Conditions
-	Conditions        []string  `json:"conditions"`
-	
+	Conditions []string `json:"conditions"`
+
 	// Fees
-	ProcessingFee     float64   `json:"processing_fee"`
-	LegalFee          float64   `json:"legal_fee"`
-	ValuationFee      float64   `json:"valuation_fee"`
-	InsurancePremium  float64   `json:"insurance_premium"`
-	TotalFees         float64   `json:"total_fees"`
-	
-	Status            string    `json:"status"`
+	ProcessingFee    float64 `json:"processing_fee"`
+	LegalFee         float64 `json:"legal_fee"`
+	ValuationFee     float64 `json:"valuation_fee"`
+	InsurancePremium float64 `json:"insurance_premium"`
+	TotalFees        float64 `json:"total_fees"`
+
+	Status string `json:"status"`
 }
 
 func generateOfferConditions(app *MortgageApplication) []string {
@@ -353,15 +354,15 @@ func generateOfferConditions(app *MortgageApplication) []string {
 
 // NHF Integration
 type NHFVerificationResult struct {
-	IsContributor       bool    `json:"is_contributor"`
-	AccountNumber       string  `json:"account_number"`
-	ContributionMonths  int     `json:"contribution_months"`
-	Balance             float64 `json:"balance"`
-	EmployerName        string  `json:"employer_name"`
-	EmployerCode        string  `json:"employer_code"`
+	IsContributor        bool      `json:"is_contributor"`
+	AccountNumber        string    `json:"account_number"`
+	ContributionMonths   int       `json:"contribution_months"`
+	Balance              float64   `json:"balance"`
+	EmployerName         string    `json:"employer_name"`
+	EmployerCode         string    `json:"employer_code"`
 	LastContributionDate time.Time `json:"last_contribution_date"`
-	EligibleLoanAmount  float64 `json:"eligible_loan_amount"`
-	Message             string  `json:"message"`
+	EligibleLoanAmount   float64   `json:"eligible_loan_amount"`
+	Message              string    `json:"message"`
 }
 
 // verifyNHFContributionExternal simulates NHF verification API call
@@ -370,7 +371,7 @@ func verifyNHFContributionExternal(accountNumber, employerCode string) *NHFVerif
 	// For now, simulate a successful verification
 
 	// Simulate contribution history
-	contributionMonths := 24 // 2 years of contributions
+	contributionMonths := 24       // 2 years of contributions
 	monthlyContribution := 25000.0 // Average monthly contribution
 	balance := monthlyContribution * float64(contributionMonths)
 
@@ -378,15 +379,15 @@ func verifyNHFContributionExternal(accountNumber, employerCode string) *NHFVerif
 	eligibleAmount := balance * 3
 
 	return &NHFVerificationResult{
-		IsContributor:       true,
-		AccountNumber:       accountNumber,
-		ContributionMonths:  contributionMonths,
-		Balance:             balance,
-		EmployerName:        "Sample Employer Ltd",
-		EmployerCode:        employerCode,
+		IsContributor:        true,
+		AccountNumber:        accountNumber,
+		ContributionMonths:   contributionMonths,
+		Balance:              balance,
+		EmployerName:         "Sample Employer Ltd",
+		EmployerCode:         employerCode,
 		LastContributionDate: time.Now().AddDate(0, -1, 0),
-		EligibleLoanAmount:  eligibleAmount,
-		Message:             "NHF contribution verified successfully",
+		EligibleLoanAmount:   eligibleAmount,
+		Message:              "NHF contribution verified successfully",
 	}
 }
 
@@ -451,19 +452,22 @@ const (
 
 // MortgageIFRS9Classification represents IFRS 9 classification
 type MortgageIFRS9Classification struct {
-	MortgageID          string     `json:"mortgage_id"`
-	Stage               IFRS9Stage `json:"stage"`
-	DaysPastDue         int        `json:"days_past_due"`
-	ProbabilityOfDefault float64   `json:"probability_of_default"`
-	LossGivenDefault    float64    `json:"loss_given_default"`
-	ExposureAtDefault   float64    `json:"exposure_at_default"`
-	ExpectedCreditLoss  float64    `json:"expected_credit_loss"`
-	ClassificationDate  time.Time  `json:"classification_date"`
-	Reason              string     `json:"reason"`
+	MortgageID           string     `json:"mortgage_id"`
+	Stage                IFRS9Stage `json:"stage"`
+	DaysPastDue          int        `json:"days_past_due"`
+	ProbabilityOfDefault float64    `json:"probability_of_default"`
+	LossGivenDefault     float64    `json:"loss_given_default"`
+	ExposureAtDefault    float64    `json:"exposure_at_default"`
+	ExpectedCreditLoss   float64    `json:"expected_credit_loss"`
+	ClassificationDate   time.Time  `json:"classification_date"`
+	Reason               string     `json:"reason"`
 }
 
-// classifyMortgageIFRS9 classifies a mortgage under IFRS 9
-func classifyMortgageIFRS9(app *MortgageApplication, daysPastDue int) *MortgageIFRS9Classification {
+// classifyMortgageIFRS9 classifies a mortgage under IFRS 9. The exposure at
+// default is read from the real ledger; when the balance cannot be read the
+// classification is refused (error) rather than computed against a fabricated
+// zero exposure.
+func classifyMortgageIFRS9(app *MortgageApplication, daysPastDue int) (*MortgageIFRS9Classification, error) {
 	classification := &MortgageIFRS9Classification{
 		MortgageID:         app.ID,
 		DaysPastDue:        daysPastDue,
@@ -489,8 +493,11 @@ func classifyMortgageIFRS9(app *MortgageApplication, daysPastDue int) *MortgageI
 		classification.LossGivenDefault = 0.25
 	}
 
-	// Calculate EAD (Exposure at Default)
-	balance, _ := tbClient.GetAccountBalance(app.PrincipalAccountID)
+	// Calculate EAD (Exposure at Default) — a financial read; errors propagate.
+	balance, err := tbClient.GetAccountBalance(app.PrincipalAccountID)
+	if err != nil {
+		return nil, fmt.Errorf("ifrs9 classification: read exposure for %s: %w", app.ID, err)
+	}
 	classification.ExposureAtDefault = balance
 
 	// Calculate ECL (Expected Credit Loss)
@@ -510,5 +517,5 @@ func classifyMortgageIFRS9(app *MortgageApplication, daysPastDue int) *MortgageI
 			remainingYears
 	}
 
-	return classification
+	return classification, nil
 }

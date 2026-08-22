@@ -7,6 +7,15 @@ import (
 	"time"
 )
 
+// testFXRateProvider is the deterministic rate source used by tests:
+// 1 NGN = 0.0013 USD → 13 basis points of minor units.
+func testFXRateProvider(fromCurrency, toCurrency string, valueDate time.Time) (int64, error) {
+	if fromCurrency == "NGN" && toCurrency == "USD" {
+		return 13, nil
+	}
+	return 0, fmt.Errorf("no test rate for %s/%s", fromCurrency, toCurrency)
+}
+
 func TestLoanRepaymentSaga_DoubleEntry(t *testing.T) {
 	steps, state := LoanRepaymentSaga("borrower", "loan-acct", "interest-acct", 90000, 10000)
 	if len(steps) != 7 {
@@ -128,7 +137,13 @@ func TestAllSagasExecuteWithCompensation(t *testing.T) {
 		{"P2P", func() ([]SagaStep, *SagaState) { return P2PTransferSaga("A", "B", 10000) }},
 		{"Salary", func() ([]SagaStep, *SagaState) { return BulkSalarySaga("C", []string{"D"}, []AmountKobo{10000}) }},
 		{"Loan", func() ([]SagaStep, *SagaState) { return LoanDisbursementSaga("L", "B", 50000) }},
-		{"Remittance", func() ([]SagaStep, *SagaState) { return CrossBorderRemittanceSaga("S", "R", 100000, 13, "USD") }},
+		{"Remittance", func() ([]SagaStep, *SagaState) {
+			steps, state, err := CrossBorderRemittanceSaga("S", "R", 100000, "USD")
+			if err != nil {
+				return nil, nil
+			}
+			return steps, state
+		}},
 		{"Fee", func() ([]SagaStep, *SagaState) { return FeeCollectionSaga("C", "F", 500, "monthly") }},
 		{"Repayment", func() ([]SagaStep, *SagaState) { return LoanRepaymentSaga("B", "L", "I", 90000, 10000) }},
 		{"StandingOrder", func() ([]SagaStep, *SagaState) { return StandingOrderSaga("A", "B", 5000, "SO-1") }},
@@ -243,6 +258,7 @@ func installTestBackends(t *testing.T) {
 	ConfigurePolicyActivator(func(ctx context.Context, policyRef string, active bool) error { return nil })
 	ConfigureAccountFreezer(func(ctx context.Context, accountID string, frozen bool) error { return nil })
 	ConfigureAccountArchiver(func(ctx context.Context, accountID string, archived bool) error { return nil })
+	ConfigureFXRateSource(testFXRateProvider)
 	t.Cleanup(func() {
 		ConfigureLedger(nil)
 		ConfigureLocks(nil)
@@ -253,6 +269,7 @@ func installTestBackends(t *testing.T) {
 		ConfigurePolicyActivator(nil)
 		ConfigureAccountFreezer(nil)
 		ConfigureAccountArchiver(nil)
+		ConfigureFXRateSource(nil)
 	})
 }
 
