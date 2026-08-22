@@ -97,9 +97,67 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="islamic-banking-py", version="1.0.0", lifespan=lifespan)
 
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
