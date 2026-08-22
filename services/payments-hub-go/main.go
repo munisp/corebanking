@@ -340,7 +340,7 @@ func idempotencySet(key string, status int, body []byte, ttl time.Duration) {
 		pipe := redisClient.Pipeline()
 		pipe.Set(ctx, prefix+":status", strconv.Itoa(status), ttl)
 		pipe.Set(ctx, prefix+":body", string(body), ttl)
-		if _, err := pipe.Exec(); err != nil {
+		if _, err := pipe.Exec(ctx); err != nil {
 			log.Printf("[%s] Redis idempotency SET error: %v", serviceName, err)
 		}
 		return
