@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -509,10 +510,10 @@ func createApplication(c *gin.Context) {
 		Amount:    app.RequestedAmount,
 		Timestamp: time.Now(),
 		Metadata: map[string]interface{}{
-			"student_id": app.StudentID,
-			"student_name": app.StudentName,
-			"loan_type": app.LoanType,
-			"program_name": app.ProgramName,
+			"student_id":       app.StudentID,
+			"student_name":     app.StudentName,
+			"loan_type":        app.LoanType,
+			"program_name":     app.ProgramName,
 			"program_duration": app.ProgramDuration,
 			"requested_amount": app.RequestedAmount,
 		},
@@ -1851,8 +1852,14 @@ func getEducationLoanProduct(c *gin.Context) {
 
 func getPortfolioReport(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
+	if !validTenantID(tenantID) {
+		SendError(c.Writer, "bad_request", "Invalid tenant identifier", http.StatusBadRequest, nil)
+		return
+	}
 
-	// Query lakehouse for portfolio analytics
+	// Query lakehouse for portfolio analytics.
+	// NOTE: the lakehouse client accepts raw SQL only (no bind parameters); the
+	// tenant ID above is allowlist-validated to [A-Za-z0-9-] so interpolation is safe.
 	report, err := lakehouseClient.Query(`
 		SELECT 
 			loan_type,
@@ -1878,6 +1885,18 @@ func getDisbursementReport(c *gin.Context) {
 	startDate := c.Query("start_date")
 	endDate := c.Query("end_date")
 
+	// Strict input validation: all three values are interpolated into lakehouse
+	// SQL (no parameterized-query support), so reject anything outside the
+	// allowlists instead of quoting/escaping untrusted text.
+	if !validTenantID(tenantID) {
+		SendError(c.Writer, "bad_request", "Invalid tenant identifier", http.StatusBadRequest, nil)
+		return
+	}
+	if !validReportDate(startDate) || !validReportDate(endDate) {
+		SendError(c.Writer, "bad_request", "start_date and end_date must be valid YYYY-MM-DD dates", http.StatusBadRequest, nil)
+		return
+	}
+
 	report, _ := lakehouseClient.Query(fmt.Sprintf(`
 		SELECT 
 			DATE(disbursed_at) as date,
@@ -1896,6 +1915,10 @@ func getDisbursementReport(c *gin.Context) {
 
 func getArrearsReport(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
+	if !validTenantID(tenantID) {
+		SendError(c.Writer, "bad_request", "Invalid tenant identifier", http.StatusBadRequest, nil)
+		return
+	}
 
 	report, _ := lakehouseClient.Query(`
 		SELECT 
@@ -1993,11 +2016,40 @@ func loggingMiddleware() gin.HandlerFunc {
 	}
 }
 
+// tenantIDPattern allowlists tenant identifiers. Tenant IDs are interpolated
+// into lakehouse SQL (the lakehouse client has no parameterized-query API),
+// so they MUST match this pattern before use — anything else is rejected.
+var tenantIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
+
+// reportDatePattern matches canonical YYYY-MM-DD dates only.
+var reportDatePattern = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}$`)
+
+// validTenantID reports whether s is safe to embed in SQL and routing keys.
+func validTenantID(s string) bool {
+	return tenantIDPattern.MatchString(s)
+}
+
+// validReportDate strictly validates a YYYY-MM-DD date before it is embedded
+// in a lakehouse SQL string.
+func validReportDate(s string) bool {
+	if _, err := time.Parse("2006-01-02", s); err != nil {
+		return false
+	}
+	// time.Parse alone accepts some non-canonical forms; also require the strict
+	// character set to rule out SQL metacharacters.
+	return reportDatePattern.MatchString(s)
+}
+
 func tenantMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tenantID := c.GetHeader("X-Tenant-ID")
 		if tenantID == "" {
 			tenantID = "default"
+		}
+		if !validTenantID(tenantID) {
+			SendError(c.Writer, "bad_request", "Invalid X-Tenant-ID header", http.StatusBadRequest, nil)
+			c.Abort()
+			return
 		}
 		c.Set("tenant_id", tenantID)
 		c.Next()
