@@ -180,24 +180,53 @@ func ledgerAccountUint128(accountID string) tbclient.Uint128 {
 	return tbclient.BytesToUint128(b)
 }
 
+// maxPostingAmountNaira caps a single posting at ₦1 trillion. Anything larger
+// is rejected before float64→uint64 conversion, which would otherwise
+// overflow/wrap into a garbage ledger amount (cluster-confirmed incident:
+// 1e308 naira became a ~₦92-quadrillion transfer).
+const maxPostingAmountNaira = 1e12
+
+// validatePostingAmount rejects non-finite, non-positive, oversized, or
+// sub-kobo-precision amounts. Returns the amount in kobo (math.Round).
+func validatePostingAmount(amount float64) (uint64, error) {
+	if amount != amount || math.IsInf(amount, 0) {
+		return 0, fmt.Errorf("amount must be finite")
+	}
+	if amount <= 0 {
+		return 0, fmt.Errorf("amount must be positive")
+	}
+	if amount > maxPostingAmountNaira {
+		return 0, fmt.Errorf("amount %.2f exceeds maximum posting limit %.0f naira", amount, maxPostingAmountNaira)
+	}
+	if amount*100 != math.Round(amount*100) {
+		return 0, fmt.Errorf("amount %.10f has sub-kobo precision — reject rather than silently round", amount)
+	}
+	kobo := uint64(math.Round(amount * 100))
+	if kobo == 0 {
+		return 0, fmt.Errorf("amount %.4f rounds to zero minor units", amount)
+	}
+	return kobo, nil
+}
+
 // postLedgerTransfer posts the double-entry transfer to the real cluster.
 // Returns error unless the cluster confirmed it.
 func postLedgerTransfer(debit, credit string, amount float64, idempotencyKey string) (string, error) {
 	if ledgerClient == nil {
 		return "", fmt.Errorf("tigerbeetle ledger unavailable: %v", ledgerConnErr)
 	}
-	if amount <= 0 {
-		return "", fmt.Errorf("amount must be positive")
-	}
-	kobo := uint64(amount * 100)
-	if kobo == 0 {
-		return "", fmt.Errorf("amount %.4f rounds to zero minor units", amount)
+	kobo, err := validatePostingAmount(amount)
+	if err != nil {
+		return "", err
 	}
 
 	ctx := context.Background()
-	// Idempotently ensure both accounts exist (AccountExists tolerated).
+	// Idempotently ensure both accounts exist (AccountExists tolerated). The
+	// debited (customer) account is created with debits_must_not_exceed_credits
+	// so it can NEVER be overdrafted at the ledger level — TigerBeetle rejects
+	// any transfer that would push debits past credits.
+	debitAcctID := ledgerAccountUint128(debit)
 	results, err := ledgerClient.CreateAccounts(ctx, []tbclient.Account{
-		{ID: ledgerAccountUint128(debit), Ledger: 1, Code: 1},
+		{ID: debitAcctID, Ledger: 1, Code: 1, Flags: tbclient.AccountFlags{DebitsMustNotExceedCredits: true}.ToUint16()},
 		{ID: ledgerAccountUint128(credit), Ledger: 1, Code: 1},
 	})
 	if err != nil {
@@ -207,6 +236,13 @@ func postLedgerTransfer(debit, credit string, amount float64, idempotencyKey str
 		if r.Status != tbclient.AccountCreated && r.Status != tbclient.AccountExists {
 			return "", fmt.Errorf("tigerbeetle account rejected: %v", r.Status)
 		}
+	}
+
+	// Defense-in-depth balance pre-check: accounts created before the
+	// debits_must_not_exceed_credits flag was introduced do not have it, so
+	// verify the posted balance covers the debit before submitting.
+	if bal, balErr := ledgerClient.GetAccountBalance(ctx, debitAcctID); balErr == nil && bal < int64(kobo) {
+		return "", fmt.Errorf("insufficient funds: debit account balance %d kobo < amount %d kobo", bal, kobo)
 	}
 
 	// Cluster-level idempotency: transfer ID derived from the idempotency
@@ -262,8 +298,8 @@ func postingHandler(w http.ResponseWriter, r *http.Request) {
 		jsonResp(w, 400, map[string]string{"error": "debit_account and credit_account are required"})
 		return
 	}
-	if req.Amount <= 0 {
-		jsonResp(w, 400, map[string]string{"error": "amount must be positive"})
+	if _, err := validatePostingAmount(req.Amount); err != nil {
+		jsonResp(w, 400, map[string]string{"error": err.Error()})
 		return
 	}
 
