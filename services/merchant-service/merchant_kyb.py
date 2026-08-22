@@ -25,6 +25,22 @@ logger = logging.getLogger("merchant-kyb")
 
 router = APIRouter(prefix="/api/v1/merchants", tags=["KYB Verification"])
 
+# Module-level pool, injected by main.py at startup (routers are mounted there).
+_db_pool: Optional[asyncpg.Pool] = None
+
+
+def set_db_pool(pool: asyncpg.Pool) -> None:
+    """Inject the shared asyncpg pool (called once from main.py startup)."""
+    global _db_pool
+    _db_pool = pool
+
+
+async def get_db_pool() -> asyncpg.Pool:
+    """FastAPI dependency — fail closed when the database is unavailable."""
+    if _db_pool is None:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable")
+    return _db_pool
+
 # Sanctions/PEP screening service (kyc-aml-screening-py, port 8136 by default)
 SANCTIONS_SCREENING_URL = os.getenv("SANCTIONS_SCREENING_URL", "http://localhost:8136")
 SCREENING_TIMEOUT_SECONDS = float(os.getenv("SANCTIONS_SCREENING_TIMEOUT", "10"))
@@ -120,7 +136,7 @@ def _collect_party_names(merchant, kyb) -> List[str]:
 async def submit_kyb_documents(
     merchant_id: str,
     submission: KYBSubmission,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Submit KYB documents for verification"""
     async with db.acquire() as conn:
@@ -179,7 +195,7 @@ async def submit_kyb_documents(
         }
 
 @router.get("/{merchant_id}/kyb/status")
-async def get_kyb_status(merchant_id: str, db: asyncpg.Pool = Depends()):
+async def get_kyb_status(merchant_id: str, db: asyncpg.Pool = Depends(get_db_pool)):
     """Get KYB verification status"""
     async with db.acquire() as conn:
         kyb = await conn.fetchrow("""
@@ -210,7 +226,7 @@ async def get_kyb_status(merchant_id: str, db: asyncpg.Pool = Depends()):
 async def verify_kyb(
     merchant_id: str,
     decision: KYBVerificationDecision,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Make KYB verification decision (admin only)"""
     async with db.acquire() as conn:
@@ -261,7 +277,7 @@ async def verify_kyb(
 @router.post("/{merchant_id}/kyb/risk-assessment")
 async def perform_risk_assessment(
     merchant_id: str,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Perform risk assessment on merchant.
 
@@ -400,7 +416,7 @@ async def perform_risk_assessment(
         return assessment
 
 @router.get("/{merchant_id}/kyb/documents")
-async def get_kyb_documents(merchant_id: str, db: asyncpg.Pool = Depends()):
+async def get_kyb_documents(merchant_id: str, db: asyncpg.Pool = Depends(get_db_pool)):
     """Get list of submitted KYB documents"""
     async with db.acquire() as conn:
         kyb = await conn.fetchrow(
@@ -428,7 +444,7 @@ async def request_additional_info(
     required_documents: List[str],
     notes: str,
     requested_by: str,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Request additional information from merchant"""
     async with db.acquire() as conn:
@@ -461,7 +477,7 @@ async def request_additional_info(
 async def get_pending_kyb_verifications(
     skip: int = 0,
     limit: int = 20,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Get list of pending KYB verifications for admin review"""
     async with db.acquire() as conn:

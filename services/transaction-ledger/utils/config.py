@@ -1,8 +1,16 @@
 import os
+from decimal import Decimal
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Maximum accepted transaction amount (major units, e.g. Naira). Enforced at
+# the schema boundary and again in the repository before any GL posting.
+# Default: 1 billion Naira; override via MAX_TRANSACTION_AMOUNT_NAIRA.
+MAX_TRANSACTION_AMOUNT_NAIRA = Decimal(
+    os.getenv("MAX_TRANSACTION_AMOUNT_NAIRA", "1000000000.00")
+)
 
 class Config:
     """Base config"""

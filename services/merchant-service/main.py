@@ -11,10 +11,28 @@ from datetime import datetime, timedelta
 from enum import Enum
 import uvicorn
 import asyncpg
+import hashlib
 import os
+import secrets
 import sys
 from decimal import Decimal
 import json
+
+from merchant_settlement import (
+    router as settlement_router,
+    set_db_pool as settlement_set_db_pool,
+    create_settlement_tables,
+)
+from merchant_kyb import (
+    router as kyb_router,
+    set_db_pool as kyb_set_db_pool,
+    create_kyb_tables,
+)
+from docling_kyb_integration import DoclingKYBProcessor
+from kyb_document_endpoints import (
+    router as kyb_documents_router,
+    init_kyb_endpoints,
+)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../shared/python'))
 
@@ -28,6 +46,11 @@ app = FastAPI(
     description="Complete merchant management and settlement service",
     version="1.0.0"
 )
+
+# Mount the settlement and KYB routers so the real endpoints serve traffic.
+app.include_router(settlement_router)
+app.include_router(kyb_router)
+app.include_router(kyb_documents_router)
 
 allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "https://app.54link-dev.internal,https://admin.54link-dev.internal,https://pwa.54link-dev.internal").split(",") if origin.strip()]
 app.add_middleware(
@@ -94,6 +117,11 @@ class MerchantUpdate(BaseModel):
     contact_person_phone: Optional[str] = None
 
 class MerchantResponse(BaseModel):
+    """Merchant as returned by list/get endpoints.
+
+    NEVER contains the API key or its hash — only the last-4 identifier.
+    The full key is returned exactly once, at creation (MerchantCreatedResponse).
+    """
     id: int
     merchant_id: str
     tenant_id: str
@@ -102,9 +130,13 @@ class MerchantResponse(BaseModel):
     business_phone: str
     status: MerchantStatus
     kyb_status: KYBStatus
-    api_key: Optional[str] = None
+    api_key_last4: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+class MerchantCreatedResponse(MerchantResponse):
+    """Creation response — the ONLY place the full API key is ever returned."""
+    api_key: str
 
 class KYBVerificationRequest(BaseModel):
     merchant_id: str
@@ -181,6 +213,8 @@ async def startup():
 
         async with db_pool.acquire() as conn:
             await conn.execute("""
+                CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
                 CREATE TABLE IF NOT EXISTS merchants (
                     id SERIAL PRIMARY KEY,
                     merchant_id VARCHAR(50) UNIQUE NOT NULL,
@@ -200,9 +234,21 @@ async def startup():
                     status VARCHAR(20) DEFAULT 'pending',
                     kyb_status VARCHAR(20) DEFAULT 'not_started',
                     api_key VARCHAR(255),
+                    api_key_hash VARCHAR(64),
+                    api_key_last4 VARCHAR(4),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                -- Upgrades for pre-existing deployments (plaintext api_key no
+                -- longer written; only a SHA-256 hash + last-4 are stored).
+                ALTER TABLE merchants ADD COLUMN IF NOT EXISTS api_key_hash VARCHAR(64);
+                ALTER TABLE merchants ADD COLUMN IF NOT EXISTS api_key_last4 VARCHAR(4);
+                UPDATE merchants
+                    SET api_key_hash = encode(digest(api_key, 'sha256'), 'hex'),
+                        api_key_last4 = right(api_key, 4),
+                        api_key = NULL
+                WHERE api_key IS NOT NULL;
 
                 CREATE INDEX IF NOT EXISTS idx_merchants_merchant_id ON merchants(merchant_id);
                 CREATE INDEX IF NOT EXISTS idx_merchants_tenant_id ON merchants(tenant_id);
@@ -235,9 +281,16 @@ async def startup():
                     bank_code VARCHAR(20),
                     account_name VARCHAR(255),
                     status VARCHAR(20) DEFAULT 'pending',
+                    claimed_at TIMESTAMP,
                     processed_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                -- Upgrades for pre-existing deployments (atomic claim uses
+                -- claimed_at; all status transitions touch updated_at).
+                ALTER TABLE merchant_settlements ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP;
+                ALTER TABLE merchant_settlements ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
                 CREATE INDEX IF NOT EXISTS idx_settlements_merchant_id ON merchant_settlements(merchant_id);
                 CREATE INDEX IF NOT EXISTS idx_settlements_status ON merchant_settlements(status);
@@ -312,6 +365,22 @@ async def startup():
                 CREATE INDEX IF NOT EXISTS idx_kyb_documents_type ON kyb_documents(document_type);
             """)
 
+            # Settlement/KYB router tables + one-payout-per-settlement guard.
+            await create_settlement_tables(conn)
+            await create_kyb_tables(conn)
+            await conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_payouts_settlement
+                ON merchant_payouts(settlement_id);
+            """)
+
+        # Inject live dependencies into the mounted routers.
+        settlement_set_db_pool(db_pool)
+        kyb_set_db_pool(db_pool)
+        init_kyb_endpoints(
+            db_pool,
+            DoclingKYBProcessor(os.getenv("DOCLING_URL", "http://docling-service:8010")),
+        )
+
         print("Merchant service started successfully")
     except Exception as e:
         print(f"DB unavailable at startup, service running in degraded mode: {e}", file=sys.stderr)
@@ -327,38 +396,61 @@ async def shutdown():
 async def health_check():
     return {"status": "healthy", "service": "merchant-service"}
 
+def _generate_api_key() -> tuple:
+    """Generate an unpredictable live API key (CSPRNG).
+
+    Returns (plaintext_key, sha256_hash, last4). Only the hash and last-4 are
+    ever stored; the plaintext is returned to the caller exactly once.
+    """
+    plaintext = "sk_live_" + secrets.token_urlsafe(32)
+    key_hash = hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+    return plaintext, key_hash, plaintext[-4:]
+
+
+def _scrub_api_key(record: dict) -> dict:
+    """Remove key material from a merchants row before returning it."""
+    record.pop("api_key", None)
+    record.pop("api_key_hash", None)
+    return record
+
+
 # Merchant Management Endpoints
-@app.post("/api/v1/merchants", response_model=MerchantResponse, status_code=201)
+@app.post("/api/v1/merchants", response_model=MerchantCreatedResponse, status_code=201)
 async def create_merchant(
     merchant: MerchantCreate,
     db=Depends(get_db)
 ):
-    """Create a new merchant account"""
+    """Create a new merchant account.
+
+    The full API key is returned ONLY in this response; afterwards only the
+    SHA-256 hash and last-4 characters are stored/retrievable.
+    """
     merchant_id = f"MER{int(datetime.now().timestamp())}"
-    api_key = f"sk_live_{merchant_id}_{int(datetime.now().timestamp())}"
-    
+    api_key, api_key_hash, api_key_last4 = _generate_api_key()
+
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO merchants (
                 merchant_id, tenant_id, business_name, business_email, business_phone,
                 business_address, business_type, registration_number, tax_id,
                 contact_person_name, contact_person_email, contact_person_phone,
-                industry, website, api_key
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                industry, website, api_key, api_key_hash, api_key_last4
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             RETURNING *
         """, merchant_id, merchant.tenant_id, merchant.business_name, merchant.business_email,
             merchant.business_phone, merchant.business_address, merchant.business_type,
             merchant.registration_number, merchant.tax_id, merchant.contact_person_name,
             merchant.contact_person_email, merchant.contact_person_phone, merchant.industry,
-            merchant.website, api_key)
-        
+            merchant.website, None, api_key_hash, api_key_last4)
+
         # Initialize fee configuration with defaults
         await conn.execute("""
             INSERT INTO merchant_fee_config (merchant_id)
             VALUES ($1)
         """, merchant_id)
 
-        merchant_payload = dict(row)
+        merchant_payload = _scrub_api_key(dict(row))
+        merchant_payload["api_key"] = api_key  # shown exactly once, at creation
 
     publish_merchant_event(
         event_type="MERCHANT_CREATED",
@@ -404,7 +496,8 @@ async def list_merchants(
     
     async with db.acquire() as conn:
         rows = await conn.fetch(query, *params)
-        return [dict(row) for row in rows]
+        # Never return key material (full key or hash) in list responses.
+        return [_scrub_api_key(dict(row)) for row in rows]
 
 @app.get("/api/v1/merchants/{merchant_id}", response_model=MerchantResponse)
 async def get_merchant(merchant_id: str, db=Depends(get_db)):
@@ -416,7 +509,7 @@ async def get_merchant(merchant_id: str, db=Depends(get_db)):
         )
         if not row:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        return dict(row)
+        return _scrub_api_key(dict(row))
 
 @app.put("/api/v1/merchants/{merchant_id}")
 async def update_merchant(
@@ -454,7 +547,7 @@ async def update_merchant(
         row = await conn.fetchrow(query, *params)
         if not row:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        updated = dict(row)
+        updated = _scrub_api_key(dict(row))
     publish_merchant_event(
         event_type="MERCHANT_UPDATED",
         tenant_id=updated.get("tenant_id", "tenant-demo"),

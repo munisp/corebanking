@@ -4,6 +4,7 @@ KYB Service - Document Upload Endpoints with Docling Integration
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Header
 from typing import Optional, List
+import logging
 import tempfile
 import os
 import asyncpg
@@ -11,9 +12,11 @@ import json
 from datetime import datetime
 from docling_kyb_integration import DoclingKYBProcessor
 
+logger = logging.getLogger("merchant-service.kyb-documents")
+
 router = APIRouter(prefix="/api/v1/merchants/kyb/documents", tags=["KYB Documents"])
 
-# Global instances (will be initialized in main.py)
+# Global instances (initialized in main.py at startup)
 db_pool = None
 docling_processor = None
 
@@ -22,6 +25,11 @@ def init_kyb_endpoints(pool: asyncpg.Pool, processor: DoclingKYBProcessor):
     global db_pool, docling_processor
     db_pool = pool
     docling_processor = processor
+
+def _require_ready():
+    """Fail closed when dependencies were not injected at startup."""
+    if db_pool is None or docling_processor is None:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable")
 
 @router.post("/upload/business-registration")
 async def upload_business_registration(
@@ -33,6 +41,7 @@ async def upload_business_registration(
     Upload and process CAC business registration certificate
     Automatically extracts RC number, company name, directors, etc.
     """
+    _require_ready()
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
     try:
         content = await file.read()
@@ -79,8 +88,9 @@ async def upload_business_registration(
             "processed_at": datetime.utcnow().isoformat()
         }
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
+    except Exception:
+        logger.exception("KYB document processing failed")
+        raise HTTPException(status_code=500, detail="Document processing failed")
     finally:
         if os.path.exists(temp_file.name):
             os.unlink(temp_file.name)
@@ -95,6 +105,7 @@ async def upload_tax_certificate(
     Upload and process tax identification certificate (TIN)
     Automatically extracts TIN, company name, tax office, etc.
     """
+    _require_ready()
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
     try:
         content = await file.read()
@@ -132,8 +143,9 @@ async def upload_tax_certificate(
             "processed_at": datetime.utcnow().isoformat()
         }
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
+    except Exception:
+        logger.exception("KYB document processing failed")
+        raise HTTPException(status_code=500, detail="Document processing failed")
     finally:
         if os.path.exists(temp_file.name):
             os.unlink(temp_file.name)
@@ -149,6 +161,7 @@ async def upload_directors_id(
     Upload and process director's identity document
     Verifies director name matches the submitted document
     """
+    _require_ready()
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
     try:
         content = await file.read()
@@ -189,8 +202,9 @@ async def upload_directors_id(
             "processed_at": datetime.utcnow().isoformat()
         }
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
+    except Exception:
+        logger.exception("KYB document processing failed")
+        raise HTTPException(status_code=500, detail="Document processing failed")
     finally:
         if os.path.exists(temp_file.name):
             os.unlink(temp_file.name)
@@ -205,6 +219,7 @@ async def upload_bank_statement(
     Upload and process business bank statement
     Automatically extracts account details, balances, transaction summary
     """
+    _require_ready()
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
     try:
         content = await file.read()
@@ -242,8 +257,9 @@ async def upload_bank_statement(
             "processed_at": datetime.utcnow().isoformat()
         }
         
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Document processing failed: {str(e)}")
+    except Exception:
+        logger.exception("KYB document processing failed")
+        raise HTTPException(status_code=500, detail="Document processing failed")
     finally:
         if os.path.exists(temp_file.name):
             os.unlink(temp_file.name)
@@ -257,6 +273,7 @@ async def calculate_kyb_score(
     Calculate overall KYB verification score
     Returns score (0-100) with component breakdown and recommendations
     """
+    _require_ready()
     try:
         # Get all documents for merchant
         async with db_pool.acquire() as conn:
@@ -288,8 +305,9 @@ async def calculate_kyb_score(
         
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"KYB score calculation failed: {str(e)}")
+    except Exception:
+        logger.exception("KYB score calculation failed")
+        raise HTTPException(status_code=500, detail="KYB score calculation failed")
 
 @router.get("/list/{merchant_id}")
 async def list_merchant_documents(
@@ -297,6 +315,7 @@ async def list_merchant_documents(
     tenant_id: str
 ):
     """List all KYB documents submitted by a merchant"""
+    _require_ready()
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("""
             SELECT document_id, document_type, verification_status,
@@ -316,6 +335,7 @@ async def list_merchant_documents(
 @router.get("/details/{document_id}")
 async def get_document_details(document_id: str):
     """Get detailed information about a specific KYB document"""
+    _require_ready()
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT * FROM kyb_documents WHERE document_id = $1

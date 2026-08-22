@@ -18,6 +18,10 @@ class TransactionStatus(enum.Enum):
     SUCCESS = "success"
     REVERSED = "reversed"
     FRAUD = "fraud"
+    # Durable record exists but the GL journal entry could not be posted.
+    # A GL posting outbox row is written for retry; the transaction must
+    # never reach SUCCESS from this state without a successful GL post.
+    GL_FAILED = "gl_failed"
 
 
 class CurrencyEnum(enum.Enum):

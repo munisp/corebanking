@@ -10,11 +10,46 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
 import asyncpg
+import hashlib
 import json
+import logging
 
-from middleware_events import post_ledger_transfer, publish_domain_event
+from middleware_events import (
+    LedgerPostError,
+    ledger_transfer_id,
+    post_ledger_transfer,
+    publish_domain_event,
+)
+
+logger = logging.getLogger("merchant-service.settlement")
 
 router = APIRouter(prefix="/api/v1/merchants", tags=["Settlement"])
+
+# Module-level pool, injected by main.py at startup (routers are mounted there).
+_db_pool: Optional[asyncpg.Pool] = None
+
+
+def set_db_pool(pool: asyncpg.Pool) -> None:
+    """Inject the shared asyncpg pool (called once from main.py startup)."""
+    global _db_pool
+    _db_pool = pool
+
+
+async def get_db_pool() -> asyncpg.Pool:
+    """FastAPI dependency — fail closed when the database is unavailable."""
+    if _db_pool is None:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable")
+    return _db_pool
+
+
+def _settlement_id_for(merchant_id: str, period_start: datetime, period_end: datetime) -> str:
+    """Deterministic settlement ID from natural/business keys (SHA-256).
+
+    One settlement per (merchant, period): replays/retries of the create call
+    produce the same ID instead of colliding timestamp-based IDs.
+    """
+    natural_key = f"settlement:{merchant_id}:{period_start.isoformat()}:{period_end.isoformat()}"
+    return "STL" + hashlib.sha256(natural_key.encode("utf-8")).hexdigest()[:24].upper()
 
 class SettlementFrequency(str, Enum):
     DAILY = "daily"
@@ -59,7 +94,7 @@ async def calculate_settlement(
     merchant_id: str,
     period_start: datetime,
     period_end: datetime,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Calculate settlement amount for a given period"""
     async with db.acquire() as conn:
@@ -133,29 +168,29 @@ async def calculate_settlement(
         chargeback_fee = fee_config['chargeback_fee'] if fee_config else Decimal("2500")
         total_chargeback_fees = chargeback_fee * chargeback_count
         
-        # Calculate net amount
+        # Calculate net amount — all money stays in Decimal (no float math)
         net_amount = gross_amount - total_fees - refund_amount - chargeback_amount - total_chargeback_fees
-        
+
         return {
             "merchant_id": merchant_id,
             "period_start": period_start,
             "period_end": period_end,
             "summary": {
                 "total_transactions": total_transactions,
-                "gross_amount": float(gross_amount),
-                "transaction_fees": float(transaction_fees),
-                "settlement_fee": float(settlement_fee),
-                "refunds": float(refund_amount),
-                "chargebacks": float(chargeback_amount),
+                "gross_amount": gross_amount,
+                "transaction_fees": transaction_fees,
+                "settlement_fee": settlement_fee,
+                "refunds": refund_amount,
+                "chargebacks": chargeback_amount,
                 "chargeback_count": chargeback_count,
-                "chargeback_fees": float(total_chargeback_fees),
-                "total_fees": float(total_fees + total_chargeback_fees),
-                "net_amount": float(net_amount)
+                "chargeback_fees": total_chargeback_fees,
+                "total_fees": total_fees + total_chargeback_fees,
+                "net_amount": net_amount
             },
             "transactions": [
                 {
                     "transaction_id": t['transaction_id'],
-                    "amount": float(t['amount']),
+                    "amount": t['amount'],
                     "created_at": t['created_at']
                 }
                 for t in transactions
@@ -166,7 +201,7 @@ async def calculate_settlement(
 async def create_settlement(
     merchant_id: str,
     settlement: SettlementCreate,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Create a new settlement for processing"""
     async with db.acquire() as conn:
@@ -180,22 +215,37 @@ async def create_settlement(
         
         summary = calc_result['summary']
         
-        # Generate settlement ID
-        settlement_id = f"STL{int(datetime.now().timestamp())}"
-        
-        # Create settlement record
+        # Deterministic settlement ID over natural keys — never a bare
+        # timestamp (two merchants settling in the same second must not
+        # collide, and a retried create must be idempotent).
+        settlement_id = _settlement_id_for(
+            merchant_id,
+            settlement.settlement_period_start,
+            settlement.settlement_period_end,
+        )
+
+        # Create settlement record — atomic idempotency: a concurrent or
+        # retried create for the same (merchant, period) hits the unique
+        # constraint and is rejected instead of duplicating the settlement.
         row = await conn.fetchrow("""
             INSERT INTO merchant_settlements (
                 settlement_id, merchant_id, settlement_period_start, settlement_period_end,
                 total_transactions, gross_amount, fees_amount, net_amount,
                 bank_account_number, bank_code, account_name, status
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+            ON CONFLICT (settlement_id) DO NOTHING
             RETURNING *
         """, settlement_id, merchant_id, settlement.settlement_period_start,
             settlement.settlement_period_end, summary['total_transactions'],
             summary['gross_amount'], summary['total_fees'], summary['net_amount'],
             settlement.bank_account_number, settlement.bank_code, settlement.account_name)
-        
+
+        if row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="A settlement for this merchant and period already exists"
+            )
+
         await publish_domain_event("merchant.settlement.created", merchant_id, {
             "settlement_id": settlement_id,
             "merchant_id": merchant_id,
@@ -211,81 +261,128 @@ async def create_settlement(
 async def process_settlement(
     merchant_id: str,
     settlement_id: str,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
-    """Process a pending settlement"""
+    """Process a pending settlement.
+
+    Concurrency- and failure-safe payout flow:
+      1. ATOMIC CLAIM — a single UPDATE ... WHERE status='pending' ... RETURNING
+         inside a transaction. Exactly one caller can claim the settlement;
+         concurrent/duplicate requests get 409. No double payout is possible.
+      2. REAL PAYOUT — the payout is posted to the TigerBeetle ledger via the
+         middleware adapter with a deterministic idempotency key (SHA-256 over
+         natural keys). This is a real funds-movement posting, NOT a
+         simulation. If the payout rail is unavailable the settlement is
+         marked 'failed' and the API returns 503 — success is never simulated.
+      3. FINALIZE — the 'completed' status transition and the payout record
+         are written in ONE transaction, only after the ledger post succeeded.
+         A payout is never marked complete when the ledger post failed.
+    """
+    # STEP 1: atomic claim (pending -> processing). The WHERE status='pending'
+    # predicate makes the claim race-free; RETURNING * yields the claimed row.
     async with db.acquire() as conn:
-        # Get settlement
-        settlement = await conn.fetchrow("""
-            SELECT * FROM merchant_settlements
-            WHERE settlement_id = $1 AND merchant_id = $2
-        """, settlement_id, merchant_id)
-        
-        if not settlement:
-            raise HTTPException(status_code=404, detail="Settlement not found")
-        
-        if settlement['status'] != 'pending':
-            raise HTTPException(
-                status_code=400,
-                detail=f"Settlement cannot be processed. Current status: {settlement['status']}"
-            )
-        
-        # Update status to processing
-        await conn.execute("""
-            UPDATE merchant_settlements
-            SET status = 'processing', updated_at = CURRENT_TIMESTAMP
-            WHERE settlement_id = $1
-        """, settlement_id)
-        
-        # Simulate payment processing (would integrate with payment gateway)
-        # In production, this would call bank API to initiate transfer
-        try:
-            # Simulate successful processing
-            await conn.execute("""
+        async with conn.transaction():
+            settlement = await conn.fetchrow("""
                 UPDATE merchant_settlements
-                SET status = 'completed', processed_at = CURRENT_TIMESTAMP,
+                SET status = 'processing',
+                    claimed_at = CURRENT_TIMESTAMP,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE settlement_id = $1
-            """, settlement_id)
-            
-            # Record payout transaction
-            await conn.execute("""
-                INSERT INTO merchant_payouts (
-                    settlement_id, merchant_id, amount, bank_account_number,
-                    bank_code, account_name, status
-                ) VALUES ($1, $2, $3, $4, $5, $6, 'completed')
-            """, settlement_id, merchant_id, settlement['net_amount'],
-                settlement['bank_account_number'], settlement['bank_code'],
-                settlement['account_name'])
-            
-            # Post the payout to the ledger (Dr settlement payable, Cr cash) and
-            # publish the settlement-completed event.
-            await post_ledger_transfer(settlement_id, float(settlement['net_amount']), merchant_id)
-            await publish_domain_event("merchant.settlement.completed", merchant_id, {
-                "settlement_id": settlement_id,
-                "merchant_id": merchant_id,
-                "amount": float(settlement['net_amount']),
-            })
-            return {
-                "status": "completed",
-                "settlement_id": settlement_id,
-                "merchant_id": merchant_id,
-                "amount": float(settlement['net_amount']),
-                "processed_at": datetime.now()
-            }
-            
-        except Exception as e:
-            # Mark as failed
-            await conn.execute("""
-                UPDATE merchant_settlements
-                SET status = 'failed', updated_at = CURRENT_TIMESTAMP
-                WHERE settlement_id = $1
-            """, settlement_id)
-            
+                  AND merchant_id = $2
+                  AND status = 'pending'
+                RETURNING *
+            """, settlement_id, merchant_id)
+
+        if settlement is None:
+            existing = await conn.fetchrow("""
+                SELECT status FROM merchant_settlements
+                WHERE settlement_id = $1 AND merchant_id = $2
+            """, settlement_id, merchant_id)
+            if existing is None:
+                raise HTTPException(status_code=404, detail="Settlement not found")
             raise HTTPException(
-                status_code=500,
-                detail=f"Settlement processing failed: {str(e)}"
+                status_code=409,
+                detail="Settlement is not pending and cannot be processed"
             )
+
+    amount = Decimal(str(settlement['net_amount']))
+    transfer_id = ledger_transfer_id(settlement_id, nature="payout")
+
+    # STEP 2: real ledger payout (Dr settlement payable, Cr cash at bank).
+    # Fails closed: any error marks the settlement failed and returns 503.
+    try:
+        await post_ledger_transfer(transfer_id, amount, tenant_id=merchant_id)
+    except LedgerPostError:
+        logger.error(
+            "settlement payout FAILED settlement_id=%s merchant_id=%s",
+            settlement_id, merchant_id, exc_info=True,
+        )
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("""
+                    UPDATE merchant_settlements
+                    SET status = 'failed', updated_at = CURRENT_TIMESTAMP
+                    WHERE settlement_id = $1 AND status = 'processing'
+                """, settlement_id)
+        await publish_domain_event("merchant.settlement.failed", merchant_id, {
+            "settlement_id": settlement_id,
+            "merchant_id": merchant_id,
+            "reason": "payout_rail_unavailable",
+        })
+        raise HTTPException(
+            status_code=503,
+            detail="Settlement payout rail unavailable; settlement marked failed"
+        )
+
+    # STEP 3: finalize — status transition + payout record in one transaction.
+    try:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("""
+                    UPDATE merchant_settlements
+                    SET status = 'completed', processed_at = CURRENT_TIMESTAMP,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE settlement_id = $1 AND status = 'processing'
+                """, settlement_id)
+
+                await conn.execute("""
+                    INSERT INTO merchant_payouts (
+                        settlement_id, merchant_id, amount, bank_account_number,
+                        bank_code, account_name, status, processed_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, 'completed', CURRENT_TIMESTAMP)
+                    ON CONFLICT (settlement_id) DO NOTHING
+                """, settlement_id, merchant_id, amount,
+                    settlement['bank_account_number'], settlement['bank_code'],
+                    settlement['account_name'])
+    except Exception:
+        # The ledger transfer already succeeded (idempotent transfer id), but
+        # the finalize write failed. Leave the settlement in 'processing' so
+        # it is never silently completed nor re-claimed for a second payout;
+        # reconciliation can re-run the finalize step safely.
+        logger.critical(
+            "settlement finalize FAILED after successful ledger post "
+            "settlement_id=%s transfer_id=%s — manual reconciliation required",
+            settlement_id, transfer_id, exc_info=True,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Settlement finalization failed"
+        )
+
+    await publish_domain_event("merchant.settlement.completed", merchant_id, {
+        "settlement_id": settlement_id,
+        "merchant_id": merchant_id,
+        "amount": str(amount),
+        "ledger_transfer_id": transfer_id,
+    })
+    return {
+        "status": "completed",
+        "settlement_id": settlement_id,
+        "merchant_id": merchant_id,
+        "amount": amount,
+        "ledger_transfer_id": transfer_id,
+        "processed_at": datetime.now()
+    }
 
 @router.get("/{merchant_id}/settlements")
 async def list_settlements(
@@ -295,7 +392,7 @@ async def list_settlements(
     end_date: Optional[datetime] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """List settlements for a merchant"""
     query = "SELECT * FROM merchant_settlements WHERE merchant_id = $1"
@@ -334,7 +431,7 @@ async def list_settlements(
 async def get_settlement(
     merchant_id: str,
     settlement_id: str,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Get settlement details"""
     async with db.acquire() as conn:
@@ -366,7 +463,7 @@ async def get_settlement(
 async def set_settlement_config(
     merchant_id: str,
     config: SettlementConfig,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Configure settlement preferences for merchant"""
     async with db.acquire() as conn:
@@ -405,7 +502,7 @@ async def set_settlement_config(
         }
 
 @router.get("/{merchant_id}/settlements/config")
-async def get_settlement_config(merchant_id: str, db: asyncpg.Pool = Depends()):
+async def get_settlement_config(merchant_id: str, db: asyncpg.Pool = Depends(get_db_pool)):
     """Get settlement configuration for merchant"""
     async with db.acquire() as conn:
         config = await conn.fetchrow("""
@@ -434,7 +531,7 @@ async def adjust_settlement(
     merchant_id: str,
     settlement_id: str,
     adjustment: SettlementAdjustment,
-    db: asyncpg.Pool = Depends()
+    db: asyncpg.Pool = Depends(get_db_pool)
 ):
     """Apply adjustment to a settlement"""
     async with db.acquire() as conn:
@@ -521,7 +618,9 @@ async def create_settlement_tables(conn: asyncpg.Connection):
             processed_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
-        
+
+        -- At most one payout per settlement (double-payout defense in depth).
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_payouts_settlement ON merchant_payouts(settlement_id);
         CREATE INDEX IF NOT EXISTS idx_payouts_merchant ON merchant_payouts(merchant_id);
         
         CREATE TABLE IF NOT EXISTS merchant_settlement_adjustments (

@@ -17,8 +17,8 @@ from database import Base
 from utils import TransactionStatus, CurrencyEnum
 from .mixins import TimestampMixin, SoftDeleteMixin
 
-from sqlalchemy import String, Enum, TIMESTAMP, Numeric, UniqueConstraint, Index
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import String, Enum, TIMESTAMP, Numeric, UniqueConstraint, Index, Integer, Text
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy_serializer import SerializerMixin
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -69,6 +69,9 @@ class Transaction(Base, SerializerMixin, TimestampMixin, SoftDeleteMixin):
         Enum(CurrencyEnum), nullable=False, default=CurrencyEnum.NGN
     )
     completed_at: Mapped[datetime.datetime] = mapped_column(TIMESTAMP, nullable=True)
+    # Set once the GL journal entry has been durably posted. NULL means the GL
+    # has NOT seen this transaction — such a record must never reach SUCCESS.
+    gl_posted_at: Mapped[datetime.datetime] = mapped_column(TIMESTAMP, nullable=True)
     note: Mapped[str] = mapped_column(String(512), nullable=True)
     tag: Mapped[str] = mapped_column(String(128), nullable=True)
     tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -80,3 +83,31 @@ class Transaction(Base, SerializerMixin, TimestampMixin, SoftDeleteMixin):
             f"payer={self.payer} payee={self.payee} amount={self.amount} "
             f"status={self.status.value}>"
         )
+
+
+class GLPostingOutbox(Base, SerializerMixin, TimestampMixin):
+    """Outbox for GL journal postings that failed after the durable record
+    was committed.
+
+    A row with status='pending' means: the transaction record exists in the
+    database but the GL has not (successfully) seen the journal entry yet.
+    A retry worker / event redelivery drains this outbox. Fail-closed: rows
+    are only marked 'done' after a confirmed GL post.
+    """
+
+    __tablename__ = "gl_posting_outbox"
+
+    __table_args__ = (
+        Index("ix_gl_outbox_tenant_txn", "tenant_id", "transaction_id"),
+        Index("ix_gl_outbox_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    transaction_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    tenant_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    entry_payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str] = mapped_column(Text, nullable=True)
