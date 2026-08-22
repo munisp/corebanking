@@ -1064,54 +1064,61 @@ type LedgerEntry struct {
 	Ledger        uint32  `json:"ledger"`
 }
 
+// CreateTransfer posts a real transfer to the TigerBeetle HTTP bridge and
+// fails loudly on any error. Previously this function discarded the HTTP
+// result and always appended to an in-memory shadow ledger, returning success
+// even when nothing was posted — silent mockware on the money path.
 func (t *TigerBeetleClient) CreateTransfer(ctx context.Context, entry LedgerEntry) (string, error) {
 	transferID := fmt.Sprintf("TB-%d", time.Now().UnixMilli())
 
-	if t.connected {
-		transfer := map[string]any{
-			"id":                transferID,
-			"debit_account_id":  entry.DebitAccount,
-			"credit_account_id": entry.CreditAccount,
-			"amount":            entry.Amount,
-			"ledger":            entry.Ledger,
-			"code":              entry.Code,
-		}
-		data, _ := json.Marshal(map[string]any{"transfers": []any{transfer}})
-		req, _ := http.NewRequestWithContext(ctx, "POST",
-			fmt.Sprintf("%s/transfers/create", t.HTTPAddress), bytes.NewReader(data))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := t.httpClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
+	if !t.connected {
+		return "", fmt.Errorf("tigerbeetle unavailable: not connected (addresses=%s)", t.Addresses)
 	}
-	t.mu.Lock()
-	t.transfers = append(t.transfers, map[string]any{
-		"id": transferID, "debit": entry.DebitAccount, "credit": entry.CreditAccount,
-		"amount": entry.Amount, "timestamp": NowISO(),
-	})
-	t.mu.Unlock()
+	transfer := map[string]any{
+		"id":                transferID,
+		"debit_account_id":  entry.DebitAccount,
+		"credit_account_id": entry.CreditAccount,
+		"amount":            entry.Amount,
+		"ledger":            entry.Ledger,
+		"code":              entry.Code,
+	}
+	data, _ := json.Marshal(map[string]any{"transfers": []any{transfer}})
+	req, _ := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/transfers/create", t.HTTPAddress), bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		t.connected = false
+		return "", fmt.Errorf("tigerbeetle transfer failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("tigerbeetle transfer rejected: HTTP %d", resp.StatusCode)
+	}
 	return transferID, nil
 }
 
+// CreateAccount creates a real account via the TigerBeetle HTTP bridge and
+// fails loudly on any error. Previously it discarded the HTTP result and
+// always recorded a shadow in-memory account with zero balances.
 func (t *TigerBeetleClient) CreateAccount(ctx context.Context, id int64, ledger uint32, code uint16) error {
-	if t.connected {
-		account := map[string]any{"id": id, "ledger": ledger, "code": code}
-		data, _ := json.Marshal(map[string]any{"accounts": []any{account}})
-		req, _ := http.NewRequestWithContext(ctx, "POST",
-			fmt.Sprintf("%s/accounts/create", t.HTTPAddress), bytes.NewReader(data))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := t.httpClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
+	if !t.connected {
+		return fmt.Errorf("tigerbeetle unavailable: not connected (addresses=%s)", t.Addresses)
 	}
-	t.mu.Lock()
-	t.accounts[id] = map[string]any{
-		"id": id, "ledger": ledger, "code": code,
-		"debits_posted": 0, "credits_posted": 0,
+	account := map[string]any{"id": id, "ledger": ledger, "code": code}
+	data, _ := json.Marshal(map[string]any{"accounts": []any{account}})
+	req, _ := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/accounts/create", t.HTTPAddress), bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		t.connected = false
+		return fmt.Errorf("tigerbeetle account create failed: %w", err)
 	}
-	t.mu.Unlock()
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("tigerbeetle account create rejected: HTTP %d", resp.StatusCode)
+	}
 	return nil
 }
 
