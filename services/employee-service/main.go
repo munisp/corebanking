@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -834,20 +835,32 @@ func (s *EmployeeService) handleEmployeeEvent(ctx context.Context) (retry bool, 
 	return false, nil
 }
 
-// setSessionContext sets PostgreSQL session context for RLS
+// sessionContextIDPattern allowlists identifiers that may be written into the
+// PostgreSQL RLS session context (bank/branch/user IDs). It covers both UUIDs
+// and slug-style tenant IDs such as "54bank-platform-prod".
+var sessionContextIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
+
+// setSessionContext sets PostgreSQL session context for RLS.
+//
+// Values are validated against an allowlist AND bound via set_config(..., $1)
+// parameters: pgx's simple protocol would otherwise allow stacked-query
+// injection through a string-built SET statement.
 func (s *EmployeeService) setSessionContext(ctx context.Context, tenantID, branchID, keycloakID string) error {
-	_, err := s.db.Exec(ctx, fmt.Sprintf("SET app.current_bank_id = '%s'", tenantID))
-	if err != nil {
+	for name, v := range map[string]string{"tenant": tenantID, "branch": branchID, "keycloak": keycloakID} {
+		if v != "" && !sessionContextIDPattern.MatchString(v) {
+			return fmt.Errorf("invalid %s identifier for session context", name)
+		}
+	}
+
+	if _, err := s.db.Exec(ctx, "SELECT set_config('app.current_bank_id', $1, false)", tenantID); err != nil {
 		return err
 	}
 
-	_, err = s.db.Exec(ctx, fmt.Sprintf("SET app.current_branch_id = '%s'", branchID))
-	if err != nil {
+	if _, err := s.db.Exec(ctx, "SELECT set_config('app.current_branch_id', $1, false)", branchID); err != nil {
 		return err
 	}
 
-	_, err = s.db.Exec(ctx, fmt.Sprintf("SET app.current_user_id = '%s'", keycloakID))
-	if err != nil {
+	if _, err := s.db.Exec(ctx, "SELECT set_config('app.current_user_id', $1, false)", keycloakID); err != nil {
 		return err
 	}
 
