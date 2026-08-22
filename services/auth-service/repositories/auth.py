@@ -16,7 +16,15 @@ class AuthRepository:
         return self.__db.query(Auth).filter(Auth.keycloak_id == keycloak_id, Auth.tenant_id == tenant_id).first()
     
     def get_auth_by_api_key(self, key: str, secret: str, tenant_id: str):
-        return self.__db.query(Auth).filter(Auth.api_key == key, Auth.tenant_id == tenant_id).filter(Auth.api_secret == secret).first()
+        # api_secret is stored hashed (sha256+salt); compare via verification.
+        from utils.helpers import verify_api_secret
+
+        auth = self.__db.query(Auth).filter(Auth.api_key == key, Auth.tenant_id == tenant_id).first()
+        if auth is None:
+            return None
+        if not verify_api_secret(secret, auth.api_secret):
+            return None
+        return auth
     
     def create_auth(self, email: str, user_role: Optional[UserRole], tenant_id: str, keycloak_id: str, api_key: str, api_secret: str):
         auth = Auth(

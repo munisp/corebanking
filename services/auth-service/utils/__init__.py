@@ -9,7 +9,7 @@ from .enums import (
 )
 from .external_api_client import ExternalAPIClient
 from .errors import ApiError
-from .helpers import generate_api_key, create_logger
+from .helpers import generate_api_key, create_logger, hash_api_secret, verify_api_secret
 from .vpn_detector import VPNDetector, detect_vpn
 from .failed_login_tracker import FailedLoginTracker, get_failed_login_tracker
 from .otp_service import OTPService, get_otp_service

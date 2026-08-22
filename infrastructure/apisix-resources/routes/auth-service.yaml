@@ -24,6 +24,16 @@ spec:
             regex_uri:
               - "^/auth(?:/system)?/(.*)"
               - "/$1"
+        - name: 54link-access-plugin
+          enable: true
+          config:
+            authorizer_url: "http://identity-auth.54link-dev.svc.cluster.local:9365/token"
+            mint_account_url: "http://core-accounts.54link-dev.svc.cluster.local:9280/system/create-mint-account"
+            keycloak_public_key_url: "http://platform-tenant.54link-dev.svc.cluster.local:9528/tenant/keycloak-public-key"
+            billing_url: "http://platform-tenant.54link-dev.svc.cluster.local:9523"
+            redis_host: "redis-master.redis.svc.cluster.local"
+            redis_port: 6379
+            redis_cache_ttl: 60
         - name: cors
           enable: true
           config:
