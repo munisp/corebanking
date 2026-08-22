@@ -20,15 +20,27 @@ import time
 import threading
 import signal
 import socket as _socket
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("unit-test-runner-py")
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/unit_test_runner_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -592,151 +604,6 @@ SERVICE_NAME = "unit-test-runner-py"
 records: list = []
 audit_log: list = []
 domain_stats: dict = {"processed_today": 0}
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
-
-    def _json(self, code, data):
-        if code >= 400:
-            inc_errors()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        add_security_headers(self)
-        self.end_headers()
-        self.wfile.write(json.dumps(data, default=str).encode())
-
-    def respond(self, code, data):
-        self._json(code, data)
-
-    def do_GET(self):
-        _cache_key = f"unit_test_runner_{self.path}"
-        _cached = cache_get(_cache_key)
-        if _cached and self.path not in ("/healthz", "/readyz", "/livez", "/metrics", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-Cache", "HIT")
-            add_security_headers(self)
-            self.end_headers()
-            self.wfile.write(_cached.encode() if isinstance(_cached, str) else _cached)
-            return
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[unit-test-runner-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-
-        if path == "/healthz":
-            db = get_db()
-            self.respond(200, {
-                "status": "healthy",
-                "service": "unit-test-runner-py",
-                "version": "2.0.0",
-                "db": "connected" if db else "not_configured",
-                "uptime_secs": round(time.time() - START_TIME),
-            })
-        elif path == "/readyz":
-            self.respond(200, {"ready": True})
-        elif path == "/livez":
-            self.respond(200, {"alive": True})
-        elif path == "/v1/degradation":
-            self.respond(200, {"service": "unit-test-runner-py", **_degrade.status()})
-        elif path == "/v1/alerts":
-            self.respond(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-        elif path == "/metrics":
-            body = (
-                f'# HELP requests_total Total requests\n'
-                f'# TYPE requests_total counter\n'
-                f'requests_total{{service="unit-test-runner-py"}} {request_count}\n'
-                f'# HELP errors_total Total errors\n'
-                f'# TYPE errors_total counter\n'
-                f'errors_total{{service="unit-test-runner-py"}} {error_count}\n'
-            )
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body.encode())
-        elif path in ("/api/v1/service_configs", "/v1/config"):
-            # Real data from Postgres; loud 503 when unavailable.
-            try:
-                conn = get_db()
-                with conn.cursor() as cur:
-                    cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
-                    rows = cur.fetchall()
-                items = [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
-                self._json(200, {"items": items, "total": len(items), "source": "database"})
-            except Exception as e:
-                logger.error(f"config query failed: {e}")
-                self._json(503, {"error": "config_unavailable"})
-        else:
-            # Never fabricate a response for an unimplemented endpoint.
-            self._json(501, {"error": "not_implemented", "path": path})
-
-    def do_POST(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[unit-test-runner-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(length).decode())) if length > 0 else {}
-
-        # JWT auth check — real signature verification, fail closed
-        claims, err = validate_jwt(dict(self.headers))
-        if err:
-            self.respond(401, {"error": "unauthorized", "detail": err})
-            return
-
-        if path == "/v1/create":
-            # Not backed by real persistence in this handler; fail fast.
-            self.respond(501, {"error": "not_implemented", "path": path})
-        elif path == "/v1/unit-test-runner/update":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid:
-                    if "status" in body:
-                        rec["status"] = body["status"]
-                    rec["data"].update({k: v for k, v in body.items() if k != "id"})
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    audit_log.append({"id": gen_id(), "action": "update", "record_id": rid,
-                                     "actor": body.get("updated_by", "system"), "timestamp": now_iso()})
-                    self.respond(200, {"updated": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found: {rid}"})
-
-        elif path == "/v1/unit-test-runner/process":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid and rec["status"] in ("pending", "active"):
-                    rec["status"] = "completed"
-                    rec["data"]["processed_at"] = now_iso()
-                    rec["data"]["processing_result"] = "success"
-                    rec["data"]["score"] = round(0.85 + random.random() * 0.14, 3)
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    domain_stats["processed_today"] += 1
-                    audit_log.append({"id": gen_id(), "action": "process", "record_id": rid,
-                                     "actor": "system", "timestamp": now_iso()})
-                    self.respond(200, {"processed": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found or not processable: {rid}"})
-        elif path == "/v1/unit-test-runner/process":
-            result = run_test_suite(**body) if isinstance(body, dict) else run_test_suite(body)
-            self.respond(200, {"service": "unit-test-runner-py", "result": result})
-
 
 @app.post("/api/v1/service_configs", status_code=201)
 def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):

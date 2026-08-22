@@ -19,14 +19,26 @@ import time
 import threading
 import signal
 import socket as _socket
-from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("tenant-provisioning-py")
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/tenant_provisioning_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -816,76 +828,6 @@ def db_insert(record_id, body):
         )
     conn.commit()
     return True
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
-
-    def respond(self, code, data):
-        body = json.dumps(data).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        add_security_headers(self)
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        _cache_key = f"tenant_provisioning_{self.path}"
-        _cached = cache_get(_cache_key)
-        if _cached and self.path not in ("/healthz", "/readyz", "/livez", "/metrics", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-Cache", "HIT")
-            add_security_headers(self)
-            self.end_headers()
-            self.wfile.write(_cached.encode() if isinstance(_cached, str) else _cached)
-            return
-        global _request_counter
-        with _counter_lock:
-            _request_counter += 1
-        path = urlparse(self.path).path
-        if path in ("/healthz", "/readyz", "/livez"):
-            self.respond(200, {"status": "healthy", "service": SERVICE_NAME})
-            return
-        if path == "/metrics":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(f'requests_total{{service="{SERVICE_NAME}"}} {_request_counter}\n'.encode())
-            return
-        result = handle_request(path)
-        if "error" in result:
-            self.respond(404, result)
-        else:
-            self.respond(200, result)
-
-    def do_POST(self):
-        global _request_counter
-        with _counter_lock:
-            _request_counter += 1
-        valid, err = validate_jwt(dict(self.headers))
-        if not valid:
-            inc_errors()
-            self.respond(401, {"error": "unauthorized", "detail": err})
-            return
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Retry-After", "1")
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(content_length).decode("utf-8"))) if content_length > 0 else {}
-        path = urlparse(self.path).path
-        db_insert("provisioning_events", {"tenant_id": self.get_tenant_id(), "path": path, "action": "create", "timestamp": time.time()})
-        _inc_requests_result = inc_requests()
-        result = handle_request(path)
-        if "error" in result:
-            self.respond(404, result)
-        else:
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-            self.respond(201, result)
 
 if __name__ == "__main__":
     import uvicorn

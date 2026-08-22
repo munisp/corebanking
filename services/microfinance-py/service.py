@@ -3,10 +3,24 @@ import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", "8182"))
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
 MW = {
     "kafka": {"broker": os.environ.get("KAFKA_BROKER", "localhost:9092"), "topics": ["microfinance.loans", "microfinance.savings", "microfinance.groups"]},
     "redis": {"url": os.environ.get("REDIS_URL", "redis://localhost:6379"), "cache_keys": ["mfi:groups", "mfi:rates", "mfi:collections"]},
-    "postgres": {"url": os.environ.get("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": ["mfi_groups", "mfi_loans", "mfi_savings", "mfi_collections", "mfi_officers"]},
+    "postgres": {"url": _require_env("DATABASE_URL"), "tables": ["mfi_groups", "mfi_loans", "mfi_savings", "mfi_collections", "mfi_officers"]},
     "opensearch": {"url": os.environ.get("OPENSEARCH_URL", "http://localhost:9200"), "indices": ["microfinance-loans", "microfinance-audit"]},
     "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "client": "microfinance"},
     "permify": {"url": os.environ.get("PERMIFY_URL", "http://localhost:3476"), "resources": ["mfi_group", "mfi_loan", "mfi_officer"]},

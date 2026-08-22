@@ -3,10 +3,24 @@ import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", "8179"))
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
 MW = {
     "kafka": {"broker": os.environ.get("KAFKA_BROKER", "localhost:9092"), "topics": ["chatbot.conversations", "chatbot.intents", "chatbot.escalations"]},
     "redis": {"url": os.environ.get("REDIS_URL", "redis://localhost:6379"), "cache_keys": ["chatbot:sessions", "chatbot:faqs", "chatbot:context"]},
-    "postgres": {"url": os.environ.get("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": ["chatbot_conversations", "chatbot_intents", "chatbot_training", "escalation_log"]},
+    "postgres": {"url": _require_env("DATABASE_URL"), "tables": ["chatbot_conversations", "chatbot_intents", "chatbot_training", "escalation_log"]},
     "opensearch": {"url": os.environ.get("OPENSEARCH_URL", "http://localhost:9200"), "indices": ["chatbot-conversations", "chatbot-analytics"]},
     "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "client": "chatbot"},
     "permify": {"url": os.environ.get("PERMIFY_URL", "http://localhost:3476"), "resources": ["chatbot_session"]},

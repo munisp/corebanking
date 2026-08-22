@@ -22,7 +22,6 @@ import re
 import time
 import threading
 import urllib.request
-import http.server
 
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
@@ -34,7 +33,21 @@ SERVICE_NAME = "kgqa-reasoning-engine-py"
 logger = logging.getLogger(SERVICE_NAME)
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/kgqa_reasoning_engine_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -939,137 +952,6 @@ def db_insert(record_id, body):
         )
     conn.commit()
     return True
-
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        trace_id = f"trace-{int(time.time()*1e9)}"
-        logger.info(f"[{SERVICE_NAME}] {self.command} {self.path} trace={trace_id}")
-
-    def respond(self, status, data):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        self.send_header("Content-Security-Policy", "default-src 'self'")
-        self.send_header("X-XSS-Protection", "1; mode=block")
-        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-
-    def do_GET(self):
-        inc_requests()
-        path = self.path.split("?")[0]
-
-        if path == "/healthz":
-            self.respond(200, {
-                "status": "healthy",
-                "service": SERVICE_NAME,
-                "version": "1.0.0",
-                "capabilities": [
-                    "epr_kgqa", "nl_to_cypher", "regulatory_reasoning",
-                    "entity_extraction", "question_classification",
-                    "knowledge_graph_qa", "vector_similarity_search"
-                ],
-                "regulatoryKB": list(REGULATORY_KB.keys()),
-            })
-        elif path == "/readyz":
-            self.respond(200, {"ready": True, "service": SERVICE_NAME})
-        elif path == "/livez":
-            self.respond(200, {"live": True})
-        elif path == "/v1/degradation":
-            self.respond(200, {"service": "kgqa-reasoning-engine-py", **_degrade.status()})
-        elif path == "/v1/alerts":
-            self.respond(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-        elif path == "/metrics":
-            body = f'# TYPE requests_total counter\nrequests_total{{service="{SERVICE_NAME}"}} {request_count}\n# TYPE errors_total counter\nerrors_total{{service="{SERVICE_NAME}"}} {error_count}\n'
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body.encode())
-        else:
-            items, total = [], 0
-            pool = get_db()
-            if pool:
-                try:
-                    conn = pool.getconn()
-                    cur = conn.cursor()
-                    cur.execute("SELECT data FROM records WHERE service = %s ORDER BY created_at DESC LIMIT 20", (SERVICE_NAME,))
-                    items = [row[0] for row in cur.fetchall()]
-                    cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", (SERVICE_NAME,))
-                    total = cur.fetchone()[0]
-                    pool.putconn(conn)
-                except Exception:
-                    pass
-            self.respond(200, {"service": SERVICE_NAME, "items": items, "total": total, "source": "database" if pool else "in-memory"})
-
-    def do_POST(self):
-        inc_requests()
-        path = self.path.split("?")[0]
-        content_length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
-        body = json.loads(sanitize_input(raw.decode("utf-8")))
-
-        if path in ["/healthz", "/readyz", "/livez", "/metrics"]:
-            self.do_GET()
-            return
-
-        if not rl_allow():
-            inc_errors()
-            self.send_response(429)
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(b'{"error":"rate_limit_exceeded"}')
-            return
-
-        if not check_jwt(self.headers):
-            inc_errors()
-            self.respond(401, {"error": "unauthorized"})
-            return
-
-        if path == "/v1/kgqa/ask":
-            question = body.get("question", "")
-            if not question:
-                inc_errors()
-                self.respond(400, {"error": "question is required"})
-                return
-            result = process_question(question)
-            db_insert(SERVICE_NAME, {"tenant_id": self.get_tenant_id(), "action": "kgqa_ask", "question": question, "confidence": result.get("confidence", 0)})
-            cache_set(f"{self.get_tenant_id()}:kgqa_{question[:50]}", json.dumps(result))
-            self.respond(200, result)
-
-        elif path == "/v1/kgqa/extract-entities":
-            text = body.get("text", "")
-            entities = extract_entities(text)
-            self.respond(200, {"entities": entities, "text": text})
-
-        elif path == "/v1/kgqa/classify":
-            question = body.get("question", "")
-            qtype, intent = classify_question(question)
-            self.respond(200, {"questionType": qtype, "intent": intent})
-
-        elif path == "/v1/kgqa/cypher":
-            question = body.get("question", "")
-            entities = extract_entities(question)
-            qtype, intent = classify_question(question)
-            cypher = generate_cypher(question, entities, qtype, intent)
-            self.respond(200, {"cypher": cypher, "entities": entities, "questionType": qtype})
-
-        elif path == "/v1/kgqa/regulatory":
-            topic = body.get("topic", "").upper()
-            if topic in REGULATORY_KB:
-                self.respond(200, {"topic": topic, "regulation": REGULATORY_KB[topic]})
-            else:
-                self.respond(200, {"topic": topic, "available": list(REGULATORY_KB.keys()), "message": "Topic not found"})
-
-        elif path == "/v1/create":
-            result = db_insert(SERVICE_NAME, body)
-            cache_set(f"{self.get_tenant_id()}:last_post", json.dumps(body))
-            self.respond(201, {"created": True, "service": SERVICE_NAME})
-
-        else:
-            self.respond(404, {"error": "not found", "path": path})
-
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 

@@ -8,13 +8,27 @@ import json, os
 import os
 import json
 
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
 def middleware_config():
     return {
         "kafka": {"broker": os.getenv("KAFKA_BROKER", "localhost:9092"), "topics": ["video-kyc-py.events"]},
         "dapr": {"app_id": "video-kyc-py", "url": os.getenv("DAPR_URL", "http://localhost:3500")},
         "fluvio": {"url": os.getenv("FLUVIO_URL", "localhost:9003"), "topics": ["video-kyc-py-stream"]},
         "temporal": {"url": os.getenv("TEMPORAL_URL", "localhost:7233"), "namespace": "video-kyc-py"},
-        "postgres": {"url": os.getenv("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db")},
+        "postgres": {"url": _require_env("DATABASE_URL")},
         "keycloak": {"url": os.getenv("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "client_id": "video-kyc-py"},
         "permify": {"url": os.getenv("PERMIFY_URL", "http://localhost:3476"), "schema": "video-kyc-py"},
         "redis": {"url": os.getenv("REDIS_URL", "redis://localhost:6379")},

@@ -244,7 +244,21 @@ KYC_SERVICE_URL = os.getenv("KYC_SERVICE_URL", "https://kyc.54link-dev.internal"
 KYB_SERVICE_URL = os.getenv("KYB_SERVICE_URL", "https://kyb.54link-dev.internal")
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "temporal-frontend.54link-dev.svc.cluster.local:7233")
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://app_user:54link-dev-postgres-secret@postgres-primary:5432/app_db?sslmode=require")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 
 # Enums
 class CustomerType(str, Enum):

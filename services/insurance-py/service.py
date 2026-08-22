@@ -3,10 +3,24 @@ import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", "8194"))
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
 MW = {
     "kafka": {"broker": os.environ.get("KAFKA_BROKER", "localhost:9092")},
     "redis": {"url": os.environ.get("REDIS_URL", "redis://localhost:6379")},
-    "postgres": {"url": os.environ.get("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db")},
+    "postgres": {"url": _require_env("DATABASE_URL")},
     "opensearch": {"url": os.environ.get("OPENSEARCH_URL", "http://localhost:9200")},
     "keycloak": {"url": os.environ.get("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev"},
     "permify": {"url": os.environ.get("PERMIFY_URL", "http://localhost:3476")},
