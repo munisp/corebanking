@@ -207,6 +207,20 @@ local function get_cookie(ctx, cookie_name)
     return nil
 end
 
+-- Returns a short, non-reversible fingerprint of a token for log correlation.
+-- Raw bearer tokens must NEVER be written to logs.
+local function token_fingerprint(token)
+    if not token then
+        return "null"
+    end
+    local ok, str = pcall(require, "resty.string")
+    if ok then
+        return str.to_hex(ngx.sha1_bin(token)):sub(1, 8)
+    end
+    -- Fallback: log length only (no token material).
+    return "len=" .. #token
+end
+
 -- Helper function to retrieve token from the request context
 local function get_token(ctx)
     -- Try to get the token from query parameter
@@ -216,8 +230,8 @@ local function get_token(ctx)
     if not token then
         token = get_cookie(ctx, "access_token")
 
-        if token then 
-            core.log.warn("Token from cookie: " .. token)
+        if token then
+            core.log.warn("Token from cookie: sha1:" .. token_fingerprint(token))
         else
             core.log.warn("Token from cookie: null")
         end
@@ -228,7 +242,7 @@ local function get_token(ctx)
         local auth_header = core.request.header(ctx, "Authorization")
         if auth_header and auth_header:match("^Bearer%s+(%S+)$") then
             token = auth_header:match("^Bearer%s+(%S+)$")
-            core.log.warn("Token from Authorization header: " .. token)
+            core.log.warn("Token from Authorization header: sha1:" .. token_fingerprint(token))
         else
             core.log.warn("Token from Authorization header: null")
         end
