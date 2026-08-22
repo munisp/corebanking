@@ -1,17 +1,30 @@
 /**
  * DB-First Middleware — intercepts all /api/platform/* routes and serves data from Postgres.
- * Falls back to in-memory seed data if DB is unavailable or table is empty.
  *
  * Strategy:
  *   1. Map the incoming route path to the corresponding Drizzle table
  *   2. Query Postgres via the generic repository
- *   3. If DB returns data, send it; otherwise pass to next() for seed fallback
+ *   3. If DB returns data, send it
+ *   4. If Postgres is down or the query fails, respond 503 — NEVER serve seed
+ *      data as if it were live. The only exception is explicit non-production
+ *      demo mode (NODE_ENV !== "production" AND BANKING_DEMO_MODE === "true"),
+ *      where requests may fall through to demo seed handlers.
  */
 
 import { getDb } from "../db";
 import { sql, count } from "drizzle-orm";
 import { logger } from "./logger";
 import * as schema from "../../drizzle/schema";
+
+// Seed-data fallback is only allowed in explicit non-production demo mode.
+const DEMO_MODE = process.env.NODE_ENV !== "production" && process.env.BANKING_DEMO_MODE === "true";
+
+function dbUnavailable(res: any) {
+  return res.status(503).json({
+    error: "database_unavailable",
+    message: "Postgres is unavailable; refusing to serve seed data as live data",
+  });
+}
 
 // Build a mapping from URL path segments to schema tables
 // e.g. "/api/platform/escrow/accounts" => schema.escrowAccounts
@@ -111,7 +124,9 @@ export function createDbFirstMiddleware() {
 
     const db = await getDb();
     if (!db) {
-      return next(); // No DB, fall through to seed data
+      if (DEMO_MODE) return next(); // Demo mode only: fall through to demo seed handlers
+      logger.error(`[dbFirst] Postgres unavailable for ${req.path}; failing closed with 503`);
+      return dbUnavailable(res);
     }
 
     // Extract the path after /api/platform/
@@ -136,7 +151,9 @@ export function createDbFirstMiddleware() {
       const total = totalResult[0]?.count ?? 0;
 
       if (total === 0) {
-        return next(); // Empty table, fall through to seed data
+        if (DEMO_MODE) return next(); // Demo mode only: fall through to demo seed handlers
+        // Empty table is REAL data — return it, never substitute seed data.
+        return res.json({ items: [], total: 0, page, limit, totalPages: 0, source: "postgres" });
       }
 
       res.json({
@@ -148,8 +165,9 @@ export function createDbFirstMiddleware() {
         source: "postgres",
       });
     } catch (error) {
-      logger.warn(`[dbFirst] Query failed for ${subPath}, falling back to seed`, { error: String(error) });
-      return next(); // Query error, fall through
+      logger.error(`[dbFirst] Query failed for ${subPath}; failing closed with 503`, { error: String(error) });
+      if (DEMO_MODE) return next(); // Demo mode only: fall through to demo seed handlers
+      return dbUnavailable(res);
     }
   };
 }
