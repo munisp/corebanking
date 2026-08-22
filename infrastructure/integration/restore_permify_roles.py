@@ -32,11 +32,11 @@ import urllib.request
 import urllib.error
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DB_URI = (
-    "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv"
-    "@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com"
-    ":25060/link_core_banking"
-)
+# Database credentials are never stored in the repository; supply the
+# connection string via the DB_URI environment variable (fail-closed).
+DB_URI = os.environ.get("DB_URI", "")
+if not DB_URI:
+    sys.exit("DB_URI environment variable must be set (e.g. postgresql://user:pass@host:25060/link_core_banking)")
 PERMIFY_URL = "http://localhost:3476"
 WRITE_ATTEMPTS = 3  # Postgres-backed Permify only needs 1, but retry for safety
 
