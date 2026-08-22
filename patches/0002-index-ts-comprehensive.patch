@@ -453,7 +453,6 @@ index b414a21b..f142067a 100644
  
 -  app.post("/api/platform/billing/approval-matrices", async (req, res) => {
 +  app.post("/api/platform/billing/approval-matrices", asyncHandler(async (req, res) => {
-     await ensureBillingEngineSeed();
      const role = readRole(req);
      const actorId = readActorId(req, role);
      const tenantId = String(req.body?.tenantId || "54bank-platform-prod");
