@@ -838,6 +838,11 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 		if sub, ok := claims["sub"].(string); ok {
 			r.Header.Set("X-User-Id", sub)
 		}
+		if tenant := tenantFromClaims(claims); tenant != "" {
+			r.Header.Set("X-Tenant-ID", tenant)
+		} else {
+			r.Header.Del("X-Tenant-ID")
+		}
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -930,6 +935,17 @@ func initSchema() {
 			log.Fatalf("schema init failed: %v", err)
 		}
 	}
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func main() {

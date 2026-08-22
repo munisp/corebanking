@@ -453,6 +453,8 @@ type jwksCache struct {
 
 var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
 
+var jwksRefreshOnce sync.Once
+
 func jwtRealmURL() string {
 	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
 		return v
@@ -1255,6 +1257,47 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process.
+func ensureJWKSRefresh() {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(jwtRealmURL())
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(jwtRealmURL())
+			}
+		}()
+	})
+}
+
+// isProbePath reports whether p is a health/metrics endpoint that must remain
+// unauthenticated for orchestrators (exact or suffixed probe paths).
+func isProbePath(p string) bool {
+	switch p {
+	case "/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics", "/ping":
+		return true
+	}
+	for _, s := range []string{"/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics"} {
+		if strings.HasSuffix(p, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 func main() {
 	initDB()
 	port := os.Getenv("PORT")
@@ -1308,21 +1351,120 @@ func dbInsert(id, service, typ, status string, data []byte) error {
 	return err
 }
 
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + required exp claim). Fail-closed: any verification
+// problem yields 401. Identity headers (X-User-Id, X-Keycloak-ID, X-Tenant-ID,
+// X-User-Role) are overwritten from verified claims — caller-supplied values
+// are never trusted.
 func jwtAuthMiddleware(next http.Handler) http.Handler {
+	ensureJWKSRefresh()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
+		if isProbePath(p) {
 			next.ServeHTTP(w, r)
 			return
 		}
 		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			// Unknown key — refresh once and retry (key rotation).
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+		claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			http.Error(w, `{"error":"invalid claims encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		var claims map[string]interface{}
+		if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+			http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
+			return
+		}
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		// Identity headers come ONLY from verified claims; overwrite or drop any
+		// caller-supplied values before invoking the handler.
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			r.Header.Set("X-User-Id", sub)
+			r.Header.Set("X-Keycloak-ID", sub)
+		} else {
+			r.Header.Del("X-User-Id")
+			r.Header.Del("X-Keycloak-ID")
+		}
+		if tenant := tenantFromClaims(claims); tenant != "" {
+			r.Header.Set("X-Tenant-ID", tenant)
+		} else {
+			r.Header.Del("X-Tenant-ID")
+		}
+		r.Header.Del("X-User-Role")
+		if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
+			if roleList, ok := ra["roles"].([]interface{}); ok {
+				roles := make([]string, 0, len(roleList))
+				for _, v := range roleList {
+					if s, ok := v.(string); ok {
+						roles = append(roles, s)
+					}
+				}
+				if len(roles) > 0 {
+					r.Header.Set("X-User-Role", strings.Join(roles, ","))
+				}
+			}
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 

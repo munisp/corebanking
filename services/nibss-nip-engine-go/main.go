@@ -705,11 +705,11 @@ func main() {
 	// Money-path endpoints require a verified RS256 Bearer token (fail-closed).
 	http.Handle("/v1/nip/name-enquiry", jwtAuthMiddleware(http.HandlerFunc(handleNameEnquiry)))
 	http.Handle("/v1/nip/funds-transfer", jwtAuthMiddleware(http.HandlerFunc(handleFundsTransfer)))
-	http.HandleFunc("/v1/nip/tsq", handleTSQ)
-	http.HandleFunc("/v1/nip/transactions", handleTransactions)
-	http.HandleFunc("/v1/nip/mandates", handleMandates)
-	http.HandleFunc("/v1/nip/settlements", handleSettlements)
-	http.HandleFunc("/v1/nip/response-codes", handleResponseCodes)
+	http.Handle("/v1/nip/tsq", jwtAuthMiddleware(http.HandlerFunc(handleTSQ)))
+	http.Handle("/v1/nip/transactions", jwtAuthMiddleware(http.HandlerFunc(handleTransactions)))
+	http.Handle("/v1/nip/mandates", jwtAuthMiddleware(http.HandlerFunc(handleMandates)))
+	http.Handle("/v1/nip/settlements", jwtAuthMiddleware(http.HandlerFunc(handleSettlements)))
+	http.Handle("/v1/nip/response-codes", jwtAuthMiddleware(http.HandlerFunc(handleResponseCodes)))
 
 	if nibss.baseURL == "" {
 		log.Printf("WARNING: NIBSS_BASE_URL not set — name-enquiry and funds-transfer will return 503 (responseCode 96)")

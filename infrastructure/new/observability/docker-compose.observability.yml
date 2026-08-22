@@ -78,7 +78,9 @@ services:
     image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
     container_name: 54bank-postgres-exporter
     environment:
-      DATA_SOURCE_NAME: postgresql://postgres:postgres@postgres:5432/corebanking?sslmode=disable
+      # R4-V5: no credential-bearing default. Required env ref — docker compose
+      # fails at parse/up time when POSTGRES_EXPORTER_DSN is unset.
+      DATA_SOURCE_NAME: ${POSTGRES_EXPORTER_DSN:?POSTGRES_EXPORTER_DSN is required (no default credentials shipped)}
     ports:
       - '9187:9187'
     restart: unless-stopped

@@ -10,7 +10,9 @@ services:
     environment:
       ENVIRONMENT: development
       DEBUG: "true"
-      DATABASE_URI: postgresql://banking:banking@postgres:5432/banking54
+      # R4-V5: no credential-bearing default (even in this dev compose).
+      # Required env ref — compose fails closed when DATABASE_URI is unset.
+      DATABASE_URI: ${DATABASE_URI:?DATABASE_URI is required (no default credentials shipped)}
       KAFKA_BROKERS: kafka:9092
       KEYCLOAK_URL: http://keycloak:8080
       PERMIFY_HOST: permify
