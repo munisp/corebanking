@@ -1,7 +1,7 @@
 from fastapi import APIRouter , HTTPException, responses, Header
 from utils import create_logger
 from schemas import GenerateQRSchema, ValidateQRSchema, Context
-from services import QRService
+from services import QRService, QRSigningKeyUnavailable
 
 qr_router = APIRouter()
 
@@ -35,6 +35,10 @@ def generate_qr_code(
             }, status_code=200)
     except HTTPException as e:
         raise e
+    except QRSigningKeyUnavailable as e:
+        # Fail closed: without the signing key the service is unavailable.
+        logger.error(f"QR signing key unavailable: {str(e)}")
+        raise HTTPException(status_code=503, detail="QR signing is not available on this service.")
     except Exception as e:
         logger.error(f"Unexpected error during QR code generation: {str(e)}")
         raise HTTPException(status_code=500, detail="QR code generation failed.")

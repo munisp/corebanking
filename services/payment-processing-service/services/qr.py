@@ -1,10 +1,39 @@
-import datetime, json, base64
+import datetime, json, base64, os
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from cryptography.hazmat.primitives import serialization
 from schemas import GenerateQRSchema, ValidateQRSchema, Context
 from utils import generate_qr_base64, create_logger
 
 logger = create_logger(__name__)
+
+# The Ed25519 QR signing private key must be provided at runtime (e.g. via a
+# mounted secret). It is NEVER stored in the repository.
+QR_SIGNING_KEY_PATH = os.getenv("QR_SIGNING_KEY_PATH", "/run/secrets/qr_private.key")
+
+
+class QRSigningKeyUnavailable(RuntimeError):
+    """Raised when the QR signing private key cannot be loaded.
+
+    Signing routes must fail closed (HTTP 503) when this is raised; a
+    payment-QR signing service without its key is not operational.
+    """
+
+
+def _load_signing_key() -> ed25519.Ed25519PrivateKey:
+    try:
+        with open(QR_SIGNING_KEY_PATH, "rb") as f:
+            key_data = f.read()
+    except OSError as exc:
+        logger.error(f"QR signing key not available at configured path: {exc}")
+        raise QRSigningKeyUnavailable("QR signing key is not configured on this service") from exc
+    try:
+        private_key = serialization.load_pem_private_key(key_data, password=None)
+    except (ValueError, TypeError) as exc:
+        logger.error(f"QR signing key could not be parsed: {exc}")
+        raise QRSigningKeyUnavailable("QR signing key is invalid") from exc
+    if not isinstance(private_key, ed25519.Ed25519PrivateKey):
+        raise QRSigningKeyUnavailable("QR signing key is not an Ed25519 private key")
+    return private_key
 
 class QRService:
     def generate_qr_code(self, payload: GenerateQRSchema, context: Context) -> str:
@@ -67,14 +96,10 @@ class QRService:
             return False
     
     def sign_qr_payload(self, payload: dict) -> str:
-        with open("qr_private.key", "rb") as f:
-            private_key = serialization.load_pem_private_key(f.read(), password=None)
+        private_key = _load_signing_key()
 
-            if not isinstance(private_key, ed25519.Ed25519PrivateKey):
-                raise TypeError("Loaded private key is not of type Ed25519PrivateKey")
+        message = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
 
-            message = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+        signature = private_key.sign(message)
 
-            signature = private_key.sign(message)
-
-            return base64.b64encode(signature).decode("utf-8")
+        return base64.b64encode(signature).decode("utf-8")

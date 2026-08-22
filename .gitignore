@@ -60,3 +60,5 @@ target/
 
 # env
 .venv/
+# Payment QR signing private key (runtime secret, never commit)
+**/qr_private.key
