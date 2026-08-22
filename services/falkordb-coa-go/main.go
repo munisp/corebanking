@@ -345,7 +345,7 @@ func (c *FalkorDBClient) GraphQuery(graphName, cypher string) ([]map[string]inte
 	}
 	buf := make([]byte, 8192)
 	n, _ := c.conn.Read(buf)
-	return []map[string]interface{{"raw": string(buf[:n])}}, nil
+	return []map[string]interface{}{{"raw": string(buf[:n])}}, nil
 }
 
 var falkorClient = NewFalkorDBClient()
