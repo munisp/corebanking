@@ -201,6 +201,31 @@ func TestStats(t *testing.T) {
 	}
 }
 
+// TestTimeoutNotTruncated guards against the uint32-nanosecond overflow that
+// shrank a 60s pending timeout to ~4.2s (60e9 ns mod 2^32 ≈ 4.165e9 ns).
+func TestTimeoutNotTruncated(t *testing.T) {
+	mgr, poster := newTestManager(60 * time.Second)
+	pt, err := mgr.CreatePending(NewID(1), NewID(2), 50000, 1, 1001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pt.Transfer.Timeout != 60*time.Second {
+		t.Errorf("transfer timeout = %v, want 60s (uint32-ns truncation regression)", pt.Transfer.Timeout)
+	}
+	// TimeoutAt must be ~60s in the future, not ~4.2s.
+	untilTimeout := time.Until(pt.TimeoutAt)
+	if untilTimeout < 55*time.Second || untilTimeout > 61*time.Second {
+		t.Errorf("TimeoutAt is %v away, want ~60s", untilTimeout)
+	}
+	// The cluster-facing timeout (seconds) must be 60.
+	if len(poster.transfers) != 1 || len(poster.transfers[0]) != 1 {
+		t.Fatalf("expected 1 submitted transfer, got %v", poster.transfers)
+	}
+	if got := poster.transfers[0][0].Timeout; got != 60 {
+		t.Errorf("cluster timeout = %d seconds, want 60", got)
+	}
+}
+
 func TestNotFoundErrors(t *testing.T) {
 	mgr, _ := newTestManager(5 * time.Second)
 	err := mgr.PostPending(NewID(999))

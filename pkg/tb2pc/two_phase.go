@@ -22,6 +22,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +56,7 @@ type Transfer struct {
 	Ledger          uint32        `json:"ledger"`
 	Code            uint16        `json:"code"`
 	Flags           TransferFlags `json:"flags"`
-	Timeout         uint32        `json:"timeout_ns,omitempty"` // pending transfer timeout
+	Timeout         time.Duration `json:"timeout_ns,omitempty"` // pending transfer timeout (nanoseconds; int64 — no uint32 truncation)
 	Timestamp       int64         `json:"timestamp"`
 	UserData128     uint128       `json:"user_data_128,omitempty"`
 }
@@ -131,7 +132,7 @@ type TwoPhaseCommitManager struct {
 	posted     int64
 	voided     int64
 	expired    int64
-	timeoutNs  uint32 // default timeout in nanoseconds
+	timeout    time.Duration // default pending timeout (int64 nanoseconds — uint32 truncation of e.g. 60s to ~4.2s was a confirmed incident)
 }
 
 // NewTwoPhaseCommitManager creates a manager connected to the cluster
@@ -140,8 +141,8 @@ type TwoPhaseCommitManager struct {
 // ErrTigerBeetleUnavailable.
 func NewTwoPhaseCommitManager(defaultTimeout time.Duration) *TwoPhaseCommitManager {
 	mgr := &TwoPhaseCommitManager{
-		pending:   make(map[uint128]*PendingTransfer),
-		timeoutNs: uint32(defaultTimeout.Nanoseconds()),
+		pending: make(map[uint128]*PendingTransfer),
+		timeout: defaultTimeout,
 	}
 	client, err := tbclient.NewClient(tbclient.Config{})
 	if err != nil {
@@ -158,8 +159,8 @@ func NewTwoPhaseCommitManager(defaultTimeout time.Duration) *TwoPhaseCommitManag
 // connected tbclient.Client. A nil client yields fail-fast behavior.
 func NewTwoPhaseCommitManagerWithClient(defaultTimeout time.Duration, client *tbclient.Client) *TwoPhaseCommitManager {
 	mgr := &TwoPhaseCommitManager{
-		pending:   make(map[uint128]*PendingTransfer),
-		timeoutNs: uint32(defaultTimeout.Nanoseconds()),
+		pending: make(map[uint128]*PendingTransfer),
+		timeout: defaultTimeout,
 	}
 	if client == nil {
 		mgr.clusterErr = fmt.Errorf("nil tbclient")
@@ -173,9 +174,9 @@ func NewTwoPhaseCommitManagerWithClient(defaultTimeout time.Duration, client *tb
 // newManagerWithPoster wires a custom transfer poster (used by tests).
 func newManagerWithPoster(defaultTimeout time.Duration, poster transferPoster) *TwoPhaseCommitManager {
 	mgr := &TwoPhaseCommitManager{
-		pending:   make(map[uint128]*PendingTransfer),
-		timeoutNs: uint32(defaultTimeout.Nanoseconds()),
-		tb:        poster,
+		pending: make(map[uint128]*PendingTransfer),
+		timeout: defaultTimeout,
+		tb:      poster,
 	}
 	if poster == nil {
 		mgr.clusterErr = fmt.Errorf("nil transfer poster")
@@ -195,11 +196,17 @@ func (m *TwoPhaseCommitManager) unavailableErr() error {
 }
 
 // timeoutSeconds converts the configured timeout to TigerBeetle's
-// seconds-based pending timeout (minimum 1s).
+// seconds-based pending timeout (minimum 1s, capped at uint32 max).
+// The manager stores the timeout as time.Duration (int64 nanoseconds), so
+// values above ~4.29s are no longer truncated by a uint32 nanosecond
+// conversion.
 func (m *TwoPhaseCommitManager) timeoutSeconds() uint32 {
-	secs := uint64(m.timeoutNs) / uint64(time.Second)
-	if secs == 0 {
+	secs := m.timeout / time.Second
+	if secs < 1 {
 		secs = 1
+	}
+	if secs > time.Duration(math.MaxUint32) {
+		secs = time.Duration(math.MaxUint32)
 	}
 	return uint32(secs)
 }
@@ -230,7 +237,7 @@ func (m *TwoPhaseCommitManager) CreatePending(debitAccount, creditAccount uint12
 	}
 
 	now := time.Now()
-	timeout := time.Duration(m.timeoutNs) * time.Nanosecond
+	timeout := m.timeout
 	id := fromTB(tbclient.ID())
 
 	transfer := Transfer{
@@ -241,7 +248,7 @@ func (m *TwoPhaseCommitManager) CreatePending(debitAccount, creditAccount uint12
 		Ledger:          ledger,
 		Code:            code,
 		Flags:           FlagPending,
-		Timeout:         m.timeoutNs,
+		Timeout:         m.timeout,
 		Timestamp:       now.UnixNano(),
 	}
 
@@ -283,7 +290,7 @@ func (m *TwoPhaseCommitManager) CreateLinkedPending(transfers []Transfer) ([]*Pe
 	}
 
 	now := time.Now()
-	timeout := time.Duration(m.timeoutNs) * time.Nanosecond
+	timeout := m.timeout
 
 	// Validate: amounts positive; totals balanced per ledger is the caller's
 	// responsibility (TigerBeetle enforces account-level invariants).
@@ -298,7 +305,7 @@ func (m *TwoPhaseCommitManager) CreateLinkedPending(transfers []Transfer) ([]*Pe
 		id := fromTB(tbclient.ID())
 		transfers[i].ID = id
 		transfers[i].Flags = FlagPending | FlagLinked
-		transfers[i].Timeout = m.timeoutNs
+		transfers[i].Timeout = m.timeout
 		transfers[i].Timestamp = now.UnixNano()
 
 		tbTransfers = append(tbTransfers, tbclient.Transfer{
