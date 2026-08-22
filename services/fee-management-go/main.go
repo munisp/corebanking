@@ -190,7 +190,20 @@ func pathID(path, prefix string) string {
 
 func handleRules(store Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "*")
 		w.Header().Set("Access-Control-Allow-Headers", "*")
 		if r.Method == http.MethodOptions {

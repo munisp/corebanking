@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"strings"
 
 	// "encoding/json"
 	"fmt"
@@ -2168,7 +2169,20 @@ func calculateLTV(c *gin.Context) {
 // Middleware functions
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := c.Request.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+				c.Writer.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-Request-ID")
 

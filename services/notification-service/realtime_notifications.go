@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -421,7 +423,20 @@ func SSEHandler(hub *WebSocketHub) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {
