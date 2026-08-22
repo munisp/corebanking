@@ -1,5 +1,7 @@
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import json, os, uuid, time
+import json, os, time
+import os
+import json
 
 PORT = int(os.environ.get("PORT", 8338))
 

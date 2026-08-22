@@ -7,15 +7,23 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import time
+import threading
+import signal
+import random
+import string
+import socket as _socket
+import urllib.request
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("ussd-multilingual-py")
@@ -31,10 +39,14 @@ PORT = int(os.getenv("PORT", "8707"))
 
 db_conn = None
 
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -167,25 +179,22 @@ def release_db(conn):
             pass
 
 def init_schema():
-    conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+    """Create the tables this service actually uses. Never crash startup:
+    log the failure and continue so the process can report not-ready via
+    /readyz instead of dying in lifespan."""
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"init_schema: database unavailable: {e}")
+        return
     try:
         cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "ussd-multilingual-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
-
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -194,13 +203,14 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_channel_sessions_tenant ON channel_sessions(tenant_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_channel_sessions_status ON channel_sessions(status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_channel_sessions_created ON channel_sessions(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
-    conn.commit()
-    logger.info("Schema initialized")
+        conn.commit()
+        logger.info("Schema initialized")
+    except Exception as e:
+        logger.error(f"init_schema failed: {e}")
 
 
 @asynccontextmanager
@@ -269,29 +279,26 @@ def metrics():
 
 
 @app.get("/api/v1/channel_sessions")
-def list_records(x_tenant_id: Optional[str] = Header(None)):
+def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
-        return [], 0
+        return {"items": [], "total": 0, "page": page, "limit": limit}
     try:
         cur = conn.cursor()
         offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("ussd-multilingual-py", limit, offset))
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (limit, offset))
         rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("ussd-multilingual-py",))
+        items = [
+            {"id": str(row[0]), "status": row[1], "tenant_id": str(row[2]) if row[2] else None, "created_at": str(row[3])}
+            for row in rows
+        ]
+        cur.execute("SELECT COUNT(*) FROM service_configs")
         total = cur.fetchone()[0]
-        return items, total
+        return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
     except Exception as e:
         logger.error(f"DB query failed: {e}")
-        return [], 0
-
+        raise HTTPException(status_code=503, detail="config_unavailable")
 # --- JWT Auth ---
 def validate_jwt(headers):
     """Validate Bearer JWT with real HS256 signature verification (stdlib).
@@ -555,15 +562,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
 
-    def respond(self, code, data):
+    def _json(self, code, data):
         if code >= 400:
             inc_errors()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
         add_security_headers(self)
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
+
+    def respond(self, code, data):
+        self._json(code, data)
 
     def do_GET(self):
         _cache_key = f"ussd_multilingual_{self.path}"
@@ -602,10 +611,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/livez":
             self.respond(200, {"alive": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "ussd-multilingual-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "ussd-multilingual-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             body = (
                 f'# HELP requests_total Total requests\n'
                 f'# TYPE requests_total counter\n'
@@ -614,9 +623,25 @@ class Handler(BaseHTTPRequestHandler):
                 f'# TYPE errors_total counter\n'
                 f'errors_total{{service=\"ussd-multilingual-py\"}} {error_count}\n'
             )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(body.encode())
+        elif path in ("/api/v1/channel_sessions", "/v1/config"):
+            # Real data from Postgres; loud 503 when unavailable.
+            try:
+                conn = get_db()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, status, created_at FROM channel_sessions ORDER BY created_at DESC LIMIT 50")
+                    rows = cur.fetchall()
+                items = [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
+                self._json(200, {"items": items, "total": len(items), "source": "database"})
+            except Exception as e:
+                logger.error(f"config query failed: {e}")
+                self._json(503, {"error": "config_unavailable"})
         else:
-            cur.execute("SELECT id, status, created_at FROM channel_sessions ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
+            # Never fabricate a response for an unimplemented endpoint.
+            self._json(501, {"error": "not_implemented", "path": path})
 
     def do_POST(self):
         trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
@@ -637,49 +662,17 @@ class Handler(BaseHTTPRequestHandler):
         claims, err = validate_jwt(dict(self.headers))
         if err:
             self.respond(401, {"error": "unauthorized", "detail": err})
-            # Inter-service call
-            try:
-                _upstream = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-                call_service("POST", f"{_upstream}/v1/screen", {"service": SERVICE_NAME, "action": "notify"})
-            except Exception as _e:
-                log_event("WARN", f"inter-service call failed: {_e}")
             return
 
         if path == "/v1/create":
-            result = db_insert("ussd_multilingual_py", body)
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-            self.respond(201, {"created": True, "data": result})
+            # Not backed by real persistence in this handler; fail fast.
+            self.respond(501, {"error": "not_implemented", "path": path})
         elif path == "/v1/ussd-multilingual/update":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid:
-                    if "status" in body:
-                        rec["status"] = body["status"]
-                    rec["data"].update({k: v for k, v in body.items() if k != "id"})
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    audit_log.append({"id": gen_id(), "action": "update", "record_id": rid,
-                                     "actor": body.get("updated_by", "system"), "timestamp": now_iso()})
-                    self.respond(200, {"updated": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found: {rid}"})
-
+            # Not backed by real persistence in this handler; fail fast.
+            self.respond(501, {"error": "not_implemented", "path": path})
         elif path == "/v1/ussd-multilingual/process":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid and rec["status"] in ("pending", "active"):
-                    rec["status"] = "completed"
-                    rec["data"]["processed_at"] = now_iso()
-                    rec["data"]["processing_result"] = "success"
-                    rec["data"]["score"] = round(0.85 + random.random() * 0.14, 3)
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    domain_stats["processed_today"] += 1
-                    audit_log.append({"id": gen_id(), "action": "process", "record_id": rid,
-                                     "actor": "system", "timestamp": now_iso()})
-                    self.respond(200, {"processed": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found or not processable: {rid}"})
+            # Not backed by real persistence in this handler; fail fast.
+            self.respond(501, {"error": "not_implemented", "path": path})
         elif path == "/v1/ussd-multilingual/process":
             result = process_ussd_input(**body) if isinstance(body, dict) else process_ussd_input(body)
             self.respond(200, {"service": "ussd-multilingual-py", "result": result})

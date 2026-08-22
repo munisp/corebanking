@@ -1,21 +1,19 @@
 """CBN Service"""
 
 import json
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from datetime import datetime, timedelta
-from enum import Enum
-import uvicorn, asyncpg, os, random, hashlib
+from datetime import datetime
+import uvicorn, asyncpg, os
 from dotenv import load_dotenv
 from middlewares import RequiredHeadersMiddleware
 from typing import List, Dict, Any
-from pydantic import BaseModel
 from datetime import date
 import calendar
-from fastapi import Depends
 from utils.kafka_instance import KafkaClientInstance
 from utils.kafka_client import CBNEventTypes
+import os
 
 load_dotenv()
 

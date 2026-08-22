@@ -106,7 +106,7 @@ app.include_router(
 
 
 @app.post("/business/kyb/complete")
-async def complete_kyb(request: Request, db: Session = Depends(get_session)):
+def complete_kyb(request: Request, db: Session = Depends(get_session)):
     """Internal: called by orchestrator after KYB verification passes."""
     tenant_id  = request.headers.get("x-tenant-id")
     keycloak_id = request.headers.get("x-keycloak-id")

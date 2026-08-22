@@ -1,13 +1,10 @@
 """Reporting and Analytics Service"""
 from fastapi import FastAPI, Header, Depends
 from audit_middleware import AuditMiddleware
-from pydantic import BaseModel
-from typing import Optional
-from datetime import datetime
-from decimal import Decimal
 import uvicorn, asyncpg, os
 from dotenv import load_dotenv
 from utils.coa_client import CoAClient
+import os
 
 load_dotenv()
 

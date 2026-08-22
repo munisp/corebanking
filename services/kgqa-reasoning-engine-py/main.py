@@ -10,15 +10,19 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import re
+import time
+import threading
+import urllib.request
+import http.server
 
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
@@ -28,6 +32,14 @@ TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54link-dev/certs/ca.crt")
 PORT = int(os.environ.get("PORT", "8080"))
 SERVICE_NAME = "kgqa-reasoning-engine-py"
 logger = logging.getLogger(SERVICE_NAME)
+
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/kgqa_reasoning_engine_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 
 db_conn = None
@@ -704,6 +716,34 @@ class _DegradationState:
             }
 
 _degrade = _DegradationState()
+
+
+def db_query():
+    """Read real config rows from Postgres. Raises on failure (fail fast)."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1],
+             "tenant_id": str(r[2]) if len(r) > 2 and r[2] else None,
+             "created_at": str(r[3] if len(r) > 3 else r[-1])} for r in rows]
+
+
+def db_insert(record_id, body):
+    """Persist a record to Postgres with an outbox event. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO service_configs (id, status) VALUES (%s::uuid, %s) ON CONFLICT (id) DO NOTHING",
+            (record_id, (body or {}).get("status", "active") if isinstance(body, dict) else "active"),
+        )
+        payload = json.dumps({"id": str(record_id), "data": body}, default=str)
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("record.created", str(record_id), payload),
+        )
+    conn.commit()
+    return True
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):

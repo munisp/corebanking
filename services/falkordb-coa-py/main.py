@@ -7,18 +7,18 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
-from contextlib import asynccontextmanager
 
-import psycopg2
-import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from fastapi import HTTPException
+from http.server import ThreadingHTTPServer
+import time
+import threading
+import socket as _socket
+import urllib.request
+from http.server import BaseHTTPRequestHandler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("falkordb-coa-py")
+SERVICE_NAME = "falkordb-coa-py"
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/falkordb_coa_py")
@@ -302,6 +302,24 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
+
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
+def _rl_allow():
+    global _rl_tokens
+    now = time.time()
+    with _rl_lock:
+        if now - _rl_last_refill[0] >= 1.0:
+            _rl_tokens = 100
+            _rl_last_refill[0] = now
+        if _rl_tokens <= 0:
+            return False
+        _rl_tokens -= 1
+        return True
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
     def respond(self, code, data):
@@ -335,10 +353,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/readyz": self.respond(200, {"ready": True, "service": SERVICE_NAME})
         elif path == "/livez": self.respond(200, {"live": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "falkordb-coa-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self.respond(200, {"service": "falkordb-coa-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self.respond(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write(f'requests_total{{service="{SERVICE_NAME}"}} {request_count}\nerrors_total{{service="{SERVICE_NAME}"}} {error_count}\n'.encode())
         elif path == "/v1/graph/funding-flows":
@@ -381,5 +399,11 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(201, {"created": True})
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting"}))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

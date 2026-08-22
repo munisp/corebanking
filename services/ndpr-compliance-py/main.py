@@ -6,6 +6,9 @@ import os, json, logging
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 from datetime import datetime
+import logging
+import os
+import json
 
 logging.basicConfig(level=logging.INFO, format='[ndpr-compliance-py] %(levelname)s %(message)s')
 PORT = int(os.environ.get("PORT", "9440"))

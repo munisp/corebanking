@@ -9,16 +9,20 @@ import uuid
 import random
 import string
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-from datetime import datetime, timezone
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import time
+import threading
+import signal
+import logging
+import socket as _socket
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("backup-manager-py")
@@ -34,10 +38,14 @@ PORT = int(os.getenv("PORT", "8639"))
 
 db_conn = None
 
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -170,25 +178,22 @@ def release_db(conn):
             pass
 
 def init_schema():
-    conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+    """Create the tables this service actually uses. Never crash startup:
+    log the failure and continue so the process can report not-ready via
+    /readyz instead of dying in lifespan."""
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"init_schema: database unavailable: {e}")
+        return
     try:
         cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "backup-manager-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
-
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -197,13 +202,14 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
-    conn.commit()
-    logger.info("Schema initialized")
+        conn.commit()
+        logger.info("Schema initialized")
+    except Exception as e:
+        logger.error(f"init_schema failed: {e}")
 
 
 @asynccontextmanager
@@ -272,29 +278,26 @@ def metrics():
 
 
 @app.get("/api/v1/service_configs")
-def list_records(x_tenant_id: Optional[str] = Header(None)):
+def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
-        return [], 0
+        return {"items": [], "total": 0, "page": page, "limit": limit}
     try:
         cur = conn.cursor()
         offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("backup-manager-py", limit, offset))
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (limit, offset))
         rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("backup-manager-py",))
+        items = [
+            {"id": str(row[0]), "status": row[1], "tenant_id": str(row[2]) if row[2] else None, "created_at": str(row[3])}
+            for row in rows
+        ]
+        cur.execute("SELECT COUNT(*) FROM service_configs")
         total = cur.fetchone()[0]
-        return items, total
+        return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
     except Exception as e:
         logger.error(f"DB query failed: {e}")
-        return [], 0
-
+        raise HTTPException(status_code=503, detail="config_unavailable")
 # --- JWT Auth ---
 def validate_jwt(headers):
     """Validate Bearer JWT with real HS256 signature verification (stdlib).
@@ -539,15 +542,17 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
 
-    def respond(self, code, data):
+    def _json(self, code, data):
         if code >= 400:
             inc_errors()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
         add_security_headers(self)
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
+
+    def respond(self, code, data):
+        self._json(code, data)
 
     def do_GET(self):
         _cache_key = f"backup_manager_{self.path}"
@@ -598,15 +603,25 @@ class Handler(BaseHTTPRequestHandler):
                 f'# TYPE errors_total counter\n'
                 f'errors_total{{service="backup-manager-py"}} {error_count}\n'
             )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(body.encode())
+        elif path in ("/api/v1/service_configs", "/v1/config"):
+            # Real data from Postgres; loud 503 when unavailable.
+            try:
+                conn = get_db()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+                    rows = cur.fetchall()
+                items = [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
+                self._json(200, {"items": items, "total": len(items), "source": "database"})
+            except Exception as e:
+                logger.error(f"config query failed: {e}")
+                self._json(503, {"error": "config_unavailable"})
         else:
-            cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
-
-    records = [
-        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
-        for r in rows
-    ]
-    return {"data": records, "count": len(records)}
+            # Never fabricate a response for an unimplemented endpoint.
+            self._json(501, {"error": "not_implemented", "path": path})
 
 
 @app.post("/api/v1/service_configs", status_code=201)
@@ -671,82 +686,6 @@ def delete_record(record_id: str):
             ("service_configs.deleted", record_id, payload)
         )
     conn.commit()
-
-    def do_POST(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[backup-manager-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(length).decode() if isinstance(self.rfile.read(length), bytes) else str(self.rfile.read(length)))) if length > 0 else {}
-
-        # JWT auth check — real signature verification, fail closed
-        claims, err = validate_jwt(dict(self.headers))
-        if err:
-            self.respond(401, {"error": "unauthorized", "detail": err})
-            # Inter-service call
-            try:
-                _upstream = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-                call_service("POST", f"{_upstream}/v1/screen", {"service": "backup-manager-py", "action": "notify"})
-            except Exception as _e:
-                logger.warning(f"inter-service call failed: {_e}")
-            return
-
-        if path == "/v1/create":
-            result = db_insert("backup_manager_py", body)
-            cache_set("backup_manager:last_post", str(body))
-            self.respond(201, {"created": True, "data": result})
-        elif path == "/v1/backup-manager/update":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid:
-                    if "status" in body:
-                        rec["status"] = body["status"]
-                    rec["data"].update({k: v for k, v in body.items() if k != "id"})
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    audit_log.append({"id": gen_id(), "action": "update", "record_id": rid,
-                                     "actor": body.get("updated_by", "system"), "timestamp": now_iso()})
-                    self.respond(200, {"updated": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found: {rid}"})
-
-        elif path == "/v1/backup-manager/process":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid and rec["status"] in ("pending", "active"):
-                    rec["status"] = "completed"
-                    rec["data"]["processed_at"] = now_iso()
-                    rec["data"]["processing_result"] = "success"
-                    rec["data"]["score"] = round(0.85 + random.random() * 0.14, 3)
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    domain_stats["processed_today"] += 1
-                    audit_log.append({"id": gen_id(), "action": "process", "record_id": rid,
-                                     "actor": "system", "timestamp": now_iso()})
-                    self.respond(200, {"processed": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found or not processable: {rid}"})
-        elif path == "/v1/backup-manager/validate-config":
-            result = validate_config(body.get("config", body))
-            self.respond(200, result)
-        elif path == "/v1/backup-manager/resource-usage":
-            result = compute_resource_usage(body.get("metrics", body))
-            self.respond(200, result)
-
-
-
-        else:
-            self.respond(404, {"error": "Not found"})
-
-
 
 # --- Graceful Shutdown ---
 server = None

@@ -3,9 +3,11 @@
 Continuous authentication via keystroke dynamics, touch pressure, swipe patterns.
 Persists all profiles to PostgreSQL.
 """
-import os, json, time, hashlib, math, statistics
+import os, json, statistics
 from datetime import datetime, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+import json
 
 SERVICE_NAME = "behavioral-biometrics-py"
 PORT = int(os.environ.get("PORT", "9047"))

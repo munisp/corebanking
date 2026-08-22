@@ -7,10 +7,11 @@ Middleware: Kafka, Redis, TigerBeetle, Temporal, Postgres, OpenSearch, Lakehouse
 """
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from datetime import datetime, date, timedelta
-from typing import Optional, List
-import uvicorn, os, math, uuid
+from typing import List
+import uvicorn, os, uuid
+import os
 
 app = FastAPI(title="54link-dev Treasury & Liquidity", version="1.0.0")
 

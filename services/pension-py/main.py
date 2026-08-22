@@ -8,10 +8,14 @@ inter-service wiring, connection pooling, input sanitization.
 
 import os
 import json
-import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
@@ -22,6 +26,7 @@ PORT = int(os.environ.get("PORT", 9526))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("pension-py")
+SERVICE_NAME = "pension-py"
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/pension_py")
@@ -252,6 +257,13 @@ def respond(handler, code, body):
 import socket as _grpc_socket
 import struct as _grpc_struct
 import threading as _grpc_threading
+import time
+import threading
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
+import sys
+import html
+from urllib.parse import parse_qs
 
 class GrpcServicer:
     """gRPC handler for inter-service calls."""
@@ -435,6 +447,84 @@ class _DegradationState:
             }
 
 _degrade = _DegradationState()
+
+
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
+def _rl_allow():
+    global _rl_tokens
+    now = time.time()
+    with _rl_lock:
+        if now - _rl_last_refill[0] >= 1.0:
+            _rl_tokens = 100
+            _rl_last_refill[0] = now
+        if _rl_tokens <= 0:
+            return False
+        _rl_tokens -= 1
+        return True
+
+
+# --- Metrics ---
+request_count = 0
+error_count = 0
+metrics_lock = threading.Lock()
+
+def inc_requests():
+    global request_count
+    with metrics_lock:
+        request_count += 1
+
+def inc_errors():
+    global error_count
+    with metrics_lock:
+        error_count += 1
+
+
+MAX_INPUT_SIZE = 10240
+
+def sanitize(val):
+    if isinstance(val, str):
+        return html.escape(val)[:4096]
+    if isinstance(val, dict):
+        return {sanitize(k): sanitize(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [sanitize(v) for v in val]
+    return val
+
+_start_time = time.time()
+
+_trace_header = "X-Trace-Id"
+
+
+def db_query():
+    """Read real config rows from Postgres. Raises on failure (fail fast)."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1],
+             "tenant_id": str(r[2]) if len(r) > 2 and r[2] else None,
+             "created_at": str(r[3] if len(r) > 3 else r[-1])} for r in rows]
+
+
+def db_insert(record_id, body):
+    """Persist a record to Postgres with an outbox event. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO service_configs (id, status) VALUES (%s::uuid, %s) ON CONFLICT (id) DO NOTHING",
+            (record_id, (body or {}).get("status", "active") if isinstance(body, dict) else "active"),
+        )
+        payload = json.dumps({"id": str(record_id), "data": body}, default=str)
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("record.created", str(record_id), payload),
+        )
+    conn.commit()
+    return True
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):

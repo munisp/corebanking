@@ -7,12 +7,11 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -20,8 +19,6 @@ from typing import Optional, Dict, Any
 import time
 import threading
 import signal
-import random
-import string
 import socket as _socket
 import urllib.request
 from http.server import BaseHTTPRequestHandler
@@ -351,7 +348,8 @@ def validate_jwt(headers):
 
 # --- Domain Logic ---
 def gen_id():
-    return "SAG-" + "".join(random.choices(string.hexdigits[:16].upper(), k=8))
+    # CSPRNG-backed saga record ID (no predictable PRNG for security-relevant IDs).
+    return "SAG-" + uuid.uuid4().hex[:8].upper()
 
 
 def now_iso():

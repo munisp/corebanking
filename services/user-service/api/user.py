@@ -136,13 +136,15 @@ def get_metrics(
     }
 
 @user_router.post("/kyc/save")
-async def save_kyc_state(
+def save_kyc_state(
     db: Session = Depends(get_session),
-    payload: dict = {},
+    payload: dict = None,
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
 ):
     """Complete user KYC"""
+    if payload is None:
+        payload = {}
 
     context = Context(
         tenant_id=tenant_id,
@@ -179,7 +181,7 @@ async def save_kyc_state(
     }
 
 @user_router.post("/kyc/complete")
-async def complete_kyc(
+def complete_kyc(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
@@ -224,13 +226,15 @@ async def complete_kyc(
     }
 
 @user_router.post("/tier/assign")
-async def assign_tier(
+def assign_tier(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
-    payload: dict = {},
+    payload: dict = None,
 ):
     """Assign KYC tier to user"""
+    if payload is None:
+        payload = {}
 
     context = Context(
         tenant_id=tenant_id,
@@ -261,7 +265,7 @@ async def assign_tier(
     }
 
 @user_router.post("/kyc/fail")
-async def fail_kyc(
+def fail_kyc(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
@@ -336,7 +340,7 @@ def get_user(
     }   
 
 @user_router.put("/{id}")
-async def update_user(
+def update_user(
     id: str, 
     payload: UserSchema, 
     db: Session = Depends(get_session),
@@ -384,7 +388,7 @@ async def update_user(
     }
 
 @user_router.put("/{id}/activate")
-async def activate_user(
+def activate_user(
     id: str,
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -429,7 +433,7 @@ async def activate_user(
     }
 
 @user_router.put("/{id}/suspend")
-async def suspend_user(
+def suspend_user(
     id: str,
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -473,7 +477,7 @@ async def suspend_user(
         "user": user
     }
 @user_router.post("/kyc/liveness-check")
-async def liveness_check(
+def liveness_check(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),

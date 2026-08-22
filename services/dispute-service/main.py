@@ -3,7 +3,6 @@
 from fastapi import FastAPI, HTTPException, Depends, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional
 from datetime import datetime
 from enum import Enum
 from decimal import Decimal
@@ -15,6 +14,7 @@ from dotenv import load_dotenv
 from middlewares import RequiredHeadersMiddleware, AuditMiddleware
 from adapters import TransactionLedgerAdapter
 from schemas import Context
+import os
 
 load_dotenv()
 

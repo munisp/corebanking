@@ -5,6 +5,8 @@ Middleware: Kafka, Dapr, Fluvio, Temporal, Postgres, Keycloak, Permify,
 """
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json, os
+import os
+import json
 
 def middleware_config():
     return {

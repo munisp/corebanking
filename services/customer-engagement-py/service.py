@@ -6,10 +6,11 @@ Middleware: Kafka, Redis, OpenSearch, Postgres, Temporal
 """
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from datetime import datetime, date
+from pydantic import BaseModel
+from datetime import datetime
 from typing import Optional, List
 import uvicorn, os, uuid, random
+import os
 
 app = FastAPI(title="54link-dev Customer Engagement", version="1.0.0")
 

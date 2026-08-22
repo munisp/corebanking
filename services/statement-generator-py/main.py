@@ -22,14 +22,13 @@ import logging
 import threading
 import signal
 import socket as _socket
-from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
-from datetime import datetime, timezone
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -45,7 +44,7 @@ REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
 OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 TRANSACTION_LEDGER_URL = os.getenv("TRANSACTION_LEDGER_URL", "")
-PORT = int(os.getenv("PORT", "8937"))
+PORT = int(os.environ.get("PORT", "9638"))
 
 db_conn = None
 
@@ -151,7 +150,6 @@ MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
 TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54link-dev/certs/service.crt")
 TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54link-dev/certs/service.key")
 TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54link-dev/certs/ca.crt")
-PORT = int(os.environ.get("PORT", "9638"))
 START_TIME = time.time()
 
 # --- Metrics ---
@@ -502,8 +500,6 @@ def grpc_call(target, method, payload, retries=3):
             _grpc_cb.record_failure()
         except Exception as e:
             _grpc_cb.record_failure()
-            if attempt < retries - 1:
-                time.sleep((2 ** attempt) * 0.2)
             logger.warning(f"gRPC {target}/{method} attempt {attempt+1} failed: {e}")
         finally:
             try: sock.close()
@@ -525,8 +521,6 @@ def call_service(method, url, body=None, retries=3, timeout=15):
             return json.loads(resp.read())
         except Exception as e:
             _grpc_cb.record_failure()
-            if attempt < retries - 1:
-                time.sleep((2 ** attempt) * 0.2)
             logger.warning(f"HTTP {method} {url} attempt {attempt+1} failed: {e}")
     return None
 
@@ -835,7 +829,7 @@ signal.signal(signal.SIGINT, shutdown_handler)
 
 if __name__ == "__main__":
     get_db()
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     logger.info(json.dumps({"service": "statement-generator-py", "port": PORT, "message": "starting"}))
     try:
         server.serve_forever()

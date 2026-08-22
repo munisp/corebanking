@@ -7,18 +7,30 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import time
+import threading
+import signal
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("credit-scoring-py")
+
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/credit_scoring_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 
 # --- Redis Caching Layer ---
 import socket as _socket
@@ -100,25 +112,22 @@ def release_db(conn):
             pass
 
 def init_schema():
-    conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+    """Create the tables this service actually uses. Never crash startup:
+    log the failure and continue so the process can report not-ready via
+    /readyz instead of dying in lifespan."""
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"init_schema: database unavailable: {e}")
+        return
     try:
         cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "credit-scoring-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
-
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -127,13 +136,20 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_loans_tenant ON loans(tenant_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_loans_status ON loans(status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_loans_created ON loans(created_at DESC)")
+        cur.execute("""CREATE TABLE IF NOT EXISTS loans (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
-    conn.commit()
-    logger.info("Schema initialized")
+        conn.commit()
+        logger.info("Schema initialized")
+    except Exception as e:
+        logger.error(f"init_schema failed: {e}")
 
 
 @asynccontextmanager
@@ -202,29 +218,41 @@ def metrics():
 
 
 @app.get("/api/v1/loans")
-def list_records(x_tenant_id: Optional[str] = Header(None)):
-    conn = get_db()
+def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
+    # Validate inputs: fail fast with 400 on invalid parameters.
+    if page < 1:
+        raise HTTPException(status_code=400, detail="page must be >= 1")
+    if limit < 1 or limit > 100:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 100")
+    if x_tenant_id is not None:
+        try:
+            uuid.UUID(x_tenant_id)
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(status_code=400, detail="invalid x_tenant_id: must be a UUID")
+    # Never return a silent empty list when the data source is down: fail with 503.
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"loans list: database unavailable: {e}")
+        raise HTTPException(status_code=503, detail="loans_unavailable")
     if not conn:
-        return [], 0
+        raise HTTPException(status_code=503, detail="loans_unavailable")
     try:
         cur = conn.cursor()
         offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("credit-scoring-py", limit, offset))
+        cur.execute("SELECT id, status, tenant_id, created_at FROM loans ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (limit, offset))
         rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("credit-scoring-py",))
+        items = [
+            {"id": str(row[0]), "status": row[1], "tenant_id": str(row[2]) if row[2] else None, "created_at": str(row[3])}
+            for row in rows
+        ]
+        cur.execute("SELECT COUNT(*) FROM loans")
         total = cur.fetchone()[0]
-        return items, total
+        return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
     except Exception as e:
         logger.error(f"DB query failed: {e}")
-        return [], 0
-
+        raise HTTPException(status_code=503, detail="loans_unavailable")
 # --- JWT Auth ---
 def validate_jwt(headers):
     """Validate Bearer JWT with real HS256 signature verification (stdlib).
@@ -310,8 +338,7 @@ _rl_last_refill = [0.0]
 
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -539,15 +566,17 @@ class Handler(BaseHTTPRequestHandler):
     def get_tenant_id(self):
         return self.headers.get("X-Tenant-Id", "platform")
 
-    def respond(self, code, data):
+    def _json(self, code, data):
         if code >= 400:
             inc_errors()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
         add_security_headers(self)
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
+
+    def respond(self, code, data):
+        self._json(code, data)
 
     def do_GET(self):
         _cache_key = f"credit_scoring_{self.path}"
@@ -598,9 +627,25 @@ class Handler(BaseHTTPRequestHandler):
                 f'# TYPE errors_total counter\n'
                 f'errors_total{{service="credit-scoring-py"}} {error_count}\n'
             )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(body.encode())
+        elif path in ("/api/v1/loans", "/v1/config"):
+            # Real data from Postgres; loud 503 when unavailable.
+            try:
+                conn = get_db()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, status, created_at FROM loans ORDER BY created_at DESC LIMIT 50")
+                    rows = cur.fetchall()
+                items = [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
+                self._json(200, {"items": items, "total": len(items), "source": "database"})
+            except Exception as e:
+                logger.error(f"config query failed: {e}")
+                self._json(503, {"error": "config_unavailable"})
         else:
-            cur.execute("SELECT id, status, created_at FROM loans ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
+            # Never fabricate a response for an unimplemented endpoint.
+            self._json(501, {"error": "not_implemented", "path": path})
 
     def do_POST(self):
         trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
@@ -624,12 +669,8 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(401, {"error": "unauthorized", "detail": err})
             return
 
-        if path == "/v1/create":
-            result = db_insert("credit_scoring_py", body)
-            cache_set(f"{self.get_tenant_id()}:credit_scoring_last_post", str(body))
-            self.respond(201, {"created": True, "data": result})
-        else:
-            self.respond(404, {"error": "not_found", "path": path})
+        # No POST endpoints are backed by real persistence in this handler.
+        self.respond(501, {"error": "not_implemented", "path": path})
 
 # --- Graceful Shutdown ---
 server = None

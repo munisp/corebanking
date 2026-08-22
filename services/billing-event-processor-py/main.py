@@ -1,3 +1,25 @@
+import time
+import threading
+import uuid
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
+import psycopg2
+import psycopg2.extras
+from contextlib import asynccontextmanager
+import socket as _grpc_socket
+import struct as _grpc_struct
+import sys
+import html
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
+import os
+import json
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
+logger = logging.getLogger("billing-event-processor-py")
 #!/usr/bin/env python3
 """
 billing-event-processor-py — 54link-dev Microservice
@@ -560,6 +582,107 @@ class _DegradationState:
             }
 
 _degrade = _DegradationState()
+
+
+# --- JWT Auth ---
+def validate_jwt(headers):
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    Canonical implementation: services/shared/auth/jwt_validation.py.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = auth[7:]
+    import hmac, hashlib, base64, json as _json, time as _t
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if _t.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
+
+
+# --- Metrics ---
+request_count = 0
+error_count = 0
+metrics_lock = threading.Lock()
+
+def inc_requests():
+    global request_count
+    with metrics_lock:
+        request_count += 1
+
+def inc_errors():
+    global error_count
+    with metrics_lock:
+        error_count += 1
+
+
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/billing_event_processor_py")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
+
+
+def db_query():
+    """Read real config rows from Postgres. Raises on failure (fail fast)."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1],
+             "tenant_id": str(r[2]) if len(r) > 2 and r[2] else None,
+             "created_at": str(r[3] if len(r) > 3 else r[-1])} for r in rows]
+
+
+def db_insert(record_id, body):
+    """Persist a record to Postgres with an outbox event. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO service_configs (id, status) VALUES (%s::uuid, %s) ON CONFLICT (id) DO NOTHING",
+            (record_id, (body or {}).get("status", "active") if isinstance(body, dict) else "active"),
+        )
+        payload = json.dumps({"id": str(record_id), "data": body}, default=str)
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("record.created", str(record_id), payload),
+        )
+    conn.commit()
+    return True
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):

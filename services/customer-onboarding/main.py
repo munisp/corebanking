@@ -8,7 +8,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from typing import Optional, Literal
 from datetime import datetime
-import httpx
 import asyncio
 from enum import Enum
 import logging
@@ -150,10 +149,9 @@ class OnboardingResponse(BaseModel):
     next_steps: list[str]
 
 # Database Models (SQLAlchemy)
-from sqlalchemy import create_engine, Column, String, DateTime, Enum as SQLEnum, JSON, Float, Integer, Boolean
+from sqlalchemy import create_engine, Column, String, DateTime, Enum as SQLEnum, JSON, Float
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
 
 Base = declarative_base()
 
@@ -302,6 +300,12 @@ async def get_temporal_client():
 
 # API Endpoints
 
+async def _db_run(fn, *args, **kwargs):
+    """Run a blocking sync SQLAlchemy call off the event loop (M-31)."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+
+
 @app.post("/api/v1/onboarding/individual", response_model=OnboardingResponse)
 async def onboard_individual_customer(
     request: IndividualCustomerRequest,
@@ -350,8 +354,8 @@ async def onboard_individual_customer(
         },
     )
     
-    db.add(customer)
-    db.commit()
+    await _db_run(db.add, customer)
+    await _db_run(db.commit)
     
     # Trigger KYC workflow via Temporal
     try:
@@ -380,7 +384,7 @@ async def onboard_individual_customer(
         customer.workflow_id = workflow_id
         customer.workflow_channel = "temporal"
         customer.verification_status = VerificationStatus.IN_PROGRESS
-        db.commit()
+        await _db_run(db.commit)
         
     except Exception as e:
         logger.warning("Failed to start KYC workflow for %s: %s", customer_id, e)
@@ -388,7 +392,7 @@ async def onboard_individual_customer(
         customer.workflow_id = workflow_id
         customer.workflow_channel = "manual_review"
         customer.verification_status = VerificationStatus.MANUAL_REVIEW
-        db.commit()
+        await _db_run(db.commit)
     
     # Publish onboarding event
     publish_event("customer.onboarded", {
@@ -484,8 +488,8 @@ async def onboard_corporate_customer(
         },
     )
     
-    db.add(customer)
-    db.commit()
+    await _db_run(db.add, customer)
+    await _db_run(db.commit)
     
     # Trigger KYB workflow via Temporal
     try:
@@ -513,7 +517,7 @@ async def onboard_corporate_customer(
         customer.workflow_id = workflow_id
         customer.workflow_channel = "temporal"
         customer.verification_status = VerificationStatus.IN_PROGRESS
-        db.commit()
+        await _db_run(db.commit)
         
     except Exception as e:
         logger.warning("Failed to start KYB workflow for %s: %s", customer_id, e)
@@ -521,7 +525,7 @@ async def onboard_corporate_customer(
         customer.workflow_id = workflow_id
         customer.workflow_channel = "manual_review"
         customer.verification_status = VerificationStatus.MANUAL_REVIEW
-        db.commit()
+        await _db_run(db.commit)
 
     publish_event("customer.onboarded", {
         "customer_id": customer_id,
@@ -576,7 +580,7 @@ async def get_onboarding_status(
 ):
     """Get customer onboarding status"""
     
-    customer = db.query(Customer).filter(Customer.customer_id == customer_id, Customer.tenant_id == x_tenant_id).first()
+    customer = await _db_run(lambda: db.query(Customer).filter(Customer.customer_id == customer_id, Customer.tenant_id == x_tenant_id).first())
     
     if not customer:
         raise HTTPException(status_code=404, detail="Customer not found")
@@ -641,7 +645,7 @@ async def list_onboarding_customers(
             (Customer.last_name.ilike(like)) |
             (Customer.company_name.ilike(like))
         )
-    rows = query.order_by(Customer.created_at.desc()).limit(limit).all()
+    rows = await _db_run(lambda: query.order_by(Customer.created_at.desc()).limit(limit).all())
     return {
         "tenant_id": x_tenant_id,
         "customers": [
@@ -663,7 +667,7 @@ async def list_onboarding_customers(
 
 @app.get("/ready")
 async def readiness_check(db = Depends(get_db)):
-    db.query(Customer).count()
+    await _db_run(lambda: db.query(Customer).count())
     return {
         "status": "ready",
         "service": "customer-onboarding",

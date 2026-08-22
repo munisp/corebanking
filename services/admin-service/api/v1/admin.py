@@ -224,13 +224,15 @@ def unsuspend_admin(
 
 
 @admin_router.post("/kyc/save")
-async def save_kyc_state(
+def save_kyc_state(
     db: Session = Depends(get_session),
-    payload: dict = Body(default={}),
+    payload: dict = Body(default=None),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
 ):
     """Save admin KYC state"""
+    if payload is None:
+        payload = {}
 
     context = Context(tenant_id=tenant_id)
 
@@ -266,7 +268,7 @@ async def save_kyc_state(
 
 
 @admin_router.post("/kyc/complete")
-async def complete_kyc(
+def complete_kyc(
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),

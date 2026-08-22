@@ -3,9 +3,11 @@
 ML-based intraday cash position prediction.
 Persists observations to PostgreSQL.
 """
-import os, json, math, time, hashlib
+import os, json, math
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+import json
 
 SERVICE_NAME = "liquidity-forecast-py"
 PORT = int(os.environ.get("PORT", "9050"))

@@ -7,18 +7,18 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
-from contextlib import asynccontextmanager
 
-import psycopg2
-import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from http.server import ThreadingHTTPServer
+import time
+import threading
+import socket as _socket
+import urllib.request
+from http.server import BaseHTTPRequestHandler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("agent-regulatory-returns-py")
+SERVICE_NAME = "agent-regulatory-returns-py"
+AGENT_TOOLS = ["neo4j_graph", "falkordb", "qdrant_search", "gl_engine", "core_banking", "kyc", "aml_engine", "kgqa", "langchain"]
 
 # Configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/agent_regulatory_returns_py")
@@ -27,7 +27,7 @@ KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
 OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
-PORT = int(os.getenv("PORT", "8044"))
+PORT = int(os.getenv("PORT", "8080"))
 
 import threading as _rl_threading
 _rl_tokens = 100
@@ -101,7 +101,6 @@ MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
 TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54link-dev/certs/service.crt")
 TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54link-dev/certs/service.key")
 TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54link-dev/certs/ca.crt")
-PORT = int(os.environ.get("PORT", "8080"))
 
 
 # --- gRPC Server (binary protocol, length-prefixed, with circuit breaker + retry) ---
@@ -410,9 +409,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/readyz": self.respond(200, {"ready": True, "service": SERVICE_NAME})
         elif path == "/livez": self.respond(200, {"live": True})
         elif path == "/v1/degradation":
-            self._json(200, {"service": "agent-regulatory-returns-py", **_degrade.status()})
+            self.respond(200, {"service": "agent-regulatory-returns-py", **_degrade.status()})
         elif path == "/v1/alerts":
-            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+            self.respond(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
         elif path == "/metrics":
             self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers()
             self.wfile.write(f'requests_total{{service="{SERVICE_NAME}"}} {request_count}\nerrors_total{{service="{SERVICE_NAME}"}} {error_count}\n'.encode())
@@ -534,5 +533,11 @@ class Handler(BaseHTTPRequestHandler):
             self.respond(404, {"error": "not_found"})
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting"}))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

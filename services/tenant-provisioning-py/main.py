@@ -7,15 +7,20 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import time
+import threading
+import signal
+import socket as _socket
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("tenant-provisioning-py")
@@ -31,10 +36,14 @@ PORT = int(os.getenv("PORT", "8031"))
 
 db_conn = None
 
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -167,25 +176,22 @@ def release_db(conn):
             pass
 
 def init_schema():
-    conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+    """Create the tables this service actually uses. Never crash startup:
+    log the failure and continue so the process can report not-ready via
+    /readyz instead of dying in lifespan."""
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"init_schema: database unavailable: {e}")
+        return
     try:
         cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "tenant-provisioning-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
-
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -194,13 +200,14 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
-    conn.commit()
-    logger.info("Schema initialized")
+        conn.commit()
+        logger.info("Schema initialized")
+    except Exception as e:
+        logger.error(f"init_schema failed: {e}")
 
 
 @asynccontextmanager
@@ -351,6 +358,26 @@ def delete_record(record_id: str):
         )
     conn.commit()
 
+
+# --- Domain constants: provisioning workflow definitions ---
+PROVISIONING_STEPS = [
+    {"step": 1, "name": "tenant_identity", "description": "Create tenant org record and admin principal"},
+    {"step": 2, "name": "schema_provisioning", "description": "Provision database schema and RLS policies"},
+    {"step": 3, "name": "ledger_setup", "description": "Create chart of accounts and ledger accounts"},
+    {"step": 4, "name": "compliance_profile", "description": "Attach KYC/AML and regulatory reporting profile"},
+    {"step": 5, "name": "feature_activation", "description": "Enable tier-entitled product features"},
+]
+GROWTH_FEATURE_SETUP = [
+    {"feature": "chatbot", "min_tier": "starter"},
+    {"feature": "smart_savings", "min_tier": "starter"},
+    {"feature": "virtual_cards", "min_tier": "commercial"},
+    {"feature": "qr_payments", "min_tier": "commercial"},
+    {"feature": "bnpl", "min_tier": "enterprise"},
+    {"feature": "investments", "min_tier": "enterprise"},
+    {"feature": "remittances", "min_tier": "enterprise"},
+    {"feature": "gamification", "min_tier": "enterprise"},
+]
+
 # --- Domain Logic ---
 def middleware_status():
     return {
@@ -371,6 +398,15 @@ def middleware_status():
     }
 
 
+def _state_query(table):
+    """Read tenant-onboarding state rows from Postgres. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT id, status, created_at FROM {table} ORDER BY created_at DESC LIMIT 100")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
+
+
 def handle_request(path: str) -> dict:
     if path == "/healthz":
         return {
@@ -385,11 +421,26 @@ def handle_request(path: str) -> dict:
     elif path == "/v1/provisioning/growth-feature-setup":
         return {"features": GROWTH_FEATURE_SETUP, "total": len(GROWTH_FEATURE_SETUP), "middleware": middleware_status()}
     elif path == "/v1/provisioning/history":
-        return {"items": ONBOARDING_HISTORY, "total": len(ONBOARDING_HISTORY), "middleware": middleware_status()}
+        try:
+            items = _state_query("onboarding_history")
+        except Exception as e:
+            logger.error(f"onboarding_history query failed: {e}")
+            raise HTTPException(status_code=503, detail="state_unavailable")
+        return {"items": items, "total": len(items), "middleware": middleware_status()}
     elif path == "/v1/provisioning/pending":
-        return {"items": PENDING_ONBOARDINGS, "total": len(PENDING_ONBOARDINGS), "middleware": middleware_status()}
+        try:
+            items = _state_query("pending_onboardings")
+        except Exception as e:
+            logger.error(f"pending_onboardings query failed: {e}")
+            raise HTTPException(status_code=503, detail="state_unavailable")
+        return {"items": items, "total": len(items), "middleware": middleware_status()}
     elif path == "/v1/provisioning/tier-changes":
-        return {"items": TIER_CHANGES, "total": len(TIER_CHANGES), "middleware": middleware_status()}
+        try:
+            items = _state_query("tier_changes")
+        except Exception as e:
+            logger.error(f"tier_changes query failed: {e}")
+            raise HTTPException(status_code=503, detail="state_unavailable")
+        return {"items": items, "total": len(items), "middleware": middleware_status()}
     elif path == "/v1/provisioning/cost-calculator":
         return {
             "calculator": {
@@ -631,6 +682,82 @@ class _DegradationState:
             }
 
 _degrade = _DegradationState()
+
+
+# --- JWT Auth ---
+def validate_jwt(headers):
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    Canonical implementation: services/shared/auth/jwt_validation.py.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = auth[7:]
+    import hmac, hashlib, base64, json as _json, time as _t
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if _t.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
+
+
+def db_query():
+    """Read real config rows from Postgres. Raises on failure (fail fast)."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1],
+             "tenant_id": str(r[2]) if len(r) > 2 and r[2] else None,
+             "created_at": str(r[3] if len(r) > 3 else r[-1])} for r in rows]
+
+
+def db_insert(record_id, body):
+    """Persist a record to Postgres with an outbox event. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO service_configs (id, status) VALUES (%s::uuid, %s) ON CONFLICT (id) DO NOTHING",
+            (record_id, (body or {}).get("status", "active") if isinstance(body, dict) else "active"),
+        )
+        payload = json.dumps({"id": str(record_id), "data": body}, default=str)
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("record.created", str(record_id), payload),
+        )
+    conn.commit()
+    return True
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):

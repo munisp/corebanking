@@ -12,9 +12,11 @@ class BankingDocumentParser:
         self,
         text: str,
         document_type: DocumentType,
-        structured_data: List[Dict[str, Any]] = []
+        structured_data: List[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """Parse banking document based on type"""
+        if structured_data is None:
+            structured_data = []
         
         if document_type == DocumentType.NATIONAL_ID:
             return self._parse_national_id(text)
