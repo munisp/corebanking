@@ -31,8 +31,13 @@ spec:
               env:
                 - name: CLUSTER_BASE_URL
                   value: "https://54link-dev.upi.dev"
-                - name: PYTHONUNRELEASED
+                - name: PYTHONUNBUFFERED
                   value: "1"
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: 54link-shared-database-svc-secret
+                      key: DATABASE_URL
               resources:
                 requests:
                   cpu: "250m"
