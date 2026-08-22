@@ -39,7 +39,7 @@ export async function sendWebhook(url: string, result: KycWorkflowResult) {
   }
 
   logger.info(`[sendWebhook] → POST ${url}`);
-  logger.info(`[sendWebhook] payload: %j", result);
+  logger.info(`[sendWebhook] payload: %j`, result);
 
   const payload = {
     id: result.id,
