@@ -182,7 +182,18 @@ const CBN_RETURNS: CBNReturn[] = [
 
 // ─── COMPUTATION ENGINE (operates on real GL accounts passed in) ────────────
 
-function generateEFASSFromGL(accounts: GLAccount[]): { forms: EFASSFormLine[]; totals: Record<string, number> } {
+interface EFASSTotals {
+  totalAssets: number;
+  totalLiabilities: number;
+  totalEquity: number;
+  totalIncome: number;
+  totalExpenses: number;
+  netProfit: number;
+  car: number | null;
+  liquidityRatio: number;
+}
+
+function generateEFASSFromGL(accounts: GLAccount[], rwa: number | null): { forms: EFASSFormLine[]; totals: EFASSTotals } {
   const forms: EFASSFormLine[] = EFASS_MAPPINGS.map(mapping => {
     const matchingAccounts = accounts.filter(
       gl => gl.glAccountCode >= mapping.glCodeStart && gl.glAccountCode <= mapping.glCodeEnd
@@ -202,14 +213,14 @@ function generateEFASSFromGL(accounts: GLAccount[]): { forms: EFASSFormLine[]; t
     };
   });
 
-  const totals = {
+  const totals: EFASSTotals = {
     totalAssets: forms.filter(f => f.reportCategory === "assets").reduce((s, f) => s + f.amount, 0),
     totalLiabilities: forms.filter(f => f.reportCategory === "liabilities").reduce((s, f) => s + f.amount, 0),
     totalEquity: forms.filter(f => f.reportCategory === "equity").reduce((s, f) => s + f.amount, 0),
     totalIncome: forms.filter(f => f.reportCategory === "income").reduce((s, f) => s + f.amount, 0),
     totalExpenses: forms.filter(f => f.reportCategory === "expenses").reduce((s, f) => s + f.amount, 0),
     netProfit: 0,
-    car: 0,
+    car: null,
     liquidityRatio: 0,
   };
   totals.netProfit = totals.totalIncome - totals.totalExpenses;
@@ -221,8 +232,11 @@ function generateEFASSFromGL(accounts: GLAccount[]): { forms: EFASSFormLine[]; t
     accounts.filter(g => g.glAccountCode === "3008").reduce((s, g) => s + g.balance, 0) * 0.5,
     tier1 * 0.5
   );
-  const rwa = totals.totalAssets * 0.65;
-  totals.car = rwa > 0 ? ((tier1 + tier2) / rwa) * 100 : 0;
+  // CAR is only computed from REAL risk-weighted assets. If RWA is not computable
+  // from actual risk-weighted exposure data, car stays null → reported as
+  // "unavailable". A fabricated ratio (e.g. a flat fraction of total assets)
+  // must never be produced.
+  totals.car = rwa !== null && rwa > 0 ? ((tier1 + tier2) / rwa) * 100 : null;
 
   const liquidAssets = accounts.filter(g => g.glAccountCode >= "1001" && g.glAccountCode <= "1007")
     .reduce((s, g) => s + g.balance, 0) +
@@ -236,8 +250,31 @@ function generateEFASSFromGL(accounts: GLAccount[]): { forms: EFASSFormLine[]; t
   return { forms, totals };
 }
 
-// ─── REAL HEALTH PROBES ─────────────────────────────────────────────────────
+/**
+ * Computes risk-weighted assets from real risk-weighted exposure records in
+ * Postgres (`risk_weighted_exposures`: exposure_amount × risk_weight). Returns
+ * null when no such data exists — callers must report CAR as "unavailable"
+ * rather than fabricating a ratio.
+ */
+async function computeRiskWeightedAssets(): Promise<number | null> {
+  try {
+    const db = await getDb();
+    if (!db) return null;
+    const result = await db.execute(sql`
+      SELECT COALESCE(SUM(exposure_amount::float8 * risk_weight::float8), 0) AS rwa
+      FROM risk_weighted_exposures
+    `);
+    const rows = ((result as unknown as { rows?: unknown[] }).rows ?? []) as Array<{ rwa?: number }>;
+    const rwa = Number(rows[0]?.rwa ?? 0);
+    return rwa > 0 ? rwa : null;
+  } catch (error) {
+    // Table missing or DB down — RWA is not computable from real data.
+    logger.warn("Risk-weighted assets not computable from DB; CAR will be reported as unavailable", { error: String(error) });
+    return null;
+  }
+}
 
+// ─── REAL HEALTH PROBES ─────────────────────────────────────────────────────
 type ProbeStatus = "connected" | "unavailable";
 
 async function probeHttp(baseUrl: string): Promise<ProbeStatus> {
@@ -277,7 +314,8 @@ export function registerGLPipelineRoutes(app: Express): void {
     const loaded = await loadGLAccounts();
     if (!loaded) return glSourceUnavailable(res);
     const period = (req.query.period as string) || new Date().toISOString().slice(0, 7);
-    const { forms, totals } = generateEFASSFromGL(loaded.accounts);
+    const rwa = await computeRiskWeightedAssets();
+    const { forms, totals } = generateEFASSFromGL(loaded.accounts, rwa);
     res.json({
       reportId: `EFASS-54BANK-${period}`,
       period,
@@ -287,9 +325,10 @@ export function registerGLPipelineRoutes(app: Express): void {
       forms,
       totals,
       cbnCompliance: {
-        carCompliant: totals.car >= 10.0,
+        carCompliant: totals.car !== null ? totals.car >= 10.0 : null,
         liquidityCompliant: totals.liquidityRatio >= 30.0,
-        carValue: `${totals.car.toFixed(2)}%`,
+        carValue: totals.car !== null ? `${totals.car.toFixed(2)}%` : "unavailable",
+        carStatus: totals.car !== null ? "computed" : "unavailable",
         liquidityValue: `${totals.liquidityRatio.toFixed(2)}%`,
       },
     });
