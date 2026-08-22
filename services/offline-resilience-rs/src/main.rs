@@ -49,9 +49,10 @@ async fn sync_offline(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     db_persist(&state, "sync_offline", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("offline-resilience-rs: upstream call ok"),
-        Err(e) => eprintln!("offline-resilience-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("offline-resilience-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("offline-resilience-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("offline-resilience-rs: upstream call join failed: {}", e),
     }
 
     HttpResponse::Ok().json(json!({
@@ -313,6 +314,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {

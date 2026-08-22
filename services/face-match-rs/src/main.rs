@@ -4,7 +4,7 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 use std::time::Instant;
 use std::env;
 use uuid::Uuid;
@@ -117,9 +117,10 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     if let Err(resp) = check_jwt(&req) { return resp; }
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("face-match-rs: upstream call ok"),
-        Err(e) => eprintln!("face-match-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("face-match-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("face-match-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("face-match-rs: upstream call join failed: {}", e),
     }
     db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
@@ -209,11 +210,11 @@ async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppSt
     };
 
     {
-        let mut matches = state.matches.lock().unwrap();
+        let mut matches = state.matches.lock().await;
         matches.push(result.clone());
     }
     {
-        let mut st = state.stats.lock().unwrap();
+        let mut st = state.stats.lock().await;
         st.total_matches += 1;
         if matched { st.successful_matches += 1; } else { st.failed_matches += 1; }
         st.match_rate = st.successful_matches as f64 / st.total_matches as f64;
@@ -234,14 +235,14 @@ async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppSt
 
 async fn get_matches(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let matches = state.matches.lock().unwrap();
+    let matches = state.matches.lock().await;
     db_persist(&state, "get_matches", &json!({"action": "get_matches"})).await;
     HttpResponse::Ok().json(json!({"matches": *matches, "total": matches.len()}))
 }
 
 async fn get_match_by_id(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
     let id = path.into_inner();
-    let matches = state.matches.lock().unwrap();
+    let matches = state.matches.lock().await;
     match matches.iter().find(|m| m.id == id) {
         Some(m) => HttpResponse::Ok().json(m),
         None => HttpResponse::NotFound().json(json!({"error": format!("Match {} not found", id)})),
@@ -250,7 +251,7 @@ async fn get_match_by_id(path: web::Path<String>, state: web::Data<AppState>) ->
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let st = state.stats.lock().unwrap();
+    let st = state.stats.lock().await;
     db_persist(&state, "get_stats", &json!({"action": "get_stats"})).await;
     HttpResponse::Ok().json(&*st)
 }

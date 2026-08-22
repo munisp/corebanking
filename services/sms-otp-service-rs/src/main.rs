@@ -64,43 +64,50 @@ fn generate_otp() -> String {
     format!("{:06}", rand::rngs::OsRng.gen_range(0..1_000_000u32))
 }
 
-/// Minimal synchronous HTTP POST (matches the service's existing call pattern).
-fn http_post_json(url: &str, body: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    if !url.starts_with("http://") {
-        return Err("only http:// provider URLs supported by this transport".to_string());
-    }
-    let url_parsed = url.strip_prefix("http://").unwrap_or(url);
-    let (host_port, path) = url_parsed.split_once('/').unwrap_or((url_parsed, "/"));
-    let host_port = if host_port.contains(':') { host_port.to_string() } else { format!("{}:80", host_port) };
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &host_port.parse().map_err(|e| format!("{}", e))?,
-        Duration::from_secs(5),
-    ).map_err(|e| format!("connection failed: {}", e))?;
-    let host = host_port.split(':').next().unwrap_or("localhost");
-    let req = format!(
-        "POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        path, host, body.len(), body
-    );
-    stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
-    let mut resp = String::new();
-    stream.read_to_string(&mut resp).map_err(|e| format!("{}", e))?;
-    Ok(resp)
+/// Returns true when the deployment is production-like (fail closed: unknown => production).
+fn is_production_env() -> bool {
+    let env_name = std::env::var("APP_ENV")
+        .or_else(|_| std::env::var("ENVIRONMENT"))
+        .unwrap_or_else(|_| "production".to_string())
+        .to_ascii_lowercase();
+    !matches!(env_name.as_str(), "dev" | "development" | "test" | "testing" | "staging" | "local")
 }
 
 /// Dispatch the OTP through the configured SMS provider. Fails closed.
-fn dispatch_sms(phone: &str, message: &str) -> Result<(), String> {
+/// TLS policy: https:// provider URLs are always required in production.
+/// Cleartext http:// is only accepted outside production AND with the explicit
+/// SMS_ALLOW_INSECURE_HTTP=true opt-in. TLS certificate verification is always on.
+async fn dispatch_sms(phone: &str, message: &str) -> Result<(), String> {
     let provider = match std::env::var("SMS_PROVIDER_URL") {
         Ok(u) if !u.is_empty() => u,
         _ => return Err("SMS_PROVIDER_URL is not configured".to_string()),
     };
-    let payload = json!({"to": phone, "message": message}).to_string();
-    let resp = http_post_json(&provider, &payload)?;
-    // Treat explicit HTTP error status lines as failures.
-    if let Some(status_line) = resp.lines().next() {
-        if status_line.contains(" 4") || status_line.contains(" 5") {
-            return Err(format!("provider responded: {}", status_line));
+    if provider.starts_with("http://") {
+        let allow_insecure = std::env::var("SMS_ALLOW_INSECURE_HTTP")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        if is_production_env() || !allow_insecure {
+            return Err(
+                "cleartext http:// SMS provider URL rejected: use https:// (http requires SMS_ALLOW_INSECURE_HTTP=true in a non-production environment)"
+                    .to_string(),
+            );
         }
+    } else if !provider.starts_with("https://") {
+        return Err("SMS_PROVIDER_URL must be an https:// URL".to_string());
+    }
+    let payload = json!({"to": phone, "message": message});
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("http client init failed: {}", e))?;
+    let resp = client
+        .post(&provider)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("provider request failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("provider responded with status {}", resp.status()));
     }
     Ok(())
 }
@@ -175,7 +182,7 @@ async fn send_otp(req: actix_web::HttpRequest, state: web::Data<AppState>, body:
     };
     let message = format!("Your verification code is {}. It expires in 5 minutes.", otp);
     // Dispatch first; only retain the OTP if the provider accepted it.
-    if let Err(e) = dispatch_sms(&body.phone, &message) {
+    if let Err(e) = dispatch_sms(&body.phone, &message).await {
         eprintln!("sms-otp-service-rs: SMS dispatch failed: {}", e);
         return HttpResponse::ServiceUnavailable().json(json!({
             "error": "sms_provider_unavailable",

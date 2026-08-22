@@ -78,9 +78,10 @@ async fn initiate_kyc(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     db_persist(&state, "initiate_kyc", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("KYC_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8122".to_string());
-    match call_service_sync(&format!("{}/v1/verify", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("telegram-kyc-bot-rs: upstream call ok"),
-        Err(e) => eprintln!("telegram-kyc-bot-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/verify", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("telegram-kyc-bot-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("telegram-kyc-bot-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("telegram-kyc-bot-rs: upstream call join failed: {}", e),
     }
 
     HttpResponse::Ok().json(json!({
@@ -585,6 +586,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create kyc_records table");
+}
 
 #[cfg(test)]
 mod tests {

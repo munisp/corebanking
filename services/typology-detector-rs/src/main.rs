@@ -90,9 +90,10 @@ async fn detect_typologies(req: actix_web::HttpRequest, state: web::Data<AppStat
     db_persist(&state, "detect_typologies", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_grpc(&format!("{}/v1/screen", _upstream_url), "POST", "{}") {
-        Ok(_resp) => eprintln!("typology-detector-rs: upstream call ok"),
-        Err(e) => eprintln!("typology-detector-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_grpc(&format!("{}/v1/screen", _upstream_url), "POST", "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("typology-detector-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("typology-detector-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("typology-detector-rs: upstream call join failed: {}", e),
     }
 
     HttpResponse::Ok().json(json!({
@@ -617,6 +618,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create audit_events table");
+}
 
 #[cfg(test)]
 mod tests {

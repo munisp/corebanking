@@ -519,6 +519,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create payments table");
+}
 
 #[cfg(test)]
 mod tests {

@@ -140,9 +140,10 @@ async fn screen_transaction(req: actix_web::HttpRequest, state: web::Data<AppSta
     let result = detect_structuring(amounts, threshold_kobo);
     // Inter-service call: sanctions_check
     let _upstream_url = std::env::var("SANCTIONS_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_grpc(&format!("{}/v1/screen", _upstream_url), "POST", "{}") {
-        Ok(_resp) => eprintln!("aml-engine-rs: sanctions_check ok"),
-        Err(e) => eprintln!("aml-engine-rs: sanctions_check failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_grpc(&format!("{}/v1/screen", _upstream_url), "POST", "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("aml-engine-rs: sanctions_check ok"),
+        Ok(Err(e)) => eprintln!("aml-engine-rs: sanctions_check failed: {}", e),
+        Err(e) => eprintln!("aml-engine-rs: sanctions_check join failed: {}", e),
     }
 
     let _result_data = json!({"endpoint": "screen_transaction"});
@@ -677,6 +678,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create compliance_records table");
+}
 
 #[cfg(test)]
 mod tests {

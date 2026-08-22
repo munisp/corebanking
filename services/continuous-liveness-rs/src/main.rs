@@ -1,7 +1,7 @@
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -160,9 +160,10 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     if let Err(resp) = check_jwt(&req) { return resp; }
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("continuous-liveness-rs: upstream call ok"),
-        Err(e) => eprintln!("continuous-liveness-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("continuous-liveness-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("continuous-liveness-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("continuous-liveness-rs: upstream call join failed: {}", e),
     }
     db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
@@ -194,7 +195,7 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
 
 async fn get_configs(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let configs = state.configs.lock().unwrap();
+    let configs = state.configs.lock().await;
     db_persist(&state, "get_configs", &json!({"action": "get_configs"})).await;
     HttpResponse::Ok().json(json!({"configs": *configs, "total": configs.len()}))
 }
@@ -205,7 +206,7 @@ async fn evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<A
     let trigger = body.get("trigger").and_then(|v| v.as_str()).unwrap_or("high_value_transfer");
     let amount = body.get("transactionAmount").and_then(|v| v.as_u64()).unwrap_or(0);
 
-    let configs = state.configs.lock().unwrap();
+    let configs = state.configs.lock().await;
     let matching_config = configs.iter().find(|c| c.trigger == trigger && c.enabled && amount >= c.threshold);
 
     match matching_config {
@@ -225,7 +226,7 @@ async fn evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<A
                 timestamp: chrono_now(),
             };
 
-            let mut checks = state.checks.lock().unwrap();
+            let mut checks = state.checks.lock().await;
             checks.push(check.clone());
 
     db_persist(&state, "evaluate_step_up", &json!({"action": "evaluate_step_up"})).await;
@@ -250,7 +251,7 @@ async fn evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<A
 async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
     let customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
 
-    let profiles = state.profiles.lock().unwrap();
+    let profiles = state.profiles.lock().await;
     let profile = profiles.iter().find(|p| p.customer_id == customer_id);
     let default_profile = default_profiles().into_iter().next().unwrap();
     let prof = profile.unwrap_or(&default_profile);
@@ -290,7 +291,7 @@ async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data
         timestamp: chrono_now(),
     };
 
-    let mut beh_checks = state.behavioral_checks.lock().unwrap();
+    let mut beh_checks = state.behavioral_checks.lock().await;
     beh_checks.push(check.clone());
 
     db_persist(&state, "analyze_behavioral", &json!({"action": "analyze_behavioral"})).await;
@@ -303,29 +304,29 @@ async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data
 
 async fn get_profiles(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let profiles = state.profiles.lock().unwrap();
+    let profiles = state.profiles.lock().await;
     db_persist(&state, "get_profiles", &json!({"action": "get_profiles"})).await;
     HttpResponse::Ok().json(json!({"profiles": *profiles, "total": profiles.len()}))
 }
 
 async fn get_checks(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let checks = state.checks.lock().unwrap();
+    let checks = state.checks.lock().await;
     db_persist(&state, "get_checks", &json!({"action": "get_checks"})).await;
     HttpResponse::Ok().json(json!({"checks": *checks, "total": checks.len()}))
 }
 
 async fn get_behavioral_checks(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let checks = state.behavioral_checks.lock().unwrap();
+    let checks = state.behavioral_checks.lock().await;
     db_persist(&state, "get_behavioral_checks", &json!({"action": "get_behavioral_checks"})).await;
     HttpResponse::Ok().json(json!({"behavioral_checks": *checks, "total": checks.len()}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let checks = state.checks.lock().unwrap();
-    let beh = state.behavioral_checks.lock().unwrap();
+    let checks = state.checks.lock().await;
+    let beh = state.behavioral_checks.lock().await;
     let total = checks.len() as f64;
     let passed = checks.iter().filter(|c| c.passed).count() as f64;
     let beh_passed = beh.iter().filter(|c| c.passed).count();

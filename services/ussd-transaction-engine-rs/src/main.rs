@@ -85,9 +85,10 @@ async fn process_ussd(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     db_persist(&state, "process_ussd", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("PAYMENTS_HUB_URL").unwrap_or_else(|_| "http://localhost:8126".to_string());
-    match call_service_grpc(&format!("{}/v1/process", _upstream_url), "POST", "{}") {
-        Ok(_resp) => eprintln!("ussd-transaction-engine-rs: upstream call ok"),
-        Err(e) => eprintln!("ussd-transaction-engine-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_grpc(&format!("{}/v1/process", _upstream_url), "POST", "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("ussd-transaction-engine-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("ussd-transaction-engine-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("ussd-transaction-engine-rs: upstream call join failed: {}", e),
     }
 
     HttpResponse::Ok().json(json!({
@@ -611,6 +612,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create transactions table");
+}
 
 #[cfg(test)]
 mod tests {

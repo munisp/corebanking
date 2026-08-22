@@ -10,7 +10,7 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -130,13 +130,14 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
             .json(serde_json::json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap();
-    let watchlist = state.watchlist.lock().unwrap();
+    let screenings = state.screenings.lock().await;
+    let watchlist = state.watchlist.lock().await;
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("sanctions-engine-rs: upstream call ok"),
-        Err(e) => eprintln!("sanctions-engine-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("sanctions-engine-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("sanctions-engine-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("sanctions-engine-rs: upstream call join failed: {}", e),
     }
     db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
@@ -179,7 +180,7 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
     let entity_type = body.entity_type.as_deref().unwrap_or("individual");
     let screening_type = body.screening_type.as_deref().unwrap_or("customer_onboarding");
 
-    let watchlist = state.watchlist.lock().unwrap();
+    let watchlist = state.watchlist.lock().await;
     if watchlist.is_empty() {
         // FAIL CLOSED: no real watchlist -> no safe-negative "clear" verdict.
         return HttpResponse::ServiceUnavailable().json(json!({
@@ -226,7 +227,7 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
         notes: None,
     };
 
-    let mut screenings = state.screenings.lock().unwrap();
+    let mut screenings = state.screenings.lock().await;
     screenings.push(screening.clone());
 
     db_persist(&state, "screen_entity", &json!({"action": "screen_entity"})).await;
@@ -243,7 +244,7 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
 }
 
 async fn record_decision(body: web::Json<DecisionRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let mut screenings = state.screenings.lock().unwrap();
+    let mut screenings = state.screenings.lock().await;
     for s in screenings.iter_mut() {
         if s.id == body.screening_id {
             s.decision = body.decision.clone();
@@ -261,7 +262,7 @@ async fn record_decision(body: web::Json<DecisionRequest>, state: web::Data<AppS
 }
 
 async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let watchlist = state.watchlist.lock().unwrap();
+    let watchlist = state.watchlist.lock().await;
     if watchlist.is_empty() {
         return HttpResponse::ServiceUnavailable().json(json!({
             "error": "watchlist_unavailable",
@@ -287,7 +288,7 @@ async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<Ap
 
 async fn list_screenings(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap();
+    let screenings = state.screenings.lock().await;
     let pending = screenings.iter().filter(|s| s.decision_by.is_none()).count();
     db_persist(&state, "list_screenings", &json!({"action": "list_screenings"})).await;
     HttpResponse::Ok().json(json!({
@@ -299,8 +300,8 @@ async fn list_screenings(req: actix_web::HttpRequest, state: web::Data<AppState>
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap();
-    let watchlist = state.watchlist.lock().unwrap();
+    let screenings = state.screenings.lock().await;
+    let watchlist = state.watchlist.lock().await;
     let total = screenings.len();
     let matches = screenings.iter().filter(|s| s.match_score >= 0.7).count();
     let false_positives = screenings.iter().filter(|s| s.status == "false_positive").count();
@@ -322,7 +323,7 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 
 async fn get_false_positives(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let screenings = state.screenings.lock().unwrap();
+    let screenings = state.screenings.lock().await;
     let fps: Vec<&Screening> = screenings.iter().filter(|s| s.status == "false_positive").collect();
     db_persist(&state, "get_false_positives", &json!({"action": "get_false_positives"})).await;
     HttpResponse::Ok().json(json!({

@@ -9,7 +9,7 @@ fn middleware_config() -> serde_json::Value {
     serde_json::json!({
         "kafka": {"broker": get_env("KAFKA_BROKER", "localhost:9092"), "topics": "liquidity.lcr-computed,liquidity.nsfr-computed,liquidity.limit-breached"},
         "redis": {"url": get_env("REDIS_URL", "redis://localhost:6379"), "purpose": "liquidity-ratio-cache"},
-        "postgres": {"url": get_env("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": "lcr_reports,nsfr_reports,liquidity_buckets"},
+        "postgres": {"url": env::var("DATABASE_URL").expect("DATABASE_URL must be set - refusing to boot with default database credentials"), "tables": "lcr_reports,nsfr_reports,liquidity_buckets"},
         "opensearch": {"url": get_env("OPENSEARCH_URL", "http://localhost:9200"), "index": "liquidity-metrics"},
         "keycloak": {"url": get_env("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "role": "treasury-officer,alco-member,risk-officer"},
         "permify": {"url": get_env("PERMIFY_URL", "http://localhost:3476"), "schema": "liquidity:compute,liquidity:override,liquidity:report"},

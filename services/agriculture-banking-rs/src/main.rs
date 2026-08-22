@@ -70,9 +70,10 @@ async fn assess_farm(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
     let result = crop_cycle_months(crop);
     // Inter-service call: credit_check
     let _upstream_url = std::env::var("CREDIT_BUREAU_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_grpc(&format!("{}/v1/query_bureau", _upstream_url), "POST", "{}") {
-        Ok(_resp) => eprintln!("agriculture-banking-rs: credit_check ok"),
-        Err(e) => eprintln!("agriculture-banking-rs: credit_check failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_grpc(&format!("{}/v1/query_bureau", _upstream_url), "POST", "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("agriculture-banking-rs: credit_check ok"),
+        Ok(Err(e)) => eprintln!("agriculture-banking-rs: credit_check failed: {}", e),
+        Err(e) => eprintln!("agriculture-banking-rs: credit_check join failed: {}", e),
     }
 
     let _result_data = json!({"endpoint": "assess_farm"});
@@ -532,6 +533,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {

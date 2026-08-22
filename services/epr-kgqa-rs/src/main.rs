@@ -191,7 +191,7 @@ async fn ask(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web:
     let input = body.into_inner();
     db_persist(&state, "ask", &input).await;
     let upstream = env::var("GL_ENGINE_URL").unwrap_or_else(|_| "http://gl-engine-rs:8080".into());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!(r#"{"source": "epr-kgqa-rs", "action": "ask"}"#));
+    let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), &format!(r#"{"source": "epr-kgqa-rs", "action": "ask"}"#))).await;
     HttpResponse::Ok().json(json!({"service": "epr-kgqa-rs", "endpoint": "ask", "result": input}))
 }
 

@@ -91,7 +91,7 @@ async fn enaira_cbdc(req: actix_web::HttpRequest, state: web::Data<AppState>) ->
         "middleware": middleware_actions("banking.enaira.cbdc"),
     });
     let upstream = std::env::var("AML_URL").unwrap_or_else(|_| "http://aml-engine-rs:8080".to_string());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), r#"{"source": "ai-fraud-scoring-rs", "action": "enaira_cbdc"}"#);
+    let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), r#"{"source": "ai-fraud-scoring-rs", "action": "enaira_cbdc"}"#)).await;
     db_persist(&state, "enaira_cbdc", &json!({"action": "enaira_cbdc"})).await;
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(result)
 }
@@ -522,9 +522,8 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("[ai-fraud-scoring-rs] starting");
 
-    let db_name = "ai-fraud-scoring-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+    // FAIL FAST (M-21): DATABASE_URL is required; no default/compiled-in database credentials.
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set - refusing to boot with default database credentials");
 
     let pool = PgPoolOptions::new()
         .max_connections(25)
@@ -627,6 +626,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create fraud_alerts table");
+}
 
 #[cfg(test)]
 mod tests {

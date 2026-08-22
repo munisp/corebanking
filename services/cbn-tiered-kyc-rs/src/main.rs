@@ -4,6 +4,7 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
+use tokio::sync::Mutex;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
 
@@ -211,9 +212,10 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     if let Err(resp) = check_jwt(&req) { return resp; }
     // Inter-service call
     let _upstream_url = std::env::var("KYC_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8122".to_string());
-    match call_service_sync(&format!("{}/v1/verify", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("cbn-tiered-kyc-rs: upstream call ok"),
-        Err(e) => eprintln!("cbn-tiered-kyc-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/verify", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("cbn-tiered-kyc-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("cbn-tiered-kyc-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("cbn-tiered-kyc-rs: upstream call join failed: {}", e),
     }
     db_persist(&state, "healthz", &json!({"action": "healthz"})).await;
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
@@ -261,7 +263,7 @@ async fn assess_tier(body: web::Json<serde_json::Value>, state: web::Data<AppSta
     let address = body.get("addressVerified").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let assessment = assess_tier_eligibility(customer_id, &docs, liveness, bvn, nin, address);
-    let mut assessments = state.assessments.lock().unwrap();
+    let mut assessments = state.assessments.lock().await;
     assessments.push(assessment.clone());
 
     db_persist(&state, "assess_tier", &json!({"action": "assess_tier"})).await;
@@ -278,7 +280,7 @@ async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web:
     check.customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
     check.transaction_type = body.get("transactionType").and_then(|v| v.as_str()).unwrap_or("transfer").to_string();
 
-    let mut checks = state.limit_checks.lock().unwrap();
+    let mut checks = state.limit_checks.lock().await;
     checks.push(check.clone());
 
     db_persist(&state, "check_transaction_limit", &json!({"action": "check_transaction_limit"})).await;
@@ -287,15 +289,15 @@ async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web:
 
 async fn get_assessments(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let assessments = state.assessments.lock().unwrap();
+    let assessments = state.assessments.lock().await;
     db_persist(&state, "get_assessments", &json!({"action": "get_assessments"})).await;
     HttpResponse::Ok().json(json!({"assessments": *assessments, "total": assessments.len()}))
 }
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let assessments = state.assessments.lock().unwrap();
-    let checks = state.limit_checks.lock().unwrap();
+    let assessments = state.assessments.lock().await;
+    let checks = state.limit_checks.lock().await;
     let mut tier_counts = std::collections::HashMap::new();
     for a in assessments.iter() {
         *tier_counts.entry(a.eligible_tier.clone()).or_insert(0) += 1;

@@ -89,9 +89,10 @@ async fn evaluate_transaction(req: actix_web::HttpRequest, state: web::Data<AppS
     let result = velocity_score(txn_count_1h, txn_count_24h, avg_1h, avg_24h);
     // Inter-service call: aml_screen
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("fraud-detection-rs: aml_screen ok"),
-        Err(e) => eprintln!("fraud-detection-rs: aml_screen failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("fraud-detection-rs: aml_screen ok"),
+        Ok(Err(e)) => eprintln!("fraud-detection-rs: aml_screen failed: {}", e),
+        Err(e) => eprintln!("fraud-detection-rs: aml_screen join failed: {}", e),
     }
 
     let _result_data = json!({"endpoint": "evaluate_transaction"});
@@ -593,6 +594,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create fraud_alerts table");
+}
 
 #[cfg(test)]
 mod tests {

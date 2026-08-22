@@ -100,9 +100,10 @@ async fn validate_mt103(req: actix_web::HttpRequest, state: web::Data<AppState>,
     if errors.is_empty() {
     // Inter-service call: payment_process
     let _upstream_url = std::env::var("PAYMENTS_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_sync(&format!("{}/v1/process", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("swift-iso20022-rs: payment_process ok"),
-        Err(e) => eprintln!("swift-iso20022-rs: payment_process failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/process", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("swift-iso20022-rs: payment_process ok"),
+        Ok(Err(e)) => eprintln!("swift-iso20022-rs: payment_process failed: {}", e),
+        Err(e) => eprintln!("swift-iso20022-rs: payment_process join failed: {}", e),
     }
 
     let _result_data = json!({"endpoint": "validate_mt103"});
@@ -509,6 +510,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {

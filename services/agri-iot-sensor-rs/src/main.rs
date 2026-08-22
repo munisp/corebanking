@@ -69,9 +69,10 @@ async fn process_sensor(req: actix_web::HttpRequest, state: web::Data<AppState>,
     let result = soil_moisture_status(pct);
     // Inter-service call: register_sensor
     let _upstream_url = std::env::var("AGRI_BANKING_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_grpc(&format!("{}/v1/register", _upstream_url), "POST", "{}") {
-        Ok(_resp) => eprintln!("agri-iot-sensor-rs: register_sensor ok"),
-        Err(e) => eprintln!("agri-iot-sensor-rs: register_sensor failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_grpc(&format!("{}/v1/register", _upstream_url), "POST", "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("agri-iot-sensor-rs: register_sensor ok"),
+        Ok(Err(e)) => eprintln!("agri-iot-sensor-rs: register_sensor failed: {}", e),
+        Err(e) => eprintln!("agri-iot-sensor-rs: register_sensor join failed: {}", e),
     }
 
     let _result_data = json!({"endpoint": "process_sensor"});
@@ -531,6 +532,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {

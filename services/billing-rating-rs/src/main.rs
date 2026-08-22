@@ -90,9 +90,10 @@ async fn rate_transaction(req: actix_web::HttpRequest, state: web::Data<AppState
     let result = compute_fee(amount, fee_type, tier);
     // Inter-service call: charge
     let _upstream_url = std::env::var("CORE_BANKING_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_sync(&format!("{}/v1/charge", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("billing-rating-rs: charge ok"),
-        Err(e) => eprintln!("billing-rating-rs: charge failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/charge", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("billing-rating-rs: charge ok"),
+        Ok(Err(e)) => eprintln!("billing-rating-rs: charge failed: {}", e),
+        Err(e) => eprintln!("billing-rating-rs: charge join failed: {}", e),
     }
 
     let _result_data = json!({"endpoint": "rate_transaction"});
@@ -642,6 +643,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {

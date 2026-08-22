@@ -2,7 +2,7 @@
 //! 54link-dev Reconciliation Engine — Rust (Real-Time Transaction Matching)
 //! Automated 3-way reconciliation: Core Banking ↔ Payment Switch ↔ Settlement.
 //! Supports NIP/NIBSS, POS (ISW/NIBSS), card (Visa/MC), eNaira, and inter-branch.
-//! Matching: exact hash, fuzzy (amount tolerance ±₦0.01), date window (T±1).
+//! Matching: exact hash, exact amount in integer minor units (kobo), date window (T±1).
 //! Recon counts and match rates are ALWAYS computed from real data; when a
 //! source is unavailable the run fails fast (503) and dashboards report zeros.
 
@@ -10,7 +10,7 @@ use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 use chrono::Utc;
@@ -94,7 +94,7 @@ fn source_unavailable(detail: &str) -> HttpResponse {
 
 // ─── Real reconciliation against Postgres ───────────────────────────────────
 // source = core banking transactions; target = settlement transactions.
-// Matched on reference + amount (±₦0.01). Any DB failure => Err => run FAILED.
+// Matched on reference + exact amount in integer minor units. Any DB failure => Err => run FAILED.
 async fn run_recon_real(
     db_url: &str,
     channel: &str,
@@ -111,23 +111,24 @@ async fn run_recon_real(
 
     let src_rows = client
         .query(
-            "SELECT reference, amount::float8 FROM transactions WHERE channel = $1 AND created_at::date = $2::date",
+            "SELECT reference, ROUND(amount * 100)::bigint FROM transactions WHERE channel = $1 AND created_at::date = $2::date",
             &[&channel, &biz_date],
         )
         .await
         .map_err(|e| format!("source (transactions) unavailable: {}", e))?;
     let tgt_rows = client
         .query(
-            "SELECT reference, amount::float8 FROM settlement_transactions WHERE channel = $1 AND settlement_date = $2::date",
+            "SELECT reference, ROUND(amount * 100)::bigint FROM settlement_transactions WHERE channel = $1 AND settlement_date = $2::date",
             &[&channel, &biz_date],
         )
         .await
         .map_err(|e| format!("target (settlement_transactions) unavailable: {}", e))?;
 
     use std::collections::HashMap;
-    let mut target_map: HashMap<String, f64> = HashMap::new();
+    // Amounts are compared as integer minor units (kobo) — exact equality, no float tolerance.
+    let mut target_map: HashMap<String, i64> = HashMap::new();
     for r in &tgt_rows {
-        target_map.insert(r.get::<usize, String>(0), r.get::<usize, f64>(1));
+        target_map.insert(r.get::<usize, String>(0), r.get::<usize, i64>(1));
     }
 
     let job_id = rand_id("RECON");
@@ -135,18 +136,18 @@ async fn run_recon_real(
     let mut exceptions: Vec<ReconException> = Vec::new();
     for r in &src_rows {
         let sref: String = r.get(0);
-        let samt: f64 = r.get(1);
+        let samt: i64 = r.get(1); // minor units (kobo)
         match target_map.get(&sref) {
-            Some(tamt) if (tamt - samt).abs() <= 0.01 => matched += 1,
+            Some(tamt) if *tamt == samt => matched += 1,
             Some(tamt) => exceptions.push(ReconException {
                 id: rand_id("EXC"),
                 job_id: job_id.clone(),
                 exception_type: "amount_mismatch".into(),
                 source_ref: sref.clone(),
                 target_ref: Some(sref.clone()),
-                source_amount: samt,
-                target_amount: Some(*tamt),
-                difference: Some(tamt - samt),
+                source_amount: samt as f64 / 100.0,
+                target_amount: Some(*tamt as f64 / 100.0),
+                difference: Some((*tamt - samt) as f64 / 100.0),
                 channel: channel.to_string(),
                 status: "open".into(),
                 assigned_to: None,
@@ -159,7 +160,7 @@ async fn run_recon_real(
                 exception_type: "unmatched_source".into(),
                 source_ref: sref.clone(),
                 target_ref: None,
-                source_amount: samt,
+                source_amount: samt as f64 / 100.0,
                 target_amount: None,
                 difference: None,
                 channel: channel.to_string(),
@@ -175,7 +176,7 @@ async fn run_recon_real(
     for r in &tgt_rows {
         let tref: String = r.get(0);
         if !source_refs.contains(&tref) {
-            let tamt: f64 = r.get(1);
+            let tamt: i64 = r.get(1); // minor units (kobo)
             exceptions.push(ReconException {
                 id: rand_id("EXC"),
                 job_id: job_id.clone(),
@@ -183,7 +184,7 @@ async fn run_recon_real(
                 source_ref: tref.clone(),
                 target_ref: Some(tref),
                 source_amount: 0.0,
-                target_amount: Some(tamt),
+                target_amount: Some(tamt as f64 / 100.0),
                 difference: None,
                 channel: channel.to_string(),
                 status: "open".into(),
@@ -223,7 +224,7 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
         "channels": ["NIP", "NEFT", "POS_ISW", "POS_NIBSS", "VISA", "MASTERCARD", "VERVE", "eNaira", "RTGS", "INTER_BRANCH", "ATM", "USSD"],
         "matching_rules": {
             "exact": "Reference hash match (STAN + RRN + amount + date)",
-            "fuzzy_amount": "Tolerance ±₦0.01 for rounding differences",
+            "exact_amount": "Exact match on integer minor units (kobo); any kobo difference raises an exception",
             "date_window": "T±1 business day for settlement delays",
             "partial": "Amount split detection (one source → multiple targets)",
         },
@@ -253,7 +254,7 @@ async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 error: Some("source_unavailable".into()),
             };
-            state.jobs.lock().unwrap().push(job.clone());
+            state.jobs.lock().await.push(job.clone());
             return HttpResponse::ServiceUnavailable().json(json!({"job": job, "error": "source_unavailable"}));
         }
     };
@@ -281,8 +282,8 @@ async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 error: None,
             };
-            state.jobs.lock().unwrap().push(job.clone());
-            state.exceptions.lock().unwrap().extend(new_exceptions);
+            state.jobs.lock().await.push(job.clone());
+            state.exceptions.lock().await.extend(new_exceptions);
             HttpResponse::Ok().json(json!({
                 "job": job,
                 "summary": {
@@ -310,7 +311,7 @@ async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 error: Some("source_unavailable".into()),
             };
-            state.jobs.lock().unwrap().push(job.clone());
+            state.jobs.lock().await.push(job.clone());
             HttpResponse::ServiceUnavailable().json(json!({"job": job, "error": "source_unavailable", "detail": e}))
         }
     }
@@ -318,13 +319,13 @@ async fn run_recon(req: actix_web::HttpRequest, body: web::Json<RunReconRequest>
 
 async fn list_jobs(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let jobs = state.jobs.lock().unwrap();
+    let jobs = state.jobs.lock().await;
     HttpResponse::Ok().json(json!({"jobs": *jobs, "total": jobs.len()}))
 }
 
 async fn list_exceptions(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let excs = state.exceptions.lock().unwrap();
+    let excs = state.exceptions.lock().await;
     let open = excs.iter().filter(|e| e.status == "open").count();
     let resolved = excs.iter().filter(|e| e.status == "resolved").count();
     HttpResponse::Ok().json(json!({
@@ -335,7 +336,7 @@ async fn list_exceptions(req: actix_web::HttpRequest, state: web::Data<AppState>
 
 async fn resolve_exception(req: actix_web::HttpRequest, body: web::Json<ResolveRequest>, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let mut excs = state.exceptions.lock().unwrap();
+    let mut excs = state.exceptions.lock().await;
     for exc in excs.iter_mut() {
         if exc.id == body.exception_id {
             exc.status = "resolved".into();
@@ -349,8 +350,8 @@ async fn resolve_exception(req: actix_web::HttpRequest, body: web::Json<ResolveR
 
 async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let jobs = state.jobs.lock().unwrap();
-    let excs = state.exceptions.lock().unwrap();
+    let jobs = state.jobs.lock().await;
+    let excs = state.exceptions.lock().await;
     let total_matched: u64 = jobs.iter().map(|j| j.matched).sum();
     let total_source: u64 = jobs.iter().map(|j| j.source_count).sum();
     let avg_match_rate = if total_source > 0 { total_matched as f64 / total_source as f64 * 100.0 } else { 0.0 };
@@ -377,8 +378,8 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
 
 async fn recon_dashboard(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req) { return resp; }
-    let jobs = state.jobs.lock().unwrap();
-    let excs = state.exceptions.lock().unwrap();
+    let jobs = state.jobs.lock().await;
+    let excs = state.exceptions.lock().await;
 
     if jobs.is_empty() {
         // Never hardcode dashboard figures: no stored runs => zeros + no_runs.

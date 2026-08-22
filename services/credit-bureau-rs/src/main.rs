@@ -71,9 +71,10 @@ async fn query_bureau(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     let result = credit_score_band(score);
     // Inter-service call: kyc_verify
     let _upstream_url = std::env::var("KYC_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_grpc(&format!("{}/v1/verify", _upstream_url), "POST", "{}") {
-        Ok(_resp) => eprintln!("credit-bureau-rs: kyc_verify ok"),
-        Err(e) => eprintln!("credit-bureau-rs: kyc_verify failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_grpc(&format!("{}/v1/verify", _upstream_url), "POST", "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("credit-bureau-rs: kyc_verify ok"),
+        Ok(Err(e)) => eprintln!("credit-bureau-rs: kyc_verify failed: {}", e),
+        Err(e) => eprintln!("credit-bureau-rs: kyc_verify join failed: {}", e),
     }
 
     let _result_data = json!({"endpoint": "query_bureau"});
@@ -541,6 +542,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create loans table");
+}
 
 #[cfg(test)]
 mod tests {

@@ -86,9 +86,10 @@ async fn score_entity(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     db_persist(&state, "score_entity", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("RISK_ASSESSMENT_URL").unwrap_or_else(|_| "http://localhost:8125".to_string());
-    match call_service_sync(&format!("{}/v1/assess", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("risk-scoring-rs: upstream call ok"),
-        Err(e) => eprintln!("risk-scoring-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/assess", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("risk-scoring-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("risk-scoring-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("risk-scoring-rs: upstream call join failed: {}", e),
     }
 
     HttpResponse::Ok().json(json!({
@@ -577,6 +578,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {

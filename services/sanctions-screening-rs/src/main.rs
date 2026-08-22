@@ -238,6 +238,40 @@ async fn delete_record(req: actix_web::HttpRequest, state: web::Data<AppState>, 
 
 use tokio_postgres::NoTls;
 
+/// Returns true when the deployment is production-like (fail closed: unknown => production).
+fn is_production_env() -> bool {
+    let env_name = std::env::var("APP_ENV")
+        .or_else(|_| std::env::var("ENVIRONMENT"))
+        .unwrap_or_else(|_| "production".to_string())
+        .to_ascii_lowercase();
+    !matches!(env_name.as_str(), "dev" | "development" | "test" | "testing" | "staging" | "local")
+}
+
+/// FAIL CLOSED (M-46): outbound DB connections carrying watchlist data must use
+/// TLS with certificate verification in production. Plaintext (NoTls) is only
+/// tolerated outside production with the explicit DB_ALLOW_INSECURE_NO_TLS=true
+/// opt-in. Note: sslmode=verify-full/verify-ca requires a TLS-capable Postgres
+/// connector; with NoTls the driver refuses such URLs, which is the intended
+/// fail-closed behavior until a TLS connector is provisioned.
+fn enforce_db_tls_policy(db_url: &str) {
+    let url_l = db_url.to_ascii_lowercase();
+    if url_l.contains("sslmode=verify-full") || url_l.contains("sslmode=verify-ca") {
+        return;
+    }
+    let allow_insecure = std::env::var("DB_ALLOW_INSECURE_NO_TLS")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if is_production_env() || !allow_insecure {
+        eprintln!(
+            "FATAL: DATABASE_URL must enable TLS with certificate verification \
+             (sslmode=verify-full or sslmode=verify-ca). Plaintext DB connections are only \
+             allowed outside production with DB_ALLOW_INSECURE_NO_TLS=true."
+        );
+        std::process::exit(1);
+    }
+    eprintln!("WARNING: connecting to Postgres without TLS — non-production opt-in only");
+}
+
 async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
     match tokio_postgres::connect(db_url, NoTls).await {
         Ok((client, connection)) => {
@@ -298,6 +332,7 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 async fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8125);
     let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
+        enforce_db_tls_policy(&url);
         init_db(&url).await.map(Arc::new)
     } else { None };
     let watchlist = if let Some(ref c) = db_client {

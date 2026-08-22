@@ -272,7 +272,8 @@ async fn detect_circular(req: actix_web::HttpRequest, state: web::Data<AppState>
 
     // Inter-service: notify AML engine
     let upstream = env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://aml-engine-rs:8080".to_string());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!("{{\"source\": \"falkordb-graph-engine-rs\", \"circular_txns\": {}}}", cycles.len()));
+    let _notify_body = format!("{{\"source\": \"falkordb-graph-engine-rs\", \"circular_txns\": {}}}", cycles.len());
+    let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), &_notify_body)).await;
 
     db_persist(&state, "detect_circular", &json!({"cycles_found": cycles.len()})).await;
     HttpResponse::Ok().json(json!({"circularTransactions": cycles, "count": cycles.len()}))
@@ -435,9 +436,8 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("[falkordb-graph-engine-rs] starting");
 
-    let db_name = "falkordb-graph-engine-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+    // FAIL FAST (M-21): DATABASE_URL is required; no default/compiled-in database credentials.
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set - refusing to boot with default database credentials");
 
     let pool = PgPoolOptions::new()
         .max_connections(25)

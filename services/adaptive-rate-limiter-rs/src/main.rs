@@ -83,7 +83,7 @@ async fn check_rate(req: actix_web::HttpRequest, body: web::Json<serde_json::Val
     if allowed { *tokens -= 1; }
     db_persist(&state, "check_rate", &json!({"action": "check_rate"})).await;
     let upstream = std::env::var("METRICS_URL").unwrap_or_else(|_| "http://kpi-threshold-monitor-rs:8080".to_string());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), r#"{"source": "adaptive-rate-limiter-rs", "action": "check_rate"}"#);
+    let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), r#"{"source": "adaptive-rate-limiter-rs", "action": "check_rate"}"#)).await;
     HttpResponse::Ok().json(json!({"client_id": client_id, "allowed": allowed, "remaining": tokens, "limit": limit, "adaptive_factor": limit as f64 / base_rate as f64}))
 }
 
@@ -493,6 +493,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {

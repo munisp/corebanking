@@ -91,9 +91,10 @@ async fn score_customer(req: actix_web::HttpRequest, state: web::Data<AppState>,
     db_persist(&state, "score_customer", &_result_data).await;
     // Inter-service call
     let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_grpc(&format!("{}/v1/screen", _upstream_url), "POST", "{}") {
-        Ok(_resp) => eprintln!("aml-risk-scoring-rs: upstream call ok"),
-        Err(e) => eprintln!("aml-risk-scoring-rs: upstream call failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_grpc(&format!("{}/v1/screen", _upstream_url), "POST", "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("aml-risk-scoring-rs: upstream call ok"),
+        Ok(Err(e)) => eprintln!("aml-risk-scoring-rs: upstream call failed: {}", e),
+        Err(e) => eprintln!("aml-risk-scoring-rs: upstream call join failed: {}", e),
     }
 
     HttpResponse::Ok().json(json!({
@@ -617,6 +618,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create compliance_records table");
+}
 
 #[cfg(test)]
 mod tests {

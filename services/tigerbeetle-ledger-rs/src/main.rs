@@ -32,9 +32,8 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("[tigerbeetle-ledger-rs] starting");
 
-    let db_name = "tigerbeetle-ledger-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+    // FAIL FAST (M-21): DATABASE_URL is required; no default/compiled-in database credentials.
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set - refusing to boot with default database credentials");
 
     let pool = PgPoolOptions::new()
         .max_connections(25)

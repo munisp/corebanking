@@ -73,9 +73,10 @@ async fn trace_animal(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     let result = generate_nlis_tag(state_code, species, seq);
     // Inter-service call: register_animal
     let _upstream_url = std::env::var("AGRI_BANKING_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_sync(&format!("{}/v1/register", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("animal-id-traceability-rs: register_animal ok"),
-        Err(e) => eprintln!("animal-id-traceability-rs: register_animal failed: {}", e),
+    match tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/register", _upstream_url), "{}")).await {
+        Ok(Ok(_resp)) => eprintln!("animal-id-traceability-rs: register_animal ok"),
+        Ok(Err(e)) => eprintln!("animal-id-traceability-rs: register_animal failed: {}", e),
+        Err(e) => eprintln!("animal-id-traceability-rs: register_animal join failed: {}", e),
     }
 
     let _result_data = json!({"endpoint": "trace_animal"});
@@ -502,6 +503,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {

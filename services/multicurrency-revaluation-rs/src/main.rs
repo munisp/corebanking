@@ -11,7 +11,7 @@ fn middleware_config() -> serde_json::Value {
     serde_json::json!({
         "kafka": {"broker": get_env("KAFKA_BROKER", "localhost:9092"), "topics": "fx.revaluation-completed,fx.rate-updated,fx.position-changed"},
         "redis": {"url": get_env("REDIS_URL", "redis://localhost:6379"), "purpose": "rate-cache,position-cache"},
-        "postgres": {"url": get_env("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": "fx_rates,fx_positions,fx_revaluations,currency_accounts"},
+        "postgres": {"url": env::var("DATABASE_URL").expect("DATABASE_URL must be set - refusing to boot with default database credentials"), "tables": "fx_rates,fx_positions,fx_revaluations,currency_accounts"},
         "opensearch": {"url": get_env("OPENSEARCH_URL", "http://localhost:9200"), "index": "fx-revaluation-history"},
         "keycloak": {"url": get_env("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "role": "treasury-officer"},
         "permify": {"url": get_env("PERMIFY_URL", "http://localhost:3476"), "schema": "fx:revalue,fx:override-rate,fx:close-position"},

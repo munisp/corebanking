@@ -401,7 +401,8 @@ async fn search_regulations(req: actix_web::HttpRequest, state: web::Data<AppSta
 
     // Inter-service: notify knowledge graph
     let upstream = env::var("NEO4J_KG_URL").unwrap_or_else(|_| "http://neo4j-knowledge-graph-go:8080".to_string());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), &format!("{{\"source\": \"qdrant-vector-store-rs\", \"action\": \"regulation_search\", \"query\": \"{}\"}}", query_text));
+    let _notify_body = format!("{{\"source\": \"qdrant-vector-store-rs\", \"action\": \"regulation_search\", \"query\": \"{}\"}}", query_text);
+    let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), &_notify_body)).await;
 
     HttpResponse::Ok().json(json!({"query": query_text, "results": results, "count": results.len(), "engine": "qdrant"}))
 }
@@ -493,9 +494,8 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("[qdrant-vector-store-rs] starting");
 
-    let db_name = "qdrant-vector-store-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
+    // FAIL FAST (M-21): DATABASE_URL is required; no default/compiled-in database credentials.
+    let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set - refusing to boot with default database credentials");
 
     let pool = PgPoolOptions::new()
         .max_connections(25)
