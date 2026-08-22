@@ -31,10 +31,8 @@ spec:
               env:
                 - name: CLUSTER_BASE_URL
                   value: "https://54link-dev.upi.dev"
-                - name: PYTHONUNBUFFERED
+                - name: PYTHONUNRELEASED
                   value: "1"
-                - name: DATABASE_URL
-                  value: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking?sslmode=require"
               resources:
                 requests:
                   cpu: "250m"

@@ -10,7 +10,9 @@ spec:
     - name: redisHost
       value: redis-master.redis.svc.cluster.local:6379
     - name: redisPassword
-      value: "3phHSv7qbAuZLb2pi9FWED2X"
+      secretKeyRef:
+        name: redis-credentials
+        key: password
     - name: enableTLS
       value: "false"
     - name: dialTimeout
@@ -31,3 +33,5 @@ spec:
       value: "5m"
     - name: idleCheckFrequency
       value: "1m"
+  auth:
+    secretStore: kubernetes
