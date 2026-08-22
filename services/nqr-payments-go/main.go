@@ -324,7 +324,11 @@ func main() {
 	log.Printf("[nqr-payments-go] starting on :8066")
 
 	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/nqr_payments_go?sslmode=disable")
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[nqr-payments-go] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {

@@ -715,9 +715,10 @@ func main() {
 	startWatchdog(10 * time.Second)
 
 	// Postgres (journal records + outbox)
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
 	dsn := os.Getenv("DATABASE_URL")
 	if dsn == "" {
-		dsn = "postgres://postgres:postgres@localhost:5432/journal_posting_go?sslmode=disable"
+		log.Fatalf("[journal-posting-go] DATABASE_URL env var is required; refusing to start with default database credentials")
 	}
 	var err error
 	db, err = sql.Open("postgres", dsn)

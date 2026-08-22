@@ -324,7 +324,11 @@ func main() {
 	log.Printf("[account-statement-go] starting on :8341")
 
 	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/account_statement_go?sslmode=disable")
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[account-statement-go] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {

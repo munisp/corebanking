@@ -1,10 +1,10 @@
 package main
 
 import (
-	"github.com/IBM/sarama"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"github.com/IBM/sarama"
 	"log"
 	"net/http"
 	"os"
@@ -13,17 +13,16 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/lib/pq"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	_ "github.com/lib/pq"
 	"math/big"
 	"sync"
 )
 
 var db *sql.DB
-
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
@@ -58,9 +57,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -73,7 +76,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		for range time.Tick(5 * time.Minute) {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -98,7 +103,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -160,7 +167,9 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 
 	// Events are marked published ONLY after a confirmed Kafka produce.
 	producer, err := getKafkaProducer(brokers)
@@ -170,14 +179,18 @@ func relayOutbox(brokers string, topic string) {
 	}
 
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
 		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
 			Topic: topic,
 			Key:   sarama.StringEncoder(aggID),
@@ -189,7 +202,9 @@ func relayOutbox(brokers string, topic string) {
 		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
+	if len(ids) == 0 {
+		return
+	}
 	for _, id := range ids {
 		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
 			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
@@ -222,14 +237,16 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 	return kafkaProducer, nil
 }
 
-
-
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("[account-closure-go] starting on :8207")
 
 	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/account_closure_go?sslmode=disable")
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[account-closure-go] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {

@@ -52,36 +52,36 @@ type Challenge struct {
 	// Nonce is a single-use, CSPRNG-generated value bound to the session ID,
 	// challenge ID and subject (H-19 replay protection). It is rotated after
 	// every failed attempt.
-	Nonce     string  `json:"nonce,omitempty"`
+	Nonce string `json:"nonce,omitempty"`
 }
 
 type LivenessSession struct {
-	ID               string       `json:"id"`
-	CustomerID       string       `json:"customerId"`
-	TenantID         string       `json:"tenantId,omitempty"`
-	Status           string       `json:"status"` // pending | in_progress | completed | failed
-	Mode             string       `json:"mode"`   // active | passive | hybrid
-	Challenges       []Challenge  `json:"challenges,omitempty"`
-	ChallengesTotal  int          `json:"challengesTotal"`
-	ChallengesPassed int          `json:"challengesPassed"`
-	OverallScore     float64      `json:"overallScore"`
-	IsLive           bool         `json:"isLive"`
-	Verdict          string       `json:"verdict,omitempty"` // LIVE | SPOOF | UNKNOWN
-	DevicePlatform   string       `json:"devicePlatform,omitempty"`
-	DeviceModel      string       `json:"deviceModel,omitempty"`
-	IPAddress        string       `json:"ipAddress,omitempty"`
-	Attempts         int          `json:"attempts"`
-	MaxAttempts      int          `json:"maxAttempts"`
-	StartedAt        string       `json:"startedAt"`
-	ExpiresAt        string       `json:"expiresAt,omitempty"`
-	CompletedAt      string       `json:"completedAt,omitempty"`
+	ID               string           `json:"id"`
+	CustomerID       string           `json:"customerId"`
+	TenantID         string           `json:"tenantId,omitempty"`
+	Status           string           `json:"status"` // pending | in_progress | completed | failed
+	Mode             string           `json:"mode"`   // active | passive | hybrid
+	Challenges       []Challenge      `json:"challenges,omitempty"`
+	ChallengesTotal  int              `json:"challengesTotal"`
+	ChallengesPassed int              `json:"challengesPassed"`
+	OverallScore     float64          `json:"overallScore"`
+	IsLive           bool             `json:"isLive"`
+	Verdict          string           `json:"verdict,omitempty"` // LIVE | SPOOF | UNKNOWN
+	DevicePlatform   string           `json:"devicePlatform,omitempty"`
+	DeviceModel      string           `json:"deviceModel,omitempty"`
+	IPAddress        string           `json:"ipAddress,omitempty"`
+	Attempts         int              `json:"attempts"`
+	MaxAttempts      int              `json:"maxAttempts"`
+	StartedAt        string           `json:"startedAt"`
+	ExpiresAt        string           `json:"expiresAt,omitempty"`
+	CompletedAt      string           `json:"completedAt,omitempty"`
 	AntiSpoof        *AntiSpoofResult `json:"antiSpoof,omitempty"`
-	KafkaEventID     string       `json:"kafkaEventId,omitempty"`
+	KafkaEventID     string           `json:"kafkaEventId,omitempty"`
 }
 
 type AntiSpoofResult struct {
-	IsSpoof   bool    `json:"isSpoof"`
-	SpoofType string  `json:"spoofType"`
+	IsSpoof    bool    `json:"isSpoof"`
+	SpoofType  string  `json:"spoofType"`
 	Confidence float64 `json:"confidence"`
 }
 
@@ -102,12 +102,12 @@ type FaceMatchResponse struct {
 }
 
 type serviceStats struct {
-	mu                sync.Mutex
-	TotalSessions     int64 `json:"totalSessions"`
-	TotalFaceMatches  int64 `json:"totalFaceMatches"`
-	CompletedLive     int64 `json:"completedLive"`
-	CompletedSpoof    int64 `json:"completedSpoof"`
-	EngineErrors      int64 `json:"engineErrors"`
+	mu               sync.Mutex
+	TotalSessions    int64 `json:"totalSessions"`
+	TotalFaceMatches int64 `json:"totalFaceMatches"`
+	CompletedLive    int64 `json:"completedLive"`
+	CompletedSpoof   int64 `json:"completedSpoof"`
+	EngineErrors     int64 `json:"engineErrors"`
 }
 
 var stats serviceStats
@@ -385,18 +385,18 @@ func handleCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	session := &LivenessSession{
-		ID:              generateID("SES"),
-		CustomerID:      body.CustomerID,
-		TenantID:        body.TenantID,
-		Status:          "pending",
-		Mode:            body.Mode,
-		Challenges:      generateChallenges(body.ChallengeCount),
-		DevicePlatform:  body.DevicePlatform,
-		DeviceModel:     body.DeviceModel,
-		IPAddress:       r.RemoteAddr,
-		StartedAt:       now.Format(time.RFC3339),
-		ExpiresAt:       now.Add(5 * time.Minute).Format(time.RFC3339),
-		MaxAttempts:     3,
+		ID:             generateID("SES"),
+		CustomerID:     body.CustomerID,
+		TenantID:       body.TenantID,
+		Status:         "pending",
+		Mode:           body.Mode,
+		Challenges:     generateChallenges(body.ChallengeCount),
+		DevicePlatform: body.DevicePlatform,
+		DeviceModel:    body.DeviceModel,
+		IPAddress:      r.RemoteAddr,
+		StartedAt:      now.Format(time.RFC3339),
+		ExpiresAt:      now.Add(5 * time.Minute).Format(time.RFC3339),
+		MaxAttempts:    3,
 	}
 	session.ChallengesTotal = len(session.Challenges)
 	session.KafkaEventID = publishEvent("session_created", session.ID, body.CustomerID, body.TenantID, nil)
@@ -1301,7 +1301,11 @@ func main() {
 	log.Printf("[%s] starting", serviceName)
 
 	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/liveness_orchestrator_go?sslmode=disable")
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[liveness-orchestrator-go] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
