@@ -6,23 +6,30 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 )
 
@@ -117,10 +124,10 @@ type COANode struct {
 }
 
 type COAEdge struct {
-	FromCode     string  `json:"from_code"`
-	ToCode       string  `json:"to_code"`
-	RelationType string  `json:"relation_type"` // CHILD_OF, FLOWS_TO, REGULATED_BY, PROVISION_FOR
-	Weight       float64 `json:"weight,omitempty"`
+	FromCode     string                 `json:"from_code"`
+	ToCode       string                 `json:"to_code"`
+	RelationType string                 `json:"relation_type"` // CHILD_OF, FLOWS_TO, REGULATED_BY, PROVISION_FOR
+	Weight       float64                `json:"weight,omitempty"`
 	Metadata     map[string]interface{} `json:"metadata,omitempty"`
 }
 
@@ -329,16 +336,16 @@ func (g *InMemoryGraph) ComputeBaselIIIMetrics() map[string]interface{} {
 		nplRatio = totalProvisions / totalLoans * 100
 	}
 	return map[string]interface{}{
-		"total_rwa":             totalRWA,
-		"cet1_capital":          cet1Capital,
-		"tier2_capital":         tier2Capital,
-		"total_capital":         cet1Capital + tier2Capital,
+		"total_rwa":              totalRWA,
+		"cet1_capital":           cet1Capital,
+		"tier2_capital":          tier2Capital,
+		"total_capital":          cet1Capital + tier2Capital,
 		"capital_adequacy_ratio": car,
-		"cbn_minimum_car":       15.0,
-		"car_compliant":         car >= 15.0,
-		"total_loans":           totalLoans,
-		"total_provisions":      totalProvisions,
-		"npl_coverage_ratio":    nplRatio,
+		"cbn_minimum_car":        15.0,
+		"car_compliant":          car >= 15.0,
+		"total_loans":            totalLoans,
+		"total_provisions":       totalProvisions,
+		"npl_coverage_ratio":     nplRatio,
 	}
 }
 
@@ -359,11 +366,11 @@ func (g *InMemoryGraph) ComputeLiquidityRatio() map[string]interface{} {
 		ratio = liquidAssets / totalDeposits * 100
 	}
 	return map[string]interface{}{
-		"liquid_assets":    liquidAssets,
-		"total_deposits":   totalDeposits,
-		"liquidity_ratio":  ratio,
-		"cbn_minimum":      30.0,
-		"compliant":        ratio >= 30.0,
+		"liquid_assets":   liquidAssets,
+		"total_deposits":  totalDeposits,
+		"liquidity_ratio": ratio,
+		"cbn_minimum":     30.0,
+		"compliant":       ratio >= 30.0,
 	}
 }
 
@@ -405,8 +412,14 @@ func metricsHandler(w http.ResponseWriter, r *http.Request) {
 
 func coaGraphHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded", "retry_after": "1"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded", "retry_after": "1"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	nodes := make([]COANode, 0)
 	graph.mu.RLock()
 	for _, n := range graph.nodes {
@@ -419,8 +432,14 @@ func coaGraphHandler(w http.ResponseWriter, r *http.Request) {
 
 func coaNodeHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	code := strings.TrimPrefix(r.URL.Path, "/v1/coa/node/")
 	node, ok := graph.GetNode(code)
 	if !ok {
@@ -433,8 +452,14 @@ func coaNodeHandler(w http.ResponseWriter, r *http.Request) {
 
 func coaTraverseHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 10240))
 	body = []byte(sanitizeInput(string(body)))
 	var req struct {
@@ -452,8 +477,14 @@ func coaTraverseHandler(w http.ResponseWriter, r *http.Request) {
 
 func coaCypherHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 10240))
 	body = []byte(sanitizeInput(string(body)))
 	var req struct {
@@ -461,6 +492,11 @@ func coaCypherHandler(w http.ResponseWriter, r *http.Request) {
 		Params map[string]interface{} `json:"params"`
 	}
 	json.Unmarshal(body, &req)
+	if ok, reason := validateCypherQuery(req.Query); !ok {
+		atomic.AddUint64(&errorCount, 1)
+		jsonResp(w, 400, map[string]string{"error": "cypher_query_rejected", "reason": reason})
+		return
+	}
 	neo := NewNeo4jClient()
 	results, err := neo.ExecuteCypher(req.Query, req.Params)
 	if err != nil {
@@ -478,8 +514,14 @@ func coaCypherHandler(w http.ResponseWriter, r *http.Request) {
 
 func pagerankHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	ranks := graph.ComputePageRank(20, 0.85)
 	type rankedNode struct {
 		Code string  `json:"code"`
@@ -499,24 +541,42 @@ func pagerankHandler(w http.ResponseWriter, r *http.Request) {
 
 func baselHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	metrics := graph.ComputeBaselIIIMetrics()
 	jsonResp(w, 200, metrics)
 }
 
 func liquidityHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	metrics := graph.ComputeLiquidityRatio()
 	jsonResp(w, 200, metrics)
 }
 
 func transactionFlowHandler(w http.ResponseWriter, r *http.Request) {
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 10240))
 	body = []byte(sanitizeInput(string(body)))
 	var txn TransactionFlow
@@ -540,10 +600,18 @@ func transactionFlowHandler(w http.ResponseWriter, r *http.Request) {
 
 func createHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-Id")
-	if tenantID == "" { tenantID = "platform" }
+	if tenantID == "" {
+		tenantID = "platform"
+	}
 	atomic.AddUint64(&requestCount, 1)
-	if !rlAllow() { jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"}); return }
-	if err := checkJWT(r); err != nil { jsonResp(w, 401, map[string]string{"error": "unauthorized"}); return }
+	if !rlAllow() {
+		jsonResp(w, 429, map[string]string{"error": "rate_limit_exceeded"})
+		return
+	}
+	if err := checkJWT(r); err != nil {
+		jsonResp(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
 	body, _ := io.ReadAll(io.LimitReader(r.Body, 10240))
 	body = []byte(sanitizeInput(string(body)))
 	var node COANode
@@ -635,7 +703,7 @@ func dbInsert(id, svc, tenant, status string, data []byte) error {
 	return err
 }
 
-func cacheGet(key string) (string, bool) { return "", false }
+func cacheGet(key string) (string, bool)  { return "", false }
 func cacheSet(key, value string, ttl int) {}
 
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
@@ -684,35 +752,32 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 
 // --- JWT Validation (JWKS-aware) ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        p := r.URL.Path
-        if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" || p == "/v1/degradation" {
-            next.ServeHTTP(w, r)
-            return
-        }
-        auth := r.Header.Get("Authorization")
-        if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-            return
-        }
-        token := strings.TrimPrefix(auth, "Bearer ")
-        // Validate JWT structure (header.payload.signature)
-        parts := strings.Split(token, ".")
-        if len(parts) != 3 {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
-            return
-        }
-        // In production: validate against Keycloak JWKS endpoint
-        // keycloakURL := os.Getenv("KEYCLOAK_URL")
-        // Decode payload for claims
-        r.Header.Set("X-User-Id", "validated")
-        next.ServeHTTP(w, r)
-    })
-}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" || p == "/v1/degradation" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		// Validate JWT structure (header.payload.signature)
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
+			return
+		}
+		// In production: validate against Keycloak JWKS endpoint
+		// keycloakURL := os.Getenv("KEYCLOAK_URL")
+		// Decode payload for claims
+		r.Header.Set("X-User-Id", "validated")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -728,140 +793,157 @@ func getTLSConfig() (bool, string, string) {
 
 // ─── MAIN ───────────────────────────────────────────────────────────────────
 
+// cypherWriteClause matches Cypher write/administrative clauses as whole words.
+// The /v1/coa/cypher endpoint is strictly read-only; mutations must go through
+// the dedicated write endpoints (e.g. /v1/create).
+var cypherWriteClause = regexp.MustCompile(`(?i)\b(CREATE|MERGE|DELETE|DETACH|SET|DROP|CALL|REMOVE|LOAD\s+CSV|GRANT|REVOKE|DENY|ALTER)\b`)
 
+// validateCypherQuery rejects any user-supplied query containing a write or
+// administrative clause. It must be called on every user-influenced Cypher
+// query before execution.
 func validateCypherQuery(query string) (bool, string) {
-	upper := strings.ToUpper(query)
-	dangerous := []string{"DROP", "DELETE ALL", "DETACH DELETE"}
-	for _, d := range dangerous { if strings.Contains(upper, d) { return false, "Destructive query not allowed: " + d } }
+	if strings.TrimSpace(query) == "" {
+		return false, "Empty query not allowed"
+	}
+	if m := cypherWriteClause.FindString(query); m != "" {
+		return false, "Write/administrative clause not allowed on this read-only endpoint: " + strings.ToUpper(m)
+	}
 	return true, "Cypher query valid"
 }
 func computeGraphMetrics(nodeCount, edgeCount int) map[string]float64 {
 	density := 0.0
-	if nodeCount > 1 { density = float64(edgeCount) / float64(nodeCount*(nodeCount-1)) }
+	if nodeCount > 1 {
+		density = float64(edgeCount) / float64(nodeCount*(nodeCount-1))
+	}
 	return map[string]float64{"density": density, "avg_degree": float64(edgeCount*2) / float64(nodeCount)}
 }
 
-
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
+	failures    int
+	lastFailure time.Time
+	threshold   int
+	resetAfter  time.Duration
+	mu          sync.Mutex
 }
 
 func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2
-            return true
-        }
-        return false
-    }
-    return true
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures >= cb.threshold {
+		if time.Since(cb.lastFailure) > cb.resetAfter {
+			cb.failures = cb.threshold / 2
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures > 0 {
+		cb.failures--
+	}
 }
 
 func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
 }
 
 var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
 
 func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
-        }
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        req.Header.Set("X-Source-Service", serviceName)
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+	if !_cb.allow() {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+		}
+		var req *http.Request
+		if body != nil {
+			jsonData, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Source-Service", serviceName)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cb.recordFailure()
+			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			_cb.recordFailure()
+			continue
+		}
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cb.recordSuccess()
+		return result, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
 // --- Alerting ---
 type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
+	rules []alertRule
+	mu    sync.RWMutex
 }
 
 type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
+	Name      string
+	Metric    string
+	Threshold float64
+	Severity  string
 }
 
 var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
+	rules: []alertRule{
+		{"high_error_rate", "error_rate", 0.05, "critical"},
+		{"high_latency", "p99_latency_ms", 5000, "warning"},
+		{"db_connection_failures", "db_failures", 3, "critical"},
+	},
 }
 
 func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
+	var fired []map[string]interface{}
+	errRate := float64(atomic.LoadUint64(&errorCount)) / float64(max64(atomic.LoadUint64(&requestCount), 1))
+	if errRate > 0.05 {
+		fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+	}
+	return fired
 }
 
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Integration Tests ---
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(code)
-    json.NewEncoder(w).Encode(data)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(data)
 }
-
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
@@ -896,9 +978,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -911,7 +997,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		for range time.Tick(5 * time.Minute) {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -936,7 +1024,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -998,51 +1088,100 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	if len(ids) == 0 {
+		return
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
 
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
 
 func main() {
 	initDB()
 	graph.SeedCOA()
 
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
-	_ = tlsCert; _ = tlsKey; _ = tlsEnabled
+	_ = tlsCert
+	_ = tlsKey
+	_ = tlsEnabled
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/alerts", alertsHandler)
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
 	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/readyz", readyHandler)
 	mux.HandleFunc("/livez", liveHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
-	mux.HandleFunc("/v1/coa/graph", coaGraphHandler)
-	mux.HandleFunc("/v1/coa/node/", coaNodeHandler)
-	mux.HandleFunc("/v1/coa/traverse", coaTraverseHandler)
-	mux.HandleFunc("/v1/coa/cypher", coaCypherHandler)
-	mux.HandleFunc("/v1/coa/pagerank", pagerankHandler)
-	mux.HandleFunc("/v1/coa/basel-iii", baselHandler)
-	mux.HandleFunc("/v1/coa/liquidity", liquidityHandler)
-	mux.HandleFunc("/v1/coa/transaction-flow", transactionFlowHandler)
-	mux.HandleFunc("/v1/create", createHandler)
+	mux.Handle("/v1/coa/graph", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(coaGraphHandler)))
+	mux.Handle("/v1/coa/node/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(coaNodeHandler)))
+	mux.Handle("/v1/coa/traverse", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(coaTraverseHandler)))
+	mux.Handle("/v1/coa/cypher", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(coaCypherHandler)))
+	mux.Handle("/v1/coa/pagerank", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(pagerankHandler)))
+	mux.Handle("/v1/coa/basel-iii", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(baselHandler)))
+	mux.Handle("/v1/coa/liquidity", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(liquidityHandler)))
+	mux.Handle("/v1/coa/transaction-flow", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(transactionFlowHandler)))
+	mux.Handle("/v1/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(createHandler)))
 
 	port := envOr("PORT", "8080")
 	handler := rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(mux)))
@@ -1063,4 +1202,13 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	srv.Shutdown(ctx)
+}
+
+// jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
+// scripts/fix-go-wire-jwt.py).
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
 }
