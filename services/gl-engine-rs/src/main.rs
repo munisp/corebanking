@@ -142,7 +142,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -269,7 +270,8 @@ fn row_to_account(r: &sqlx::postgres::PgRow) -> GLAccount {
     }
 }
 
-async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppState>) -> HttpResponse {
+async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let entries = body.into_inner();
     if let Err(e) = validate_double_entry(&entries) {
         return HttpResponse::BadRequest().json(json!({"error": e}));
@@ -346,7 +348,8 @@ async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppSt
     HttpResponse::Ok().json(json!({"entry_id": entry_id, "status": "posted", "entries": entries.len()}))
 }
 
-async fn trial_balance(body: web::Json<TrialBalanceRequest>, state: web::Data<AppState>) -> HttpResponse {
+async fn trial_balance(body: web::Json<TrialBalanceRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     match sqlx::query(BALANCE_SQL).fetch_all(&state.db).await {
         Ok(rows) => {
             mark_db_available(true);
@@ -390,7 +393,8 @@ async fn chart_of_accounts(req: actix_web::HttpRequest, state: web::Data<AppStat
     }
 }
 
-async fn account_balance(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
+async fn account_balance(path: web::Path<String>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let code = path.into_inner();
     let result = sqlx::query(
         r#"SELECT a.account_code, a.account_name, a.account_type, a.currency,
@@ -421,7 +425,8 @@ async fn account_balance(path: web::Path<String>, state: web::Data<AppState>) ->
     }
 }
 
-async fn validate_entry(body: web::Json<Vec<JournalEntry>>) -> HttpResponse {
+async fn validate_entry(body: web::Json<Vec<JournalEntry>>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     match validate_double_entry(&body) {
         Ok(_) => HttpResponse::Ok().json(json!({"valid": true})),
         Err(e) => HttpResponse::Ok().json(json!({"valid": false, "error": e})),
@@ -439,7 +444,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -885,7 +891,8 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-async fn list_records(data: web::Data<AppState>) -> HttpResponse {
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let result = sqlx::query(
         "SELECT id::text AS id, config_key, config_value::text AS config_value, environment, status, version, is_active \
          FROM service_configs ORDER BY created_at DESC LIMIT 100",
@@ -914,7 +921,8 @@ async fn list_records(data: web::Data<AppState>) -> HttpResponse {
     }
 }
 
-async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>) -> HttpResponse {
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let config_key = body
         .extra
         .get("config_key")
@@ -953,7 +961,8 @@ async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>
     }
 }
 
-async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     let result = sqlx::query(
         "SELECT id::text AS id, config_key, config_value::text AS config_value, environment, status, version, is_active \
@@ -977,7 +986,8 @@ async fn get_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpR
     }
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
@@ -1001,7 +1011,8 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
     }
 }
 
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(id.as_str())

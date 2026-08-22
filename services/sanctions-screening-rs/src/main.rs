@@ -105,7 +105,8 @@ async fn metrics() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
-async fn degradation_status(state: web::Data<AppState>) -> HttpResponse {
+async fn degradation_status(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": state.db_client.is_some(),
         "mode": if state.db_client.is_some() { "normal" } else { "degraded" },

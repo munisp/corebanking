@@ -174,7 +174,8 @@ async fn metrics() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
-async fn degradation_status(state: web::Data<AppState>) -> HttpResponse {
+async fn degradation_status(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": state.db_client.is_some(),
         "mode": if state.db_client.is_some() { "normal" } else { "degraded" },
@@ -234,7 +235,8 @@ async fn verify(req: actix_web::HttpRequest, state: web::Data<AppState>, body: w
     }))
 }
 
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
+async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let enrollments = state.enrollments.lock().unwrap();
     HttpResponse::Ok().json(json!({"total_enrollments": enrollments.len(), "service": "biometric-auth-rs"}))
 }

@@ -43,7 +43,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -191,6 +192,17 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
         Err(_) => Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
     }
 }
+// --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
+async fn jwt_route_guard(
+    req: actix_web::dev::ServiceRequest,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
+    if let Err(resp) = check_jwt(req.request()) {
+        return Ok(req.into_response(resp));
+    }
+    next.call(req).await.map(|res| res.map_into_boxed_body())
+}
+
 
 
 // --- Security Headers Middleware ---
@@ -469,8 +481,8 @@ async fn main() -> std::io::Result<()> {
             .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
             .route("/api/v1/kyc_records", web::get().to(list_records))
-            .route("/api/v1/kyc_records", web::post().to(create_record))
-            .route("/api/v1/kyc_records/{id}", web::get().to(get_record))
+            .service(web::resource("/api/v1/kyc_records").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::post().to(create_record)))
+            .service(web::resource("/api/v1/kyc_records/{id}").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::get().to(get_record)))
             .route("/api/v1/kyc_records/{id}", web::put().to(update_record))
             .route("/api/v1/kyc_records/{id}", web::delete().to(delete_record))
     })
@@ -549,7 +561,8 @@ mod tests {
 
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
@@ -573,7 +586,8 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
     }
 }
 
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     sqlx::query("UPDATE kyc_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)

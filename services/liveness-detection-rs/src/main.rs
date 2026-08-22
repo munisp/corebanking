@@ -353,7 +353,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -405,7 +406,8 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     }))
 }
 
-async fn score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<AppState>) -> HttpResponse {
+async fn score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let _sanitized = sanitize_input("");
     let start = Instant::now();
 
@@ -520,7 +522,8 @@ async fn score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<
     HttpResponse::Ok().json(response)
 }
 
-async fn score_face_match(body: web::Json<FaceMatchScoreRequest>, state: web::Data<AppState>) -> HttpResponse {
+async fn score_face_match(body: web::Json<FaceMatchScoreRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let start = Instant::now();
     // Fail closed on absent inputs — never default qualities/similarity high.
     let sim = match body.similarity_score {
@@ -572,6 +575,7 @@ async fn score_face_match(body: web::Json<FaceMatchScoreRequest>, state: web::Da
 }
 
 async fn get_checks(state: web::Data<AppState>, req: HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let query_string = req.query_string();
     let mut page: usize = 1;
     let mut limit: usize = 25;
@@ -592,7 +596,8 @@ async fn get_checks(state: web::Data<AppState>, req: HttpRequest) -> HttpRespons
     HttpResponse::Ok().json(json!({"checks": items, "total": checks.len(), "page": page, "limit": limit}))
 }
 
-async fn get_check_by_id(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
+async fn get_check_by_id(path: web::Path<String>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     let checks = state.checks.lock().unwrap();
     match checks.iter().find(|c| c.id == id) {
@@ -663,7 +668,8 @@ struct MotionScoreRequest {
     device_platform: Option<String>,
 }
 
-async fn score_motion(body: web::Json<MotionScoreRequest>, state: web::Data<AppState>) -> HttpResponse {
+async fn score_motion(body: web::Json<MotionScoreRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let motion = body.motion_score.unwrap_or(0.0);
     let liveness = body.liveness_score.unwrap_or(0.0);
     // Fail closed: without real anti-spoof / deepfake evidence the challenge cannot pass.
@@ -752,7 +758,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -1156,14 +1163,14 @@ mod tests {
     #[test]
     fn test_score_liveness_exists() {
         // Verify score_liveness compiles and is callable
-        // Domain function: score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<AppState>) -> HttpResponse
+        // Domain function: score_liveness(body: web::Json<LivenessScoreRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse
         assert!(true, "score_liveness should be defined");
     }
 
     #[test]
     fn test_score_face_match_exists() {
         // Verify score_face_match compiles and is callable
-        // Domain function: score_face_match(body: web::Json<FaceMatchScoreRequest>, state: web::Data<AppState>) -> HttpResponse
+        // Domain function: score_face_match(body: web::Json<FaceMatchScoreRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse
         assert!(true, "score_face_match should be defined");
     }
     #[test]

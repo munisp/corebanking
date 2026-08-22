@@ -43,7 +43,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -105,7 +106,8 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
     HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": if state.db_url.is_some() { "database" } else { "in-memory" }}))
 }
 
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
+async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let records = state.records.lock().unwrap();
     HttpResponse::Ok().json(json!({"total": records.len(), "service": "clickjack-defender-rs"}))
 }
@@ -121,7 +123,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -136,10 +139,12 @@ async fn alerts_endpoint() -> HttpResponse {
     }))
 }
 
-async fn readyz() -> HttpResponse {
+async fn readyz(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({"ready": true, "service": "clickjack-defender-rs"}))
 }
-async fn livez() -> HttpResponse {
+async fn livez(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({"alive": true}))
 }
 async fn prom_metrics() -> HttpResponse {

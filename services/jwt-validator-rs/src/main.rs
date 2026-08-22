@@ -107,7 +107,8 @@ async fn metrics() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
-async fn degradation_status(state: web::Data<AppState>) -> HttpResponse {
+async fn degradation_status(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": state.db_client.is_some(),
         "mode": if state.db_client.is_some() { "normal" } else { "degraded" },
@@ -117,6 +118,7 @@ async fn degradation_status(state: web::Data<AppState>) -> HttpResponse {
 /// POST /v1/jwt/validate — validate the JWT from the Authorization header
 /// (or an explicit {"token": "..."} body). Never trusts caller-supplied claims.
 async fn validate_jwt(req: actix_web::HttpRequest, state: web::Data<AppState>, body: Option<web::Json<ValidateRequest>>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let token = if let Some(b) = &body {
         if let Some(t) = &b.token {
             Some(t.clone())

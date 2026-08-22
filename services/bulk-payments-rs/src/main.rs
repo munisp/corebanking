@@ -294,7 +294,8 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
     HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "in-memory"}))
 }
 
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
+async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     if let Some(ref client) = state.db_client {
         if let Ok(row) = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = $1", &[&"bulk_payments_rs"]).await {
             let total: i64 = row.get(0);
@@ -380,6 +381,17 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
         Err(_) => Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
     }
 }
+// --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
+async fn jwt_route_guard(
+    req: actix_web::dev::ServiceRequest,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
+    if let Err(resp) = check_jwt(req.request()) {
+        return Ok(req.into_response(resp));
+    }
+    next.call(req).await.map(|res| res.map_into_boxed_body())
+}
+
 
 
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
@@ -484,8 +496,8 @@ async fn main() -> std::io::Result<()> {
             .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
             .route("/api/v1/payments", web::get().to(list_records))
-            .route("/api/v1/payments", web::post().to(create_record))
-            .route("/api/v1/payments/{id}", web::get().to(get_record))
+            .service(web::resource("/api/v1/payments").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::post().to(create_record)))
+            .service(web::resource("/api/v1/payments/{id}").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::get().to(get_record)))
             .route("/api/v1/payments/{id}", web::put().to(update_record))
             .route("/api/v1/payments/{id}", web::delete().to(delete_record))
     })
@@ -538,7 +550,8 @@ mod tests {
     fn test_nibss_fee() { let r = nibss_fee(10000.0); assert!(r >= 0.0); }
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
@@ -562,7 +575,8 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
     }
 }
 
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     sqlx::query("UPDATE payments SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)

@@ -53,7 +53,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -94,7 +95,8 @@ fn tigerbeetle_unavailable() -> HttpResponse {
     }))
 }
 
-async fn list_accounts(state: web::Data<AppState>) -> HttpResponse {
+async fn list_accounts(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let client = match &state.db_client {
         Some(c) => c.clone(),
         None => return tigerbeetle_unavailable(),
@@ -128,7 +130,8 @@ async fn list_accounts(state: web::Data<AppState>) -> HttpResponse {
     }
 }
 
-async fn list_transfers(state: web::Data<AppState>) -> HttpResponse {
+async fn list_transfers(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let client = match &state.db_client {
         Some(c) => c.clone(),
         None => return tigerbeetle_unavailable(),
@@ -203,7 +206,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };

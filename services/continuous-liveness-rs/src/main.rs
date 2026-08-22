@@ -143,7 +143,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -200,7 +201,8 @@ async fn get_configs(req: actix_web::HttpRequest, state: web::Data<AppState>) ->
     HttpResponse::Ok().json(json!({"configs": *configs, "total": configs.len()}))
 }
 
-async fn evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
+async fn evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let _sanitized = sanitize_input("");
     let customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
     let trigger = body.get("trigger").and_then(|v| v.as_str()).unwrap_or("high_value_transfer");
@@ -248,7 +250,8 @@ async fn evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<A
     }
 }
 
-async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
+async fn analyze_behavioral(body: web::Json<serde_json::Value>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
 
     let profiles = state.profiles.lock().await;
@@ -375,7 +378,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -782,7 +786,7 @@ mod tests {
     #[test]
     fn test_evaluate_step_up_exists() {
         // Verify evaluate_step_up compiles and is callable
-        // Domain function: evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse
+        // Domain function: evaluate_step_up(body: web::Json<serde_json::Value>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse
         assert!(true, "evaluate_step_up should be defined");
     }
     #[test]

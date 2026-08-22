@@ -29,7 +29,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -78,7 +79,8 @@ async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, q
     HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": if state.db_url.is_some() { "database" } else { "in-memory" }}))
 }
 
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
+async fn stats(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let records = state.records.lock().unwrap();
     HttpResponse::Ok().json(json!({"total": records.len(), "service": "tigerbeetle-adapter-rs"}))
 }
@@ -94,7 +96,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -175,6 +178,17 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
         Err(_) => Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
     }
 }
+// --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
+async fn jwt_route_guard(
+    req: actix_web::dev::ServiceRequest,
+    next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
+) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
+    if let Err(resp) = check_jwt(req.request()) {
+        return Ok(req.into_response(resp));
+    }
+    next.call(req).await.map(|res| res.map_into_boxed_body())
+}
+
 
 
 // --- Security Headers Middleware ---
@@ -452,8 +466,8 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/tb_operation", web::post().to(tb_operation))
             .route("/v1/records", web::get().to(list_records))
             .route("/v1/stats", web::get().to(stats))
-            .route("/v1/tb_user_data", web::post().to(tb_user_data_handler))
-            .route("/v1/tb_account_flags", web::post().to(tb_account_flags_handler))
+            .service(web::resource("/v1/tb_user_data").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::post().to(tb_user_data_handler)))
+            .service(web::resource("/v1/tb_account_flags").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::post().to(tb_account_flags_handler)))
             .route("/v1/alerts", web::get().to(alerts_endpoint))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(livez))

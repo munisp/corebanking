@@ -115,7 +115,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -174,7 +175,8 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     }))
 }
 
-async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState>) -> HttpResponse {
+async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let _sanitized = sanitize_input("");
     let name = &body.entity_name;
     let entity_type = body.entity_type.as_deref().unwrap_or("individual");
@@ -243,7 +245,8 @@ async fn screen_entity(body: web::Json<ScreenRequest>, state: web::Data<AppState
     }))
 }
 
-async fn record_decision(body: web::Json<DecisionRequest>, state: web::Data<AppState>) -> HttpResponse {
+async fn record_decision(body: web::Json<DecisionRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let mut screenings = state.screenings.lock().await;
     for s in screenings.iter_mut() {
         if s.id == body.screening_id {
@@ -261,7 +264,8 @@ async fn record_decision(body: web::Json<DecisionRequest>, state: web::Data<AppS
     HttpResponse::NotFound().json(json!({"error": format!("Screening not found: {}", body.screening_id)}))
 }
 
-async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<AppState>) -> HttpResponse {
+async fn batch_rescreen(body: web::Json<BatchScreenRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let watchlist = state.watchlist.lock().await;
     if watchlist.is_empty() {
         return HttpResponse::ServiceUnavailable().json(json!({
@@ -380,7 +384,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };

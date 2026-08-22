@@ -52,7 +52,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -501,6 +502,7 @@ fn mtls_config() -> (bool, String, String, String) {
 // ── Billing RBAC enforce handler ──────────────────────────────────────────────
 
 async fn billing_rbac_enforce(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let auth = req.headers().get("authorization")
         .or_else(|| req.headers().get("Authorization"))
         .and_then(|v| v.to_str().ok())

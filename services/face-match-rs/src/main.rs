@@ -100,7 +100,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -154,7 +155,8 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     }))
 }
 
-async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppState>) -> HttpResponse {
+async fn perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let _sanitized = sanitize_input("");
     let start = Instant::now();
 
@@ -240,7 +242,8 @@ async fn get_matches(req: actix_web::HttpRequest, state: web::Data<AppState>) ->
     HttpResponse::Ok().json(json!({"matches": *matches, "total": matches.len()}))
 }
 
-async fn get_match_by_id(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
+async fn get_match_by_id(path: web::Path<String>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     let matches = state.matches.lock().await;
     match matches.iter().find(|m| m.id == id) {
@@ -267,7 +270,8 @@ fn chrono_now() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-async fn deepface_info() -> HttpResponse {
+async fn deepface_info(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let inference_url = std::env::var("LIVENESS_INFERENCE_URL").unwrap_or_else(|_| "http://localhost:8230".into());
     HttpResponse::Ok().json(json!({
         "deepface_integration": {
@@ -301,7 +305,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -685,7 +690,7 @@ mod tests {
     #[test]
     fn test_perform_match_exists() {
         // Verify perform_match compiles and is callable
-        // Domain function: perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppState>) -> HttpResponse
+        // Domain function: perform_match(body: web::Json<FaceMatchRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse
         assert!(true, "perform_match should be defined");
     }
 
@@ -699,7 +704,7 @@ mod tests {
     #[test]
     fn test_get_match_by_id_exists() {
         // Verify get_match_by_id compiles and is callable
-        // Domain function: get_match_by_id(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse
+        // Domain function: get_match_by_id(path: web::Path<String>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse
         assert!(true, "get_match_by_id should be defined");
     }
 

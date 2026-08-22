@@ -181,7 +181,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(AtomicOrdering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(AtomicOrdering::Relaxed),
         "mode": degradation_mode(),
@@ -202,8 +203,10 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
     }))
 }
 
-async fn ready() -> HttpResponse { HttpResponse::Ok().json(json!({"ready": true, "service": "neo4j-coa-graph-rs"})) }
-async fn live() -> HttpResponse { HttpResponse::Ok().json(json!({"live": true})) }
+async fn ready(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; } HttpResponse::Ok().json(json!({"ready": true, "service": "neo4j-coa-graph-rs"})) }
+async fn live(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; } HttpResponse::Ok().json(json!({"live": true})) }
 async fn metrics() -> HttpResponse {
     let r = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
     let e = ERROR_COUNT.load(AtomicOrdering::Relaxed);

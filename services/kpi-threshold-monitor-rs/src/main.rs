@@ -71,7 +71,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(AtomicOrdering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(AtomicOrdering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(AtomicOrdering::Relaxed),
@@ -96,7 +97,8 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
     }))
 }
 
-async fn list_thresholds(state: web::Data<AppState>, query: web::Query<ListParams>) -> HttpResponse {
+async fn list_thresholds(state: web::Data<AppState>, query: web::Query<ListParams>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let thresholds = state.thresholds.read().unwrap();
     let mut filtered: Vec<&ThresholdRule> = thresholds.iter().collect();
 
@@ -122,7 +124,8 @@ async fn list_thresholds(state: web::Data<AppState>, query: web::Query<ListParam
     }))
 }
 
-async fn list_alerts(state: web::Data<AppState>, query: web::Query<ListParams>) -> HttpResponse {
+async fn list_alerts(state: web::Data<AppState>, query: web::Query<ListParams>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let alerts = state.alerts.read().unwrap();
     let mut filtered: Vec<&KpiAlert> = alerts.iter().collect();
 
@@ -240,7 +243,8 @@ async fn evaluate_thresholds(req: actix_web::HttpRequest, state: web::Data<AppSt
     }))
 }
 
-async fn acknowledge_alert(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn acknowledge_alert(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let alert_id = path.into_inner();
     let mut alerts = state.alerts.write().unwrap();
     if let Some(alert) = alerts.iter_mut().find(|a| a.id == alert_id) {
@@ -252,7 +256,8 @@ async fn acknowledge_alert(state: web::Data<AppState>, path: web::Path<String>) 
     }
 }
 
-async fn resolve_alert(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn resolve_alert(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let alert_id = path.into_inner();
     let mut alerts = state.alerts.write().unwrap();
     if let Some(alert) = alerts.iter_mut().find(|a| a.id == alert_id) {
@@ -374,7 +379,8 @@ fn default_thresholds() -> Vec<ThresholdRule> {
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
 
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };

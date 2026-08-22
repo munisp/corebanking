@@ -277,7 +277,8 @@ struct CreateRequest {
     extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
-async fn list_records(state: web::Data<AppState>) -> HttpResponse {
+async fn list_records(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     match sqlx::query(
         "SELECT id::text, batch_id, settlement_type, counterparty, net_amount_kobo, currency, status, transaction_count, settlement_date::text, reference, channel FROM settlements ORDER BY created_at DESC LIMIT 500",
@@ -303,7 +304,8 @@ async fn list_records(state: web::Data<AppState>) -> HttpResponse {
     }
 }
 
-async fn create_record(state: web::Data<AppState>, body: web::Json<CreateRequest>) -> HttpResponse {
+async fn create_record(state: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     let req = body.into_inner();
     let batch_id = req.extra.get("batchId").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -328,7 +330,8 @@ async fn create_record(state: web::Data<AppState>, body: web::Json<CreateRequest
     }
 }
 
-async fn get_record(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn get_record(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let db = match require_db(&state) { Ok(d) => d, Err(r) => return r };
     let id = path.into_inner();
     match sqlx::query("SELECT id::text, batch_id, status FROM settlements WHERE id = $1::uuid")
@@ -344,7 +347,8 @@ async fn get_record(state: web::Data<AppState>, path: web::Path<String>) -> Http
     }
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let db = match require_db(&data) { Ok(d) => d, Err(r) => return r };
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
@@ -359,7 +363,8 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
     }
 }
 
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let db = match require_db(&data) { Ok(d) => d, Err(r) => return r };
     let id = path.into_inner();
     let _ = sqlx::query("UPDATE settlements SET status = 'deleted' WHERE id = $1::uuid")
@@ -377,7 +382,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(AtomicOrdering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(AtomicOrdering::Relaxed),
         "mode": degradation_mode(),
@@ -402,7 +408,8 @@ async fn healthz(state: web::Data<AppState>) -> HttpResponse {
 static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
 
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };

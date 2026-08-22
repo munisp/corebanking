@@ -114,9 +114,11 @@ async fn health() -> HttpResponse {
 }
 
 async fn list_accounts(
+    req: HttpRequest,
     state: web::Data<AppState>,
     query: web::Query<std::collections::HashMap<String, String>>,
 ) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(25);
     let search = query.get("search").map(|s| s.to_lowercase()).unwrap_or_default();
@@ -145,7 +147,8 @@ async fn list_accounts(
     }))
 }
 
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
+async fn stats(state: web::Data<AppState>, req: HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let accounts = state.accounts.lock().unwrap_or_else(|e| e.into_inner());
     let mut s = DormancyStats {
         total: accounts.len(),
@@ -359,7 +362,8 @@ async fn prom_metrics() -> HttpResponse {
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };

@@ -317,7 +317,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -376,7 +377,8 @@ async fn livez() -> HttpResponse {
     HttpResponse::Ok().json(json!({"live": true}))
 }
 
-async fn seed_graph(state: web::Data<AppState>) -> HttpResponse {
+async fn seed_graph(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let queries = falkordb_seed_coa_query();
     for q in &queries {
@@ -786,7 +788,8 @@ async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: act
     }
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
@@ -810,7 +813,8 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
     }
 }
 
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let id = path.into_inner();
     sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)

@@ -195,7 +195,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -246,11 +247,13 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     }))
 }
 
-async fn get_tiers() -> HttpResponse {
+async fn get_tiers(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     HttpResponse::Ok().json(json!({"tiers": default_tiers()}))
 }
 
-async fn assess_tier(body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
+async fn assess_tier(body: web::Json<serde_json::Value>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let _sanitized = sanitize_input("");
     let customer_id = body.get("customerId").and_then(|v| v.as_str()).unwrap_or("unknown");
     let docs: Vec<String> = body.get("docsPresent")
@@ -270,7 +273,8 @@ async fn assess_tier(body: web::Json<serde_json::Value>, state: web::Data<AppSta
     HttpResponse::Ok().json(json!({"assessment": assessment}))
 }
 
-async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
+async fn check_transaction_limit(body: web::Json<serde_json::Value>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let tier = body.get("tier").and_then(|v| v.as_str()).unwrap_or("tier1");
     let amount = body.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
     let daily = body.get("currentDailyTotal").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -326,7 +330,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req) { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
