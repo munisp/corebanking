@@ -470,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length > 0 else b"{}"
         body = json.loads(sanitize_input(raw.decode("utf-8")))
 
-        # JWT auth check (monitoring mode: warn but allow)
+        # JWT auth check — real signature verification, fail closed
         claims, err = validate_jwt(dict(self.headers))
         if err:
             self.respond(401, {"error": "unauthorized", "detail": err})

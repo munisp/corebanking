@@ -219,31 +219,13 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	id := getString(body, "id")
-	for i := range records {
-		if records[i].ID == id && records[i].Status == "pending" {
-			records[i].Status = "processing"
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
-			// Simulate domain processing
-			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
-			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
-			records[i].Status = "completed"
-			domainStats.ProcessedToday++
-			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
-			return
-		}
-	}
-	respondJSON(w, 404, map[string]string{"error": "Record not found or not pending: " + id})
+	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
+	// (processingResult="success" and a random score via math/rand). Real domain
+	// processing must be implemented before this endpoint is enabled.
+	// Fail fast; never fabricate.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
+
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()

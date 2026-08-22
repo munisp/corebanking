@@ -5,6 +5,7 @@ edition = "2021"
 description = "54link-dev Treasury & Liquidity Management — FX positions, money market, ALM, liquidity ratios"
 
 [dependencies]
+jsonwebtoken = "9.3.0"
 tokio-postgres = { version = "0.7.13", features = ["default"] }
 actix-web = "4.9.0"
 actix-rt = "2.10.0"

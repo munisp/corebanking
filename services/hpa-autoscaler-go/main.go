@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 "context"
 "os/signal"
@@ -214,31 +215,13 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	id := getString(body, "id")
-	for i := range records {
-		if records[i].ID == id && records[i].Status == "pending" {
-			records[i].Status = "processing"
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
-			// Simulate domain processing
-			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
-			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
-			records[i].Status = "completed"
-			domainStats.ProcessedToday++
-			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
-			return
-		}
-	}
-	respondJSON(w, 404, map[string]string{"error": "Record not found or not pending: " + id})
+	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
+	// (processingResult="success" and a random score via math/rand). Real domain
+	// processing must be implemented before this endpoint is enabled.
+	// Fail fast; never fabricate.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
+
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
@@ -530,6 +513,14 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 
 func relayOutbox(brokers string, topic string) {
 	if db == nil { return }
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
 	if err != nil { return }
 	defer rows.Close()
@@ -539,17 +530,50 @@ func relayOutbox(brokers string, topic string) {
 		var id, eventType, aggID string
 		var payload []byte
 		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
 	if len(ids) == 0 { return }
-	// Mark as published
 	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
+
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
+
 
 
 func main() {
@@ -598,8 +622,8 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	// Domain endpoints
-	mux.HandleFunc("/api/v1/service_configs", domainHandler)
-	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
+	mux.Handle("/api/v1/service_configs", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(domainHandler)))
+	mux.Handle("/api/v1/service_configs/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(domainDetailHandler)))
 
 	server := &http.Server{
 		Addr:         ":" + getEnv("PORT", "8926"),
@@ -1089,17 +1113,17 @@ mux := http.NewServeMux()
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/alerts", alertsHandler)
-	mux.HandleFunc("/v1/degradation", degradationStatusHandler)
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/v1/hpa-autoscaler/list", handleList)
-	mux.HandleFunc("/v1/hpa-autoscaler/create", handleCreate)
-	mux.HandleFunc("/v1/hpa-autoscaler/update", handleUpdate)
-	mux.HandleFunc("/v1/hpa-autoscaler/process", handleProcess)
-	mux.HandleFunc("/v1/hpa-autoscaler/audit", handleAudit)
-	mux.HandleFunc("/v1/hpa-autoscaler/stats", handleStats)
-	mux.HandleFunc("/v1/hpa-autoscaler/score", hpa_autoscalerScoreHandler)
-	mux.HandleFunc("/v1/hpa-autoscaler/validate", hpa_autoscalerValidateRequestHandler)
+	mux.Handle("/v1/hpa-autoscaler/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
+	mux.Handle("/v1/hpa-autoscaler/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
+	mux.Handle("/v1/hpa-autoscaler/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
+	mux.Handle("/v1/hpa-autoscaler/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
+	mux.Handle("/v1/hpa-autoscaler/audit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAudit)))
+	mux.Handle("/v1/hpa-autoscaler/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
+	mux.Handle("/v1/hpa-autoscaler/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(hpa_autoscalerScoreHandler)))
+	mux.Handle("/v1/hpa-autoscaler/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(hpa_autoscalerValidateRequestHandler)))
 	log.Printf("Hpa Autoscaler v2.0 (Infrastructure/Ops) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1128,3 +1152,12 @@ mux := http.NewServeMux()
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
+
+// jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
+// scripts/fix-go-wire-jwt.py).
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}

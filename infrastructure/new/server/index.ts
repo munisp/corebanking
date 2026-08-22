@@ -59,7 +59,7 @@ import { registerAMLEnhancementRoutes } from "./lib/amlEnhancement";
 import { registerAgricultureEnhancementRoutes } from "./lib/agricultureEnhancement";
 import { registerChannelBankingRoutes } from "./lib/channelBanking";
 import { registerMultiTenantPlatformRoutes } from "./lib/multiTenantPlatform";
-import { registerSeedDataFallback, getProxyFallback, fallbackRegistry, registerFeatureFlagEngine, featureFlagMiddleware } from "./lib/seedDataFallback";
+import { registerSeedDataFallback, fallbackRegistry, registerFeatureFlagEngine, featureFlagMiddleware } from "./lib/seedDataFallback";
 import { registerPlatformSeedRoutes, registerProxySeedFallback } from "./lib/platformSeedData";
 import { registerDatabasePersistence } from "./lib/databasePersistence";
 import { registerKafkaEventBus } from "./lib/kafkaEventBus";
@@ -772,7 +772,10 @@ interface CustomerTransferOtpRequest {
   otpReference: string;
   expiresAt: string;
   maskedDestination: string;
-  previewCode: string;
+  // SECURITY: the OTP code itself is never part of this contract. It is
+  // generated server-side via generateOTP() and delivered out-of-band
+  // (notifications/communication service). The previous `previewCode` field
+  // leaked a hardcoded OTP ("542001") to any API caller.
 }
 
 interface CustomerStatementExportLink {
@@ -1880,16 +1883,43 @@ function getRoleProfile(role: OperatorRole) {
   return roleProfiles.find((item) => item.role === role) || roleProfiles[1];
 }
 
+// Express 4 does NOT forward rejected promises from async route handlers to the
+// error middleware — an unhandled rejection leaves the client hanging. Wrap
+// every async handler so rejections reach globalErrorHandler via next(err).
+function asyncHandler(
+  fn: (req: Request, res: express.Response, next: express.NextFunction) => Promise<unknown>,
+) {
+  return (req: Request, res: express.Response, next: express.NextFunction) => {
+    void Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 function readRole(req: Request): OperatorRole {
-  const raw = String(req.header("x-operator-role") || req.query.role || "operations").toLowerCase();
-  if (raw === "branch" || raw === "operations" || raw === "treasury" || raw === "compliance") {
-    return raw;
+  // SECURITY: the operator role is derived ONLY from verified JWT claims
+  // (req.user.role, populated by the auth middleware after HMAC signature
+  // verification). The x-operator-role header and ?role= query parameter are
+  // attacker-controlled and are IGNORED — trusting them let any caller
+  // self-assign the checker role and defeat maker-checker separation of duties.
+  const claim = String((req as any).user?.role ?? "").toLowerCase();
+  if (claim === "branch" || claim === "operations" || claim === "treasury" || claim === "compliance") {
+    return claim;
   }
+  if (claim === "admin") {
+    // Platform administrators (superuser in requireRole) operate at the
+    // operations level unless their token carries a specific operator role.
+    return "operations";
+  }
+  // No verified operator claim (unauthenticated/non-operator token): fall back
+  // to the lowest-privilege operator default. Maker-checker approvals require
+  // specific roles (e.g. "branch"), so this default cannot approve them.
   return "operations";
 }
 
 function readActorId(req: Request, role: OperatorRole) {
-  return String(req.header("x-actor-id") || `${role}.default`);
+  // Prefer verified identity claims; the x-actor-id header is only a
+  // last-resort fallback for unauthenticated dev-mode requests.
+  const user = (req as any).user;
+  return String(user?.email || user?.openId || req.header("x-actor-id") || `${role}.default`);
 }
 
 function nextCustomerId() {
@@ -2980,7 +3010,7 @@ async function startServer() {
     next();
   });
 
-  app.get("/healthz", async (_req, res) => {
+  app.get("/healthz", asyncHandler(async (_req, res) => {
     let dbStatus: "connected" | "disconnected" | "unconfigured" = "unconfigured";
     if (process.env.DATABASE_URL) {
       try {
@@ -3011,7 +3041,7 @@ async function startServer() {
     };
     res.setHeader("Cache-Control", `public, max-age=${healthCacheSeconds}, stale-while-revalidate=${healthCacheSeconds}`);
     res.status(status === "ok" ? 200 : 503).json(health);
-  });
+  }));
 
   app.get("/api/platform/security/posture", (_req, res) => {
     res.json({
@@ -3046,19 +3076,19 @@ async function startServer() {
     });
   });
 
-  app.get("/api/platform/products", async (_req, res) => {
+  app.get("/api/platform/products", asyncHandler(async (_req, res) => {
     res.json({ items: defaultProducts, total: defaultProducts.length, asOf: new Date().toISOString() });
-  });
+  }));
 
   app.get("/api/platform/roles", (_req, res) => {
     res.json({ asOf: new Date().toISOString(), items: roleProfiles, total: roleProfiles.length });
   });
 
-  app.get("/api/platform/tenants/configurations", async (_req, res) => {
+  app.get("/api/platform/tenants/configurations", asyncHandler(async (_req, res) => {
     res.json(await getTenantConfigurationsOverview());
-  });
+  }));
 
-  app.put("/api/platform/tenants/configurations/:tenantId/feature-flags/:featureKey", async (req, res) => {
+  app.put("/api/platform/tenants/configurations/:tenantId/feature-flags/:featureKey", asyncHandler(async (req, res) => {
     const resolvedTenantId = req.params.tenantId;
     const featureKey = req.params.featureKey;
     const payload = req.body as { enabled?: boolean; rolloutPct?: number };
@@ -3100,9 +3130,9 @@ async function startServer() {
     });
 
     res.json(await getTenantConfigurationsOverview());
-  });
+  }));
 
-  app.put("/api/platform/tenants/configurations/:tenantId/branding", async (req, res) => {
+  app.put("/api/platform/tenants/configurations/:tenantId/branding", asyncHandler(async (req, res) => {
     const resolvedTenantId = req.params.tenantId;
     const payload = req.body as {
       displayName?: string;
@@ -3154,7 +3184,7 @@ async function startServer() {
     });
 
     res.json(await getTenantConfigurationsOverview());
-  });
+  }));
 
   app.get("/api/platform/auth/context", (req, res) => {
     const role = readRole(req);
@@ -3189,7 +3219,7 @@ async function startServer() {
     });
   });
 
-  app.get("/api/platform/overview", async (_req, res) => {
+  app.get("/api/platform/overview", asyncHandler(async (_req, res) => {
     const [teller, erpnext, islamic, reconciliation] = await Promise.all([
       getTellerOverview(),
       getERPNextOverview(),
@@ -3214,7 +3244,26 @@ async function startServer() {
       serviceHealth: serviceHealthItems,
       metrics: computeOverviewMetrics({ teller, erpnext, islamic, reconciliation }),
     });
-  });
+  }));
+
+  // SECURITY GUARD: the customer / customer-servicing handlers below are an
+  // IN-MEMORY DEMO implementation — fabricated balances, transfers and bill
+  // payments with no ledger postings and no real persistence. They must not
+  // answer in production. Real customer operations come from the customer /
+  // payment microservices (proxy routes) or the DB-backed drizzle routes.
+  const inMemoryServicingGuard = (req: Request, res: express.Response, next: express.NextFunction) => {
+    if (process.env.SEED_DATA_FALLBACK === "true" && runtimeEnvironment !== "production") {
+      next();
+      return;
+    }
+    res.status(503).json({
+      error: "servicing_module_unavailable",
+      message:
+        "The in-memory demo servicing module is disabled outside explicit demo mode. Configure the customer/payment microservices for real operations.",
+    });
+  };
+  app.use("/api/platform/customer-servicing", inMemoryServicingGuard);
+  app.use("/api/platform/customers", inMemoryServicingGuard);
 
   app.get("/api/platform/customers", (req, res) => {
     const role = readRole(req);
@@ -3367,7 +3416,7 @@ async function startServer() {
     res.json({ asOf: new Date().toISOString(), customerId, items, total: items.length });
   });
 
-  app.get("/api/platform/customer-servicing/session-preference", async (req, res) => {
+  app.get("/api/platform/customer-servicing/session-preference", asyncHandler(async (req, res) => {
     try {
       const role = readRole(req);
       const actorId = readActorId(req, role);
@@ -3378,9 +3427,9 @@ async function startServer() {
       logger.warn("Session preference read failed", { error: String(err) });
       res.json(null);
     }
-  });
+  }));
 
-  app.put("/api/platform/customer-servicing/session-preference", async (req, res) => {
+  app.put("/api/platform/customer-servicing/session-preference", asyncHandler(async (req, res) => {
     try {
       const role = readRole(req);
       const actorId = readActorId(req, role);
@@ -3418,7 +3467,7 @@ async function startServer() {
       logger.warn("Session preference upsert failed", { error: String(err) });
       res.status(500).json({ message: "Session preference temporarily unavailable" });
     }
-  });
+  }));
 
   app.get("/api/platform/customer-servicing/beneficiaries", (req, res) => {
     const customerId = resolveCustomerId(req);
@@ -3748,14 +3797,24 @@ async function startServer() {
       return;
     }
     transfer.status = "otp_pending";
-    transfer.otpReference = `OTP-${Date.now()}`;
+    // SECURITY FIX: real OTP challenge via the transaction-signing module.
+    // The code is never returned in this response (previously the hardcoded
+    // "542001" was leaked as previewCode and accepted at confirm).
+    const otpActorId = readActorId(req, role);
+    let otpChallenge: { otpId: string; expiresInSeconds: number };
+    try {
+      otpChallenge = generateOTP(otpActorId);
+    } catch (otpErr) {
+      res.status(429).json({ message: otpErr instanceof Error ? otpErr.message : "OTP issuance rate-limited" });
+      return;
+    }
+    transfer.otpReference = otpChallenge.otpId;
     transfer.otpIssuedAt = new Date().toISOString();
     const otp: CustomerTransferOtpRequest = {
       transferId: transfer.id,
       otpReference: transfer.otpReference,
-      expiresAt: new Date(Date.now() + 1000 * 60 * 5).toISOString(),
+      expiresAt: new Date(Date.now() + 1000 * otpChallenge.expiresInSeconds).toISOString(),
       maskedDestination: transfer.accountNumber ? `••••${transfer.accountNumber.slice(-4)}` : transfer.beneficiaryName,
-      previewCode: "542001",
     };
     recordAudit({
       actorRole: role,
@@ -3789,7 +3848,19 @@ async function startServer() {
       res.status(404).json({ message: "Transfer not found" });
       return;
     }
-    if (!payload.otpReference || payload.otpReference !== transfer.otpReference || payload.otpCode !== "542001") {
+    // Idempotency / double-payout guard: a transfer that already completed the
+    // confirmation transition must NEVER be processed again. Replay returns the
+    // recorded outcome instead of re-posting a second debit (check-then-act
+    // race between concurrent confirm requests).
+    if (transfer.status === "completed" || transfer.status === "submitted") {
+      res.status(200).json({ message: "Transfer already confirmed", transfer, idempotentReplay: true });
+      return;
+    }
+    if (transfer.status !== "otp_pending") {
+      res.status(409).json({ message: `Transfer ${transfer.id} is not awaiting OTP confirmation (status: ${transfer.status})` });
+      return;
+    }
+    if (!payload.otpReference || payload.otpReference !== transfer.otpReference || !payload.otpCode || !verifyOTP(payload.otpReference, payload.otpCode)) {
       res.status(400).json({ message: "OTP confirmation failed" });
       return;
     }
@@ -4104,13 +4175,13 @@ async function startServer() {
     );
   });
 
-  app.get("/api/platform/partner-onboarding", async (_req, res) => {
+  app.get("/api/platform/partner-onboarding", asyncHandler(async (_req, res) => {
     await refreshPartnerOnboardingRuntimeFromDb();
     const items = listPartnerOnboardingRecords();
     res.json({ asOf: new Date().toISOString(), items, total: items.length, approvals: listPartnerApprovalRecords() });
-  });
+  }));
 
-  app.get("/api/platform/partner-onboarding/:partnerId", async (req, res) => {
+  app.get("/api/platform/partner-onboarding/:partnerId", asyncHandler(async (req, res) => {
     await refreshPartnerOnboardingRuntimeFromDb();
     const partner = getPartnerOnboardingRecord(req.params.partnerId);
     if (!partner) {
@@ -4118,9 +4189,9 @@ async function startServer() {
       return;
     }
     res.json({ partner, approvals: listPartnerApprovalRecords(partner.id) });
-  });
+  }));
 
-  app.post("/api/platform/partner-onboarding", async (req, res) => {
+  app.post("/api/platform/partner-onboarding", asyncHandler(async (req, res) => {
     await refreshPartnerOnboardingRuntimeFromDb();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4139,9 +4210,9 @@ async function startServer() {
       detail: "A new white-label partner onboarding draft was created through the active onboarding workspace.",
     });
     res.status(201).json({ partner, approvals: listPartnerApprovalRecords(partner.id) });
-  });
+  }));
 
-  app.put("/api/platform/partner-onboarding/:partnerId", async (req, res) => {
+  app.put("/api/platform/partner-onboarding/:partnerId", asyncHandler(async (req, res) => {
     await refreshPartnerOnboardingRuntimeFromDb();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4164,9 +4235,9 @@ async function startServer() {
       detail: "Partner onboarding draft data was updated through the self-service or admin workspace.",
     });
     res.json({ partner, approvals: listPartnerApprovalRecords(partner.id) });
-  });
+  }));
 
-  app.post("/api/platform/partner-onboarding/:partnerId/submit", async (req, res) => {
+  app.post("/api/platform/partner-onboarding/:partnerId/submit", asyncHandler(async (req, res) => {
     await refreshPartnerOnboardingRuntimeFromDb();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4193,9 +4264,9 @@ async function startServer() {
       logger.warn("Unable to deliver partner onboarding submission notification", { error: String(error) });
     });
     res.json({ partner, approvals });
-  });
+  }));
 
-  app.post("/api/platform/partner-onboarding/:partnerId/approvals/:approvalId/approve", async (req, res) => {
+  app.post("/api/platform/partner-onboarding/:partnerId/approvals/:approvalId/approve", asyncHandler(async (req, res) => {
     await refreshPartnerOnboardingRuntimeFromDb();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4255,9 +4326,9 @@ async function startServer() {
       });
     }
     res.json({ partner: result.partner, approval: result.approval, approvals, tenantConfiguration });
-  });
+  }));
 
-  app.post("/api/platform/partner-onboarding/:partnerId/approvals/:approvalId/reject", async (req, res) => {
+  app.post("/api/platform/partner-onboarding/:partnerId/approvals/:approvalId/reject", asyncHandler(async (req, res) => {
     await refreshPartnerOnboardingRuntimeFromDb();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4292,7 +4363,7 @@ async function startServer() {
       logger.warn("Unable to deliver partner approval notification", { error: String(error) });
     });
     res.json({ partner: result.partner, approval: result.approval, approvals });
-  });
+  }));
 
   app.get("/api/platform/actions", (req, res) => {
     const role = readRole(req);
@@ -4415,7 +4486,7 @@ async function startServer() {
     res.status(201).json(job);
   });
 
-  app.get("/api/platform/billing/dashboard", async (_req, res) => {
+  app.get("/api/platform/billing/dashboard", asyncHandler(async (_req, res) => {
     await ensureBillingEngineSeed();
     await refreshBillingAccrualSnapshots();
     const dashboard = await getBillingDashboard();
@@ -4424,15 +4495,15 @@ async function startServer() {
       ...dashboard,
       middleware: ["Kafka", "Dapr", "Redis", "Permify", "Keycloak", "TigerBeetle", "Lakehouse"],
     });
-  });
+  }));
 
-  app.get("/api/platform/billing/rate-cards", async (_req, res) => {
+  app.get("/api/platform/billing/rate-cards", asyncHandler(async (_req, res) => {
     await ensureBillingEngineSeed();
     const items = await listBillingRateCards();
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/rate-cards", async (req, res) => {
+  app.post("/api/platform/billing/rate-cards", asyncHandler(async (req, res) => {
     await ensureBillingEngineSeed();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4459,15 +4530,15 @@ async function startServer() {
       detail: "A draft billing rate card was created through the next-generation billing workspace.",
     });
     res.status(201).json(card);
-  });
+  }));
 
-  app.get("/api/platform/billing/usage-events", async (_req, res) => {
+  app.get("/api/platform/billing/usage-events", asyncHandler(async (_req, res) => {
     await ensureBillingEngineSeed();
     const items = await listBillingUsageEvents(100);
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/usage-events", validateBody(billingUsageEventSchema), async (req, res) => {
+  app.post("/api/platform/billing/usage-events", validateBody(billingUsageEventSchema), asyncHandler(async (req, res) => {
     await ensureBillingEngineSeed();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4507,16 +4578,16 @@ async function startServer() {
       detail: "A billable platform event was ingested and rated for the accrued-charge dashboard.",
     });
     res.status(201).json(usageEvent);
-  });
+  }));
 
-  app.get("/api/platform/billing/accruals", async (_req, res) => {
+  app.get("/api/platform/billing/accruals", asyncHandler(async (_req, res) => {
     await ensureBillingEngineSeed();
     await refreshBillingAccrualSnapshots();
     const items = await listBillingAccrualSnapshots();
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.get("/api/platform/billing/invoices", async (_req, res) => {
+  app.get("/api/platform/billing/invoices", asyncHandler(async (_req, res) => {
     await ensureBillingEngineSeed();
     const [items, lines, approvals] = await Promise.all([
       listBillingInvoices(),
@@ -4524,9 +4595,9 @@ async function startServer() {
       listBillingInvoiceApprovals(),
     ]);
     res.json({ asOf: new Date().toISOString(), items, lines, approvals, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/invoices/generate", async (req, res) => {
+  app.post("/api/platform/billing/invoices/generate", asyncHandler(async (req, res) => {
     await ensureBillingEngineSeed();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4548,9 +4619,9 @@ async function startServer() {
       detail: "The billing engine generated invoices with billing-period logic and approval-lane scaffolding.",
     });
     res.status(201).json({ asOf: new Date().toISOString(), ...generated, total: generated.invoices.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/invoices/:invoiceId/approvals/:approvalId", async (req, res) => {
+  app.post("/api/platform/billing/invoices/:invoiceId/approvals/:approvalId", asyncHandler(async (req, res) => {
     await ensureBillingEngineSeed();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4578,18 +4649,18 @@ async function startServer() {
       detail: "An invoice approval lane was resolved from the next-generation billing control workspace.",
     });
     res.json(invoice);
-  });
+  }));
 
-  app.get("/api/platform/billing/dashboard/extended", async (_req, res) => {
+  app.get("/api/platform/billing/dashboard/extended", asyncHandler(async (_req, res) => {
     res.json({ asOf: new Date().toISOString(), ...(await getBillingExtendedDashboard()) });
-  });
+  }));
 
-  app.get("/api/platform/billing/approval-matrices", async (_req, res) => {
+  app.get("/api/platform/billing/approval-matrices", asyncHandler(async (_req, res) => {
     const items = await listBillingApprovalMatrices();
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/approval-matrices", async (req, res) => {
+  app.post("/api/platform/billing/approval-matrices", asyncHandler(async (req, res) => {
     const role = readRole(req);
     const actorId = readActorId(req, role);
     const tenantId = String(req.body?.tenantId || "54bank-platform-prod");
@@ -4626,9 +4697,9 @@ async function startServer() {
       detail: "Tenant-level approval matrices are now configurable through the billing engine workspace.",
     });
     res.status(201).json(item);
-  });
+  }));
 
-  app.post("/api/platform/billing/invoices/generate-advanced", async (req, res) => {
+  app.post("/api/platform/billing/invoices/generate-advanced", asyncHandler(async (req, res) => {
     const role = readRole(req);
     const actorId = readActorId(req, role);
     const generated = await generateBillingInvoicesWithMatrix({
@@ -4649,9 +4720,9 @@ async function startServer() {
       detail: "The billing engine generated invoices using tenant-specific approval matrix rules.",
     });
     res.status(201).json({ asOf: new Date().toISOString(), ...generated, total: generated.invoices.length });
-  });
+  }));
 
-  app.get("/api/platform/billing/invoices/:invoiceId/export", async (req, res) => {
+  app.get("/api/platform/billing/invoices/:invoiceId/export", asyncHandler(async (req, res) => {
     const format = req.query.format === "csv" || req.query.format === "html" ? req.query.format : "json";
     const bundle = await exportBillingInvoice(req.params.invoiceId, format);
     if (!bundle) {
@@ -4660,14 +4731,14 @@ async function startServer() {
     }
     res.setHeader("Content-Disposition", `attachment; filename="${bundle.fileName}"`);
     res.type(bundle.contentType).send(bundle.body);
-  });
+  }));
 
-  app.get("/api/platform/billing/erp-postings", async (_req, res) => {
+  app.get("/api/platform/billing/erp-postings", asyncHandler(async (_req, res) => {
     const items = await listBillingErpPostingAttempts();
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/invoices/:invoiceId/erp-post", async (req, res) => {
+  app.post("/api/platform/billing/invoices/:invoiceId/erp-post", asyncHandler(async (req, res) => {
     const role = readRole(req);
     const actorId = readActorId(req, role);
     const item = await queueBillingInvoiceErpPosting({
@@ -4691,9 +4762,9 @@ async function startServer() {
       detail: "Billing invoices can now be queued for ERP posting with typed commercial payloads.",
     });
     res.status(201).json(item);
-  });
+  }));
 
-  app.post("/api/platform/billing/erp-postings/:attemptId/resolve", async (req, res) => {
+  app.post("/api/platform/billing/erp-postings/:attemptId/resolve", asyncHandler(async (req, res) => {
     const item = await markBillingErpPostingResult({
       attemptId: req.params.attemptId,
       status: req.body?.status === "failed" ? "failed" : "posted",
@@ -4704,14 +4775,14 @@ async function startServer() {
       return;
     }
     res.json(item);
-  });
+  }));
 
-  app.get("/api/platform/billing/disputes", async (_req, res) => {
+  app.get("/api/platform/billing/disputes", asyncHandler(async (_req, res) => {
     const items = await listBillingInvoiceDisputes();
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/disputes", async (req, res) => {
+  app.post("/api/platform/billing/disputes", asyncHandler(async (req, res) => {
     const role = readRole(req);
     const actorId = readActorId(req, role);
     const item = await createBillingInvoiceDispute({
@@ -4737,9 +4808,9 @@ async function startServer() {
       detail: "Billing disputes now have an explicit review lifecycle in the billing control tower.",
     });
     res.status(201).json(item);
-  });
+  }));
 
-  app.post("/api/platform/billing/disputes/:disputeId/resolve", async (req, res) => {
+  app.post("/api/platform/billing/disputes/:disputeId/resolve", asyncHandler(async (req, res) => {
     const item = await resolveBillingInvoiceDispute({
       disputeId: req.params.disputeId,
       status: req.body?.status === "rejected" ? "rejected" : req.body?.status === "resolved" ? "resolved" : "under_review",
@@ -4750,9 +4821,9 @@ async function startServer() {
       return;
     }
     res.json(item);
-  });
+  }));
 
-  app.post("/api/platform/billing/usage-events/ingest", async (req, res) => {
+  app.post("/api/platform/billing/usage-events/ingest", asyncHandler(async (req, res) => {
     const tenantId = String(req.body?.tenantId || "54bank-platform-prod");
     const usageEvent = await ingestBillingUsageViaMiddleware({
       tenantId,
@@ -4774,15 +4845,15 @@ async function startServer() {
       return;
     }
     res.status(201).json(usageEvent);
-  });
+  }));
 
-  app.get("/api/platform/billing/contract-overrides", async (_req, res) => {
+  app.get("/api/platform/billing/contract-overrides", asyncHandler(async (_req, res) => {
     await ensureBillingEngineSeed();
     const items = await listBillingContractOverrides();
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/contract-overrides", async (req, res) => {
+  app.post("/api/platform/billing/contract-overrides", asyncHandler(async (req, res) => {
     await ensureBillingEngineSeed();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4805,15 +4876,15 @@ async function startServer() {
       return;
     }
     res.status(201).json(created);
-  });
+  }));
 
-  app.get("/api/platform/billing/discount-rules", async (_req, res) => {
+  app.get("/api/platform/billing/discount-rules", asyncHandler(async (_req, res) => {
     await ensureBillingEngineSeed();
     const items = await listBillingDiscountRules();
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/discount-rules", async (req, res) => {
+  app.post("/api/platform/billing/discount-rules", asyncHandler(async (req, res) => {
     await ensureBillingEngineSeed();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4837,15 +4908,15 @@ async function startServer() {
       return;
     }
     res.status(201).json(created);
-  });
+  }));
 
-  app.get("/api/platform/billing/revenue-share-rules", async (_req, res) => {
+  app.get("/api/platform/billing/revenue-share-rules", asyncHandler(async (_req, res) => {
     await ensureBillingEngineSeed();
     const items = await listBillingRevenueShareRules();
     res.json({ asOf: new Date().toISOString(), items, total: items.length });
-  });
+  }));
 
-  app.post("/api/platform/billing/revenue-share-rules", async (req, res) => {
+  app.post("/api/platform/billing/revenue-share-rules", asyncHandler(async (req, res) => {
     await ensureBillingEngineSeed();
     const role = readRole(req);
     const actorId = readActorId(req, role);
@@ -4867,7 +4938,7 @@ async function startServer() {
       return;
     }
     res.status(201).json(created);
-  });
+  }));
 
   app.get("/api/platform/exports/:exportId/download", (req, res) => {
     const role = readRole(req);
@@ -4913,21 +4984,21 @@ async function startServer() {
     res.json({ asOf: new Date().toISOString(), items: q ? buildSearchResults(q) : buildSearchResults("") });
   });
 
-  app.get("/api/platform/teller/overview", async (_req, res) => {
+  app.get("/api/platform/teller/overview", asyncHandler(async (_req, res) => {
     res.json(await getTellerOverview());
-  });
+  }));
 
-  app.get("/api/platform/reconciliation/overview", async (_req, res) => {
+  app.get("/api/platform/reconciliation/overview", asyncHandler(async (_req, res) => {
     res.json(await getReconciliationOverview());
-  });
+  }));
 
-  app.get("/api/platform/erpnext/overview", async (_req, res) => {
+  app.get("/api/platform/erpnext/overview", asyncHandler(async (_req, res) => {
     res.json(await getERPNextOverview());
-  });
+  }));
 
-  app.get("/api/platform/islamic-banking/overview", async (_req, res) => {
+  app.get("/api/platform/islamic-banking/overview", asyncHandler(async (_req, res) => {
     res.json(await getIslamicOverview());
-  });
+  }));
 
   app.get("/api/platform/trade-finance/overview", (_req, res) => {
     res.json(buildDomainOverview("trade-finance", "/trade-finance"));
@@ -5038,7 +5109,7 @@ async function startServer() {
   const serviceUrls: Record<string, string> = {};
   const healthCheckServices = () => Object.entries(serviceUrls);
 
-  app.get("/healthz/services", async (_req, res) => {
+  app.get("/healthz/services", asyncHandler(async (_req, res) => {
     const results: Record<string, { status: string; latencyMs: number }> = {};
     const checks = healthCheckServices().map(async ([name, url]) => {
       const start = Date.now();
@@ -5058,7 +5129,7 @@ async function startServer() {
       uptime: process.uptime(),
       wsClients: wsClients.size,
     });
-  });
+  }));
 
   // --- Audit trail endpoints (#16) ---
   app.get("/api/platform/audit", (_req, res) => {
@@ -5077,7 +5148,7 @@ async function startServer() {
   });
 
   // --- Full-text search across domains (#20) ---
-  app.get("/api/platform/search", async (req, res) => {
+  app.get("/api/platform/search", asyncHandler(async (req, res) => {
     const query = String(req.query.q ?? "").toLowerCase().trim();
     if (!query) {
       res.status(400).json({ error: "Query parameter 'q' is required" });
@@ -5114,7 +5185,7 @@ async function startServer() {
 
     results.sort((a, b) => b.score - a.score);
     res.json({ query, results: results.slice(0, limit), total: results.length });
-  });
+  }));
 
   // Service URL registry
   const AGRICULTURE_SERVICE_URL = process.env.AGRICULTURE_SERVICE_URL || "http://localhost:8090";
@@ -5220,25 +5291,26 @@ async function startServer() {
       const data = await upstream.text();
       res.set("x-correlation-id", correlationId);
       res.status(upstream.status).set("content-type", "application/json").send(data);
-    } catch (_err) {
-      // Try fallback seed data instead of returning 503
-      const fallback = getProxyFallback(servicePath);
-      if (req.method === "GET") {
-        if (fallback) {
-          res.json({ items: fallback, total: fallback.length });
-        } else {
-          res.json({ items: [], total: 0 });
-        }
-      } else if (req.method === "POST") {
-        const record = { id: `REC-${Date.now()}`, ...req.body, createdAt: new Date().toISOString() };
-        res.status(201).json(record);
-      } else if (req.method === "PUT" || req.method === "PATCH") {
-        res.json({ ...req.body, updatedAt: new Date().toISOString() });
-      } else if (req.method === "DELETE") {
-        res.json({ success: true, deletedAt: new Date().toISOString() });
-      } else {
-        res.json({ items: [], total: 0 });
-      }
+    } catch (err) {
+      // FAIL-FAST (security fix): NEVER fabricate a successful response when an
+      // upstream microservice is unreachable. Previously this catch block served
+      // canned seed data for GET and returned fake 201/200 write acknowledgements
+      // for POST/PUT/DELETE — silently dropping payments, KYC submissions and
+      // other mutations while clients believed they succeeded.
+      const correlationId = (req.headers["x-correlation-id"] as string) || "unknown";
+      logger.error("Upstream service unreachable — refusing to fabricate response", {
+        servicePath,
+        method: req.method,
+        correlationId,
+        error: String(err),
+      });
+      res.status(502).json({
+        error: "upstream_unavailable",
+        message: `Upstream service for ${servicePath} is unreachable. The request was NOT processed.`,
+        servicePath,
+        method: req.method,
+        correlationId,
+      });
     }
   }
 
@@ -5371,8 +5443,14 @@ async function startServer() {
   registerERPNextBridgeRoutes(app);
   registerIntegrationProtocolRoutes(app);
 
-  // Seed database on startup (no-op if tables already have data or no DB)
-  seedDatabaseIfEmpty().catch(() => {});
+  // Seed database on startup — DEMO/DEV ONLY (explicit opt-in, never in production).
+  // SECURITY: seeding fabricated customers/accounts into a real database launders
+  // mock data into the system of record. Production databases must only contain
+  // real operational data.
+  if (process.env.SEED_DATABASE === "true" && runtimeEnvironment !== "production") {
+    logger.warn("SEED_DATABASE is enabled — inserting DEMO rows into the database. Never enable in production.");
+    seedDatabaseIfEmpty().catch((err) => logger.error("Database seeding failed", { error: String(err) }));
+  }
 
   // Initialize Redis + Kafka middleware connections
   initRedis().catch(() => {});
@@ -5442,11 +5520,16 @@ async function startServer() {
   // DB-First Middleware — serves data from Postgres before falling back to seed data
   app.use(createDbFirstMiddleware());
 
-  // Seed Data Fallback — inline data for all routes so no page ever shows 503
-  // MUST be registered BEFORE proxy routes so seed data handlers match first
-  registerSeedDataFallback(app);
-  registerProxySeedFallback(fallbackRegistry);
-  registerPlatformSeedRoutes(app);
+  // Seed Data Fallback — DEMO/DEV ONLY (explicit opt-in, hard-disabled in production).
+  // SECURITY: these handlers shadow real proxy routes and serve fabricated banking
+  // data (fake GL balances, fake KYC verdicts, fake regulatory ratios). They must
+  // never be active in a production deployment.
+  if (process.env.SEED_DATA_FALLBACK === "true" && runtimeEnvironment !== "production") {
+    logger.warn("SEED_DATA_FALLBACK is enabled — API routes serve DEMO data. Never enable in production.");
+    registerSeedDataFallback(app);
+    registerProxySeedFallback(fallbackRegistry);
+    registerPlatformSeedRoutes(app);
+  }
 
   // KYC/KYB Enforcement Middleware — intercepts POST/PUT to gated services, verifies KYC/KYB status
   app.use(kycEnforcementMiddleware);
@@ -7834,15 +7917,38 @@ async function startServer() {
       res.status(400).json({ error: "Journal entry must have at least one line", code: "LEDGER_EMPTY_ENTRY" });
       return;
     }
+    // Reject negative/non-finite amounts: GL lines must be positive debit or
+    // credit values; a negative amount would silently invert the entry.
+    const invalidLine = (entry.entries as Array<{ debit?: number; credit?: number }>).find((line) => {
+      const debit = Number(line.debit ?? 0);
+      const credit = Number(line.credit ?? 0);
+      return !Number.isFinite(debit) || !Number.isFinite(credit) || debit < 0 || credit < 0 || (debit === 0 && credit === 0);
+    });
+    if (invalidLine) {
+      res.status(400).json({ error: "Journal entry lines must have finite, non-negative debit/credit amounts with at least one side > 0", code: "LEDGER_INVALID_AMOUNT" });
+      return;
+    }
     const balance = validateJournalBalance(entry.entries);
     if (!balance.valid) {
       res.status(400).json({ error: `Journal entry not balanced: debit=${balance.totalDebit} credit=${balance.totalCredit} diff=${balance.difference}`, code: "LEDGER_UNBALANCED" });
       return;
     }
-    entry.id = `JE-${Date.now()}`;
-    entry.status = "posted";
+    // Collision-resistant ID (Date.now() millisecond timestamps can collide
+    // under concurrent posts and must not double as an idempotency key).
+    entry.id = `JE-${randomUUID()}`;
     entry.postedAt = new Date().toISOString();
-    addJournalEntry(entry);
+    try {
+      // Save durably first; only mark the entry posted after the save succeeds.
+      entry.status = "pending";
+      addJournalEntry(entry);
+      entry.status = "posted";
+    } catch (err) {
+      // Failure marking: never leave a silent half-posted state.
+      entry.status = "failed";
+      logger.error("Journal entry persistence failed; entry marked failed", { error: String(err), entryId: entry.id });
+      res.status(503).json({ error: "Unable to durably save journal entry; it was NOT posted", code: "LEDGER_PERSISTENCE_FAILED", entryId: entry.id });
+      return;
+    }
     res.status(201).json(entry);
   });
 

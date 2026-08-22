@@ -8,6 +8,7 @@ name = "rate-cascade"
 path = "src/main.rs"
 
 [dependencies]
+jsonwebtoken = "9.3.0"
 tokio-postgres = { version = "0.7.13", features = ["default"] }
 actix-web = "4.9.0"
 serde = { version = "1.0.219", features = ["derive"] }

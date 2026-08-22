@@ -1,6 +1,7 @@
 package main
 
 import (
+	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 "sync"
 "bytes"
@@ -584,6 +585,14 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 
 func relayOutbox(brokers string, topic string) {
 	if db == nil { return }
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
 	if err != nil { return }
 	defer rows.Close()
@@ -593,17 +602,50 @@ func relayOutbox(brokers string, topic string) {
 		var id, eventType, aggID string
 		var payload []byte
 		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
 	if len(ids) == 0 { return }
-	// Mark as published
 	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
+
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
+
 
 
 func main() {
@@ -652,8 +694,8 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	// Domain endpoints
-	mux.HandleFunc("/api/v1/cards", domainHandler)
-	mux.HandleFunc("/api/v1/cards/", domainDetailHandler)
+	mux.Handle("/api/v1/cards", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(domainHandler)))
+	mux.Handle("/api/v1/cards/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(domainDetailHandler)))
 
 	server := &http.Server{
 		Addr:         ":" + getEnv("PORT", "8383"),
@@ -1053,17 +1095,17 @@ mux := http.NewServeMux()
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/alerts", alertsHandler)
-	mux.HandleFunc("/v1/degradation", degradationStatusHandler)
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
+	mux.Handle("/v1/degradation", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(degradationStatusHandler)))
 	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/api/list", listHandler)
-	mux.HandleFunc("/api/stats", statsHandler)
-	mux.HandleFunc("/api/get", getByIdHandler)
-	mux.HandleFunc("/api/create", createHandler)
+	mux.Handle("/api/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(listHandler)))
+	mux.Handle("/api/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(statsHandler)))
+	mux.Handle("/api/get", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(getByIdHandler)))
+	mux.Handle("/api/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(createHandler)))
 
-	mux.HandleFunc("/v1/cards/issue", issueCardHandler)
-	mux.HandleFunc("/v1/cards/action", cardActionHandler)
-	mux.HandleFunc("/v1/cards/pin-gen", pinGenHandler)
+	mux.Handle("/v1/cards/issue", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(issueCardHandler)))
+	mux.Handle("/v1/cards/action", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(cardActionHandler)))
+	mux.Handle("/v1/cards/pin-gen", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(pinGenHandler)))
 
 	log.Printf("card-management-go listening on port %s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
@@ -1090,4 +1132,13 @@ mux := http.NewServeMux()
     defer cancel()
     _ = server.Shutdown(ctx)
     log.Println("[card-management-go] Server stopped gracefully")
+}
+
+// jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
+// scripts/fix-go-wire-jwt.py).
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
 }

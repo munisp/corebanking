@@ -462,14 +462,28 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
     }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+    };
+    // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+    let secret = match std::env::var("JWT_SECRET") {
+        Ok(s) if !s.is_empty() => s,
+        _ => return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwt_validation_unavailable"}))),
+    };
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    match jsonwebtoken::decode::<serde_json::Value>(
+        token,
+        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    ) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
     }
 }
 

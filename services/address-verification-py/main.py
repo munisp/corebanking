@@ -294,16 +294,50 @@ def list_records(x_tenant_id: Optional[str] = Header(None)):
 
 # --- JWT Auth ---
 def validate_jwt(headers):
-    auth = headers.get("Authorization", "")
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    Canonical implementation: services/shared/auth/jwt_validation.py.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
     if not auth.startswith("Bearer "):
         return None, "Missing Bearer token"
     token = auth[7:]
+    import hmac, hashlib, base64, json as _json, time as _t
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
     parts = token.split(".")
     if len(parts) != 3:
         return None, "Invalid token format"
-    # In production: verify JWT signature with JWT_SECRET
-    return {"sub": "authenticated"}, None
-
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if _t.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
 # --- Domain Logic ---
 # --- HTTP Handler ---
 
@@ -579,7 +613,7 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = json.loads(sanitize_input(self.rfile.read(length).decode() if isinstance(self.rfile.read(length), bytes) else str(self.rfile.read(length)))) if length > 0 else {}
 
-        # JWT auth check (monitoring mode: warn but allow)
+        # JWT auth check — real signature verification, fail closed
         claims, err = validate_jwt(dict(self.headers))
         if err:
             self.respond(401, {"error": "unauthorized", "detail": err})
