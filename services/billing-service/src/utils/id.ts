@@ -1,3 +1,4 @@
+import { randomInt } from "crypto";
 import { v4 as uuidv4 } from "uuid";
 
 export function generateId(prefix?: string): string {
@@ -33,7 +34,8 @@ export function generateInvoiceNumber(): string {
   const now = new Date();
   const year = now.getFullYear();
   const month = String(now.getMonth() + 1).padStart(2, "0");
-  const seq = String(Math.floor(Math.random() * 99999)).padStart(5, "0");
+  // CSPRNG sequence — never Math.random() for financial document numbers.
+  const seq = String(randomInt(0, 100000)).padStart(5, "0");
   return `INV-${year}-${month}-${seq}`;
 }
 

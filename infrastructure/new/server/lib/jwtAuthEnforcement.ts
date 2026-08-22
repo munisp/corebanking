@@ -45,7 +45,19 @@ const JWT_CONFIG: JWTConfig = {
   issuer: process.env.KEYCLOAK_ISSUER ?? "https://identity.54bank.app/realms/54bank",
   audience: process.env.KEYCLOAK_AUDIENCE ?? "54bank-platform",
   realm: "54bank",
-  publicKeyUrl: process.env.KEYCLOAK_JWKS_URL ?? "https://identity.54bank.app/realms/54bank/protocol/openid-connect/certs",
+  // N-10: the JWKS endpoint must be supplied via the KEYCLOAK_JWKS_URL env var.
+  // Fail-closed: no hardcoded host/insecure default — module load throws when
+  // the variable is unset so tokens can never be verified against an
+  // attacker-influenced or stale default endpoint.
+  publicKeyUrl: (() => {
+    const jwksUrl = process.env.KEYCLOAK_JWKS_URL;
+    if (!jwksUrl) {
+      throw new Error(
+        "[AUTH] KEYCLOAK_JWKS_URL is not set — refusing to initialize JWT enforcement without an explicit JWKS endpoint (fail-closed)"
+      );
+    }
+    return jwksUrl;
+  })(),
   tokenExpiry: 900,
   refreshExpiry: 86400,
   algorithms: ["RS256"],

@@ -4574,7 +4574,7 @@ async function startServer() {
     const actorId = readActorId(req, role);
     const usageEvent = await createBillingUsageEvent({
       tenantId,
-      idempotencyKey: String(req.body?.idempotencyKey || `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
+      idempotencyKey: String(req.body?.idempotencyKey || randomUUID()),
       sourceService: String(req.body?.sourceService || "billing-gateway"),
       sourceEventType: String(req.body?.sourceEventType || "usage.manual_capture"),
       meterKey: String(req.body?.meterKey || "active_customer"),

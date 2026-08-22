@@ -12,7 +12,7 @@
  *   TIGERBEETLE_ADDRESSES   — comma-separated replica addresses (required)
  *   TIGERBEETLE_CLUSTER_ID  — u128 cluster id (default "0")
  */
-import { createHash } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { createRequire } from "module";
 import type { Express, Request, Response } from "express";
 import { sql } from "drizzle-orm";
@@ -196,7 +196,8 @@ export function registerTigerBeetleLedger(app: Express) {
     if (!Number.isInteger(ledgerNum) || ledgerNum <= 0 || !Number.isInteger(codeNum) || codeNum <= 0) {
       return res.status(400).json({ error: "validation_error", message: "Positive integer ledger and code are required" });
     }
-    const externalId = typeof id === "string" && id.trim() ? id.trim() : `tb-acc-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 16)}`;
+    // CSPRNG-derived fallback id — never Math.random() for ledger identifiers.
+    const externalId = typeof id === "string" && id.trim() ? id.trim() : `tb-acc-${createHash("sha256").update(randomBytes(32)).digest("hex").slice(0, 16)}`;
     const tbId = toU128(externalId);
     const errors = await client.createAccounts([{ id: tbId, ledger: ledgerNum, code: codeNum }]);
     if (errors.length > 0) {
@@ -232,7 +233,8 @@ export function registerTigerBeetleLedger(app: Express) {
     if (!Number.isInteger(ledgerNum) || ledgerNum <= 0 || !Number.isInteger(codeNum) || codeNum <= 0) {
       return res.status(400).json({ error: "validation_error", message: "Positive integer ledger and code are required" });
     }
-    const externalId = typeof id === "string" && id.trim() ? id.trim() : `tb-txn-${createHash("sha256").update(`${Date.now()}-${Math.random()}`).digest("hex").slice(0, 16)}`;
+    // CSPRNG-derived fallback id — never Math.random() for ledger identifiers.
+    const externalId = typeof id === "string" && id.trim() ? id.trim() : `tb-txn-${createHash("sha256").update(randomBytes(32)).digest("hex").slice(0, 16)}`;
     const transfer = {
       id: toU128(externalId),
       debit_account_id: toU128(String(debitAccountId)),

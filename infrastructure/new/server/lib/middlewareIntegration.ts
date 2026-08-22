@@ -211,7 +211,8 @@ export function registerMiddlewareIntegration(app: Express) {
       return res.status(400).json({ error: "topic and message required" });
     }
     // In production, this publishes to Kafka via KafkaJS
-    const eventId = `evt-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+    // CSPRNG event id — never Math.random() for event/correlation identifiers.
+    const eventId = `evt-${Date.now()}-${crypto.randomUUID()}`;
     logger.info(`Kafka publish: topic=${topic} eventId=${eventId}`);
     res.json({
       eventId,
