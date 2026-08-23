@@ -1358,6 +1358,62 @@ func (s *EscrowService) ResolveDispute(ctx context.Context, input ResolveDispute
 	return dispute, nil
 }
 
+// EscalateDispute escalates an unresolved dispute: it transitions the dispute
+// to "escalated", persists the state change, writes an audit event, and
+// notifies all contract parties. Any persistence failure is returned so the
+// caller (Temporal EscalateDispute activity) retries instead of silently
+// dropping the escalation (W7-C-05).
+func (s *EscrowService) EscalateDispute(ctx context.Context, disputeID string, reason string) (*Dispute, error) {
+	dispute, err := s.GetDispute(ctx, disputeID)
+	if err != nil {
+		return nil, err
+	}
+
+	switch dispute.Status {
+	case DisputeStatusOpen, DisputeStatusUnderReview, DisputeStatusAwaitingEvidence, DisputeStatusAwaitingDecision:
+		// Escalatable states.
+	default:
+		return nil, fmt.Errorf("dispute cannot be escalated in status: %s", dispute.Status)
+	}
+
+	contract, err := s.GetContract(ctx, dispute.ContractID)
+	if err != nil {
+		return nil, err
+	}
+
+	dispute.Status = DisputeStatusEscalated
+	dispute.Escalated = true
+	if err := s.updateDispute(ctx, dispute); err != nil {
+		return nil, fmt.Errorf("failed to persist dispute escalation: %w", err)
+	}
+
+	// Log audit event
+	s.auditService.LogEvent(ctx, AuditEvent{
+		TenantID:   contract.TenantID,
+		EntityType: "escrow_dispute",
+		EntityID:   dispute.ID,
+		EventType:  "dispute_escalated",
+		ActorID:    "system",
+		ActorType:  "system",
+		Details: map[string]interface{}{
+			"reason":      reason,
+			"contract_id": dispute.ContractID,
+		},
+	})
+
+	// Notify all contract parties that the dispute was escalated
+	for _, party := range contract.Parties {
+		s.notificationSvc.SendNotification(ctx, party.ID, map[string]interface{}{
+			"type":        "dispute_escalated",
+			"contract_id": dispute.ContractID,
+			"dispute_id":  dispute.ID,
+			"reason":      reason,
+		})
+	}
+
+	return dispute, nil
+}
+
 // ResolveDisputeInput represents input for resolving a dispute
 type ResolveDisputeInput struct {
 	DisputeID      string   `json:"dispute_id"`
