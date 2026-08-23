@@ -299,7 +299,9 @@ export const getOcrResult = asyncHandler(async (req: Request, res: Response) => 
 /** POST /api/v1/verification/:id/biometric/face-match */
 export const faceMatch = asyncHandler(async (req: Request, res: Response) => {
   const { id } = req.params;
-  const { selfieImage, documentFaceImage } = req.body || {};
+  // `documentFaceImage` is accepted for backward compatibility but no longer
+  // used: the provider verifies the selfie against the identity reference.
+  const { selfieImage } = req.body || {};
 
   const session = getSession(id);
   if (!session) throw new ApiError(httpStatus.NOT_FOUND, "Session not found", "VER-404-02", "verification-service");
@@ -307,7 +309,10 @@ export const faceMatch = asyncHandler(async (req: Request, res: Response) => {
 
   updateSession(id, { selfieBase64: selfieImage });
 
-  const result = compareFaces(selfieImage, documentFaceImage);
+  // The identity reference (NIN) must come from session metadata captured at
+  // initialization — never from the face-match request body.
+  const nin = (session.metadata?.nin ?? session.metadata?.UIN) as string | undefined;
+  const result = await compareFaces(selfieImage, nin);
   updateSession(id, { faceMatchScore: result.score });
 
   return res.json({
@@ -523,15 +528,37 @@ async function runOcrJob(
 }
 
 /**
- * Face comparison.
- * TODO: Replace with a real face-similarity service (e.g. AWS Rekognition, Shield).
- * Current: returns a mock high-confidence match when both images are present.
+ * Face comparison (W7-C-02).
+ *
+ * `verified: true` is NEVER a default. The selfie is verified through the
+ * configured Shield face-verification provider against the identity reference
+ * (NIN passport photo). When no provider is configured, or the session carries
+ * no identity reference, the request fails closed (503/400) instead of
+ * returning a fabricated similarity score. Match threshold: similarity ≥ 0.70.
  */
-function compareFaces(selfie: string, docFace?: string): { score: number; verified: boolean } {
-  if (!selfie || !docFace) return { score: 0.5, verified: false };
-  // Production: compute embedding cosine-similarity; threshold ≥ 0.70 = match
-  const score = 0.88;
-  return { score, verified: score >= 0.70 };
+async function compareFaces(selfie: string, nin?: string): Promise<{ score: number; verified: boolean }> {
+  if (!selfie) return { score: 0, verified: false };
+  if (!readEnv("SHIELD_VERIFICATION_BASE_URL") || !readEnv("SHIELD_VERIFICATION_API_KEY")) {
+    throw new ApiError(
+      httpStatus.SERVICE_UNAVAILABLE,
+      "Face-match provider not configured (face_match_not_configured)",
+      "VER-503-01",
+      "verification-service",
+    );
+  }
+  if (!nin) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "Session metadata must include an identity reference (nin) before face match can run",
+      "VER-400-05",
+      "verification-service",
+    );
+  }
+  const result = await shieldApiClient.verifyFace({ base64Image: selfie, nin });
+  const similarity = typeof result.similarity === "number" && Number.isFinite(result.similarity)
+    ? Math.min(Math.max(result.similarity, 0), 1)
+    : 0;
+  return { score: similarity, verified: result.success === true && similarity >= 0.70 };
 }
 
 /**
@@ -548,7 +575,9 @@ function computeScore(
   const docConfidence  = completedOcr?.result?.confidence ?? 0;
   const docScore       = flags.documentVerified ? Math.max(docConfidence, 0.80) : 0;
 
-  const faceScore      = session.faceMatchScore ?? (flags.faceMatched ? 0.88 : 0);
+  // W7-C-02: only a measured provider score counts. A client-supplied
+  // `faceMatched` flag can never mint a similarity score.
+  const faceScore      = session.faceMatchScore ?? 0;
   const livenessScore  = (session.livenessVerified || flags.livenessVerified) ? 1.0 : 0;
 
   const total = docScore * 0.40 + faceScore * 0.40 + livenessScore * 0.20;

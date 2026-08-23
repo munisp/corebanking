@@ -832,26 +832,71 @@ func contains(slice []string, item string) bool {
 	return false
 }
 
+// parseWindowMinutes parses an "HH:MM" wall-clock time into minutes since
+// midnight. Any malformed or out-of-range value is an error (fail-closed:
+// callers deny access for unparseable windows).
+func parseWindowMinutes(s string) (int, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) != 2 {
+		return 0, fmt.Errorf("invalid time window value %q (expected HH:MM)", s)
+	}
+	hour, err := strconv.Atoi(parts[0])
+	if err != nil || hour < 0 || hour > 23 {
+		return 0, fmt.Errorf("invalid hour in time window value %q", s)
+	}
+	minute, err := strconv.Atoi(parts[1])
+	if err != nil || minute < 0 || minute > 59 {
+		return 0, fmt.Errorf("invalid minute in time window value %q", s)
+	}
+	return hour*60 + minute, nil
+}
+
+// isInTimeWindow reports whether timestamp falls inside any of the given
+// access windows. Each window's StartTime/EndTime ("HH:MM") are interpreted in
+// the window's IANA Timezone (UTC when unset). Overnight windows (e.g.
+// 22:00-06:00) are supported: the window opens on a listed day and closes the
+// following day. Malformed windows and unknown timezones are skipped
+// (fail-closed: they never grant access).
 func isInTimeWindow(windows []models.TimeWindow, timestamp time.Time) bool {
 	for _, window := range windows {
-		// Check day of week
-		dayName := timestamp.Format("Mon")
-		if !contains(window.Days, dayName) {
+		loc := time.UTC
+		if window.Timezone != "" {
+			l, err := time.LoadLocation(window.Timezone)
+			if err != nil {
+				continue
+			}
+			loc = l
+		}
+		local := timestamp.In(loc)
+
+		startMin, err := parseWindowMinutes(window.StartTime)
+		if err != nil {
+			continue
+		}
+		endMin, err := parseWindowMinutes(window.EndTime)
+		if err != nil {
 			continue
 		}
 
-		// Check time range
-		// Parse start and end times
-		startParts := strings.Split(window.StartTime, ":")
-		endParts := strings.Split(window.EndTime, ":")
+		nowMin := local.Hour()*60 + local.Minute()
+		today := local.Format("Mon")
+		yesterday := local.AddDate(0, 0, -1).Format("Mon")
 
-		// Simplified time check (actual implementation should handle timezones properly)
-		// TODO: Implement proper time window checking
-
-		// Basic validation
-		if len(startParts) == 2 && len(endParts) == 2 {
-			// This is a simplified check
-			return true
+		if startMin <= endMin {
+			// Same-day window: day must be listed and time within [start, end].
+			if contains(window.Days, today) && nowMin >= startMin && nowMin <= endMin {
+				return true
+			}
+		} else {
+			// Overnight window (e.g. 22:00-06:00): inside when today is listed
+			// and time is past start, or yesterday was listed and time is
+			// still before the end.
+			if contains(window.Days, today) && nowMin >= startMin {
+				return true
+			}
+			if contains(window.Days, yesterday) && nowMin <= endMin {
+				return true
+			}
 		}
 	}
 	return false
