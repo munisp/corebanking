@@ -14,3 +14,4 @@ sqlx = { version = "0.8.3", features = ["runtime-tokio-rustls", "postgres", "uui
 log = "0.4.27"
 env_logger = "0.11.8"
 jsonwebtoken = "9.3.0"
+reqwest = { version = "0.12.22", features = ["json"] }
