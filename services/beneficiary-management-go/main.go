@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -247,28 +248,9 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"service": "beneficiary-management-go", "status": "ok",
-			"middleware": map[string]interface{}{
-				"kafka":       map[string]interface{}{"status": "connected", "topics": []string{"beneficiary_management.events", "beneficiary_management.audit", "beneficiary_management.notifications"}},
-				"dapr":        map[string]interface{}{"status": "connected", "appId": "beneficiary_management-sidecar"},
-				"fluvio":      map[string]interface{}{"status": "connected", "topic": "beneficiary_management-stream"},
-				"temporal":    map[string]interface{}{"status": "connected", "namespace": "beneficiary_management"},
-				"postgres":    map[string]interface{}{"status": "connected", "database": "ndsep_db", "schema": "beneficiary_management"},
-				"keycloak":    map[string]interface{}{"status": "connected", "realm": "54bank"},
-				"permify":     map[string]interface{}{"status": "connected", "schema": "beneficiary_management_authz"},
-				"redis":       map[string]interface{}{"status": "connected", "prefix": "beneficiary_management:"},
-				"mojaloop":    map[string]interface{}{"status": "connected", "participant": "beneficiary_management"},
-				"opensearch":  map[string]interface{}{"status": "connected", "index": "beneficiary_management-*"},
-				"openappsec":  map[string]interface{}{"status": "connected", "policy": "beneficiary_management-protection"},
-				"apisix":      map[string]interface{}{"status": "connected", "upstream": "beneficiary_management"},
-				"tigerbeetle": map[string]interface{}{"status": "connected", "cluster": "54bank-ledger"},
-				"lakehouse":   map[string]interface{}{"status": "connected", "table": "beneficiary_management_iceberg"},
-			},
-			"banks": len(bankDirectory),
-		})
-	})
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/v1/beneficiaries", handleBeneficiaries)
 	mux.HandleFunc("/v1/beneficiaries/verify", handleNameEnquiry)
 	mux.HandleFunc("/v1/beneficiaries/favorite", handleToggleFavorite)
@@ -277,7 +259,7 @@ func main() {
 
 	handler := corsMiddleware(mux)
 	log.Printf("Beneficiary Management Service starting on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, jwtAuthMiddleware(handler)))
+	log.Fatal(http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(handler)))))
 }
 
 func handleBeneficiaries(w http.ResponseWriter, r *http.Request) {
@@ -492,6 +474,101 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(204)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service": "beneficiary-management-go", "status": "ok",
+		"middleware": map[string]interface{}{
+			"kafka":       map[string]interface{}{"status": "connected", "topics": []string{"beneficiary_management.events", "beneficiary_management.audit", "beneficiary_management.notifications"}},
+			"dapr":        map[string]interface{}{"status": "connected", "appId": "beneficiary_management-sidecar"},
+			"fluvio":      map[string]interface{}{"status": "connected", "topic": "beneficiary_management-stream"},
+			"temporal":    map[string]interface{}{"status": "connected", "namespace": "beneficiary_management"},
+			"postgres":    map[string]interface{}{"status": "connected", "database": "ndsep_db", "schema": "beneficiary_management"},
+			"keycloak":    map[string]interface{}{"status": "connected", "realm": "54bank"},
+			"permify":     map[string]interface{}{"status": "connected", "schema": "beneficiary_management_authz"},
+			"redis":       map[string]interface{}{"status": "connected", "prefix": "beneficiary_management:"},
+			"mojaloop":    map[string]interface{}{"status": "connected", "participant": "beneficiary_management"},
+			"opensearch":  map[string]interface{}{"status": "connected", "index": "beneficiary_management-*"},
+			"openappsec":  map[string]interface{}{"status": "connected", "policy": "beneficiary_management-protection"},
+			"apisix":      map[string]interface{}{"status": "connected", "upstream": "beneficiary_management"},
+			"tigerbeetle": map[string]interface{}{"status": "connected", "cluster": "54bank-ledger"},
+			"lakehouse":   map[string]interface{}{"status": "connected", "table": "beneficiary_management_iceberg"},
+		},
+		"banks": len(bankDirectory),
+	})
+}
+
+// --- Request metrics (restored fleet-canonical block) ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"beneficiary-management-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"beneficiary-management-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"beneficiary-management-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"beneficiary-management-go"}`)
+}
+
+// --- Rate limiting (restored fleet-canonical token bucket: 100 rps) ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
 			return
 		}
 		next.ServeHTTP(w, r)
