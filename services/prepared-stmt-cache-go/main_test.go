@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -55,5 +56,22 @@ func TestRateLimiting(t *testing.T) {
 		req := httptest.NewRequest("GET", "/healthz", nil)
 		w := httptest.NewRecorder()
 		rateLimitMiddleware(http.HandlerFunc(healthHandler)).ServeHTTP(w, req)
+	}
+}
+
+func TestJWTForgedTokenRejected(t *testing.T) {
+	// A structurally valid RS256-shaped token with a forged signature must be
+	// rejected: the middleware performs real JWKS signature verification and
+	// never trusts token structure or claims without a valid signature.
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","kid":"forged-key"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"attacker","exp":9999999999}`))
+	sig := base64.RawURLEncoding.EncodeToString([]byte("forged-signature"))
+	req := httptest.NewRequest("GET", "/api/list", nil)
+	req.Header.Set("Authorization", "Bearer "+header+"."+payload+"."+sig)
+	w := httptest.NewRecorder()
+	handler := jwtAuthMiddleware(http.HandlerFunc(listHandler))
+	handler.ServeHTTP(w, req)
+	if w.Code != 401 {
+		t.Errorf("expected 401 for forged JWT, got %d", w.Code)
 	}
 }
