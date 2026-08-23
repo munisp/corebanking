@@ -665,20 +665,17 @@ func traceMiddleware(next http.Handler) http.Handler {
 
 // --- JWT Auth Middleware ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
+	// Chain-level guard delegates to the canonical RS256/JWKS verifier
+	// (jwtMiddleware): every non-probe request gets real Keycloak signature
+	// verification with exp/iss/aud enforcement; probe/health paths stay exempt.
+	inner := jwtMiddleware(jwtRealmURL(), next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-			return
-		}
-		next.ServeHTTP(w, r)
+		inner.ServeHTTP(w, r)
 	})
 }
 
@@ -1209,28 +1206,27 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func computeCropInsurancePremium(farmSize, sumInsured float64, cropType, state string) float64 {
-	baseRate := 0.05 // 5% of sum insured
-	cropMultipliers := map[string]float64{"rice": 1.0, "maize": 0.9, "cassava": 0.7, "yam": 0.8, "cocoa": 1.2}
-	m := cropMultipliers[cropType]
-	if m == 0 {
-		m = 1.0
+// ─── Domain Logic: Agri Evoucher ────────────────────────────────────────────
+
+func validateRequest(requestType string, payload map[string]interface{}) (bool, string) {
+	if requestType == "" {
+		return false, "Request type required"
 	}
-	riskZones := map[string]float64{"Borno": 1.5, "Adamawa": 1.3, "Zamfara": 1.4, "Lagos": 0.8, "Ogun": 0.9}
-	z := riskZones[state]
-	if z == 0 {
-		z = 1.0
+	if len(payload) == 0 {
+		return false, "Payload required"
 	}
-	return sumInsured * baseRate * m * z
+	return true, "Request valid"
 }
-func validateFarmerEligibility(bvnVerified bool, farmSize float64, state string) (bool, string) {
-	if !bvnVerified {
-		return false, "BVN verification required for agri lending"
+
+func computeMetrics(items []map[string]interface{}) map[string]interface{} {
+	total := len(items)
+	active := 0
+	for _, item := range items {
+		if status, ok := item["status"].(string); ok && status == "active" {
+			active++
+		}
 	}
-	if farmSize < 0.5 {
-		return false, "Minimum farm size is 0.5 hectares"
-	}
-	return true, "Farmer eligible for agri products"
+	return map[string]interface{}{"total": total, "active": active, "inactive": total - active, "utilization": float64(active) / float64(total+1) * 100}
 }
 
 // --- Circuit Breaker + Retry (Production) ---
