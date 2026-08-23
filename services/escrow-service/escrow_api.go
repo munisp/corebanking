@@ -215,6 +215,11 @@ func (api *EscrowAPI) SetupRoutes() *chi.Mux {
 			r.Get("/{milestoneID}", api.getMilestone)
 			r.Put("/{milestoneID}", api.updateMilestone)
 			r.Delete("/{milestoneID}", api.deleteMilestone)
+			// W7-C-04: completion/approval/evidence handlers were fully
+			// implemented but never routed — register them like sibling routes.
+			r.Post("/{milestoneID}/complete", api.completeMilestone)
+			r.Post("/{milestoneID}/approve", api.approveMilestone)
+			r.Post("/{milestoneID}/evidence", api.submitMilestoneEvidence)
 		})
 
 		// Dispute endpoints
@@ -223,6 +228,8 @@ func (api *EscrowAPI) SetupRoutes() *chi.Mux {
 			r.Get("/{disputeID}", api.getDispute)
 			r.Post("/{disputeID}/resolve", api.resolveDispute)
 			r.Post("/{disputeID}/escalate", api.escalateDispute)
+			// W7-C-04: dispute evidence submission was implemented but unrouted.
+			r.Post("/{disputeID}/evidence", api.submitDisputeEvidence)
 		})
 
 		// Template endpoints
