@@ -40,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -301,7 +302,7 @@ var httpClient = &http.Client{
 // callBVNAPI calls the configured BVN verification API.
 // Expected provider response (Prembly-compatible):
 //
-//	{ "status": true, "detail": { "first_name": "...", "last_name": "..., ... } }
+//	{ "status": true, "detail": { "first_name": "...", "last_name": "...", ... } }
 //
 // Adapt the field mapping below to match your specific provider's schema.
 func callBVNAPI(bvn string) (*BVNVerification, []byte, error) {
@@ -935,13 +936,86 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", handleHealthz)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/api/bvn/verify", handleBVNVerify)
 	mux.HandleFunc("/api/nin/verify", handleNINVerify)
 	mux.HandleFunc("/api/bvn-nin/check", handleBVNNINLinkage)
 
 	port := env("PORT", "8281")
 	log.Printf("bvn-nin-verification-go listening on :%s", port)
-	if err := http.ListenAndServe(":"+port, jwtAuthMiddleware(mux)); err != nil {
+	if err := http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+// --- Request metrics (restored fleet-canonical block) ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"bvn-nin-verification-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"bvn-nin-verification-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"bvn-nin-verification-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"bvn-nin-verification-go"}`)
+}
+
+// --- Rate limiting (restored fleet-canonical token bucket: 100 rps) ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
