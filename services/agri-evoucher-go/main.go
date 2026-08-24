@@ -1206,27 +1206,28 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// ─── Domain Logic: Agri Evoucher ────────────────────────────────────────────
-
-func validateRequest(requestType string, payload map[string]interface{}) (bool, string) {
-	if requestType == "" {
-		return false, "Request type required"
+func computeCropInsurancePremium(farmSize, sumInsured float64, cropType, state string) float64 {
+	baseRate := 0.05 // 5% of sum insured
+	cropMultipliers := map[string]float64{"rice": 1.0, "maize": 0.9, "cassava": 0.7, "yam": 0.8, "cocoa": 1.2}
+	m := cropMultipliers[cropType]
+	if m == 0 {
+		m = 1.0
 	}
-	if len(payload) == 0 {
-		return false, "Payload required"
+	riskZones := map[string]float64{"Borno": 1.5, "Adamawa": 1.3, "Zamfara": 1.4, "Lagos": 0.8, "Ogun": 0.9}
+	z := riskZones[state]
+	if z == 0 {
+		z = 1.0
 	}
-	return true, "Request valid"
+	return sumInsured * baseRate * m * z
 }
-
-func computeMetrics(items []map[string]interface{}) map[string]interface{} {
-	total := len(items)
-	active := 0
-	for _, item := range items {
-		if status, ok := item["status"].(string); ok && status == "active" {
-			active++
-		}
+func validateFarmerEligibility(bvnVerified bool, farmSize float64, state string) (bool, string) {
+	if !bvnVerified {
+		return false, "BVN verification required for agri lending"
 	}
-	return map[string]interface{}{"total": total, "active": active, "inactive": total - active, "utilization": float64(active) / float64(total+1) * 100}
+	if farmSize < 0.5 {
+		return false, "Minimum farm size is 0.5 hectares"
+	}
+	return true, "Farmer eligible for agri products"
 }
 
 // --- Circuit Breaker + Retry (Production) ---
