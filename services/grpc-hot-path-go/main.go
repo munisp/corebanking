@@ -487,6 +487,17 @@ func warnIfAuthUnconfigured() {
 	}
 }
 
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	// Initial JWKS fetch
 	go fetchJWKS(realmURL)
@@ -580,6 +591,15 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			}
 		}
 		// Pass claims in context
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
+		}
+		r.Header.Set("X-Tenant-ID", tenant)
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -588,22 +608,26 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 // enforceTenantClaim cross-checks a client-supplied tenant identifier against
 // the verified JWT claims (C-15). When the token carries a tenant (or
 // tenant_id) claim and it does not match the requested tenant, the request is
-// rejected with 403 and false is returned. Tokens without a tenant claim
-// (e.g. service accounts) are allowed.
+// rejected with 403 and false is returned. Fail-closed (wave-7.5): an empty
+// requested tenant, missing verified claims, or a token without a tenant claim
+// is rejected instead of being allowed.
 func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
 	if requestedTenant == "" {
-		return true
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return false
 	}
 	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
 	if claims == nil {
-		return true
+		http.Error(w, `{"error":"unauthorized: no verified token claims"}`, http.StatusUnauthorized)
+		return false
 	}
 	claimTenant, _ := claims["tenant"].(string)
 	if claimTenant == "" {
 		claimTenant, _ = claims["tenant_id"].(string)
 	}
 	if claimTenant == "" {
-		return true
+		http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+		return false
 	}
 	if claimTenant != requestedTenant {
 		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)
@@ -990,7 +1014,7 @@ func listRecords(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	offset := 0
 
-	query := `SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	query := `SELECT id, status, created_at FROM service_configs WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1024,7 +1048,8 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if tenantID == "" {
-		tenantID = "default"
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return
 	}
 	body["tenant_id"] = tenantID
 
@@ -1189,21 +1214,52 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func validateGRPCRequest(serviceName, methodName string, payloadSize int) (bool, string) {
-	if serviceName == "" {
-		return false, "Service name required"
-	}
-	if methodName == "" {
-		return false, "Method name required"
-	}
-	if payloadSize > 4194304 {
-		return false, "Payload exceeds 4MB gRPC limit"
-	}
-	return true, "gRPC request valid"
+// ─── Domain Logic: Grpc Hot Path ────────────────────────────────────────────
+
+type ConnectionPool struct {
+	ServiceName     string `json:"service_name"`
+	ActiveConns     int    `json:"active_conns"`
+	MaxConns        int    `json:"max_conns"`
+	AvgLatencyMs    int    `json:"avg_latency_ms"`
+	RequestsPerSec  int    `json:"requests_per_sec"`
+	ErrorRate       float64 `json:"error_rate"`
+	CircuitState    string `json:"circuit_state"`
 }
-func computeDeadline(methodType string) int {
-	deadlines := map[string]int{"unary": 30, "server_stream": 120, "client_stream": 120, "bidi_stream": 300}
-	return deadlines[methodType]
+
+func computePoolHealth(pool ConnectionPool) map[string]interface{} {
+	utilization := float64(pool.ActiveConns) / float64(pool.MaxConns) * 100
+	healthScore := 100.0
+	if pool.AvgLatencyMs > 100 {
+		healthScore -= 20
+	}
+	if pool.ErrorRate > 0.01 {
+		healthScore -= 30
+	}
+	if utilization > 80 {
+		healthScore -= 15
+	}
+	if pool.CircuitState != "closed" {
+		healthScore -= 25
+	}
+	return map[string]interface{}{
+		"health_score": healthScore, "conn_utilization": utilization,
+		"healthy": healthScore > 60, "recommendation": func() string {
+			if healthScore < 60 { return "scale_or_failover" }
+			if utilization > 80 { return "scale_up" }
+			return "optimal"
+		}(),
+	}
+}
+
+func handlePoolHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	var pool ConnectionPool
+	json.NewDecoder(r.Body).Decode(&pool)
+	health := computePoolHealth(pool)
+	respondJSON(w, 200, map[string]interface{}{"service": pool.ServiceName, "health": health})
 }
 
 // --- Circuit Breaker + Retry (Production) ---
@@ -1378,7 +1434,7 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "9365"
+		port = "9381"
 	}
 	initDB()
 	mux := http.NewServeMux()
@@ -1399,6 +1455,7 @@ func main() {
 	mux.Handle("/v1/grpc-hot-path/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 	mux.Handle("/v1/grpc-hot-path/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(grpc_hot_pathScoreHandler)))
 	mux.Handle("/v1/grpc-hot-path/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(grpc_hot_pathValidateRequestHandler)))
+	mux.Handle("/v1/grpc-hot-path/pool-health", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handlePoolHealth)))
 	log.Printf("Grpc Hot Path v2.0 (Infrastructure/Data) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1435,14 +1492,6 @@ func jwtRealmURL() string {
 		return v
 	}
 	return "http://keycloak:8080/realms/54bank"
-}
-
-func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil {
-		return fmt.Errorf("no db")
-	}
-	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
-	return err
 }
 
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
@@ -1495,6 +1544,14 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
+}
+
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
 }
 
 var _cbOpen atomic.Bool
