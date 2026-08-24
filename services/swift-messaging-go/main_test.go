@@ -10,7 +10,7 @@ import (
 func TestHealthEndpoint(t *testing.T) {
 	req := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
-	healthHandler(w, req)
+	healthz(w, req)
 	if w.Code != 200 {
 		t.Errorf("health returned %d", w.Code)
 	}
@@ -43,7 +43,7 @@ func TestMetricsEndpoint(t *testing.T) {
 func TestJWTRequired(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/list", nil)
 	w := httptest.NewRecorder()
-	handler := jwtAuthMiddleware(http.HandlerFunc(listHandler))
+	handler := jwtAuthMiddleware(http.HandlerFunc(handleMessages))
 	handler.ServeHTTP(w, req)
 	if w.Code != 401 {
 		t.Errorf("expected 401 without JWT, got %d", w.Code)
@@ -54,6 +54,6 @@ func TestRateLimiting(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		req := httptest.NewRequest("GET", "/healthz", nil)
 		w := httptest.NewRecorder()
-		rateLimitMiddleware(http.HandlerFunc(healthHandler)).ServeHTTP(w, req)
+		rateLimitMiddleware(http.HandlerFunc(healthz)).ServeHTTP(w, req)
 	}
 }
