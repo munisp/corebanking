@@ -296,6 +296,39 @@ func initDB() {
 	}
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
+
+	// PH-AUDIT-MEM: the audit trail must be durable — create the hash-chained
+	// table up front so an append never depends on an out-of-band migration.
+	initAuditSchema()
+}
+
+// initAuditSchema creates the append-only, hash-chained audit table
+// (mirrors services/security-service/audit_trail.go).
+func initAuditSchema() {
+	if db == nil {
+		return
+	}
+	if _, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS payments_hub_audit_trail (
+				id            VARCHAR(50) PRIMARY KEY,
+				action        VARCHAR(100) NOT NULL,
+				record_id     VARCHAR(128),
+				actor         VARCHAR(128),
+				tenant_id     VARCHAR(128),
+				details       TEXT,
+				previous_hash VARCHAR(64),
+				entry_hash    VARCHAR(64) NOT NULL,
+				created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)`); err != nil {
+		log.Printf("[audit] ERROR: failed to create payments_hub_audit_trail: %v", err)
+		return
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_ph_audit_tenant ON payments_hub_audit_trail(tenant_id)`); err != nil {
+		log.Printf("[audit] ERROR: failed to create audit tenant index: %v", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_ph_audit_created ON payments_hub_audit_trail(created_at)`); err != nil {
+		log.Printf("[audit] ERROR: failed to create audit created_at index: %v", err)
+	}
 }
 
 // --- Idempotency Middleware (Redis-backed) ---
@@ -567,8 +600,8 @@ func outboxAppend(topic, key string, payload interface{}, idempotencyKey string)
 	if db != nil {
 		payloadJSON, _ := json.Marshal(payload)
 		_, err := db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (idempotency_key) DO NOTHING`,
+				VALUES ($1, $2, $3, $4, $5, $6, $7)
+				ON CONFLICT (idempotency_key) DO NOTHING`,
 			entry.ID, topic, key, payloadJSON, idempotencyKey, entry.CreatedAt, entry.Status)
 		if err != nil {
 			log.Printf("[outbox] INSERT failed: %v", err)
@@ -673,6 +706,10 @@ func routePayment(w http.ResponseWriter, r *http.Request) {
 
 	if resp.StatusCode >= 300 || railResp.ResponseCode != "00" {
 		atomic.AddUint64(&errorCount, 1)
+		if err := appendAudit("payment.failed", paymentID, r.Header.Get("X-User-Id"), r.Header.Get("X-Tenant-ID"),
+			fmt.Sprintf("channel=NIP rail_code=%s rail_message=%s", sanitizeLogValue(railResp.ResponseCode), sanitizeLogValue(railResp.ResponseMessage))); err != nil {
+			log.Printf("[audit] ERROR: failed to persist payment.failed audit for %s: %v", paymentID, err)
+		}
 		respondJSON(w, 502, map[string]interface{}{
 			"payment_id": paymentID, "channel": "NIP", "status": "failed",
 			"rail_response_code": railResp.ResponseCode, "rail_message": railResp.ResponseMessage,
@@ -695,6 +732,12 @@ func routePayment(w http.ResponseWriter, r *http.Request) {
 			"session_id": railResp.SessionID,
 		})
 		return
+	}
+	if err := appendAudit("payment.routed", paymentID, r.Header.Get("X-User-Id"), r.Header.Get("X-Tenant-ID"),
+		fmt.Sprintf("channel=NIP session=%s amount_kobo=%d", sanitizeLogValue(railResp.SessionID), body["amount_kobo"])); err != nil {
+		// The payment is already routed at the rail; an audit persistence
+		// failure is a reportable incident, surfaced loudly — never dropped.
+		log.Printf("[audit] ERROR: failed to persist payment.routed audit for %s: %v", paymentID, err)
 	}
 	respondJSON(w, map[string]interface{}{
 		"payment_id": paymentID, "channel": "NIP", "status": "routed", "session_id": railResp.SessionID,
@@ -766,27 +809,82 @@ func validateAmount(amount float64) error {
 	return nil
 }
 
-// --- Audit Trail (append-only) ---
+// --- Audit Trail (durable, hash-chained, append-only) ---
+// PH-AUDIT-MEM: previously this trail was a process-memory slice lost on
+// restart and auditHash was dead code. Entries now persist to
+// payments_hub_audit_trail with a SHA-256 chain (previous_hash/entry_hash),
+// mirroring services/security-service/audit_trail.go semantics.
 type AuditEntry struct {
-	ID        string `json:"id"`
-	Action    string `json:"action"`
-	RecordID  string `json:"record_id"`
-	Actor     string `json:"actor"`
-	Timestamp string `json:"timestamp"`
-	Details   string `json:"details"`
+	ID           string `json:"id"`
+	Action       string `json:"action"`
+	RecordID     string `json:"record_id"`
+	Actor        string `json:"actor"`
+	TenantID     string `json:"tenant_id"`
+	Timestamp    string `json:"timestamp"`
+	Details      string `json:"details"`
+	PreviousHash string `json:"previous_hash"`
+	EntryHash    string `json:"entry_hash"`
 }
 
-var auditLog []AuditEntry
+var (
+	auditChainMu   sync.Mutex
+	auditChainHead string // cached last entry_hash; seeded from the DB once
+	auditChainInit bool
+)
 
 var eventBus = newEventBus("banking.payments", "payments-hub")
 
-func appendAudit(action, recordID, actor, details string) {
-	auditLog = append(auditLog, AuditEntry{
-		ID:     fmt.Sprintf("AUD-%08X", secureRandUint32()),
-		Action: action, RecordID: recordID, Actor: actor,
-		Timestamp: time.Now().UTC().Format(time.RFC3339), Details: details,
-	})
+// appendAudit persists one audit entry chained to the previous entry's hash.
+// The chain head is re-seeded from the database on first use so a restart
+// continues the existing chain instead of forking it. Any failure is
+// returned — callers must surface it, never drop the audit record silently.
+func appendAudit(action, recordID, actor, tenantID, details string) error {
+	if db == nil {
+		return fmt.Errorf("audit store unavailable (no database connection)")
+	}
 
+	auditChainMu.Lock()
+	defer auditChainMu.Unlock()
+
+	if !auditChainInit {
+		var head sql.NullString
+		err := db.QueryRow(
+			"SELECT entry_hash FROM payments_hub_audit_trail ORDER BY created_at DESC, id DESC LIMIT 1",
+		).Scan(&head)
+		if err != nil && err != sql.ErrNoRows {
+			return fmt.Errorf("load audit chain head: %w", err)
+		}
+		auditChainHead = head.String
+		auditChainInit = true
+	}
+
+	entry := AuditEntry{
+		ID:        fmt.Sprintf("AUD-%08X", secureRandUint32()),
+		Action:    action,
+		RecordID:  recordID,
+		Actor:     actor,
+		TenantID:  tenantID,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Details:   details,
+	}
+	entry.PreviousHash = auditChainHead
+	canonical := strings.Join([]string{
+		entry.ID, entry.Action, entry.RecordID, entry.Actor, entry.TenantID,
+		entry.PreviousHash, entry.Timestamp,
+	}, "|")
+	entry.EntryHash = auditHash(entry.PreviousHash, canonical)
+
+	if _, err := db.Exec(
+		`INSERT INTO payments_hub_audit_trail
+				(id, action, record_id, actor, tenant_id, details, previous_hash, entry_hash, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		entry.ID, entry.Action, entry.RecordID, entry.Actor, entry.TenantID,
+		entry.Details, entry.PreviousHash, entry.EntryHash, entry.Timestamp,
+	); err != nil {
+		return fmt.Errorf("persist audit entry: %w", err)
+	}
+	auditChainHead = entry.EntryHash
+	return nil
 }
 
 // sanitizeLogValue strips CR/LF and other control characters from
