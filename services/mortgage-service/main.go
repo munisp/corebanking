@@ -548,7 +548,7 @@ func fetchJWKS(realmURL string) {
 		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 	}
 	jwtCache.updated = time.Now()
-	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwks.Keys))
 }
 
 // ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
@@ -1931,8 +1931,11 @@ func recordPayment(c *gin.Context) {
 		return
 	}
 
-	// Update arrears status if applicable
-	updateArrearsStatus(id, tenantID)
+	// Update arrears status if applicable — recalculation failures are
+	// logged, never silently dropped (the daily servicing workflow retries).
+	if err := updateArrearsStatus(id, tenantID); err != nil {
+		log.Printf("Failed to update arrears status for mortgage %s after payment: %v", id, err)
+	}
 
 	// Publish event
 	kafkaClient.PublishEventReliably("mortgages.payments", MortgageEvent{
