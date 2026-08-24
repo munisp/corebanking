@@ -359,7 +359,6 @@ func countingMiddleware(next http.Handler) http.Handler {
 		}
 	})
 }
-
 type responseWriter struct {
 	http.ResponseWriter
 	status int
@@ -837,7 +836,6 @@ func (cb *circuitBreaker) allow() bool {
 	}
 	return true
 }
-
 
 func (cb *circuitBreaker) recordSuccess() {
 	cb.mu.Lock()
