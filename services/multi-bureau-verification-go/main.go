@@ -1172,33 +1172,39 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func validateBureauConfig(provider string, endpoint string, timeoutMs int) (bool, string) {
-	if provider == "" {
-		return false, "Provider required"
+func aggregateBureauScores(scores map[string]int) (int, string) {
+	total := 0
+	count := 0
+	for _, s := range scores {
+		total += s
+		count++
 	}
-	if endpoint == "" {
-		return false, "Endpoint required"
+	if count == 0 {
+		return 0, "No bureau data"
 	}
-	if timeoutMs > 30000 {
-		return false, "Bureau timeout cannot exceed 30 seconds"
+	avg := total / count
+	grade := "E"
+	switch {
+	case avg >= 750:
+		grade = "A"
+	case avg >= 650:
+		grade = "B"
+	case avg >= 550:
+		grade = "C"
+	case avg >= 450:
+		grade = "D"
 	}
-	if timeoutMs < 1000 {
-		return false, "Bureau timeout must be at least 1 second"
-	}
-	return true, "Bureau config valid"
+	return avg, grade
 }
-func computeVerificationConsensus(bvnMatch bool, ninMatch bool, dlMatch bool) float64 {
-	score := 0.0
-	if bvnMatch {
-		score += 0.4
+func validateBureauReport(bureauName string, reportAge int) (bool, string) {
+	if reportAge > 90 {
+		return false, "Bureau report older than 90 days — request fresh report"
 	}
-	if ninMatch {
-		score += 0.35
+	validBureaus := map[string]bool{"CRC": true, "FirstCentral": true, "CreditRegistry": true}
+	if !validBureaus[bureauName] {
+		return false, "Unknown credit bureau: " + bureauName
 	}
-	if dlMatch {
-		score += 0.25
-	}
-	return score
+	return true, "Bureau report valid"
 }
 
 // --- Circuit Breaker + Retry (Production) ---
@@ -1373,7 +1379,7 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "9391"
+		port = "9088"
 	}
 	initDB()
 	mux := http.NewServeMux()
@@ -1392,7 +1398,7 @@ func main() {
 	mux.Handle("/v1/multi-bureau/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 	mux.Handle("/v1/multi-bureau-verification/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(multi_bureau_verificationScoreHandler)))
 	mux.Handle("/v1/multi-bureau-verification/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(multi_bureau_verificationValidateRequestHandler)))
-	log.Printf("Multi-Bureau Verification v2.0 (Identity) on :%s", port)
+	log.Printf("Multi-Bureau Verification v2.0 (Go) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
 	_ = tlsKey
