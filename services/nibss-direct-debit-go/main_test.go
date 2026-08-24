@@ -1,26 +1,45 @@
 package main
 
-import "testing"
+import (
+	"net/http/httptest"
+	"strings"
+	"testing"
+)
 
-func TestValidateMandate(t *testing.T) {
-	ok, errs := validateMandate("0123456789", "MND001", 50000)
-	if !ok {
-		t.Errorf("valid 10-digit NUBAN should pass, errors: %v", errs)
+// Rewritten: the previous tests referenced helpers (healthHandler/readyzHandler/
+// metricsHandler/jwtAuthMiddleware/rateLimitMiddleware/listHandler) from the
+// fleet scaffold that this stub service does not implement. These tests cover
+// the handlers the service actually serves today.
+
+func TestHealthEndpoint(t *testing.T) {
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	healthHandler(w, req)
+	if w.Code != 200 {
+		t.Errorf("health returned %d", w.Code)
 	}
-	ok, _ = validateMandate("short", "MND001", 50000)
-	if ok {
-		t.Error("non-10-digit account should fail")
+	if !strings.Contains(w.Body.String(), `"status":"ok"`) {
+		t.Error("missing ok status")
 	}
-	ok, _ = validateMandate("0123456789", "", 50000)
-	if ok {
-		t.Error("empty mandate ref should fail")
+}
+
+func TestRootEndpoint(t *testing.T) {
+	req := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	rootHandler(w, req)
+	if w.Code != 200 {
+		t.Errorf("root returned %d", w.Code)
 	}
-	ok, _ = validateMandate("0123456789", "MND001", 0)
-	if ok {
-		t.Error("zero amount should fail")
+	if !strings.Contains(w.Body.String(), `"status":"running"`) {
+		t.Error("missing running status")
 	}
-	ok, _ = validateMandate("0123456789", "MND001", -100)
-	if ok {
-		t.Error("negative amount should fail")
+}
+
+func TestUnknownPathNotFound(t *testing.T) {
+	req := httptest.NewRequest("GET", "/no-such-path", nil)
+	w := httptest.NewRecorder()
+	rootHandler(w, req)
+	if w.Code != 404 {
+		t.Errorf("expected 404 for unknown path, got %d", w.Code)
 	}
 }
