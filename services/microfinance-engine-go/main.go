@@ -14,181 +14,86 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-func envOr(k, f string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return f
-}
-func now() string { return time.Now().UTC().Format(time.RFC3339) }
+var port = getEnv("PORT", "8252")
 
-type MFGroup struct {
-	ID             string  `json:"id"`
-	Name           string  `json:"name"`
-	GroupType      string  `json:"groupType"`
-	Members        int     `json:"members"`
-	LoanOfficer    string  `json:"loanOfficer"`
-	MeetingDay     string  `json:"meetingDay"`
-	SavingsBalance float64 `json:"savingsBalance"`
-	LoanBalance    float64 `json:"loanBalance"`
-	AttendanceRate float64 `json:"attendanceRate"`
-	Status         string  `json:"status"`
-	Region         string  `json:"region"`
+type GroupLoan struct {
+	GroupID      string  `json:"groupId"`
+	GroupName    string  `json:"groupName"`
+	CenterName   string  `json:"centerName"`
+	Members      int     `json:"memberCount"`
+	TotalAmount  float64 `json:"totalAmount"`
+	RepaidAmount float64 `json:"repaidAmount"`
+	WeeklyRate   float64 `json:"weeklyRate"`
+	Weeks        int     `json:"weeksTotal"`
+	WeeksPaid    int     `json:"weeksPaid"`
+	Officer      string  `json:"loanOfficer"`
+	Status       string  `json:"status"`
 }
 
-type MFLoan struct {
-	ID          string   `json:"id"`
-	GroupID     string   `json:"groupId"`
-	MemberName  string   `json:"memberName"`
-	Amount      float64  `json:"amount"`
-	Purpose     string   `json:"purpose"`
-	Term        int      `json:"term"`
-	Rate        float64  `json:"rate"`
-	Repaid      float64  `json:"repaid"`
-	Status      string   `json:"status"`
-	Guarantors  []string `json:"guarantors"`
-	DisbursedAt string   `json:"disbursedAt"`
+type Member struct {
+	ID          string `json:"id"`
+	GroupID     string `json:"groupId"`
+	Name        string `json:"name"`
+	Phone       string `json:"phone"`
+	Business    string `json:"business"`
+	LoanShare   string `json:"loanShare"`
+	SavingsBal  string `json:"savingsBalance"`
+	MeetingRate string `json:"meetingAttendance"`
 }
 
-type SavingsCycle struct {
-	ID         string  `json:"id"`
-	GroupID    string  `json:"groupId"`
-	CycleNo    int     `json:"cycleNo"`
-	StartDate  string  `json:"startDate"`
-	EndDate    string  `json:"endDate"`
-	TotalSaved float64 `json:"totalSaved"`
-	ShareValue float64 `json:"shareValue"`
-	Status     string  `json:"status"`
+type Center struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	Location string `json:"location"`
+	Groups   int    `json:"groupCount"`
+	Members  int    `json:"memberCount"`
+	Officer  string `json:"officer"`
 }
 
 var (
-	mu     sync.RWMutex
-	groups []MFGroup
-	loans  []MFLoan
-	cycles []SavingsCycle
+	groupLoans []GroupLoan
+	members    []Member
+	centers    []Center
 )
 
 func init() {
-	groups = []MFGroup{
-		{ID: "MFG-001", Name: "Iya Oloja Women's Group", GroupType: "solidarity", Members: 15, LoanOfficer: "LO-001 Adebisi Kemi", MeetingDay: "Monday", SavingsBalance: 4500000.0, LoanBalance: 12000000.0, AttendanceRate: 96.5, Status: "active", Region: "Lagos-Mushin"},
-		{ID: "MFG-002", Name: "Agric Cooperative Kano", GroupType: "cooperative", Members: 25, LoanOfficer: "LO-002 Musa Ibrahim", MeetingDay: "Wednesday", SavingsBalance: 8200000.0, LoanBalance: 25000000.0, AttendanceRate: 92.0, Status: "active", Region: "Kano-Sabon-Gari"},
-		{ID: "MFG-003", Name: "Traders Union Onitsha", GroupType: "village_banking", Members: 30, LoanOfficer: "LO-003 Chidera Obi", MeetingDay: "Thursday", SavingsBalance: 6800000.0, LoanBalance: 18000000.0, AttendanceRate: 88.5, Status: "active", Region: "Anambra-Onitsha"},
-		{ID: "MFG-004", Name: "Youth Empowerment Ibadan", GroupType: "solidarity", Members: 12, LoanOfficer: "LO-004 Taiwo Ade", MeetingDay: "Friday", SavingsBalance: 2100000.0, LoanBalance: 5000000.0, AttendanceRate: 94.0, Status: "active", Region: "Oyo-Ibadan"},
-		{ID: "MFG-005", Name: "Market Women PH", GroupType: "village_banking", Members: 20, LoanOfficer: "LO-005 Grace Amadi", MeetingDay: "Tuesday", SavingsBalance: 5500000.0, LoanBalance: 15000000.0, AttendanceRate: 91.0, Status: "active", Region: "Rivers-PH"},
-	}
-	loans = []MFLoan{
-		{ID: "MFL-001", GroupID: "MFG-001", MemberName: "Adeola Balogun", Amount: 500000.0, Purpose: "textile_trading", Term: 12, Rate: 2.5, Repaid: 350000.0, Status: "performing", Guarantors: []string{"Funke Adeyemi", "Shade Okonkwo"}, DisbursedAt: "2026-01-15T10:00:00Z"},
-		{ID: "MFL-002", GroupID: "MFG-001", MemberName: "Funke Adeyemi", Amount: 750000.0, Purpose: "food_processing", Term: 18, Rate: 2.5, Repaid: 450000.0, Status: "performing", Guarantors: []string{"Adeola Balogun", "Bisi Oladipo"}, DisbursedAt: "2025-11-01T10:00:00Z"},
-		{ID: "MFL-003", GroupID: "MFG-002", MemberName: "Aliyu Danjuma", Amount: 2000000.0, Purpose: "irrigation_equipment", Term: 24, Rate: 3.0, Repaid: 800000.0, Status: "performing", Guarantors: []string{"Sani Mohammed", "Bello Garba"}, DisbursedAt: "2025-09-01T10:00:00Z"},
-		{ID: "MFL-004", GroupID: "MFG-003", MemberName: "Nkechi Uzoma", Amount: 1500000.0, Purpose: "electronics_import", Term: 12, Rate: 2.8, Repaid: 1500000.0, Status: "fully_repaid", Guarantors: []string{"Obioma Nwachukwu", "Ada Okafor"}, DisbursedAt: "2025-05-01T10:00:00Z"},
-		{ID: "MFL-005", GroupID: "MFG-004", MemberName: "Tunde Ajayi", Amount: 300000.0, Purpose: "phone_repair_shop", Term: 6, Rate: 2.0, Repaid: 50000.0, Status: "performing", Guarantors: []string{"Segun Ojo"}, DisbursedAt: "2026-04-01T10:00:00Z"},
-		{ID: "MFL-006", GroupID: "MFG-005", MemberName: "Blessing Okoro", Amount: 800000.0, Purpose: "provision_store", Term: 12, Rate: 2.5, Repaid: 100000.0, Status: "watch_list", Guarantors: []string{"Joy Amaechi", "Patience Nwogu"}, DisbursedAt: "2026-03-01T10:00:00Z"},
-	}
-	cycles = []SavingsCycle{
-		{ID: "SC-001", GroupID: "MFG-001", CycleNo: 3, StartDate: "2026-01-01", EndDate: "2026-12-31", TotalSaved: 4500000.0, ShareValue: 10000.0, Status: "active"},
-		{ID: "SC-002", GroupID: "MFG-002", CycleNo: 2, StartDate: "2026-01-01", EndDate: "2026-12-31", TotalSaved: 8200000.0, ShareValue: 25000.0, Status: "active"},
-		{ID: "SC-003", GroupID: "MFG-003", CycleNo: 4, StartDate: "2026-01-01", EndDate: "2026-12-31", TotalSaved: 6800000.0, ShareValue: 15000.0, Status: "active"},
-	}
+	groupLoans = []GroupLoan{}
+	members = []Member{}
+	centers = []Center{}
 }
 
-func respond(w http.ResponseWriter, code int, data interface{}) {
+var middlewareStatus = map[string]interface{}{
+	"kafka":       map[string]interface{}{"broker": getEnv("KAFKA_BROKER", "localhost:9092"), "topics": "microfinance.disbursements,microfinance.repayments,microfinance.meetings"},
+	"dapr":        map[string]interface{}{"url": getEnv("DAPR_URL", "http://localhost:3500"), "app_id": "microfinance-engine"},
+	"fluvio":      map[string]interface{}{"url": getEnv("FLUVIO_URL", "localhost:9003"), "topic": "microfinance-repayments"},
+	"temporal":    map[string]interface{}{"url": getEnv("TEMPORAL_URL", "localhost:7233"), "workflows": "GroupLendingWorkflow,RepaymentWorkflow,MeetingWorkflow"},
+	"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": "group_loans,members,centers,repayment_schedules"},
+	"keycloak":    map[string]interface{}{"url": getEnv("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank"},
+	"permify":     map[string]interface{}{"url": getEnv("PERMIFY_URL", "http://localhost:3476"), "schema": "microfinance_rbac"},
+	"redis":       map[string]interface{}{"url": getEnv("REDIS_URL", "redis://localhost:6379"), "purpose": "session,cache"},
+	"mojaloop":    map[string]interface{}{"url": getEnv("MOJALOOP_URL", "http://localhost:4000"), "purpose": "microloan settlement"},
+	"opensearch":  map[string]interface{}{"url": getEnv("OPENSEARCH_URL", "http://localhost:9200"), "index": "microfinance-*"},
+	"openappsec":  map[string]interface{}{"url": getEnv("OPENAPPSEC_URL", "http://localhost:8090"), "policy": "microfinance-protection"},
+	"apisix":      map[string]interface{}{"url": getEnv("APISIX_URL", "http://localhost:9080"), "route": "/v1/microfinance/*"},
+	"tigerbeetle": map[string]interface{}{"url": getEnv("TIGERBEETLE_URL", "localhost:3000"), "purpose": "microloan ledger"},
+	"lakehouse":   map[string]interface{}{"url": getEnv("LAKEHOUSE_URL", "http://localhost:8206"), "tables": "microfinance_analytics"},
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func jsonResponse(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(data)
-}
-
-func healthz(w http.ResponseWriter, _ *http.Request) {
-	respond(w, 200, map[string]interface{}{
-		"service": "microfinance-engine-go", "status": "healthy", "version": "1.0.0",
-		"middleware": map[string]interface{}{
-			"kafka":       map[string]interface{}{"status": "connected", "topics": []string{"mf.groups", "mf.loans", "mf.savings", "mf.attendance"}},
-			"dapr":        map[string]interface{}{"status": "connected", "appId": "microfinance-engine-go"},
-			"fluvio":      map[string]interface{}{"status": "connected", "topic": "mf-realtime"},
-			"temporal":    map[string]interface{}{"status": "connected", "workflows": []string{"loan-disbursement", "savings-cycle", "attendance-tracking"}},
-			"postgres":    map[string]interface{}{"status": "connected", "tables": []string{"mf_groups", "mf_loans", "savings_cycles", "attendance"}},
-			"keycloak":    map[string]interface{}{"status": "connected", "realm": "54bank"},
-			"permify":     map[string]interface{}{"status": "connected", "schema": "mf_rbac"},
-			"redis":       map[string]interface{}{"status": "connected", "prefix": "mf:"},
-			"mojaloop":    map[string]interface{}{"status": "connected", "participant": "mf-engine"},
-			"opensearch":  map[string]interface{}{"status": "connected", "index": "mf-operations-*"},
-			"openappsec":  map[string]interface{}{"status": "connected", "policy": "mf-protection"},
-			"apisix":      map[string]interface{}{"status": "connected", "upstream": "microfinance-engine"},
-			"tigerbeetle": map[string]interface{}{"status": "connected", "cluster": "54bank-ledger"},
-			"lakehouse":   map[string]interface{}{"status": "connected", "table": "mf_operations_iceberg"},
-		},
-	})
-}
-
-func handleGroups(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
-	if r.Method == http.MethodPost {
-		var g MFGroup
-		json.NewDecoder(r.Body).Decode(&g)
-		g.ID = fmt.Sprintf("MFG-%03d", len(groups)+1)
-		g.Status = "forming"
-		groups = append(groups, g)
-		respond(w, 201, g)
-		return
-	}
-	respond(w, 200, map[string]interface{}{"items": groups, "total": len(groups)})
-}
-
-func handleLoans(w http.ResponseWriter, r *http.Request) {
-	mu.Lock()
-	defer mu.Unlock()
-	if r.Method == http.MethodPost {
-		var l MFLoan
-		json.NewDecoder(r.Body).Decode(&l)
-		l.ID = fmt.Sprintf("MFL-%03d", len(loans)+1)
-		l.Status = "pending_approval"
-		l.DisbursedAt = now()
-		loans = append(loans, l)
-		respond(w, 201, l)
-		return
-	}
-	respond(w, 200, map[string]interface{}{"items": loans, "total": len(loans)})
-}
-
-func handleCycles(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	respond(w, 200, map[string]interface{}{"items": cycles, "total": len(cycles)})
-}
-
-func handleStats(w http.ResponseWriter, _ *http.Request) {
-	mu.RLock()
-	defer mu.RUnlock()
-	totalMembers := 0
-	var totalSavings, totalLoanBalance, totalRepaid float64
-	for _, g := range groups {
-		totalMembers += g.Members
-		totalSavings += g.SavingsBalance
-		totalLoanBalance += g.LoanBalance
-	}
-	performing := 0
-	fullyRepaid := 0
-	watchList := 0
-	for _, l := range loans {
-		totalRepaid += l.Repaid
-		switch l.Status {
-		case "performing":
-			performing++
-		case "fully_repaid":
-			fullyRepaid++
-		case "watch_list":
-			watchList++
-		}
-	}
-	respond(w, 200, map[string]interface{}{
-		"totalGroups": len(groups), "totalMembers": totalMembers,
-		"totalSavings": totalSavings, "totalLoanBalance": totalLoanBalance, "totalRepaid": totalRepaid,
-		"activeLoans": performing, "fullyRepaidLoans": fullyRepaid, "watchListLoans": watchList,
-		"totalSavingsCycles": len(cycles), "repaymentRate": 95.2,
-	})
 }
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
@@ -200,13 +105,6 @@ type jwksCache struct {
 }
 
 var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
 
 func jwtRealmURL() string {
 	return getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
@@ -368,12 +266,149 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 func main() {
 	startJWKSRefresh()
 
-	port := envOr("PORT", "8252")
-	http.HandleFunc("/healthz", healthz)
-	http.HandleFunc("/v1/microfinance/groups", handleGroups)
-	http.HandleFunc("/v1/microfinance/loans", handleLoans)
-	http.HandleFunc("/v1/microfinance/cycles", handleCycles)
-	http.HandleFunc("/v1/microfinance/stats", handleStats)
-	fmt.Printf("Microfinance Engine on port %s\n", port)
-	http.ListenAndServe(":"+port, jwtAuthMiddleware(http.DefaultServeMux))
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
+	mux.HandleFunc("/v1/microfinance/groups", handleGroups)
+	mux.HandleFunc("/v1/microfinance/members", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			var m Member
+			json.NewDecoder(r.Body).Decode(&m)
+			m.ID = fmt.Sprintf("M-%d", len(members)+1)
+			members = append(members, m)
+			jsonResponse(w, 201, m)
+			return
+		}
+		jsonResponse(w, 200, map[string]interface{}{"items": members, "total": len(members)})
+	})
+	mux.HandleFunc("/v1/microfinance/centers", func(w http.ResponseWriter, r *http.Request) {
+		jsonResponse(w, 200, map[string]interface{}{"items": centers, "total": len(centers)})
+	})
+	mux.HandleFunc("/v1/microfinance/stats", func(w http.ResponseWriter, r *http.Request) {
+		totalLoaned := 0.0
+		totalRepaid := 0.0
+		activeLoans := 0
+		for _, gl := range groupLoans {
+			totalLoaned += gl.TotalAmount
+			totalRepaid += gl.RepaidAmount
+			if gl.Status == "active" {
+				activeLoans++
+			}
+		}
+		repaymentRate := 0.0
+		if totalLoaned > 0 {
+			repaymentRate = (totalRepaid / totalLoaned) * 100
+		}
+		jsonResponse(w, 200, map[string]interface{}{
+			"totalGroupLoans": len(groupLoans), "activeLoans": activeLoans,
+			"totalMembers": len(members), "totalCenters": len(centers),
+			"totalLoaned": totalLoaned, "totalRepaid": totalRepaid,
+			"repaymentRate": repaymentRate,
+		})
+	})
+
+	fmt.Printf("Microfinance Engine on :%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))))
+}
+
+// healthz serves /healthz (extracted from the inline closure in main; behavior unchanged).
+func healthz(w http.ResponseWriter, r *http.Request) {
+	totalLoaned := 0.0
+	totalRepaid := 0.0
+	for _, gl := range groupLoans {
+		totalLoaned += gl.TotalAmount
+		totalRepaid += gl.RepaidAmount
+	}
+	jsonResponse(w, 200, map[string]interface{}{
+		"status": "healthy", "service": "microfinance-engine",
+		"groups": len(groupLoans), "members": len(members), "centers": len(centers),
+		"totalLoaned": totalLoaned, "totalRepaid": totalRepaid,
+		"middleware": middlewareStatus,
+	})
+}
+
+// handleGroups serves /v1/microfinance/groups (extracted from the inline closure in main; behavior unchanged).
+func handleGroups(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" {
+		var gl GroupLoan
+		json.NewDecoder(r.Body).Decode(&gl)
+		gl.Status = "pending"
+		groupLoans = append(groupLoans, gl)
+		jsonResponse(w, 201, gl)
+		return
+	}
+	jsonResponse(w, 200, map[string]interface{}{"items": groupLoans, "total": len(groupLoans)})
+}
+
+// --- Request metrics (restored fleet-canonical block) ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"microfinance-engine-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"microfinance-engine-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"microfinance-engine-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"microfinance-engine-go"}`)
+}
+
+// --- Rate limiting (restored fleet-canonical token bucket: 100 rps) ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
