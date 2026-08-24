@@ -1214,52 +1214,21 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// ─── Domain Logic: Grpc Hot Path ────────────────────────────────────────────
-
-type ConnectionPool struct {
-	ServiceName     string `json:"service_name"`
-	ActiveConns     int    `json:"active_conns"`
-	MaxConns        int    `json:"max_conns"`
-	AvgLatencyMs    int    `json:"avg_latency_ms"`
-	RequestsPerSec  int    `json:"requests_per_sec"`
-	ErrorRate       float64 `json:"error_rate"`
-	CircuitState    string `json:"circuit_state"`
+func validateGRPCRequest(serviceName, methodName string, payloadSize int) (bool, string) {
+	if serviceName == "" {
+		return false, "Service name required"
+	}
+	if methodName == "" {
+		return false, "Method name required"
+	}
+	if payloadSize > 4194304 {
+		return false, "Payload exceeds 4MB gRPC limit"
+	}
+	return true, "gRPC request valid"
 }
-
-func computePoolHealth(pool ConnectionPool) map[string]interface{} {
-	utilization := float64(pool.ActiveConns) / float64(pool.MaxConns) * 100
-	healthScore := 100.0
-	if pool.AvgLatencyMs > 100 {
-		healthScore -= 20
-	}
-	if pool.ErrorRate > 0.01 {
-		healthScore -= 30
-	}
-	if utilization > 80 {
-		healthScore -= 15
-	}
-	if pool.CircuitState != "closed" {
-		healthScore -= 25
-	}
-	return map[string]interface{}{
-		"health_score": healthScore, "conn_utilization": utilization,
-		"healthy": healthScore > 60, "recommendation": func() string {
-			if healthScore < 60 { return "scale_or_failover" }
-			if utilization > 80 { return "scale_up" }
-			return "optimal"
-		}(),
-	}
-}
-
-func handlePoolHealth(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		respondJSON(w, 405, map[string]string{"error": "POST required"})
-		return
-	}
-	var pool ConnectionPool
-	json.NewDecoder(r.Body).Decode(&pool)
-	health := computePoolHealth(pool)
-	respondJSON(w, 200, map[string]interface{}{"service": pool.ServiceName, "health": health})
+func computeDeadline(methodType string) int {
+	deadlines := map[string]int{"unary": 30, "server_stream": 120, "client_stream": 120, "bidi_stream": 300}
+	return deadlines[methodType]
 }
 
 // --- Circuit Breaker + Retry (Production) ---
@@ -1434,7 +1403,7 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "9381"
+		port = "9365"
 	}
 	initDB()
 	mux := http.NewServeMux()
@@ -1455,7 +1424,6 @@ func main() {
 	mux.Handle("/v1/grpc-hot-path/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 	mux.Handle("/v1/grpc-hot-path/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(grpc_hot_pathScoreHandler)))
 	mux.Handle("/v1/grpc-hot-path/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(grpc_hot_pathValidateRequestHandler)))
-	mux.Handle("/v1/grpc-hot-path/pool-health", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handlePoolHealth)))
 	log.Printf("Grpc Hot Path v2.0 (Infrastructure/Data) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1492,6 +1460,14 @@ func jwtRealmURL() string {
 		return v
 	}
 	return "http://keycloak:8080/realms/54bank"
+}
+
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
 }
 
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
@@ -1544,14 +1520,6 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
-}
-
-func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil {
-		return fmt.Errorf("no db")
-	}
-	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
-	return err
 }
 
 var _cbOpen atomic.Bool
