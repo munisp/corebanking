@@ -15,11 +15,11 @@ import (
 
 // NIBSSClient handles communication with NIBSS for VAN registration and payment routing
 type NIBSSClient struct {
-	baseURL     string
-	apiKey      string
-	secretKey   string
-	bankCode    string
-	httpClient  *http.Client
+	baseURL    string
+	apiKey     string
+	secretKey  string
+	bankCode   string
+	httpClient *http.Client
 }
 
 // NewNIBSSClient creates a new NIBSS client
@@ -209,7 +209,7 @@ func (c *NIBSSClient) ValidateInboundPayment(payment *NIBSSInboundPayment, signa
 	// Reconstruct the signature from the payment data
 	payloadJSON, _ := json.Marshal(payment)
 	expectedSignature := c.generateSignature(payloadJSON, payment.PaymentDate)
-	
+
 	return hmac.Equal([]byte(signature), []byte(expectedSignature))
 }
 
@@ -290,11 +290,11 @@ func (c *NIBSSClient) RegisterVANBatch(ctx context.Context, vans []*VirtualAccou
 
 // NIBSSPaymentConfirmation represents a payment confirmation to NIBSS
 type NIBSSPaymentConfirmation struct {
-	SessionID      string `json:"session_id"`
-	ResponseCode   string `json:"response_code"`
-	ResponseMsg    string `json:"response_message"`
-	ProcessedAt    string `json:"processed_at"`
-	LedgerEntryID  string `json:"ledger_entry_id,omitempty"`
+	SessionID     string `json:"session_id"`
+	ResponseCode  string `json:"response_code"`
+	ResponseMsg   string `json:"response_message"`
+	ProcessedAt   string `json:"processed_at"`
+	LedgerEntryID string `json:"ledger_entry_id,omitempty"`
 }
 
 // ConfirmPayment sends payment confirmation to NIBSS

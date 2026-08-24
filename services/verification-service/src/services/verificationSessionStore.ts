@@ -7,6 +7,8 @@
  * (via the /submit endpoint which updates KycVerificationWorkflowEntity).
  */
 
+import { randomUUID } from "crypto";
+
 const SESSION_TTL_MS = 30 * 60 * 1000; // 30 min
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
@@ -99,8 +101,9 @@ setInterval(() => {
 
 // ─── ID generator ─────────────────────────────────────────────────────────────
 
+// M-56: CSPRNG session/job identifiers (unpredictable, unguessable).
 function genId(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  return `${prefix}_${randomUUID()}`;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────

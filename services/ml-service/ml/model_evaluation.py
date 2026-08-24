@@ -472,11 +472,39 @@ class ModelEvaluator:
     def save_report(
         self,
         report: EvaluationReport,
-        output_dir: str
+        output_dir: str = ""
     ) -> str:
-        """Save evaluation report to disk"""
-        os.makedirs(output_dir, exist_ok=True)
-        
+        """Save evaluation report to disk — path-injection safe.
+
+        Reports are only ever written inside the configured report root
+        (ML_REPORTS_DIR, default: <ML_MODELS_DIR>/evaluation_reports).
+        `output_dir` is treated as a relative subdirectory of that root; any
+        traversal outside it is rejected (realpath containment, fail closed).
+        The model_id embedded in the filename is sanitized to a single path
+        component.
+        """
+        base = os.path.realpath(
+            os.getenv(
+                "ML_REPORTS_DIR",
+                os.path.join(
+                    os.getenv(
+                        "ML_MODELS_DIR",
+                        "/home/ubuntu/54link-dev_platform/54link-dev-unified-platform/services/ml-service/models_store",
+                    ),
+                    "evaluation_reports",
+                ),
+            )
+        )
+        target = os.path.realpath(os.path.join(base, output_dir or ""))
+        if target != base and not target.startswith(base + os.sep):
+            raise ValueError("Report output_dir escapes the configured report directory")
+        os.makedirs(target, exist_ok=True)
+
+        # Sanitize model_id — it is interpolated into the filename.
+        safe_model_id = os.path.basename(str(report.model_id))
+        if not safe_model_id or safe_model_id in (".", ".."):
+            raise ValueError("Invalid model_id for report filename")
+
         # Convert to dict
         report_dict = {
             "model_id": report.model_id,
@@ -495,9 +523,9 @@ class ModelEvaluator:
         }
         
         # Save JSON
-        filename = f"evaluation_{report.model_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-        filepath = os.path.join(output_dir, filename)
-        
+        filename = f"evaluation_{safe_model_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = os.path.join(target, filename)
+
         with open(filepath, 'w') as f:
             json.dump(report_dict, f, indent=2)
         

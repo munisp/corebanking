@@ -10,8 +10,13 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+import psycopg2
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
@@ -22,9 +27,24 @@ PORT = int(os.environ.get("PORT", 9511))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("dispute-management-py")
+SERVICE_NAME = "dispute-management-py"
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/dispute_management_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -91,9 +111,67 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="dispute-management-py", version="1.0.0", lifespan=lifespan)
 
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -304,6 +382,12 @@ def respond(handler, code, body):
 import socket as _grpc_socket
 import struct as _grpc_struct
 import threading as _grpc_threading
+import time
+import threading
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
+import sys
+import html
 
 class GrpcServicer:
     """gRPC handler for inter-service calls."""
@@ -487,6 +571,132 @@ class _DegradationState:
             }
 
 _degrade = _DegradationState()
+
+
+# --- JWT Auth ---
+def validate_jwt(headers):
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    Canonical implementation: services/shared/auth/jwt_validation.py.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = auth[7:]
+    import hmac, hashlib, base64, json as _json, time as _t
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if _t.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
+
+
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
+def _rl_allow():
+    global _rl_tokens
+    now = time.time()
+    with _rl_lock:
+        if now - _rl_last_refill[0] >= 1.0:
+            _rl_tokens = 100
+            _rl_last_refill[0] = now
+        if _rl_tokens <= 0:
+            return False
+        _rl_tokens -= 1
+        return True
+
+
+# --- Metrics ---
+request_count = 0
+error_count = 0
+metrics_lock = threading.Lock()
+
+def inc_requests():
+    global request_count
+    with metrics_lock:
+        request_count += 1
+
+def inc_errors():
+    global error_count
+    with metrics_lock:
+        error_count += 1
+
+
+MAX_INPUT_SIZE = 10240
+
+def sanitize(val):
+    if isinstance(val, str):
+        return html.escape(val)[:4096]
+    if isinstance(val, dict):
+        return {sanitize(k): sanitize(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [sanitize(v) for v in val]
+    return val
+
+_start_time = time.time()
+
+_trace_header = "X-Trace-Id"
+
+
+def db_query():
+    """Read real config rows from Postgres. Raises on failure (fail fast)."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1],
+             "tenant_id": str(r[2]) if len(r) > 2 and r[2] else None,
+             "created_at": str(r[3] if len(r) > 3 else r[-1])} for r in rows]
+
+
+def db_insert(record_id, body):
+    """Persist a record to Postgres with an outbox event. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO service_configs (id, status) VALUES (%s::uuid, %s) ON CONFLICT (id) DO NOTHING",
+            (record_id, (body or {}).get("status", "active") if isinstance(body, dict) else "active"),
+        )
+        payload = json.dumps({"id": str(record_id), "data": body}, default=str)
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("record.created", str(record_id), payload),
+        )
+    conn.commit()
+    return True
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):

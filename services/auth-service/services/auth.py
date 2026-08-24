@@ -11,6 +11,7 @@ from repositories import AuthRepository, DeviceRepository
 from utils import (
     ApiError,
     generate_api_key,
+    hash_api_secret,
     create_logger,
     PermissionManager,
     UserRole,
@@ -44,6 +45,9 @@ class AuthService:
 
         api_key = generate_api_key(24)
         api_secret = generate_api_key(32) + "123#"  # Password requirements
+        # Only the salted hash is persisted; the plaintext secret is attached
+        # transiently so the route can return it exactly once at creation.
+        api_secret_hash = hash_api_secret(api_secret)
 
         create_keycloak_user_payload = CreateKeycloakUser(
             email=payload.email, user_name=payload.email
@@ -87,10 +91,7 @@ class AuthService:
             email=api_key + "_" + payload.email, user_name=api_key, password=api_secret
         )
 
-        logger.info(
-            f"create_keycloak_service_account_payload: {create_keycloak_service_account_payload}"
-        )
-
+        # Never log the service-account payload: it contains a credential.
         logger.info(f"Creating service account for {payload.email}")
         try:
             keycloak_adapter.create_user(
@@ -112,10 +113,13 @@ class AuthService:
             tenant_id=context.tenant_id,
             keycloak_id=keycloak_user.id,
             api_key=api_key,
-            api_secret=api_secret,
+            api_secret=api_secret_hash,
         )
 
         self._db.commit()
+        # Transient, never persisted: lets the route return the plaintext
+        # secret exactly once at creation time.
+        auth._plaintext_api_secret = api_secret
         logger.info(f"✓ Auth database record created for {payload.email}")
 
         # Assign Permify v2.perm roles based on the explicit role fields
@@ -172,7 +176,8 @@ class AuthService:
                 code="AUTH-AUTH-INT-4003",
             )
 
-        logger.info(f"get user token success: {token_response}")
+        # Never log token material.
+        logger.info(f"get user token success for {payload.email}")
 
         return {**token_response, "keycloak_id": auth.keycloak_id}
 

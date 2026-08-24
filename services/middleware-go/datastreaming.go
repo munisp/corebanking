@@ -146,8 +146,8 @@ func lakehouseEndpoint() string {
 
 func NewLakehouseClient() *LakehouseClient {
 	client := &LakehouseClient{
-		tables:   make(map[string]*LakehouseTable),
-		endpoint: lakehouseEndpoint(),
+		tables:     make(map[string]*LakehouseTable),
+		endpoint:   lakehouseEndpoint(),
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 	// Register known table metadata (used as fallback when server is unreachable)

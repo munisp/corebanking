@@ -7,11 +7,12 @@ use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::env;
 use std::time::Instant;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 #[derive(Clone)]
-struct AppState { start_time: Instant     db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+struct AppState { start_time: Instant, db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -52,7 +53,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -61,7 +63,7 @@ async fn degradation_status() -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
         "service": "tigerbeetle-protocol-rs",
         "status": "healthy",
@@ -78,82 +80,117 @@ async fn healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> Htt
     }))
 }
 
-async fn list_accounts() -> HttpResponse {
-    let accounts = vec![
-        json!({"id": "TB-ACC-001", "ledger": 1, "code": 1001, "debitsPending": 0, "debitsPosted": 450000000000_u64, "creditsPending": 0, "creditsPosted": 500000000000_u64, "flags": ["debits_must_not_exceed_credits"], "description": "Customer Deposits Pool"}),
-        json!({"id": "TB-ACC-002", "ledger": 1, "code": 2001, "debitsPending": 0, "debitsPosted": 150000000000_u64, "creditsPending": 50000000000_u64, "creditsPosted": 200000000000_u64, "flags": [], "description": "Loan Disbursement Account"}),
-        json!({"id": "TB-ACC-003", "ledger": 2, "code": 4001, "debitsPending": 0, "debitsPosted": 0, "creditsPending": 0, "creditsPosted": 35000000000_u64, "flags": ["credits_must_not_exceed_debits"], "description": "Fee Income"}),
-        json!({"id": "TB-ACC-004", "ledger": 1, "code": 1101, "debitsPending": 0, "debitsPosted": 80000000000_u64, "creditsPending": 0, "creditsPosted": 75000000000_u64, "flags": [], "description": "NIBSS Clearing Account"}),
-    ];
-    HttpResponse::Ok().json(json!({"accounts": accounts, "total": 4}))
+// ─── TigerBeetle access policy ──────────────────────────────────────────────
+// Money movement MUST go through a real TigerBeetle cluster client. This
+// service has no TigerBeetle client dependency wired, so write endpoints
+// (create_transfer / commit_pending / void_pending) FAIL FAST with 503 rather
+// than fabricating posted/committed ledger results.
+// Read endpoints serve the Postgres CDC mirror tables (tb_accounts /
+// tb_transfers); when the mirror is unavailable they also fail fast with 503.
+fn tigerbeetle_unavailable() -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({
+        "success": false,
+        "error": "tigerbeetle_unavailable",
+        "detail": "no TigerBeetle cluster client is wired in this service; refusing to fabricate ledger postings",
+    }))
 }
 
-async fn list_transfers() -> HttpResponse {
-    let transfers = vec![
-        json!({"id": "TB-TXN-001", "debitAccountId": "TB-ACC-001", "creditAccountId": "TB-ACC-004", "amount": 50000000_u64, "ledger": 1, "code": 101, "flags": ["linked"], "status": "posted", "timestamp": "2026-05-09T14:30:00Z"}),
-        json!({"id": "TB-TXN-002", "debitAccountId": "TB-ACC-004", "creditAccountId": "TB-ACC-001", "amount": 45000000_u64, "ledger": 1, "code": 102, "flags": [], "status": "posted", "timestamp": "2026-05-09T14:31:00Z"}),
-        json!({"id": "TB-TXN-003", "debitAccountId": "TB-ACC-001", "creditAccountId": "TB-ACC-002", "amount": 25000000000_u64, "ledger": 1, "code": 201, "flags": ["two_phase_commit"], "pendingId": "TB-PEND-001", "status": "pending", "timestamp": "2026-05-09T15:00:00Z"}),
-    ];
-    HttpResponse::Ok().json(json!({"transfers": transfers, "total": 3}))
+async fn list_accounts(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let client = match &state.db_client {
+        Some(c) => c.clone(),
+        None => return tigerbeetle_unavailable(),
+    };
+    let rows = client.query(
+        "SELECT id, ledger, code, debits_pending, debits_posted, credits_pending, credits_posted, flags, description FROM tb_accounts ORDER BY id",
+        &[],
+    ).await;
+    match rows {
+        Ok(rows) => {
+            let accounts: Vec<serde_json::Value> = rows.iter().map(|r| {
+                let flags: Vec<String> = r.get::<usize, Vec<String>>(7);
+                json!({
+                    "id": r.get::<usize, String>(0),
+                    "ledger": r.get::<usize, i32>(1),
+                    "code": r.get::<usize, i32>(2),
+                    "debitsPending": r.get::<usize, i64>(3),
+                    "debitsPosted": r.get::<usize, i64>(4),
+                    "creditsPending": r.get::<usize, i64>(5),
+                    "creditsPosted": r.get::<usize, i64>(6),
+                    "flags": flags,
+                    "description": r.get::<usize, String>(8),
+                })
+            }).collect();
+            HttpResponse::Ok().json(json!({"accounts": accounts, "total": accounts.len()}))
+        }
+        Err(e) => {
+            eprintln!("[tigerbeetle-protocol-rs] tb_accounts query failed: {}", e);
+            tigerbeetle_unavailable()
+        }
+    }
+}
+
+async fn list_transfers(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let client = match &state.db_client {
+        Some(c) => c.clone(),
+        None => return tigerbeetle_unavailable(),
+    };
+    let rows = client.query(
+        "SELECT id, debit_account_id, credit_account_id, amount, ledger, code, flags, pending_id, status, created_at FROM tb_transfers ORDER BY created_at DESC LIMIT 500",
+        &[],
+    ).await;
+    match rows {
+        Ok(rows) => {
+            let transfers: Vec<serde_json::Value> = rows.iter().map(|r| {
+                let flags: Vec<String> = r.get::<usize, Vec<String>>(6);
+                let pending: Option<String> = r.get(7);
+                json!({
+                    "id": r.get::<usize, String>(0),
+                    "debitAccountId": r.get::<usize, String>(1),
+                    "creditAccountId": r.get::<usize, String>(2),
+                    "amount": r.get::<usize, i64>(3),
+                    "ledger": r.get::<usize, i32>(4),
+                    "code": r.get::<usize, i32>(5),
+                    "flags": flags,
+                    "pendingId": pending,
+                    "status": r.get::<usize, String>(8),
+                    "timestamp": r.get::<usize, String>(9),
+                })
+            }).collect();
+            HttpResponse::Ok().json(json!({"transfers": transfers, "total": transfers.len()}))
+        }
+        Err(e) => {
+            eprintln!("[tigerbeetle-protocol-rs] tb_transfers query failed: {}", e);
+            tigerbeetle_unavailable()
+        }
+    }
 }
 
 async fn create_transfer(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if !rl_allow() {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let _ = sanitize_input("");
-    HttpResponse::Created().json(json!({
-        "success": true,
-        "transferId": format!("TB-TXN-{}", chrono_placeholder()),
-        "status": "posted",
-        "debitAccountId": body.get("debitAccountId"),
-        "creditAccountId": body.get("creditAccountId"),
-        "amount": body.get("amount"),
-    }))
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    // A transfer is money movement: without a real TigerBeetle client we must
+    // not pretend the ledger accepted it.
+    tigerbeetle_unavailable()
 }
 
 async fn commit_pending(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if !rl_allow() {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let _result_data = json!({"endpoint": "create_transfer"});
-    db_persist(&state, "create_transfer", &_result_data).await;
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("tigerbeetle-protocol-rs: upstream call ok"),
-        Err(e) => eprintln!("tigerbeetle-protocol-rs: upstream call failed: {}", e),
-    }
-    let _result_data = json!({"endpoint": "commit_pending"});
-    db_persist(&state, "commit_pending", &_result_data).await;
-
-
-    HttpResponse::Ok().json(json!({
-        "success": true,
-        "action": "commit",
-        "pendingId": body.get("pendingId"),
-        "status": "posted",
-        "twoPhaseResult": "committed"
-    }))
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    tigerbeetle_unavailable()
 }
 
 async fn void_pending(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if !rl_allow() {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let _result_data = json!({"endpoint": "void_pending"});
-    db_persist(&state, "void_pending", &_result_data).await;
-
-    HttpResponse::Ok().json(json!({
-        "success": true,
-        "action": "void",
-        "pendingId": body.get("pendingId"),
-        "status": "voided",
-        "twoPhaseResult": "voided"
-    }))
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    tigerbeetle_unavailable()
 }
 
 fn chrono_placeholder() -> String { format!("{:06}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_micros()) }
@@ -169,7 +206,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -221,20 +259,187 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
 
 
 // --- JWT Auth Check ---
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
+// --- JWT Auth Check (fail-closed; R4-V4 remediation) ---
+// Canonical RS256/JWKS-primary verifier aligned with pin-block-engine-rs:
+// tokens are verified against the Keycloak JWKS (KEYCLOAK_JWKS_URL, or derived
+// from KEYCLOAK_REALM_URL) with a 300s cache and a 5s fetch timeout; HS256 via
+// JWT_SECRET remains as a fallback. 401 on missing/malformed/expired/
+// unknown-kid tokens; 503 when no verification backend is available. Verified
+// claims are stored in request extensions for downstream handlers.
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct VerifiedClaims(serde_json::Value);
+
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
+}
+
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
+        }
+    }
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
+        }
+        _ => None,
+    }
+}
+
+async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpResponse> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => {
+            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwt_validation_unavailable",
+                "detail": "no JWKS endpoint configured"
+            })))
+        }
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
+            }
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "client init failed"
+        })))?;
+    let resp = client.get(&url).send().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+    })?;
+    if !resp.status().is_success() {
+        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "upstream returned error status"
+        })));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "malformed JWKS payload"
+        }))
+    })?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
+}
+
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
+        }
+    }
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
+    }
+}
+
+async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks().await?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks().await?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => {
+                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                        }
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    })))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": format!("unsupported alg {:?}", other)
+        }))),
+    }
+}
+
+async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
     }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
-    }
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+    };
+    let claims = verify_jwt_token(token).await?;
+    req.extensions_mut().insert(VerifiedClaims(claims));
+    Ok(())
 }
 
 
@@ -405,7 +610,14 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
                     if msg_len > 4 * 1024 * 1024 { return; }
                     let mut payload = vec![0u8; msg_len];
                     if stream.read_exact(&mut payload).is_err() { return; }
-                    let resp = format!(r#"{{"status":"ok","service":"{}"}}"#, service_name);
+                    let resp = if std::env::var("FAKE_GRPC_OK").ok().as_deref() == Some("1") {
+                        // FAKE_GRPC_OK=1: legacy stub for local development only.
+                        format!(r#"{"status":"ok","service":"{}"}"#, service_name)
+                    } else {
+                        // gRPC UNIMPLEMENTED (status 12): never fabricate OK for
+                        // an unimplemented handler.
+                        format!(r#"{"error":"unimplemented","grpcStatus":12,"service":"{}"}"#, service_name)
+                    };
                     let resp_bytes = resp.as_bytes();
                     let resp_len = (resp_bytes.len() as u32).to_be_bytes();
                     let _ = stream.write_all(&resp_len);
@@ -460,11 +672,11 @@ fn mtls_config() -> (bool, String, String, String) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8116".to_string());
-    let state = AppState { start_time: Instant::now() };
     println!("TigerBeetle Protocol Engine (Rust) on :{} — accounts + transfers + 2PC", port);
-        let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
-    let _db_client = if !db_url.is_empty() { init_db(&db_url).await } else { None };
-        start_grpc_server("tigerbeetle-protocol-rs", 10367);
+    let db_url = std::env::var("DATABASE_URL").unwrap_or_default();
+    let db_client = if !db_url.is_empty() { init_db(&db_url).await.map(std::sync::Arc::new) } else { None };
+    let state = AppState { start_time: Instant::now(), db_client };
+    start_grpc_server("tigerbeetle-protocol-rs", 10367);
     HttpServer::new(move || {
         App::new()
                 .wrap(
@@ -521,36 +733,26 @@ mod tests {
 
     #[test]
     fn test_healthz_exists() {
-        // Verify healthz compiles and is callable
-        // Domain function: healthz(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse
         assert!(true, "healthz should be defined");
     }
 
     #[test]
     fn test_list_accounts_exists() {
-        // Verify list_accounts compiles and is callable
-        // Domain function: list_accounts() -> HttpResponse
         assert!(true, "list_accounts should be defined");
     }
 
     #[test]
     fn test_list_transfers_exists() {
-        // Verify list_transfers compiles and is callable
-        // Domain function: list_transfers() -> HttpResponse
         assert!(true, "list_transfers should be defined");
     }
 
     #[test]
     fn test_create_transfer_exists() {
-        // Verify create_transfer compiles and is callable
-        // Domain function: create_transfer(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse
         assert!(true, "create_transfer should be defined");
     }
 
     #[test]
     fn test_commit_pending_exists() {
-        // Verify commit_pending compiles and is callable
-        // Domain function: commit_pending(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse
         assert!(true, "commit_pending should be defined");
     }
     #[test]
@@ -568,46 +770,4 @@ mod tests {
         DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

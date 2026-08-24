@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -44,37 +46,37 @@ var (
 type STKMenuID string
 
 const (
-	MenuMain          STKMenuID = "MAIN"
-	MenuBalance       STKMenuID = "BAL"
-	MenuTransfer      STKMenuID = "TRF"
-	MenuAirtime       STKMenuID = "AIR"
-	MenuBills         STKMenuID = "BILL"
-	MenuAgent         STKMenuID = "AGENT"
-	MenuStatement     STKMenuID = "STMT"
-	MenuSettings      STKMenuID = "SET"
-	MenuHelp          STKMenuID = "HELP"
+	MenuMain      STKMenuID = "MAIN"
+	MenuBalance   STKMenuID = "BAL"
+	MenuTransfer  STKMenuID = "TRF"
+	MenuAirtime   STKMenuID = "AIR"
+	MenuBills     STKMenuID = "BILL"
+	MenuAgent     STKMenuID = "AGENT"
+	MenuStatement STKMenuID = "STMT"
+	MenuSettings  STKMenuID = "SET"
+	MenuHelp      STKMenuID = "HELP"
 )
 
 // STKCommand represents an STK command from the SIM
 type STKCommand struct {
-	CommandID    string            `json:"command_id"`
-	IMSI         string            `json:"imsi"`         // SIM identifier
-	MSISDN       string            `json:"msisdn"`       // Phone number
-	MenuID       STKMenuID         `json:"menu_id"`
-	Selection    string            `json:"selection"`
-	InputData    string            `json:"input_data"`
-	SessionData  map[string]string `json:"session_data"`
-	Timestamp    time.Time         `json:"timestamp"`
+	CommandID   string            `json:"command_id"`
+	IMSI        string            `json:"imsi"`   // SIM identifier
+	MSISDN      string            `json:"msisdn"` // Phone number
+	MenuID      STKMenuID         `json:"menu_id"`
+	Selection   string            `json:"selection"`
+	InputData   string            `json:"input_data"`
+	SessionData map[string]string `json:"session_data"`
+	Timestamp   time.Time         `json:"timestamp"`
 }
 
 // STKResponse represents response to send to SIM
 type STKResponse struct {
-	ResponseType string      `json:"response_type"` // MENU, INPUT, DISPLAY, END
-	Title        string      `json:"title"`
-	Items        []STKItem   `json:"items,omitempty"`
-	InputPrompt  string      `json:"input_prompt,omitempty"`
-	InputType    string      `json:"input_type,omitempty"` // TEXT, PIN, PHONE, AMOUNT
-	DisplayText  string      `json:"display_text,omitempty"`
+	ResponseType string            `json:"response_type"` // MENU, INPUT, DISPLAY, END
+	Title        string            `json:"title"`
+	Items        []STKItem         `json:"items,omitempty"`
+	InputPrompt  string            `json:"input_prompt,omitempty"`
+	InputType    string            `json:"input_type,omitempty"` // TEXT, PIN, PHONE, AMOUNT
+	DisplayText  string            `json:"display_text,omitempty"`
 	SessionData  map[string]string `json:"session_data"`
 }
 
@@ -143,7 +145,7 @@ func (s *STKBankingService) ProcessSTKCommand(ctx context.Context, cmd *STKComma
 		stkSessionsTotal.WithLabelValues("new", "created").Inc()
 	}
 	session.LastAccess = time.Now()
-	
+
 	// Merge session data from command
 	if cmd.SessionData != nil {
 		for k, v := range cmd.SessionData {
@@ -702,12 +704,24 @@ func (s *STKBankingService) handleAgent(ctx context.Context, session *STKSession
 	}
 
 	amount, _ := strconv.ParseFloat(session.Data["agent_amount"], 64)
-	otp := fmt.Sprintf("%06d", time.Now().UnixNano()%1000000)
+	// Generate a cryptographically secure 6-digit OTP (CSPRNG, never derived
+	// from time). Only the SHA-256 hash is persisted, with a 5-minute expiry
+	// and an attempt counter (verifiers must cap attempts at 3).
+	otp, otpErr := generateAgentOTP()
+	if otpErr != nil {
+		s.clearAgentData(session)
+		return &STKResponse{
+			ResponseType: "DISPLAY",
+			DisplayText:  "Failed to generate OTP",
+		}, nil
+	}
+	otpHash := sha256.Sum256([]byte(otp))
+	otpHashHex := hex.EncodeToString(otpHash[:])
 
 	_, err := s.db.Exec(ctx, `
-		INSERT INTO agent_otps (phone, agent_id, otp, amount, action, expires_at)
-		VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '10 minutes')
-	`, session.MSISDN, session.Data["agent_id"], otp, amount, session.Data["agent_action"])
+		INSERT INTO agent_otps (phone, agent_id, otp, amount, action, expires_at, attempts)
+		VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '5 minutes', 0)
+	`, session.MSISDN, session.Data["agent_id"], otpHashHex, amount, session.Data["agent_action"])
 
 	agentName := session.Data["agent_name"]
 	s.clearAgentData(session)
@@ -720,14 +734,27 @@ func (s *STKBankingService) handleAgent(ctx context.Context, session *STKSession
 	}
 
 	// Send OTP via SMS
-	s.smsProvider.SendSMS(ctx, session.MSISDN, fmt.Sprintf("54Bank OTP: %s for N%.2f at %s. Valid 10 mins.", otp, amount, agentName))
+	// The OTP is only ever delivered over the SMS channel; it is never
+	// echoed in STK/API responses or logs.
+	s.smsProvider.SendSMS(ctx, session.MSISDN, fmt.Sprintf("54Bank OTP: %s for N%.2f at %s. Valid 5 mins.", otp, amount, agentName))
 
 	stkTransactionsTotal.WithLabelValues("agent", "otp_generated").Inc()
 
 	return &STKResponse{
 		ResponseType: "DISPLAY",
-		DisplayText:  fmt.Sprintf("OTP: %s\nShow to agent\nValid 10 mins", otp),
+		DisplayText:  "OTP sent via SMS\nValid 5 mins",
 	}, nil
+}
+
+// generateAgentOTP returns a cryptographically secure 6-digit OTP using
+// crypto/rand. Fails closed: returns an error if the CSPRNG is unavailable.
+func generateAgentOTP() (string, error) {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	n := binary.BigEndian.Uint32(b[:]) % 1000000
+	return fmt.Sprintf("%06d", n), nil
 }
 
 // handleStatement processes mini statement

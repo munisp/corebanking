@@ -8,7 +8,9 @@ class EventRepository:
     def get_event_by_id(self, event_id, tenant_id: str):
         return self.__db.query(Event).filter(Event.id == event_id, Event.tenant_id == tenant_id).first()
 
-    def create_event(self, topic: str = "default", raw: dict = {}, tenant_id: str = ""):
+    def create_event(self, topic: str = "default", raw: dict = None, tenant_id: str = ""):
+        if raw is None:
+            raw = {}
         new_event = Event(
             topic=topic,
             raw=raw,

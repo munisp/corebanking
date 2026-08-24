@@ -4,34 +4,40 @@
 package main
 
 import (
-"bytes"
-"context"
-"database/sql"
-"encoding/json"
-"fmt"
-"log"
-"net/http"
-"os"
-"os/signal"
-"strings"
-"syscall"
-"time"
-
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
-	"sync"
-	"time"
-	"database/sql"
-	"bytes"
+	"os/signal"
 	"strings"
-
-	"net"
-
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 )
+
+// cryptoRandUint32 returns a cryptographically secure random uint32 for
+// record and audit identifiers (L-06/L-16-residual: math/rand IDs are
+// predictable and collision-prone).
+func cryptoRandUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		log.Fatalf("crypto/rand unavailable: %v", err)
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "dapr-sidecar-go"
 
@@ -40,15 +46,15 @@ var startTime = time.Now()
 // ─── Domain Types ───────────────────────────────────────────────────────────
 
 type Record struct {
-	ID          string                 `json:"id"`
-	Type        string                 `json:"type"`
-	Status      string                 `json:"status"`
-	Data        map[string]interface{} `json:"data"`
-	CreatedAt   string                 `json:"createdAt"`
-	UpdatedAt   string                 `json:"updatedAt"`
-	CreatedBy   string                 `json:"createdBy,omitempty"`
-	TenantID    string                 `json:"tenantId,omitempty"`
-	Version     int                    `json:"version"`
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Status    string                 `json:"status"`
+	Data      map[string]interface{} `json:"data"`
+	CreatedAt string                 `json:"createdAt"`
+	UpdatedAt string                 `json:"updatedAt"`
+	CreatedBy string                 `json:"createdBy,omitempty"`
+	TenantID  string                 `json:"tenantId,omitempty"`
+	Version   int                    `json:"version"`
 }
 
 type AuditEntry struct {
@@ -61,12 +67,12 @@ type AuditEntry struct {
 }
 
 type DomainStats struct {
-	TotalRecords    int                    `json:"totalRecords"`
-	ActiveRecords   int                    `json:"activeRecords"`
-	PendingRecords  int                    `json:"pendingRecords"`
-	ProcessedToday  int                    `json:"processedToday"`
-	Domain          string                 `json:"domain"`
-	Metrics         map[string]interface{} `json:"metrics"`
+	TotalRecords   int                    `json:"totalRecords"`
+	ActiveRecords  int                    `json:"activeRecords"`
+	PendingRecords int                    `json:"pendingRecords"`
+	ProcessedToday int                    `json:"processedToday"`
+	Domain         string                 `json:"domain"`
+	Metrics        map[string]interface{} `json:"metrics"`
 }
 
 var (
@@ -76,7 +82,7 @@ var (
 		{ID: "DAP-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Infrastructure/Ops", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
 		{ID: "DAP-003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Infrastructure/Ops", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
 	}
-	auditLog = []AuditEntry{}
+	auditLog    = []AuditEntry{}
 	domainStats = DomainStats{
 		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
 		Domain: "Infrastructure/Ops",
@@ -100,7 +106,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"service": "dapr-sidecar-go", "status": "healthy", "version": "2.0.0",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
-		"domain": "Dapr Sidecar — Infrastructure/Ops",
+		"domain":      "Dapr Sidecar — Infrastructure/Ops",
 		"middleware": map[string]string{
 			"kafka":      "dapr-sidecar.events, dapr-sidecar.audit",
 			"postgres":   "dapr_sidecar_records",
@@ -147,12 +153,17 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheSet("dapr_sidecar_list", "", 1) // invalidate list cache on write
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 	// Inter-service call: health_check
 	_upstreamURL := os.Getenv("CORE_BANKING_URL")
-	if _upstreamURL == "" { _upstreamURL = "http://localhost:8100" }
+	if _upstreamURL == "" {
+		_upstreamURL = "http://localhost:8100"
+	}
 	_result, _err := callService("POST", _upstreamURL+"/v1/health", nil)
 	if _err != nil {
 		log.Printf("dapr-sidecar-go: health_check failed: %v", _err)
@@ -160,12 +171,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		log.Printf("dapr-sidecar-go: health_check ok: %v", _result)
 	}
 
-
 	mu.Lock()
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("DAP-%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("DAP-%08X", cryptoRandUint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -175,7 +185,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		TenantID:  getString(body, "tenantId"),
 		Version:   1,
 	}
-	if rec.Type == "" { rec.Type = "primary" }
+	if rec.Type == "" {
+		rec.Type = "primary"
+	}
 	records = append(records, rec)
 	domainStats.TotalRecords = len(records)
 
@@ -187,7 +199,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -196,7 +208,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
+	if r.Method != "POST" && r.Method != "PUT" {
+		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
@@ -206,14 +221,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
-			if s := getString(body, "status"); s != "" { records[i].Status = s }
+			if s := getString(body, "status"); s != "" {
+				records[i].Status = s
+			}
 			for k, v := range body {
-				if k != "id" { records[i].Data[k] = v }
+				if k != "id" {
+					records[i].Data[k] = v
+				}
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -225,30 +244,11 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	id := getString(body, "id")
-	for i := range records {
-		if records[i].ID == id && records[i].Status == "pending" {
-			records[i].Status = "processing"
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
-			// Simulate domain processing
-			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
-			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
-			records[i].Status = "completed"
-			domainStats.ProcessedToday++
-			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
-			return
-		}
-	}
-	respondJSON(w, 404, map[string]string{"error": "Record not found or not pending: " + id})
+	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
+	// (processingResult="success" and a random score via math/rand). Real domain
+	// processing must be implemented before this endpoint is enabled.
+	// Fail fast; never fabricate.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
@@ -261,10 +261,15 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	domainStats.TotalRecords = len(records)
-	active := 0; pending := 0
+	active := 0
+	pending := 0
 	for _, r := range records {
-		if r.Status == "active" || r.Status == "completed" { active++ }
-		if r.Status == "pending" || r.Status == "processing" { pending++ }
+		if r.Status == "active" || r.Status == "completed" {
+			active++
+		}
+		if r.Status == "pending" || r.Status == "processing" {
+			pending++
+		}
 	}
 	domainStats.ActiveRecords = active
 	domainStats.PendingRecords = pending
@@ -272,101 +277,101 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok { return v }
+	if v, ok := m[key].(string); ok {
+		return v
+	}
 	return ""
 }
 
-
 func dapr_sidecarComputeScore(value float64, weight float64, threshold float64) float64 {
-    score := value * weight
-    if score > threshold { score = threshold }
-    return score
+	score := value * weight
+	if score > threshold {
+		score = threshold
+	}
+	return score
 }
 
 func dapr_sidecarValidateRequest(data map[string]interface{}) map[string]interface{} {
-    errors := []string{}
-    required := []string{"id", "type"}
-    for _, field := range required {
-        if _, ok := data[field]; !ok {
-            errors = append(errors, field + " is required")
-        }
-    }
-    return map[string]interface{}{"valid": len(errors) == 0, "errors": errors}
+	errors := []string{}
+	required := []string{"id", "type"}
+	for _, field := range required {
+		if _, ok := data[field]; !ok {
+			errors = append(errors, field+" is required")
+		}
+	}
+	return map[string]interface{}{"valid": len(errors) == 0, "errors": errors}
 }
 
 func dapr_sidecarScoreHandler(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        Value     float64 `json:"value"`
-        Weight    float64 `json:"weight"`
-        Threshold float64 `json:"threshold"`
-    }
-    json.NewDecoder(r.Body).Decode(&req)
-    score := dapr_sidecarComputeScore(req.Value, req.Weight, req.Threshold)
-    respondJSON(w, 200, map[string]interface{}{"score": score})
+	var req struct {
+		Value     float64 `json:"value"`
+		Weight    float64 `json:"weight"`
+		Threshold float64 `json:"threshold"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	score := dapr_sidecarComputeScore(req.Value, req.Weight, req.Threshold)
+	respondJSON(w, 200, map[string]interface{}{"score": score})
 }
 
 func dapr_sidecarValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
-    var body map[string]interface{}
-    json.NewDecoder(r.Body).Decode(&body)
-    result := dapr_sidecarValidateRequest(body)
-    respondJSON(w, 200, result)
+	var body map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&body)
+	result := dapr_sidecarValidateRequest(body)
+	respondJSON(w, 200, result)
 }
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"dapr-sidecar-go"}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"dapr-sidecar-go"}`)
 }
 
 func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"alive":true}`)
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"dapr-sidecar-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"dapr-sidecar-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"dapr-sidecar-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"dapr-sidecar-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"dapr-sidecar-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"dapr-sidecar-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
-
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
 }
 
 type responseWriter struct {
-    http.ResponseWriter
-    status int
+	http.ResponseWriter
+	status int
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
-
 
 // --- Database Layer ---
 var db *sql.DB
-var daprClient dapr.Client
 var daprAvailable bool
 
 func initDB() {
@@ -402,9 +407,13 @@ func initDB() {
 }
 
 func dbList(service string, limit int) ([]map[string]interface{}, error) {
-	if db == nil { return nil, fmt.Errorf("no db") }
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
 	rows, err := db.Query("SELECT id, type, status, data, created_at FROM service_records WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var items []map[string]interface{}
 	for rows.Next() {
@@ -416,14 +425,83 @@ func dbList(service string, limit int) ([]map[string]interface{}, error) {
 }
 
 func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil { return fmt.Errorf("no db") }
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
 	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
 	return err
 }
 
-
 // --- JWT Auth Middleware ---
+// --- JWT Validation (JWKS/RS256, fail-closed) ---
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func jwtRealmURL() string {
+	if u := os.Getenv("KEYCLOAK_REALM_URL"); u != "" {
+		return u
+	}
+	return os.Getenv("KEYCLOAK_URL")
+}
+
+func fetchJWKS(realmURL string) {
+	if realmURL == "" {
+		return
+	}
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+// jwtAuthMiddleware verifies Bearer tokens against the Keycloak JWKS endpoint
+// (RS256). Tokens are rejected unless the signature verifies against a fetched
+// key, the algorithm is RS256, and the token is not expired. Fail-closed.
 func jwtAuthMiddleware(next http.Handler) http.Handler {
+	realmURL := jwtRealmURL()
+	go fetchJWKS(realmURL)
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
+	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
@@ -431,16 +509,76 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		token := auth[7:]
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			fetchJWKS(realmURL)
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if iss := os.Getenv("KEYCLOAK_ISSUER"); iss != "" && claims["iss"] != iss {
+			http.Error(w, `{"error":"invalid issuer"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
-
 
 // --- Inter-Service Communication with Circuit Breaker ---
 var _cbFailures int
@@ -451,38 +589,77 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	if _cbOpen { _cbOpen = false; _cbFailures = 0 }
+	if _cbOpen {
+		_cbOpen = false
+		_cbFailures = 0
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 { time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond) }
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+		}
 		var req *http.Request
 		if body != nil {
 			j, _ := json.Marshal(body)
-		j = []byte(sanitizeInput(string(j)))
+			j = []byte(sanitizeInput(string(j)))
 			req, _ = http.NewRequest(method, url, bytes.NewBuffer(j))
 		} else {
 			req, _ = http.NewRequest(method, url, nil)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := client.Do(req)
-		if err != nil { lastErr = err; _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		if err != nil {
+			lastErr = err
+			_cbFailures++
+			_cbLastFail = time.Now()
+			if _cbFailures >= 5 {
+				_cbOpen = true
+			}
+			continue
+		}
 		defer resp.Body.Close()
-		if resp.StatusCode >= 500 { lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode); _cbFailures++; _cbLastFail = time.Now(); if _cbFailures >= 5 { _cbOpen = true }; continue }
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode)
+			_cbFailures++
+			_cbLastFail = time.Now()
+			if _cbFailures >= 5 {
+				_cbOpen = true
+			}
+			continue
+		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
-		_cbFailures = 0; _cbOpen = false
+		_cbFailures = 0
+		_cbOpen = false
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
 }
 
+// sanitizeLogValue strips CR/LF and other control characters from
+// client-supplied values (e.g. trace headers) before they reach log
+// statements, preventing log injection/forgery (L-18). Output length is
+// bounded to keep log lines small.
+func sanitizeLogValue(s string) string {
+	const maxLen = 128
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
+		traceID := sanitizeLogValue(r.Header.Get("X-Trace-Id"))
 		if traceID == "" {
-			traceID = r.Header.Get("traceparent")
+			traceID = sanitizeLogValue(r.Header.Get("traceparent"))
 		}
 		if traceID == "" {
 			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
@@ -506,24 +683,32 @@ func init() {
 
 func cacheGet(key string) (string, bool) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
+	if err != nil {
+		return "", false
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
+	if err != nil || n < 3 {
+		return "", false
+	}
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
 		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+		if len(parts) >= 3 {
+			return parts[1], true
+		}
 	}
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
 		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
@@ -531,11 +716,17 @@ func cacheSet(key, value string, ttlSeconds int) {
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	if os.Getenv("TLS_ENABLED") != "true" {
+		return false, "", ""
+	}
 	cert := os.Getenv("TLS_CERT_PATH")
 	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
-	if key == "" { key = "/etc/54bank/certs/service.key" }
+	if cert == "" {
+		cert = "/etc/54bank/certs/service.crt"
+	}
+	if key == "" {
+		key = "/etc/54bank/certs/service.key"
+	}
 	return true, cert, key
 }
 
@@ -583,13 +774,12 @@ func sanitizeInput(s string) string {
 	return s
 }
 
-
 var _rlTokens int64 = 100
 var _rlLastRefill int64 = 0
 
 func rlAllow() bool {
 	nowr := time.Now().UnixMilli()
-	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
 		atomic.StoreInt64(&_rlTokens, 100)
 		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
@@ -611,11 +801,14 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 func validateDaprBinding(bindingName, operation string) (bool, string) {
-	if bindingName == "" { return false, "Binding name required" }
+	if bindingName == "" {
+		return false, "Binding name required"
+	}
 	validOps := map[string]bool{"create": true, "get": true, "delete": true, "list": true}
-	if !validOps[operation] { return false, "Invalid binding operation: " + operation }
+	if !validOps[operation] {
+		return false, "Invalid binding operation: " + operation
+	}
 	return true, "Dapr binding valid"
 }
 func computeStateStoreTTL(stateType string) int {
@@ -623,169 +816,182 @@ func computeStateStoreTTL(stateType string) int {
 	return ttls[stateType]
 }
 
-
 // --- Circuit Breaker + Retry (Production) ---
 type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
+	failures    int
+	lastFailure time.Time
+	threshold   int
+	resetAfter  time.Duration
+	mu          sync.Mutex
 }
 
 func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2
-            return true
-        }
-        return false
-    }
-    return true
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures >= cb.threshold {
+		if time.Since(cb.lastFailure) > cb.resetAfter {
+			cb.failures = cb.threshold / 2
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures > 0 {
+		cb.failures--
+	}
 }
 
 func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
 }
 
 var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
 
 func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
-        }
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        req.Header.Set("X-Source-Service", serviceName)
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+	if !_cb.allow() {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
+		}
+		var req *http.Request
+		if body != nil {
+			jsonData, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Source-Service", serviceName)
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cb.recordFailure()
+			log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			_cb.recordFailure()
+			continue
+		}
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cb.recordSuccess()
+		return result, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
 // --- Alerting ---
 type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
+	rules []alertRule
+	mu    sync.RWMutex
 }
 
 type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
+	Name      string
+	Metric    string
+	Threshold float64
+	Severity  string
 }
 
 var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
+	rules: []alertRule{
+		{"high_error_rate", "error_rate", 0.05, "critical"},
+		{"high_latency", "p99_latency_ms", 5000, "warning"},
+		{"db_connection_failures", "db_failures", 3, "critical"},
+	},
 }
 
 func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
+	var fired []map[string]interface{}
+	errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+	if errRate > 0.05 {
+		fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+	}
+	return fired
 }
 
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Graceful Degradation ---
 type degradationState struct {
-    dbAvailable    bool
-    cacheAvailable bool
-    upstreamOK     map[string]bool
-    mu             sync.RWMutex
+	dbAvailable    bool
+	cacheAvailable bool
+	upstreamOK     map[string]bool
+	mu             sync.RWMutex
 }
 
 var _degrade = &degradationState{
-    dbAvailable:    true,
-    cacheAvailable: true,
-    upstreamOK:     make(map[string]bool),
+	dbAvailable:    true,
+	cacheAvailable: true,
+	upstreamOK:     make(map[string]bool),
 }
 
 func (d *degradationState) setDB(ok bool) {
-    d.mu.Lock()
-    defer d.mu.Unlock()
-    d.dbAvailable = ok
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.dbAvailable = ok
 }
 
 func (d *degradationState) isDBAvailable() bool {
-    d.mu.RLock()
-    defer d.mu.RUnlock()
-    return d.dbAvailable
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.dbAvailable
 }
 
 func (d *degradationState) setUpstream(name string, ok bool) {
-    d.mu.Lock()
-    defer d.mu.Unlock()
-    d.upstreamOK[name] = ok
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.upstreamOK[name] = ok
 }
 
 func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
-    _degrade.mu.RLock()
-    defer _degrade.mu.RUnlock()
-    jsonResp(w, 200, map[string]interface{}{
-        "service":        serviceName,
-        "db_available":   _degrade.dbAvailable,
-        "cache_available": _degrade.cacheAvailable,
-        "upstreams":      _degrade.upstreamOK,
-        "mode":           func() string { if _degrade.dbAvailable { return "normal" }; return "degraded" }(),
-    })
+	_degrade.mu.RLock()
+	defer _degrade.mu.RUnlock()
+	jsonResp(w, 200, map[string]interface{}{
+		"service":         serviceName,
+		"db_available":    _degrade.dbAvailable,
+		"cache_available": _degrade.cacheAvailable,
+		"upstreams":       _degrade.upstreamOK,
+		"mode": func() string {
+			if _degrade.dbAvailable {
+				return "normal"
+			}
+			return "degraded"
+		}(),
+	})
 }
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" { port = "9343" }
+	if port == "" {
+		port = "9343"
+	}
 	initDB()
-mux := http.NewServeMux()
+	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
 	mux.HandleFunc("/livez", livezHandler)
@@ -809,48 +1015,24 @@ mux := http.NewServeMux()
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[dapr-sidecar-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[dapr-sidecar-go] Server stopped gracefully")
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Println("[dapr-sidecar-go] Shutdown signal received")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[dapr-sidecar-go] Server stopped gracefully")
 }
-writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-})
-mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-writeJSON(w, http.StatusOK, map[string]string{"status": "alive"})
-})
-mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-var evtCount, stateCount int64
-db.QueryRow("SELECT COUNT(*) FROM dapr_published_events").Scan(&evtCount)
-db.QueryRow("SELECT COUNT(*) FROM dapr_state_operations").Scan(&stateCount)
-fmt.Fprintf(w, "dapr_events_published_total %d\ndapr_state_operations_total %d\n", evtCount, stateCount)
-})
-mux.HandleFunc("/dapr/subscribe", subscribeEndpoint)
-mux.HandleFunc("/dapr/subscribe/transactions", handleSubscribedEvent("banking.transactions"))
-mux.HandleFunc("/dapr/subscribe/payments", handleSubscribedEvent("banking.payments.raw"))
-mux.HandleFunc("/dapr/subscribe/kyc", handleSubscribedEvent("banking.kyc.events"))
-mux.HandleFunc("/dapr/subscribe/aml", handleSubscribedEvent("banking.aml.alerts"))
-mux.HandleFunc("/dapr/subscribe/notifications", handleSubscribedEvent("banking.notifications"))
-mux.HandleFunc("/api/v1/publish", publishHandler)
-mux.HandleFunc("/api/v1/state/", func(w http.ResponseWriter, r *http.Request) {
-if r.Method == http.MethodPost { saveStateHandler(w, r) } else { getStateHandler(w, r) }
-})
-mux.HandleFunc("/api/v1/invoke", invokeHandler)
-mux.HandleFunc("/api/v1/subscriptions", subscriptionsHandler)
-
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }

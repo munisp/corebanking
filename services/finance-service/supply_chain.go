@@ -1,32 +1,95 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
+	"os"
 	"time"
 )
+
+// ==================== REAL INTEGRATION CLIENTS ====================
+//
+// Doctrine: bank transfers go through the real payments rail; KYC status
+// comes from the real KYC service or is "unknown". Nothing is hardcoded.
+
+var supplyChainHTTPClient = &http.Client{Timeout: 15 * time.Second}
+
+func paymentsRailURL() string {
+	if v := os.Getenv("PAYMENTS_RAIL_URL"); v != "" {
+		return v
+	}
+	return os.Getenv("PAYMENTS_HUB_URL") // may be empty => transfers fail closed
+}
+
+func kycServiceURL() string {
+	return os.Getenv("KYC_SERVICE_URL") // may be empty => KYC status "unknown"
+}
+
+// getKYCStatus queries the KYC service for an entity's verification status.
+// Returns "verified", another provider-reported status, or "unknown" when the
+// KYC service is unconfigured/unreachable. Never returns a hardcoded value.
+func getKYCStatus(ctx context.Context, entityID string) string {
+	base := kycServiceURL()
+	if base == "" || entityID == "" {
+		return "unknown"
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", base+"/v1/kyc/"+entityID, nil)
+	if err != nil {
+		return "unknown"
+	}
+	resp, err := supplyChainHTTPClient.Do(req)
+	if err != nil {
+		return "unknown"
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "unknown"
+	}
+	var body struct {
+		Status      string `json:"status"`
+		KYCVerified *bool  `json:"kycVerified"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "unknown"
+	}
+	if body.KYCVerified != nil {
+		if *body.KYCVerified {
+			return "verified"
+		}
+		return "not_verified"
+	}
+	if body.Status != "" {
+		return body.Status
+	}
+	return "unknown"
+}
 
 // ==================== MODELS ====================
 
 // Invoice represents a trade invoice
 type Invoice struct {
-	ID              string
-	TenantID        string
-	InvoiceNumber   string
-	SupplierID      string
-	BuyerID         string
-	InvoiceDate     time.Time
-	DueDate         time.Time
-	InvoiceAmount   float64
-	Currency        string
-	Status          string // "pending", "verified", "discounted", "paid", "overdue"
-	PaymentTerms    int    // days
-	GoodsDescription string
-	PurchaseOrderRef string
+	ID                 string
+	TenantID           string
+	InvoiceNumber      string
+	SupplierID         string
+	BuyerID            string
+	InvoiceDate        time.Time
+	DueDate            time.Time
+	InvoiceAmount      float64
+	Currency           string
+	Status             string // "pending", "verified", "discounted", "paid", "overdue"
+	PaymentTerms       int    // days
+	GoodsDescription   string
+	PurchaseOrderRef   string
 	VerificationStatus string // "pending", "verified", "rejected"
-	VerifiedBy      string
-	VerifiedAt      *time.Time
-	CreatedAt       time.Time
+	VerifiedBy         string
+	VerifiedAt         *time.Time
+	CreatedAt          time.Time
 }
 
 // InvoiceDiscounting represents a discounting transaction
@@ -52,18 +115,18 @@ type InvoiceDiscounting struct {
 
 // Supplier represents a supplier in the supply chain
 type Supplier struct {
-	ID              string
-	TenantID        string
-	BusinessName    string
-	RegistrationNo  string
-	TaxID           string
-	BankAccount     string
-	CreditRating    string // "AAA", "AA", "A", "BBB", "BB", "B"
-	CreditLimit     float64
+	ID                string
+	TenantID          string
+	BusinessName      string
+	RegistrationNo    string
+	TaxID             string
+	BankAccount       string
+	CreditRating      string // "AAA", "AA", "A", "BBB", "BB", "B"
+	CreditLimit       float64
 	OutstandingAmount float64
-	Status          string // "active", "suspended", "blocked"
-	KYCVerified     bool
-	CreatedAt       time.Time
+	Status            string // "active", "suspended", "blocked"
+	KYCVerified       bool
+	CreatedAt         time.Time
 }
 
 // Buyer represents a buyer in the supply chain
@@ -84,12 +147,12 @@ type Buyer struct {
 
 // PaymentRecord represents buyer's payment history
 type PaymentRecord struct {
-	InvoiceID   string
-	Amount      float64
-	DueDate     time.Time
-	PaidDate    time.Time
-	DaysLate    int
-	Status      string // "on_time", "late", "defaulted"
+	InvoiceID string
+	Amount    float64
+	DueDate   time.Time
+	PaidDate  time.Time
+	DaysLate  int
+	Status    string // "on_time", "late", "defaulted"
 }
 
 // ==================== INVOICE VERIFIER ====================
@@ -173,36 +236,98 @@ func (v *InvoiceVerifier) VerifyInvoice(invoice *Invoice) (bool, []string, error
 	return isValid, issues, nil
 }
 
+// getSupplier loads the supplier from Postgres. KYC status is resolved
+// against the real KYC service; when it cannot be determined the supplier is
+// treated as NOT KYC-verified (fail-closed for financing decisions).
 func (v *InvoiceVerifier) getSupplier(supplierID string) (*Supplier, error) {
-	// In production, query database
-	return &Supplier{
-		ID:           supplierID,
-		Status:       "active",
-		KYCVerified:  true,
-		CreditRating: "A",
-	}, nil
+	if db == nil {
+		return nil, fmt.Errorf("supplier store unavailable")
+	}
+	s := &Supplier{}
+	err := db.QueryRow(
+		`SELECT supplier_id, COALESCE(business_name,''), COALESCE(registration_no,''),
+			COALESCE(tax_id,''), COALESCE(bank_account,''), COALESCE(credit_rating,''),
+			COALESCE(credit_limit,0), COALESCE(outstanding_amount,0), COALESCE(status,''), created_at
+		 FROM suppliers WHERE supplier_id = $1`, supplierID).
+		Scan(&s.ID, &s.BusinessName, &s.RegistrationNo, &s.TaxID, &s.BankAccount,
+			&s.CreditRating, &s.CreditLimit, &s.OutstandingAmount, &s.Status, &s.CreatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("supplier %s not found", supplierID)
+		}
+		return nil, fmt.Errorf("supplier lookup failed: %w", err)
+	}
+	// KYC from the real KYC service; "unknown" is never treated as verified.
+	s.KYCVerified = getKYCStatus(context.Background(), supplierID) == "verified"
+	return s, nil
 }
 
+// getBuyer loads the buyer (incl. real payment history) from Postgres, with
+// KYC resolved via the KYC service (unknown => not verified).
 func (v *InvoiceVerifier) getBuyer(buyerID string) (*Buyer, error) {
-	// In production, query database
-	return &Buyer{
-		ID:              buyerID,
-		Status:          "active",
-		KYCVerified:     true,
-		CreditLimit:     10000000.0, // ₦10M
-		UsedCredit:      2000000.0,  // ₦2M
-		AvailableCredit: 8000000.0,  // ₦8M
-	}, nil
+	if db == nil {
+		return nil, fmt.Errorf("buyer store unavailable")
+	}
+	b := &Buyer{}
+	err := db.QueryRow(
+		`SELECT buyer_id, COALESCE(business_name,''), COALESCE(registration_no,''),
+			COALESCE(tax_id,''), COALESCE(credit_limit,0), COALESCE(used_credit,0), COALESCE(status,''), created_at
+		 FROM buyers WHERE buyer_id = $1`, buyerID).
+		Scan(&b.ID, &b.BusinessName, &b.RegistrationNo, &b.TaxID,
+			&b.CreditLimit, &b.UsedCredit, &b.Status, &b.CreatedAt)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("buyer %s not found", buyerID)
+		}
+		return nil, fmt.Errorf("buyer lookup failed: %w", err)
+	}
+	b.AvailableCredit = b.CreditLimit - b.UsedCredit
+
+	rows, err := db.Query(
+		`SELECT invoice_id, amount, due_date, paid_date, days_late, status
+		 FROM buyer_payment_history WHERE buyer_id = $1 ORDER BY paid_date DESC LIMIT 200`, buyerID)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var pr PaymentRecord
+			if rows.Scan(&pr.InvoiceID, &pr.Amount, &pr.DueDate, &pr.PaidDate, &pr.DaysLate, &pr.Status) == nil {
+				b.PaymentHistory = append(b.PaymentHistory, pr)
+			}
+		}
+	}
+	b.KYCVerified = getKYCStatus(context.Background(), buyerID) == "verified"
+	return b, nil
 }
 
+// checkDuplicate performs a real duplicate check against stored invoices.
+// On lookup error it returns true (fail-closed: block financing rather than
+// risk double-financing the same invoice).
 func (v *InvoiceVerifier) checkDuplicate(invoiceNumber string, supplierID string) bool {
-	// In production, check database
-	return false
+	if db == nil {
+		return true
+	}
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM invoices WHERE invoice_number = $1 AND supplier_id = $2`,
+		invoiceNumber, supplierID).Scan(&count); err != nil {
+		return true
+	}
+	return count > 0
 }
 
+// verifyPurchaseOrder verifies the PO exists for the buyer in Postgres.
+// Lookup errors fail closed (PO treated as invalid).
 func (v *InvoiceVerifier) verifyPurchaseOrder(poRef string, buyerID string) bool {
-	// In production, verify PO exists and matches buyer
-	return true
+	if db == nil {
+		return false
+	}
+	var count int
+	if err := db.QueryRow(
+		`SELECT COUNT(*) FROM purchase_orders WHERE po_ref = $1 AND buyer_id = $2 AND status IN ('approved','issued')`,
+		poRef, buyerID).Scan(&count); err != nil {
+		return false
+	}
+	return count > 0
 }
 
 // ==================== DISCOUNTING ENGINE ====================
@@ -219,7 +344,7 @@ func (d *DiscountingEngine) CalculateDiscounting(
 	supplier *Supplier,
 	buyer *Buyer,
 ) (*InvoiceDiscounting, error) {
-	
+
 	// Validate invoice is verified
 	if invoice.VerificationStatus != "verified" {
 		return nil, fmt.Errorf("invoice must be verified before discounting")
@@ -403,7 +528,8 @@ func (de *DisbursementEngine) DisburseAdvance(discounting *InvoiceDiscounting, s
 		return fmt.Errorf("net disbursement amount is invalid")
 	}
 
-	// Execute bank transfer
+	// Execute bank transfer via the real payments rail. On any failure the
+	// discounting stays "approved" and the caller maps this to 502.
 	transferSuccess, err := de.executeBankTransfer(
 		supplier.BankAccount,
 		netDisbursement,
@@ -422,11 +548,56 @@ func (de *DisbursementEngine) DisburseAdvance(discounting *InvoiceDiscounting, s
 	return nil
 }
 
+// executeBankTransfer executes a real transfer through the payments rail
+// (PAYMENTS_RAIL_URL / PAYMENTS_HUB_URL). It returns true only when the rail
+// confirms the transfer. When the rail is unconfigured, unreachable, or
+// rejects the transfer, it returns false + error — no success is simulated.
 func (de *DisbursementEngine) executeBankTransfer(accountNumber string, amount float64, narration string) (bool, error) {
-	// In production, integrate with NIBSS or bank API
-	// For now, simulate successful transfer
-	fmt.Printf("Transferring ₦%.2f to account %s: %s\n", amount, accountNumber, narration)
-	return true, nil
+	base := paymentsRailURL()
+	if base == "" {
+		return false, fmt.Errorf("payments rail unconfigured (set PAYMENTS_RAIL_URL or PAYMENTS_HUB_URL)")
+	}
+	payload, err := json.Marshal(map[string]interface{}{
+		"accountNumber": accountNumber,
+		"amount":        amount,
+		"currency":      "NGN",
+		"narration":     narration,
+		"source":        "finance-service/supply-chain",
+	})
+	if err != nil {
+		return false, err
+	}
+	resp, err := supplyChainHTTPClient.Post(base+"/v1/transfers", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		return false, fmt.Errorf("payments rail call failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
+		return false, fmt.Errorf("payments rail returned status %d", resp.StatusCode)
+	}
+	var result struct {
+		Success    *bool  `json:"success"`
+		Status     string `json:"status"`
+		TransferID string `json:"transferId"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, fmt.Errorf("payments rail returned invalid JSON: %w", err)
+	}
+	switch {
+	case result.Success != nil:
+		if !*result.Success {
+			return false, fmt.Errorf("payments rail rejected transfer (status=%s)", result.Status)
+		}
+		return true, nil
+	case result.Status != "":
+		if result.Status == "success" || result.Status == "completed" || result.Status == "accepted" {
+			return true, nil
+		}
+		return false, fmt.Errorf("payments rail transfer status: %s", result.Status)
+	default:
+		// A rail that cannot state its outcome must not be treated as success.
+		return false, fmt.Errorf("payments rail response contained no transfer outcome")
+	}
 }
 
 // ==================== SETTLEMENT ENGINE ====================
@@ -455,9 +626,21 @@ func (se *SettlementEngine) SettleInvoice(discounting *InvoiceDiscounting, payme
 	remainingAmount := discounting.InvoiceAmount - discounting.AdvanceAmount
 
 	if remainingAmount > 0 {
-		// Transfer remaining amount to supplier
-		// In production, execute bank transfer
-		fmt.Printf("Transferring remaining ₦%.2f to supplier\n", remainingAmount)
+		// Transfer remaining amount to supplier via the real payments rail.
+		// On failure the discounting is NOT marked settled.
+		supplier, err := NewInvoiceVerifier().getSupplier(discounting.SupplierID)
+		if err != nil || supplier.BankAccount == "" {
+			return fmt.Errorf("cannot settle: supplier account unavailable: %v", err)
+		}
+		de := NewDisbursementEngine()
+		ok, err := de.executeBankTransfer(
+			supplier.BankAccount,
+			remainingAmount,
+			fmt.Sprintf("Residual settlement for invoice %s", discounting.InvoiceID),
+		)
+		if err != nil || !ok {
+			return fmt.Errorf("residual settlement transfer failed: %w", err)
+		}
 	}
 
 	// Update discounting status
@@ -555,7 +738,7 @@ func (epc *EarlyPaymentCalculator) CalculateEarlyPaymentDiscount(
 	paymentDate time.Time,
 	discountRate float64,
 ) float64 {
-	
+
 	// Calculate days early
 	daysEarly := int(dueDate.Sub(paymentDate).Hours() / 24)
 

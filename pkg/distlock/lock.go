@@ -5,9 +5,27 @@
 //   - Mutual exclusion: only one holder at a time per resource
 //   - Deadlock prevention: locks sorted by resource ID before acquisition
 //   - Auto-expiry: TTL prevents orphaned locks from indefinitely blocking
-//   - Fencing token: monotonic token prevents stale lock holders from writing
+//   - Fencing token: strictly monotonic token (Redis INCR, shared across ALL
+//     lock-manager instances) prevents stale lock holders from writing
 //   - Reentrant-safe: lock owner tracked by unique holder ID
 //   - Redis-backed: survives process restart, works across multiple instances
+//
+// Fencing tokens are derived from a single Redis INCR counter, so they are
+// strictly monotonic across every LockManager instance and process restart.
+// Token issuance FAILS CLOSED: if Redis cannot issue a token, Acquire returns
+// an error (and releases the lock) rather than falling back to a local,
+// non-monotonic counter.
+//
+// Documented usage for writers (mandatory on money/state-mutation paths):
+//
+//	lock, err := mgr.Acquire(key, holderID, ttl)
+//	if err != nil { ... }
+//	defer mgr.Release(lock.Key, holderID)
+//	// Before performing the protected write, validate the fence:
+//	if err := mgr.CheckFence(lock.Key, lock.Token); err != nil {
+//	    return err // stale lock holder — abort the write
+//	}
+//	// ... perform the write, persisting lock.Token alongside the mutation ...
 package distlock
 
 import (
@@ -16,8 +34,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -34,8 +50,6 @@ type Lock struct {
 // LockManager manages distributed locks backed by Redis.
 type LockManager struct {
 	rdb        *redis.Client
-	mu         sync.Mutex // protects local token counter
-	token      int64
 	prefix     string
 	instanceID string
 }
@@ -76,13 +90,6 @@ func NewLockManagerWithConfig(cfg Config) *LockManager {
 		instanceID: instanceID,
 	}
 
-	// Initialize fencing token counter from Redis
-	ctx := context.Background()
-	val, err := rdb.Get(ctx, cfg.KeyPrefix+"__fencing_counter__").Int64()
-	if err == nil {
-		mgr.token = val
-	}
-
 	return mgr
 }
 
@@ -115,7 +122,10 @@ func (m *LockManager) Acquire(key, holderID string, ttl time.Duration) (*Lock, e
 		if existing == holderID {
 			// Reentrant: extend TTL
 			m.rdb.Expire(ctx, redisKey, ttl)
-			token := m.currentToken(key, ctx)
+			token, err := m.currentToken(ctx, key)
+			if err != nil {
+				return nil, fmt.Errorf("fencing token unavailable for %s: %w", key, err)
+			}
 			return &Lock{
 				Key:       key,
 				HolderID:  holderID,
@@ -127,8 +137,13 @@ func (m *LockManager) Acquire(key, holderID string, ttl time.Duration) (*Lock, e
 		return nil, fmt.Errorf("lock %s held by %s until %v", key, existing, time.Now().Add(remainTTL))
 	}
 
-	// Acquired — get monotonic fencing token
-	token := m.nextToken(ctx)
+	// Acquired — get strictly monotonic fencing token via Redis INCR.
+	// Fail closed: if the token cannot be issued, release the lock and error.
+	token, err := m.nextToken(ctx)
+	if err != nil {
+		m.rdb.Del(ctx, redisKey)
+		return nil, fmt.Errorf("fencing token issuance failed for %s (lock released): %w", key, err)
+	}
 	tokenKey := m.prefix + "token:" + key
 	m.rdb.Set(ctx, tokenKey, token, ttl+time.Minute) // token persists slightly longer than lock
 
@@ -203,6 +218,7 @@ func (m *LockManager) IsHeld(key string) bool {
 }
 
 // ValidateFencingToken checks that the token is still the current holder's token.
+// Fail closed: any Redis error or unknown token returns false.
 func (m *LockManager) ValidateFencingToken(key string, token int64) bool {
 	ctx := context.Background()
 	tokenKey := m.prefix + "token:" + key
@@ -213,30 +229,54 @@ func (m *LockManager) ValidateFencingToken(key string, token int64) bool {
 	return val == token
 }
 
+// CheckFence validates a fencing token before a protected write. Writers MUST
+// call this immediately before mutating the guarded resource; a stale token
+// (a newer acquisition has since issued a higher token) or any validation
+// failure aborts the write. Returns nil only when token is the latest token
+// issued for key.
+func (m *LockManager) CheckFence(key string, token int64) error {
+	if token <= 0 {
+		return fmt.Errorf("invalid fencing token %d for %s", token, key)
+	}
+	ctx := context.Background()
+	tokenKey := m.prefix + "token:" + key
+	val, err := m.rdb.Get(ctx, tokenKey).Int64()
+	if err != nil {
+		return fmt.Errorf("fence check failed for %s (fail closed): %w", key, err)
+	}
+	if val != token {
+		return fmt.Errorf("stale fencing token for %s: have %d, current is %d", key, token, val)
+	}
+	return nil
+}
+
 // Close closes the Redis connection.
 func (m *LockManager) Close() error {
 	return m.rdb.Close()
 }
 
-// nextToken returns the next monotonically increasing fencing token (Redis INCR).
-func (m *LockManager) nextToken(ctx context.Context) int64 {
+// nextToken returns the next strictly monotonically increasing fencing token.
+// The counter is a single Redis INCR key, so tokens are monotonic across all
+// lock-manager instances. There is deliberately NO local fallback: a local
+// counter would not be monotonic across instances, which is exactly the
+// failure mode fencing tokens exist to prevent.
+func (m *LockManager) nextToken(ctx context.Context) (int64, error) {
 	counterKey := m.prefix + "__fencing_counter__"
 	val, err := m.rdb.Incr(ctx, counterKey).Result()
 	if err != nil {
-		// Fallback to local counter if Redis fails
-		return atomic.AddInt64(&m.token, 1)
+		return 0, fmt.Errorf("redis INCR %s failed: %w", counterKey, err)
 	}
-	return val
+	return val, nil
 }
 
 // currentToken retrieves the current token for a key.
-func (m *LockManager) currentToken(key string, ctx context.Context) int64 {
+func (m *LockManager) currentToken(ctx context.Context, key string) (int64, error) {
 	tokenKey := m.prefix + "token:" + key
 	val, err := m.rdb.Get(ctx, tokenKey).Int64()
 	if err != nil {
-		return atomic.LoadInt64(&m.token)
+		return 0, fmt.Errorf("redis GET %s failed: %w", tokenKey, err)
 	}
-	return val
+	return val, nil
 }
 
 func generateInstanceID() string {

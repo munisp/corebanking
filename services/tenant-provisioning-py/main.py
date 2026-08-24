@@ -7,21 +7,38 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import time
+import threading
+import signal
+import socket as _socket
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("tenant-provisioning-py")
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/tenant_provisioning_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -31,10 +48,14 @@ PORT = int(os.getenv("PORT", "8031"))
 
 db_conn = None
 
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -167,25 +188,22 @@ def release_db(conn):
             pass
 
 def init_schema():
-    conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+    """Create the tables this service actually uses. Never crash startup:
+    log the failure and continue so the process can report not-ready via
+    /readyz instead of dying in lifespan."""
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"init_schema: database unavailable: {e}")
+        return
     try:
         cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "tenant-provisioning-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
-
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -194,13 +212,14 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
-    conn.commit()
-    logger.info("Schema initialized")
+        conn.commit()
+        logger.info("Schema initialized")
+    except Exception as e:
+        logger.error(f"init_schema failed: {e}")
 
 
 @asynccontextmanager
@@ -216,9 +235,67 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="tenant-provisioning-py", version="1.0.0", lifespan=lifespan)
 
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -351,6 +428,26 @@ def delete_record(record_id: str):
         )
     conn.commit()
 
+
+# --- Domain constants: provisioning workflow definitions ---
+PROVISIONING_STEPS = [
+    {"step": 1, "name": "tenant_identity", "description": "Create tenant org record and admin principal"},
+    {"step": 2, "name": "schema_provisioning", "description": "Provision database schema and RLS policies"},
+    {"step": 3, "name": "ledger_setup", "description": "Create chart of accounts and ledger accounts"},
+    {"step": 4, "name": "compliance_profile", "description": "Attach KYC/AML and regulatory reporting profile"},
+    {"step": 5, "name": "feature_activation", "description": "Enable tier-entitled product features"},
+]
+GROWTH_FEATURE_SETUP = [
+    {"feature": "chatbot", "min_tier": "starter"},
+    {"feature": "smart_savings", "min_tier": "starter"},
+    {"feature": "virtual_cards", "min_tier": "commercial"},
+    {"feature": "qr_payments", "min_tier": "commercial"},
+    {"feature": "bnpl", "min_tier": "enterprise"},
+    {"feature": "investments", "min_tier": "enterprise"},
+    {"feature": "remittances", "min_tier": "enterprise"},
+    {"feature": "gamification", "min_tier": "enterprise"},
+]
+
 # --- Domain Logic ---
 def middleware_status():
     return {
@@ -371,6 +468,15 @@ def middleware_status():
     }
 
 
+def _state_query(table):
+    """Read tenant-onboarding state rows from Postgres. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT id, status, created_at FROM {table} ORDER BY created_at DESC LIMIT 100")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
+
+
 def handle_request(path: str) -> dict:
     if path == "/healthz":
         return {
@@ -385,11 +491,26 @@ def handle_request(path: str) -> dict:
     elif path == "/v1/provisioning/growth-feature-setup":
         return {"features": GROWTH_FEATURE_SETUP, "total": len(GROWTH_FEATURE_SETUP), "middleware": middleware_status()}
     elif path == "/v1/provisioning/history":
-        return {"items": ONBOARDING_HISTORY, "total": len(ONBOARDING_HISTORY), "middleware": middleware_status()}
+        try:
+            items = _state_query("onboarding_history")
+        except Exception as e:
+            logger.error(f"onboarding_history query failed: {e}")
+            raise HTTPException(status_code=503, detail="state_unavailable")
+        return {"items": items, "total": len(items), "middleware": middleware_status()}
     elif path == "/v1/provisioning/pending":
-        return {"items": PENDING_ONBOARDINGS, "total": len(PENDING_ONBOARDINGS), "middleware": middleware_status()}
+        try:
+            items = _state_query("pending_onboardings")
+        except Exception as e:
+            logger.error(f"pending_onboardings query failed: {e}")
+            raise HTTPException(status_code=503, detail="state_unavailable")
+        return {"items": items, "total": len(items), "middleware": middleware_status()}
     elif path == "/v1/provisioning/tier-changes":
-        return {"items": TIER_CHANGES, "total": len(TIER_CHANGES), "middleware": middleware_status()}
+        try:
+            items = _state_query("tier_changes")
+        except Exception as e:
+            logger.error(f"tier_changes query failed: {e}")
+            raise HTTPException(status_code=503, detail="state_unavailable")
+        return {"items": items, "total": len(items), "middleware": middleware_status()}
     elif path == "/v1/provisioning/cost-calculator":
         return {
             "calculator": {
@@ -632,75 +753,81 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        pass
 
-    def respond(self, code, data):
-        body = json.dumps(data).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        add_security_headers(self)
-        self.end_headers()
-        self.wfile.write(body)
+# --- JWT Auth ---
+def validate_jwt(headers):
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
 
-    def do_GET(self):
-        _cache_key = f"tenant_provisioning_{self.path}"
-        _cached = cache_get(_cache_key)
-        if _cached and self.path not in ("/healthz", "/readyz", "/livez", "/metrics", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-Cache", "HIT")
-            add_security_headers(self)
-            self.end_headers()
-            self.wfile.write(_cached.encode() if isinstance(_cached, str) else _cached)
-            return
-        global _request_counter
-        with _counter_lock:
-            _request_counter += 1
-        path = urlparse(self.path).path
-        if path in ("/healthz", "/readyz", "/livez"):
-            self.respond(200, {"status": "healthy", "service": SERVICE_NAME})
-            return
-        if path == "/metrics":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(f'requests_total{{service="{SERVICE_NAME}"}} {_request_counter}\n'.encode())
-            return
-        result = handle_request(path)
-        if "error" in result:
-            self.respond(404, result)
-        else:
-            self.respond(200, result)
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    Canonical implementation: services/shared/auth/jwt_validation.py.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = auth[7:]
+    import hmac, hashlib, base64, json as _json, time as _t
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if _t.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
 
-    def do_POST(self):
-        global _request_counter
-        with _counter_lock:
-            _request_counter += 1
-        valid, err = validate_jwt(dict(self.headers))
-        if not valid:
-            inc_errors()
-            self.respond(401, {"error": "unauthorized", "detail": err})
-            return
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Retry-After", "1")
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(content_length).decode("utf-8"))) if content_length > 0 else {}
-        path = urlparse(self.path).path
-        db_insert("provisioning_events", {"tenant_id": self.get_tenant_id(), "path": path, "action": "create", "timestamp": time.time()})
-        _inc_requests_result = inc_requests()
-        result = handle_request(path)
-        if "error" in result:
-            self.respond(404, result)
-        else:
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-            self.respond(201, result)
+
+def db_query():
+    """Read real config rows from Postgres. Raises on failure (fail fast)."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1],
+             "tenant_id": str(r[2]) if len(r) > 2 and r[2] else None,
+             "created_at": str(r[3] if len(r) > 3 else r[-1])} for r in rows]
+
+
+def db_insert(record_id, body):
+    """Persist a record to Postgres with an outbox event. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO service_configs (id, status) VALUES (%s::uuid, %s) ON CONFLICT (id) DO NOTHING",
+            (record_id, (body or {}).get("status", "active") if isinstance(body, dict) else "active"),
+        )
+        payload = json.dumps({"id": str(record_id), "data": body}, default=str)
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("record.created", str(record_id), payload),
+        )
+    conn.commit()
+    return True
 
 if __name__ == "__main__":
     import uvicorn

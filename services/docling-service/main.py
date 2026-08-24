@@ -113,31 +113,111 @@ LAKEHOUSE_API_URL = os.getenv("LAKEHOUSE_API_URL", "http://lakehouse-api:8000")
 
 # ==================== HELPER FUNCTIONS ====================
 
+# Maximum remote document download size (default 20 MiB)
+MAX_DOCUMENT_DOWNLOAD_BYTES = int(
+    os.getenv("DOCLING_MAX_DOWNLOAD_BYTES", str(20 * 1024 * 1024))
+)
+ALLOWED_DOWNLOAD_PORTS = {80, 443}
+
+
+def validate_remote_document_url(url: str) -> None:
+    """Validate a remote document URL before any server-side fetch (SSRF guard).
+
+    Fails closed: raises ValueError unless the URL uses http/https on an
+    allowlisted port (80/443) and every resolved address is a public IP.
+    Private, loopback, link-local (e.g. 169.254.169.254 cloud metadata),
+    reserved, multicast and unspecified addresses are rejected.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("URL scheme must be http or https")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL host is required")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        raise ValueError("URL port is invalid")
+    if port not in ALLOWED_DOWNLOAD_PORTS:
+        raise ValueError(f"URL port {port} is not allowed")
+    try:
+        addrinfos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        raise ValueError("URL host cannot be resolved")
+    if not addrinfos:
+        raise ValueError("URL host cannot be resolved")
+    for info in addrinfos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise ValueError(f"URL host resolves to a non-public address ({ip})")
+
+
+async def _fetch_url_capped(url: str) -> tuple:
+    """Fetch a validated URL with a hard response-size cap.
+
+    Redirects are not followed (a redirect target would bypass validation);
+    callers receive the redirect as an HTTP error instead.
+    Returns (content_bytes, content_type).
+    """
+    import httpx
+
+    validate_remote_document_url(url)
+    async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            content_length = response.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > MAX_DOCUMENT_DOWNLOAD_BYTES:
+                        raise ValueError(
+                            f"Remote document exceeds maximum size of {MAX_DOCUMENT_DOWNLOAD_BYTES} bytes"
+                        )
+                except ValueError as exc:
+                    if "exceeds maximum size" in str(exc):
+                        raise
+            chunks = []
+            received = 0
+            async for chunk in response.aiter_bytes(65536):
+                received += len(chunk)
+                if received > MAX_DOCUMENT_DOWNLOAD_BYTES:
+                    raise ValueError(
+                        f"Remote document exceeds maximum size of {MAX_DOCUMENT_DOWNLOAD_BYTES} bytes"
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks), response.headers.get("content-type", "")
+
+
 async def download_or_decode_document(content: str, document_id: str) -> str:
     """
     Download document from URL or decode base64 content
     Returns: file path to saved document
     """
     import base64
-    import httpx
     import tempfile
-    
+
     # Check if content is URL or base64
     if content.startswith(('http://', 'https://')):
-        # Download from URL
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.get(content)
-            response.raise_for_status()
-            file_content = response.content
-            
-            # Determine file extension from content-type
-            content_type = response.headers.get('content-type', '')
-            if 'pdf' in content_type:
-                ext = '.pdf'
-            elif 'image' in content_type:
-                ext = '.jpg'
-            else:
-                ext = '.bin'
+        # Download from URL (SSRF-validated, size-capped)
+        file_content, content_type = await _fetch_url_capped(content)
+
+        # Determine file extension from content-type
+        if 'pdf' in content_type:
+            ext = '.pdf'
+        elif 'image' in content_type:
+            ext = '.jpg'
+        else:
+            ext = '.bin'
     else:
         # Decode base64
         try:
@@ -473,11 +553,18 @@ async def get_document_result(
 @app.post("/api/v1/documents/batch")
 async def batch_upload(
     request: BatchUploadRequest,
-    background_tasks: BackgroundTasks
+    background_tasks: BackgroundTasks,
+    tenant_id: str = Depends(get_current_tenant)
 ):
     """
-    Upload and process multiple documents in batch
+    Upload and process multiple documents in batch.
+
+    Requires a valid Bearer JWT. The tenant is derived from verified token
+    claims; a body-supplied tenant_id that does not match the token tenant
+    is rejected (fail-closed) to prevent cross-tenant access to results.
     """
+    if request.tenant_id != tenant_id:
+        raise HTTPException(status_code=403, detail="Tenant mismatch with authenticated identity")
     document_ids = []
     
     for doc_content in request.documents:

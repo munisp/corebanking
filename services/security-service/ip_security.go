@@ -16,34 +16,34 @@ import (
 // IPSecurityConfig holds configurable IP security settings
 type IPSecurityConfig struct {
 	// Auto-blocking settings
-	EnableAutoBlock           bool `json:"enable_auto_block"`
-	FailedAttemptsThreshold   int  `json:"failed_attempts_threshold"`
-	BlockDurationMinutes      int  `json:"block_duration_minutes"`
-	SuspicionScoreThreshold   int  `json:"suspicion_score_threshold"`
-	SuspicionScoreDecayHours  int  `json:"suspicion_score_decay_hours"`
+	EnableAutoBlock          bool `json:"enable_auto_block"`
+	FailedAttemptsThreshold  int  `json:"failed_attempts_threshold"`
+	BlockDurationMinutes     int  `json:"block_duration_minutes"`
+	SuspicionScoreThreshold  int  `json:"suspicion_score_threshold"`
+	SuspicionScoreDecayHours int  `json:"suspicion_score_decay_hours"`
 
 	// Geo-restriction settings
-	EnableGeoRestriction      bool     `json:"enable_geo_restriction"`
-	AllowedCountries          []string `json:"allowed_countries"`
-	BlockedCountries          []string `json:"blocked_countries"`
-	HighRiskCountries         []string `json:"high_risk_countries"`
-	HomeCountry               string   `json:"home_country"`
+	EnableGeoRestriction bool     `json:"enable_geo_restriction"`
+	AllowedCountries     []string `json:"allowed_countries"`
+	BlockedCountries     []string `json:"blocked_countries"`
+	HighRiskCountries    []string `json:"high_risk_countries"`
+	HomeCountry          string   `json:"home_country"`
 
 	// VPN/Proxy detection
-	EnableVPNDetection        bool `json:"enable_vpn_detection"`
-	BlockVPN                  bool `json:"block_vpn"`
-	BlockTor                  bool `json:"block_tor"`
-	BlockProxy                bool `json:"block_proxy"`
-	BlockDatacenter           bool `json:"block_datacenter"`
+	EnableVPNDetection bool `json:"enable_vpn_detection"`
+	BlockVPN           bool `json:"block_vpn"`
+	BlockTor           bool `json:"block_tor"`
+	BlockProxy         bool `json:"block_proxy"`
+	BlockDatacenter    bool `json:"block_datacenter"`
 
 	// Rate limiting
-	MaxRequestsPerMinute      int `json:"max_requests_per_minute"`
-	MaxRequestsPerHour        int `json:"max_requests_per_hour"`
-	MaxLoginAttemptsPerHour   int `json:"max_login_attempts_per_hour"`
+	MaxRequestsPerMinute    int `json:"max_requests_per_minute"`
+	MaxRequestsPerHour      int `json:"max_requests_per_hour"`
+	MaxLoginAttemptsPerHour int `json:"max_login_attempts_per_hour"`
 
 	// Whitelist/Blacklist
-	EnableWhitelist           bool `json:"enable_whitelist"`
-	EnableBlacklist           bool `json:"enable_blacklist"`
+	EnableWhitelist bool `json:"enable_whitelist"`
+	EnableBlacklist bool `json:"enable_blacklist"`
 }
 
 // DefaultIPSecurityConfig provides secure defaults
@@ -54,24 +54,24 @@ var DefaultIPSecurityConfig = IPSecurityConfig{
 	SuspicionScoreThreshold:  100,
 	SuspicionScoreDecayHours: 24,
 
-	EnableGeoRestriction:     false, // Default to global access for BaaS
-	AllowedCountries:         []string{}, // Empty = all allowed
-	BlockedCountries:         []string{},
-	HighRiskCountries:        []string{"KP", "IR", "SY", "CU"}, // Sanctioned countries
-	HomeCountry:              "NG", // Nigeria
+	EnableGeoRestriction: false,      // Default to global access for BaaS
+	AllowedCountries:     []string{}, // Empty = all allowed
+	BlockedCountries:     []string{},
+	HighRiskCountries:    []string{"KP", "IR", "SY", "CU"}, // Sanctioned countries
+	HomeCountry:          "NG",                             // Nigeria
 
-	EnableVPNDetection:       true,
-	BlockVPN:                 false, // Don't block, but flag for step-up auth
-	BlockTor:                 true,  // Block Tor by default
-	BlockProxy:               false, // Don't block, but flag
-	BlockDatacenter:          false, // Don't block, but flag
+	EnableVPNDetection: true,
+	BlockVPN:           false, // Don't block, but flag for step-up auth
+	BlockTor:           true,  // Block Tor by default
+	BlockProxy:         false, // Don't block, but flag
+	BlockDatacenter:    false, // Don't block, but flag
 
-	MaxRequestsPerMinute:     100,
-	MaxRequestsPerHour:       1000,
-	MaxLoginAttemptsPerHour:  20,
+	MaxRequestsPerMinute:    100,
+	MaxRequestsPerHour:      1000,
+	MaxLoginAttemptsPerHour: 20,
 
-	EnableWhitelist:          false,
-	EnableBlacklist:          true,
+	EnableWhitelist: false,
+	EnableBlacklist: true,
 }
 
 // IPType represents the type of IP address
@@ -88,32 +88,32 @@ const (
 
 // IPInfo holds information about an IP address
 type IPInfo struct {
-	IP            string    `json:"ip"`
-	Type          IPType    `json:"type"`
-	CountryCode   string    `json:"country_code"`
-	CountryName   string    `json:"country_name"`
-	City          string    `json:"city"`
-	Region        string    `json:"region"`
-	ISP           string    `json:"isp"`
-	Organization  string    `json:"organization"`
-	ASN           string    `json:"asn"`
-	IsVPN         bool      `json:"is_vpn"`
-	IsTor         bool      `json:"is_tor"`
-	IsProxy       bool      `json:"is_proxy"`
-	IsDatacenter  bool      `json:"is_datacenter"`
-	ThreatScore   int       `json:"threat_score"`
-	LastChecked   time.Time `json:"last_checked"`
+	IP           string    `json:"ip"`
+	Type         IPType    `json:"type"`
+	CountryCode  string    `json:"country_code"`
+	CountryName  string    `json:"country_name"`
+	City         string    `json:"city"`
+	Region       string    `json:"region"`
+	ISP          string    `json:"isp"`
+	Organization string    `json:"organization"`
+	ASN          string    `json:"asn"`
+	IsVPN        bool      `json:"is_vpn"`
+	IsTor        bool      `json:"is_tor"`
+	IsProxy      bool      `json:"is_proxy"`
+	IsDatacenter bool      `json:"is_datacenter"`
+	ThreatScore  int       `json:"threat_score"`
+	LastChecked  time.Time `json:"last_checked"`
 }
 
 // IPCheckResult represents the result of an IP security check
 type IPCheckResult struct {
-	Allowed         bool     `json:"allowed"`
-	RequiresMFA     bool     `json:"requires_mfa"`
-	RequiresReview  bool     `json:"requires_review"`
-	RiskScore       int      `json:"risk_score"`
-	Reasons         []string `json:"reasons"`
-	IPInfo          *IPInfo  `json:"ip_info,omitempty"`
-	BlockedUntil    *time.Time `json:"blocked_until,omitempty"`
+	Allowed        bool       `json:"allowed"`
+	RequiresMFA    bool       `json:"requires_mfa"`
+	RequiresReview bool       `json:"requires_review"`
+	RiskScore      int        `json:"risk_score"`
+	Reasons        []string   `json:"reasons"`
+	IPInfo         *IPInfo    `json:"ip_info,omitempty"`
+	BlockedUntil   *time.Time `json:"blocked_until,omitempty"`
 }
 
 // IPSecurityManager manages IP-based security

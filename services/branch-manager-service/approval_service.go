@@ -65,22 +65,22 @@ func (s *ApprovalService) CreateApproval(tenantID, branchID, userID string, req 
 	defer s.mu.Unlock()
 
 	approval := &ApprovalRequest{
-		RequestID:       uuid.New().String(),
-		TenantID:        tenantID,
-		BranchID:        branchID,
-		RequestType:     req.RequestType,
-		ReferenceID:     req.ReferenceID,
-		RequestedBy:     userID,
-		CustomerID:      req.CustomerID,
-		CustomerName:    req.CustomerName,
-		Amount:          req.Amount,
-		Currency:        req.Currency,
-		Description:     req.Description,
-		Priority:        req.Priority,
-		Status:          "pending",
-		Details:         req.Details,
-		CreatedAt:       time.Now(),
-		UpdatedAt:       time.Now(),
+		RequestID:    uuid.New().String(),
+		TenantID:     tenantID,
+		BranchID:     branchID,
+		RequestType:  req.RequestType,
+		ReferenceID:  req.ReferenceID,
+		RequestedBy:  userID,
+		CustomerID:   req.CustomerID,
+		CustomerName: req.CustomerName,
+		Amount:       req.Amount,
+		Currency:     req.Currency,
+		Description:  req.Description,
+		Priority:     req.Priority,
+		Status:       "pending",
+		Details:      req.Details,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
 	}
 
 	// Set due date based on priority

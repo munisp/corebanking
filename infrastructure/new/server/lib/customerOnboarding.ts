@@ -24,6 +24,13 @@
  *   - Kafka: account.onboarding.started, kyc.verification.required, account.opened
  */
 
+import { randomInt } from "crypto";
+
+/** CSPRNG account number (540-prefixed, 10 digits) — never Math.random(). */
+function generateAccountNumber(): string {
+  return `540${String(randomInt(0, 10000000)).padStart(7, "0")}`;
+}
+
 export interface OnboardingApplication {
   id: string;
   firstName: string;
@@ -203,7 +210,7 @@ export function advanceOnboarding(id: string, step: string, result: { passed: bo
         app.status = "approved";
         app.completedAt = now;
         app.kycCompletedAt = now;
-        app.accountNumber = `540${String(Math.floor(Math.random() * 10000000)).padStart(7, "0")}`;
+        app.accountNumber = generateAccountNumber();
         return { application: app, nextStep: "Account created — Tier 1 (BVN-only mobile money)" };
       }
       app.status = "nin_pending";
@@ -245,7 +252,7 @@ export function advanceOnboarding(id: string, step: string, result: { passed: bo
       app.completedAt = now;
       app.kycCompletedAt = now;
       if (app.tier === "Tier 3") app.kycLevel = "enhanced";
-      app.accountNumber = `540${String(Math.floor(Math.random() * 10000000)).padStart(7, "0")}`;
+      app.accountNumber = generateAccountNumber();
       return { application: app, nextStep: `Account created — ${app.tier} (KYC ${app.kycLevel})` };
 
     default:

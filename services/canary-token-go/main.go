@@ -4,16 +4,21 @@ package main
 
 import (
 	"context"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -23,9 +28,12 @@ import (
 )
 
 func secureRandHex(n int) string { b := make([]byte, n); rand.Read(b); return hex.EncodeToString(b) }
+
 var semaphore = make(chan struct{}, 100)
+
 func acquireSem() { semaphore <- struct{}{} }
 func releaseSem() { <-semaphore }
+
 var serviceName = "canary-token-go"
 var eventBus = newEventBus("security.insider-threat", "canary-token")
 var startTime = time.Now()
@@ -58,7 +66,9 @@ var (
 )
 
 func initSchema() {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	for _, q := range []string{
@@ -92,7 +102,9 @@ func initSchema() {
 }
 
 func dbSaveToken(t *CanaryToken) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	triggersJSON, _ := json.Marshal(t.Triggers)
@@ -102,7 +114,9 @@ func dbSaveToken(t *CanaryToken) {
 }
 
 func dbLoadTokenByResource(resource string) *CanaryToken {
-	if db == nil { return nil }
+	if db == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	row := db.QueryRowContext(ctx, `SELECT id, type, name, resource, status, COALESCE(created_by,''), created_at, triggers FROM canary_tokens WHERE resource=$1 AND status != 'disabled' LIMIT 1`, resource)
@@ -110,7 +124,9 @@ func dbLoadTokenByResource(resource string) *CanaryToken {
 }
 
 func dbLoadToken(id string) *CanaryToken {
-	if db == nil { return nil }
+	if db == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	row := db.QueryRowContext(ctx, `SELECT id, type, name, resource, status, COALESCE(created_by,''), created_at, triggers FROM canary_tokens WHERE id=$1`, id)
@@ -128,17 +144,23 @@ func scanToken(row *sql.Row) *CanaryToken {
 }
 
 func dbListTokens() []*CanaryToken {
-	if db == nil { return nil }
+	if db == nil {
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	rows, err := db.QueryContext(ctx, `SELECT id, type, name, resource, status, COALESCE(created_by,''), created_at, triggers FROM canary_tokens ORDER BY created_at`)
-	if err != nil { return nil }
+	if err != nil {
+		return nil
+	}
 	defer rows.Close()
 	var result []*CanaryToken
 	for rows.Next() {
 		var t CanaryToken
 		var triggersJSON string
-		if rows.Scan(&t.ID, &t.Type, &t.Name, &t.Resource, &t.Status, &t.CreatedBy, &t.CreatedAt, &triggersJSON) != nil { continue }
+		if rows.Scan(&t.ID, &t.Type, &t.Name, &t.Resource, &t.Status, &t.CreatedBy, &t.CreatedAt, &triggersJSON) != nil {
+			continue
+		}
 		json.Unmarshal([]byte(triggersJSON), &t.Triggers)
 		result = append(result, &t)
 	}
@@ -149,8 +171,12 @@ func triggerCanary(tokenID, actorID, actorIP, operation, userAgent string) error
 	mu.Lock()
 	defer mu.Unlock()
 	token := dbLoadToken(tokenID)
-	if token == nil { return fmt.Errorf("canary token %s not found", tokenID) }
-	if token.Status == "disabled" { return nil }
+	if token == nil {
+		return fmt.Errorf("canary token %s not found", tokenID)
+	}
+	if token.Status == "disabled" {
+		return nil
+	}
 	token.Status = "triggered"
 	atomic.AddUint64(&triggerCount, 1)
 	h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%s", tokenID, actorID, operation, time.Now().Format(time.RFC3339Nano))))
@@ -175,7 +201,10 @@ func triggerCanary(tokenID, actorID, actorIP, operation, userAgent string) error
 func handleCheckResource(w http.ResponseWriter, r *http.Request) {
 	resource := r.URL.Query().Get("resource")
 	actorID := r.URL.Query().Get("actor_id")
-	if resource == "" { http.Error(w, "resource required", 400); return }
+	if resource == "" {
+		http.Error(w, "resource required", 400)
+		return
+	}
 	mu.RLock()
 	token := dbLoadTokenByResource(resource)
 	mu.RUnlock()
@@ -188,9 +217,15 @@ func handleCheckResource(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleCreateToken(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost { http.Error(w, "method not allowed", 405); return }
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
 	var token CanaryToken
-	if err := json.NewDecoder(r.Body).Decode(&token); err != nil { http.Error(w, "invalid JSON", 400); return }
+	if err := json.NewDecoder(r.Body).Decode(&token); err != nil {
+		http.Error(w, "invalid JSON", 400)
+		return
+	}
 	token.ID = fmt.Sprintf("CANARY-%s-%s", token.Type, secureRandHex(4))
 	token.Status = "active"
 	token.CreatedAt = time.Now()
@@ -198,13 +233,18 @@ func handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	dbSaveToken(&token)
 	mu.Unlock()
-	w.Header().Set("Content-Type", "application/json"); w.WriteHeader(201); json.NewEncoder(w).Encode(token)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(201)
+	json.NewEncoder(w).Encode(token)
 }
 
 func handleListTokens(w http.ResponseWriter, r *http.Request) {
 	result := dbListTokens()
-	if result == nil { result = make([]*CanaryToken, 0) }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(result)
+	if result == nil {
+		result = make([]*CanaryToken, 0)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 func handleListTriggers(w http.ResponseWriter, r *http.Request) {
@@ -219,61 +259,326 @@ func handleListTriggers(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	}
-	if triggers == nil { triggers = make([]map[string]interface{}, 0) }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(triggers)
+	if triggers == nil {
+		triggers = make([]map[string]interface{}, 0)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(triggers)
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
 	tokens := dbListTokens()
 	active, triggered := 0, 0
-	for _, t := range tokens { if t.Status == "active" { active++ } else if t.Status == "triggered" { triggered++ } }
+	for _, t := range tokens {
+		if t.Status == "active" {
+			active++
+		} else if t.Status == "triggered" {
+			triggered++
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"total_tokens": len(tokens), "active": active, "triggered": triggered,
 		"total_trigger_events": atomic.LoadUint64(&triggerCount),
-		"uptime_seconds": int(time.Since(startTime).Seconds()),
+		"uptime_seconds":       int(time.Since(startTime).Seconds()),
 	})
 }
 
-var healthyFlag int32 = 1; var lastActivity int64
-func healthzHandler(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]interface{}{"status": "healthy", "service": serviceName}) }
-func livezHandler(w http.ResponseWriter, r *http.Request) { w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "alive"}) }
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if db == nil { w.WriteHeader(503); json.NewEncoder(w).Encode(map[string]string{"status": "not_ready"}); return }
-	w.Header().Set("Content-Type", "application/json"); json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+var healthyFlag int32 = 1
+var lastActivity int64
+
+func healthzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "healthy", "service": serviceName})
 }
-func startWatchdog() { atomic.StoreInt64(&lastActivity, time.Now().Unix()); go func() { for { time.Sleep(15*time.Second); if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 60 { atomic.StoreInt32(&healthyFlag, 0) } else { atomic.StoreInt32(&healthyFlag, 1) } } }() }
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+}
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not_ready"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+func startWatchdog() {
+	atomic.StoreInt64(&lastActivity, time.Now().Unix())
+	go func() {
+		for {
+			time.Sleep(15 * time.Second)
+			if time.Now().Unix()-atomic.LoadInt64(&lastActivity) > 60 {
+				atomic.StoreInt32(&healthyFlag, 0)
+			} else {
+				atomic.StoreInt32(&healthyFlag, 1)
+			}
+		}
+	}()
+}
 func recordActivity() { atomic.StoreInt64(&lastActivity, time.Now().Unix()) }
 
-type EventBusImpl struct { topic, source string; mu sync.Mutex; events []map[string]interface{} }
-func newEventBus(topic, source string) *EventBusImpl { return &EventBusImpl{topic: topic, source: source, events: make([]map[string]interface{}, 0)} }
-func (eb *EventBusImpl) Emit(eventType string, payload map[string]interface{}) { eb.mu.Lock(); defer eb.mu.Unlock(); eb.events = append(eb.events, map[string]interface{}{"event_type": eventType, "source": eb.source, "topic": eb.topic, "timestamp": time.Now().Format(time.RFC3339), "payload": payload}); log.Printf("[EventBus] %s -> %s: %v", eb.topic, eventType, payload) }
-func loggingMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { recordActivity(); start := time.Now(); next.ServeHTTP(w, r); log.Printf("[%s] %s %s %s", serviceName, r.Method, r.URL.Path, time.Since(start)) }) }
-func rateLimitMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { acquireSem(); defer releaseSem(); next.ServeHTTP(w, r) }) }
-func panicMW(next http.Handler) http.Handler { return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { defer func() { if err := recover(); err != nil { log.Printf("[PANIC] %v", err); http.Error(w, "internal error", 500) } }(); next.ServeHTTP(w, r) }) }
+type EventBusImpl struct {
+	topic, source string
+	mu            sync.Mutex
+	events        []map[string]interface{}
+}
+
+func newEventBus(topic, source string) *EventBusImpl {
+	return &EventBusImpl{topic: topic, source: source, events: make([]map[string]interface{}, 0)}
+}
+func (eb *EventBusImpl) Emit(eventType string, payload map[string]interface{}) {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	eb.events = append(eb.events, map[string]interface{}{"event_type": eventType, "source": eb.source, "topic": eb.topic, "timestamp": time.Now().Format(time.RFC3339), "payload": payload})
+	log.Printf("[EventBus] %s -> %s: %v", eb.topic, eventType, payload)
+}
+func loggingMW(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recordActivity()
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("[%s] %s %s %s", serviceName, r.Method, r.URL.Path, time.Since(start))
+	})
+}
+func rateLimitMW(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { acquireSem(); defer releaseSem(); next.ServeHTTP(w, r) })
+}
+func panicMW(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Printf("[PANIC] %v", err)
+				http.Error(w, "internal error", 500)
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func jwtRealmURL() string {
+	return getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(jwtRealmURL())
+		}
+	}()
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + expiry). Fail-closed: requests without a verifiable token
+// get 401. Only health/metrics probes are exempt. Tenant identity is derived
+// from the verified claims and stamped onto X-Tenant-ID, overwriting any
+// caller-supplied value.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":%q}`, "canary-token-go")
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"malformed token","service":%q}`, "canary-token-go")
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		// Tenant identity comes ONLY from verified claims; overwrite any
+		// caller-supplied tenant header before invoking the handler.
+		if tenant := tenantFromClaims(claims); tenant != "" {
+			r.Header.Set("X-Tenant-ID", tenant)
+		} else {
+			r.Header.Del("X-Tenant-ID")
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 func main() {
-	port := os.Getenv("PORT"); if port == "" { port = "8080" }
+	startJWKSRefresh()
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL != "" {
-		var err error; db, err = sql.Open("postgres", dbURL)
-		if err != nil { log.Printf("[canary] DB: %v", err)
+		var err error
+		db, err = sql.Open("postgres", dbURL)
+		if err != nil {
+			log.Printf("[canary] DB: %v", err)
 		} else {
-			db.SetMaxOpenConns(25); db.SetMaxIdleConns(5); db.SetConnMaxLifetime(5*time.Minute)
-			if err := db.Ping(); err != nil { log.Printf("[canary] DB ping: %v", err) } else { initSchema() }
+			db.SetMaxOpenConns(25)
+			db.SetMaxIdleConns(5)
+			db.SetConnMaxLifetime(5 * time.Minute)
+			if err := db.Ping(); err != nil {
+				log.Printf("[canary] DB ping: %v", err)
+			} else {
+				initSchema()
+			}
 		}
-	} else { log.Println("[canary] WARNING: DATABASE_URL not set") }
+	} else {
+		log.Println("[canary] WARNING: DATABASE_URL not set")
+	}
 	startWatchdog()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", healthzHandler); mux.HandleFunc("/livez", livezHandler); mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/healthz", healthzHandler)
+	mux.HandleFunc("/livez", livezHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/api/v1/canary/check", handleCheckResource)
 	mux.HandleFunc("/api/v1/canary/create", handleCreateToken)
 	mux.HandleFunc("/api/v1/canary/tokens", handleListTokens)
 	mux.HandleFunc("/api/v1/canary/triggers", handleListTriggers)
 	mux.HandleFunc("/api/v1/canary/stats", handleStats)
 	handler := panicMW(rateLimitMW(loggingMW(mux)))
-	srv := &http.Server{Addr: ":" + port, Handler: handler, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
-	go func() { log.Printf("[canary-token] Starting on :%s", port); if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed { log.Fatal(err) } }()
-	quit := make(chan os.Signal, 1); signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM); <-quit
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second); defer cancel(); srv.Shutdown(ctx)
+	srv := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(handler), ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second}
+	go func() {
+		log.Printf("[canary-token] Starting on :%s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	srv.Shutdown(ctx)
 }

@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from "axios";
-import * as https from "https";
+import { createSecureHttpsAgent } from "../lib/secureHttpsAgent";
 import { readEnv } from "../config/readEnv.config";
 import {
   ICreateAccountPayload,
@@ -16,9 +16,7 @@ class AccountService {
       headers: {
         "content-type": "application/json",
       },
-      httpsAgent: new https.Agent({
-        rejectUnauthorized: false,
-      }),
+      httpsAgent: createSecureHttpsAgent(),
     });
   }
 

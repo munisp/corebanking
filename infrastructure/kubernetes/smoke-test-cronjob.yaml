@@ -34,7 +34,10 @@ spec:
                 - name: PYTHONUNBUFFERED
                   value: "1"
                 - name: DATABASE_URL
-                  value: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking?sslmode=require"
+                  valueFrom:
+                    secretKeyRef:
+                      name: 54link-shared-database-svc-secret
+                      key: DATABASE_URL
               resources:
                 requests:
                   cpu: "250m"

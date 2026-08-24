@@ -1,18 +1,20 @@
 package main
 
 import (
-	// "context"
-	// "encoding/json"
+	"crypto/sha256"
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	tb "github.com/tigerbeetle/tigerbeetle-go"
 )
 
-// TigerBeetle metrics
+// TigerBeetle metrics — counters are only incremented for transfers the
+// cluster actually accepted (status reflects the real outcome).
 var (
 	tbTransfersTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -109,39 +111,132 @@ type uint128 struct {
 	Hi uint64
 }
 
-// TigerBeetleClient handles TigerBeetle operations for mortgages
+// TigerBeetleClient handles TigerBeetle operations for mortgages against a
+// real TigerBeetle cluster (official tigerbeetle-go SDK). When the cluster
+// cannot be reached, connected=false and every mutating method returns an
+// error — no transfer, balance, or reconciliation result is ever simulated.
 type TigerBeetleClient struct {
 	endpoint  string
 	clusterID uint32
 	ledgerID  uint32
 	mutex     sync.RWMutex
-	accounts  map[string]*TigerBeetleAccount
-	transfers map[string]*TigerBeetleTransfer
+	tb        tb.Client
 	connected bool
+	// history indexes cluster-confirmed transfers created by this process,
+	// keyed by mortgage ID, for GetTransferHistory. Never populated on failure.
+	history map[string][]*TigerBeetleTransfer
 }
 
-// NewTigerBeetleClient creates a new TigerBeetle client
+// NewTigerBeetleClient creates a new TigerBeetle client and actually dials
+// the cluster. On failure the client is returned with connected=false; all
+// mutating operations then fail fast instead of simulating success.
 func NewTigerBeetleClient() *TigerBeetleClient {
 	endpoint := os.Getenv("TB_ADDRESS")
 	if endpoint == "" {
-		// Use cluster TigerBeetle addresses
-		endpoint = "192.168.152.250:3000,192.168.14.240:3000,192.168.96.166:3000"
+		endpoint = os.Getenv("TIGERBEETLE_ADDRESSES")
 	}
 
 	client := &TigerBeetleClient{
 		endpoint:  endpoint,
 		clusterID: 0,
 		ledgerID:  1, // Mortgage ledger
-		accounts:  make(map[string]*TigerBeetleAccount),
-		transfers: make(map[string]*TigerBeetleTransfer),
-		connected: true, // Simulated connection
+		connected: false,
+		history:   make(map[string][]*TigerBeetleTransfer),
 	}
 
-	log.Printf("TigerBeetle client initialized: %s", endpoint)
+	if endpoint == "" {
+		log.Printf("TigerBeetle client NOT connected: TB_ADDRESS/TIGERBEETLE_ADDRESSES unset — all ledger operations will fail fast")
+		return client
+	}
+
+	addresses := strings.Split(endpoint, ",")
+	for i := range addresses {
+		addresses[i] = strings.TrimSpace(addresses[i])
+	}
+
+	tbClient, err := tb.NewClient(tb.ToUint128(uint64(client.clusterID)), addresses)
+	if err != nil {
+		log.Printf("TigerBeetle client connection FAILED (%v) — all ledger operations will fail fast", err)
+		return client
+	}
+
+	client.tb = tbClient
+	client.connected = true
+	log.Printf("TigerBeetle client connected to cluster at %s", endpoint)
 	return client
 }
 
-// CreateMortgageAccounts creates all necessary accounts for a mortgage
+// errNotConnected is returned by every operation when the cluster is down.
+func (c *TigerBeetleClient) errNotConnected() error {
+	return fmt.Errorf("tigerbeetle cluster unavailable (endpoint %q): mortgage ledger operation refused — no funds were moved or recorded", c.endpoint)
+}
+
+// accountUint128 maps a mortgage account string ID to a deterministic
+// TigerBeetle Uint128 ID (SHA-256 namespaced). Stable across restarts, so
+// balances survive process restarts; unlike the previous toy additive hash,
+// this is collision-resistant.
+func accountUint128(accountID string) tb.Uint128 {
+	sum := sha256.Sum256([]byte("54bank/mortgage/" + accountID))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	return tb.BytesToUint128(b)
+}
+
+func toLocalUint128(v tb.Uint128) uint128 {
+	lo, hi := v.Uint64()
+	return uint128{Lo: lo, Hi: hi}
+}
+
+func nairaToKoboU64(amount float64) (uint64, error) {
+	if amount <= 0 {
+		return 0, fmt.Errorf("amount must be positive: %.2f", amount)
+	}
+	kobo := uint64(amount * 100)
+	if kobo == 0 {
+		return 0, fmt.Errorf("amount %.2f NGN rounds to zero kobo", amount)
+	}
+	return kobo, nil
+}
+
+// createTransfers submits transfers to the cluster and returns an error
+// unless every transfer was created (or already existed, for idempotent
+// retries). Metrics reflect the real outcome.
+func (c *TigerBeetleClient) createTransfers(transfers []tb.Transfer, opLabel string) error {
+	results, err := c.tb.CreateTransfers(transfers)
+	if err != nil {
+		tbTransfersTotal.WithLabelValues(opLabel, "error").Inc()
+		return fmt.Errorf("tigerbeetle create transfers (%s): %w", opLabel, err)
+	}
+	for _, r := range results {
+		if r.Status != tb.TransferCreated && r.Status != tb.TransferExists {
+			tbTransfersTotal.WithLabelValues(opLabel, "rejected").Inc()
+			return fmt.Errorf("tigerbeetle transfer rejected (%s): status=%v", opLabel, r.Status)
+		}
+	}
+	tbTransfersTotal.WithLabelValues(opLabel, "success").Inc()
+	return nil
+}
+
+// recordHistory indexes a cluster-confirmed transfer for GetTransferHistory.
+func (c *TigerBeetleClient) recordHistory(mortgageID string, t tb.Transfer) {
+	amt, _ := t.Amount.Uint64()
+	rec := &TigerBeetleTransfer{
+		ID:              toLocalUint128(t.ID),
+		DebitAccountID:  toLocalUint128(t.DebitAccountID),
+		CreditAccountID: toLocalUint128(t.CreditAccountID),
+		UserData:        toLocalUint128(t.UserData128),
+		Timeout:         t.Timeout,
+		Ledger:          t.Ledger,
+		Code:            t.Code,
+		Flags:           t.Flags,
+		Amount:          amt,
+		Timestamp:       t.Timestamp,
+	}
+	c.history[mortgageID] = append(c.history[mortgageID], rec)
+}
+
+// CreateMortgageAccounts creates all necessary accounts for a mortgage in
+// the TigerBeetle cluster. Fails when the cluster is unreachable.
 func (c *TigerBeetleClient) CreateMortgageAccounts(tenantID, mortgageID string) (*MortgageAccounts, error) {
 	start := time.Now()
 	defer func() {
@@ -150,6 +245,11 @@ func (c *TigerBeetleClient) CreateMortgageAccounts(tenantID, mortgageID string) 
 
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
+
+	if !c.connected {
+		tbTransfersTotal.WithLabelValues("create_accounts", "error").Inc()
+		return nil, c.errNotConnected()
+	}
 
 	// Generate account IDs
 	baseID := generateAccountID(tenantID, mortgageID)
@@ -162,37 +262,34 @@ func (c *TigerBeetleClient) CreateMortgageAccounts(tenantID, mortgageID string) 
 		FeesAccountID:      fmt.Sprintf("%s-FEES", baseID),
 	}
 
-	// Create principal account (tracks outstanding principal)
-	principalAccount := &TigerBeetleAccount{
-		ID:     stringToUint128(accounts.PrincipalAccountID),
-		Ledger: c.ledgerID,
-		Code:   uint16(AccountTypeMortgagePrincipal),
+	tbAccounts := []tb.Account{
+		{ID: accountUint128(accounts.PrincipalAccountID), Ledger: c.ledgerID, Code: uint16(AccountTypeMortgagePrincipal)},
+		{ID: accountUint128(accounts.InterestAccountID), Ledger: c.ledgerID, Code: uint16(AccountTypeMortgageInterest)},
+		{ID: accountUint128(accounts.EscrowAccountID), Ledger: c.ledgerID, Code: uint16(AccountTypeMortgageEscrow)},
+		{ID: accountUint128(accounts.FeesAccountID), Ledger: c.ledgerID, Code: uint16(AccountTypeMortgageFees)},
 	}
-	c.accounts[accounts.PrincipalAccountID] = principalAccount
 
-	// Create interest account (tracks accrued interest)
-	interestAccount := &TigerBeetleAccount{
-		ID:     stringToUint128(accounts.InterestAccountID),
-		Ledger: c.ledgerID,
-		Code:   uint16(AccountTypeMortgageInterest),
+	results, err := c.tb.CreateAccounts(tbAccounts)
+	if err != nil {
+		tbTransfersTotal.WithLabelValues("create_accounts", "error").Inc()
+		return nil, fmt.Errorf("tigerbeetle create mortgage accounts: %w", err)
 	}
-	c.accounts[accounts.InterestAccountID] = interestAccount
+	for _, r := range results {
+		if r.Status != tb.AccountCreated && r.Status != tb.AccountExists {
+			tbTransfersTotal.WithLabelValues("create_accounts", "rejected").Inc()
+			return nil, fmt.Errorf("tigerbeetle account creation rejected: status=%v", r.Status)
+		}
+	}
 
-	// Create escrow account (for taxes and insurance)
-	escrowAccount := &TigerBeetleAccount{
-		ID:     stringToUint128(accounts.EscrowAccountID),
-		Ledger: c.ledgerID,
-		Code:   uint16(AccountTypeMortgageEscrow),
+	// Register account IDs so reconciliation can resolve them later.
+	accountRegistry.Lock()
+	accountRegistry.byMortgage[mortgageID] = map[string]string{
+		"principal": accounts.PrincipalAccountID,
+		"interest":  accounts.InterestAccountID,
+		"escrow":    accounts.EscrowAccountID,
+		"fees":      accounts.FeesAccountID,
 	}
-	c.accounts[accounts.EscrowAccountID] = escrowAccount
-
-	// Create fees account
-	feesAccount := &TigerBeetleAccount{
-		ID:     stringToUint128(accounts.FeesAccountID),
-		Ledger: c.ledgerID,
-		Code:   uint16(AccountTypeMortgageFees),
-	}
-	c.accounts[accounts.FeesAccountID] = feesAccount
+	accountRegistry.Unlock()
 
 	log.Printf("Created TigerBeetle accounts for mortgage %s", mortgageID)
 	tbTransfersTotal.WithLabelValues("create_accounts", "success").Inc()
@@ -201,6 +298,8 @@ func (c *TigerBeetleClient) CreateMortgageAccounts(tenantID, mortgageID string) 
 }
 
 // CreateDisbursementTransfer creates a transfer for mortgage disbursement
+// in the cluster. The transfer either lands in TigerBeetle or an error is
+// returned — balances are never updated locally.
 func (c *TigerBeetleClient) CreateDisbursementTransfer(
 	tenantID string,
 	principalAccountID string,
@@ -216,35 +315,163 @@ func (c *TigerBeetleClient) CreateDisbursementTransfer(
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	transferID := generateTransferID(tenantID, mortgageID, "DISB")
+	if !c.connected {
+		return "", c.errNotConnected()
+	}
 
-	// Convert amount to kobo (smallest unit)
-	amountKobo := uint64(amount * 100)
+	amountKobo, err := nairaToKoboU64(amount)
+	if err != nil {
+		return "", err
+	}
 
-	transfer := &TigerBeetleTransfer{
-		ID:              stringToUint128(transferID),
-		DebitAccountID:  stringToUint128(disbursementAccountID), // Bank funds account
-		CreditAccountID: stringToUint128(principalAccountID),    // Mortgage principal
+	// Deterministic transfer ID over the natural/business keys: a retried
+	// disbursement for the same mortgage maps to the same TigerBeetle
+	// transfer ID, so the cluster answers TransferExists instead of moving
+	// funds twice.
+	transferID := fmt.Sprintf("TF-%s-%s-DISB", tenantID, mortgageID)
+
+	transfer := tb.Transfer{
+		ID:              accountUint128(transferID),
+		DebitAccountID:  accountUint128(disbursementAccountID), // Bank funds account
+		CreditAccountID: accountUint128(principalAccountID),    // Mortgage principal
 		Ledger:          c.ledgerID,
 		Code:            uint16(TransferCodeDisbursement),
-		Amount:          amountKobo,
-		Timestamp:       uint64(time.Now().UnixNano()),
+		Amount:          tb.ToUint128(amountKobo),
 	}
 
-	c.transfers[transferID] = transfer
-
-	// Update account balances (simulated)
-	if acc, ok := c.accounts[principalAccountID]; ok {
-		acc.CreditsPosted += amountKobo
+	if err := c.createTransfers([]tb.Transfer{transfer}, "disbursement"); err != nil {
+		return "", err
 	}
+	c.recordHistory(mortgageID, transfer)
 
-	log.Printf("Created disbursement transfer %s for mortgage %s: %.2f NGN", transferID, mortgageID, amount)
-	tbTransfersTotal.WithLabelValues("disbursement", "success").Inc()
-
+	log.Printf("Created disbursement transfer %s for mortgage %s: %.2f NGN (cluster-confirmed)", transferID, mortgageID, amount)
 	return transferID, nil
 }
 
-// CreatePaymentTransfer creates transfers for a mortgage payment
+// ReverseDisbursementTransfer compensates a completed disbursement with the
+// exact mirror transfer (debit the mortgage principal account, credit the
+// bank funds account back). The reversal ID is deterministically derived from
+// the original transfer ID, so a retried compensation is idempotent
+// (TransferExists). An error return means the funds remain moved and MUST be
+// surfaced as compensation_failed by the caller — never swallowed.
+func (c *TigerBeetleClient) ReverseDisbursementTransfer(
+	tenantID string,
+	principalAccountID string,
+	disbursementAccountID string,
+	amount float64,
+	mortgageID string,
+	originalTransferID string,
+) (string, error) {
+	start := time.Now()
+	defer func() {
+		tbTransferLatency.WithLabelValues("disbursement_reversal").Observe(time.Since(start).Seconds())
+	}()
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if !c.connected {
+		return "", c.errNotConnected()
+	}
+
+	amountKobo, err := nairaToKoboU64(amount)
+	if err != nil {
+		return "", err
+	}
+
+	reversalID := originalTransferID + "-REV"
+
+	transfer := tb.Transfer{
+		ID:              accountUint128(reversalID),
+		DebitAccountID:  accountUint128(principalAccountID),    // Take funds back from mortgage principal
+		CreditAccountID: accountUint128(disbursementAccountID), // Return to bank funds account
+		Ledger:          c.ledgerID,
+		Code:            uint16(TransferCodeDisbursement),
+		Amount:          tb.ToUint128(amountKobo),
+	}
+
+	if err := c.createTransfers([]tb.Transfer{transfer}, "disbursement_reversal"); err != nil {
+		return "", err
+	}
+	c.recordHistory(mortgageID, transfer)
+
+	log.Printf("Reversed disbursement transfer %s for mortgage %s via %s (cluster-confirmed)", originalTransferID, mortgageID, reversalID)
+	return reversalID, nil
+}
+
+// paymentAllocation is the schedule-derived waterfall split of a payment.
+type paymentAllocation struct {
+	InterestKobo  uint64
+	PrincipalKobo uint64
+	EscrowKobo    uint64
+}
+
+// allocatePayment derives the payment waterfall from the actual repayment
+// schedule stored for this mortgage (interest → escrow → scheduled principal,
+// remainder to principal prepayment). It never invents a percentage split:
+// when no schedule data exists it returns an error.
+func allocatePayment(mortgageID string, totalKobo uint64) (*paymentAllocation, error) {
+	schedule, err := fetchRepaymentSchedule(mortgageID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot allocate payment for mortgage %s: repayment schedule lookup failed: %w", mortgageID, err)
+	}
+	if len(schedule) == 0 {
+		return nil, fmt.Errorf("cannot allocate payment for mortgage %s: no repayment schedule exists — refusing to invent an interest/principal/escrow split", mortgageID)
+	}
+
+	alloc := &paymentAllocation{}
+	remaining := totalKobo
+
+	// Waterfall over unpaid (or partially paid) schedule entries in order.
+	for _, entry := range schedule {
+		if remaining == 0 {
+			break
+		}
+		if entry.Status == "paid" {
+			continue
+		}
+		entryTotalKobo := uint64(entry.TotalAmount * 100)
+		entryPaidKobo := uint64(entry.PaidAmount * 100)
+		entryRemaining := entryTotalKobo
+		if entryPaidKobo < entryTotalKobo {
+			entryRemaining = entryTotalKobo - entryPaidKobo
+		}
+		if entryRemaining == 0 {
+			continue
+		}
+
+		take := remaining
+		if take > entryRemaining {
+			take = entryRemaining
+		}
+
+		// Split the taken amount across this entry's scheduled components
+		// proportionally to the entry's own composition. The principal
+		// component falls out as the residual below.
+		interestKobo := uint64(entry.InterestAmount * 100)
+		escrowKobo := uint64(entry.EscrowAmount * 100)
+		if interestKobo+escrowKobo > entryTotalKobo {
+			// Degenerate schedule row: treat everything as principal rather
+			// than fabricating component amounts.
+			interestKobo, escrowKobo = 0, 0
+		}
+
+		if entryTotalKobo > 0 {
+			alloc.InterestKobo += take * interestKobo / entryTotalKobo
+			alloc.EscrowKobo += take * escrowKobo / entryTotalKobo
+		}
+		remaining -= take
+	}
+
+	// Whatever was not consumed by scheduled dues reduces principal.
+	alloc.PrincipalKobo = totalKobo - alloc.InterestKobo - alloc.EscrowKobo
+	return alloc, nil
+}
+
+// CreatePaymentTransfer creates transfers for a mortgage payment. The
+// interest/principal/escrow split is derived from the mortgage's actual
+// repayment schedule (see allocatePayment); without schedule data the
+// payment is rejected rather than allocated by hardcoded percentages.
 func (c *TigerBeetleClient) CreatePaymentTransfer(
 	tenantID string,
 	sourceAccountID string,
@@ -262,48 +489,66 @@ func (c *TigerBeetleClient) CreatePaymentTransfer(
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	// Get current balances to determine payment allocation
-	principalBalance := c.getAccountBalanceInternal(principalAccountID)
-	interestBalance := c.getAccountBalanceInternal(interestAccountID)
+	if !c.connected {
+		return "", c.errNotConnected()
+	}
 
-	println(principalBalance)
+	amountKobo, err := nairaToKoboU64(totalAmount)
+	if err != nil {
+		return "", err
+	}
 
-	// Payment allocation: Interest first, then principal, then escrow
-	// This is a simplified allocation - in production, use actual schedule
-	interestPayment := min(totalAmount*0.3, interestBalance) // ~30% to interest
-	escrowPayment := totalAmount * 0.1                       // ~10% to escrow
-	principalPayment := totalAmount - interestPayment - escrowPayment
+	alloc, err := allocatePayment(mortgageID, amountKobo)
+	if err != nil {
+		tbTransfersTotal.WithLabelValues("payment", "error").Inc()
+		return "", err
+	}
 
 	transferID := generateTransferID(tenantID, mortgageID, "PAY")
-	amountKobo := uint64(totalAmount * 100)
+	source := accountUint128(sourceAccountID)
 
-	// Create main transfer record
-	transfer := &TigerBeetleTransfer{
-		ID:              stringToUint128(transferID),
-		DebitAccountID:  stringToUint128(sourceAccountID),
-		CreditAccountID: stringToUint128(principalAccountID),
-		Ledger:          c.ledgerID,
-		Code:            uint16(TransferCodePrincipalRepay),
-		Amount:          amountKobo,
-		Timestamp:       uint64(time.Now().UnixNano()),
+	type leg struct {
+		credit string
+		amount uint64
+		code   TransferCode
 	}
-	c.transfers[transferID] = transfer
-
-	// Update account balances (simulated)
-	if acc, ok := c.accounts[principalAccountID]; ok {
-		acc.DebitsPosted += uint64(principalPayment * 100)
-	}
-	if acc, ok := c.accounts[interestAccountID]; ok {
-		acc.DebitsPosted += uint64(interestPayment * 100)
-	}
-	if acc, ok := c.accounts[escrowAccountID]; ok {
-		acc.CreditsPosted += uint64(escrowPayment * 100)
+	legs := []leg{
+		{interestAccountID, alloc.InterestKobo, TransferCodeInterestRepay},
+		{principalAccountID, alloc.PrincipalKobo, TransferCodePrincipalRepay},
+		{escrowAccountID, alloc.EscrowKobo, TransferCodeEscrowDeposit},
 	}
 
-	log.Printf("Created payment transfer %s for mortgage %s: %.2f NGN (P:%.2f, I:%.2f, E:%.2f)",
-		transferID, mortgageID, totalAmount, principalPayment, interestPayment, escrowPayment)
-	tbTransfersTotal.WithLabelValues("payment", "success").Inc()
+	var transfers []tb.Transfer
+	for _, l := range legs {
+		if l.amount == 0 {
+			continue
+		}
+		flags := tb.TransferFlags{Linked: true}.ToUint16()
+		transfers = append(transfers, tb.Transfer{
+			ID:              accountUint128(fmt.Sprintf("%s-%s", transferID, l.credit)),
+			DebitAccountID:  source,
+			CreditAccountID: accountUint128(l.credit),
+			Ledger:          c.ledgerID,
+			Code:            uint16(l.code),
+			Amount:          tb.ToUint128(l.amount),
+			Flags:           flags,
+		})
+	}
+	if len(transfers) == 0 {
+		return "", fmt.Errorf("payment allocation produced no transfers for mortgage %s", mortgageID)
+	}
+	// Close the linked chain: the last transfer must not be linked.
+	transfers[len(transfers)-1].Flags = tb.TransferFlags{}.ToUint16()
 
+	if err := c.createTransfers(transfers, "payment"); err != nil {
+		return "", err
+	}
+	for _, t := range transfers {
+		c.recordHistory(mortgageID, t)
+	}
+
+	log.Printf("Created payment transfer %s for mortgage %s: %.2f NGN (P:%d I:%d E:%d kobo, cluster-confirmed)",
+		transferID, mortgageID, totalAmount, alloc.PrincipalKobo, alloc.InterestKobo, alloc.EscrowKobo)
 	return transferID, nil
 }
 
@@ -324,30 +569,33 @@ func (c *TigerBeetleClient) CreatePrepaymentTransfer(
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
+	if !c.connected {
+		return "", c.errNotConnected()
+	}
+
 	transferID := generateTransferID(tenantID, mortgageID, "PREP")
 	netAmount := amount - fee
-	amountKobo := uint64(netAmount * 100)
+	amountKobo, err := nairaToKoboU64(netAmount)
+	if err != nil {
+		return "", fmt.Errorf("prepayment net of fee invalid: %w", err)
+	}
 
-	transfer := &TigerBeetleTransfer{
-		ID:              stringToUint128(transferID),
-		DebitAccountID:  stringToUint128(sourceAccountID),
-		CreditAccountID: stringToUint128(principalAccountID),
+	transfer := tb.Transfer{
+		ID:              accountUint128(transferID),
+		DebitAccountID:  accountUint128(sourceAccountID),
+		CreditAccountID: accountUint128(principalAccountID),
 		Ledger:          c.ledgerID,
 		Code:            uint16(TransferCodePrepayment),
-		Amount:          amountKobo,
-		Timestamp:       uint64(time.Now().UnixNano()),
-	}
-	c.transfers[transferID] = transfer
-
-	// Update principal balance
-	if acc, ok := c.accounts[principalAccountID]; ok {
-		acc.DebitsPosted += amountKobo
+		Amount:          tb.ToUint128(amountKobo),
 	}
 
-	log.Printf("Created prepayment transfer %s for mortgage %s: %.2f NGN (fee: %.2f)",
+	if err := c.createTransfers([]tb.Transfer{transfer}, "prepayment"); err != nil {
+		return "", err
+	}
+	c.recordHistory(mortgageID, transfer)
+
+	log.Printf("Created prepayment transfer %s for mortgage %s: %.2f NGN (fee: %.2f, cluster-confirmed)",
 		transferID, mortgageID, netAmount, fee)
-	tbTransfersTotal.WithLabelValues("prepayment", "success").Inc()
-
 	return transferID, nil
 }
 
@@ -368,33 +616,36 @@ func (c *TigerBeetleClient) CreateEscrowDisbursement(
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	transferID := generateTransferID(tenantID, mortgageID, "ESC")
-	amountKobo := uint64(amount * 100)
+	if !c.connected {
+		return "", c.errNotConnected()
+	}
 
-	transfer := &TigerBeetleTransfer{
-		ID:              stringToUint128(transferID),
-		DebitAccountID:  stringToUint128(escrowAccountID),
-		CreditAccountID: stringToUint128(payeeAccountID),
+	transferID := generateTransferID(tenantID, mortgageID, "ESC")
+	amountKobo, err := nairaToKoboU64(amount)
+	if err != nil {
+		return "", err
+	}
+
+	transfer := tb.Transfer{
+		ID:              accountUint128(transferID),
+		DebitAccountID:  accountUint128(escrowAccountID),
+		CreditAccountID: accountUint128(payeeAccountID),
 		Ledger:          c.ledgerID,
 		Code:            uint16(TransferCodeEscrowWithdraw),
-		Amount:          amountKobo,
-		Timestamp:       uint64(time.Now().UnixNano()),
-	}
-	c.transfers[transferID] = transfer
-
-	// Update escrow balance
-	if acc, ok := c.accounts[escrowAccountID]; ok {
-		acc.DebitsPosted += amountKobo
+		Amount:          tb.ToUint128(amountKobo),
 	}
 
-	log.Printf("Created escrow disbursement %s for mortgage %s: %.2f NGN (%s)",
+	if err := c.createTransfers([]tb.Transfer{transfer}, "escrow_disbursement"); err != nil {
+		return "", err
+	}
+	c.recordHistory(mortgageID, transfer)
+
+	log.Printf("Created escrow disbursement %s for mortgage %s: %.2f NGN (%s, cluster-confirmed)",
 		transferID, mortgageID, amount, disbursementType)
-	tbTransfersTotal.WithLabelValues("escrow_disbursement", "success").Inc()
-
 	return transferID, nil
 }
 
-// AccrueInterest creates interest accrual entries
+// AccrueInterest creates interest accrual entries in the cluster.
 func (c *TigerBeetleClient) AccrueInterest(
 	tenantID string,
 	principalAccountID string,
@@ -410,32 +661,37 @@ func (c *TigerBeetleClient) AccrueInterest(
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	transferID := generateTransferID(tenantID, mortgageID, "INT")
-	amountKobo := uint64(interestAmount * 100)
+	if !c.connected {
+		return "", c.errNotConnected()
+	}
 
-	transfer := &TigerBeetleTransfer{
-		ID:              stringToUint128(transferID),
-		DebitAccountID:  stringToUint128(principalAccountID), // Interest expense
-		CreditAccountID: stringToUint128(interestAccountID),  // Interest receivable
+	transferID := generateTransferID(tenantID, mortgageID, "INT")
+	amountKobo, err := nairaToKoboU64(interestAmount)
+	if err != nil {
+		return "", err
+	}
+
+	transfer := tb.Transfer{
+		ID:              accountUint128(transferID),
+		DebitAccountID:  accountUint128(principalAccountID), // Interest expense
+		CreditAccountID: accountUint128(interestAccountID),  // Interest receivable
 		Ledger:          c.ledgerID,
 		Code:            uint16(TransferCodeInterestAccrual),
-		Amount:          amountKobo,
-		Timestamp:       uint64(time.Now().UnixNano()),
-	}
-	c.transfers[transferID] = transfer
-
-	// Update interest balance
-	if acc, ok := c.accounts[interestAccountID]; ok {
-		acc.CreditsPosted += amountKobo
+		Amount:          tb.ToUint128(amountKobo),
 	}
 
-	log.Printf("Accrued interest %s for mortgage %s: %.2f NGN", transferID, mortgageID, interestAmount)
-	tbTransfersTotal.WithLabelValues("interest_accrual", "success").Inc()
+	if err := c.createTransfers([]tb.Transfer{transfer}, "interest_accrual"); err != nil {
+		return "", err
+	}
+	c.recordHistory(mortgageID, transfer)
 
+	log.Printf("Accrued interest %s for mortgage %s: %.2f NGN (cluster-confirmed)", transferID, mortgageID, interestAmount)
 	return transferID, nil
 }
 
-// WriteOffMortgage creates write-off entries for defaulted mortgage
+// WriteOffMortgage creates write-off entries for defaulted mortgage. The
+// write-off amount is the actual outstanding balance read from the cluster;
+// if the cluster says nothing is outstanding, no write-off is created.
 func (c *TigerBeetleClient) WriteOffMortgage(
 	tenantID string,
 	principalAccountID string,
@@ -451,82 +707,130 @@ func (c *TigerBeetleClient) WriteOffMortgage(
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
-	// Get outstanding balances
-	principalBalance := c.getAccountBalanceInternal(principalAccountID)
-	interestBalance := c.getAccountBalanceInternal(interestAccountID)
+	if !c.connected {
+		return "", c.errNotConnected()
+	}
+
+	// Read actual outstanding balances from the cluster.
+	principalBalance, err := c.getAccountBalanceInternal(principalAccountID)
+	if err != nil {
+		return "", fmt.Errorf("write-off aborted, cannot read principal balance: %w", err)
+	}
+	interestBalance, err := c.getAccountBalanceInternal(interestAccountID)
+	if err != nil {
+		return "", fmt.Errorf("write-off aborted, cannot read interest balance: %w", err)
+	}
 	totalWriteOff := principalBalance + interestBalance
+	if totalWriteOff <= 0 {
+		return "", fmt.Errorf("write-off refused for mortgage %s: cluster shows no outstanding balance (principal=%.2f interest=%.2f)",
+			mortgageID, principalBalance, interestBalance)
+	}
 
 	transferID := generateTransferID(tenantID, mortgageID, "WO")
-	amountKobo := uint64(totalWriteOff * 100)
+	amountKobo, err := nairaToKoboU64(totalWriteOff)
+	if err != nil {
+		return "", err
+	}
 
-	transfer := &TigerBeetleTransfer{
-		ID:              stringToUint128(transferID),
-		DebitAccountID:  stringToUint128(writeOffAccountID),
-		CreditAccountID: stringToUint128(principalAccountID),
+	transfer := tb.Transfer{
+		ID:              accountUint128(transferID),
+		DebitAccountID:  accountUint128(writeOffAccountID),
+		CreditAccountID: accountUint128(principalAccountID),
 		Ledger:          c.ledgerID,
 		Code:            uint16(TransferCodeWriteOff),
-		Amount:          amountKobo,
-		Timestamp:       uint64(time.Now().UnixNano()),
-	}
-	c.transfers[transferID] = transfer
-
-	// Zero out balances
-	if acc, ok := c.accounts[principalAccountID]; ok {
-		acc.DebitsPosted = acc.CreditsPosted
-	}
-	if acc, ok := c.accounts[interestAccountID]; ok {
-		acc.DebitsPosted = acc.CreditsPosted
+		Amount:          tb.ToUint128(amountKobo),
 	}
 
-	log.Printf("Write-off transfer %s for mortgage %s: %.2f NGN", transferID, mortgageID, totalWriteOff)
-	tbTransfersTotal.WithLabelValues("write_off", "success").Inc()
+	if err := c.createTransfers([]tb.Transfer{transfer}, "write_off"); err != nil {
+		return "", err
+	}
+	c.recordHistory(mortgageID, transfer)
 
+	log.Printf("Write-off transfer %s for mortgage %s: %.2f NGN (cluster-confirmed)", transferID, mortgageID, totalWriteOff)
 	return transferID, nil
 }
 
-// GetAccountBalance returns the current balance of an account
+// GetAccountBalance returns the current balance of an account from the
+// cluster. Errors when the cluster is unreachable or the account is unknown.
 func (c *TigerBeetleClient) GetAccountBalance(accountID string) (float64, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	return c.getAccountBalanceInternal(accountID), nil
-}
-
-func (c *TigerBeetleClient) getAccountBalanceInternal(accountID string) float64 {
-	if acc, ok := c.accounts[accountID]; ok {
-		// Balance = Credits - Debits (for liability accounts like mortgages)
-		balanceKobo := int64(acc.CreditsPosted) - int64(acc.DebitsPosted)
-		return float64(balanceKobo) / 100.0
+	if !c.connected {
+		return 0, c.errNotConnected()
 	}
-	return 0
+	return c.getAccountBalanceInternal(accountID)
 }
 
-// GetAccountDetails returns full account details
+// getAccountBalanceInternal reads credits-posted minus debits-posted from
+// the cluster (liability-style balance for mortgage accounts).
+// Callers must hold at least a read lock.
+func (c *TigerBeetleClient) getAccountBalanceInternal(accountID string) (float64, error) {
+	accounts, err := c.tb.LookupAccounts([]tb.Uint128{accountUint128(accountID)})
+	if err != nil {
+		return 0, fmt.Errorf("tigerbeetle lookup account %s: %w", accountID, err)
+	}
+	if len(accounts) == 0 {
+		return 0, fmt.Errorf("tigerbeetle account not found: %s", accountID)
+	}
+	credits, _ := accounts[0].CreditsPosted.Uint64()
+	debits, _ := accounts[0].DebitsPosted.Uint64()
+	return float64(int64(credits)-int64(debits)) / 100.0, nil
+}
+
+// GetAccountDetails returns full account details from the cluster.
 func (c *TigerBeetleClient) GetAccountDetails(accountID string) (*TigerBeetleAccount, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	if acc, ok := c.accounts[accountID]; ok {
-		return acc, nil
+	if !c.connected {
+		return nil, c.errNotConnected()
 	}
-	return nil, fmt.Errorf("account not found: %s", accountID)
+
+	accounts, err := c.tb.LookupAccounts([]tb.Uint128{accountUint128(accountID)})
+	if err != nil {
+		return nil, fmt.Errorf("tigerbeetle lookup account %s: %w", accountID, err)
+	}
+	if len(accounts) == 0 {
+		return nil, fmt.Errorf("account not found: %s", accountID)
+	}
+	a := accounts[0]
+	dp, _ := a.DebitsPending.Uint64()
+	dpo, _ := a.DebitsPosted.Uint64()
+	cp, _ := a.CreditsPending.Uint64()
+	cpo, _ := a.CreditsPosted.Uint64()
+	return &TigerBeetleAccount{
+		ID:             toLocalUint128(a.ID),
+		UserData:       toLocalUint128(a.UserData128),
+		Ledger:         a.Ledger,
+		Code:           a.Code,
+		Flags:          a.Flags,
+		DebitsPending:  dp,
+		DebitsPosted:   dpo,
+		CreditsPending: cp,
+		CreditsPosted:  cpo,
+		Timestamp:      a.Timestamp,
+	}, nil
 }
 
-// GetTransferHistory returns transfer history for a mortgage
+// GetTransferHistory returns the cluster-confirmed transfers this process
+// created for a mortgage. (Process-local index; the cluster remains the
+// system of record.)
 func (c *TigerBeetleClient) GetTransferHistory(mortgageID string) ([]*TigerBeetleTransfer, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
 
-	var transfers []*TigerBeetleTransfer
-	for id, transfer := range c.transfers {
-		if containsMortgageID(id, mortgageID) {
-			transfers = append(transfers, transfer)
-		}
+	transfers := c.history[mortgageID]
+	if transfers == nil {
+		transfers = []*TigerBeetleTransfer{}
 	}
 	return transfers, nil
 }
 
-// ReconcileMortgageBalances reconciles mortgage balances with external systems
+// ReconcileMortgageBalances compares real cluster balances against the
+// expected values supplied by the caller and reports actual discrepancies.
+// If the cluster cannot be reached, the result is status "failed" with
+// Matched=false and an error is returned — reconciliation is never faked.
 func (c *TigerBeetleClient) ReconcileMortgageBalances(mortgageID string, expectedPrincipal, expectedInterest float64) (*ReconciliationResult, error) {
 	c.mutex.RLock()
 	defer c.mutex.RUnlock()
@@ -537,12 +841,81 @@ func (c *TigerBeetleClient) ReconcileMortgageBalances(mortgageID string, expecte
 		Discrepancies: []Discrepancy{},
 	}
 
-	// This would compare TigerBeetle balances with external system
-	// For now, return success
-	result.Status = "reconciled"
-	result.Matched = true
+	if !c.connected {
+		result.Status = "failed"
+		result.Matched = false
+		return result, c.errNotConnected()
+	}
 
+	// Resolve this mortgage's account IDs from the account registry
+	// (populated on successful CreateMortgageAccounts). Without known
+	// accounts we cannot reconcile honestly.
+	accountIDs := c.knownAccountIDs(mortgageID)
+	if len(accountIDs) == 0 {
+		result.Status = "failed"
+		result.Matched = false
+		return result, fmt.Errorf("cannot reconcile mortgage %s: no TigerBeetle accounts known for it in this process", mortgageID)
+	}
+	principalAccountID := accountIDs["principal"]
+	interestAccountID := accountIDs["interest"]
+
+	const tolerance = 0.005 // half a kobo
+	matched := true
+
+	actualPrincipal, err := c.getAccountBalanceInternal(principalAccountID)
+	if err != nil {
+		result.Status = "failed"
+		result.Matched = false
+		return result, fmt.Errorf("reconciliation failed for mortgage %s: %w", mortgageID, err)
+	}
+	if d := actualPrincipal - expectedPrincipal; d > tolerance || d < -tolerance {
+		matched = false
+		result.Discrepancies = append(result.Discrepancies, Discrepancy{
+			AccountType:     "principal",
+			ExpectedBalance: expectedPrincipal,
+			ActualBalance:   actualPrincipal,
+			Difference:      d,
+		})
+	}
+
+	actualInterest, err := c.getAccountBalanceInternal(interestAccountID)
+	if err != nil {
+		result.Status = "failed"
+		result.Matched = false
+		return result, fmt.Errorf("reconciliation failed for mortgage %s: %w", mortgageID, err)
+	}
+	if d := actualInterest - expectedInterest; d > tolerance || d < -tolerance {
+		matched = false
+		result.Discrepancies = append(result.Discrepancies, Discrepancy{
+			AccountType:     "interest",
+			ExpectedBalance: expectedInterest,
+			ActualBalance:   actualInterest,
+			Difference:      d,
+		})
+	}
+
+	result.Matched = matched
+	if matched {
+		result.Status = "reconciled"
+	} else {
+		result.Status = "mismatched"
+	}
 	return result, nil
+}
+
+// accountRegistry records which cluster account string IDs belong to each
+// mortgage (principal/interest/escrow/fees), populated on successful
+// CreateMortgageAccounts. Used by reconciliation.
+var accountRegistry = struct {
+	sync.RWMutex
+	byMortgage map[string]map[string]string
+}{byMortgage: make(map[string]map[string]string)}
+
+// knownAccountIDs returns the registered account IDs for a mortgage.
+func (c *TigerBeetleClient) knownAccountIDs(mortgageID string) map[string]string {
+	accountRegistry.RLock()
+	defer accountRegistry.RUnlock()
+	return accountRegistry.byMortgage[mortgageID]
 }
 
 // ReconciliationResult represents the result of balance reconciliation
@@ -569,28 +942,4 @@ func generateAccountID(tenantID, mortgageID string) string {
 
 func generateTransferID(tenantID, mortgageID, transferType string) string {
 	return fmt.Sprintf("TF-%s-%s-%s-%d", tenantID, mortgageID, transferType, time.Now().UnixNano())
-}
-
-func stringToUint128(s string) uint128 {
-	// Simple hash for simulation
-	var lo, hi uint64
-	for i, c := range s {
-		if i%2 == 0 {
-			lo += uint64(c) * uint64(i+1)
-		} else {
-			hi += uint64(c) * uint64(i+1)
-		}
-	}
-	return uint128{Lo: lo, Hi: hi}
-}
-
-func containsMortgageID(transferID, mortgageID string) bool {
-	return len(transferID) > len(mortgageID) && transferID[3:3+len(mortgageID)] == mortgageID
-}
-
-func min(a, b float64) float64 {
-	if a < b {
-		return a
-	}
-	return b
 }

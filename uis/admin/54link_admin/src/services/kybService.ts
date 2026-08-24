@@ -265,7 +265,10 @@ class KYBService {
    */
   generateVerificationId(): string {
     const timestamp = Date.now();
-    const random = Math.floor(Math.random() * 1000000);
+    // CSPRNG suffix — verification IDs are security-relevant, never Math.random().
+    const buf = new Uint32Array(1);
+    crypto.getRandomValues(buf);
+    const random = String(buf[0] % 1000000).padStart(6, "0");
     return `verif_${timestamp}${random}`;
   }
 

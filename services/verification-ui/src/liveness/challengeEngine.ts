@@ -22,7 +22,11 @@ export const CHALLENGE_INSTRUCTIONS: Record<ChallengeType, string> = {
 };
 
 export function generateChallenge(): ChallengeType {
-  return CHALLENGES[Math.floor(Math.random() * CHALLENGES.length)];
+  // CSPRNG challenge selection — liveness challenges are security-relevant
+  // (anti-spoofing), so never use Math.random() here.
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return CHALLENGES[buf[0] % CHALLENGES.length];
 }
 
 export function generateChallengeSequence(count: number = 1): ChallengeType[] {

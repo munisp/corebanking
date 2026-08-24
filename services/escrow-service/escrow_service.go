@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -645,13 +646,21 @@ func (s *EscrowService) CreateContract(ctx context.Context, input CreateContract
 			TigerBeetleID:   s.idGenerator.NextID(),
 		}
 
-		// Verify KYC if user/business ID provided
+		// Verify KYC if user/business ID provided. Fail closed: on a KYC
+		// service error the party stays unverified, but the outage is logged —
+		// never silently swallowed.
 		if partyInput.UserID != nil {
-			verified, level, _ := s.kycService.VerifyUser(ctx, *partyInput.UserID)
+			verified, level, err := s.kycService.VerifyUser(ctx, *partyInput.UserID)
+			if err != nil {
+				log.Printf("ERROR: KYC VerifyUser failed for escrow party (user %s): %v — party recorded as unverified", *partyInput.UserID, err)
+			}
 			party.KYCVerified = verified
 			party.KYCLevel = level
 		} else if partyInput.BusinessID != nil {
-			verified, level, _ := s.kycService.VerifyBusiness(ctx, *partyInput.BusinessID)
+			verified, level, err := s.kycService.VerifyBusiness(ctx, *partyInput.BusinessID)
+			if err != nil {
+				log.Printf("ERROR: KYC VerifyBusiness failed for escrow party (business %s): %v — party recorded as unverified", *partyInput.BusinessID, err)
+			}
 			party.KYCVerified = verified
 			party.KYCLevel = level
 		}
@@ -713,8 +722,13 @@ func (s *EscrowService) CreateContract(ctx context.Context, input CreateContract
 		}
 	}
 
-	// Run fraud check
-	riskScore, alerts, _ := s.fraudService.ScoreEscrow(ctx, contract)
+	// Run fraud check. Fail closed: if the fraud service is unavailable the
+	// contract must NOT be created unscored — a swallowed error here would
+	// silently bypass the fraud gate (riskScore defaults to 0).
+	riskScore, alerts, scoreErr := s.fraudService.ScoreEscrow(ctx, contract)
+	if scoreErr != nil {
+		return nil, fmt.Errorf("fraud scoring unavailable — refusing to create escrow: %w", scoreErr)
+	}
 	if riskScore > 0.8 {
 		return nil, fmt.Errorf("escrow blocked due to high fraud risk: %v", alerts)
 	}
@@ -1338,6 +1352,62 @@ func (s *EscrowService) ResolveDispute(ctx context.Context, input ResolveDispute
 			"contract_id":     dispute.ContractID,
 			"dispute_id":      dispute.ID,
 			"resolution_type": input.ResolutionType,
+		})
+	}
+
+	return dispute, nil
+}
+
+// EscalateDispute escalates an unresolved dispute: it transitions the dispute
+// to "escalated", persists the state change, writes an audit event, and
+// notifies all contract parties. Any persistence failure is returned so the
+// caller (Temporal EscalateDispute activity) retries instead of silently
+// dropping the escalation (W7-C-05).
+func (s *EscrowService) EscalateDispute(ctx context.Context, disputeID string, reason string) (*Dispute, error) {
+	dispute, err := s.GetDispute(ctx, disputeID)
+	if err != nil {
+		return nil, err
+	}
+
+	switch dispute.Status {
+	case DisputeStatusOpen, DisputeStatusUnderReview, DisputeStatusAwaitingEvidence, DisputeStatusAwaitingDecision:
+		// Escalatable states.
+	default:
+		return nil, fmt.Errorf("dispute cannot be escalated in status: %s", dispute.Status)
+	}
+
+	contract, err := s.GetContract(ctx, dispute.ContractID)
+	if err != nil {
+		return nil, err
+	}
+
+	dispute.Status = DisputeStatusEscalated
+	dispute.Escalated = true
+	if err := s.updateDispute(ctx, dispute); err != nil {
+		return nil, fmt.Errorf("failed to persist dispute escalation: %w", err)
+	}
+
+	// Log audit event
+	s.auditService.LogEvent(ctx, AuditEvent{
+		TenantID:   contract.TenantID,
+		EntityType: "escrow_dispute",
+		EntityID:   dispute.ID,
+		EventType:  "dispute_escalated",
+		ActorID:    "system",
+		ActorType:  "system",
+		Details: map[string]interface{}{
+			"reason":      reason,
+			"contract_id": dispute.ContractID,
+		},
+	})
+
+	// Notify all contract parties that the dispute was escalated
+	for _, party := range contract.Parties {
+		s.notificationSvc.SendNotification(ctx, party.ID, map[string]interface{}{
+			"type":        "dispute_escalated",
+			"contract_id": dispute.ContractID,
+			"dispute_id":  dispute.ID,
+			"reason":      reason,
 		})
 	}
 

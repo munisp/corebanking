@@ -1,11 +1,16 @@
 package main
 
 import (
-	"database/sql"
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,13 +19,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"crypto"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
-	"math/big"
 
+	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
+	"github.com/munisp/corebanking/pkg/tbclient"
 )
 
 var db *sql.DB
@@ -31,12 +33,12 @@ var serviceName = "journal-posting-go"
 
 // --- Monetary Safety ---
 func nairaToKobo(naira float64) int64 { return int64(naira * 100) }
-func koboToNaira(kobo int64) float64 { return float64(kobo) / 100.0 }
+func koboToNaira(kobo int64) float64  { return float64(kobo) / 100.0 }
 
 // --- Watchdog ---
 var watchdogLastPing atomic.Int64
 
-func watchdogPing() { watchdogLastPing.Store(time.Now().UnixMilli()) }
+func watchdogPing()         { watchdogLastPing.Store(time.Now().UnixMilli()) }
 func watchdogHealthy() bool { return time.Now().UnixMilli()-watchdogLastPing.Load() < 60000 }
 func startWatchdog(interval time.Duration) {
 	watchdogPing()
@@ -50,12 +52,12 @@ func startWatchdog(interval time.Duration) {
 
 // --- Circuit Breaker ---
 type CircuitBreaker struct {
-	mu            sync.Mutex
-	failures      int
-	threshold     int
-	resetTimeout  time.Duration
-	state         string
-	lastFailure   time.Time
+	mu           sync.Mutex
+	failures     int
+	threshold    int
+	resetTimeout time.Duration
+	state        string
+	lastFailure  time.Time
 }
 
 func newCircuitBreaker() *CircuitBreaker {
@@ -113,9 +115,13 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	reqs := rl.requests[ip]
 	var valid []time.Time
 	for _, t := range reqs {
-		if now.Sub(t) < rl.window { valid = append(valid, t) }
+		if now.Sub(t) < rl.window {
+			valid = append(valid, t)
+		}
 	}
-	if len(valid) >= rl.max { return false }
+	if len(valid) >= rl.max {
+		return false
+	}
 	rl.requests[ip] = append(valid, now)
 	return true
 }
@@ -123,21 +129,45 @@ func (rl *RateLimiter) Allow(ip string) bool {
 var rateLimiter = newRateLimiter()
 
 // --- EventBus ---
+// Events are really published to Kafka via sarama. Emit NEVER pretends to
+// publish: on Kafka failure the event is queued in the Postgres outbox
+// (published=FALSE) and the error is returned.
 type EventBus struct {
-	broker  string
-	topic   string
-	service string
-	mu      sync.Mutex
-	buffer  []map[string]interface{}
+	broker   string
+	topic    string
+	service  string
+	mu       sync.Mutex
+	producer sarama.SyncProducer
 }
 
 func newEventBus(topic string) *EventBus {
 	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" { broker = "localhost:9092" }
+	if broker == "" {
+		broker = "localhost:9092"
+	}
 	return &EventBus{broker: broker, topic: topic, service: serviceName}
 }
 
-func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
+func (eb *EventBus) getProducer() (sarama.SyncProducer, error) {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	if eb.producer != nil {
+		return eb.producer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(eb.broker, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	eb.producer = p
+	return eb.producer, nil
+}
+
+// Publish sends one event to Kafka. Returns error when Kafka is unavailable.
+func (eb *EventBus) Publish(eventType string, payload map[string]interface{}) error {
 	event := map[string]interface{}{
 		"id":        fmt.Sprintf("%s_%d", eb.service, time.Now().UnixMilli()),
 		"type":      eventType,
@@ -146,10 +176,39 @@ func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 		"data":      payload,
 	}
-	eb.mu.Lock()
-	eb.buffer = append(eb.buffer, event)
-	eb.mu.Unlock()
-	log.Printf("[EventBus] %s -> %s: %s", eb.service, eb.topic, eventType)
+	data, err := json.Marshal(event)
+	if err != nil {
+		return err
+	}
+	producer, err := eb.getProducer()
+	if err != nil {
+		return fmt.Errorf("kafka unavailable: %w", err)
+	}
+	_, _, err = producer.SendMessage(&sarama.ProducerMessage{
+		Topic: eb.topic,
+		Key:   sarama.StringEncoder(event["id"].(string)),
+		Value: sarama.ByteEncoder(data),
+	})
+	return err
+}
+
+// Emit publishes via Kafka; on failure it durably queues the event in the
+// outbox for the relay and logs the failure loudly.
+func (eb *EventBus) Emit(eventType string, payload map[string]interface{}) {
+	if err := eb.Publish(eventType, payload); err != nil {
+		log.Printf("[EventBus] PUBLISH FAILED %s -> %s: %s (%v) — queueing to outbox", eb.service, eb.topic, eventType, err)
+		if db != nil {
+			data, mErr := json.Marshal(map[string]interface{}{"type": eventType, "data": payload})
+			if mErr == nil {
+				if _, dErr := db.Exec(`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
+					eventType, fmt.Sprintf("%s_%d", eb.service, time.Now().UnixMilli()), string(data)); dErr != nil {
+					log.Printf("[EventBus] outbox queue failed: %v", dErr)
+				}
+			}
+		}
+		return
+	}
+	log.Printf("[EventBus] published %s -> %s", eb.service, eb.topic)
 }
 
 var eventBus = newEventBus("accounting.ledger")
@@ -158,7 +217,9 @@ var eventBus = newEventBus("accounting.ledger")
 func sanitizeInput(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
-	if len(s) > 1000 { s = s[:1000] }
+	if len(s) > 1000 {
+		s = s[:1000]
+	}
 	return s
 }
 
@@ -211,7 +272,6 @@ func panicRecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
 type jwksCache struct {
@@ -245,9 +305,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -260,7 +324,11 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -285,7 +353,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -319,7 +389,12 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		var claims map[string]interface{}
 		json.Unmarshal(claimsBytes, &claims)
 		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}
@@ -347,34 +422,334 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := eventBus.getProducer()
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	if len(ids) == 0 {
+		return
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	// Mark as published — only events confirmed by Kafka above. If the UPDATE
+	// fails the event stays unpublished and will be re-published on the next
+	// relay tick (duplicate-safe), so the error is logged loudly, never
+	// silently dropped — and never crashes the relay.
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v — event remains unpublished and will be retried", id, err)
+		}
+	}
+	log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
 }
 
+// ─── Journal Posting Engine (real, TigerBeetle-backed) ─────────────────────
+//
+// POST /v1/journals posts a BALANCED double-entry journal to TigerBeetle via
+// pkg/tbclient and records it in Postgres. The posting fails fast when the
+// ledger is unavailable; nothing is reported "posted" that was not committed.
+
+var tbClient *tbclient.Client
+
+type JournalLeg struct {
+	AccountID uint64 `json:"accountId"` // TigerBeetle account id (uint64 form)
+	Type      string `json:"type"`      // debit | credit
+	Amount    uint64 `json:"amount"`    // smallest currency unit (e.g. kobo)
+}
+
+type PostJournalRequest struct {
+	TenantID       string       `json:"tenantId"`
+	TransactionRef string       `json:"transactionRef"`
+	Narration      string       `json:"narration"`
+	Currency       string       `json:"currency"`
+	Legs           []JournalLeg `json:"legs"`
+}
+
+func handlePostJournal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		w.WriteHeader(405)
+		json.NewEncoder(w).Encode(map[string]string{"error": "POST required"})
+		return
+	}
+	var req PostJournalRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if len(req.Legs) < 2 {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "journal must have at least 2 legs"})
+		return
+	}
+
+	// Balanced check: total debits must equal total credits.
+	var debits, credits uint64
+	for _, leg := range req.Legs {
+		if leg.Amount == 0 || leg.AccountID == 0 {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "each leg requires accountId and amount > 0"})
+			return
+		}
+		switch leg.Type {
+		case "debit":
+			debits += leg.Amount
+		case "credit":
+			credits += leg.Amount
+		default:
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "leg type must be debit or credit"})
+			return
+		}
+	}
+	if debits != credits {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "journal not balanced: debits != credits"})
+		return
+	}
+
+	if tbClient == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "ledger_unavailable", "detail": "TigerBeetle client not configured (set TB_ADDRESS) — journal NOT posted"})
+		return
+	}
+
+	// Deterministic journal identity: the same logical journal (same
+	// tenant + transactionRef, or an identical leg payload when no ref is
+	// supplied) always maps to the same journalID, so an HTTP retry replays
+	// against the same TigerBeetle transfer IDs (TransferExists) instead of
+	// double-posting with fresh random IDs.
+	idBasis := req.TenantID + "|" + req.TransactionRef
+	if req.TransactionRef == "" {
+		legsJSON, _ := json.Marshal(req.Legs)
+		idBasis = req.TenantID + "|payload:" + string(legsJSON)
+	}
+	journalIDSum := sha256.Sum256([]byte("54bank/journal-posting/" + idBasis))
+	journalID := fmt.Sprintf("JRN-%x", journalIDSum[:16])
+
+	// transferIDForLeg derives the TigerBeetle transfer ID for leg i from the
+	// journal ID (sha256 of journalID + leg index) — deterministic, so retries
+	// yield TransferExists instead of duplicates.
+	transferIDForLeg := func(i int) tbclient.Uint128 {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%s/leg/%d", journalID, i)))
+		var b [16]byte
+		copy(b[:], sum[:16])
+		return tbclient.BytesToUint128(b)
+	}
+
+	// Post each leg to TigerBeetle against the clearing account. Balanced
+	// totals guarantee the clearing account nets to zero per journal. All
+	// legs are submitted as one LINKED batch (all-or-nothing): a failure in
+	// any leg fails the whole batch, so no partial journal can be applied.
+	clearingAccount := tbclient.ToUint128(1) // ledger clearing account 1
+	var transfers []tbclient.Transfer
+	for i, leg := range req.Legs {
+		acct := tbclient.ToUint128(leg.AccountID)
+		t := tbclient.Transfer{
+			ID:     transferIDForLeg(i),
+			Amount: tbclient.ToUint128(leg.Amount),
+			Ledger: 1,
+			Code:   100,
+		}
+		// Linked chain: every transfer except the last carries the linked
+		// flag; the last one closes the chain (TigerBeetle semantics).
+		if i < len(req.Legs)-1 {
+			t.Flags = tbclient.TransferFlags{Linked: true}.ToUint16()
+		}
+		if leg.Type == "debit" {
+			t.DebitAccountID = acct
+			t.CreditAccountID = clearingAccount
+		} else {
+			t.DebitAccountID = clearingAccount
+			t.CreditAccountID = acct
+		}
+		transfers = append(transfers, t)
+	}
+
+	results, err := tbClient.CreateTransfers(r.Context(), transfers)
+	if err != nil {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]string{"error": "ledger_posting_failed", "detail": err.Error()})
+		return
+	}
+	allExisted := true
+	for _, res := range results {
+		// Any non-created/non-existing result means the journal did not post.
+		// (Linked batches fail atomically, so this is all-or-nothing.)
+		if res.Status != tbclient.TransferCreated && res.Status != tbclient.TransferExists {
+			w.WriteHeader(502)
+			json.NewEncoder(w).Encode(map[string]string{
+				"error": "ledger_posting_rejected", "detail": fmt.Sprintf("transfer status code %d", res.Status),
+			})
+			return
+		}
+		if res.Status != tbclient.TransferExists {
+			allExisted = false
+		}
+	}
+
+	if allExisted {
+		// Pure retry of an already-posted journal: the linked batch with
+		// deterministic IDs matched existing transfers. Do NOT insert another
+		// journal record or outbox event — report the idempotent replay.
+		w.WriteHeader(200)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"journalId":   journalID,
+			"status":      "already_posted",
+			"ledger":      "tigerbeetle",
+			"legsPosted":  len(transfers),
+			"totalAmount": debits,
+		})
+		return
+	}
+
+	// Persist the journal record + outbox event (relay publishes to Kafka).
+	if db != nil {
+		payload, _ := json.Marshal(map[string]interface{}{
+			"journalId": journalID, "tenantId": req.TenantID, "transactionRef": req.TransactionRef,
+			"narration": req.Narration, "currency": req.Currency, "legs": req.Legs,
+			"totalAmount": debits,
+		})
+		if _, err := db.ExecContext(r.Context(),
+			`INSERT INTO journal_postings (journal_id, tenant_id, transaction_ref, narration, currency, total_amount, leg_count, payload)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+			 ON CONFLICT (journal_id) DO NOTHING`,
+			journalID, req.TenantID, req.TransactionRef, req.Narration, req.Currency, int64(debits), len(req.Legs), string(payload)); err != nil {
+			log.Printf("[%s] journal record persist failed (ledger posting DID commit): %v", serviceName, err)
+		}
+		if _, err := db.ExecContext(r.Context(),
+			`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ('journal.posted', $1, $2)`,
+			journalID, string(payload)); err != nil {
+			log.Printf("[%s] outbox insert failed: %v", serviceName, err)
+		}
+	}
+
+	w.WriteHeader(201)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"journalId":   journalID,
+		"status":      "posted",
+		"ledger":      "tigerbeetle",
+		"legsPosted":  len(transfers),
+		"totalAmount": debits,
+		"postedAt":    time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+func handleGetJournal(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "database unavailable"})
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/journals/")
+	var payload string
+	err := db.QueryRowContext(r.Context(), `SELECT payload FROM journal_postings WHERE journal_id = $1`, id).Scan(&payload)
+	if err == sql.ErrNoRows {
+		w.WriteHeader(404)
+		json.NewEncoder(w).Encode(map[string]string{"error": "journal not found"})
+		return
+	}
+	if err != nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+	w.Write([]byte(payload))
+}
+
+func initJournalSchema() {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS journal_postings (
+		journal_id VARCHAR(96) PRIMARY KEY,
+		tenant_id VARCHAR(64),
+		transaction_ref VARCHAR(128),
+		narration VARCHAR(500),
+		currency VARCHAR(8),
+		total_amount BIGINT,
+		leg_count INT,
+		payload JSONB,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Fatalf("journal_postings schema init failed: %v", err)
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		event_type VARCHAR(64) NOT NULL,
+		aggregate_id VARCHAR(128) NOT NULL,
+		payload JSONB NOT NULL,
+		published BOOLEAN DEFAULT FALSE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("outbox table creation (may already exist): %v", err)
+	}
+}
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" { port = "8080" }
+	if port == "" {
+		port = "8080"
+	}
 
 	startWatchdog(10 * time.Second)
+
+	// Postgres (journal records + outbox)
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[journal-posting-go] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Fatalf("database connection failed: %v", err)
+	}
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		log.Fatalf("database ping failed: %v", err)
+	}
+	initJournalSchema()
+
+	// TigerBeetle ledger client (required for posting; 503 if unconfigured)
+	if tb, err := tbclient.NewClient(tbclient.Config{}); err != nil {
+		log.Printf("[%s] TigerBeetle unavailable: %v — /v1/journals will fail closed (503)", serviceName, err)
+	} else {
+		tbClient = tb
+		defer tbClient.Close()
+	}
+
+	// Outbox relay: marks published only after confirmed Kafka produce
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	startOutboxRelay(relayCtx, eventBus.broker, eventBus.topic)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", healthHandler)
@@ -382,6 +757,8 @@ func main() {
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/livez", livezHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
+	mux.Handle("/v1/journals", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handlePostJournal)))
+	mux.Handle("/v1/journals/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleGetJournal)))
 
 	handler := panicRecoveryMiddleware(securityMiddleware(mux))
 
@@ -408,4 +785,13 @@ func main() {
 	defer cancel()
 	srv.Shutdown(ctx)
 	log.Printf("[%s] Server stopped", serviceName)
+}
+
+// jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
+// scripts/fix-go-wire-jwt.py).
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
 }

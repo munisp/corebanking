@@ -6,6 +6,56 @@ import (
 	"time"
 )
 
+// --- Configurable business-action hooks ---
+//
+// Scenario-specific side effects (schedule updates, mandate validation,
+// policy activation, account freeze/archive) are executed through these
+// hooks. Until a hook is configured, the corresponding saga step fails
+// loudly instead of pretending the side effect happened.
+
+var (
+	scheduleUpdater  func(ctx context.Context, orderRef, transferID string) error
+	mandateValidator func(ctx context.Context, mandateRef string, amount AmountKobo) error
+	policyActivator  func(ctx context.Context, policyRef string, active bool) error
+	accountFreezer   func(ctx context.Context, accountID string, frozen bool) error
+	accountArchiver  func(ctx context.Context, accountID string, archived bool) error
+)
+
+// ConfigureScheduleUpdater installs the standing-order schedule updater.
+func ConfigureScheduleUpdater(f func(ctx context.Context, orderRef, transferID string) error) {
+	backendMu.Lock()
+	defer backendMu.Unlock()
+	scheduleUpdater = f
+}
+
+// ConfigureMandateValidator installs the direct-debit mandate validator.
+func ConfigureMandateValidator(f func(ctx context.Context, mandateRef string, amount AmountKobo) error) {
+	backendMu.Lock()
+	defer backendMu.Unlock()
+	mandateValidator = f
+}
+
+// ConfigurePolicyActivator installs the insurance policy activator.
+func ConfigurePolicyActivator(f func(ctx context.Context, policyRef string, active bool) error) {
+	backendMu.Lock()
+	defer backendMu.Unlock()
+	policyActivator = f
+}
+
+// ConfigureAccountFreezer installs the account freeze/unfreeze hook.
+func ConfigureAccountFreezer(f func(ctx context.Context, accountID string, frozen bool) error) {
+	backendMu.Lock()
+	defer backendMu.Unlock()
+	accountFreezer = f
+}
+
+// ConfigureAccountArchiver installs the account archive/reactivate hook.
+func ConfigureAccountArchiver(f func(ctx context.Context, accountID string, archived bool) error) {
+	backendMu.Lock()
+	defer backendMu.Unlock()
+	accountArchiver = f
+}
+
 // --- Scenario 5: Loan Repayment ---
 
 func LoanRepaymentSaga(borrowerID, loanAccountID, interestAccountID string,
@@ -113,11 +163,16 @@ func StandingOrderSaga(senderID, receiverID string, amount AmountKobo,
 	updateScheduleStep := SagaStep{
 		Name: "update_schedule",
 		Forward: func(ctx context.Context, s *SagaState) error {
-			// Update next_execution_date in DB within same transaction
-			return nil
+			backendMu.RLock()
+			f := scheduleUpdater
+			backendMu.RUnlock()
+			if f == nil {
+				return fmt.Errorf("fundsaga: schedule updater not configured (ConfigureScheduleUpdater) — next_execution_date NOT updated")
+			}
+			return f(ctx, orderRef, s.TransferID)
 		},
 		Compensate: func(ctx context.Context, s *SagaState) error {
-			// Revert schedule update
+			// Revert schedule update (hook must be idempotent)
 			return nil
 		},
 	}
@@ -155,8 +210,13 @@ func DirectDebitSaga(debtorID, creditorID string, amount AmountKobo,
 	validateMandate := SagaStep{
 		Name: "validate_mandate",
 		Forward: func(ctx context.Context, s *SagaState) error {
-			// Check mandate status, expiry, amount within mandate limit
-			return nil
+			backendMu.RLock()
+			f := mandateValidator
+			backendMu.RUnlock()
+			if f == nil {
+				return fmt.Errorf("fundsaga: mandate validator not configured (ConfigureMandateValidator) — mandate %s NOT verified", mandateRef)
+			}
+			return f(ctx, mandateRef, amount)
 		},
 		Compensate: nil,
 	}
@@ -260,8 +320,8 @@ func AgentCashInSaga(agentID, customerID string, amount AmountKobo) ([]SagaStep,
 	state := &SagaState{
 		TransferID: fmt.Sprintf("CASHIN-%d", time.Now().UnixNano()),
 		Legs: []TransferLeg{
-			{AccountID: agentID, Amount: amount, Direction: "debit", Ledger: 1, Code: 15001},      // agent float decreases
-			{AccountID: customerID, Amount: amount, Direction: "credit", Ledger: 1, Code: 15001},   // customer balance increases
+			{AccountID: agentID, Amount: amount, Direction: "debit", Ledger: 1, Code: 15001},     // agent float decreases
+			{AccountID: customerID, Amount: amount, Direction: "credit", Ledger: 1, Code: 15001}, // customer balance increases
 		},
 		Metadata: map[string]interface{}{"type": "cash_in"},
 	}
@@ -281,8 +341,8 @@ func AgentCashOutSaga(customerID, agentID string, amount AmountKobo) ([]SagaStep
 	state := &SagaState{
 		TransferID: fmt.Sprintf("CASHOUT-%d", time.Now().UnixNano()),
 		Legs: []TransferLeg{
-			{AccountID: customerID, Amount: amount, Direction: "debit", Ledger: 1, Code: 15002},   // customer balance decreases
-			{AccountID: agentID, Amount: amount, Direction: "credit", Ledger: 1, Code: 15002},     // agent float increases
+			{AccountID: customerID, Amount: amount, Direction: "debit", Ledger: 1, Code: 15002}, // customer balance decreases
+			{AccountID: agentID, Amount: amount, Direction: "credit", Ledger: 1, Code: 15002},   // agent float increases
 		},
 		Metadata: map[string]interface{}{"type": "cash_out"},
 	}
@@ -314,12 +374,24 @@ func InsurancePremiumSaga(customerID, insurerAccountID string,
 	activatePolicy := SagaStep{
 		Name: "activate_policy",
 		Forward: func(ctx context.Context, s *SagaState) error {
+			backendMu.RLock()
+			f := policyActivator
+			backendMu.RUnlock()
+			if f == nil {
+				return fmt.Errorf("fundsaga: policy activator not configured (ConfigurePolicyActivator) — policy %s NOT activated", policyRef)
+			}
 			// Only activate policy after payment is confirmed
-			return nil
+			return f(ctx, policyRef, true)
 		},
 		Compensate: func(ctx context.Context, s *SagaState) error {
 			// Deactivate policy on payment reversal
-			return nil
+			backendMu.RLock()
+			f := policyActivator
+			backendMu.RUnlock()
+			if f == nil {
+				return nil
+			}
+			return f(ctx, policyRef, false)
 		},
 	}
 
@@ -348,8 +420,8 @@ func QRPaymentSaga(customerID, merchantID, feeAccountID string,
 			{AccountID: feeAccountID, Amount: feeKobo, Direction: "credit", Ledger: 4, Code: 19002},
 		},
 		Metadata: map[string]interface{}{
-			"type":       "qr_payment",
-			"fee_kobo":   feeKobo,
+			"type":                 "qr_payment",
+			"fee_kobo":             feeKobo,
 			"net_to_merchant_kobo": paymentKobo - feeKobo,
 		},
 	}
@@ -401,35 +473,59 @@ func AccountClosureSaga(customerID, settlementAccountID string,
 		TransferID: fmt.Sprintf("CLOSE-%d", time.Now().UnixNano()),
 		Legs:       legs,
 		Metadata: map[string]interface{}{
-			"type":                "account_closure",
-			"final_balance_kobo":  finalBalanceKobo,
-			"pending_fees_kobo":   pendingFeesKobo,
+			"type":                  "account_closure",
+			"final_balance_kobo":    finalBalanceKobo,
+			"pending_fees_kobo":     pendingFeesKobo,
 			"accrued_interest_kobo": accruedInterestKobo,
-			"net_payout_kobo":     netPayoutKobo,
+			"net_payout_kobo":       netPayoutKobo,
 		},
 	}
 
 	freezeAccount := SagaStep{
 		Name: "freeze_account",
 		Forward: func(ctx context.Context, s *SagaState) error {
+			backendMu.RLock()
+			f := accountFreezer
+			backendMu.RUnlock()
+			if f == nil {
+				return fmt.Errorf("fundsaga: account freezer not configured (ConfigureAccountFreezer) — account %s NOT frozen; closure aborted", customerID)
+			}
 			// Freeze the account to prevent new transactions during closure
-			return nil
+			return f(ctx, customerID, true)
 		},
 		Compensate: func(ctx context.Context, s *SagaState) error {
 			// Unfreeze if closure fails
-			return nil
+			backendMu.RLock()
+			f := accountFreezer
+			backendMu.RUnlock()
+			if f == nil {
+				return nil
+			}
+			return f(ctx, customerID, false)
 		},
 	}
 
 	archiveAccount := SagaStep{
 		Name: "archive_account",
 		Forward: func(ctx context.Context, s *SagaState) error {
+			backendMu.RLock()
+			f := accountArchiver
+			backendMu.RUnlock()
+			if f == nil {
+				return fmt.Errorf("fundsaga: account archiver not configured (ConfigureAccountArchiver) — account %s NOT archived", customerID)
+			}
 			// Move account to archive/closed status
-			return nil
+			return f(ctx, customerID, true)
 		},
 		Compensate: func(ctx context.Context, s *SagaState) error {
 			// Reactivate if downstream fails
-			return nil
+			backendMu.RLock()
+			f := accountArchiver
+			backendMu.RUnlock()
+			if f == nil {
+				return nil
+			}
+			return f(ctx, customerID, false)
 		},
 	}
 

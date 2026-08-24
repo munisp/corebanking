@@ -1,6 +1,9 @@
 FROM rust:1.83 AS builder
 WORKDIR /app
-COPY Cargo.toml Cargo.lock ./
+# Cargo.lock is not vendored in this tree and cannot be generated offline
+# (no cargo toolchain / crates.io unreachable in the gate environment); the fleet
+# builds without --locked, so the lockfile is resolved at image build time.
+COPY Cargo.toml ./
 COPY src ./src
 RUN cargo build --release
 

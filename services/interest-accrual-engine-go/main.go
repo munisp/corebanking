@@ -1,221 +1,715 @@
 // 54link-dev Interest Accrual Engine — Go
 // Computes daily interest accrual for savings, loans, FDs, overdrafts.
-// Posts journal entries to GL for every accrual (debit: interest expense/receivable, credit: customer account/payable).
-// Integrates with all 14 middleware.
+//
+// Data integrity doctrine:
+//   - Accrual-eligible accounts are read from Postgres (accrual_eligible_accounts).
+//   - Every accrual posts a REAL balanced double-entry journal into the GL
+//     store ("journalEntries" + "glAccounts" balance update) in one tx.
+//   - If Postgres is unavailable the batch FAILS with an error and nothing is
+//     marked posted. No hardcoded accounts, no fabricated "posted" statuses,
+//     no middleware action claims.
 package main
 
 import (
+	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math"
+	"math/big"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
-type MiddlewareStatus struct {
-	Kafka       string `json:"kafka"`
-	Dapr        string `json:"dapr"`
-	Fluvio      string `json:"fluvio"`
-	Temporal    string `json:"temporal"`
-	Postgres    string `json:"postgres"`
-	Keycloak    string `json:"keycloak"`
-	Permify     string `json:"permify"`
-	Redis       string `json:"redis"`
-	Mojaloop    string `json:"mojaloop"`
-	OpenSearch  string `json:"opensearch"`
-	OpenAppSec  string `json:"openappsec"`
-	APISIX      string `json:"apisix"`
-	TigerBeetle string `json:"tigerbeetle"`
-	Lakehouse   string `json:"lakehouse"`
-}
+var db *sql.DB
+
+var serviceName = "interest-accrual-engine-go"
 
 type AccrualProduct struct {
-	ProductType string  `json:"productType"`
-	GLDebit     string  `json:"glDebit"`
-	GLCredit    string  `json:"glCredit"`
-	Description string  `json:"description"`
-	Rate        float64 `json:"sampleRate"`
-	Basis       int     `json:"dayBasis"`
+	ProductType string `json:"productType"`
+	GLDebit     string `json:"glDebit"`
+	GLCredit    string `json:"glCredit"`
+	Description string `json:"description"`
+	Basis       int    `json:"dayBasis"`
+}
+
+// GL posting map per product type (static accounting configuration, not data).
+var accrualProducts = []AccrualProduct{
+	{ProductType: "savings", GLDebit: "5101", GLCredit: "2102", Description: "Interest Expense on Savings → Savings Deposit Payable", Basis: 365},
+	{ProductType: "fixed_deposit", GLDebit: "5102", GLCredit: "2103", Description: "Interest Expense on FD → FD Payable", Basis: 365},
+	{ProductType: "loan", GLDebit: "1301", GLCredit: "4101", Description: "Interest Receivable on Loans → Interest Income (Loans)", Basis: 360},
+	{ProductType: "overdraft", GLDebit: "1301", GLCredit: "4101", Description: "Interest Receivable on OD → Interest Income (Loans)", Basis: 365},
+	{ProductType: "mortgage", GLDebit: "1309", GLCredit: "4102", Description: "Interest Receivable on Mortgage → Interest Income (Retail)", Basis: 365},
+	{ProductType: "placement", GLDebit: "1104", GLCredit: "4105", Description: "Placement Receivable → Interest on Placements", Basis: 365},
+}
+
+type accrualAccount struct {
+	ID            string
+	Name          string
+	ProductType   string
+	PrincipalKobo int64
+	AnnualRateBP  int64 // annual rate in basis points — no float money
+	DayBasis      int
 }
 
 type AccrualResult struct {
-	AccountID     string  `json:"accountId"`
-	AccountName   string  `json:"accountName"`
-	ProductType   string  `json:"productType"`
-	Principal     float64 `json:"principal"`
-	AnnualRate    float64 `json:"annualRate"`
-	DayBasis      int     `json:"dayBasis"`
-	DailyAccrual  float64 `json:"dailyAccrual"`
-	GLDebitCode   string  `json:"glDebitCode"`
-	GLCreditCode  string  `json:"glCreditCode"`
-	JournalEntry  string  `json:"journalEntryId"`
-	Status        string  `json:"status"`
+	AccountID    string `json:"accountId"`
+	AccountName  string `json:"accountName"`
+	ProductType  string `json:"productType"`
+	AccruedKobo  int64  `json:"accrued_kobo"`
+	GLDebitCode  string `json:"glDebitCode"`
+	GLCreditCode string `json:"glCreditCode"`
+	JournalEntry string `json:"journalEntryId"`
+	Status       string `json:"status"` // posted | failed
 }
 
 type AccrualBatchResult struct {
-	BatchID           string           `json:"batchId"`
-	BusinessDate      string           `json:"businessDate"`
-	TotalAccounts     int              `json:"totalAccounts"`
-	TotalAccrued      float64          `json:"totalAccrued"`
-	InterestIncome    float64          `json:"interestIncome"`
-	InterestExpense   float64          `json:"interestExpense"`
-	JournalEntries    int              `json:"journalEntriesPosted"`
-	Results           []AccrualResult  `json:"results"`
-	GLPostings        []GLPosting      `json:"glPostings"`
-	Pipeline          PipelineTrace    `json:"pipeline"`
-	MiddlewareActions map[string]interface{} `json:"middlewareActions"`
+	BatchID          string          `json:"batchId"`
+	BusinessDate     string          `json:"businessDate"`
+	TotalAccounts    int             `json:"totalAccounts"`
+	TotalAccruedKobo int64           `json:"total_accrued_kobo"`
+	Posted           int             `json:"journalEntriesPosted"`
+	Failed           int             `json:"journalEntriesFailed"`
+	Results          []AccrualResult `json:"results"`
+	Status           string          `json:"status"` // completed | failed | no_eligible_accounts
 }
 
-type GLPosting struct {
-	EntryID     string  `json:"entryId"`
-	GLCode      string  `json:"glCode"`
-	GLName      string  `json:"glName"`
-	Type        string  `json:"type"`
-	Amount      float64 `json:"amount"`
-	PostingDate string  `json:"postingDate"`
-	Narration   string  `json:"narration"`
+// computeDailyAccrualKobo: principal_kobo × rate_bp / 10000 / basis, integer math.
+func computeDailyAccrualKobo(principalKobo int64, annualRateBP int64, basis int) int64 {
+	if basis <= 0 {
+		basis = 365
+	}
+	return principalKobo * annualRateBP / 10000 / int64(basis)
 }
 
-type PipelineTrace struct {
-	Step1 string `json:"step1_compute"`
-	Step2 string `json:"step2_journal"`
-	Step3 string `json:"step3_gl_post"`
-	Step4 string `json:"step4_balance_update"`
-	Step5 string `json:"step5_audit_index"`
+func productFor(t string) (AccrualProduct, bool) {
+	for _, p := range accrualProducts {
+		if p.ProductType == t {
+			return p, true
+		}
+	}
+	return AccrualProduct{}, false
 }
 
-var accrualProducts = []AccrualProduct{
-	{ProductType: "savings", GLDebit: "5101", GLCredit: "2102", Description: "Interest Expense on Savings → Savings Deposit Payable", Rate: 4.5, Basis: 365},
-	{ProductType: "fixed_deposit", GLDebit: "5102", GLCredit: "2103", Description: "Interest Expense on FD → FD Payable", Rate: 14.0, Basis: 365},
-	{ProductType: "loan", GLDebit: "1301", GLCredit: "4101", Description: "Interest Receivable on Loans → Interest Income (Loans)", Rate: 22.0, Basis: 360},
-	{ProductType: "overdraft", GLDebit: "1301", GLCredit: "4101", Description: "Interest Receivable on OD → Interest Income (Loans)", Rate: 28.0, Basis: 365},
-	{ProductType: "mortgage", GLDebit: "1309", GLCredit: "4102", Description: "Interest Receivable on Mortgage → Interest Income (Retail)", Rate: 18.0, Basis: 365},
-	{ProductType: "placement", GLDebit: "1104", GLCredit: "4105", Description: "Placement Receivable → Interest on Placements", Rate: 12.0, Basis: 365},
+// loadEligibleAccounts reads the real accrual-eligible account set from Postgres.
+func loadEligibleAccounts(ctx context.Context) ([]accrualAccount, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT account_id, account_name, product_type, principal_kobo, annual_rate_bp, day_basis
+		 FROM accrual_eligible_accounts WHERE status = 'active' ORDER BY account_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []accrualAccount
+	for rows.Next() {
+		var a accrualAccount
+		if err := rows.Scan(&a.ID, &a.Name, &a.ProductType, &a.PrincipalKobo, &a.AnnualRateBP, &a.DayBasis); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
-func computeDailyAccrual(principal float64, annualRate float64, basis int) float64 {
-	return math.Round(principal*annualRate/100.0/float64(basis)*100) / 100
+// postAccrualJournal writes a balanced double-entry journal (debit + credit)
+// and updates GL balances atomically. The (tenant_id, account_id,
+// accrual_date) idempotency claim is inserted in the SAME transaction, so a
+// replayed batch is a no-op: it returns alreadyPosted=true with the existing
+// journal entry id and amount instead of posting a second journal.
+func postAccrualJournal(ctx context.Context, tenantID, jeID, narration string, acc accrualAccount, product AccrualProduct, amountKobo int64, postingDate time.Time, accrualDate string) (alreadyPosted bool, existingJE string, existingKobo int64, err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, "", 0, err
+	}
+	defer tx.Rollback()
+
+	// Atomic idempotency claim: first writer wins; a conflict means this
+	// account was already accrued for this tenant/date.
+	var claimedJE string
+	claimErr := tx.QueryRowContext(ctx,
+		`INSERT INTO accrual_postings (tenant_id, account_id, accrual_date, journal_entry_id, accrued_kobo)
+		 VALUES ($1,$2,$3,$4,$5)
+		 ON CONFLICT (tenant_id, account_id, accrual_date) DO NOTHING
+		 RETURNING journal_entry_id`,
+		tenantID, acc.ID, accrualDate, jeID, amountKobo).Scan(&claimedJE)
+	if claimErr == sql.ErrNoRows {
+		// Replay: return the previously recorded result, post nothing.
+		var prevJE string
+		var prevKobo int64
+		if qerr := tx.QueryRowContext(ctx,
+			`SELECT journal_entry_id, accrued_kobo FROM accrual_postings
+			 WHERE tenant_id=$1 AND account_id=$2 AND accrual_date=$3`,
+			tenantID, acc.ID, accrualDate).Scan(&prevJE, &prevKobo); qerr != nil {
+			return false, "", 0, fmt.Errorf("accrual replay lookup failed: %w", qerr)
+		}
+		return true, prevJE, prevKobo, nil
+	}
+	if claimErr != nil {
+		return false, "", 0, fmt.Errorf("accrual idempotency claim failed: %w", claimErr)
+	}
+
+	legs := []struct{ code, typ string }{{product.GLDebit, "debit"}, {product.GLCredit, "credit"}}
+	for _, leg := range legs {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO "journalEntries"
+			("entryId", "tenantId", "accountId", "glAccountCode", "type", "amount_kobo", "currency", "narration", "transactionRef", "postingDate", "valueDate")
+			VALUES ($1,$2,$3,$4,$5,$6,'NGN',$7,$8,$9,$9)`,
+			jeID+"-"+leg.typ, tenantID, acc.ID, leg.code, leg.typ, amountKobo, narration, jeID, postingDate); err != nil {
+			return false, "", 0, fmt.Errorf("journal insert (%s) failed: %w", leg.typ, err)
+		}
+		var balSQL string
+		if leg.typ == "debit" {
+			balSQL = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" + $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
+		} else {
+			balSQL = `UPDATE "glAccounts" SET "balance_kobo" = "balance_kobo" - $1, "updatedAt" = NOW() WHERE "glAccountCode" = $2`
+		}
+		if _, err := tx.ExecContext(ctx, balSQL, amountKobo, leg.code); err != nil {
+			return false, "", 0, fmt.Errorf("GL balance update (%s) failed: %w", leg.typ, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, "", 0, err
+	}
+	return false, jeID, amountKobo, nil
+}
+
+// jwtClaims extracts the verified JWT claims placed on the request context by
+// jwtAuthMiddleware. Returns nil when absent (fail-closed callers reject).
+func jwtClaims(r *http.Request) map[string]interface{} {
+	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
+	return claims
+}
+
+// claimsHaveServiceRole enforces that only service accounts / admins may
+// trigger a state-changing accrual batch.
+func claimsHaveServiceRole(claims map[string]interface{}) bool {
+	hasRole := func(v interface{}) bool {
+		roles, ok := v.([]interface{})
+		if !ok {
+			return false
+		}
+		for _, role := range roles {
+			if s, ok := role.(string); ok && (s == "service" || s == "admin" || s == "accrual-service") {
+				return true
+			}
+		}
+		return false
+	}
+	if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
+		if hasRole(ra["roles"]) {
+			return true
+		}
+	}
+	return hasRole(claims["roles"])
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied query/body parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 func runAccrualBatch(w http.ResponseWriter, r *http.Request) {
+	// State-changing endpoint: POST only — never trigger an accrual via GET.
+	if r.Method != "POST" {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, 405, map[string]string{"error": "method_not_allowed", "detail": "accrual is state-changing; POST required"})
+		return
+	}
+	if db == nil {
+		writeJSON(w, 503, map[string]string{"error": "accrual_store_unavailable", "detail": "postgres not connected; accrual batch NOT run"})
+		return
+	}
+
+	// Authorization: a verified token with a service/admin role is required.
+	claims := jwtClaims(r)
+	if claims == nil {
+		writeJSON(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !claimsHaveServiceRole(claims) {
+		writeJSON(w, 403, map[string]string{"error": "forbidden", "detail": "accrual batches require a service or admin role"})
+		return
+	}
+	// Tenant comes ONLY from verified JWT claims — never caller-controlled.
+	tenantID := tenantFromClaims(claims)
+	if tenantID == "" {
+		writeJSON(w, 403, map[string]string{"error": "forbidden", "detail": "token carries no tenant claim"})
+		return
+	}
+
+	// businessDate: caller may request a past/current date; it is validated
+	// and never future-dated. Default is derived server-side.
+	var reqBody struct {
+		BusinessDate string `json:"businessDate"`
+	}
+	json.NewDecoder(r.Body).Decode(&reqBody) // empty body is fine
 	businessDate := time.Now().Format("2006-01-02")
-
-	accounts := []struct {
-		id, name, product string
-		principal         float64
-		rate              float64
-	}{
-		{"ACC-001", "Aisha Mohammed", "savings", 5_000_000, 4.5},
-		{"ACC-002", "Ibrahim Musa FD", "fixed_deposit", 50_000_000, 14.0},
-		{"ACC-003", "Zenith Construction", "loan", 250_000_000, 22.0},
-		{"ACC-004", "Chukwuemeka Obi OD", "overdraft", 15_000_000, 28.0},
-		{"ACC-005", "Fatimah Abdullahi", "savings", 1_200_000, 3.75},
-		{"ACC-006", "Adebayo Mortgage", "mortgage", 45_000_000, 18.0},
-		{"ACC-007", "SME Loan - Okonkwo", "loan", 12_000_000, 24.0},
-		{"ACC-008", "Corporate Term", "loan", 180_000_000, 20.5},
-		{"ACC-009", "Interbank Placement", "placement", 500_000_000, 12.0},
-		{"ACC-010", "Premium FD - Hassan", "fixed_deposit", 100_000_000, 15.5},
+	postingDate := time.Now()
+	if reqBody.BusinessDate != "" {
+		d, err := time.Parse("2006-01-02", reqBody.BusinessDate)
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "invalid businessDate (want YYYY-MM-DD)"})
+			return
+		}
+		if reqBody.BusinessDate > businessDate {
+			writeJSON(w, 400, map[string]string{"error": "businessDate must not be future-dated"})
+			return
+		}
+		businessDate = reqBody.BusinessDate
+		postingDate = d
 	}
 
-	var results []AccrualResult
-	var glPostings []GLPosting
-	var totalAccrued, interestIncome, interestExpense float64
-	entryNum := 1
-
-	for _, acc := range accounts {
-		var product AccrualProduct
-		for _, p := range accrualProducts {
-			if p.ProductType == acc.product {
-				product = p
-				break
-			}
-		}
-		basis := product.Basis
-		if basis == 0 { basis = 365 }
-		daily := computeDailyAccrual(acc.principal, acc.rate, basis)
-		totalAccrued += daily
-
-		jeID := fmt.Sprintf("JE-ACCRUAL-%s-%03d", businessDate, entryNum)
-
-		if acc.product == "loan" || acc.product == "overdraft" || acc.product == "mortgage" || acc.product == "placement" {
-			interestIncome += daily
-		} else {
-			interestExpense += daily
-		}
-
-		results = append(results, AccrualResult{
-			AccountID: acc.id, AccountName: acc.name, ProductType: acc.product,
-			Principal: acc.principal, AnnualRate: acc.rate, DayBasis: basis,
-			DailyAccrual: daily, GLDebitCode: product.GLDebit, GLCreditCode: product.GLCredit,
-			JournalEntry: jeID, Status: "posted",
-		})
-
-		glPostings = append(glPostings,
-			GLPosting{EntryID: jeID, GLCode: product.GLDebit, GLName: product.Description, Type: "debit", Amount: daily, PostingDate: businessDate, Narration: fmt.Sprintf("Daily accrual %s - %s", acc.product, acc.name)},
-			GLPosting{EntryID: jeID, GLCode: product.GLCredit, GLName: product.Description, Type: "credit", Amount: daily, PostingDate: businessDate, Narration: fmt.Sprintf("Daily accrual %s - %s", acc.product, acc.name)},
-		)
-		entryNum++
+	ctx := r.Context()
+	accounts, err := loadEligibleAccounts(ctx)
+	if err != nil {
+		log.Printf("[%s] eligible accounts query failed: %v", serviceName, err)
+		writeJSON(w, 503, map[string]string{"error": "accrual_source_unavailable"})
+		return
 	}
 
+	// Deterministic batch id: a replay of the same tenant/date maps to the
+	// same batch and each account-level posting is a claimed no-op.
+	batchID := fmt.Sprintf("BATCH-ACCRUAL-%s-%s", tenantID, businessDate)
 	batch := AccrualBatchResult{
-		BatchID:        fmt.Sprintf("BATCH-ACCRUAL-%s", businessDate),
-		BusinessDate:   businessDate,
-		TotalAccounts:  len(accounts),
-		TotalAccrued:   totalAccrued,
-		InterestIncome: interestIncome,
-		InterestExpense: interestExpense,
-		JournalEntries: len(accounts),
-		Results:        results,
-		GLPostings:     glPostings,
-		Pipeline: PipelineTrace{
-			Step1: "Compute daily accrual (principal × rate / dayBasis)",
-			Step2: "Create double-entry journal (debit: receivable/expense, credit: income/payable)",
-			Step3: "Post to GL accounts (update trialBalances)",
-			Step4: "Update customer account balances (accrued interest)",
-			Step5: "Index to OpenSearch + append to Lakehouse",
-		},
-		MiddlewareActions: map[string]interface{}{
-			"kafka":       map[string]string{"topic": "banking.interest.accrued", "status": "published"},
-			"dapr":        map[string]string{"statestore": "accrual-state", "status": "saved"},
-			"fluvio":      map[string]string{"stream": "interest-accrual-events", "status": "appended"},
-			"temporal":    map[string]string{"workflow": "InterestAccrualWorkflow", "status": "completed"},
-			"postgres":    map[string]string{"tables": "journalEntries, trialBalances, accounts", "status": "updated"},
-			"keycloak":    map[string]string{"role": "eod_processor", "status": "authorized"},
-			"permify":     map[string]string{"permission": "interest.accrue", "status": "granted"},
-			"redis":       map[string]string{"key": fmt.Sprintf("accrual:%s:batch", businessDate), "status": "cached"},
-			"mojaloop":    map[string]string{"purpose": "cross-border loan interest", "status": "not_applicable"},
-			"opensearch":  map[string]string{"index": "interest-accrual-2026", "status": "indexed"},
-			"openappsec":  map[string]string{"policy": "eod-batch-protection", "status": "passed"},
-			"apisix":      map[string]string{"route": "/v1/interest/accrue", "status": "rate_limited"},
-			"tigerbeetle": map[string]string{"action": "transfer_batch_posted", "entries": fmt.Sprintf("%d", len(accounts)*2)},
-			"lakehouse":   map[string]string{"table": "kpi_catalog.banking.interest_accrual_iceberg", "status": "written"},
-		},
+		BatchID:      batchID,
+		BusinessDate: businessDate,
+		Status:       "completed",
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(batch)
+	if len(accounts) == 0 {
+		batch.Status = "no_eligible_accounts"
+		writeJSON(w, 200, batch)
+		return
+	}
+
+	entryNum := 1
+	for _, acc := range accounts {
+		product, ok := productFor(acc.ProductType)
+		if !ok {
+			log.Printf("[%s] skipping account %s: unknown product type %q", serviceName, acc.ID, acc.ProductType)
+			continue
+		}
+		daily := computeDailyAccrualKobo(acc.PrincipalKobo, acc.AnnualRateBP, acc.DayBasis)
+		if daily <= 0 {
+			continue
+		}
+		jeID := fmt.Sprintf("JE-ACCRUAL-%s-%s-%03d", tenantID, businessDate, entryNum)
+		entryNum++
+		narration := fmt.Sprintf("Daily accrual %s - %s", acc.ProductType, acc.Name)
+
+		res := AccrualResult{
+			AccountID: acc.ID, AccountName: acc.Name, ProductType: acc.ProductType,
+			AccruedKobo: daily, GLDebitCode: product.GLDebit, GLCreditCode: product.GLCredit,
+			JournalEntry: jeID,
+		}
+		already, prevJE, prevKobo, err := postAccrualJournal(ctx, tenantID, jeID, narration, acc, product, daily, postingDate, businessDate)
+		if err != nil {
+			log.Printf("[%s] journal posting failed for %s: %v", serviceName, acc.ID, err)
+			res.Status = "failed"
+			batch.Failed++
+		} else if already {
+			// Idempotent replay: report the existing posting, change nothing.
+			res.Status = "already_posted"
+			res.JournalEntry = prevJE
+			res.AccruedKobo = prevKobo
+			batch.Posted++
+			batch.TotalAccruedKobo += prevKobo
+		} else {
+			res.Status = "posted" // only after the GL tx committed
+			batch.Posted++
+			batch.TotalAccruedKobo += daily
+		}
+		batch.Results = append(batch.Results, res)
+	}
+	batch.TotalAccounts = len(accounts)
+	if batch.Failed > 0 {
+		batch.Status = "failed"
+	}
+
+	// Persist the batch run record (replay-safe: same batch id per tenant/date).
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO accrual_batches (batch_id, business_date, tenant_id, total_accounts, posted, failed, total_accrued_kobo, status)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		 ON CONFLICT (batch_id) DO UPDATE SET
+			posted = EXCLUDED.posted, failed = EXCLUDED.failed,
+			total_accrued_kobo = EXCLUDED.total_accrued_kobo, status = EXCLUDED.status`,
+		batchID, businessDate, tenantID, batch.TotalAccounts, batch.Posted, batch.Failed, batch.TotalAccruedKobo, batch.Status); err != nil {
+		log.Printf("[%s] batch record insert failed: %v", serviceName, err)
+	}
+
+	code := 200
+	if batch.Status == "failed" {
+		code = 500
+	}
+	writeJSON(w, code, batch)
 }
 
 func healthz(w http.ResponseWriter, r *http.Request) {
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": "healthy", "service": "interest-accrual-engine-go", "version": "1.0.0",
-		"middleware": MiddlewareStatus{
-			Kafka: "connected", Dapr: "connected", Fluvio: "connected", Temporal: "connected",
-			Postgres: "connected", Keycloak: "connected", Permify: "connected", Redis: "connected",
-			Mojaloop: "connected", OpenSearch: "connected", OpenAppSec: "connected", APISIX: "connected",
-			TigerBeetle: "connected", Lakehouse: "connected",
-		},
-		"pipeline": "Interest Accrual → GL Journal Entry → Account Balance",
+	pg := "unavailable"
+	if db != nil && db.Ping() == nil {
+		pg = "connected"
+	}
+	writeJSON(w, 200, map[string]interface{}{
+		"status": "healthy", "service": serviceName, "version": "2.0.0",
+		"postgres": pg,
+		"pipeline": "Interest Accrual → GL Journal Entry (postgres tx) → GL Balance",
 	})
 }
 
+// ─── Shared hardening handlers (used by tests and routes) ──────────────────
+
+func healthHandler(w http.ResponseWriter, r *http.Request) { healthz(w, r) }
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": "database not initialized"})
+		return
+	}
+	if err := db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"interest-accrual-engine-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"interest-accrual-engine-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"interest-accrual-engine-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+// listHandler lists recorded accrual batches from Postgres.
+func listHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		writeJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	rows, err := db.QueryContext(r.Context(),
+		`SELECT batch_id, business_date, tenant_id, total_accounts, posted, failed, total_accrued_kobo, status, created_at
+		 FROM accrual_batches ORDER BY created_at DESC LIMIT 100`)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var out []map[string]interface{}
+	for rows.Next() {
+		var bid, bdate, tenant, status string
+		var total, posted, failed int
+		var accrued int64
+		var created time.Time
+		if err := rows.Scan(&bid, &bdate, &tenant, &total, &posted, &failed, &accrued, &status, &created); err != nil {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"batchId": bid, "businessDate": bdate, "tenantId": tenant,
+			"totalAccounts": total, "posted": posted, "failed": failed,
+			"total_accrued_kobo": accrued, "status": status, "createdAt": created,
+		})
+	}
+	writeJSON(w, 200, map[string]interface{}{"batches": out, "total": len(out)})
+}
+
+// --- Rate Limiting ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64 = 0
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ── MIDDLEWARE: JWT Validation (JWKS / RS256) ───────────────────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func jwtRealmURL() string {
+	return getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(jwtRealmURL())
+		}
+	}()
+}
+
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + expiry). Fail-closed: no token is accepted on structure
+// alone.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":%q}`, serviceName)
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"malformed token","service":%q}`, serviceName)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func initSchema() {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS accrual_eligible_accounts (
+			account_id VARCHAR(64) PRIMARY KEY,
+			account_name VARCHAR(200) NOT NULL,
+			product_type VARCHAR(32) NOT NULL,
+			principal_kobo BIGINT NOT NULL,
+			annual_rate_bp BIGINT NOT NULL,
+			day_basis INT NOT NULL DEFAULT 365,
+			status VARCHAR(20) NOT NULL DEFAULT 'active',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS accrual_batches (
+			batch_id VARCHAR(96) PRIMARY KEY,
+			business_date VARCHAR(10) NOT NULL,
+			tenant_id VARCHAR(64) NOT NULL,
+			total_accounts INT NOT NULL,
+			posted INT NOT NULL,
+			failed INT NOT NULL,
+			total_accrued_kobo BIGINT NOT NULL,
+			status VARCHAR(20) NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		// Idempotency fence: one accrual posting per tenant/account/date.
+		// Claimed atomically (INSERT ... ON CONFLICT DO NOTHING) inside the
+		// journal-posting transaction, so replays are no-ops.
+		`CREATE TABLE IF NOT EXISTS accrual_postings (
+			tenant_id VARCHAR(64) NOT NULL,
+			account_id VARCHAR(64) NOT NULL,
+			accrual_date DATE NOT NULL,
+			journal_entry_id VARCHAR(96) NOT NULL,
+			accrued_kobo BIGINT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (tenant_id, account_id, accrual_date)
+		)`,
+	}
+	for _, s := range stmts {
+		if _, err := db.Exec(s); err != nil {
+			log.Fatalf("schema init failed: %v", err)
+		}
+	}
+}
+
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" { port = "8093" }
-	http.HandleFunc("/healthz", healthz)
-	http.HandleFunc("/v1/interest/accrue", runAccrualBatch)
-	log.Printf("Interest Accrual Engine (Go) listening on :%s — 14 middleware connected", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[interest-accrual-engine-go] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Fatalf("database connection failed: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+	if err := db.Ping(); err != nil {
+		log.Fatalf("database ping failed: %v", err)
+	}
+	initSchema()
+
+	startJWKSRefresh()
+
+	port := getEnv("PORT", "8093")
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthz)
+	mux.HandleFunc("/health", healthz)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+	})
+	mux.HandleFunc("/metrics", metricsHandler)
+	mux.HandleFunc("/v1/interest/accrue", runAccrualBatch)
+	mux.HandleFunc("/v1/interest/batches", listHandler)
+
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(jwtAuthMiddleware(mux)),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	log.Printf("[%s] listening on :%s", serviceName, port)
+	log.Fatal(server.ListenAndServe())
 }

@@ -2,9 +2,17 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
+	"math/big"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,16 +56,16 @@ var (
 type NotificationType string
 
 const (
-	NotificationTypeTransaction    NotificationType = "transaction"
-	NotificationTypeTransfer       NotificationType = "transfer"
-	NotificationTypePayment        NotificationType = "payment"
-	NotificationTypeLoan           NotificationType = "loan"
-	NotificationTypeAlert          NotificationType = "alert"
-	NotificationTypePromotion      NotificationType = "promotion"
-	NotificationTypeSystem         NotificationType = "system"
-	NotificationTypeKYC            NotificationType = "kyc"
-	NotificationTypeSecurity       NotificationType = "security"
-	NotificationTypeAccountUpdate  NotificationType = "account_update"
+	NotificationTypeTransaction   NotificationType = "transaction"
+	NotificationTypeTransfer      NotificationType = "transfer"
+	NotificationTypePayment       NotificationType = "payment"
+	NotificationTypeLoan          NotificationType = "loan"
+	NotificationTypeAlert         NotificationType = "alert"
+	NotificationTypePromotion     NotificationType = "promotion"
+	NotificationTypeSystem        NotificationType = "system"
+	NotificationTypeKYC           NotificationType = "kyc"
+	NotificationTypeSecurity      NotificationType = "security"
+	NotificationTypeAccountUpdate NotificationType = "account_update"
 )
 
 // NotificationPriority represents notification priority
@@ -72,19 +80,19 @@ const (
 
 // Notification represents a notification message
 type Notification struct {
-	ID          string                 `json:"id"`
-	UserID      string                 `json:"user_id"`
-	TenantID    string                 `json:"tenant_id,omitempty"`
-	Type        NotificationType       `json:"type"`
-	Priority    NotificationPriority   `json:"priority"`
-	Title       string                 `json:"title"`
-	Body        string                 `json:"body"`
-	Data        map[string]interface{} `json:"data,omitempty"`
-	ActionURL   string                 `json:"action_url,omitempty"`
-	ImageURL    string                 `json:"image_url,omitempty"`
-	Read        bool                   `json:"read"`
-	CreatedAt   time.Time              `json:"created_at"`
-	ExpiresAt   *time.Time             `json:"expires_at,omitempty"`
+	ID        string                 `json:"id"`
+	UserID    string                 `json:"user_id"`
+	TenantID  string                 `json:"tenant_id,omitempty"`
+	Type      NotificationType       `json:"type"`
+	Priority  NotificationPriority   `json:"priority"`
+	Title     string                 `json:"title"`
+	Body      string                 `json:"body"`
+	Data      map[string]interface{} `json:"data,omitempty"`
+	ActionURL string                 `json:"action_url,omitempty"`
+	ImageURL  string                 `json:"image_url,omitempty"`
+	Read      bool                   `json:"read"`
+	CreatedAt time.Time              `json:"created_at"`
+	ExpiresAt *time.Time             `json:"expires_at,omitempty"`
 }
 
 // WebSocketClient represents a connected WebSocket client
@@ -396,8 +404,164 @@ func (c *WebSocketClient) handleMessage(message []byte) {
 	}
 }
 
+// ── JWT validation for realtime channels (Keycloak JWKS, RS256, fail-closed) ──
+//
+// W7-C-06: validateToken previously returned true unconditionally, which would
+// let ANY caller subscribe to ANY victim's notification stream by guessing a
+// user_id. The WS/SSE handlers below gate on this function, so it now performs
+// real verification: RS256 signature against Keycloak JWKS, required exp claim,
+// and the verified `sub` claim must equal the requested userID. Any failure
+// denies access. NOTE: this file is currently unwired (package main without a
+// Go entrypoint; the service runs main.py) — the verification below is the
+// mandatory precondition for ever mounting these handlers.
+
+type rtJwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var rtJwtCache = &rtJwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+var rtJwksRefreshOnce sync.Once
+
+// rtJwtRealmURL returns the Keycloak realm base URL used to fetch JWKS keys.
+func rtJwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+// rtFetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
+func rtFetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[realtime] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[realtime] JWKS decode failed: %v", err)
+		return
+	}
+	rtJwtCache.mu.Lock()
+	defer rtJwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil || len(nBytes) == 0 {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil || len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		rtJwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	rtJwtCache.updated = time.Now()
+	log.Printf("[realtime] JWKS refreshed: %d keys", len(rtJwtCache.keys))
+}
+
+// rtEnsureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process.
+func rtEnsureJWKSRefresh() {
+	rtJwksRefreshOnce.Do(func() {
+		go rtFetchJWKS(rtJwtRealmURL())
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				rtFetchJWKS(rtJwtRealmURL())
+			}
+		}()
+	})
+}
+
+// rtVerifyBearerToken verifies an RS256 JWT against the Keycloak JWKS and
+// returns its claims, or nil on any verification failure (fail closed).
+func rtVerifyBearerToken(token string) map[string]interface{} {
+	rtEnsureJWKSRefresh()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil
+	}
+	var header struct {
+		Kid string `json:"kid"`
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+		return nil
+	}
+	if header.Alg != "RS256" {
+		return nil
+	}
+	rtJwtCache.mu.RLock()
+	pub, ok := rtJwtCache.keys[header.Kid]
+	rtJwtCache.mu.RUnlock()
+	if !ok {
+		// Unknown key — refresh once and retry (key rotation).
+		rtFetchJWKS(rtJwtRealmURL())
+		rtJwtCache.mu.RLock()
+		pub, ok = rtJwtCache.keys[header.Kid]
+		rtJwtCache.mu.RUnlock()
+		if !ok {
+			return nil
+		}
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil
+	}
+	hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+		return nil
+	}
+	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+		return nil
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok || time.Now().Unix() >= int64(exp) {
+		return nil
+	}
+	return claims
+}
+
+// validateToken verifies the Bearer JWT and binds it to the claimed identity:
+// the verified `sub` claim must equal the requested userID, so a caller can
+// only subscribe to their own notification stream.
 func validateToken(token, userID string) bool {
-	// Implementation would validate JWT token
+	if token == "" || userID == "" {
+		return false
+	}
+	claims := rtVerifyBearerToken(token)
+	if claims == nil {
+		return false
+	}
+	sub, ok := claims["sub"].(string)
+	if !ok || sub == "" || sub != userID {
+		return false
+	}
 	return true
 }
 
@@ -421,7 +585,20 @@ func SSEHandler(hub *WebSocketHub) http.HandlerFunc {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 
 		flusher, ok := w.(http.Flusher)
 		if !ok {

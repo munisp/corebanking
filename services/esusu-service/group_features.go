@@ -23,7 +23,7 @@ type DBEsusuMeeting struct {
 	Location    string    `gorm:"type:varchar(255)"`
 	ScheduledAt time.Time `gorm:"not null"`
 	Status      string    `gorm:"type:varchar(20);default:'scheduled'"` // scheduled, completed, cancelled
-	Attendees   string    `gorm:"type:jsonb"`                            // JSON array of member IDs
+	Attendees   string    `gorm:"type:jsonb"`                           // JSON array of member IDs
 	CreatedBy   string    `gorm:"type:varchar(36)"`
 	CreatedAt   time.Time `gorm:"autoCreateTime"`
 	UpdatedAt   time.Time `gorm:"autoUpdateTime"`
@@ -37,8 +37,8 @@ type DBEsusuPenalty struct {
 	MemberID  string    `gorm:"type:varchar(36);index;not null"`
 	TenantID  string    `gorm:"type:varchar(50);index"`
 	Amount    float64   `gorm:"type:decimal(15,2);not null"`
-	Reason    string    `gorm:"type:varchar(50);not null"` // late_payment, missed_payment, early_withdrawal
-	Status    string    `gorm:"type:varchar(20);default:'pending'"`  // pending, deducted, waived
+	Reason    string    `gorm:"type:varchar(50);not null"`          // late_payment, missed_payment, early_withdrawal
+	Status    string    `gorm:"type:varchar(20);default:'pending'"` // pending, deducted, waived
 	CreatedAt time.Time `gorm:"autoCreateTime"`
 	UpdatedAt time.Time `gorm:"autoUpdateTime"`
 }
@@ -62,12 +62,12 @@ type DBEsusuManagementRecord struct {
 func (DBEsusuManagementRecord) TableName() string { return "esusu_management_records" }
 
 type DBEsusuRotation struct {
-	ID          string    `gorm:"primaryKey;type:varchar(36)"`
-	GroupID     string    `gorm:"type:varchar(36);uniqueIndex;not null"`
-	TenantID    string    `gorm:"type:varchar(50);index"`
-	CycleNumber int       `gorm:"not null"`
-	MemberOrder string    `gorm:"type:jsonb"` // ordered list of member IDs
-	CurrentIdx  int       `gorm:"default:0"`
+	ID          string `gorm:"primaryKey;type:varchar(36)"`
+	GroupID     string `gorm:"type:varchar(36);uniqueIndex;not null"`
+	TenantID    string `gorm:"type:varchar(50);index"`
+	CycleNumber int    `gorm:"not null"`
+	MemberOrder string `gorm:"type:jsonb"` // ordered list of member IDs
+	CurrentIdx  int    `gorm:"default:0"`
 	NextPayDate time.Time
 	Status      string    `gorm:"type:varchar(20);default:'active'"` // active, completed, paused
 	CreatedAt   time.Time `gorm:"autoCreateTime"`
@@ -201,12 +201,12 @@ func (h *EsusuHandler) GetCreditScores(w http.ResponseWriter, r *http.Request) {
 	h.service.db.Where("group_id = ?", groupID).Find(&dbMembers)
 
 	type MemberScore struct {
-		MemberID    string          `json:"member_id"`
-		Name        string          `json:"name"`
-		CreditScore float64         `json:"credit_score"`
-		RiskScore   float64         `json:"risk_score"`
-		RiskCategory string         `json:"risk_category"`
-		AIProfile   MemberAIProfile `json:"ai_profile"`
+		MemberID     string          `json:"member_id"`
+		Name         string          `json:"name"`
+		CreditScore  float64         `json:"credit_score"`
+		RiskScore    float64         `json:"risk_score"`
+		RiskCategory string          `json:"risk_category"`
+		AIProfile    MemberAIProfile `json:"ai_profile"`
 	}
 
 	scores := make([]MemberScore, 0, len(dbMembers))
@@ -385,13 +385,13 @@ func (h *EsusuHandler) GetRotation(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal([]byte(dbGroup.PayoutOrder), &order)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"group_id":     groupID,
-			"cycle_number": dbGroup.CurrentCycle,
-			"member_order": order,
-			"current_idx":  dbGroup.CurrentCycle,
+			"group_id":      groupID,
+			"cycle_number":  dbGroup.CurrentCycle,
+			"member_order":  order,
+			"current_idx":   dbGroup.CurrentCycle,
 			"next_pay_date": dbGroup.NextPayoutDate,
-			"status":       string(dbGroup.Status),
-			"source":       "group",
+			"status":        string(dbGroup.Status),
+			"source":        "group",
 		})
 		return
 	}
@@ -401,13 +401,13 @@ func (h *EsusuHandler) GetRotation(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"group_id":     rotation.GroupID,
-		"cycle_number": rotation.CycleNumber,
-		"member_order": order,
-		"current_idx":  rotation.CurrentIdx,
+		"group_id":      rotation.GroupID,
+		"cycle_number":  rotation.CycleNumber,
+		"member_order":  order,
+		"current_idx":   rotation.CurrentIdx,
 		"next_pay_date": rotation.NextPayDate,
-		"status":       rotation.Status,
-		"source":       "rotation",
+		"status":        rotation.Status,
+		"source":        "rotation",
 	})
 }
 
@@ -445,7 +445,7 @@ func (h *EsusuHandler) SetRotation(w http.ResponseWriter, r *http.Request) {
 		h.service.db.Create(&rotation)
 	} else {
 		h.service.db.Model(&rotation).Updates(map[string]interface{}{
-			"member_order": string(orderJSON),
+			"member_order":  string(orderJSON),
 			"next_pay_date": req.NextPayDate,
 		})
 	}
@@ -455,10 +455,10 @@ func (h *EsusuHandler) SetRotation(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"group_id":     rotation.GroupID,
-		"cycle_number": rotation.CycleNumber,
-		"member_order": order,
+		"group_id":      rotation.GroupID,
+		"cycle_number":  rotation.CycleNumber,
+		"member_order":  order,
 		"next_pay_date": rotation.NextPayDate,
-		"status":       rotation.Status,
+		"status":        rotation.Status,
 	})
 }

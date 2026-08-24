@@ -4,6 +4,20 @@ from typing import Optional
 from pydantic_settings import BaseSettings
 
 
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
 class Settings(BaseSettings):
     """Application configuration from environment variables."""
 
@@ -18,10 +32,7 @@ class Settings(BaseSettings):
     PORT: int = int(os.getenv("PORT", 8086))
     
     # Database
-    DATABASE_URI: str = os.getenv(
-        "DATABASE_URI",
-        "postgresql://banking:banking@localhost:5432/banking54"
-    )
+    DATABASE_URI: str = _require_env("DATABASE_URI")
     DATABASE_POOL_SIZE: int = int(os.getenv("DATABASE_POOL_SIZE", 10))
     DATABASE_MAX_OVERFLOW: int = int(os.getenv("DATABASE_MAX_OVERFLOW", 20))
     DATABASE_POOL_TIMEOUT: int = int(os.getenv("DATABASE_POOL_TIMEOUT", 30))

@@ -10,6 +10,19 @@ const DB_PASSWORD = readEnv("DB_PASSWORD");
 const DB_DATABASE = readEnv("DB_DATABASE");
 const DB_DATABASE_TYPE = readEnv("DB_DATABASE_TYPE");
 
+// M-50: TLS certificate verification for database connections is ON by default.
+// The only opt-out is an explicit development override: ALLOW_INSECURE_TLS=true
+// AND non-production. In production the override is ignored (fail closed).
+const IS_PRODUCTION = process.env.NODE_ENV === "production" || process.env.ENVIRONMENT === "production";
+const ALLOW_INSECURE_TLS = process.env.ALLOW_INSECURE_TLS === "true" && !IS_PRODUCTION;
+if (process.env.ALLOW_INSECURE_TLS === "true") {
+  console.warn(
+    ALLOW_INSECURE_TLS
+      ? "[TLS] ALLOW_INSECURE_TLS=true — database TLS certificate verification DISABLED (non-production override). NEVER use in production."
+      : "[TLS] ALLOW_INSECURE_TLS=true IGNORED in production — database TLS certificate verification remains ENABLED."
+  );
+}
+
 export const AppDataSource = new DataSource({
   type: DB_DATABASE_TYPE as SupportedDatabaseTypes,
   host: DB_HOST,
@@ -25,6 +38,6 @@ export const AppDataSource = new DataSource({
   ssl: devEnvironment()
     ? undefined
     : {
-        rejectUnauthorized: false,
+        rejectUnauthorized: !ALLOW_INSECURE_TLS,
       },
 });

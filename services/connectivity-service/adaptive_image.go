@@ -52,11 +52,11 @@ var (
 type ImageQuality int
 
 const (
-	QualityUltraLow  ImageQuality = 10  // For 2G/GPRS
-	QualityLow       ImageQuality = 30  // For EDGE
-	QualityMedium    ImageQuality = 50  // For 3G
-	QualityHigh      ImageQuality = 75  // For 4G
-	QualityOriginal  ImageQuality = 95  // For 5G/WiFi
+	QualityUltraLow ImageQuality = 10 // For 2G/GPRS
+	QualityLow      ImageQuality = 30 // For EDGE
+	QualityMedium   ImageQuality = 50 // For 3G
+	QualityHigh     ImageQuality = 75 // For 4G
+	QualityOriginal ImageQuality = 95 // For 5G/WiFi
 )
 
 // ImageFormat represents output formats
@@ -74,9 +74,9 @@ type NetworkImageConfig struct {
 	MaxWidth      int
 	MaxHeight     int
 	Format        ImageFormat
-	Grayscale     bool  // Convert to grayscale for extreme low bandwidth
-	Progressive   bool  // Use progressive JPEG
-	MaxFileSize   int   // Max file size in bytes
+	Grayscale     bool // Convert to grayscale for extreme low bandwidth
+	Progressive   bool // Use progressive JPEG
+	MaxFileSize   int  // Max file size in bytes
 	EnableCaching bool
 }
 
@@ -162,21 +162,21 @@ type AdaptiveImageProcessor struct {
 
 // ProcessedImage represents a processed image
 type ProcessedImage struct {
-	Data         []byte       `json:"data"`
-	Format       ImageFormat  `json:"format"`
-	Width        int          `json:"width"`
-	Height       int          `json:"height"`
-	OriginalSize int          `json:"original_size"`
-	ProcessedSize int         `json:"processed_size"`
-	Quality      ImageQuality `json:"quality"`
-	Grayscale    bool         `json:"grayscale"`
-	CacheKey     string       `json:"cache_key,omitempty"`
+	Data          []byte       `json:"data"`
+	Format        ImageFormat  `json:"format"`
+	Width         int          `json:"width"`
+	Height        int          `json:"height"`
+	OriginalSize  int          `json:"original_size"`
+	ProcessedSize int          `json:"processed_size"`
+	Quality       ImageQuality `json:"quality"`
+	Grayscale     bool         `json:"grayscale"`
+	CacheKey      string       `json:"cache_key,omitempty"`
 }
 
 // ImageCache provides caching for processed images
 type ImageCache struct {
-	cache map[string]*ProcessedImage
-	mutex sync.RWMutex
+	cache   map[string]*ProcessedImage
+	mutex   sync.RWMutex
 	maxSize int
 	ttl     time.Duration
 }
@@ -533,7 +533,7 @@ func isImageRequest(r *http.Request) bool {
 
 func detectNetworkType(r *http.Request) NetworkType {
 	// Check various headers that might indicate network type
-	
+
 	// Check Save-Data header (indicates user wants reduced data)
 	if r.Header.Get("Save-Data") == "on" {
 		return Network2G
@@ -725,12 +725,12 @@ func (b *ImageBatchProcessor) ProcessBatch(ctx context.Context, images [][]byte,
 
 // DocumentImageConfig holds settings for document images (receipts, statements, etc.)
 type DocumentImageConfig struct {
-	MaxWidth      int
-	MaxHeight     int
-	Quality       int
-	Grayscale     bool
-	EnhanceText   bool
-	DPI           int
+	MaxWidth    int
+	MaxHeight   int
+	Quality     int
+	Grayscale   bool
+	EnhanceText bool
+	DPI         int
 }
 
 // DefaultDocumentConfigs for different network types

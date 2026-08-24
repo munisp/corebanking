@@ -20,11 +20,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"strings"
@@ -44,14 +49,14 @@ func ev(k, d string) string {
 }
 
 var (
-	port               = ev("PORT", "9166")
-	databaseURL        = ev("DATABASE_URL", "")
-	daprHost           = ev("DAPR_HOST", "localhost")
-	daprPort           = ev("DAPR_HTTP_PORT", "3500")
-	daprPubsub         = ev("DAPR_PUBSUB_NAME", "pubsub")
-	sanctionsURL       = ev("SANCTIONS_SCREENING_URL", "http://sanctions-screening-service:8283")
-	cacAppID           = ev("CAC_SERVICE_APP_ID", "cac-realtime-api-go")
-	bvnAppID           = ev("BVN_SERVICE_APP_ID", "bvn-nin-verification-go")
+	port         = ev("PORT", "9166")
+	databaseURL  = ev("DATABASE_URL", "")
+	daprHost     = ev("DAPR_HOST", "localhost")
+	daprPort     = ev("DAPR_HTTP_PORT", "3500")
+	daprPubsub   = ev("DAPR_PUBSUB_NAME", "pubsub")
+	sanctionsURL = ev("SANCTIONS_SCREENING_URL", "http://sanctions-screening-service:8283")
+	cacAppID     = ev("CAC_SERVICE_APP_ID", "cac-realtime-api-go")
+	bvnAppID     = ev("BVN_SERVICE_APP_ID", "bvn-nin-verification-go")
 )
 
 func daprInvokeURL(appID, path string) string {
@@ -296,9 +301,9 @@ func listApplications(tid string) ([]KYBApplication, error) {
 // ── External verification calls ────────────────────────────────────────────────
 
 type CACDirector struct {
-	Name  string `json:"name"`
-	BVN   string `json:"bvn"`
-	Role  string `json:"role"`
+	Name string `json:"name"`
+	BVN  string `json:"bvn"`
+	Role string `json:"role"`
 }
 
 type CACCompany struct {
@@ -321,13 +326,13 @@ type BVNResult struct {
 }
 
 type verificationSummary struct {
-	CACVerified    bool          `json:"cac_verified"`
-	FIRSVerified   bool          `json:"firs_verified"`
-	SanctionsClear bool          `json:"sanctions_clear"`
-	RiskLevel      string        `json:"risk_level"`
-	Directors      []CACDirector `json:"directors"`
+	CACVerified    bool            `json:"cac_verified"`
+	FIRSVerified   bool            `json:"firs_verified"`
+	SanctionsClear bool            `json:"sanctions_clear"`
+	RiskLevel      string          `json:"risk_level"`
+	Directors      []CACDirector   `json:"directors"`
 	DirectorBVNs   map[string]bool `json:"director_bvns"`
-	SanctionHits   []string      `json:"sanction_hits"`
+	SanctionHits   []string        `json:"sanction_hits"`
 }
 
 func verifyCAC(rcNumber, tenantID string) (*CACCompany, bool) {
@@ -519,18 +524,18 @@ func handleApplications(w http.ResponseWriter, r *http.Request) {
 			docs = json.RawMessage("{}")
 		}
 		app := &KYBApplication{
-			ID:           newID(),
-			BusinessName: req.BusinessName,
-			RCNumber:     req.RCNumber,
-			TIN:          req.TIN,
-			Status:       "draft",
-			SanctionsClear: true,
-			RiskLevel:    "unknown",
-			Documents:    docs,
-			Directors:    json.RawMessage("[]"),
+			ID:                 newID(),
+			BusinessName:       req.BusinessName,
+			RCNumber:           req.RCNumber,
+			TIN:                req.TIN,
+			Status:             "draft",
+			SanctionsClear:     true,
+			RiskLevel:          "unknown",
+			Documents:          docs,
+			Directors:          json.RawMessage("[]"),
 			VerificationDetail: json.RawMessage("{}"),
-			TenantID:     tid,
-			SubmittedBy:  keycloakID(r),
+			TenantID:           tid,
+			SubmittedBy:        keycloakID(r),
 		}
 		if err := insertApplication(app); err != nil {
 			log.Printf("[kyb] insert error: %v", err)
@@ -654,9 +659,9 @@ func handleApprove(w http.ResponseWriter, r *http.Request, app *KYBApplication, 
 	}
 	updated, _ := getApplication(app.ID, tid)
 	writeJSON(w, 200, map[string]interface{}{
-		"message":          "First approval recorded. A different officer must call /finalize to complete.",
-		"application":      updated,
-		"first_approver":   approver,
+		"message":        "First approval recorded. A different officer must call /finalize to complete.",
+		"application":    updated,
+		"first_approver": approver,
 	})
 }
 
@@ -774,6 +779,225 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 
 // ── Main ───────────────────────────────────────────────────────────────────────
 
+// --- JWT Validation (Keycloak JWKS, RS256, fail-closed) ---
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+var jwksRefreshOnce sync.Once
+
+// jwtRealmURL returns the Keycloak realm base URL used to fetch JWKS keys.
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+// fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil || len(nBytes) == 0 {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil || len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process.
+func ensureJWKSRefresh() {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(jwtRealmURL())
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(jwtRealmURL())
+			}
+		}()
+	})
+}
+
+// isProbePath reports whether p is a health/metrics endpoint that must remain
+// unauthenticated for orchestrators (exact or suffixed probe paths).
+func isProbePath(p string) bool {
+	switch p {
+	case "/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics", "/ping":
+		return true
+	}
+	for _, s := range []string{"/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics"} {
+		if strings.HasSuffix(p, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + required exp claim). Fail-closed: any verification
+// problem yields 401. Identity headers (X-User-Id, X-Keycloak-ID, X-Tenant-ID,
+// X-User-Role) are overwritten from verified claims — caller-supplied values
+// are never trusted.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	ensureJWKSRefresh()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if isProbePath(p) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			// Unknown key — refresh once and retry (key rotation).
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+		claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			http.Error(w, `{"error":"invalid claims encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		var claims map[string]interface{}
+		if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+			http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
+			return
+		}
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		// Identity headers come ONLY from verified claims; overwrite or drop any
+		// caller-supplied values before invoking the handler.
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			r.Header.Set("X-User-Id", sub)
+			r.Header.Set("X-Keycloak-ID", sub)
+		} else {
+			r.Header.Del("X-User-Id")
+			r.Header.Del("X-Keycloak-ID")
+		}
+		if tenant := tenantFromClaims(claims); tenant != "" {
+			r.Header.Set("X-Tenant-ID", tenant)
+		} else {
+			r.Header.Del("X-Tenant-ID")
+		}
+		r.Header.Del("X-User-Role")
+		if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
+			if roleList, ok := ra["roles"].([]interface{}); ok {
+				roles := make([]string, 0, len(roleList))
+				for _, v := range roleList {
+					if s, ok := v.(string); ok {
+						roles = append(roles, s)
+					}
+				}
+				if len(roles) > 0 {
+					r.Header.Set("X-User-Role", strings.Join(roles, ","))
+				}
+			}
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func main() {
 	if databaseURL == "" {
 		log.Fatal("[kyb] DATABASE_URL is required")
@@ -794,9 +1018,9 @@ func main() {
 			code = 503
 		}
 		writeJSON(w, code, map[string]interface{}{
-			"service":  "kyb-service",
-			"status":   status,
-			"db":       dbOK,
+			"service": "kyb-service",
+			"status":  status,
+			"db":      dbOK,
 		})
 	})
 
@@ -805,5 +1029,5 @@ func main() {
 	mux.HandleFunc("/v1/kyb/stats", handleStats)
 
 	log.Printf("[kyb] listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(http.ListenAndServe(":"+port, jwtAuthMiddleware(mux)))
 }

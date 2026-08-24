@@ -4,9 +4,17 @@
  * Endpoints: /api/kpi/:role, /api/kpi/all, /api/kpi/rollup, /api/kpi/hierarchy,
  *            /api/kpi/trends/:metric, /api/kpi/compensation/:role, /api/kpi/flowdown/:role,
  *            /api/kpi/alerts, /api/kpi/benchmark
+ *
+ * Data doctrine: KPI values are computed from Postgres (via ../db getDb()).
+ * A metric with no computable source is returned with status "unavailable" and is
+ * excluded from all score rollups. No regulatory ratio, filing rate, or trend series
+ * is ever hardcoded. When the database is unreachable, endpoints fail fast with 503.
  */
 
 import type { Express, Request, Response } from "express";
+import { sql } from "drizzle-orm";
+import { getDb } from "../db";
+import { logger } from "./logger";
 
 // ─── ORG HIERARCHY ──────────────────────────────────────────────────────────
 
@@ -34,14 +42,16 @@ const ORG_HIERARCHY: Record<string, OrgNode> = {
 
 // ─── KPI METRIC DEFINITIONS ─────────────────────────────────────────────────
 
+type MetricStatus = "green" | "amber" | "red" | "unavailable";
+
 interface KPIMetric {
   id: string;
   name: string;
-  value: number;
+  value: number | null;
   target: number;
   unit: string;
   weight: number;
-  status: "green" | "amber" | "red";
+  status: MetricStatus;
   cadence: "hourly" | "daily" | "monthly" | "quarterly";
   description: string;
 }
@@ -49,12 +59,13 @@ interface KPIMetric {
 interface RoleKPIResult {
   role: string;
   title: string;
-  overallScore: number;
-  overallStatus: "green" | "amber" | "red";
+  overallScore: number | null;
+  overallStatus: MetricStatus;
   metrics: KPIMetric[];
   directReportScores: DirectReportScore[];
-  rollUpScore: number;
-  compositeScore: number;
+  rollUpScore: number | null;
+  compositeScore: number | null;
+  unavailableMetrics: number;
   lastUpdated: string;
   cadence: string;
 }
@@ -62,10 +73,10 @@ interface RoleKPIResult {
 interface DirectReportScore {
   role: string;
   title: string;
-  score: number;
-  status: "green" | "amber" | "red";
+  score: number | null;
+  status: MetricStatus;
   weight: number;
-  weightedScore: number;
+  weightedScore: number | null;
 }
 
 // ─── METRIC DEFINITIONS PER ROLE ────────────────────────────────────────────
@@ -184,25 +195,97 @@ const ROLE_METRICS: Record<string, Array<Omit<KPIMetric, "value" | "status">>> =
   ],
 };
 
-// ─── SIMULATED VALUES ───────────────────────────────────────────────────────
+// ─── DATABASE-BACKED METRIC VALUES ──────────────────────────────────────────
+//
+// Values are resolved in this order:
+//   1. Code-level computation against schema-verified tables (COMPUTED_QUERIES).
+//   2. The metric's own `sql_query` stored in the kpi_metrics catalogue table
+//      (authored by the platform's own migrations — see drizzle/seed-kpi.sql).
+// A metric with neither source, or whose query fails (missing table/column),
+// is returned as null and surfaced as status "unavailable" — never substituted
+// with a hardcoded number.
 
-const SIMULATED_VALUES: Record<string, number> = {
-  ceo_aum: 45000, ceo_revenue: 85, ceo_cir: 58, ceo_customer_growth: 6.2, ceo_car: 16.8, ceo_roe: 18.5, ceo_digital_adoption: 72, ceo_npl: 3.5,
-  coo_tps: 520, coo_fail_rate: 0.3, coo_settlement: 99.8, coo_uptime: 99.97, coo_queue: 450, coo_latency: 1.2,
-  cro_aml_alerts: 3, cro_response_time: 12, cro_sar_timeliness: 95, cro_false_positive: 25, cro_npl: 3.5,
-  cto_api_p95: 145, cto_error_rate: 0.05, cto_pool_util: 45, cto_cache_hit: 99.2, cto_availability: 99.97, cto_deploy_success: 100,
-  cso_incidents: 0, cso_unauthorized: 7, cso_vuln_critical: 0, cso_mfa_adoption: 85, cso_patch_compliance: 92, cso_pentest_score: 88,
-  trs_liquidity: 42.5, trs_crr: 28.5, trs_fx_exposure: 7.2, trs_nim: 4.8, trs_fx_pnl: 12.5, trs_nostro_recon: 100,
-  crd_npl: 3.5, crd_collection: 96, crd_turnaround: 3.2, crd_par30: 6.5, crd_growth: 4.8,
-  htl_txn_per_hr: 18, htl_cash_variance: 0, htl_wait_time: 3.5, htl_reversal_rate: 0.8, htl_cross_sell: 2.8,
-  cmp_kyc_pending: 35, cmp_ctr_filing: 100, cmp_sar_backlog: 0, cmp_kyc_tier: 97.5, cmp_expired_docs: 0,
-  cmp_efass_mbr: 100, cmp_prudential: 100, cmp_car: 100, cmp_lqr: 100, cmp_crr: 95, cmp_fce: 100,
-  cmp_ler: 100, cmp_ndic: 100, cmp_sca: 100, cmp_irr: 100, cmp_clr: 100, cmp_sol: 100, cmp_mmr: 95,
-  cmp_nfiu: 100, cmp_scuml: 100, cmp_pep: 100, cmp_slr: 100, cmp_amcon: 100, cmp_nsfr: 100,
-  cmp_ffr: 100, cmp_ifrs9: 100, cmp_escheat: 100, cmp_atr: 100, cmp_sanctions: 100, cmp_filing_ontime: 96,
-  cs_open_complaints: 12, cs_response_time: 22, cs_fcr: 82, cs_sla: 95, cs_churn: 0.3,
-  aud_maker_checker: 0, aud_trail_completeness: 100, aud_exceptions: 0, aud_sod_violations: 0, aud_gl_discrepancy: 0,
+export class DatabaseUnavailableError extends Error {
+  constructor() {
+    super("database_unavailable");
+    this.name = "DatabaseUnavailableError";
+  }
+}
+
+// NPL ratio is computable from the loans table (status + IFRS9 staging columns
+// exist in the deployed schema — see drizzle/0007_core_banking_tables.sql).
+const NPL_RATIO_QUERY = `SELECT COUNT(*) FILTER (WHERE status IN ('overdue', 'default', 'non_performing') OR "classificationIFRS9" = 'stage3') * 100.0 / NULLIF(COUNT(*), 0) AS value FROM loans`;
+
+const COMPUTED_QUERIES: Record<string, string> = {
+  ceo_npl: NPL_RATIO_QUERY,
+  cro_npl: NPL_RATIO_QUERY,
+  crd_npl: NPL_RATIO_QUERY,
 };
+
+// Cache of the kpi_metrics catalogue (metric_key → sql_query), 60s TTL.
+let catalogCache: { at: number; map: Map<string, string> } | null = null;
+const CATALOG_TTL_MS = 60_000;
+
+async function getCatalogQueries(db: NonNullable<Awaited<ReturnType<typeof getDb>>>): Promise<Map<string, string>> {
+  if (catalogCache && Date.now() - catalogCache.at < CATALOG_TTL_MS) {
+    return catalogCache.map;
+  }
+  const map = new Map<string, string>();
+  try {
+    const result = await db.execute(sql`SELECT metric_key, sql_query FROM kpi_metrics WHERE sql_query IS NOT NULL`);
+    for (const row of result.rows as Array<{ metric_key: string; sql_query: string }>) {
+      if (row.metric_key && row.sql_query) map.set(row.metric_key, row.sql_query);
+    }
+    catalogCache = { at: Date.now(), map };
+  } catch (error) {
+    // Catalogue table absent — metrics without a code-level query become unavailable.
+    logger.warn("[KPI] kpi_metrics catalogue not readable — catalogue-sourced metrics will be unavailable", { error: String(error) });
+  }
+  return map;
+}
+
+async function executeMetricQuery(db: NonNullable<Awaited<ReturnType<typeof getDb>>>, query: string): Promise<number | null> {
+  try {
+    const result = await db.execute(sql.raw(query));
+    const row = (result.rows as Array<Record<string, unknown>>)[0];
+    if (!row) return null;
+    const first = Object.values(row)[0];
+    const value = Number(first);
+    return Number.isFinite(value) ? value : null;
+  } catch (error) {
+    logger.warn("[KPI] metric query failed — marking metric unavailable", { error: String(error) });
+    return null;
+  }
+}
+
+/**
+ * Compute current values for the given metric ids from Postgres.
+ * Throws DatabaseUnavailableError when there is no DB connection.
+ * Individual metrics that cannot be computed resolve to null (unavailable).
+ */
+export async function computeKpiMetricValues(metricIds: string[]): Promise<Record<string, number | null>> {
+  const db = await getDb();
+  if (!db) {
+    throw new DatabaseUnavailableError();
+  }
+
+  const catalog = await getCatalogQueries(db);
+  const uniqueIds = Array.from(new Set(metricIds));
+  const values: Record<string, number | null> = {};
+
+  await Promise.all(uniqueIds.map(async (id) => {
+    const query = COMPUTED_QUERIES[id] ?? catalog.get(id);
+    values[id] = query ? await executeMetricQuery(db, query) : null;
+  }));
+
+  return values;
+}
+
+function allMetricIds(): string[] {
+  return Object.values(ROLE_METRICS).flat().map(d => d.id);
+}
+
+// ─── COMPUTATION ────────────────────────────────────────────────────────────
 
 // Lower is better for these metrics
 const LOWER_IS_BETTER = new Set([
@@ -219,8 +302,6 @@ const LOWER_IS_BETTER = new Set([
   "ceo_cir", "ceo_npl",
 ]);
 
-// ─── COMPUTATION ────────────────────────────────────────────────────────────
-
 function computeStatus(value: number, target: number, metricId: string): "green" | "amber" | "red" {
   const lowerBetter = LOWER_IS_BETTER.has(metricId);
   let ratio: number;
@@ -234,59 +315,78 @@ function computeStatus(value: number, target: number, metricId: string): "green"
   return "red";
 }
 
-function computeMetrics(role: string): KPIMetric[] {
+function computeMetrics(role: string, values: Record<string, number | null>): KPIMetric[] {
   const defs = ROLE_METRICS[role];
   if (!defs) return [];
   return defs.map(d => {
-    const value = SIMULATED_VALUES[d.id] ?? 0;
-    return { ...d, value, status: computeStatus(value, d.target, d.id) };
+    const value = values[d.id] ?? null;
+    return {
+      ...d,
+      value,
+      status: value === null ? "unavailable" : computeStatus(value, d.target, d.id),
+    };
   });
 }
 
-function computeWeightedScore(metrics: KPIMetric[]): number {
+// Weighted score over metrics with real values only — unavailable metrics are
+// excluded from the rollup rather than silently treated as compliant.
+function computeWeightedScore(metrics: KPIMetric[]): number | null {
   let total = 0, weight = 0;
   for (const m of metrics) {
+    if (m.status === "unavailable") continue;
     const score = m.status === "green" ? 100 : m.status === "amber" ? 60 : 20;
     total += score * m.weight;
     weight += m.weight;
   }
-  return weight > 0 ? Math.round((total / weight) * 100) / 100 : 0;
+  return weight > 0 ? Math.round((total / weight) * 100) / 100 : null;
 }
 
-function computeOverallStatus(score: number): "green" | "amber" | "red" {
+function computeOverallStatus(score: number | null): MetricStatus {
+  if (score === null) return "unavailable";
   if (score >= 85) return "green";
   if (score >= 60) return "amber";
   return "red";
 }
 
-function computeRollUp(role: string): { rollUpScore: number; directReportScores: DirectReportScore[] } {
+function computeRollUp(role: string, values: Record<string, number | null>): { rollUpScore: number | null; directReportScores: DirectReportScore[] } {
   const node = ORG_HIERARCHY[role];
-  if (!node || node.directReports.length === 0) return { rollUpScore: 0, directReportScores: [] };
+  if (!node || node.directReports.length === 0) return { rollUpScore: null, directReportScores: [] };
 
   const scores: DirectReportScore[] = [];
   let totalWeighted = 0, totalWeight = 0;
 
   for (const dr of node.directReports) {
     const drNode = ORG_HIERARCHY[dr];
-    const metrics = computeMetrics(dr);
+    const metrics = computeMetrics(dr, values);
     const score = computeWeightedScore(metrics);
     const status = computeOverallStatus(score);
-    const weightedScore = score * drNode.weight;
-    scores.push({ role: dr, title: drNode.title, score, status, weight: drNode.weight, weightedScore: Math.round(weightedScore * 100) / 100 });
-    totalWeighted += weightedScore;
-    totalWeight += drNode.weight;
+    const weightedScore = score === null ? null : score * drNode.weight;
+    scores.push({
+      role: dr,
+      title: drNode.title,
+      score,
+      status,
+      weight: drNode.weight,
+      weightedScore: weightedScore === null ? null : Math.round(weightedScore * 100) / 100,
+    });
+    if (weightedScore !== null) {
+      totalWeighted += weightedScore;
+      totalWeight += drNode.weight;
+    }
   }
 
-  return { rollUpScore: totalWeight > 0 ? Math.round((totalWeighted / totalWeight) * 100) / 100 : 0, directReportScores: scores };
+  return { rollUpScore: totalWeight > 0 ? Math.round((totalWeighted / totalWeight) * 100) / 100 : null, directReportScores: scores };
 }
 
-function computeRoleKPI(role: string): RoleKPIResult {
+function computeRoleKPI(role: string, values: Record<string, number | null>): RoleKPIResult {
   const node = ORG_HIERARCHY[role];
-  const metrics = computeMetrics(role);
+  const metrics = computeMetrics(role, values);
   const ownScore = computeWeightedScore(metrics);
-  const { rollUpScore, directReportScores } = computeRollUp(role);
+  const { rollUpScore, directReportScores } = computeRollUp(role, values);
   const compositeScore = directReportScores.length > 0
-    ? Math.round((ownScore * 0.6 + rollUpScore * 0.4) * 100) / 100
+    ? (ownScore === null && rollUpScore === null
+        ? null
+        : Math.round(((ownScore ?? rollUpScore ?? 0) * 0.6 + (rollUpScore ?? ownScore ?? 0) * 0.4) * 100) / 100)
     : ownScore;
 
   return {
@@ -298,6 +398,7 @@ function computeRoleKPI(role: string): RoleKPIResult {
     directReportScores,
     rollUpScore,
     compositeScore,
+    unavailableMetrics: metrics.filter(m => m.status === "unavailable").length,
     lastUpdated: new Date().toISOString(),
     cadence: metrics.some(m => m.cadence === "hourly") ? "hourly" : "daily",
   };
@@ -316,11 +417,22 @@ function checkRBAC(requestorRole: string | undefined, targetRole: string): { all
   return { allowed: false, reason: "You can only view your own KPIs or your direct reports' KPIs" };
 }
 
+// ─── ERROR HANDLING ─────────────────────────────────────────────────────────
+
+function handleKpiError(res: Response, error: unknown): void {
+  if (error instanceof DatabaseUnavailableError) {
+    res.status(503).json({ error: "database_unavailable", message: "KPI values require a live Postgres connection — no cached or default regulatory figures are served" });
+    return;
+  }
+  logger.error("[KPI] endpoint failed", { error: String(error) });
+  res.status(500).json({ error: "kpi_computation_failed" });
+}
+
 // ─── REGISTER ENDPOINTS ─────────────────────────────────────────────────────
 
 export function registerKPIGateway(app: Express): void {
   // KPI for specific role (RBAC enforced)
-  app.get("/api/kpi/:role", (req: Request, res: Response) => {
+  app.get("/api/kpi/:role", async (req: Request, res: Response) => {
     const { role } = req.params;
     if (!ORG_HIERARCHY[role]) {
       return res.status(404).json({ error: "role not found", validRoles: Object.keys(ORG_HIERARCHY) });
@@ -332,56 +444,73 @@ export function registerKPIGateway(app: Express): void {
       return res.status(403).json({ error: "access_denied", message: rbac.reason });
     }
 
-    const result = computeRoleKPI(role);
-    res.json(result);
+    try {
+      const values = await computeKpiMetricValues(ROLE_METRICS[role].map(d => d.id));
+      res.json(computeRoleKPI(role, values));
+    } catch (error) {
+      handleKpiError(res, error);
+    }
   });
 
   // All KPIs (CEO only)
-  app.get("/api/kpi/all", (req: Request, res: Response) => {
+  app.get("/api/kpi/all", async (req: Request, res: Response) => {
     const requestorRole = (req.headers["x-kpi-role"] as string) || (req.query.requestor as string) || (req as any).user?.role;
     if (requestorRole && requestorRole !== "admin" && requestorRole !== "ceo") {
       return res.status(403).json({ error: "access_denied", message: "Only CEO/MD can view all KPIs" });
     }
 
-    const results: Record<string, RoleKPIResult> = {};
-    for (const role of Object.keys(ORG_HIERARCHY)) {
-      results[role] = computeRoleKPI(role);
+    try {
+      const values = await computeKpiMetricValues(allMetricIds());
+      const results: Record<string, RoleKPIResult> = {};
+      for (const role of Object.keys(ORG_HIERARCHY)) {
+        results[role] = computeRoleKPI(role, values);
+      }
+      res.json({ roles: results, totalRoles: Object.keys(results).length, lastUpdated: new Date().toISOString() });
+    } catch (error) {
+      handleKpiError(res, error);
     }
-    res.json({ roles: results, totalRoles: Object.keys(results).length, lastUpdated: new Date().toISOString() });
   });
 
   // Hierarchical roll-up tree (flow-down view)
-  app.get("/api/kpi/rollup", (_req: Request, res: Response) => {
+  app.get("/api/kpi/rollup", async (_req: Request, res: Response) => {
     interface TreeNode {
       role: string;
       title: string;
-      ownScore: number;
-      rollUpScore: number;
-      compositeScore: number;
+      ownScore: number | null;
+      rollUpScore: number | null;
+      compositeScore: number | null;
       status: string;
       children: TreeNode[];
     }
 
-    function buildTree(role: string): TreeNode {
-      const node = ORG_HIERARCHY[role];
-      const metrics = computeMetrics(role);
-      const ownScore = computeWeightedScore(metrics);
-      const { rollUpScore } = computeRollUp(role);
-      const compositeScore = node.directReports.length > 0
-        ? Math.round((ownScore * 0.6 + rollUpScore * 0.4) * 100) / 100
-        : ownScore;
-      return {
-        role,
-        title: node.title,
-        ownScore,
-        rollUpScore,
-        compositeScore,
-        status: computeOverallStatus(compositeScore),
-        children: node.directReports.map(buildTree),
-      };
-    }
+    try {
+      const values = await computeKpiMetricValues(allMetricIds());
 
-    res.json(buildTree("ceo"));
+      function buildTree(role: string): TreeNode {
+        const node = ORG_HIERARCHY[role];
+        const metrics = computeMetrics(role, values);
+        const ownScore = computeWeightedScore(metrics);
+        const { rollUpScore } = computeRollUp(role, values);
+        const compositeScore = node.directReports.length > 0
+          ? (ownScore === null && rollUpScore === null
+              ? null
+              : Math.round(((ownScore ?? rollUpScore ?? 0) * 0.6 + (rollUpScore ?? ownScore ?? 0) * 0.4) * 100) / 100)
+          : ownScore;
+        return {
+          role,
+          title: node.title,
+          ownScore,
+          rollUpScore,
+          compositeScore,
+          status: computeOverallStatus(compositeScore),
+          children: node.directReports.map(buildTree),
+        };
+      }
+
+      res.json(buildTree("ceo"));
+    } catch (error) {
+      handleKpiError(res, error);
+    }
   });
 
   // Org hierarchy
@@ -389,28 +518,50 @@ export function registerKPIGateway(app: Express): void {
     res.json({ hierarchy: ORG_HIERARCHY, totalRoles: Object.keys(ORG_HIERARCHY).length });
   });
 
-  // Trends (delegates to Python analytics service in production)
-  app.get("/api/kpi/trends/:metric", (req: Request, res: Response) => {
+  // Trends — real historical scores from the kpi_scores table only.
+  // No series is ever synthesized; when there is no recorded history the
+  // metric is reported as unavailable with an empty trend.
+  app.get("/api/kpi/trends/:metric", async (req: Request, res: Response) => {
     const { metric } = req.params;
     const days = parseInt(req.query.days as string) || 30;
-    const baseValue = SIMULATED_VALUES[metric] ?? 50;
 
-    const trend = Array.from({ length: days }, (_, i) => {
-      const date = new Date(Date.now() - (days - i) * 86400000);
-      const improvement = 1.0 + i * 0.003;
-      const noise = Math.sin(i * 0.5) * baseValue * 0.05;
-      return { date: date.toISOString().split("T")[0], value: Math.round((baseValue * improvement + noise) * 100) / 100 };
-    });
+    try {
+      const db = await getDb();
+      if (!db) throw new DatabaseUnavailableError();
 
-    const values = trend.map(t => t.value);
-    const avg = values.reduce((a, b) => a + b, 0) / values.length;
-    const direction = values[values.length - 1] > values[0] ? "improving" : "declining";
+      const result = await db.execute(
+        sql`SELECT period_end, value, status FROM kpi_scores WHERE metric_key = ${metric} AND period_end >= NOW() - (${days} || ' days')::interval ORDER BY period_end ASC`
+      );
+      const rows = result.rows as Array<{ period_end: string | Date; value: number | string; status: string | null }>;
 
-    res.json({ metricId: metric, periodDays: days, trend, analysis: { direction, average: Math.round(avg * 100) / 100, min: Math.min(...values), max: Math.max(...values) } });
+      if (rows.length === 0) {
+        return res.json({
+          metricId: metric,
+          periodDays: days,
+          status: "unavailable",
+          trend: [],
+          analysis: null,
+          message: "No recorded history for this metric in kpi_scores — trend is not synthesized",
+        });
+      }
+
+      const trend = rows.map(r => ({
+        date: new Date(r.period_end).toISOString().split("T")[0],
+        value: Number(r.value),
+        status: r.status ?? "unknown",
+      }));
+      const vals = trend.map(t => t.value);
+      const avg = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const direction = vals[vals.length - 1] > vals[0] ? "improving" : vals[vals.length - 1] < vals[0] ? "declining" : "flat";
+
+      res.json({ metricId: metric, periodDays: days, status: "ok", trend, analysis: { direction, average: Math.round(avg * 100) / 100, min: Math.min(...vals), max: Math.max(...vals) } });
+    } catch (error) {
+      handleKpiError(res, error);
+    }
   });
 
   // Compensation calculation
-  app.get("/api/kpi/compensation/:role", (req: Request, res: Response) => {
+  app.get("/api/kpi/compensation/:role", async (req: Request, res: Response) => {
     const { role } = req.params;
     if (!ORG_HIERARCHY[role]) {
       return res.status(404).json({ error: "role not found" });
@@ -430,39 +581,60 @@ export function registerKPIGateway(app: Express): void {
       internal_audit: { fixedRatio: 0.75, variableRatio: 0.25 },
     };
 
-    const kpi = computeRoleKPI(role);
-    const model = compensationModels[role] || { fixedRatio: 0.70, variableRatio: 0.30 };
-    const achievement = kpi.compositeScore;
+    try {
+      const values = await computeKpiMetricValues(ROLE_METRICS[role].map(d => d.id));
+      const kpi = computeRoleKPI(role, values);
+      const model = compensationModels[role] || { fixedRatio: 0.70, variableRatio: 0.30 };
+      const achievement = kpi.compositeScore;
 
-    let multiplier: number;
-    if (achievement < 60) multiplier = 0;
-    else if (achievement <= 100) multiplier = (achievement - 60) / 40;
-    else if (achievement <= 120) multiplier = 1.0 + (achievement - 100) / 40;
-    else multiplier = 1.5;
+      if (achievement === null) {
+        return res.json({
+          role,
+          title: ORG_HIERARCHY[role].title,
+          fixedRatio: model.fixedRatio,
+          variableRatio: model.variableRatio,
+          compositeScore: null,
+          achievementPct: null,
+          variableMultiplier: null,
+          variablePayoutPct: null,
+          performanceBand: "unavailable",
+          message: "No computable KPI metrics for this role — compensation cannot be assessed",
+          metricBreakdown: kpi.metrics.map(m => ({ id: m.id, name: m.name, weight: m.weight, value: m.value, target: m.target, status: m.status })),
+        });
+      }
 
-    let band: string;
-    if (achievement >= 110) band = "exceptional";
-    else if (achievement >= 95) band = "exceeds_expectations";
-    else if (achievement >= 80) band = "meets_expectations";
-    else if (achievement >= 60) band = "needs_improvement";
-    else band = "unsatisfactory";
+      let multiplier: number;
+      if (achievement < 60) multiplier = 0;
+      else if (achievement <= 100) multiplier = (achievement - 60) / 40;
+      else if (achievement <= 120) multiplier = 1.0 + (achievement - 100) / 40;
+      else multiplier = 1.5;
 
-    res.json({
-      role,
-      title: ORG_HIERARCHY[role].title,
-      fixedRatio: model.fixedRatio,
-      variableRatio: model.variableRatio,
-      compositeScore: kpi.compositeScore,
-      achievementPct: achievement,
-      variableMultiplier: Math.round(multiplier * 1000) / 1000,
-      variablePayoutPct: Math.round(multiplier * 100 * 10) / 10,
-      performanceBand: band,
-      metricBreakdown: kpi.metrics.map(m => ({ id: m.id, name: m.name, weight: m.weight, value: m.value, target: m.target, status: m.status })),
-    });
+      let band: string;
+      if (achievement >= 110) band = "exceptional";
+      else if (achievement >= 95) band = "exceeds_expectations";
+      else if (achievement >= 80) band = "meets_expectations";
+      else if (achievement >= 60) band = "needs_improvement";
+      else band = "unsatisfactory";
+
+      res.json({
+        role,
+        title: ORG_HIERARCHY[role].title,
+        fixedRatio: model.fixedRatio,
+        variableRatio: model.variableRatio,
+        compositeScore: kpi.compositeScore,
+        achievementPct: achievement,
+        variableMultiplier: Math.round(multiplier * 1000) / 1000,
+        variablePayoutPct: Math.round(multiplier * 100 * 10) / 10,
+        performanceBand: band,
+        metricBreakdown: kpi.metrics.map(m => ({ id: m.id, name: m.name, weight: m.weight, value: m.value, target: m.target, status: m.status })),
+      });
+    } catch (error) {
+      handleKpiError(res, error);
+    }
   });
 
   // Flow-down analysis for a specific role
-  app.get("/api/kpi/flowdown/:role", (req: Request, res: Response) => {
+  app.get("/api/kpi/flowdown/:role", async (req: Request, res: Response) => {
     const { role } = req.params;
     const node = ORG_HIERARCHY[role];
     if (!node) return res.status(404).json({ error: "role not found" });
@@ -471,53 +643,83 @@ export function registerKPIGateway(app: Express): void {
       return res.json({ role, title: node.title, hasDirectReports: false, message: "No direct reports — KPI based on individual performance only" });
     }
 
-    const kpi = computeRoleKPI(role);
-    const weakest = kpi.directReportScores.reduce((a, b) => a.score < b.score ? a : b);
-    const strongest = kpi.directReportScores.reduce((a, b) => a.score > b.score ? a : b);
+    try {
+      const values = await computeKpiMetricValues(allMetricIds());
+      const kpi = computeRoleKPI(role, values);
+      const scored = kpi.directReportScores.filter(dr => dr.score !== null);
 
-    res.json({
-      role,
-      title: node.title,
-      hasDirectReports: true,
-      ownScore: kpi.overallScore,
-      ownWeightInComposite: 0.60,
-      rollUpScore: kpi.rollUpScore,
-      rollUpWeightInComposite: 0.40,
-      compositeScore: kpi.compositeScore,
-      compositeStatus: computeOverallStatus(kpi.compositeScore),
-      directReportsAnalysis: kpi.directReportScores.map(dr => ({
-        ...dr,
-        impactOnManager: `${Math.round(dr.weight * 40 * 10) / 10}% of composite score`,
-      })),
-      weakestLink: weakest,
-      strongestPerformer: strongest,
-    });
+      res.json({
+        role,
+        title: node.title,
+        hasDirectReports: true,
+        ownScore: kpi.overallScore,
+        ownWeightInComposite: 0.60,
+        rollUpScore: kpi.rollUpScore,
+        rollUpWeightInComposite: 0.40,
+        compositeScore: kpi.compositeScore,
+        compositeStatus: computeOverallStatus(kpi.compositeScore),
+        directReportsAnalysis: kpi.directReportScores.map(dr => ({
+          ...dr,
+          impactOnManager: dr.score === null ? "unavailable — excluded from composite" : `${Math.round(dr.weight * 40 * 10) / 10}% of composite score`,
+        })),
+        weakestLink: scored.length > 0 ? scored.reduce((a, b) => (a.score! < b.score! ? a : b)) : null,
+        strongestPerformer: scored.length > 0 ? scored.reduce((a, b) => (a.score! > b.score! ? a : b)) : null,
+      });
+    } catch (error) {
+      handleKpiError(res, error);
+    }
   });
 
-  // Industry benchmarks
-  app.get("/api/kpi/benchmark", (_req: Request, res: Response) => {
-    res.json({
-      benchmarks: {
-        npl_ratio: { industryAvg: 4.9, topQuartile: 2.5, cbnMax: 5.0, ourValue: 3.5 },
-        car: { industryAvg: 14.2, topQuartile: 18.0, cbnMin: 10.0, ourValue: 16.8 },
-        liquidity_ratio: { industryAvg: 38.5, topQuartile: 45.0, cbnMin: 30.0, ourValue: 42.5 },
-        cost_to_income: { industryAvg: 68.0, topQuartile: 55.0, target: 65.0, ourValue: 58.0 },
-        roe: { industryAvg: 12.5, topQuartile: 20.0, target: 15.0, ourValue: 18.5 },
-        digital_adoption: { industryAvg: 55.0, topQuartile: 80.0, target: 70.0, ourValue: 72.0 },
-      },
-      source: "CBN Banking Sector Report 2025 + NDIC Annual Report",
-    });
+  // Industry benchmarks — the benchmark figures are static external reference
+  // data (clearly labeled). ourValue is computed live; null when the metric
+  // has no computable source.
+  app.get("/api/kpi/benchmark", async (_req: Request, res: Response) => {
+    try {
+      const values = await computeKpiMetricValues(["ceo_npl", "ceo_car", "trs_liquidity", "ceo_cir", "ceo_roe", "ceo_digital_adoption"]);
+      res.json({
+        benchmarks: {
+          npl_ratio: { industryAvg: 4.9, topQuartile: 2.5, cbnMax: 5.0, ourValue: values["ceo_npl"] },
+          car: { industryAvg: 14.2, topQuartile: 18.0, cbnMin: 10.0, ourValue: values["ceo_car"] },
+          liquidity_ratio: { industryAvg: 38.5, topQuartile: 45.0, cbnMin: 30.0, ourValue: values["trs_liquidity"] },
+          cost_to_income: { industryAvg: 68.0, topQuartile: 55.0, target: 65.0, ourValue: values["ceo_cir"] },
+          roe: { industryAvg: 12.5, topQuartile: 20.0, target: 15.0, ourValue: values["ceo_roe"] },
+          digital_adoption: { industryAvg: 55.0, topQuartile: 80.0, target: 70.0, ourValue: values["ceo_digital_adoption"] },
+        },
+        source: "CBN Banking Sector Report 2025 + NDIC Annual Report (static external reference figures)",
+        note: "ourValue is computed live from Postgres; null means the metric has no computable source and is not reported",
+      });
+    } catch (error) {
+      handleKpiError(res, error);
+    }
   });
 
-  // KPI alerts summary (proxies to Rust threshold service)
-  app.get("/api/kpi/alerts", (_req: Request, res: Response) => {
-    res.json({
-      totalActive: 0,
-      totalAcknowledged: 0,
-      totalResolved: 0,
-      thresholdRules: 8,
-      lastEvaluation: new Date().toISOString(),
-      message: "Connect to kpi-threshold-monitor-rs:8501 for real-time alerts",
-    });
+  // KPI alerts summary — real-time threshold evaluation is performed by the
+  // Rust threshold monitor; this gateway does not fabricate alert counts.
+  app.get("/api/kpi/alerts", async (_req: Request, res: Response) => {
+    try {
+      const db = await getDb();
+      if (!db) throw new DatabaseUnavailableError();
+
+      let thresholdRules: number | null = null;
+      try {
+        const result = await db.execute(sql`SELECT COUNT(*)::int AS c FROM kpi_notification_rules WHERE enabled`);
+        thresholdRules = Number((result.rows as Array<{ c: number }>)[0]?.c ?? NaN);
+        if (!Number.isFinite(thresholdRules)) thresholdRules = null;
+      } catch {
+        thresholdRules = null;
+      }
+
+      res.json({
+        totalActive: null,
+        totalAcknowledged: null,
+        totalResolved: null,
+        thresholdRules,
+        status: "unavailable",
+        lastEvaluation: null,
+        message: "Alert event counts are not stored in this gateway — connect to kpi-threshold-monitor-rs:8501 for real-time alerts. Counts are null rather than fabricated.",
+      });
+    } catch (error) {
+      handleKpiError(res, error);
+    }
   });
 }

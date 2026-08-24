@@ -242,9 +242,9 @@ func (s *IndicatorService) UpdateIndicator(indicator *RiskIndicator) error {
 
 func (s *IndicatorService) calculateStatus(indicator *RiskIndicator) string {
 	// For metrics where higher is better (like CAR, LCR)
-	if indicator.IndicatorName == "Capital Adequacy Ratio" || 
-	   indicator.IndicatorName == "Liquidity Coverage Ratio" ||
-	   indicator.IndicatorName == "Core Banking System Availability" {
+	if indicator.IndicatorName == "Capital Adequacy Ratio" ||
+		indicator.IndicatorName == "Liquidity Coverage Ratio" ||
+		indicator.IndicatorName == "Core Banking System Availability" {
 		if indicator.CurrentValue < indicator.Threshold {
 			return "red"
 		}

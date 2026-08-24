@@ -5,36 +5,66 @@
 package main
 
 import (
-	_ "github.com/lib/pq"
+	"context"
 	"database/sql"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
+	"github.com/IBM/sarama"
+	_ "github.com/lib/pq"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 
 	"bytes"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"sync"
 	"time"
-	"net"
 
 	"strings"
 )
 
 var db *sql.DB
 
+// cryptoRandUint32 returns a cryptographically secure random uint32 for
+// record and audit identifiers (L-06/L-16-residual: math/rand IDs are
+// predictable and collision-prone).
+func cryptoRandUint32() uint32 {
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		log.Fatalf("crypto/rand unavailable: %v", err)
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
+
 var serviceName = "loan-origination-go"
 
 // Inter-service URLs
-var creditScoringURL = func() string { v := os.Getenv("CREDIT_SCORING_URL"); if v == "" { return "http://localhost:8203" }; return v }()
-var amlEngineURL = func() string { v := os.Getenv("AML_ENGINE_URL"); if v == "" { return "http://localhost:8120" }; return v }()
-var coreBankingURL = func() string { v := os.Getenv("CORE_BANKING_URL"); if v == "" { return "http://localhost:8100" }; return v }()
-
+var creditScoringURL = func() string {
+	v := os.Getenv("CREDIT_SCORING_URL")
+	if v == "" {
+		return "http://localhost:8203"
+	}
+	return v
+}()
+var amlEngineURL = func() string {
+	v := os.Getenv("AML_ENGINE_URL")
+	if v == "" {
+		return "http://localhost:8120"
+	}
+	return v
+}()
+var coreBankingURL = func() string {
+	v := os.Getenv("CORE_BANKING_URL")
+	if v == "" {
+		return "http://localhost:8100"
+	}
+	return v
+}()
 
 var startTime = time.Now()
 
@@ -64,13 +94,13 @@ type AuditEntry struct {
 }
 
 type DomainStats struct {
-	TotalRecords    int                    `json:"totalRecords"`
-	ActiveRecords   int                    `json:"activeRecords"`
-	PendingRecords  int                    `json:"pendingRecords"`
-	ProcessedToday  int                    `json:"processedToday"`
-	PendingKYC      int                    `json:"pendingKYC"`
-	Domain          string                 `json:"domain"`
-	Metrics         map[string]interface{} `json:"metrics"`
+	TotalRecords   int                    `json:"totalRecords"`
+	ActiveRecords  int                    `json:"activeRecords"`
+	PendingRecords int                    `json:"pendingRecords"`
+	ProcessedToday int                    `json:"processedToday"`
+	PendingKYC     int                    `json:"pendingKYC"`
+	Domain         string                 `json:"domain"`
+	Metrics        map[string]interface{} `json:"metrics"`
 }
 
 var (
@@ -80,7 +110,7 @@ var (
 		{ID: "LOA-002", Type: "sme_loan", Status: "pending_kyc", Data: map[string]interface{}{"domain": "Lending", "priority": "medium", "region": "abuja", "amount": 15000000, "customerId": "CUS-3021", "customerName": "John Doe"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2, KYCVerified: false, KYCLevel: ""},
 		{ID: "LOA-003", Type: "mortgage", Status: "completed", Data: map[string]interface{}{"domain": "Lending", "priority": "low", "region": "ph", "amount": 50000000, "customerId": "CUS-4055", "customerName": "Ibrahim Musa"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1, KYCVerified: true, KYCLevel: "full_edd"},
 	}
-	auditLog = []AuditEntry{}
+	auditLog    = []AuditEntry{}
 	domainStats = DomainStats{
 		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12, PendingKYC: 1,
 		Domain: "Lending",
@@ -139,7 +169,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"service": "loan-origination-go", "status": "healthy", "version": "3.0.0",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
-		"domain": "Loan Origination — Lending",
+		"domain":      "Loan Origination — Lending",
 		"kycEnforcement": map[string]interface{}{
 			"enabled":        true,
 			"default_level":  "enhanced",
@@ -180,16 +210,23 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheSet("loan_origination_list", "", 1) // invalidate list cache on write
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
 	customerID := getString(body, "customerId")
 	loanType := getString(body, "type")
-	if loanType == "" { loanType = "personal_loan" }
+	if loanType == "" {
+		loanType = "personal_loan"
+	}
 
 	amount := 0.0
-	if v, ok := body["amount"].(float64); ok { amount = v }
+	if v, ok := body["amount"].(float64); ok {
+		amount = v
+	}
 
 	// KYC enforcement — all loan applications require enhanced KYC
 	if customerID != "" {
@@ -197,34 +234,34 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			mu.Lock()
 			rec := Record{
-				ID:        fmt.Sprintf("LOA-%08X", rand.Uint32()),
-				Type:      loanType,
-				Status:    "pending_kyc",
-				Data:      body,
-				CreatedAt: time.Now().Format(time.RFC3339),
-				UpdatedAt: time.Now().Format(time.RFC3339),
-				CreatedBy: getString(body, "createdBy"),
-				TenantID:  getString(body, "tenantId"),
-				Version:   1,
+				ID:          fmt.Sprintf("LOA-%08X", cryptoRandUint32()),
+				Type:        loanType,
+				Status:      "pending_kyc",
+				Data:        body,
+				CreatedAt:   time.Now().Format(time.RFC3339),
+				UpdatedAt:   time.Now().Format(time.RFC3339),
+				CreatedBy:   getString(body, "createdBy"),
+				TenantID:    getString(body, "tenantId"),
+				Version:     1,
 				KYCVerified: false,
 			}
 			records = append(records, rec)
 			domainStats.PendingKYC++
 			mu.Unlock()
-	dataBytes, _ := json.Marshal(body)
-		dataBytes = []byte(sanitizeInput(string(dataBytes)))
-	if dbErr := dbInsert(fmt.Sprintf("loan_origination_go-%d", time.Now().UnixNano()), "loan_origination_go", "default", "active", dataBytes); dbErr != nil {
-		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-	}
+			dataBytes, _ := json.Marshal(body)
+			dataBytes = []byte(sanitizeInput(string(dataBytes)))
+			if dbErr := dbInsert(fmt.Sprintf("loan_origination_go-%d", time.Now().UnixNano()), "loan_origination_go", "default", "active", dataBytes); dbErr != nil {
+				log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
+			}
 
 			respondJSON(w, 202, map[string]interface{}{
 				"created": true, "record": rec,
-				"kycRequired": true,
-				"kycLevel":    kycLevel,
+				"kycRequired":   true,
+				"kycLevel":      kycLevel,
 				"requiredLevel": requiredKYCLevel(loanType, amount),
-				"reason":     reason,
-				"message":    fmt.Sprintf("Loan application created but requires KYC verification — %s", reason),
-				"nextStep":   "Complete KYC verification via /api/platform/kyc-triggers/initiate",
+				"reason":        reason,
+				"message":       fmt.Sprintf("Loan application created but requires KYC verification — %s", reason),
+				"nextStep":      "Complete KYC verification via /api/platform/kyc-triggers/initiate",
 				"kafkaEvents": []map[string]string{
 					{"topic": "loan.application.submitted", "status": "pending_kyc"},
 					{"topic": "kyc.verification.required", "customerId": customerID, "requiredLevel": requiredKYCLevel(loanType, amount)},
@@ -238,15 +275,15 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("LOA-%08X", rand.Uint32()),
-		Type:      loanType,
-		Status:    "pending",
-		Data:      body,
-		CreatedAt: time.Now().Format(time.RFC3339),
-		UpdatedAt: time.Now().Format(time.RFC3339),
-		CreatedBy: getString(body, "createdBy"),
-		TenantID:  getString(body, "tenantId"),
-		Version:   1,
+		ID:          fmt.Sprintf("LOA-%08X", cryptoRandUint32()),
+		Type:        loanType,
+		Status:      "pending",
+		Data:        body,
+		CreatedAt:   time.Now().Format(time.RFC3339),
+		UpdatedAt:   time.Now().Format(time.RFC3339),
+		CreatedBy:   getString(body, "createdBy"),
+		TenantID:    getString(body, "tenantId"),
+		Version:     1,
 		KYCVerified: true,
 		KYCLevel:    requiredKYCLevel(loanType, amount),
 	}
@@ -254,7 +291,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	domainStats.TotalRecords = len(records)
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: fmt.Sprintf("Loan application created — KYC verified at %s level", rec.KYCLevel),
 	})
@@ -262,13 +299,16 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 201, map[string]interface{}{
 		"created": true, "record": rec,
 		"kycVerified": true,
-		"message": fmt.Sprintf("Loan application created — KYC verified at %s level", rec.KYCLevel),
-		"kafkaEvent": map[string]string{"topic": "loan.application.submitted", "customerId": customerID},
+		"message":     fmt.Sprintf("Loan application created — KYC verified at %s level", rec.KYCLevel),
+		"kafkaEvent":  map[string]string{"topic": "loan.application.submitted", "customerId": customerID},
 	})
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
+	if r.Method != "POST" && r.Method != "PUT" {
+		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
@@ -278,14 +318,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
-			if s := getString(body, "status"); s != "" { records[i].Status = s }
+			if s := getString(body, "status"); s != "" {
+				records[i].Status = s
+			}
 			for k, v := range body {
-				if k != "id" { records[i].Data[k] = v }
+				if k != "id" {
+					records[i].Data[k] = v
+				}
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", cryptoRandUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -297,50 +341,26 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	id := getString(body, "id")
-	for i := range records {
-		if records[i].ID == id {
-			if !records[i].KYCVerified {
-				respondJSON(w, 403, map[string]interface{}{
-					"error":   "Cannot process loan — KYC verification incomplete",
-					"code":    "KYC_NOT_VERIFIED",
-					"loanId":  id,
-					"message": "Complete KYC verification before processing this loan",
-				})
-				return
-			}
-			if records[i].Status == "pending" || records[i].Status == "processing" {
-				records[i].Status = "processing"
-				records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-				records[i].Version++
-				records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
-				records[i].Data["processingResult"] = "success"
-				records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
-				records[i].Status = "completed"
-				domainStats.ProcessedToday++
-				respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
-				return
-			}
-		}
-	}
-	respondJSON(w, 404, map[string]string{"error": "Record not found or not processable: " + id})
+	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
+	// (processingResult="success" and a random score via math/rand). Real domain
+	// processing must be implemented before this endpoint is enabled.
+	// Fail fast; never fabricate.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
 
 func handleKYCCallback(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
 	customerID := getString(body, "customerId")
 	level := getString(body, "level")
-	if level == "" { level = "enhanced" }
+	if level == "" {
+		level = "enhanced"
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -373,11 +393,19 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	domainStats.TotalRecords = len(records)
-	active := 0; pending := 0; pendingKYC := 0
+	active := 0
+	pending := 0
+	pendingKYC := 0
 	for _, r := range records {
-		if r.Status == "active" || r.Status == "completed" { active++ }
-		if r.Status == "pending" || r.Status == "processing" { pending++ }
-		if r.Status == "pending_kyc" { pendingKYC++ }
+		if r.Status == "active" || r.Status == "completed" {
+			active++
+		}
+		if r.Status == "pending" || r.Status == "processing" {
+			pending++
+		}
+		if r.Status == "pending_kyc" {
+			pendingKYC++
+		}
 	}
 	domainStats.ActiveRecords = active
 	domainStats.PendingRecords = pending
@@ -386,168 +414,187 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok { return v }
+	if v, ok := m[key].(string); ok {
+		return v
+	}
 	return ""
 }
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"loan-origination-go"}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"loan-origination-go"}`)
 }
 
 func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"alive":true}`)
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"loan-origination-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"loan-origination-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"loan-origination-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"loan-origination-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"loan-origination-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"loan-origination-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
-
 
 // --- Inter-Service HTTP Client with Retry & Circuit Breaker ---
 type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
+	failures    int
+	lastFailure time.Time
+	threshold   int
+	resetAfter  time.Duration
+	mu          sync.Mutex
 }
 
 func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2 // half-open
-            return true
-        }
-        return false
-    }
-    return true
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures >= cb.threshold {
+		if time.Since(cb.lastFailure) > cb.resetAfter {
+			cb.failures = cb.threshold / 2 // half-open
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures > 0 {
+		cb.failures--
+	}
 }
 
 func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
 }
 
 var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
 
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
-        }
-        
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[inter-service] %s %s attempt %d failed: %v", method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+	if !_cb.allow() {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+		}
+
+		var req *http.Request
+		if body != nil {
+			jsonData, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cb.recordFailure()
+			log.Printf("[inter-service] %s %s attempt %d failed: %v", method, url, attempt+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			_cb.recordFailure()
+			continue
+		}
+
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cb.recordSuccess()
+		return result, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
 func callCreditScore(customerID string, amount float64) (map[string]interface{}, error) {
-    return callService("POST", creditScoringURL+"/v1/score", map[string]interface{}{
-        "customer_id": customerID, "loan_amount": amount,
-    })
+	return callService("POST", creditScoringURL+"/v1/score", map[string]interface{}{
+		"customer_id": customerID, "loan_amount": amount,
+	})
 }
 
 func callAMLScreen(customerID string, amount float64) (map[string]interface{}, error) {
-    return callService("POST", amlEngineURL+"/v1/screen", map[string]interface{}{
-        "customer_id": customerID, "amount": amount, "type": "loan_origination",
-    })
+	return callService("POST", amlEngineURL+"/v1/screen", map[string]interface{}{
+		"customer_id": customerID, "amount": amount, "type": "loan_origination",
+	})
 }
 
 func callDisburseLoan(loanID string, accountID string, amount float64) (map[string]interface{}, error) {
-    return callService("POST", coreBankingURL+"/v1/transfers", map[string]interface{}{
-        "loan_id": loanID, "to_account": accountID, "amount": amount, "currency": "NGN",
-    })
+	return callService("POST", coreBankingURL+"/v1/transfers", map[string]interface{}{
+		"loan_id": loanID, "to_account": accountID, "amount": amount, "currency": "NGN",
+	})
 }
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
 }
 
 type responseWriter struct {
-    http.ResponseWriter
-    status int
+	http.ResponseWriter
+	status int
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
 
+// sanitizeLogValue strips CR/LF and other control characters from
+// client-supplied values (e.g. trace headers) before they reach log
+// statements, preventing log injection/forgery (L-18). Output length is
+// bounded to keep log lines small.
+func sanitizeLogValue(s string) string {
+	const maxLen = 128
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
 
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
+		traceID := sanitizeLogValue(r.Header.Get("X-Trace-Id"))
 		if traceID == "" {
-			traceID = r.Header.Get("traceparent")
+			traceID = sanitizeLogValue(r.Header.Get("traceparent"))
 		}
 		if traceID == "" {
 			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
@@ -571,24 +618,32 @@ func init() {
 
 func cacheGet(key string) (string, bool) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
+	if err != nil {
+		return "", false
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
+	if err != nil || n < 3 {
+		return "", false
+	}
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
 		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+		if len(parts) >= 3 {
+			return parts[1], true
+		}
 	}
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
 		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
@@ -596,11 +651,17 @@ func cacheSet(key, value string, ttlSeconds int) {
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	if os.Getenv("TLS_ENABLED") != "true" {
+		return false, "", ""
+	}
 	cert := os.Getenv("TLS_CERT_PATH")
 	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
-	if key == "" { key = "/etc/54bank/certs/service.key" }
+	if cert == "" {
+		cert = "/etc/54bank/certs/service.crt"
+	}
+	if key == "" {
+		key = "/etc/54bank/certs/service.key"
+	}
 	return true, cert, key
 }
 
@@ -648,17 +709,22 @@ func sanitizeInput(s string) string {
 	return s
 }
 
-
 func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil { return fmt.Errorf("no db") }
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
 	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
 	return err
 }
 
 func dbList(service string, limit int) ([]map[string]interface{}, error) {
-	if db == nil { return nil, fmt.Errorf("no db") }
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
 	rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT $2", service, limit)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var items []map[string]interface{}
 	for rows.Next() {
@@ -671,13 +737,12 @@ func dbList(service string, limit int) ([]map[string]interface{}, error) {
 	return items, nil
 }
 
-
 var _rlTokens int64 = 100
 var _rlLastRefill int64 = 0
 
 func rlAllow() bool {
 	nowr := time.Now().UnixMilli()
-	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
 		atomic.StoreInt64(&_rlTokens, 100)
 		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
@@ -700,98 +765,99 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 }
 
 // --- JWT Validation (JWKS-aware) ---
+// jwtAuthMiddleware delegates to the JWKS/RS256 jwtMiddleware (fail-closed).
 func jwtAuthMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        p := r.URL.Path
-        if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" || p == "/v1/degradation" {
-            next.ServeHTTP(w, r)
-            return
-        }
-        auth := r.Header.Get("Authorization")
-        if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-            return
-        }
-        token := strings.TrimPrefix(auth, "Bearer ")
-        // Validate JWT structure (header.payload.signature)
-        parts := strings.Split(token, ".")
-        if len(parts) != 3 {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
-            return
-        }
-        // In production: validate against Keycloak JWKS endpoint
-        // keycloakURL := os.Getenv("KEYCLOAK_URL")
-        // Decode payload for claims
-        r.Header.Set("X-User-Id", "validated")
-        next.ServeHTTP(w, r)
-    })
+	return jwtMiddleware(jwtRealmURL(), next)
 }
-		next.ServeHTTP(w, r)
-	})
-}
-
 
 // ─── Domain Logic: Loan Origination ─────────────────────────────────────────
 
 type LoanApplication struct {
-	CustomerID     string  `json:"customer_id"`
-	Amount         float64 `json:"amount"`
-	TenorMonths    int     `json:"tenor_months"`
-	InterestRate   float64 `json:"interest_rate"`
-	MonthlyIncome  float64 `json:"monthly_income"`
-	ExistingDebt   float64 `json:"existing_debt"`
-	EmploymentYrs  float64 `json:"employment_years"`
-	CollateralVal  float64 `json:"collateral_value"`
-	LoanType       string  `json:"loan_type"`
-	Purpose        string  `json:"purpose"`
+	CustomerID    string  `json:"customer_id"`
+	Amount        float64 `json:"amount"`
+	TenorMonths   int     `json:"tenor_months"`
+	InterestRate  float64 `json:"interest_rate"`
+	MonthlyIncome float64 `json:"monthly_income"`
+	ExistingDebt  float64 `json:"existing_debt"`
+	EmploymentYrs float64 `json:"employment_years"`
+	CollateralVal float64 `json:"collateral_value"`
+	LoanType      string  `json:"loan_type"`
+	Purpose       string  `json:"purpose"`
 }
 
 type LoanDecision struct {
-	Eligible      bool    `json:"eligible"`
-	MaxAmount     float64 `json:"max_amount"`
-	EMI           float64 `json:"emi"`
-	DTI           float64 `json:"dti_ratio"`
-	LTV           float64 `json:"ltv_ratio"`
-	RiskGrade     string  `json:"risk_grade"`
-	InterestRate  float64 `json:"approved_rate"`
-	Reasons       []string `json:"reasons"`
+	Eligible     bool     `json:"eligible"`
+	MaxAmount    float64  `json:"max_amount"`
+	EMI          float64  `json:"emi"`
+	DTI          float64  `json:"dti_ratio"`
+	LTV          float64  `json:"ltv_ratio"`
+	RiskGrade    string   `json:"risk_grade"`
+	InterestRate float64  `json:"approved_rate"`
+	Reasons      []string `json:"reasons"`
 }
 
 func calculateEMI(principal, annualRate float64, tenorMonths int) float64 {
-	if annualRate == 0 { return principal / float64(tenorMonths) }
+	if annualRate == 0 {
+		return principal / float64(tenorMonths)
+	}
 	monthlyRate := annualRate / 12.0 / 100.0
 	n := float64(tenorMonths)
 	pow := 1.0
-	for i := 0; i < tenorMonths; i++ { pow *= (1 + monthlyRate) }
+	for i := 0; i < tenorMonths; i++ {
+		pow *= (1 + monthlyRate)
+	}
 	return principal * monthlyRate * pow / (pow - 1)
 }
 
 func computeDTI(monthlyIncome, existingDebt, proposedEMI float64) float64 {
-	if monthlyIncome <= 0 { return 100.0 }
+	if monthlyIncome <= 0 {
+		return 100.0
+	}
 	return ((existingDebt + proposedEMI) / monthlyIncome) * 100.0
 }
 
 func computeLTV(loanAmount, collateralValue float64) float64 {
-	if collateralValue <= 0 { return 100.0 }
+	if collateralValue <= 0 {
+		return 100.0
+	}
 	return (loanAmount / collateralValue) * 100.0
 }
 
 func assessLoanRiskGrade(dti, ltv, employmentYrs float64, loanType string) string {
 	score := 100.0
-	if dti > 50 { score -= 30 } else if dti > 40 { score -= 20 } else if dti > 30 { score -= 10 }
-	if ltv > 90 { score -= 25 } else if ltv > 80 { score -= 15 } else if ltv > 70 { score -= 5 }
-	if employmentYrs < 1 { score -= 20 } else if employmentYrs < 3 { score -= 10 }
-	if loanType == "unsecured" || loanType == "personal_loan" { score -= 10 }
+	if dti > 50 {
+		score -= 30
+	} else if dti > 40 {
+		score -= 20
+	} else if dti > 30 {
+		score -= 10
+	}
+	if ltv > 90 {
+		score -= 25
+	} else if ltv > 80 {
+		score -= 15
+	} else if ltv > 70 {
+		score -= 5
+	}
+	if employmentYrs < 1 {
+		score -= 20
+	} else if employmentYrs < 3 {
+		score -= 10
+	}
+	if loanType == "unsecured" || loanType == "personal_loan" {
+		score -= 10
+	}
 	switch {
-	case score >= 85: return "A"
-	case score >= 70: return "B"
-	case score >= 55: return "C"
-	case score >= 40: return "D"
-	default: return "E"
+	case score >= 85:
+		return "A"
+	case score >= 70:
+		return "B"
+	case score >= 55:
+		return "C"
+	case score >= 40:
+		return "D"
+	default:
+		return "E"
 	}
 }
 
@@ -804,7 +870,9 @@ func validateLoanApplication(app LoanApplication) (LoanDecision, error) {
 
 	// CBN guidelines: DTI max 33% for consumer, 40% for commercial
 	maxDTI := 40.0
-	if app.LoanType == "personal_loan" || app.LoanType == "consumer" { maxDTI = 33.0 }
+	if app.LoanType == "personal_loan" || app.LoanType == "consumer" {
+		maxDTI = 33.0
+	}
 
 	eligible := true
 	if dti > maxDTI {
@@ -838,19 +906,26 @@ func validateLoanApplication(app LoanApplication) (LoanDecision, error) {
 		monthlyRate := app.InterestRate / 12.0 / 100.0
 		n := float64(app.TenorMonths)
 		pow := 1.0
-		for i := 0; i < app.TenorMonths; i++ { pow *= (1 + monthlyRate) }
+		for i := 0; i < app.TenorMonths; i++ {
+			pow *= (1 + monthlyRate)
+		}
 		maxAmount = maxAffordableEMI * (pow - 1) / (monthlyRate * pow)
 	}
 
 	// Risk-adjusted interest rate
 	approvedRate := app.InterestRate
 	switch riskGrade {
-	case "C": approvedRate += 2.0
-	case "D": approvedRate += 4.0
-	case "E": approvedRate += 6.0
+	case "C":
+		approvedRate += 2.0
+	case "D":
+		approvedRate += 4.0
+	case "E":
+		approvedRate += 6.0
 	}
 
-	if len(reasons) == 0 { reasons = append(reasons, "All checks passed") }
+	if len(reasons) == 0 {
+		reasons = append(reasons, "All checks passed")
+	}
 
 	return LoanDecision{
 		Eligible: eligible, MaxAmount: maxAmount, EMI: emi,
@@ -860,21 +935,31 @@ func validateLoanApplication(app LoanApplication) (LoanDecision, error) {
 }
 
 func handleLoanEvaluate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var app LoanApplication
 	if err := json.NewDecoder(r.Body).Decode(&app); err != nil {
 		respondJSON(w, 400, map[string]string{"error": "Invalid request body"})
 		return
 	}
-	if app.InterestRate == 0 { app.InterestRate = 24.0 } // CBN benchmark
-	if app.TenorMonths == 0 { app.TenorMonths = 12 }
+	if app.InterestRate == 0 {
+		app.InterestRate = 24.0
+	} // CBN benchmark
+	if app.TenorMonths == 0 {
+		app.TenorMonths = 12
+	}
 
 	decision, _ := validateLoanApplication(app)
 	respondJSON(w, 200, decision)
 }
 
 func handleEMICalculator(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body struct {
 		Principal float64 `json:"principal"`
 		Rate      float64 `json:"rate"`
@@ -893,7 +978,9 @@ func handleEMICalculator(w http.ResponseWriter, r *http.Request) {
 		interestPart := balance * monthlyRate
 		principalPart := emi - interestPart
 		balance -= principalPart
-		if balance < 0 { balance = 0 }
+		if balance < 0 {
+			balance = 0
+		}
 		schedule = append(schedule, map[string]interface{}{
 			"month": m, "emi": round2(emi), "principal": round2(principalPart),
 			"interest": round2(interestPart), "balance": round2(balance),
@@ -907,43 +994,46 @@ func handleEMICalculator(w http.ResponseWriter, r *http.Request) {
 
 func round2(v float64) float64 { return float64(int(v*100+0.5)) / 100 }
 
-
 // --- Alerting ---
 type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
+	rules []alertRule
+	mu    sync.RWMutex
 }
 
 type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
+	Name      string
+	Metric    string
+	Threshold float64
+	Severity  string
 }
 
 var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
+	rules: []alertRule{
+		{"high_error_rate", "error_rate", 0.05, "critical"},
+		{"high_latency", "p99_latency_ms", 5000, "warning"},
+		{"db_connection_failures", "db_failures", 3, "critical"},
+	},
 }
 
 func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
+	var fired []map[string]interface{}
+	errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+	if errRate > 0.05 {
+		fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+	}
+	return fired
 }
 
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
-
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
@@ -978,9 +1068,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -993,7 +1087,11 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -1018,7 +1116,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -1052,7 +1152,12 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		var claims map[string]interface{}
 		json.Unmarshal(claimsBytes, &claims)
 		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}
@@ -1080,28 +1185,75 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	if len(ids) == 0 {
+		return
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
 
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
 
 func main() {
 
@@ -1120,7 +1272,9 @@ func main() {
 	}
 	port := os.Getenv("PORT")
 
-	if port == "" { port = "9384" }
+	if port == "" {
+		port = "9384"
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
@@ -1128,47 +1282,56 @@ func main() {
 
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/alerts", alertsHandler)
+	mux.Handle("/v1/alerts", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(alertsHandler)))
 	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/health", handleHealthz)
-	mux.HandleFunc("/v1/loan-origination/list", handleList)
-	mux.HandleFunc("/v1/loan-origination/create", handleCreate)
-	mux.HandleFunc("/v1/loan-origination/update", handleUpdate)
-	mux.HandleFunc("/v1/loan-origination/process", handleProcess)
-	mux.HandleFunc("/v1/loan-origination/kyc-callback", handleKYCCallback)
-	mux.HandleFunc("/v1/loan-origination/audit", handleAudit)
-	mux.HandleFunc("/v1/loan-origination/stats", handleStats)
+	mux.Handle("/v1/loan-origination/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
+	mux.Handle("/v1/loan-origination/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
+	mux.Handle("/v1/loan-origination/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
+	mux.Handle("/v1/loan-origination/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
+	mux.Handle("/v1/loan-origination/kyc-callback", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleKYCCallback)))
+	mux.Handle("/v1/loan-origination/audit", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleAudit)))
+	mux.Handle("/v1/loan-origination/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 	// Alternate paths
-	mux.HandleFunc("/v1/applications", handleCreate)
-	mux.HandleFunc("/v1/applications/approve", handleProcess)
-	mux.HandleFunc("/v1/disbursements", handleProcess)
-	mux.HandleFunc("/v1/loans/evaluate", handleLoanEvaluate)
-	mux.HandleFunc("/v1/loans/emi-calculator", handleEMICalculator)
+	mux.Handle("/v1/applications", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
+	mux.Handle("/v1/applications/approve", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
+	mux.Handle("/v1/disbursements", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
+	mux.Handle("/v1/loans/evaluate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleLoanEvaluate)))
+	mux.Handle("/v1/loans/emi-calculator", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleEMICalculator)))
 	log.Printf("Loan Origination v3.0 (Lending, KYC enforced) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: jwtAuthMiddleware(rateLimitMiddleware(securityHeadersMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[loan-origination-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[loan-origination-go] Server stopped gracefully")
+		Addr:         ":" + port,
+		Handler:      jwtAuthMiddleware(rateLimitMiddleware(securityHeadersMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Println("[loan-origination-go] Shutdown signal received")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[loan-origination-go] Server stopped gracefully")
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
+
+// jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
+// scripts/fix-go-wire-jwt.py).
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}

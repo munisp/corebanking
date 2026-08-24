@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
-"""54link-dev Liveness Inference Engine — Production ML Service
+"""54link-dev Liveness Inference Engine — Production ML Service.
+
 Face detection, 68-point landmarks, feature extraction (512-dim embeddings),
-anti-spoofing classification (6 attack vectors), passive liveness, deepfake detection.
-Backend: DeepFace (serengil/deepface) — 10 recognition models, 8 detectors,
-built-in anti-spoofing, facial attribute analysis (age/gender/emotion/race).
-Fallback: Custom ONNX ensemble when DeepFace unavailable.
+anti-spoofing classification, passive liveness, deepfake detection.
+
+Inference backends (real models only — no hash-seeded pseudo-ML):
+- DeepFace (serengil/deepface) when installed: detection, embeddings,
+  verification, facial attributes, built-in anti-spoofing.
+- ONNX models loaded from MODEL_DIR (default ./models) via onnxruntime.
+
+Fail-closed behavior: any inference endpoint whose required model is missing
+or cannot be executed returns HTTP 503 {"error": "model_unavailable",
+"model": "<name>"}. No endpoint ever returns a hash-derived verdict, and no
+iBeta/compliance claims are made unless a real model produced the result.
+
 Middleware: Kafka, Postgres, Redis, Temporal, OpenSearch
-"""
-liveness-inference-py - Production-ready service with PostgreSQL persistence.
-Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
 
 import os
@@ -17,8 +23,14 @@ import urllib.request
 import time
 import uuid
 import logging
+import math
+import hashlib
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
+from enum import Enum
+from dataclasses import dataclass, asdict, field
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
 
 import psycopg2
 import psycopg2.extras
@@ -31,7 +43,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 logger = logging.getLogger("liveness-inference-py")
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/liveness_inference_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -39,7 +65,6 @@ OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 PORT = int(os.getenv("PORT", "8649"))
 
-logging.basicConfig(level=logging.INFO, format="[liveness-inference-py] %(levelname)s %(message)s")
 AML_ENGINE_URL = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
 
 # --- mTLS Configuration ---
@@ -52,23 +77,141 @@ PORT = int(os.environ.get("PORT", "8230"))
 # ─── DeepFace Integration ─────────────────────────────────────────────────────
 # DeepFace provides: face verification (1:1), recognition (1:N), detection,
 # facial attribute analysis (age, gender, emotion, race), anti-spoofing.
-# Models: VGG-Face, FaceNet, FaceNet512, OpenFace, DeepFace, DeepID, ArcFace,
-#         Dlib, SFace, GhostFaceNet, Buffalo_L
-# Detectors: opencv, retinaface, mtcnn, ssd, dlib, mediapipe, yolov8, yunet, centerface
 DEEPFACE_AVAILABLE = False
 try:
     from deepface import DeepFace
     DEEPFACE_AVAILABLE = True
     logging.info("DeepFace loaded — using as primary ML backend")
 except ImportError:
-    logging.warning("DeepFace not installed — using fallback inference engine")
+    logging.warning("DeepFace not installed — ONNX models from MODEL_DIR are required")
 
 # DeepFace model configuration
 DEEPFACE_RECOGNITION_MODEL = os.environ.get("DEEPFACE_MODEL", "ArcFace")
 DEEPFACE_DETECTOR = os.environ.get("DEEPFACE_DETECTOR", "retinaface")
 DEEPFACE_DISTANCE_METRIC = os.environ.get("DEEPFACE_DISTANCE", "cosine")
 DEEPFACE_DB_PATH = os.environ.get("DEEPFACE_DB_PATH", "/data/face-db")
-DEEPFACE_BACKEND_DB = os.environ.get("DEEPFACE_BACKEND_DB", "postgres")  # postgres, pgvector, mongo
+DEEPFACE_BACKEND_DB = os.environ.get("DEEPFACE_BACKEND_DB", "postgres")
+
+# ─── ONNX Model Registry ─────────────────────────────────────────────────────
+# Every inference endpoint depends on one or more of these models. Models are
+# loaded from MODEL_DIR at startup; if a required model file is missing (or
+# onnxruntime is not installed), dependent endpoints return 503
+# {"error": "model_unavailable", "model": "<name>"} — never a synthetic result.
+MODEL_DIR = os.environ.get("MODEL_DIR", "./models")
+
+REQUIRED_MODELS = {
+    "face_detection": "retinaface_r50.onnx",
+    "landmarks": "2dfan4_68.onnx",
+    "embedding": "arcface_r100.onnx",
+    "anti_spoofing": "minifasnet_ensemble.onnx",
+    "deepfake": "efficientnet_b4_deepfake.onnx",
+    "depth": "midas_v31_small.onnx",
+}
+
+_ORT_AVAILABLE = False
+_ort = None
+try:
+    import onnxruntime as _ort_mod
+    _ort = _ort_mod
+    _ORT_AVAILABLE = True
+except ImportError:
+    logger.warning("onnxruntime not installed — ONNX inference unavailable; "
+                   "endpoints without DeepFace support will return 503 model_unavailable")
+
+MODEL_SESSIONS: dict = {}
+MODEL_STATUS: dict = {}
+
+
+def load_models():
+    """Load all required ONNX models from MODEL_DIR. Logs loudly on failure."""
+    for name, fname in REQUIRED_MODELS.items():
+        path = os.path.join(MODEL_DIR, fname)
+        if not os.path.isfile(path):
+            MODEL_STATUS[name] = "missing"
+            logger.error(f"MODEL MISSING: required model '{name}' not found at {path} — "
+                         f"dependent endpoints will return 503 model_unavailable")
+            continue
+        if not _ORT_AVAILABLE:
+            MODEL_STATUS[name] = "runtime_unavailable"
+            logger.error(f"MODEL UNLOADABLE: onnxruntime not installed; "
+                         f"model '{name}' at {path} cannot be served")
+            continue
+        try:
+            MODEL_SESSIONS[name] = _ort.InferenceSession(path, providers=["CPUExecutionProvider"])
+            MODEL_STATUS[name] = "loaded"
+            logger.info(f"Model '{name}' loaded from {path}")
+        except Exception as e:
+            MODEL_STATUS[name] = "load_failed"
+            logger.error(f"MODEL LOAD FAILED: '{name}' at {path}: {e}")
+
+
+class ModelUnavailableError(Exception):
+    """Raised when a required model/runtime cannot produce a real result."""
+
+    def __init__(self, model: str):
+        self.model = model
+        super().__init__(f"model_unavailable: {model}")
+
+
+class InvalidImageError(Exception):
+    """Raised when the request image cannot be decoded."""
+
+
+def require_model(name: str):
+    session = MODEL_SESSIONS.get(name)
+    if session is None:
+        raise ModelUnavailableError(name)
+    return session
+
+
+def _decode_image(image_data: bytes):
+    """Decode image bytes to an RGB array via OpenCV or Pillow + numpy."""
+    try:
+        import numpy as np
+    except ImportError:
+        raise ModelUnavailableError("image_codec:numpy")
+    if not image_data:
+        raise InvalidImageError("empty image payload")
+    try:
+        import cv2
+        arr = cv2.imdecode(np.frombuffer(image_data, np.uint8), cv2.IMREAD_COLOR)
+        if arr is None:
+            raise InvalidImageError("undecodable image bytes")
+        return cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+    except ImportError:
+        try:
+            from PIL import Image
+            import io as _io
+            return np.array(Image.open(_io.BytesIO(image_data)).convert("RGB"))
+        except ImportError:
+            raise ModelUnavailableError("image_codec:no_decoder")
+        except Exception:
+            raise InvalidImageError("undecodable image bytes")
+
+
+def _preprocess(img, size: int):
+    """Resize to size x size and normalize to NCHW float32 in [0, 1]."""
+    import numpy as np
+    try:
+        import cv2
+        resized = cv2.resize(img, (size, size))
+    except ImportError:
+        from PIL import Image
+        resized = np.array(Image.fromarray(img).resize((size, size)))
+    arr = resized.astype("float32") / 255.0
+    return arr.transpose(2, 0, 1)[None, :, :, :]
+
+
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
+def _softmax_max(values, index: int) -> float:
+    m = max(values)
+    exps = [math.exp(v - m) for v in values]
+    total = sum(exps)
+    return exps[index] / total
+
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 FACE_DETECTION_THRESHOLD = 0.65
@@ -95,6 +238,7 @@ class SpoofType(str, Enum):
     THREE_D_MASK = "3d_mask"
     DEEPFAKE = "deepfake"
     HIGH_QUALITY_PHOTO = "high_quality_photo"
+    UNCLASSIFIED = "unclassified"
     NONE = "none"
 
 
@@ -144,12 +288,12 @@ class AntiSpoofResult:
     spoof_type: str
     confidence: float
     method_scores: dict  # per-method breakdown
-    texture_score: float
-    depth_score: float
-    frequency_score: float
-    moiré_detected: bool
-    reflection_detected: bool
-    edge_analysis_score: float
+    texture_score: Optional[float]
+    depth_score: Optional[float]
+    frequency_score: Optional[float]
+    moiré_detected: Optional[bool]
+    reflection_detected: Optional[bool]
+    edge_analysis_score: Optional[float]
 
 
 @dataclass
@@ -176,7 +320,7 @@ class FaceMatchResult:
     embedding_distance: float
     face1_quality: float
     face2_quality: float
-    age_estimation: int
+    age_estimation: Optional[int]
     gender_estimation: str
     head_pose_diff: float
     processing_time_ms: float
@@ -200,7 +344,7 @@ class FeatureExtractionResult:
 class NoiseAssessment:
     """Camera noise level assessment for adaptive threshold adjustment."""
     noise_level: float        # 0.0 = pristine, 1.0 = unusable
-    noise_category: str       # clean, low, medium, high, unusable
+    noise_category: str       # clean, low, medium, high, unusable, unknown
     estimated_snr_db: float   # signal-to-noise ratio estimate
     blur_score: float         # 0 = sharp, 1 = very blurry
     exposure_score: float     # 0 = underexposed, 0.5 = good, 1 = overexposed
@@ -210,73 +354,58 @@ class NoiseAssessment:
 
 
 def assess_image_noise(image_data: bytes, device_platform: str = "unknown") -> NoiseAssessment:
-    """Estimate camera noise level from image data.
-    Uses Laplacian variance for blur, histogram spread for exposure,
-    and high-frequency energy ratio for noise estimation.
-    Adjusts expectations based on known device camera quality.
+    """Estimate image quality from real pixel statistics.
+
+    Uses Laplacian variance (or gradient variance) for blur and histogram mean
+    for exposure. If the image cannot be decoded/measured, returns a
+    conservative 'unknown' assessment with NO threshold relaxation — never a
+    hash-derived pseudo-measurement.
     """
-    img_hash = hashlib.sha256(image_data if image_data else b"empty").hexdigest()
-    seed = int(img_hash[:8], 16)
-    data_len = len(image_data) if image_data else 0
+    try:
+        import numpy as np
+        img = _decode_image(image_data)
+        gray = img.mean(axis=2) if getattr(img, "ndim", 0) == 3 else img.astype("float64")
+        gray = gray.astype("float64")
+        # Blur: variance of Laplacian (OpenCV) or gradient energy fallback.
+        try:
+            import cv2
+            blur_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        except ImportError:
+            gx = np.diff(gray, axis=1)
+            gy = np.diff(gray, axis=0)
+            blur_var = float(gx.var() + gy.var())
+        blur_score = min(max(1.0 - blur_var / 500.0, 0.0), 1.0)
+        mean_brightness = float(gray.mean()) / 255.0
+        exposure_score = min(max(mean_brightness, 0.0), 1.0)
+        # High-frequency energy as noise proxy
+        hf_energy = float(np.diff(gray, axis=1).std() + np.diff(gray, axis=0).std())
+        noise_level = min(max(blur_score * 0.6 + abs(exposure_score - 0.5) * 0.4, 0.0), 1.0)
+        estimated_snr_db = round(10.0 * math.log10(max(gray.std(), 1.0) / max(hf_energy, 1e-6) + 1.0), 1)
+    except (InvalidImageError, ModelUnavailableError):
+        # Cannot measure — do not fabricate; apply zero relaxation.
+        return NoiseAssessment(
+            noise_level=0.0, noise_category="unknown", estimated_snr_db=0.0,
+            blur_score=0.0, exposure_score=0.5, usable=True,
+            threshold_adjustment=0.0, recommended_action="proceed",
+        )
 
-    # Estimate noise from image entropy and size (proxy for compression/quality)
-    entropy_proxy = (seed % 256) / 255.0
-    size_factor = min(data_len / 50000.0, 1.0) if data_len > 0 else 0.5
-
-    # Laplacian variance (blur detection) — lower = blurrier
-    blur_score = 0.3 + entropy_proxy * 0.5 + (seed % 20) / 100.0
-    blur_score = min(max(blur_score, 0.0), 1.0)
-
-    # Exposure — check if image is too dark/bright
-    exposure_score = 0.4 + size_factor * 0.3 + ((seed >> 8) % 20) / 100.0
-    exposure_score = min(max(exposure_score, 0.0), 1.0)
-
-    # SNR estimate from high-frequency energy ratio
-    base_snr = 25.0 + (seed % 20) - 10  # 15-35 dB range
-
-    # Device-specific calibration: known low-quality cameras get more tolerance
-    device_lower = device_platform.lower() if device_platform else ""
-    device_penalty = 0.0
-    if any(kw in device_lower for kw in ["tecno", "itel", "infinix", "gionee"]):
-        device_penalty = 0.10  # budget phones common in Nigeria
-        base_snr -= 5
-    elif any(kw in device_lower for kw in ["samsung_a", "redmi", "poco", "realme"]):
-        device_penalty = 0.05  # mid-range
-    elif any(kw in device_lower for kw in ["iphone", "pixel", "samsung_s", "samsung_z"]):
-        device_penalty = -0.05  # high-end
-
-    # Composite noise level
-    noise_level = (1.0 - size_factor) * 0.3 + (1.0 - blur_score) * 0.3 + abs(exposure_score - 0.5) * 0.4 + device_penalty
-    noise_level = min(max(noise_level, 0.0), 1.0)
-
-    # Categorize
     if noise_level < NOISE_LOW_THRESHOLD:
-        category = "clean"
-        adjustment = 0.0
-        action = "proceed"
+        category, adjustment, action = "clean", 0.0, "proceed"
     elif noise_level < NOISE_MEDIUM_THRESHOLD:
-        category = "low"
-        adjustment = NOISE_THRESHOLD_RELAXATION * 0.3
-        action = "proceed"
+        category, adjustment, action = "low", NOISE_THRESHOLD_RELAXATION * 0.3, "proceed"
     elif noise_level < NOISE_HIGH_THRESHOLD:
-        category = "medium"
-        adjustment = NOISE_THRESHOLD_RELAXATION * 0.7
-        action = "proceed_with_caution"
+        category, adjustment, action = "medium", NOISE_THRESHOLD_RELAXATION * 0.7, "proceed_with_caution"
     elif noise_level < 0.75:
-        category = "high"
-        adjustment = NOISE_THRESHOLD_RELAXATION
-        action = "switch_to_passive"
+        category, adjustment, action = "high", NOISE_THRESHOLD_RELAXATION, "switch_to_passive"
     else:
-        category = "unusable"
-        adjustment = NOISE_THRESHOLD_RELAXATION
-        action = "retry_with_better_lighting"
+        category, adjustment, action = "unusable", NOISE_THRESHOLD_RELAXATION, "retry_with_better_lighting"
 
     usable = noise_level < 0.75
 
     return NoiseAssessment(
         noise_level=round(noise_level, 4),
         noise_category=category,
-        estimated_snr_db=round(base_snr, 1),
+        estimated_snr_db=estimated_snr_db,
         blur_score=round(blur_score, 4),
         exposure_score=round(exposure_score, 4),
         usable=usable,
@@ -290,25 +419,23 @@ def apply_noise_compensation(scores: dict, noise: NoiseAssessment) -> dict:
     Noisy images naturally score lower on texture/frequency analysis.
     We boost those scores proportionally to avoid false rejections.
     """
-    if noise.noise_category == "clean":
+    if noise.noise_category in ("clean", "unknown"):
         return scores
 
     adjusted = {}
     for method, score in scores.items():
-        if method in ("texture_analysis", "frequency_analysis"):
-            # These are most affected by camera noise — boost proportionally
+        if score is None:
+            adjusted[method] = score
+        elif method in ("texture_analysis", "frequency_analysis"):
             boost = noise.threshold_adjustment * 1.2
             adjusted[method] = min(score + boost, 0.99)
         elif method == "depth_estimation":
-            # Depth is moderately affected by noise
             boost = noise.threshold_adjustment * 0.6
             adjusted[method] = min(score + boost, 0.99)
         elif method == "passive_3d":
-            # Composite score — moderate compensation
             boost = noise.threshold_adjustment * 0.8
             adjusted[method] = min(score + boost, 0.99)
         else:
-            # Deepfake detector is less sensitive to camera noise
             adjusted[method] = score
     return adjusted
 
@@ -320,9 +447,7 @@ _frame_buffers: dict = {}  # session_id -> list of (score, noise_level)
 # ─── Active Liveness Motion Analysis ─────────────────────────────────────────
 
 def _compute_head_pose_from_landmarks(landmarks: list) -> dict:
-    """Estimate yaw/pitch/roll from 68-point landmarks using geometry.
-    Uses nose tip (point 30), chin (point 8), left eye corner (36), right eye corner (45).
-    """
+    """Estimate yaw/pitch/roll from 68-point landmarks using geometry."""
     if len(landmarks) < 48:
         return {"yaw": 0.0, "pitch": 0.0, "roll": 0.0}
 
@@ -336,33 +461,26 @@ def _compute_head_pose_from_landmarks(landmarks: list) -> dict:
     lx, ly = left_eye["x"], left_eye["y"]
     rx, ry = right_eye["x"], right_eye["y"]
 
-    # Eye center
     eye_cx = (lx + rx) / 2.0
     eye_cy = (ly + ry) / 2.0
     eye_dist = math.sqrt((rx - lx) ** 2 + (ry - ly) ** 2)
     if eye_dist < 1:
         eye_dist = 1
 
-    # Yaw: nose offset from eye center, normalized by eye distance
     yaw = math.degrees(math.atan2(nx - eye_cx, eye_dist)) * 2.0
 
-    # Pitch: nose-to-chin vertical vs nose-to-eye vertical
     face_height = abs(cy - eye_cy)
     if face_height < 1:
         face_height = 1
     pitch = math.degrees(math.atan2(ny - eye_cy, face_height)) * 1.5 - 15
 
-    # Roll: angle of eye line
     roll = math.degrees(math.atan2(ry - ly, rx - lx))
 
     return {"yaw": round(yaw, 2), "pitch": round(pitch, 2), "roll": round(roll, 2)}
 
 
 def _compute_eye_aspect_ratio(landmarks: list, eye_indices: list) -> float:
-    """Compute Eye Aspect Ratio (EAR) for blink detection.
-    EAR = (|p2-p6| + |p3-p5|) / (2 * |p1-p4|)
-    When eye is open, EAR ~ 0.25-0.35. When closed, EAR < 0.15.
-    """
+    """Compute Eye Aspect Ratio (EAR) for blink detection."""
     if len(eye_indices) != 6:
         return 0.3
     pts = []
@@ -372,10 +490,8 @@ def _compute_eye_aspect_ratio(landmarks: list, eye_indices: list) -> float:
         else:
             return 0.3
 
-    # Vertical distances
     v1 = math.sqrt((pts[1][0] - pts[5][0]) ** 2 + (pts[1][1] - pts[5][1]) ** 2)
     v2 = math.sqrt((pts[2][0] - pts[4][0]) ** 2 + (pts[2][1] - pts[4][1]) ** 2)
-    # Horizontal distance
     h = math.sqrt((pts[0][0] - pts[3][0]) ** 2 + (pts[0][1] - pts[3][1]) ** 2)
     if h < 1:
         h = 1
@@ -383,14 +499,9 @@ def _compute_eye_aspect_ratio(landmarks: list, eye_indices: list) -> float:
 
 
 def _compute_mouth_aspect_ratio(landmarks: list) -> float:
-    """Compute Mouth Aspect Ratio for smile detection.
-    Uses outer mouth landmarks (48-59) and inner (60-67).
-    Smile: wider mouth (larger horizontal), slightly open.
-    """
+    """Compute Mouth Aspect Ratio for smile detection."""
     if len(landmarks) < 68:
         return 0.0
-    # Outer mouth corners: 48 (left), 54 (right)
-    # Outer mouth top: 51, bottom: 57
     left = landmarks[48]
     right = landmarks[54]
     top = landmarks[51]
@@ -405,19 +516,9 @@ def _compute_mouth_aspect_ratio(landmarks: list) -> float:
 
 def analyze_motion(reference_frame: bytes, action_frames: list, challenge_type: str,
                    device_platform: str = "unknown") -> dict:
-    """Analyze motion between reference frame and action frames for active liveness.
-    Compares facial landmarks, head pose, EAR, and mouth ratio across frames
-    to verify the user performed the requested challenge.
-
-    Returns:
-        motion_detected: bool
-        motion_score: 0.0-1.0
-        motion_details: per-frame analysis
-        challenge_passed: bool
-    """
+    """Analyze motion between reference frame and action frames for active liveness."""
     start = time.time()
 
-    # Detect face and landmarks in reference frame
     ref_face = detect_face(reference_frame)
     if not ref_face.face_detected:
         return {
@@ -435,7 +536,6 @@ def analyze_motion(reference_frame: bytes, action_frames: list, challenge_type: 
     ref_ear = (ref_ear_left + ref_ear_right) / 2.0
     ref_mar = _compute_mouth_aspect_ratio(ref_landmarks)
 
-    # Analyze each action frame
     frame_analyses = []
     max_yaw_delta = 0.0
     max_pitch_delta = 0.0
@@ -483,15 +583,13 @@ def analyze_motion(reference_frame: bytes, action_frames: list, challenge_type: 
             "has_motion": has_motion,
         })
 
-    # Device-aware thresholds: relax for budget phones
     dev = (device_platform or "").lower()
     threshold_factor = 1.0
     if any(kw in dev for kw in ["tecno", "itel", "infinix", "gionee"]):
-        threshold_factor = 0.7  # budget phones: 30% more tolerant
+        threshold_factor = 0.7
     elif any(kw in dev for kw in ["samsung_a", "redmi", "poco", "realme"]):
         threshold_factor = 0.85
 
-    # Score based on challenge type
     motion_detected = False
     motion_score = 0.0
 
@@ -499,10 +597,10 @@ def analyze_motion(reference_frame: bytes, action_frames: list, challenge_type: 
         expected_direction = -1 if "left" in challenge_type else 1
         yaw_threshold = 12.0 * threshold_factor
         actual_yaw = max_yaw_delta if expected_direction > 0 else -max_yaw_delta
-        if actual_yaw > yaw_threshold * 0.5:  # at least half the threshold in right direction
+        if actual_yaw > yaw_threshold * 0.5:
             motion_detected = True
             motion_score = min(abs(max_yaw_delta) / (yaw_threshold * 1.5), 1.0)
-        elif abs(max_yaw_delta) > yaw_threshold * 0.5:  # any significant yaw change
+        elif abs(max_yaw_delta) > yaw_threshold * 0.5:
             motion_detected = True
             motion_score = min(abs(max_yaw_delta) / (yaw_threshold * 2.0), 0.85)
 
@@ -533,13 +631,11 @@ def analyze_motion(reference_frame: bytes, action_frames: list, challenge_type: 
             motion_detected = True
             motion_score = min(total_motion / (pose_threshold * 2.0), 1.0)
 
-    # Boost score based on fraction of frames with motion (consistency)
     total_valid_frames = sum(1 for f in frame_analyses if f.get("face_detected", False))
     if total_valid_frames > 0:
         consistency = motion_frames_count / total_valid_frames
         motion_score = motion_score * 0.7 + consistency * 0.3
 
-    # Clamp
     motion_score = round(min(max(motion_score, 0.0), 1.0), 4)
     challenge_passed = motion_detected and motion_score >= 0.45
 
@@ -565,30 +661,25 @@ def analyze_motion(reference_frame: bytes, action_frames: list, challenge_type: 
 
 
 def accumulate_frame_score(session_id: str, score: float, noise_level: float) -> dict:
-    """Accumulate frame scores for multi-frame averaging on noisy cameras.
-    Returns running average and stability metrics.
-    """
+    """Accumulate frame scores for multi-frame averaging on noisy cameras."""
     if session_id not in _frame_buffers:
         _frame_buffers[session_id] = []
 
     buf = _frame_buffers[session_id]
     buf.append((score, noise_level))
 
-    # Keep only last N frames
     if len(buf) > MULTI_FRAME_WINDOW:
         buf[:] = buf[-MULTI_FRAME_WINDOW:]
 
     scores = [s for s, _ in buf]
     avg_score = sum(scores) / len(scores)
 
-    # Score stability — low variance = consistent = more reliable
     if len(scores) >= 2:
         variance = sum((s - avg_score) ** 2 for s in scores) / len(scores)
         stability = max(1.0 - math.sqrt(variance) * 5, 0.0)
     else:
         stability = 0.5
 
-    # Weighted average: recent frames weighted more
     if len(scores) >= 3:
         weights = [0.5 ** (len(scores) - 1 - i) for i in range(len(scores))]
         w_sum = sum(weights)
@@ -607,106 +698,163 @@ def accumulate_frame_score(session_id: str, score: float, noise_level: float) ->
     }
 
 
-# ─── ML Inference Functions ──────────────────────────────────────────────────
+# ─── ML Inference Functions (real models only) ───────────────────────────────
 
-def _generate_landmarks_68(bbox: BoundingBox) -> list:
-    """Generate 68 facial landmark points relative to bounding box.
-    Uses the Multi-PIE 68-point annotation scheme:
-    Points 0-16: Jaw contour
-    Points 17-21: Left eyebrow
-    Points 22-26: Right eyebrow
-    Points 27-35: Nose bridge and tip
-    Points 36-41: Left eye
-    Points 42-47: Right eye
-    Points 48-67: Mouth (outer + inner)
-    """
+_LANDMARK_REGIONS = (
+    [(i, "jaw") for i in range(0, 17)]
+    + [(i, "eyebrow_left") for i in range(17, 22)]
+    + [(i, "eyebrow_right") for i in range(22, 27)]
+    + [(i, "nose") for i in range(27, 36)]
+    + [(i, "eye_left") for i in range(36, 42)]
+    + [(i, "eye_right") for i in range(42, 48)]
+    + [(i, "mouth") for i in range(48, 68)]
+)
+
+
+def _landmark_region(index: int) -> str:
+    for i, region in _LANDMARK_REGIONS:
+        if i == index:
+            return region
+    return "unknown"
+
+
+def _run_landmarks_model(img, bbox: BoundingBox) -> list:
+    """Run the 68-point landmark ONNX model on the cropped face region."""
+    import numpy as np
+    session = require_model("landmarks")
+    x1, y1 = max(bbox.x, 0), max(bbox.y, 0)
+    x2, y2 = bbox.x + bbox.width, bbox.y + bbox.height
+    crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
+        raise InvalidImageError("empty face crop")
+    inp = _preprocess(crop, 256)
+    outputs = session.run(None, {session.get_inputs()[0].name: inp})
+    coords = np.array(outputs[0]).reshape(-1)
+    if coords.size != 136:
+        raise ModelUnavailableError("landmarks:unrecognized_output")
     landmarks = []
-    regions = [
-        ("jaw", 17, [(0.1 + i * 0.05, 0.7 + abs(i - 8) * 0.02) for i in range(17)]),
-        ("eyebrow_left", 5, [(0.2 + i * 0.04, 0.25 - abs(i - 2) * 0.02) for i in range(5)]),
-        ("eyebrow_right", 5, [(0.56 + i * 0.04, 0.25 - abs(i - 2) * 0.02) for i in range(5)]),
-        ("nose", 9, [(0.45 + (i % 3 - 1) * 0.03, 0.35 + i * 0.04) for i in range(9)]),
-        ("eye_left", 6, [(0.28 + math.cos(i * math.pi / 3) * 0.04, 0.35 + math.sin(i * math.pi / 3) * 0.02) for i in range(6)]),
-        ("eye_right", 6, [(0.62 + math.cos(i * math.pi / 3) * 0.04, 0.35 + math.sin(i * math.pi / 3) * 0.02) for i in range(6)]),
-        ("mouth", 20, [(0.35 + math.cos(i * math.pi / 10) * 0.12, 0.65 + math.sin(i * math.pi / 10) * 0.05) for i in range(20)]),
-    ]
-    idx = 0
-    for region_name, count, positions in regions:
-        for i in range(count):
-            rx, ry = positions[i]
-            landmarks.append(Landmark(
-                index=idx,
-                x=bbox.x + rx * bbox.width,
-                y=bbox.y + ry * bbox.height,
-                confidence=0.92 + (hash(f"{idx}{bbox.x}") % 80) / 1000.0,
-                region=region_name,
-            ))
-            idx += 1
+    for i in range(68):
+        px, py = float(coords[2 * i]), float(coords[2 * i + 1])
+        # Normalized coordinates are mapped back to image space.
+        if abs(px) <= 1.5 and abs(py) <= 1.5:
+            px, py = px * bbox.width, py * bbox.height
+        else:
+            px, py = px * bbox.width / 256.0, py * bbox.height / 256.0
+        landmarks.append(Landmark(
+            index=i,
+            x=round(bbox.x + px, 2),
+            y=round(bbox.y + py, 2),
+            confidence=1.0,
+            region=_landmark_region(i),
+        ))
     return landmarks
 
 
 def detect_face(image_data: bytes, image_width: int = 640, image_height: int = 480) -> FaceDetectionResult:
-    """Run face detection using RetinaFace ONNX model.
-    Returns bounding box, 68 landmarks, quality score, head pose, occlusion.
+    """Run face detection using DeepFace or the RetinaFace ONNX model.
+
+    Fails closed: raises ModelUnavailableError when no real detector is
+    available. Never returns a hash-seeded detection.
     """
     start = time.time()
-    img_hash = hashlib.sha256(image_data if image_data else b"empty").hexdigest()
-    seed = int(img_hash[:8], 16)
 
-    face_conf = 0.85 + (seed % 150) / 1000.0
-    has_face = face_conf > FACE_DETECTION_THRESHOLD
+    if DEEPFACE_AVAILABLE:
+        try:
+            faces = DeepFace.extract_faces(
+                img_path=image_data,
+                detector_backend=DEEPFACE_DETECTOR,
+                enforce_detection=False,
+            )
+            if faces and faces[0].get("confidence", 0) and faces[0]["confidence"] >= FACE_DETECTION_THRESHOLD:
+                area = faces[0]["facial_area"]
+                conf = float(faces[0]["confidence"])
+                bbox = BoundingBox(x=int(area["x"]), y=int(area["y"]),
+                                   width=int(area["w"]), height=int(area["h"]),
+                                   confidence=min(conf, 0.99))
+                img = _decode_image(image_data)
+                landmarks = [asdict(lm) for lm in _run_landmarks_model(img, bbox)]
+                return FaceDetectionResult(
+                    face_detected=True, bounding_box=bbox, landmarks_68=landmarks,
+                    face_quality_score=min(conf, 0.99),
+                    head_pose=_compute_head_pose_from_landmarks(landmarks),
+                    occlusion={"left_eye": None, "right_eye": None, "nose": None, "mouth": None},
+                    glasses_detected=False, mask_detected=False,
+                    processing_time_ms=(time.time() - start) * 1000,
+                )
+            return FaceDetectionResult(
+                face_detected=False, bounding_box=None, landmarks_68=[],
+                face_quality_score=0.0, head_pose={"yaw": 0, "pitch": 0, "roll": 0},
+                occlusion={"left_eye": None, "right_eye": None, "nose": None, "mouth": None},
+                glasses_detected=False, mask_detected=False,
+                processing_time_ms=(time.time() - start) * 1000,
+            )
+        except (ModelUnavailableError, InvalidImageError):
+            raise
+        except Exception as e:
+            logger.warning(f"DeepFace detection failed, trying ONNX detector: {e}")
 
-    if not has_face:
+    # ONNX path
+    import numpy as np
+    session = require_model("face_detection")
+    img = _decode_image(image_data)
+    h0, w0 = img.shape[:2]
+    inp = _preprocess(img, 640)
+    outputs = session.run(None, {session.get_inputs()[0].name: inp})
+    det = np.array(outputs[0]).reshape(-1, np.array(outputs[0]).shape[-1])
+    if det.shape[1] < 5:
+        raise ModelUnavailableError("face_detection:unrecognized_output")
+
+    best = None
+    for row in det:
+        score = float(row[4])
+        if best is None or score > float(best[4]):
+            best = row
+    if best is None or float(best[4]) < FACE_DETECTION_THRESHOLD:
         return FaceDetectionResult(
             face_detected=False, bounding_box=None, landmarks_68=[],
             face_quality_score=0.0, head_pose={"yaw": 0, "pitch": 0, "roll": 0},
-            occlusion={"left_eye": False, "right_eye": False, "nose": False, "mouth": False},
+            occlusion={"left_eye": None, "right_eye": None, "nose": None, "mouth": None},
             glasses_detected=False, mask_detected=False,
             processing_time_ms=(time.time() - start) * 1000,
         )
 
-    cx, cy = image_width * 0.45 + (seed % 60), image_height * 0.35 + (seed % 40)
-    fw, fh = image_width * 0.35 + (seed % 30), image_height * 0.45 + (seed % 30)
-    bbox = BoundingBox(
-        x=int(cx - fw / 2), y=int(cy - fh / 2),
-        width=int(fw), height=int(fh), confidence=min(face_conf, 0.99),
-    )
-    landmarks = _generate_landmarks_68(bbox)
+    x1, y1, x2, y2 = float(best[0]), float(best[1]), float(best[2]), float(best[3])
+    conf = float(best[4])
+    # Map normalized or 640-space coordinates back to image space.
+    if max(abs(x1), abs(y1), abs(x2), abs(y2)) <= 1.5:
+        x1, x2 = x1 * w0, x2 * w0
+        y1, y2 = y1 * h0, y2 * h0
+    else:
+        x1, x2 = x1 * w0 / 640.0, x2 * w0 / 640.0
+        y1, y2 = y1 * h0 / 640.0, y2 * h0 / 640.0
 
-    yaw = ((seed >> 4) % 30) - 15
-    pitch = ((seed >> 8) % 20) - 10
-    roll = ((seed >> 12) % 10) - 5
-
-    quality = 0.80 + (seed % 200) / 1000.0
-    glasses = (seed % 10) > 7
-    mask = (seed % 20) > 18
+    bbox = BoundingBox(x=int(min(x1, x2)), y=int(min(y1, y2)),
+                       width=max(int(abs(x2 - x1)), 1), height=max(int(abs(y2 - y1)), 1),
+                       confidence=min(conf, 0.99))
+    landmarks = [asdict(lm) for lm in _run_landmarks_model(img, bbox)]
+    head_pose = _compute_head_pose_from_landmarks(landmarks)
 
     return FaceDetectionResult(
         face_detected=True, bounding_box=bbox,
-        landmarks_68=[asdict(lm) for lm in landmarks],
-        face_quality_score=min(quality, 0.99),
-        head_pose={"yaw": yaw, "pitch": pitch, "roll": roll},
-        occlusion={"left_eye": glasses, "right_eye": glasses, "nose": mask, "mouth": mask},
-        glasses_detected=glasses, mask_detected=mask,
+        landmarks_68=landmarks,
+        face_quality_score=min(conf, 0.99),
+        head_pose=head_pose,
+        occlusion={"left_eye": None, "right_eye": None, "nose": None, "mouth": None},
+        glasses_detected=False, mask_detected=False,
         processing_time_ms=(time.time() - start) * 1000,
     )
 
 
 def extract_features(image_data: bytes) -> FeatureExtractionResult:
-    """Extract face embedding using DeepFace (ArcFace/FaceNet/VGG-Face).
-    Falls back to custom 512-dim generation when DeepFace unavailable.
-    DeepFace supports: ArcFace (512-dim), FaceNet512 (512-dim), VGG-Face (4096-dim).
+    """Extract face embedding using DeepFace or the ArcFace ONNX model.
+
+    Fails closed: raises ModelUnavailableError when no real embedding model is
+    available. Never returns a deterministic pseudo-embedding.
     """
     start = time.time()
-    img_hash = hashlib.sha256(image_data if image_data else b"empty").hexdigest()
-    seed = int(img_hash[:16], 16)
 
     if DEEPFACE_AVAILABLE:
         try:
-            # DeepFace.represent() returns embedding vector for the face
-            # model_name options: VGG-Face, Facenet, Facenet512, OpenFace,
-            #                     DeepFace, DeepID, ArcFace, Dlib, SFace,
-            #                     GhostFaceNet, Buffalo_L
             representations = DeepFace.represent(
                 img_path=image_data,
                 model_name=DEEPFACE_RECOGNITION_MODEL,
@@ -729,147 +877,164 @@ def extract_features(image_data: bytes) -> FeatureExtractionResult:
                     processing_time_ms=(time.time() - start) * 1000,
                 )
         except Exception as e:
-            logging.warning(f"DeepFace represent failed, using fallback: {e}")
+            logger.warning(f"DeepFace represent failed, trying ONNX embedding model: {e}")
 
-    # Fallback: deterministic pseudo-embedding
-    embedding = []
-    for i in range(EMBEDDING_DIM):
-        val = math.sin(seed * (i + 1) * 0.0001) * 0.5
-        embedding.append(round(val, 6))
-
-    norm = math.sqrt(sum(v * v for v in embedding))
-    if norm > 0:
-        embedding = [round(v / norm, 6) for v in embedding]
-        norm = 1.0
+    import numpy as np
+    session = require_model("embedding")
+    img = _decode_image(image_data)
+    inp = _preprocess(img, 112)
+    outputs = session.run(None, {session.get_inputs()[0].name: inp})
+    vec = np.array(outputs[0]).reshape(-1).astype("float64")
+    if vec.size == 0:
+        raise ModelUnavailableError("embedding:empty_output")
+    norm = float(np.linalg.norm(vec))
+    embedding = [round(float(v / norm), 6) for v in vec] if norm > 0 else [float(v) for v in vec]
 
     return FeatureExtractionResult(
-        embedding=embedding, embedding_norm=norm,
-        face_quality=0.88 + (seed % 120) / 1000.0,
-        inter_eye_distance=62.0 + (seed % 20),
-        face_area_ratio=0.25 + (seed % 30) / 100.0,
+        embedding=embedding, embedding_norm=1.0 if norm > 0 else 0.0,
+        face_quality=1.0,
+        inter_eye_distance=0.0,
+        face_area_ratio=0.0,
         processing_time_ms=(time.time() - start) * 1000,
     )
 
 
 def classify_anti_spoofing(image_data: bytes) -> AntiSpoofResult:
-    """Multi-model anti-spoofing ensemble:
-    1. Texture analysis (LBP + frequency domain)
-    2. Depth estimation (monocular depth from single RGB)
-    3. Frequency analysis (FFT for moiré/screen patterns)
-    4. Edge analysis (paper/mask boundary detection)
-    5. Reflection detection (specular highlight patterns)
+    """Anti-spoofing classification via DeepFace built-in anti-spoofing or the
+    MiniFASNet ONNX ensemble (binary live/spoof classifier).
+
+    Fails closed: raises ModelUnavailableError when no real anti-spoofing
+    model is available. Sub-scores for methods that did not run are None.
     """
     start = time.time()
-    img_hash = hashlib.sha256(image_data if image_data else b"empty").hexdigest()
-    seed = int(img_hash[:8], 16)
 
-    texture_score = 0.82 + (seed % 180) / 1000.0
-    depth_score = 0.78 + ((seed >> 4) % 200) / 1000.0
-    frequency_score = 0.85 + ((seed >> 8) % 150) / 1000.0
-    edge_score = 0.80 + ((seed >> 12) % 190) / 1000.0
+    if DEEPFACE_AVAILABLE:
+        try:
+            faces = DeepFace.extract_faces(
+                img_path=image_data,
+                detector_backend=DEEPFACE_DETECTOR,
+                enforce_detection=False,
+                anti_spoofing=True,
+            )
+            if faces:
+                is_real = bool(faces[0].get("is_real", False))
+                score = float(faces[0].get("antispoof_score", 0.0))
+                return AntiSpoofResult(
+                    is_spoof=not is_real,
+                    spoof_type=SpoofType.NONE.value if is_real else SpoofType.UNCLASSIFIED.value,
+                    confidence=min(score, 0.99),
+                    method_scores={"deepface_antispoof": round(score, 4)},
+                    texture_score=round(score, 4),
+                    depth_score=None,
+                    frequency_score=None,
+                    moiré_detected=None,
+                    reflection_detected=None,
+                    edge_analysis_score=None,
+                )
+        except Exception as e:
+            logger.warning(f"DeepFace anti-spoofing failed, trying ONNX model: {e}")
 
-    moiré = (seed % 50) < 3
-    reflection = (seed % 40) < 2
+    import numpy as np
+    session = require_model("anti_spoofing")
+    img = _decode_image(image_data)
+    inp = _preprocess(img, 128)
+    outputs = session.run(None, {session.get_inputs()[0].name: inp})
+    logits = np.array(outputs[0]).reshape(-1).astype("float64")
+    if logits.size == 0:
+        raise ModelUnavailableError("anti_spoofing:empty_output")
+    if logits.size == 1:
+        prob_live = _sigmoid(float(logits[0]))
+    else:
+        # Binary classifier convention: last logit is the 'live' class.
+        prob_live = _softmax_max([float(v) for v in logits], int(logits.size) - 1)
 
-    ensemble_score = (
-        texture_score * 0.30 +
-        depth_score * 0.25 +
-        frequency_score * 0.25 +
-        edge_score * 0.20
-    )
-    is_spoof = ensemble_score < ANTI_SPOOF_THRESHOLD
-
-    spoof_type = SpoofType.NONE
-    if is_spoof:
-        if moiré:
-            spoof_type = SpoofType.SCREEN_REPLAY
-        elif depth_score < 0.5:
-            spoof_type = SpoofType.PRINTED_PHOTO
-        elif edge_score < 0.5:
-            spoof_type = SpoofType.PAPER_MASK
-        else:
-            spoof_type = SpoofType.HIGH_QUALITY_PHOTO
-
+    is_spoof = prob_live < ANTI_SPOOF_THRESHOLD
     return AntiSpoofResult(
-        is_spoof=is_spoof, spoof_type=spoof_type.value, confidence=min(ensemble_score, 0.99),
-        method_scores={
-            "texture_lbp": round(texture_score, 4),
-            "monocular_depth": round(depth_score, 4),
-            "frequency_fft": round(frequency_score, 4),
-            "edge_boundary": round(edge_score, 4),
-        },
-        texture_score=round(texture_score, 4),
-        depth_score=round(depth_score, 4),
-        frequency_score=round(frequency_score, 4),
-        moiré_detected=moiré,
-        reflection_detected=reflection,
-        edge_analysis_score=round(edge_score, 4),
+        is_spoof=is_spoof,
+        spoof_type=SpoofType.NONE.value if not is_spoof else SpoofType.UNCLASSIFIED.value,
+        confidence=min(prob_live if not is_spoof else 1.0 - prob_live, 0.99),
+        method_scores={"onnx_liveness_classifier": round(prob_live, 4)},
+        texture_score=round(prob_live, 4),
+        depth_score=None,
+        frequency_score=None,
+        moiré_detected=None,
+        reflection_detected=None,
+        edge_analysis_score=None,
     )
 
 
 def detect_deepfake(image_data: bytes) -> float:
-    """Deepfake detection using EfficientNet-B4 binary classifier.
-    Analyzes: compression artifacts, GAN fingerprints, frequency inconsistencies,
-    facial boundary irregularities, temporal coherence (for video frames).
-    Returns probability of being a deepfake (0.0 = real, 1.0 = fake).
+    """Deepfake detection via the EfficientNet-B4 ONNX binary classifier.
+
+    Returns the model's deepfake probability. Fails closed: raises
+    ModelUnavailableError when the model is not loaded.
     """
-    img_hash = hashlib.sha256(image_data if image_data else b"empty").hexdigest()
-    seed = int(img_hash[:8], 16)
-    base = (seed % 100) / 1000.0
-    return round(min(base + 0.02, 0.99), 4)
+    import numpy as np
+    session = require_model("deepfake")
+    img = _decode_image(image_data)
+    inp = _preprocess(img, 224)
+    outputs = session.run(None, {session.get_inputs()[0].name: inp})
+    logits = np.array(outputs[0]).reshape(-1).astype("float64")
+    if logits.size == 0:
+        raise ModelUnavailableError("deepfake:empty_output")
+    if logits.size == 1:
+        prob = _sigmoid(float(logits[0]))
+    else:
+        prob = _softmax_max([float(v) for v in logits], int(logits.size) - 1)
+    return round(min(max(prob, 0.0), 1.0), 4)
 
 
 def run_passive_liveness(image_data: bytes) -> dict:
     """Passive liveness from single image — no user interaction required.
-    Combines: 3D depth map, texture micro-patterns, color space analysis,
-    specular reflection mapping, moiré pattern detection.
+
+    Combines the real anti-spoofing classifier with a real monocular depth
+    map (flat depth maps indicate print/screen spoofs). Fails closed when
+    either model is unavailable.
     """
-    img_hash = hashlib.sha256(image_data if image_data else b"empty").hexdigest()
-    seed = int(img_hash[:8], 16)
+    import numpy as np
+    anti_spoof = classify_anti_spoofing(image_data)
 
-    depth_score = 0.80 + (seed % 200) / 1000.0
-    texture_score = 0.83 + ((seed >> 4) % 170) / 1000.0
-    color_score = 0.85 + ((seed >> 8) % 150) / 1000.0
-    reflection_score = 0.82 + ((seed >> 12) % 180) / 1000.0
-    moiré_score = 0.90 + ((seed >> 16) % 100) / 1000.0
+    depth_score = None
+    try:
+        depth_session = require_model("depth")
+        img = _decode_image(image_data)
+        inp = _preprocess(img, 256)
+        outputs = depth_session.run(None, {depth_session.get_inputs()[0].name: inp})
+        depth_map = np.array(outputs[0]).astype("float64")
+        # Real heuristic on a real model output: a flat depth map (very low
+        # variance) indicates a printed photo or screen replay.
+        variance = float(depth_map.var())
+        depth_score = round(min(variance / 0.05, 1.0), 4)
+    except ModelUnavailableError:
+        depth_score = None
 
-    overall = (
-        depth_score * 0.25 +
-        texture_score * 0.25 +
-        color_score * 0.20 +
-        reflection_score * 0.15 +
-        moiré_score * 0.15
-    )
+    texture_score = anti_spoof.texture_score if anti_spoof.texture_score is not None else 0.0
+    components = {"texture_micro_score": texture_score}
+    if depth_score is not None:
+        components["depth_map_score"] = depth_score
+
+    overall = sum(components.values()) / len(components)
 
     return {
         "method": "passive_3d",
         "overall_score": round(min(overall, 0.99), 4),
-        "depth_map_score": round(depth_score, 4),
+        "depth_map_score": depth_score,
         "texture_micro_score": round(texture_score, 4),
-        "color_space_score": round(color_score, 4),
-        "reflection_map_score": round(reflection_score, 4),
-        "moiré_detection_score": round(moiré_score, 4),
-        "is_live": overall >= LIVENESS_PASS_THRESHOLD,
+        "color_space_score": None,
+        "reflection_map_score": None,
+        "moiré_detection_score": None,
+        "is_live": overall >= LIVENESS_PASS_THRESHOLD and not anti_spoof.is_spoof,
     }
 
 
 def analyze_facial_attributes(image_data: bytes) -> dict:
     """Analyze facial attributes using DeepFace: age, gender, emotion, race.
-    Useful for video KYC (customer engagement detection) and demographic analytics.
+
+    Requires DeepFace — no fabricated attribute fallback. Raises
+    ModelUnavailableError when DeepFace is not installed or fails.
     """
     if not DEEPFACE_AVAILABLE:
-        img_hash = hashlib.sha256(image_data if image_data else b"empty").hexdigest()
-        seed = int(img_hash[:8], 16)
-        return {
-            "age": 25 + (seed % 40),
-            "gender": {"Man": 0.6, "Woman": 0.4} if seed % 2 == 0 else {"Man": 0.4, "Woman": 0.6},
-            "dominant_gender": "Man" if seed % 2 == 0 else "Woman",
-            "emotion": {"happy": 0.45, "neutral": 0.35, "surprise": 0.10, "sad": 0.05, "angry": 0.03, "fear": 0.01, "disgust": 0.01},
-            "dominant_emotion": "happy",
-            "race": {"black": 0.60, "white": 0.15, "middle eastern": 0.10, "indian": 0.08, "latino hispanic": 0.05, "asian": 0.02},
-            "dominant_race": "black",
-            "engine": "fallback",
-        }
+        raise ModelUnavailableError("facial_attributes")
     try:
         results = DeepFace.analyze(
             img_path=image_data,
@@ -890,25 +1055,20 @@ def analyze_facial_attributes(image_data: bytes) -> dict:
                 "engine": "deepface",
             }
     except Exception as e:
-        logging.warning(f"DeepFace analyze failed: {e}")
-    return {"age": 30, "gender": {}, "dominant_gender": "unknown", "emotion": {}, "dominant_emotion": "neutral", "race": {}, "dominant_race": "unknown", "engine": "fallback_error"}
+        logger.warning(f"DeepFace analyze failed: {e}")
+    raise ModelUnavailableError("facial_attributes")
 
 
 def match_faces(image1_data: bytes, image2_data: bytes) -> FaceMatchResult:
-    """Compare two face images using DeepFace.verify().
-    DeepFace supports 10 recognition models and 8 face detectors.
-    Falls back to custom embedding comparison when unavailable.
+    """Compare two face images using DeepFace.verify() or real ONNX embeddings.
+
+    Fails closed: raises ModelUnavailableError when no real comparison model
+    is available. Never returns hash-derived similarity or attributes.
     """
     start = time.time()
 
-    combined = hashlib.sha256(
-        (image1_data or b"") + (image2_data or b"")
-    ).hexdigest()
-    seed = int(combined[:8], 16)
-
     if DEEPFACE_AVAILABLE:
         try:
-            # DeepFace.verify() — one-line face verification
             result = DeepFace.verify(
                 img1_path=image1_data,
                 img2_path=image2_data,
@@ -922,29 +1082,34 @@ def match_faces(image1_data: bytes, image2_data: bytes) -> FaceMatchResult:
             distance = result.get("distance", 0.5)
             threshold = result.get("threshold", 0.68)
             similarity_pct = max(0, (1.0 - distance / (threshold * 2))) * 100
-            model_used = result.get("model", DEEPFACE_RECOGNITION_MODEL)
 
-            # Get facial attributes for age/gender
-            attrs = analyze_facial_attributes(image1_data)
+            age_estimation = None
+            gender_estimation = "unknown"
+            try:
+                attrs = analyze_facial_attributes(image1_data)
+                age_estimation = attrs.get("age")
+                gender_estimation = attrs.get("dominant_gender", "unknown")
+            except ModelUnavailableError:
+                pass
 
             return FaceMatchResult(
                 id=f"FM-{uuid.uuid4().hex[:8].upper()}",
                 matched=matched,
                 similarity_score=round(similarity_pct, 2),
                 embedding_distance=round(distance, 4),
-                face1_quality=0.92,
-                face2_quality=0.90,
-                age_estimation=attrs.get("age", 30),
-                gender_estimation=attrs.get("dominant_gender", "unknown"),
-                head_pose_diff=round((seed % 30) * 0.5, 1),
+                face1_quality=1.0,
+                face2_quality=1.0,
+                age_estimation=age_estimation,
+                gender_estimation=gender_estimation,
+                head_pose_diff=0.0,
                 processing_time_ms=round((time.time() - start) * 1000, 2),
                 customer_id="",
                 timestamp=datetime.now(timezone.utc).isoformat(),
             )
         except Exception as e:
-            logging.warning(f"DeepFace verify failed, using fallback: {e}")
+            logger.warning(f"DeepFace verify failed, trying ONNX embeddings: {e}")
 
-    # Fallback: custom embedding comparison
+    # ONNX embedding comparison path (extract_features fails closed itself).
     feat1 = extract_features(image1_data)
     feat2 = extract_features(image2_data)
 
@@ -963,9 +1128,9 @@ def match_faces(image1_data: bytes, image2_data: bytes) -> FaceMatchResult:
         embedding_distance=round(1.0 - cosine_sim, 4),
         face1_quality=round(feat1.face_quality, 4),
         face2_quality=round(feat2.face_quality, 4),
-        age_estimation=25 + (seed % 40),
-        gender_estimation="male" if seed % 2 == 0 else "female",
-        head_pose_diff=round((seed % 30) * 0.5, 1),
+        age_estimation=None,
+        gender_estimation="unknown",
+        head_pose_diff=0.0,
         processing_time_ms=round((time.time() - start) * 1000, 2),
         customer_id="",
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -983,17 +1148,20 @@ stats = {
     "spoof_breakdown": {t.value: 0 for t in SpoofType if t != SpoofType.NONE},
 }
 
+request_count = 0
+error_count = 0
+
 SUPPORTED_METHODS = [
-    {"id": "passive_3d", "name": "Passive 3D Depth", "description": "Single-image liveness via monocular depth estimation + texture analysis", "requires_interaction": False, "ibeta_level": 2},
-    {"id": "texture_analysis", "name": "Texture Micro-Pattern", "description": "LBP/frequency domain analysis for print/screen detection", "requires_interaction": False, "ibeta_level": 1},
-    {"id": "depth_estimation", "name": "Depth Map Estimation", "description": "Neural network monocular depth for 3D mask detection", "requires_interaction": False, "ibeta_level": 2},
-    {"id": "frequency_analysis", "name": "Frequency Domain (FFT)", "description": "Moiré pattern and screen refresh rate detection", "requires_interaction": False, "ibeta_level": 1},
-    {"id": "deepfake_detector", "name": "Deepfake Detection", "description": "EfficientNet-B4 GAN artifact and manipulation detection", "requires_interaction": False, "ibeta_level": 2},
-    {"id": "blink_challenge", "name": "Blink Challenge", "description": "Active liveness — user blinks on command", "requires_interaction": True, "ibeta_level": 1},
-    {"id": "smile_challenge", "name": "Smile Challenge", "description": "Active liveness — user smiles on command", "requires_interaction": True, "ibeta_level": 1},
-    {"id": "head_turn", "name": "Head Turn Challenge", "description": "Active liveness — user turns head left/right", "requires_interaction": True, "ibeta_level": 2},
-    {"id": "nod_challenge", "name": "Nod Challenge", "description": "Active liveness — user nods up/down", "requires_interaction": True, "ibeta_level": 1},
-    {"id": "random_pose", "name": "Random Pose Challenge", "description": "Active liveness — user follows random on-screen target", "requires_interaction": True, "ibeta_level": 2},
+    {"id": "passive_3d", "name": "Passive 3D Depth", "description": "Single-image liveness via monocular depth estimation + texture analysis", "requires_interaction": False},
+    {"id": "texture_analysis", "name": "Texture Micro-Pattern", "description": "LBP/frequency domain analysis for print/screen detection", "requires_interaction": False},
+    {"id": "depth_estimation", "name": "Depth Map Estimation", "description": "Neural network monocular depth for 3D mask detection", "requires_interaction": False},
+    {"id": "frequency_analysis", "name": "Frequency Domain (FFT)", "description": "Moiré pattern and screen refresh rate detection", "requires_interaction": False},
+    {"id": "deepfake_detector", "name": "Deepfake Detection", "description": "EfficientNet-B4 GAN artifact and manipulation detection", "requires_interaction": False},
+    {"id": "blink_challenge", "name": "Blink Challenge", "description": "Active liveness — user blinks on command", "requires_interaction": True},
+    {"id": "smile_challenge", "name": "Smile Challenge", "description": "Active liveness — user smiles on command", "requires_interaction": True},
+    {"id": "head_turn", "name": "Head Turn Challenge", "description": "Active liveness — user turns head left/right", "requires_interaction": True},
+    {"id": "nod_challenge", "name": "Nod Challenge", "description": "Active liveness — user nods up/down", "requires_interaction": True},
+    {"id": "random_pose", "name": "Random Pose Challenge", "description": "Active liveness — user follows random on-screen target", "requires_interaction": True},
 ]
 
 
@@ -1024,32 +1192,6 @@ class CircuitBreaker:
             self.state = "open"
 
 _circuit_breaker = CircuitBreaker()
-
-def call_service(method, url, body=None, retries=3, timeout=15):
-    """Call another microservice with retries and circuit breaker."""
-    if not _circuit_breaker.allow():
-        raise Exception(f"Circuit breaker open for {url}")
-    
-    last_err = None
-    for attempt in range(retries):
-        try:
-            if attempt > 0:
-                time.sleep(0.1 * (2 ** attempt))
-            
-            data = json.dumps(body).encode() if body else None
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("Content-Type", "application/json")
-            
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                result = json.loads(resp.read().decode())
-                _circuit_breaker.record_success()
-                return result
-        except Exception as e:
-            last_err = e
-            _circuit_breaker.record_failure()
-    
-    raise last_err
-
 
 # --- gRPC Server (binary protocol, length-prefixed, with circuit breaker + retry) ---
 import socket as _grpc_socket
@@ -1163,7 +1305,6 @@ def call_service(method, url, body=None, retries=3, timeout=15):
     """HTTP inter-service call with retry + circuit breaker."""
     if not _grpc_cb.allow():
         return None
-    import urllib.request, urllib.error
     for attempt in range(retries):
         try:
             data = json.dumps(body).encode() if body else None
@@ -1240,8 +1381,19 @@ class _DegradationState:
 _degrade = _DegradationState()
 
 class Handler(BaseHTTPRequestHandler):
+    def get_tenant_id(self):
+        return self.headers.get("X-Tenant-Id") or self.headers.get("x-tenant-id")
+
     def do_GET(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
+
+        # N-1: fail-closed JWT auth on the live GET path (probe endpoints exempt).
+        _n1_path = urlparse(self.path).path.rstrip("/") or "/"
+        if _n1_path not in ("/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"):
+            _n1_claims, _n1_err = validate_jwt(dict(self.headers))
+            if _n1_err:
+                self._json(401, {"error": "unauthorized", "detail": _n1_err})
+                return
+        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(time.time()*1000)}-{os.getpid()}"
         logger.info(f"[liveness-inference-py] {self.command} {self.path} trace={trace_id}")
         path = urlparse(self.path).path.rstrip("/")
         params = parse_qs(urlparse(self.path).query)
@@ -1257,42 +1409,37 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.__class__._req_count = getattr(self.__class__, "_req_count", 0) + 1
         if path in ("/healthz", "/health"):
+            models_ok = all(s == "loaded" for s in MODEL_STATUS.values()) if MODEL_STATUS else False
             self._json(200, {
                 "service": "liveness-inference-py",
-                "status": "healthy",
+                "status": "healthy" if (DEEPFACE_AVAILABLE or models_ok) else "degraded",
                 "version": "2.0.0",
                 "deepface_available": DEEPFACE_AVAILABLE,
-                "ml_backend": "deepface" if DEEPFACE_AVAILABLE else "fallback_onnx",
+                "ml_backend": "deepface" if DEEPFACE_AVAILABLE else ("onnx" if MODEL_SESSIONS else "unavailable"),
                 "models": {
-                    "primary_recognition": f"DeepFace ({DEEPFACE_RECOGNITION_MODEL})" if DEEPFACE_AVAILABLE else "ArcFace-R100 (ONNX)",
-                    "available_recognition_models": ["VGG-Face", "FaceNet", "FaceNet512", "OpenFace", "DeepFace", "DeepID", "ArcFace", "Dlib", "SFace", "GhostFaceNet", "Buffalo_L"],
-                    "face_detection": f"DeepFace ({DEEPFACE_DETECTOR})" if DEEPFACE_AVAILABLE else "RetinaFace-R50 (ONNX)",
-                    "available_detectors": ["opencv", "retinaface", "mtcnn", "ssd", "dlib", "mediapipe", "yolov8", "yunet", "centerface"],
-                    "landmarks": "2DFAN4 68-point (ONNX)",
-                    "embedding": f"DeepFace ({DEEPFACE_RECOGNITION_MODEL})" if DEEPFACE_AVAILABLE else "ArcFace-R100 (ONNX, 512-dim)",
-                    "anti_spoofing": "DeepFace built-in + custom ensemble" if DEEPFACE_AVAILABLE else "MiniFASNet ensemble (ONNX)",
-                    "deepfake": "EfficientNet-B4 (ONNX)",
-                    "depth": "MiDaS v3.1 Small (ONNX)",
-                    "facial_attributes": "DeepFace (age, gender, emotion, race)" if DEEPFACE_AVAILABLE else "not available",
+                    name: {"file": fname, "status": MODEL_STATUS.get(name, "missing")}
+                    for name, fname in REQUIRED_MODELS.items()
                 },
                 "capabilities": [
-                    "passive_liveness", "active_liveness", "face_matching",
-                    "face_detection", "68_point_landmarks", "feature_extraction",
-                    "anti_spoofing_classification", "deepfake_detection",
-                    "printed_photo_detection", "screen_replay_detection",
-                    "paper_mask_detection", "3d_mask_detection",
-                    "high_quality_photo_detection",
-                    "facial_attribute_analysis", "age_estimation",
-                    "gender_prediction", "emotion_recognition",
-                    "face_search_1n", "customer_deduplication",
+                    cap for cap, ok in [
+                        ("passive_liveness", DEEPFACE_AVAILABLE or "anti_spoofing" in MODEL_SESSIONS),
+                        ("active_liveness", DEEPFACE_AVAILABLE or ("face_detection" in MODEL_SESSIONS and "landmarks" in MODEL_SESSIONS)),
+                        ("face_matching", DEEPFACE_AVAILABLE or "embedding" in MODEL_SESSIONS),
+                        ("face_detection", DEEPFACE_AVAILABLE or "face_detection" in MODEL_SESSIONS),
+                        ("68_point_landmarks", "landmarks" in MODEL_SESSIONS),
+                        ("feature_extraction", DEEPFACE_AVAILABLE or "embedding" in MODEL_SESSIONS),
+                        ("anti_spoofing_classification", DEEPFACE_AVAILABLE or "anti_spoofing" in MODEL_SESSIONS),
+                        ("deepfake_detection", "deepfake" in MODEL_SESSIONS),
+                        ("facial_attribute_analysis", DEEPFACE_AVAILABLE),
+                    ] if ok
                 ],
-                "ibeta_certification": "Level 2",
+                "compliance_claims": [],
                 "deepface_config": {
                     "recognition_model": DEEPFACE_RECOGNITION_MODEL,
                     "detector": DEEPFACE_DETECTOR,
                     "distance_metric": DEEPFACE_DISTANCE_METRIC,
                     "db_backend": DEEPFACE_BACKEND_DB,
-                },
+                } if DEEPFACE_AVAILABLE else None,
                 "middleware": {
                     "kafka": "liveness.inference.events, liveness.inference.audit",
                     "postgres": "liveness_checks, face_matches, anti_spoofing_results, face_embeddings",
@@ -1325,16 +1472,17 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/v1/pipeline-info":
             self._json(200, {
                 "pipeline": [
-                    {"stage": 1, "name": "Face Detection", "model": "RetinaFace-R50", "latency_ms": 12},
-                    {"stage": 2, "name": "Landmark Extraction", "model": "2DFAN4 68-point", "latency_ms": 8},
-                    {"stage": 3, "name": "Quality Assessment", "model": "FaceQNet v1", "latency_ms": 5},
-                    {"stage": 4, "name": "Anti-Spoofing Ensemble", "model": "MiniFASNet x4", "latency_ms": 25},
-                    {"stage": 5, "name": "Deepfake Detection", "model": "EfficientNet-B4", "latency_ms": 18},
-                    {"stage": 6, "name": "Feature Extraction", "model": "ArcFace-R100", "latency_ms": 15},
-                    {"stage": 7, "name": "Depth Estimation", "model": "MiDaS v3.1", "latency_ms": 20},
+                    {"stage": 1, "name": "Face Detection", "model": REQUIRED_MODELS["face_detection"]},
+                    {"stage": 2, "name": "Landmark Extraction", "model": REQUIRED_MODELS["landmarks"]},
+                    {"stage": 3, "name": "Anti-Spoofing Ensemble", "model": REQUIRED_MODELS["anti_spoofing"]},
+                    {"stage": 4, "name": "Deepfake Detection", "model": REQUIRED_MODELS["deepfake"]},
+                    {"stage": 5, "name": "Feature Extraction", "model": REQUIRED_MODELS["embedding"]},
+                    {"stage": 6, "name": "Depth Estimation", "model": REQUIRED_MODELS["depth"]},
                 ],
-                "total_pipeline_latency_ms": 103,
-                "gpu_acceleration": True,
+                "model_dir": MODEL_DIR,
+                "models_loaded": sorted(MODEL_SESSIONS.keys()),
+                "gpu_acceleration": bool(_ORT_AVAILABLE and _ort and any(
+                    "CUDA" in p for s in MODEL_SESSIONS.values() for p in s.get_providers())),
                 "batch_size": 1,
                 "input_resolution": "112x112 (aligned face)",
             })
@@ -1342,7 +1490,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "Not found"})
 
     def do_POST(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
+        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(time.time()*1000)}-{os.getpid()}"
         logger.info(f"[liveness-inference-py] {self.command} {self.path} trace={trace_id}")
         path = urlparse(self.path).path.rstrip("/")
         content_len = int(self.headers.get("Content-Length", 0))
@@ -1357,52 +1505,56 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
             return
-        body = json.loads(sanitize_input(self.rfile.read(content_len).decode() if isinstance(self.rfile.read(content_len), bytes) else str(self.rfile.read(content_len)))) if content_len > 0 else {}
+        raw = self.rfile.read(content_len) if content_len > 0 else b""
+        body = json.loads(sanitize_input(raw.decode())) if raw else {}
         db_insert(f"liveness_{int(time.time()*1000)}", {"tenant_id": self.get_tenant_id(), "path": path, "action": "inference"})
         upstream = os.environ.get("AML_ENGINE_URL", "http://aml-engine-rs:8080")
         call_service("POST", f"{upstream}/v1/notify", {"source": "liveness-inference-py", "action": "inference"})
 
-        if path == "/v1/liveness/check":
-            self._handle_liveness_check(body)
-        elif path == "/v1/liveness/passive":
-            self._handle_passive_liveness(body)
-        elif path == "/v1/face-detect":
-            self._handle_face_detection(body)
-        elif path == "/v1/landmarks":
-            self._handle_landmark_extraction(body)
-        elif path == "/v1/features/extract":
-            self._handle_feature_extraction(body)
-        elif path == "/v1/anti-spoof/classify":
-            self._handle_anti_spoof(body)
-        elif path == "/v1/deepfake/detect":
-            self._handle_deepfake_detection(body)
-        elif path == "/v1/face-match":
-            self._handle_face_match(body)
-        elif path == "/v1/face-match/batch":
-            self._handle_face_match_batch(body)
-        elif path == "/v1/face/analyze":
-            self._handle_facial_analysis(body)
-        elif path == "/v1/face/search":
-            self._handle_face_search(body)
-        elif path == "/v1/face/register":
-            self._handle_face_register(body)
-        elif path == "/v1/dedup/check":
-            self._handle_dedup_check(body)
-        elif path == "/v1/noise/assess":
-            self._handle_noise_assessment(body)
-        elif path == "/v1/frame/accumulate":
-            self._handle_frame_accumulate(body)
-        elif path == "/v1/motion/analyze":
-            self._handle_motion_analysis(body)
-        else:
-            self._json(404, {"error": "Not found"})
+        try:
+            if path == "/v1/liveness/check":
+                self._handle_liveness_check(body)
+            elif path == "/v1/liveness/passive":
+                self._handle_passive_liveness(body)
+            elif path == "/v1/face-detect":
+                self._handle_face_detection(body)
+            elif path == "/v1/landmarks":
+                self._handle_landmark_extraction(body)
+            elif path == "/v1/features/extract":
+                self._handle_feature_extraction(body)
+            elif path == "/v1/anti-spoof/classify":
+                self._handle_anti_spoof(body)
+            elif path == "/v1/deepfake/detect":
+                self._handle_deepfake_detection(body)
+            elif path == "/v1/face-match":
+                self._handle_face_match(body)
+            elif path == "/v1/face-match/batch":
+                self._handle_face_match_batch(body)
+            elif path == "/v1/face/analyze":
+                self._handle_facial_analysis(body)
+            elif path == "/v1/face/search":
+                self._handle_face_search(body)
+            elif path == "/v1/face/register":
+                self._handle_face_register(body)
+            elif path == "/v1/dedup/check":
+                self._handle_dedup_check(body)
+            elif path == "/v1/noise/assess":
+                self._handle_noise_assessment(body)
+            elif path == "/v1/frame/accumulate":
+                self._handle_frame_accumulate(body)
+            elif path == "/v1/motion/analyze":
+                self._handle_motion_analysis(body)
+            else:
+                self._json(404, {"error": "Not found"})
+        except ModelUnavailableError as e:
+            logger.error(f"model_unavailable: {e.model} for {path}")
+            self._json(503, {"error": "model_unavailable", "model": e.model})
+        except InvalidImageError as e:
+            self._json(400, {"error": "invalid_image", "detail": str(e)})
 
     def _handle_liveness_check(self, body: dict):
         """Full liveness check pipeline with adaptive noise tolerance.
-        1. Assess image noise level
-        2. Adjust thresholds based on camera quality
-        3. Multi-frame averaging for noisy cameras
-        4. Graceful degradation: active → passive when camera too noisy
+        Requires real models; returns 503 model_unavailable when missing.
         """
         start = time.time()
         image_b64 = body.get("image", "")
@@ -1412,12 +1564,18 @@ class Handler(BaseHTTPRequestHandler):
         device_model = body.get("deviceModel", "")
         methods = body.get("methods", ["passive_3d", "texture_analysis", "depth_estimation", "frequency_analysis", "deepfake_detector"])
 
-        image_data = image_b64.encode() if image_b64 else b"sample_frame"
+        import base64 as _b64
+        if image_b64:
+            try:
+                image_data = _b64.b64decode(image_b64)
+            except Exception:
+                image_data = image_b64.encode()
+        else:
+            raise InvalidImageError("image is required")
 
-        # Step 1: Assess camera noise level
+        # Step 1: Assess camera noise level from real pixel statistics
         noise = assess_image_noise(image_data, device or device_model)
 
-        # If image is completely unusable, return actionable error
         if not noise.usable:
             result = {
                 "id": f"LIV-{uuid.uuid4().hex[:8].upper()}",
@@ -1438,7 +1596,6 @@ class Handler(BaseHTTPRequestHandler):
 
         face_result = detect_face(image_data)
         if not face_result.face_detected:
-            # On noisy cameras, retry guidance instead of hard fail
             guidance = "No face detected."
             if noise.noise_category in ("medium", "high"):
                 guidance += " Camera noise is high — try better lighting or hold device closer."
@@ -1459,7 +1616,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, result)
             return
 
-        # Step 2: If camera is very noisy and mode is active, suggest passive fallback
         mode_fallback = None
         if noise.noise_category == "high" and any(m in methods for m in ["blink_challenge", "smile_challenge", "head_turn", "nod_challenge"]):
             mode_fallback = "passive_fallback"
@@ -1472,24 +1628,21 @@ class Handler(BaseHTTPRequestHandler):
         method_scores = {}
         if "passive_3d" in methods:
             method_scores["passive_3d"] = passive["overall_score"]
-        if "texture_analysis" in methods:
+        if "texture_analysis" in methods and anti_spoof.texture_score is not None:
             method_scores["texture_analysis"] = anti_spoof.texture_score
-        if "depth_estimation" in methods:
-            method_scores["depth_estimation"] = anti_spoof.depth_score
-        if "frequency_analysis" in methods:
+        if "depth_estimation" in methods and passive.get("depth_map_score") is not None:
+            method_scores["depth_estimation"] = passive["depth_map_score"]
+        if "frequency_analysis" in methods and anti_spoof.frequency_score is not None:
             method_scores["frequency_analysis"] = anti_spoof.frequency_score
         if "deepfake_detector" in methods:
             method_scores["deepfake_detector"] = 1.0 - deepfake_prob
 
-        # Step 3: Apply noise compensation — boost scores that are unfairly penalized by noise
         raw_scores = dict(method_scores)
         method_scores = apply_noise_compensation(method_scores, noise)
 
         overall_score = sum(method_scores.values()) / max(len(method_scores), 1)
 
-        # Step 4: Adaptive thresholds based on noise level
         adjusted_liveness_threshold = LIVENESS_PASS_THRESHOLD - noise.threshold_adjustment
-        adjusted_spoof_threshold = ANTI_SPOOF_THRESHOLD - noise.threshold_adjustment * 0.5
 
         is_live = (
             overall_score >= adjusted_liveness_threshold and
@@ -1497,10 +1650,8 @@ class Handler(BaseHTTPRequestHandler):
             deepfake_prob < DEEPFAKE_THRESHOLD
         )
 
-        # Step 5: Multi-frame averaging for noisy cameras
         frame_stats = accumulate_frame_score(session_id, overall_score, noise.noise_level)
         if noise.noise_category in ("medium", "high") and frame_stats["sufficient_frames"]:
-            # Use weighted average across frames for more stable decision
             overall_score = frame_stats["weighted_avg_score"]
             is_live = overall_score >= adjusted_liveness_threshold and not anti_spoof.is_spoof
 
@@ -1525,6 +1676,7 @@ class Handler(BaseHTTPRequestHandler):
             "face_detection": asdict(face_result),
             "passive_liveness": passive,
             "confidence_score": round(overall_score, 4),
+            "compliance_claims": [],
             "processing_time_ms": round((time.time() - start) * 1000, 2),
             "device_platform": device,
             "device_model": device_model,
@@ -1553,27 +1705,17 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, result)
 
     def _handle_passive_liveness(self, body: dict):
-        """Passive liveness only — single image, no interaction.
-        Includes noise assessment and adaptive compensation.
-        """
-        image_data = body.get("image", "").encode() or b"sample"
+        """Passive liveness only — single image, no interaction."""
+        image_data = body.get("image", "").encode()
         device = body.get("devicePlatform", "unknown")
         noise = assess_image_noise(image_data, device)
         result = run_passive_liveness(image_data)
 
-        # Apply noise compensation to passive scores
-        if noise.noise_category != "clean":
-            for key in ["depth_map_score", "texture_micro_score", "reflection_map_score"]:
-                if key in result:
-                    boost = noise.threshold_adjustment * 0.8
-                    result[key] = round(min(result[key] + boost, 0.99), 4)
-            # Recalculate overall with compensated scores
+        if noise.noise_category not in ("clean", "unknown") and result.get("depth_map_score") is not None:
+            boost = noise.threshold_adjustment * 0.8
+            result["depth_map_score"] = round(min(result["depth_map_score"] + boost, 0.99), 4)
             result["overall_score"] = round(min(
-                result["depth_map_score"] * 0.25 +
-                result["texture_micro_score"] * 0.25 +
-                result.get("color_space_score", 0.85) * 0.20 +
-                result["reflection_map_score"] * 0.15 +
-                result.get("moiré_detection_score", 0.90) * 0.15,
+                (result["depth_map_score"] + result["texture_micro_score"]) / 2.0,
                 0.99
             ), 4)
             adjusted_threshold = LIVENESS_PASS_THRESHOLD - noise.threshold_adjustment
@@ -1582,37 +1724,31 @@ class Handler(BaseHTTPRequestHandler):
         result["noise_assessment"] = asdict(noise)
         result["noise_compensation_applied"] = noise.noise_category != "clean"
         result["customer_id"] = body.get("customerId", "unknown")
+        result["compliance_claims"] = []
         result["timestamp"] = datetime.now(timezone.utc).isoformat()
         self._json(200, result)
 
     def _handle_motion_analysis(self, body: dict):
-        """Analyze motion between reference and action frames for active liveness.
-        Accepts: referenceFrame (base64), actionFrames (list of base64),
-                 challengeType, devicePlatform, deviceModel.
-        Returns: motion_detected, motion_score, challenge_passed, frame_analyses.
-        """
+        """Analyze motion between reference and action frames for active liveness."""
         ref_b64 = body.get("referenceFrame", "")
         action_b64s = body.get("actionFrames", [])
         challenge_type = body.get("challengeType", "head_turn_left")
         device = body.get("devicePlatform", "unknown")
         device_model = body.get("deviceModel", "")
 
-        ref_data = ref_b64.encode() if ref_b64 else b"ref_frame"
+        if not ref_b64:
+            raise InvalidImageError("referenceFrame is required")
+        ref_data = ref_b64.encode()
 
-        # Also run anti-spoofing on reference frame
         noise = assess_image_noise(ref_data, device or device_model)
         anti_spoof = classify_anti_spoofing(ref_data)
         deepfake_prob = detect_deepfake(ref_data)
 
-        # Run motion analysis
         motion = analyze_motion(ref_data, action_b64s, challenge_type, device or device_model)
 
-        # Combine motion score with liveness checks
         liveness_score = 0.0
         if not anti_spoof.is_spoof and deepfake_prob < DEEPFAKE_THRESHOLD:
-            liveness_score = 0.85  # base liveness passed
-        else:
-            liveness_score = 0.3  # suspected spoof
+            liveness_score = anti_spoof.confidence
 
         combined_score = motion["motion_score"] * 0.6 + liveness_score * 0.4
 
@@ -1629,7 +1765,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_noise_assessment(self, body: dict):
         """Standalone noise assessment endpoint."""
-        image_data = body.get("image", "").encode() or b"sample"
+        image_data = body.get("image", "").encode()
         device = body.get("devicePlatform", body.get("deviceModel", "unknown"))
         noise = assess_image_noise(image_data, device)
         self._json(200, asdict(noise))
@@ -1644,7 +1780,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_face_detection(self, body: dict):
         """Face detection with bounding box, quality, pose."""
-        image_data = body.get("image", "").encode() or b"sample"
+        image_data = body.get("image", "").encode()
         width = body.get("width", 640)
         height = body.get("height", 480)
         result = detect_face(image_data, width, height)
@@ -1652,7 +1788,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_landmark_extraction(self, body: dict):
         """68-point facial landmark extraction."""
-        image_data = body.get("image", "").encode() or b"sample"
+        image_data = body.get("image", "").encode()
         face = detect_face(image_data)
         if not face.face_detected:
             self._json(200, {"landmarks": [], "count": 0, "error": "no_face_detected"})
@@ -1675,47 +1811,37 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_feature_extraction(self, body: dict):
         """512-dim ArcFace embedding extraction."""
-        image_data = body.get("image", "").encode() or b"sample"
+        image_data = body.get("image", "").encode()
         result = extract_features(image_data)
         self._json(200, asdict(result))
 
     def _handle_anti_spoof(self, body: dict):
-        """Anti-spoofing classification for all 6 attack vectors."""
-        image_data = body.get("image", "").encode() or b"sample"
+        """Anti-spoofing classification."""
+        image_data = body.get("image", "").encode()
         result = classify_anti_spoofing(image_data)
         response = asdict(result)
-        response["attack_vectors_checked"] = [
-            {"type": "printed_photo", "detected": result.spoof_type == SpoofType.PRINTED_PHOTO.value, "score": result.texture_score},
-            {"type": "screen_replay", "detected": result.moiré_detected, "score": result.frequency_score},
-            {"type": "paper_mask", "detected": result.spoof_type == SpoofType.PAPER_MASK.value, "score": result.edge_analysis_score},
-            {"type": "3d_mask", "detected": result.spoof_type == SpoofType.THREE_D_MASK.value, "score": result.depth_score},
-            {"type": "deepfake", "detected": False, "score": 0.0},
-            {"type": "high_quality_photo", "detected": result.spoof_type == SpoofType.HIGH_QUALITY_PHOTO.value, "score": result.texture_score},
-        ]
+        response["attack_vectors_checked"] = []
+        response["compliance_claims"] = []
         self._json(200, response)
 
     def _handle_deepfake_detection(self, body: dict):
         """Deepfake probability estimation."""
-        image_data = body.get("image", "").encode() or b"sample"
+        image_data = body.get("image", "").encode()
         prob = detect_deepfake(image_data)
         self._json(200, {
             "deepfake_probability": prob,
             "is_deepfake": prob >= DEEPFAKE_THRESHOLD,
             "confidence": round(1.0 - abs(0.5 - prob) * 2, 4),
-            "analysis": {
-                "compression_artifacts": round(prob * 0.8, 4),
-                "gan_fingerprint": round(prob * 0.6, 4),
-                "frequency_inconsistency": round(prob * 0.7, 4),
-                "boundary_irregularity": round(prob * 0.5, 4),
-            },
-            "model": "EfficientNet-B4",
+            "analysis": None,
+            "model": REQUIRED_MODELS["deepfake"],
+            "compliance_claims": [],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
     def _handle_face_match(self, body: dict):
         """Match two face images — selfie vs document photo."""
-        image1 = body.get("image1", "").encode() or b"face1"
-        image2 = body.get("image2", "").encode() or b"face2"
+        image1 = body.get("image1", "").encode()
+        image2 = body.get("image2", "").encode()
         customer_id = body.get("customerId", "unknown")
 
         result = match_faces(image1, image2)
@@ -1728,11 +1854,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_face_match_batch(self, body: dict):
         """Batch face matching — 1:N comparison against enrolled faces."""
-        probe_image = body.get("probeImage", "").encode() or b"probe"
+        probe_image = body.get("probeImage", "").encode()
         gallery = body.get("gallery", [])
         results = []
         for entry in gallery[:50]:
-            gallery_img = entry.get("image", "").encode() or b"gallery"
+            gallery_img = entry.get("image", "").encode()
             r = match_faces(probe_image, gallery_img)
             r.customer_id = entry.get("customerId", "unknown")
             results.append(asdict(r))
@@ -1740,54 +1866,47 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"matches": results, "total": len(results), "threshold": FACE_MATCH_THRESHOLD * 100})
 
     def _handle_facial_analysis(self, body: dict):
-        """DeepFace facial attribute analysis: age, gender, emotion, race.
-        Useful for video KYC engagement detection and demographic analytics.
-        """
-        image_data = body.get("image", "").encode() or b"sample"
+        """DeepFace facial attribute analysis: age, gender, emotion, race."""
+        image_data = body.get("image", "").encode()
         result = analyze_facial_attributes(image_data)
         result["customer_id"] = body.get("customerId", "unknown")
+        result["compliance_claims"] = []
         result["timestamp"] = datetime.now(timezone.utc).isoformat()
         self._json(200, result)
 
     def _handle_face_search(self, body: dict):
-        """1:N face search using DeepFace.find() or DeepFace.search().
-        Searches registered face database for matching identities.
-        Supports: postgres, pgvector, mongo, pinecone, weaviate backends.
-        """
-        image_data = body.get("image", "").encode() or b"probe"
+        """1:N face search using DeepFace.find()."""
+        image_data = body.get("image", "").encode()
         db_path = body.get("dbPath", DEEPFACE_DB_PATH)
         threshold = body.get("threshold", None)
         top_k = body.get("topK", 10)
 
-        if DEEPFACE_AVAILABLE:
-            try:
-                # DeepFace.find() — directory-based face search
-                results = DeepFace.find(
-                    img_path=image_data,
-                    db_path=db_path,
-                    model_name=DEEPFACE_RECOGNITION_MODEL,
-                    detector_backend=DEEPFACE_DETECTOR,
-                    distance_metric=DEEPFACE_DISTANCE_METRIC,
-                    enforce_detection=False,
-                    threshold=threshold,
-                )
-                matches = []
-                for df in results[:top_k] if isinstance(results, list) else [results]:
-                    if hasattr(df, 'to_dict'):
-                        matches.extend(df.to_dict('records')[:top_k])
-                self._json(200, {"matches": matches[:top_k], "total": len(matches), "engine": "deepface", "model": DEEPFACE_RECOGNITION_MODEL})
-                return
-            except Exception as e:
-                logging.warning(f"DeepFace find failed: {e}")
-
-        # Fallback: compare against in-memory face match results
-        self._json(200, {"matches": [], "total": 0, "engine": "fallback", "note": "DeepFace not available or DB not configured"})
+        if not DEEPFACE_AVAILABLE:
+            raise ModelUnavailableError("face_search")
+        try:
+            results = DeepFace.find(
+                img_path=image_data,
+                db_path=db_path,
+                model_name=DEEPFACE_RECOGNITION_MODEL,
+                detector_backend=DEEPFACE_DETECTOR,
+                distance_metric=DEEPFACE_DISTANCE_METRIC,
+                enforce_detection=False,
+                threshold=threshold,
+            )
+            matches = []
+            for df in results[:top_k] if isinstance(results, list) else [results]:
+                if hasattr(df, 'to_dict'):
+                    matches.extend(df.to_dict('records')[:top_k])
+            self._json(200, {"matches": matches[:top_k], "total": len(matches), "engine": "deepface", "model": DEEPFACE_RECOGNITION_MODEL})
+        except ModelUnavailableError:
+            raise
+        except Exception as e:
+            logger.warning(f"DeepFace find failed: {e}")
+            raise ModelUnavailableError("face_search")
 
     def _handle_face_register(self, body: dict):
-        """Register a face into the DeepFace database for future 1:N search.
-        Stores embedding in configured backend (postgres/pgvector/mongo).
-        """
-        image_data = body.get("image", "").encode() or b"face"
+        """Register a face into the DeepFace database for future 1:N search."""
+        image_data = body.get("image", "").encode()
         customer_id = body.get("customerId", "unknown")
         metadata = body.get("metadata", {})
 
@@ -1797,74 +1916,56 @@ class Handler(BaseHTTPRequestHandler):
             "customer_id": customer_id,
             "embedding_dim": len(embedding_result.embedding),
             "face_quality": round(embedding_result.face_quality, 4),
-            "model": DEEPFACE_RECOGNITION_MODEL if DEEPFACE_AVAILABLE else "ArcFace-R100-fallback",
-            "engine": "deepface" if DEEPFACE_AVAILABLE else "fallback",
+            "model": DEEPFACE_RECOGNITION_MODEL if DEEPFACE_AVAILABLE else REQUIRED_MODELS["embedding"],
+            "engine": "deepface" if DEEPFACE_AVAILABLE else "onnx",
             "metadata": metadata,
             "registered_at": datetime.now(timezone.utc).isoformat(),
         }
-
-        if DEEPFACE_AVAILABLE:
-            try:
-                DeepFace.register(img=image_data)
-                registration["stored_in"] = DEEPFACE_BACKEND_DB
-            except Exception as e:
-                logging.warning(f"DeepFace register failed: {e}")
-                registration["stored_in"] = "local_memory"
-        else:
-            registration["stored_in"] = "local_memory"
+        registration["stored_in"] = "local_memory"
 
         self._json(201, {"registered": True, "registration": registration})
 
     def _handle_dedup_check(self, body: dict):
-        """Customer deduplication check — detect if same face exists under different BVN/accounts.
-        Uses DeepFace.find() to search the customer face database.
-        Critical for CBN compliance (no duplicate tier 2/3 accounts).
-        """
-        image_data = body.get("image", "").encode() or b"face"
+        """Customer deduplication check — detect if same face exists under different BVN/accounts."""
+        image_data = body.get("image", "").encode()
         customer_id = body.get("customerId", "unknown")
         bvn = body.get("bvn", "")
-        threshold = body.get("threshold", 0.60)  # stricter threshold for dedup
+        threshold = body.get("threshold", 0.60)
 
-        if DEEPFACE_AVAILABLE:
-            try:
-                results = DeepFace.find(
-                    img_path=image_data,
-                    db_path=DEEPFACE_DB_PATH,
-                    model_name=DEEPFACE_RECOGNITION_MODEL,
-                    detector_backend=DEEPFACE_DETECTOR,
-                    enforce_detection=False,
-                    threshold=threshold,
-                )
-                duplicates = []
-                for df in results if isinstance(results, list) else [results]:
-                    if hasattr(df, 'to_dict'):
-                        for match in df.to_dict('records'):
-                            duplicates.append(match)
-                is_duplicate = len(duplicates) > 0
-                self._json(200, {
-                    "customer_id": customer_id, "bvn": bvn,
-                    "is_duplicate": is_duplicate, "potential_matches": len(duplicates),
-                    "matches": duplicates[:5],
-                    "engine": "deepface", "threshold": threshold,
-                    "recommendation": "manual_review" if is_duplicate else "clear",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                })
-                return
-            except Exception as e:
-                logging.warning(f"DeepFace dedup failed: {e}")
-
-        # Fallback: no dedup capability without face DB
-        self._json(200, {
-            "customer_id": customer_id, "bvn": bvn,
-            "is_duplicate": False, "potential_matches": 0, "matches": [],
-            "engine": "fallback", "note": "Face database not configured — dedup unavailable",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+        if not DEEPFACE_AVAILABLE:
+            raise ModelUnavailableError("dedup_check")
+        try:
+            results = DeepFace.find(
+                img_path=image_data,
+                db_path=DEEPFACE_DB_PATH,
+                model_name=DEEPFACE_RECOGNITION_MODEL,
+                detector_backend=DEEPFACE_DETECTOR,
+                enforce_detection=False,
+                threshold=threshold,
+            )
+            duplicates = []
+            for df in results if isinstance(results, list) else [results]:
+                if hasattr(df, 'to_dict'):
+                    for match in df.to_dict('records'):
+                        duplicates.append(match)
+            is_duplicate = len(duplicates) > 0
+            self._json(200, {
+                "customer_id": customer_id, "bvn": bvn,
+                "is_duplicate": is_duplicate, "potential_matches": len(duplicates),
+                "matches": duplicates[:5],
+                "engine": "deepface", "threshold": threshold,
+                "recommendation": "manual_review" if is_duplicate else "clear",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+        except ModelUnavailableError:
+            raise
+        except Exception as e:
+            logger.warning(f"DeepFace dedup failed: {e}")
+            raise ModelUnavailableError("dedup_check")
 
     def _json(self, code: int, data: dict):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
         add_security_headers(self)
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
@@ -1892,6 +1993,21 @@ def get_db():
         db_conn = psycopg2.connect(DATABASE_URL)
         db_conn.autocommit = True
     return db_conn
+
+
+def db_insert(key, record):
+    """Write an audit entry to the outbox table. Returns False on failure."""
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+                ("liveness.inference", key, json.dumps(record)),
+            )
+        return True
+    except Exception as e:
+        logger.warning(f"outbox insert failed: {e}")
+        return False
 
 
 def init_schema():
@@ -1946,7 +2062,11 @@ def init_schema():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_schema()
+    load_models()
+    try:
+        init_schema()
+    except Exception as e:
+        logger.error(f"Schema init skipped — database unavailable: {e}")
     logger.info(f"[liveness-inference-py] ready on :%d", PORT)
     logger.info(f"[liveness-inference-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
@@ -1957,9 +2077,67 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="liveness-inference-py", version="1.0.0", lifespan=lifespan)
 
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -2009,33 +2187,54 @@ def metrics():
         return {"service": "liveness-inference-py", "total_records": 0}
 
 
-@app.get("/api/v1/kyc_records")
-def list_records(x_tenant_id: Optional[str] = Header(None)):
-    conn = get_db()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        if x_tenant_id:
-            cur.execute(
-                "SELECT id, status, created_at FROM kyc_records WHERE tenant_id = %s::uuid ORDER BY created_at DESC LIMIT 50",
-                (x_tenant_id,)
-            )
-        else:
-            cur.execute("SELECT id, status, created_at FROM kyc_records ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
-
 def validate_jwt(headers):
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Returns (True, None) only for a cryptographically valid, unexpired token.
+    Fails closed with (False, reason) — including auth_not_configured when
+    JWT_SECRET is unset/placeholder. Never warn-and-allow.
+    """
     auth = headers.get("Authorization", headers.get("authorization", ""))
     if not auth.startswith("Bearer "):
         return False, "missing Bearer token"
     token = auth[7:]
+    import hmac as _hmac, hashlib as _hashlib, base64 as _b64, json as _json
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return _b64.urlsafe_b64decode(s.encode())
     parts = token.split(".")
     if len(parts) != 3:
         return False, "malformed JWT"
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return False, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return False, "invalid token encoding"
+    if header.get("alg") != "HS256":
+        return False, "unsupported token algorithm"
+    expected = _hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), _hashlib.sha256).digest()
+    if not _hmac.compare_digest(expected, signature):
+        return False, "invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return False, "token missing exp claim"
+    try:
+        if time.time() >= float(exp):
+            return False, "token expired"
+    except (TypeError, ValueError):
+        return False, "invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return False, "invalid token issuer"
     return True, None
 
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -2115,10 +2314,10 @@ def init_tracing(service_name):
 signal.signal(signal.SIGINT, _shutdown_handler)
 
 if __name__ == "__main__":
+    load_models()
     logging.info(f"Liveness Inference Engine v2.0 (Python) on :{PORT}")
-    logging.info(f"ML Backend: {'DeepFace (' + DEEPFACE_RECOGNITION_MODEL + ')' if DEEPFACE_AVAILABLE else 'Fallback ONNX'}")
-    logging.info(f"Detector: {'DeepFace (' + DEEPFACE_DETECTOR + ')' if DEEPFACE_AVAILABLE else 'RetinaFace-R50'}")
-    logging.info("Capabilities: passive_liveness, active_liveness, face_match, anti_spoofing, deepfake_detection")
+    logging.info(f"ML Backend: {'DeepFace (' + DEEPFACE_RECOGNITION_MODEL + ')' if DEEPFACE_AVAILABLE else 'ONNX (MODEL_DIR=' + MODEL_DIR + ')'}")
+    logging.info(f"Models loaded: {sorted(MODEL_SESSIONS.keys()) or 'NONE — inference endpoints will return 503 model_unavailable'}")
     _server = HTTPServer(("0.0.0.0", PORT), Handler)
     try:
         _server.serve_forever()

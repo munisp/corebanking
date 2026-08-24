@@ -2,6 +2,8 @@ import { AppDataSource } from "../database/dataSource";
 import { KycVerificationWorkflowEntity } from "../entity/KycVerificationWorkflowEntity";
 import { NonRetriableApplicationError } from "../middlewares/error";
 import { VerificationWorkflowStatus } from "../utils/enums";
+import { lookupHash } from "../utils/fieldEncryption";
+import { maskIdentifier } from "../utils/piiMask";
 import logger from "../config/logger.config";
 
 export async function endKycVerificationWorkflow(
@@ -11,15 +13,18 @@ export async function endKycVerificationWorkflow(
   has_sent_webhook: boolean = false,
   metadata?: { keycloak_id?: string; tenant_id?: string; is_admin?: boolean },
 ) {
+  // M-53: the stored identifier is AES-256-GCM encrypted; equality lookups go
+  // through the keyed HMAC-SHA256 lookup hash.
   const kycVerification = await AppDataSource.manager.findOne(KycVerificationWorkflowEntity, {
     where: {
-      client_app_user_id,
+      client_app_user_id_hash: lookupHash(client_app_user_id),
       status: VerificationWorkflowStatus.RUNNING,
     },
   });
 
   if (!kycVerification) {
-    logger.error(`[endKycVerificationWorkflow] no RUNNING record found for client_app_user_id=${client_app_user_id}`);
+    // M-52: never log the full identifier — masked (last 3 chars only).
+    logger.error(`[endKycVerificationWorkflow] no RUNNING record found for client_app_user_id=${maskIdentifier(client_app_user_id)}`);
     throw new NonRetriableApplicationError("Invalid verification session.");
   }
 

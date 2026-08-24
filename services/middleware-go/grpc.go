@@ -14,17 +14,17 @@ import (
 // Implements: Teller→VirtualAccounts, TradeFinance→Identity, Mortgage→Regulatory, etc.
 
 type ServiceEndpoint struct {
-	Name    string `json:"name"`
-	Address string `json:"address"`
-	Port    int    `json:"port"`
-	Health  string `json:"health"` // "healthy", "degraded", "unhealthy"
+	Name     string    `json:"name"`
+	Address  string    `json:"address"`
+	Port     int       `json:"port"`
+	Health   string    `json:"health"` // "healthy", "degraded", "unhealthy"
 	LastPing time.Time `json:"lastPing"`
 }
 
 type ServiceMesh struct {
-	mu        sync.RWMutex
-	registry  map[string]*ServiceEndpoint
-	daprPort  int
+	mu       sync.RWMutex
+	registry map[string]*ServiceEndpoint
+	daprPort int
 }
 
 func NewServiceMesh() *ServiceMesh {
@@ -34,36 +34,36 @@ func NewServiceMesh() *ServiceMesh {
 	}
 	// Register all banking microservices
 	services := map[string]int{
-		"agriculture-banking":    8090,
-		"teller-operations":      8091,
-		"islamic-banking":        8092,
-		"trade-finance":          8093,
-		"mortgage-servicing":     8094,
-		"esusu-groups":           8095,
-		"virtual-accounts":       8096,
-		"agent-banking":          8097,
-		"group-lending":          8098,
-		"education-loans":        8099,
-		"ledger-reconciliation":  8100,
-		"identity-channels":      8101,
-		"dispute-management":     8102,
-		"erpnext-sync":           8103,
-		"regulatory-reporting":   8104,
-		"security-gateway":       8105,
-		"resilience-service":     8106,
-		"payments-hub":           8107,
-		"savings-products":       8108,
-		"card-management":        8109,
-		"treasury-liquidity":     8110,
-		"customer-engagement":    8111,
-		"fraud-detection":        8112,
+		"agriculture-banking":   8090,
+		"teller-operations":     8091,
+		"islamic-banking":       8092,
+		"trade-finance":         8093,
+		"mortgage-servicing":    8094,
+		"esusu-groups":          8095,
+		"virtual-accounts":      8096,
+		"agent-banking":         8097,
+		"group-lending":         8098,
+		"education-loans":       8099,
+		"ledger-reconciliation": 8100,
+		"identity-channels":     8101,
+		"dispute-management":    8102,
+		"erpnext-sync":          8103,
+		"regulatory-reporting":  8104,
+		"security-gateway":      8105,
+		"resilience-service":    8106,
+		"payments-hub":          8107,
+		"savings-products":      8108,
+		"card-management":       8109,
+		"treasury-liquidity":    8110,
+		"customer-engagement":   8111,
+		"fraud-detection":       8112,
 	}
 	for name, port := range services {
 		mesh.registry[name] = &ServiceEndpoint{
-			Name:    name,
-			Address: "localhost",
-			Port:    port,
-			Health:  "healthy",
+			Name:     name,
+			Address:  "localhost",
+			Port:     port,
+			Health:   "healthy",
 			LastPing: time.Now(),
 		}
 	}
@@ -87,9 +87,9 @@ func (m *ServiceMesh) Invoke(targetService, method, path string, body interface{
 
 	// Return simulated success for inter-service calls
 	return map[string]interface{}{
-		"status":  "ok",
-		"service": targetService,
-		"path":    path,
+		"status":    "ok",
+		"service":   targetService,
+		"path":      path,
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 	}, nil
 }

@@ -20,16 +20,16 @@ import (
 type APIKeyScope string
 
 const (
-	ScopeRead           APIKeyScope = "read"
-	ScopeWrite          APIKeyScope = "write"
-	ScopeTransfer       APIKeyScope = "transfer"
-	ScopeAdmin          APIKeyScope = "admin"
-	ScopeWebhooks       APIKeyScope = "webhooks"
-	ScopeReports        APIKeyScope = "reports"
-	ScopeAccounts       APIKeyScope = "accounts"
-	ScopePayments       APIKeyScope = "payments"
-	ScopeCards          APIKeyScope = "cards"
-	ScopeKYC            APIKeyScope = "kyc"
+	ScopeRead     APIKeyScope = "read"
+	ScopeWrite    APIKeyScope = "write"
+	ScopeTransfer APIKeyScope = "transfer"
+	ScopeAdmin    APIKeyScope = "admin"
+	ScopeWebhooks APIKeyScope = "webhooks"
+	ScopeReports  APIKeyScope = "reports"
+	ScopeAccounts APIKeyScope = "accounts"
+	ScopePayments APIKeyScope = "payments"
+	ScopeCards    APIKeyScope = "cards"
+	ScopeKYC      APIKeyScope = "kyc"
 )
 
 // APIKeyStatus represents the status of an API key
@@ -54,29 +54,29 @@ const (
 // APIKeyConfig holds configurable API key settings
 type APIKeyConfig struct {
 	// Key generation
-	KeyLength           int  `json:"key_length"`           // Length of the key in bytes
-	PrefixLive          string `json:"prefix_live"`        // Prefix for live keys
-	PrefixTest          string `json:"prefix_test"`        // Prefix for test keys
-	PrefixSandbox       string `json:"prefix_sandbox"`     // Prefix for sandbox keys
+	KeyLength     int    `json:"key_length"`     // Length of the key in bytes
+	PrefixLive    string `json:"prefix_live"`    // Prefix for live keys
+	PrefixTest    string `json:"prefix_test"`    // Prefix for test keys
+	PrefixSandbox string `json:"prefix_sandbox"` // Prefix for sandbox keys
 
 	// Expiration
-	DefaultExpiryDays   int  `json:"default_expiry_days"` // Default expiry in days (0 = never)
-	MaxExpiryDays       int  `json:"max_expiry_days"`     // Maximum allowed expiry
+	DefaultExpiryDays    int `json:"default_expiry_days"`    // Default expiry in days (0 = never)
+	MaxExpiryDays        int `json:"max_expiry_days"`        // Maximum allowed expiry
 	RotationReminderDays int `json:"rotation_reminder_days"` // Days before expiry to remind
 
 	// Rate limiting
-	DefaultRateLimit    int  `json:"default_rate_limit"`    // Requests per minute
-	MaxRateLimit        int  `json:"max_rate_limit"`        // Maximum allowed rate limit
-	BurstLimit          int  `json:"burst_limit"`           // Burst allowance
+	DefaultRateLimit int `json:"default_rate_limit"` // Requests per minute
+	MaxRateLimit     int `json:"max_rate_limit"`     // Maximum allowed rate limit
+	BurstLimit       int `json:"burst_limit"`        // Burst allowance
 
 	// IP binding
-	EnableIPBinding     bool `json:"enable_ip_binding"`     // Require IP whitelist
-	MaxIPsPerKey        int  `json:"max_ips_per_key"`       // Maximum IPs per key
+	EnableIPBinding bool `json:"enable_ip_binding"` // Require IP whitelist
+	MaxIPsPerKey    int  `json:"max_ips_per_key"`   // Maximum IPs per key
 
 	// Security
-	RequireMFA          bool `json:"require_mfa"`           // Require MFA for key creation
-	LogAllRequests      bool `json:"log_all_requests"`      // Log all API requests
-	AlertOnSuspicious   bool `json:"alert_on_suspicious"`   // Alert on suspicious activity
+	RequireMFA        bool `json:"require_mfa"`         // Require MFA for key creation
+	LogAllRequests    bool `json:"log_all_requests"`    // Log all API requests
+	AlertOnSuspicious bool `json:"alert_on_suspicious"` // Alert on suspicious activity
 }
 
 // DefaultAPIKeyConfig provides secure defaults
@@ -100,52 +100,52 @@ var DefaultAPIKeyConfig = APIKeyConfig{
 
 // APIKey represents an API key
 type APIKey struct {
-	ID              string       `json:"id"`
-	KeyHash         string       `json:"-"`                    // Stored hash, never exposed
-	KeyPrefix       string       `json:"key_prefix"`           // First 8 chars for identification
-	Name            string       `json:"name"`
-	Description     string       `json:"description,omitempty"`
-	UserID          string       `json:"user_id"`
-	TenantID        string       `json:"tenant_id"`
-	Type            APIKeyType   `json:"type"`
-	Status          APIKeyStatus `json:"status"`
-	Scopes          []APIKeyScope `json:"scopes"`
-	AllowedIPs      []string     `json:"allowed_ips,omitempty"`
-	RateLimit       int          `json:"rate_limit"`
-	BurstLimit      int          `json:"burst_limit"`
-	ExpiresAt       *time.Time   `json:"expires_at,omitempty"`
-	LastUsedAt      *time.Time   `json:"last_used_at,omitempty"`
-	LastUsedIP      string       `json:"last_used_ip,omitempty"`
-	UsageCount      int64        `json:"usage_count"`
-	CreatedAt       time.Time    `json:"created_at"`
-	UpdatedAt       time.Time    `json:"updated_at"`
-	CreatedBy       string       `json:"created_by"`
-	Metadata        map[string]interface{} `json:"metadata,omitempty"`
+	ID          string                 `json:"id"`
+	KeyHash     string                 `json:"-"`          // Stored hash, never exposed
+	KeyPrefix   string                 `json:"key_prefix"` // First 8 chars for identification
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	UserID      string                 `json:"user_id"`
+	TenantID    string                 `json:"tenant_id"`
+	Type        APIKeyType             `json:"type"`
+	Status      APIKeyStatus           `json:"status"`
+	Scopes      []APIKeyScope          `json:"scopes"`
+	AllowedIPs  []string               `json:"allowed_ips,omitempty"`
+	RateLimit   int                    `json:"rate_limit"`
+	BurstLimit  int                    `json:"burst_limit"`
+	ExpiresAt   *time.Time             `json:"expires_at,omitempty"`
+	LastUsedAt  *time.Time             `json:"last_used_at,omitempty"`
+	LastUsedIP  string                 `json:"last_used_ip,omitempty"`
+	UsageCount  int64                  `json:"usage_count"`
+	CreatedAt   time.Time              `json:"created_at"`
+	UpdatedAt   time.Time              `json:"updated_at"`
+	CreatedBy   string                 `json:"created_by"`
+	Metadata    map[string]interface{} `json:"metadata,omitempty"`
 }
 
 // APIKeyValidationResult represents the result of API key validation
 type APIKeyValidationResult struct {
-	Valid           bool         `json:"valid"`
-	Key             *APIKey      `json:"key,omitempty"`
-	Reasons         []string     `json:"reasons,omitempty"`
-	RateLimited     bool         `json:"rate_limited"`
-	RemainingQuota  int          `json:"remaining_quota"`
+	Valid          bool     `json:"valid"`
+	Key            *APIKey  `json:"key,omitempty"`
+	Reasons        []string `json:"reasons,omitempty"`
+	RateLimited    bool     `json:"rate_limited"`
+	RemainingQuota int      `json:"remaining_quota"`
 }
 
 // APIKeyUsageLog represents a log entry for API key usage
 type APIKeyUsageLog struct {
-	ID          string    `json:"id"`
-	KeyID       string    `json:"key_id"`
-	Endpoint    string    `json:"endpoint"`
-	Method      string    `json:"method"`
-	IPAddress   string    `json:"ip_address"`
-	UserAgent   string    `json:"user_agent"`
-	StatusCode  int       `json:"status_code"`
-	ResponseTime int64    `json:"response_time_ms"`
-	RequestSize int64     `json:"request_size"`
-	ResponseSize int64    `json:"response_size"`
-	Error       string    `json:"error,omitempty"`
-	Timestamp   time.Time `json:"timestamp"`
+	ID           string    `json:"id"`
+	KeyID        string    `json:"key_id"`
+	Endpoint     string    `json:"endpoint"`
+	Method       string    `json:"method"`
+	IPAddress    string    `json:"ip_address"`
+	UserAgent    string    `json:"user_agent"`
+	StatusCode   int       `json:"status_code"`
+	ResponseTime int64     `json:"response_time_ms"`
+	RequestSize  int64     `json:"request_size"`
+	ResponseSize int64     `json:"response_size"`
+	Error        string    `json:"error,omitempty"`
+	Timestamp    time.Time `json:"timestamp"`
 }
 
 // APIKeySecurityManager manages API key security

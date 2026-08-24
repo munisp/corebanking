@@ -31,40 +31,40 @@ func (s *ActivityService) initializeDefaultData(tenantID string) {
 
 	// Recent call
 	s.activities["act-001"] = &Activity{
-		ActivityID:   "act-001",
-		TenantID:     tenantID,
-		CustomerID:   "cust-001",
-		CustomerName: "Adaeze Okonkwo",
-		ActivityType: "call",
-		Subject:      "Quarterly Portfolio Review",
-		Description:  "Discussed investment performance and upcoming opportunities",
-		Outcome:      "Customer interested in T-Bills allocation",
-		FollowUpDate: &followUp1,
+		ActivityID:    "act-001",
+		TenantID:      tenantID,
+		CustomerID:    "cust-001",
+		CustomerName:  "Adaeze Okonkwo",
+		ActivityType:  "call",
+		Subject:       "Quarterly Portfolio Review",
+		Description:   "Discussed investment performance and upcoming opportunities",
+		Outcome:       "Customer interested in T-Bills allocation",
+		FollowUpDate:  &followUp1,
 		FollowUpNotes: "Send T-Bills proposal",
-		RMID:         "rm-001",
-		Duration:     30,
-		Metadata:     make(map[string]interface{}),
-		CreatedAt:    time.Now().AddDate(0, 0, -2),
-		UpdatedAt:    time.Now().AddDate(0, 0, -2),
+		RMID:          "rm-001",
+		Duration:      30,
+		Metadata:      make(map[string]interface{}),
+		CreatedAt:     time.Now().AddDate(0, 0, -2),
+		UpdatedAt:     time.Now().AddDate(0, 0, -2),
 	}
 
 	// Meeting
 	s.activities["act-002"] = &Activity{
-		ActivityID:   "act-002",
-		TenantID:     tenantID,
-		CustomerID:   "cust-002",
-		CustomerName: "Dangote Industries Ltd",
-		ActivityType: "meeting",
-		Subject:      "Working Capital Facility Discussion",
-		Description:  "Met with CFO to discuss expanded working capital needs",
-		Outcome:      "Agreed on terms, pending board approval",
-		FollowUpDate: &followUp2,
+		ActivityID:    "act-002",
+		TenantID:      tenantID,
+		CustomerID:    "cust-002",
+		CustomerName:  "Dangote Industries Ltd",
+		ActivityType:  "meeting",
+		Subject:       "Working Capital Facility Discussion",
+		Description:   "Met with CFO to discuss expanded working capital needs",
+		Outcome:       "Agreed on terms, pending board approval",
+		FollowUpDate:  &followUp2,
 		FollowUpNotes: "Follow up on board decision",
-		RMID:         "rm-001",
-		Duration:     60,
-		Metadata:     make(map[string]interface{}),
-		CreatedAt:    time.Now().AddDate(0, 0, -5),
-		UpdatedAt:    time.Now().AddDate(0, 0, -5),
+		RMID:          "rm-001",
+		Duration:      60,
+		Metadata:      make(map[string]interface{}),
+		CreatedAt:     time.Now().AddDate(0, 0, -5),
+		UpdatedAt:     time.Now().AddDate(0, 0, -5),
 	}
 
 	// Email
@@ -104,21 +104,21 @@ func (s *ActivityService) initializeDefaultData(tenantID string) {
 	// Annual review
 	overdueFollowUp := time.Now().AddDate(0, 0, -2)
 	s.activities["act-005"] = &Activity{
-		ActivityID:   "act-005",
-		TenantID:     tenantID,
-		CustomerID:   "cust-005",
-		CustomerName: "Folake Adeyemi",
-		ActivityType: "review",
-		Subject:      "Annual Relationship Review",
-		Description:  "Conducted annual review, customer expressed concerns about service",
-		Outcome:      "Need to address service issues urgently",
-		FollowUpDate: &overdueFollowUp,
+		ActivityID:    "act-005",
+		TenantID:      tenantID,
+		CustomerID:    "cust-005",
+		CustomerName:  "Folake Adeyemi",
+		ActivityType:  "review",
+		Subject:       "Annual Relationship Review",
+		Description:   "Conducted annual review, customer expressed concerns about service",
+		Outcome:       "Need to address service issues urgently",
+		FollowUpDate:  &overdueFollowUp,
 		FollowUpNotes: "Schedule meeting with branch manager",
-		RMID:         "rm-001",
-		Duration:     45,
-		Metadata:     make(map[string]interface{}),
-		CreatedAt:    time.Now().AddDate(0, 0, -7),
-		UpdatedAt:    time.Now().AddDate(0, 0, -7),
+		RMID:          "rm-001",
+		Duration:      45,
+		Metadata:      make(map[string]interface{}),
+		CreatedAt:     time.Now().AddDate(0, 0, -7),
+		UpdatedAt:     time.Now().AddDate(0, 0, -7),
 	}
 }
 
@@ -302,8 +302,8 @@ func (s *ActivityService) GetActivityStats(tenantID, rmID string) map[string]int
 	}
 
 	return map[string]interface{}{
-		"today":           today,
-		"thisWeek":        thisWeek,
+		"today":            today,
+		"thisWeek":         thisWeek,
 		"pendingFollowUps": pendingFollowUps,
 	}
 }

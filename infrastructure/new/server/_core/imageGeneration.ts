@@ -26,8 +26,7 @@ export type GenerateImageResult = {
 
 export async function generateImage(params: GenerateImageParams): Promise<GenerateImageResult> {
   // Ollama does not require an API key — no assertion needed
-    // (key is optional for Ollama)
-  }
+  // (key is optional for Ollama)
 
   const base = (ENV.ollamaApiBase ?? "http://ollama:11434").replace(/\/$/, "");
   const response = await fetch(`${base}/images/generations`, {

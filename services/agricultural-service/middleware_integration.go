@@ -242,22 +242,22 @@ type AgricultureEvent struct {
 }
 
 const (
-	EventFarmerRegistered      = "FARMER_REGISTERED"
+	EventFarmerRegistered         = "FARMER_REGISTERED"
 	EventLoanApplicationSubmitted = "LOAN_APPLICATION_SUBMITTED"
-	EventLoanApproved          = "LOAN_APPROVED"
-	EventLoanDisbursed         = "LOAN_DISBURSED"
-	EventLoanRepaymentReceived = "LOAN_REPAYMENT_RECEIVED"
-	EventLoanDefaulted         = "LOAN_DEFAULTED"
-	EventInsurancePolicyCreated = "INSURANCE_POLICY_CREATED"
-	EventInsuranceClaimFiled   = "INSURANCE_CLAIM_FILED"
-	EventInsuranceClaimApproved = "INSURANCE_CLAIM_APPROVED"
-	EventInsuranceClaimPaid    = "INSURANCE_CLAIM_PAID"
-	EventWeatherAlertTriggered = "WEATHER_ALERT_TRIGGERED"
-	EventCropHealthAlert       = "CROP_HEALTH_ALERT"
-	EventHarvestRecorded       = "HARVEST_RECORDED"
-	EventMarketPriceUpdate     = "MARKET_PRICE_UPDATE"
-	EventInputPurchased        = "INPUT_PURCHASED"
-	EventSatelliteDataReceived = "SATELLITE_DATA_RECEIVED"
+	EventLoanApproved             = "LOAN_APPROVED"
+	EventLoanDisbursed            = "LOAN_DISBURSED"
+	EventLoanRepaymentReceived    = "LOAN_REPAYMENT_RECEIVED"
+	EventLoanDefaulted            = "LOAN_DEFAULTED"
+	EventInsurancePolicyCreated   = "INSURANCE_POLICY_CREATED"
+	EventInsuranceClaimFiled      = "INSURANCE_CLAIM_FILED"
+	EventInsuranceClaimApproved   = "INSURANCE_CLAIM_APPROVED"
+	EventInsuranceClaimPaid       = "INSURANCE_CLAIM_PAID"
+	EventWeatherAlertTriggered    = "WEATHER_ALERT_TRIGGERED"
+	EventCropHealthAlert          = "CROP_HEALTH_ALERT"
+	EventHarvestRecorded          = "HARVEST_RECORDED"
+	EventMarketPriceUpdate        = "MARKET_PRICE_UPDATE"
+	EventInputPurchased           = "INPUT_PURCHASED"
+	EventSatelliteDataReceived    = "SATELLITE_DATA_RECEIVED"
 )
 
 func NewKafkaProducer(brokers []string) *KafkaProducer {
@@ -380,12 +380,12 @@ type InsuranceClaimInput struct {
 }
 
 type HarvestFinancingInput struct {
-	FarmerID    string  `json:"farmer_id"`
-	BuyerID     string  `json:"buyer_id"`
-	CropType    string  `json:"crop_type"`
-	Quantity    float64 `json:"quantity"`
-	PricePerKg  float64 `json:"price_per_kg"`
-	DeliveryDate string `json:"delivery_date"`
+	FarmerID     string  `json:"farmer_id"`
+	BuyerID      string  `json:"buyer_id"`
+	CropType     string  `json:"crop_type"`
+	Quantity     float64 `json:"quantity"`
+	PricePerKg   float64 `json:"price_per_kg"`
+	DeliveryDate string  `json:"delivery_date"`
 }
 
 func NewTemporalClient(hostPort, namespace string) *TemporalClient {
@@ -607,11 +607,11 @@ func (s *IntegratedAgricultureService) ApplyForLoan(ctx context.Context, input L
 		FarmerID:  input.FarmerID,
 		Timestamp: time.Now(),
 		Data: map[string]interface{}{
-			"loan_type":        input.LoanType,
-			"amount":           input.Amount,
-			"purpose":          input.Purpose,
-			"crop_type":        input.CropType,
-			"workflow_id":      workflowID,
+			"loan_type":   input.LoanType,
+			"amount":      input.Amount,
+			"purpose":     input.Purpose,
+			"crop_type":   input.CropType,
+			"workflow_id": workflowID,
 		},
 	}
 	_ = s.kafka.PublishEvent(ctx, event)

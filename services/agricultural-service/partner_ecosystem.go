@@ -16,26 +16,26 @@ import (
 
 // Partner represents an ecosystem partner
 type Partner struct {
-	ID                string    `json:"id"`
-	PartnerType       string    `json:"partner_type"` // input_supplier, off_taker, warehouse, insurer, logistics, agtech
-	Name              string    `json:"name"`
-	RegistrationNumber string   `json:"registration_number"`
-	ContactPerson     string    `json:"contact_person"`
-	Email             string    `json:"email"`
-	Phone             string    `json:"phone"`
-	Address           string    `json:"address"`
-	State             string    `json:"state"`
-	LGA               string    `json:"lga"`
-	BankAccount       BankAccount `json:"bank_account"`
-	ServicesOffered   []string  `json:"services_offered"`
-	CoverageAreas     []string  `json:"coverage_areas"`
-	Certifications    []string  `json:"certifications"`
-	Rating            float64   `json:"rating"`
-	TotalTransactions int       `json:"total_transactions"`
-	TotalVolume       float64   `json:"total_volume"`
-	Status            string    `json:"status"` // pending, active, suspended, inactive
-	OnboardedAt       time.Time `json:"onboarded_at"`
-	LastActivityAt    time.Time `json:"last_activity_at"`
+	ID                 string      `json:"id"`
+	PartnerType        string      `json:"partner_type"` // input_supplier, off_taker, warehouse, insurer, logistics, agtech
+	Name               string      `json:"name"`
+	RegistrationNumber string      `json:"registration_number"`
+	ContactPerson      string      `json:"contact_person"`
+	Email              string      `json:"email"`
+	Phone              string      `json:"phone"`
+	Address            string      `json:"address"`
+	State              string      `json:"state"`
+	LGA                string      `json:"lga"`
+	BankAccount        BankAccount `json:"bank_account"`
+	ServicesOffered    []string    `json:"services_offered"`
+	CoverageAreas      []string    `json:"coverage_areas"`
+	Certifications     []string    `json:"certifications"`
+	Rating             float64     `json:"rating"`
+	TotalTransactions  int         `json:"total_transactions"`
+	TotalVolume        float64     `json:"total_volume"`
+	Status             string      `json:"status"` // pending, active, suspended, inactive
+	OnboardedAt        time.Time   `json:"onboarded_at"`
+	LastActivityAt     time.Time   `json:"last_activity_at"`
 }
 
 // BankAccount for partner payments
@@ -61,14 +61,14 @@ type EcosystemInputSupplier struct {
 // EcosystemOffTaker extends Partner for aggregators/processors
 type EcosystemOffTaker struct {
 	Partner
-	CommoditiesBought []string `json:"commodities_bought"`
-	ProcessingCapacity float64 `json:"processing_capacity_tonnes_day"`
-	StorageCapacity   float64  `json:"storage_capacity_tonnes"`
-	ExportLicense     bool     `json:"export_license"`
-	QualityGrades     []string `json:"quality_grades_accepted"`
-	PaymentTermsDays  int      `json:"payment_terms_days"`
-	ContractFarming   bool     `json:"contract_farming"`
-	MinPurchaseVolume float64  `json:"min_purchase_volume_tonnes"`
+	CommoditiesBought  []string `json:"commodities_bought"`
+	ProcessingCapacity float64  `json:"processing_capacity_tonnes_day"`
+	StorageCapacity    float64  `json:"storage_capacity_tonnes"`
+	ExportLicense      bool     `json:"export_license"`
+	QualityGrades      []string `json:"quality_grades_accepted"`
+	PaymentTermsDays   int      `json:"payment_terms_days"`
+	ContractFarming    bool     `json:"contract_farming"`
+	MinPurchaseVolume  float64  `json:"min_purchase_volume_tonnes"`
 }
 
 // Warehouse extends Partner for storage facilities
@@ -87,31 +87,31 @@ type Warehouse struct {
 
 // GovernmentProgram represents intervention programs
 type GovernmentProgram struct {
-	ID                  string    `json:"id"`
-	ProgramCode         string    `json:"program_code"`
-	Name                string    `json:"name"`
-	Sponsor             string    `json:"sponsor"` // CBN, FGN, State, DFI
-	Description         string    `json:"description"`
-	ProgramType         string    `json:"program_type"` // credit, guarantee, subsidy, grant
-	EligibilityCriteria []EligibilityCriterion `json:"eligibility_criteria"`
-	Benefits            []ProgramBenefit `json:"benefits"`
-	RequiredDocuments   []string  `json:"required_documents"`
-	ApplicationProcess  []string  `json:"application_process"`
-	MaxBenefitAmount    float64   `json:"max_benefit_amount"`
-	InterestRate        float64   `json:"interest_rate,omitempty"`
-	TenorMonths         int       `json:"tenor_months,omitempty"`
-	GracePeriodMonths   int       `json:"grace_period_months,omitempty"`
-	GuaranteePercent    float64   `json:"guarantee_percent,omitempty"`
-	SubsidyPercent      float64   `json:"subsidy_percent,omitempty"`
-	TargetBeneficiaries int       `json:"target_beneficiaries"`
-	CurrentBeneficiaries int      `json:"current_beneficiaries"`
-	TotalDisbursed      float64   `json:"total_disbursed"`
-	BudgetAllocated     float64   `json:"budget_allocated"`
-	BudgetUtilized      float64   `json:"budget_utilized"`
-	StartDate           time.Time `json:"start_date"`
-	EndDate             time.Time `json:"end_date"`
-	Status              string    `json:"status"`
-	MEDataRequired      []string  `json:"me_data_required"` // M&E data to collect
+	ID                   string                 `json:"id"`
+	ProgramCode          string                 `json:"program_code"`
+	Name                 string                 `json:"name"`
+	Sponsor              string                 `json:"sponsor"` // CBN, FGN, State, DFI
+	Description          string                 `json:"description"`
+	ProgramType          string                 `json:"program_type"` // credit, guarantee, subsidy, grant
+	EligibilityCriteria  []EligibilityCriterion `json:"eligibility_criteria"`
+	Benefits             []ProgramBenefit       `json:"benefits"`
+	RequiredDocuments    []string               `json:"required_documents"`
+	ApplicationProcess   []string               `json:"application_process"`
+	MaxBenefitAmount     float64                `json:"max_benefit_amount"`
+	InterestRate         float64                `json:"interest_rate,omitempty"`
+	TenorMonths          int                    `json:"tenor_months,omitempty"`
+	GracePeriodMonths    int                    `json:"grace_period_months,omitempty"`
+	GuaranteePercent     float64                `json:"guarantee_percent,omitempty"`
+	SubsidyPercent       float64                `json:"subsidy_percent,omitempty"`
+	TargetBeneficiaries  int                    `json:"target_beneficiaries"`
+	CurrentBeneficiaries int                    `json:"current_beneficiaries"`
+	TotalDisbursed       float64                `json:"total_disbursed"`
+	BudgetAllocated      float64                `json:"budget_allocated"`
+	BudgetUtilized       float64                `json:"budget_utilized"`
+	StartDate            time.Time              `json:"start_date"`
+	EndDate              time.Time              `json:"end_date"`
+	Status               string                 `json:"status"`
+	MEDataRequired       []string               `json:"me_data_required"` // M&E data to collect
 }
 
 // EligibilityCriterion for program qualification
@@ -132,19 +132,19 @@ type ProgramBenefit struct {
 
 // ProgramEnrollment tracks farmer enrollment in programs
 type ProgramEnrollment struct {
-	ID              string    `json:"id"`
-	ProgramID       string    `json:"program_id"`
-	FarmerID        string    `json:"farmer_id"`
-	CooperativeID   string    `json:"cooperative_id,omitempty"`
-	ApplicationDate time.Time `json:"application_date"`
-	Status          string    `json:"status"` // pending, approved, active, completed, rejected
-	ApprovedAmount  float64   `json:"approved_amount"`
-	DisbursedAmount float64   `json:"disbursed_amount"`
-	RepaidAmount    float64   `json:"repaid_amount"`
-	LinkedLoanID    string    `json:"linked_loan_id,omitempty"`
+	ID              string                 `json:"id"`
+	ProgramID       string                 `json:"program_id"`
+	FarmerID        string                 `json:"farmer_id"`
+	CooperativeID   string                 `json:"cooperative_id,omitempty"`
+	ApplicationDate time.Time              `json:"application_date"`
+	Status          string                 `json:"status"` // pending, approved, active, completed, rejected
+	ApprovedAmount  float64                `json:"approved_amount"`
+	DisbursedAmount float64                `json:"disbursed_amount"`
+	RepaidAmount    float64                `json:"repaid_amount"`
+	LinkedLoanID    string                 `json:"linked_loan_id,omitempty"`
 	MEData          map[string]interface{} `json:"me_data"`
-	CreatedAt       time.Time `json:"created_at"`
-	UpdatedAt       time.Time `json:"updated_at"`
+	CreatedAt       time.Time              `json:"created_at"`
+	UpdatedAt       time.Time              `json:"updated_at"`
 }
 
 // PartnerTransaction records transactions with partners
@@ -182,21 +182,21 @@ var governmentPrograms = []GovernmentProgram{
 			{Type: "subsidy", Description: "Input subsidy", Value: 50.0, Unit: "percent"},
 			{Type: "guarantee", Description: "NIRSAL guarantee coverage", Value: 75.0, Unit: "percent"},
 		},
-		RequiredDocuments: []string{"BVN", "Farm registration", "Cooperative membership", "Anchor agreement"},
-		MaxBenefitAmount:  500000,
-		InterestRate:      9.0,
-		TenorMonths:       12,
-		GracePeriodMonths: 6,
-		GuaranteePercent:  75,
-		TargetBeneficiaries: 1000000,
+		RequiredDocuments:    []string{"BVN", "Farm registration", "Cooperative membership", "Anchor agreement"},
+		MaxBenefitAmount:     500000,
+		InterestRate:         9.0,
+		TenorMonths:          12,
+		GracePeriodMonths:    6,
+		GuaranteePercent:     75,
+		TargetBeneficiaries:  1000000,
 		CurrentBeneficiaries: 450000,
-		TotalDisbursed:    225000000000,
-		BudgetAllocated:   500000000000,
-		BudgetUtilized:    225000000000,
-		StartDate:         time.Date(2015, 11, 1, 0, 0, 0, 0, time.UTC),
-		EndDate:           time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC),
-		Status:            "active",
-		MEDataRequired:    []string{"yield_achieved", "income_generated", "repayment_status", "employment_created"},
+		TotalDisbursed:       225000000000,
+		BudgetAllocated:      500000000000,
+		BudgetUtilized:       225000000000,
+		StartDate:            time.Date(2015, 11, 1, 0, 0, 0, 0, time.UTC),
+		EndDate:              time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC),
+		Status:               "active",
+		MEDataRequired:       []string{"yield_achieved", "income_generated", "repayment_status", "employment_created"},
 	},
 	{
 		ID:          "PROG-AGSMEIS-001",
@@ -214,20 +214,20 @@ var governmentPrograms = []GovernmentProgram{
 			{Type: "loan", Description: "Business financing at 9% p.a.", Value: 9.0, Unit: "percent_pa"},
 			{Type: "training", Description: "Free entrepreneurship training"},
 		},
-		RequiredDocuments: []string{"CAC certificate", "Business plan", "Training certificate", "BVN"},
-		MaxBenefitAmount:  10000000,
-		InterestRate:      9.0,
-		TenorMonths:       84,
-		GracePeriodMonths: 18,
-		TargetBeneficiaries: 100000,
+		RequiredDocuments:    []string{"CAC certificate", "Business plan", "Training certificate", "BVN"},
+		MaxBenefitAmount:     10000000,
+		InterestRate:         9.0,
+		TenorMonths:          84,
+		GracePeriodMonths:    18,
+		TargetBeneficiaries:  100000,
 		CurrentBeneficiaries: 35000,
-		TotalDisbursed:    175000000000,
-		BudgetAllocated:   500000000000,
-		BudgetUtilized:    175000000000,
-		StartDate:         time.Date(2017, 1, 1, 0, 0, 0, 0, time.UTC),
-		EndDate:           time.Date(2027, 12, 31, 0, 0, 0, 0, time.UTC),
-		Status:            "active",
-		MEDataRequired:    []string{"revenue_growth", "jobs_created", "export_value"},
+		TotalDisbursed:       175000000000,
+		BudgetAllocated:      500000000000,
+		BudgetUtilized:       175000000000,
+		StartDate:            time.Date(2017, 1, 1, 0, 0, 0, 0, time.UTC),
+		EndDate:              time.Date(2027, 12, 31, 0, 0, 0, 0, time.UTC),
+		Status:               "active",
+		MEDataRequired:       []string{"revenue_growth", "jobs_created", "export_value"},
 	},
 	{
 		ID:          "PROG-CACS-001",
@@ -244,20 +244,20 @@ var governmentPrograms = []GovernmentProgram{
 		Benefits: []ProgramBenefit{
 			{Type: "loan", Description: "Long-term financing at 9% p.a.", Value: 9.0, Unit: "percent_pa"},
 		},
-		RequiredDocuments: []string{"CAC certificate", "Feasibility study", "Collateral documents", "Financial statements"},
-		MaxBenefitAmount:  2000000000,
-		InterestRate:      9.0,
-		TenorMonths:       84,
-		GracePeriodMonths: 24,
-		TargetBeneficiaries: 5000,
+		RequiredDocuments:    []string{"CAC certificate", "Feasibility study", "Collateral documents", "Financial statements"},
+		MaxBenefitAmount:     2000000000,
+		InterestRate:         9.0,
+		TenorMonths:          84,
+		GracePeriodMonths:    24,
+		TargetBeneficiaries:  5000,
 		CurrentBeneficiaries: 1200,
-		TotalDisbursed:    600000000000,
-		BudgetAllocated:   1000000000000,
-		BudgetUtilized:    600000000000,
-		StartDate:         time.Date(2009, 1, 1, 0, 0, 0, 0, time.UTC),
-		EndDate:           time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC),
-		Status:            "active",
-		MEDataRequired:    []string{"production_volume", "employment", "export_earnings"},
+		TotalDisbursed:       600000000000,
+		BudgetAllocated:      1000000000000,
+		BudgetUtilized:       600000000000,
+		StartDate:            time.Date(2009, 1, 1, 0, 0, 0, 0, time.UTC),
+		EndDate:              time.Date(2025, 12, 31, 0, 0, 0, 0, time.UTC),
+		Status:               "active",
+		MEDataRequired:       []string{"production_volume", "employment", "export_earnings"},
 	},
 	{
 		ID:          "PROG-ACGSF-001",
@@ -273,53 +273,53 @@ var governmentPrograms = []GovernmentProgram{
 		Benefits: []ProgramBenefit{
 			{Type: "guarantee", Description: "75% guarantee coverage", Value: 75.0, Unit: "percent"},
 		},
-		RequiredDocuments: []string{"BVN", "Farm/business registration", "Loan application"},
-		MaxBenefitAmount:  50000000,
-		GuaranteePercent:  75,
-		TargetBeneficiaries: 500000,
+		RequiredDocuments:    []string{"BVN", "Farm/business registration", "Loan application"},
+		MaxBenefitAmount:     50000000,
+		GuaranteePercent:     75,
+		TargetBeneficiaries:  500000,
 		CurrentBeneficiaries: 180000,
-		TotalDisbursed:    90000000000,
-		BudgetAllocated:   200000000000,
-		BudgetUtilized:    90000000000,
-		StartDate:         time.Date(1978, 1, 1, 0, 0, 0, 0, time.UTC),
-		EndDate:           time.Date(2030, 12, 31, 0, 0, 0, 0, time.UTC),
-		Status:            "active",
-		MEDataRequired:    []string{"loan_performance", "default_rate"},
+		TotalDisbursed:       90000000000,
+		BudgetAllocated:      200000000000,
+		BudgetUtilized:       90000000000,
+		StartDate:            time.Date(1978, 1, 1, 0, 0, 0, 0, time.UTC),
+		EndDate:              time.Date(2030, 12, 31, 0, 0, 0, 0, time.UTC),
+		Status:               "active",
+		MEDataRequired:       []string{"loan_performance", "default_rate"},
 	},
 }
 
 // Sample partners
 var samplePartners = []Partner{
 	{
-		ID:          "PART-INP-001",
-		PartnerType: "input_supplier",
-		Name:        "Notore Agro Dealers",
-		State:       "Kano",
-		LGA:         "Kano Municipal",
+		ID:              "PART-INP-001",
+		PartnerType:     "input_supplier",
+		Name:            "Notore Agro Dealers",
+		State:           "Kano",
+		LGA:             "Kano Municipal",
 		ServicesOffered: []string{"fertilizer", "seed", "pesticide"},
-		CoverageAreas: []string{"Kano", "Kaduna", "Katsina", "Jigawa"},
-		Rating:      4.5,
-		Status:      "active",
+		CoverageAreas:   []string{"Kano", "Kaduna", "Katsina", "Jigawa"},
+		Rating:          4.5,
+		Status:          "active",
 	},
 	{
-		ID:          "PART-OFF-001",
-		PartnerType: "off_taker",
-		Name:        "Olam Nigeria Limited",
-		State:       "Lagos",
+		ID:              "PART-OFF-001",
+		PartnerType:     "off_taker",
+		Name:            "Olam Nigeria Limited",
+		State:           "Lagos",
 		ServicesOffered: []string{"rice_purchase", "processing", "export"},
-		CoverageAreas: []string{"nationwide"},
-		Rating:      4.8,
-		Status:      "active",
+		CoverageAreas:   []string{"nationwide"},
+		Rating:          4.8,
+		Status:          "active",
 	},
 	{
-		ID:          "PART-WH-001",
-		PartnerType: "warehouse",
-		Name:        "AFEX Commodities Exchange",
-		State:       "Abuja",
+		ID:              "PART-WH-001",
+		PartnerType:     "warehouse",
+		Name:            "AFEX Commodities Exchange",
+		State:           "Abuja",
 		ServicesOffered: []string{"storage", "grading", "receipt_financing"},
-		CoverageAreas: []string{"North Central", "North West"},
-		Rating:      4.7,
-		Status:      "active",
+		CoverageAreas:   []string{"North Central", "North West"},
+		Rating:          4.7,
+		Status:          "active",
 	},
 }
 
@@ -328,7 +328,7 @@ var samplePartners = []Partner{
 func handleGetPartners(w http.ResponseWriter, r *http.Request) {
 	partnerType := r.URL.Query().Get("type")
 	state := r.URL.Query().Get("state")
-	
+
 	filtered := make([]Partner, 0)
 	for _, p := range samplePartners {
 		if partnerType != "" && p.PartnerType != partnerType {
@@ -339,7 +339,7 @@ func handleGetPartners(w http.ResponseWriter, r *http.Request) {
 		}
 		filtered = append(filtered, p)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"partners": filtered,
@@ -352,7 +352,7 @@ func handleOnboardPartner(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	var request struct {
 		PartnerType        string   `json:"partner_type"`
 		Name               string   `json:"name"`
@@ -369,12 +369,12 @@ func handleOnboardPartner(w http.ResponseWriter, r *http.Request) {
 		AccountNumber      string   `json:"account_number"`
 		AccountName        string   `json:"account_name"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	partner := Partner{
 		ID:                 fmt.Sprintf("PART-%s-%d", request.PartnerType[:3], time.Now().UnixNano()%100000),
 		PartnerType:        request.PartnerType,
@@ -397,7 +397,7 @@ func handleOnboardPartner(w http.ResponseWriter, r *http.Request) {
 		Status:          "pending",
 		OnboardedAt:     time.Now(),
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -415,7 +415,7 @@ func handleOnboardPartner(w http.ResponseWriter, r *http.Request) {
 func handleGetGovernmentPrograms(w http.ResponseWriter, r *http.Request) {
 	programType := r.URL.Query().Get("type")
 	status := r.URL.Query().Get("status")
-	
+
 	filtered := make([]GovernmentProgram, 0)
 	for _, p := range governmentPrograms {
 		if programType != "" && p.ProgramType != programType {
@@ -426,15 +426,33 @@ func handleGetGovernmentPrograms(w http.ResponseWriter, r *http.Request) {
 		}
 		filtered = append(filtered, p)
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"programs": filtered,
 		"count":    len(filtered),
 		"summary": map[string]interface{}{
-			"total_budget":        func() float64 { t := 0.0; for _, p := range filtered { t += p.BudgetAllocated }; return t }(),
-			"total_utilized":      func() float64 { t := 0.0; for _, p := range filtered { t += p.BudgetUtilized }; return t }(),
-			"total_beneficiaries": func() int { t := 0; for _, p := range filtered { t += p.CurrentBeneficiaries }; return t }(),
+			"total_budget": func() float64 {
+				t := 0.0
+				for _, p := range filtered {
+					t += p.BudgetAllocated
+				}
+				return t
+			}(),
+			"total_utilized": func() float64 {
+				t := 0.0
+				for _, p := range filtered {
+					t += p.BudgetUtilized
+				}
+				return t
+			}(),
+			"total_beneficiaries": func() int {
+				t := 0
+				for _, p := range filtered {
+					t += p.CurrentBeneficiaries
+				}
+				return t
+			}(),
 		},
 	})
 }
@@ -445,7 +463,7 @@ func handleCheckProgramEligibility(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "farmer_id is required", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Mock farmer data - in production, this would query the database
 	farmerData := map[string]interface{}{
 		"farmer_type":        "smallholder",
@@ -456,17 +474,17 @@ func handleCheckProgramEligibility(w http.ResponseWriter, r *http.Request) {
 		"training_completed": true,
 		"activity":           "crop_production",
 	}
-	
+
 	eligiblePrograms := []map[string]interface{}{}
-	
+
 	for _, program := range governmentPrograms {
 		eligible := true
 		criteriaResults := []map[string]interface{}{}
-		
+
 		for _, criterion := range program.EligibilityCriteria {
 			met := false
 			farmerValue := farmerData[criterion.Field]
-			
+
 			switch criterion.Operator {
 			case "equals":
 				met = farmerValue == criterion.Value
@@ -494,32 +512,32 @@ func handleCheckProgramEligibility(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 			}
-			
+
 			criteriaResults = append(criteriaResults, map[string]interface{}{
-				"criterion":   criterion.Description,
-				"met":         met,
-				"your_value":  farmerValue,
-				"required":    criterion.Value,
+				"criterion":  criterion.Description,
+				"met":        met,
+				"your_value": farmerValue,
+				"required":   criterion.Value,
 			})
-			
+
 			if !met {
 				eligible = false
 			}
 		}
-		
+
 		if eligible {
 			eligiblePrograms = append(eligiblePrograms, map[string]interface{}{
-				"program_id":      program.ID,
-				"program_name":    program.Name,
-				"sponsor":         program.Sponsor,
-				"max_benefit":     program.MaxBenefitAmount,
-				"interest_rate":   program.InterestRate,
-				"criteria_check":  criteriaResults,
-				"apply_now":       true,
+				"program_id":     program.ID,
+				"program_name":   program.Name,
+				"sponsor":        program.Sponsor,
+				"max_benefit":    program.MaxBenefitAmount,
+				"interest_rate":  program.InterestRate,
+				"criteria_check": criteriaResults,
+				"apply_now":      true,
 			})
 		}
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"farmer_id":         farmerID,
@@ -534,19 +552,19 @@ func handleEnrollInProgram(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	var request struct {
-		ProgramID     string  `json:"program_id"`
-		FarmerID      string  `json:"farmer_id"`
-		CooperativeID string  `json:"cooperative_id,omitempty"`
+		ProgramID       string  `json:"program_id"`
+		FarmerID        string  `json:"farmer_id"`
+		CooperativeID   string  `json:"cooperative_id,omitempty"`
 		RequestedAmount float64 `json:"requested_amount"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	enrollment := ProgramEnrollment{
 		ID:              fmt.Sprintf("ENR-%d", time.Now().UnixNano()),
 		ProgramID:       request.ProgramID,
@@ -561,7 +579,7 @@ func handleEnrollInProgram(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:       time.Now(),
 		UpdatedAt:       time.Now(),
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -580,7 +598,7 @@ func handleConfigureProgram(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	var request struct {
 		ProgramCode         string                 `json:"program_code"`
 		Name                string                 `json:"name"`
@@ -597,15 +615,15 @@ func handleConfigureProgram(w http.ResponseWriter, r *http.Request) {
 		EndDate             string                 `json:"end_date"`
 		MEDataRequired      []string               `json:"me_data_required"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	startDate, _ := time.Parse("2006-01-02", request.StartDate)
 	endDate, _ := time.Parse("2006-01-02", request.EndDate)
-	
+
 	program := GovernmentProgram{
 		ID:                  fmt.Sprintf("PROG-%s-%d", request.ProgramCode, time.Now().UnixNano()%10000),
 		ProgramCode:         request.ProgramCode,
@@ -624,7 +642,7 @@ func handleConfigureProgram(w http.ResponseWriter, r *http.Request) {
 		Status:              "draft",
 		MEDataRequired:      request.MEDataRequired,
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -639,7 +657,7 @@ func handleRecordPartnerTransaction(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	var request struct {
 		PartnerID       string  `json:"partner_id"`
 		PartnerType     string  `json:"partner_type"`
@@ -649,12 +667,12 @@ func handleRecordPartnerTransaction(w http.ResponseWriter, r *http.Request) {
 		Quantity        float64 `json:"quantity,omitempty"`
 		Unit            string  `json:"unit,omitempty"`
 	}
-	
+
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	transaction := PartnerTransaction{
 		ID:              fmt.Sprintf("TXN-%d", time.Now().UnixNano()),
 		PartnerID:       request.PartnerID,
@@ -668,7 +686,7 @@ func handleRecordPartnerTransaction(w http.ResponseWriter, r *http.Request) {
 		Status:          "completed",
 		Timestamp:       time.Now(),
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(map[string]interface{}{

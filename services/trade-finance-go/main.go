@@ -2,60 +2,82 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/IBM/sarama"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
-
 )
 
 var serviceName = "trade-finance-go"
 
 // Inter-service URLs
-var sanctionsURL = func() string { v := os.Getenv("SANCTIONS_URL"); if v == "" { return "http://localhost:8127" }; return v }()
-var fxEngineURL = func() string { v := os.Getenv("FX_RATES_URL"); if v == "" { return "http://localhost:8166" }; return v }()
-var amlURL = func() string { v := os.Getenv("AML_ENGINE_URL"); if v == "" { return "http://localhost:8120" }; return v }()
+var sanctionsURL = func() string {
+	v := os.Getenv("SANCTIONS_URL")
+	if v == "" {
+		return "http://localhost:8127"
+	}
+	return v
+}()
+var fxEngineURL = func() string {
+	v := os.Getenv("FX_RATES_URL")
+	if v == "" {
+		return "http://localhost:8166"
+	}
+	return v
+}()
+var amlURL = func() string {
+	v := os.Getenv("AML_ENGINE_URL")
+	if v == "" {
+		return "http://localhost:8120"
+	}
+	return v
+}()
+
 type BankGuarantee struct {
-	ID               string            `json:"id"`
-	GuaranteeID      string            `json:"guarantee_id"`
-	GuaranteeType    string            `json:"guarantee_type"`
-	Type             string            `json:"type"`
-	Amount           float64           `json:"amount"`
-	Currency         string            `json:"currency"`
-	Applicant        string            `json:"applicant"`
-	ApplicantName    string            `json:"applicant_name"`
-	Beneficiary      string            `json:"beneficiary"`
-	BeneficiaryName  string            `json:"beneficiary_name"`
-	ExpiryDate       string            `json:"expiry_date"`
-	Status           string            `json:"status"`
-	CommissionRate   float64           `json:"commission_rate"`
-	CommissionAmount float64           `json:"commission_amount"`
-	Middleware       []string          `json:"middleware"`
-	CreatedAt        string            `json:"created_at"`
-	UpdatedAt        string            `json:"updated_at"`
+	ID               string   `json:"id"`
+	GuaranteeID      string   `json:"guarantee_id"`
+	GuaranteeType    string   `json:"guarantee_type"`
+	Type             string   `json:"type"`
+	Amount           float64  `json:"amount"`
+	Currency         string   `json:"currency"`
+	Applicant        string   `json:"applicant"`
+	ApplicantName    string   `json:"applicant_name"`
+	Beneficiary      string   `json:"beneficiary"`
+	BeneficiaryName  string   `json:"beneficiary_name"`
+	ExpiryDate       string   `json:"expiry_date"`
+	Status           string   `json:"status"`
+	CommissionRate   float64  `json:"commission_rate"`
+	CommissionAmount float64  `json:"commission_amount"`
+	Middleware       []string `json:"middleware"`
+	CreatedAt        string   `json:"created_at"`
+	UpdatedAt        string   `json:"updated_at"`
 }
 
-var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
-
 type LCRequest struct {
-	Applicant    string  `json:"applicant"`
-	Beneficiary  string  `json:"beneficiary"`
-	Amount       float64 `json:"amount"`
-	Currency     string  `json:"currency"`
-	ExpiryDate   string  `json:"expiry_date"`
-	Commodity    string  `json:"commodity"`
-	Incoterm     string  `json:"incoterm"`
+	Applicant   string  `json:"applicant"`
+	Beneficiary string  `json:"beneficiary"`
+	Amount      float64 `json:"amount"`
+	Currency    string  `json:"currency"`
+	ExpiryDate  string  `json:"expiry_date"`
+	Commodity   string  `json:"commodity"`
+	Incoterm    string  `json:"incoterm"`
 }
 
 type DocumentPresentation struct {
-	LCID       string   `json:"lc_id"`
-	Documents  []string `json:"documents"`
+	LCID      string   `json:"lc_id"`
+	Documents []string `json:"documents"`
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) {
@@ -65,9 +87,8 @@ func jsonResp(w http.ResponseWriter, code int, data interface{}) {
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	
-	
-	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "trade-finance-go", })
+
+	jsonResp(w, 200, map[string]interface{}{"status": "healthy", "service": "trade-finance-go"})
 }
 
 // ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
@@ -88,28 +109,75 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	if len(ids) == 0 {
+		return
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
 
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
 
 func initDB() {
 	dsn := os.Getenv("DATABASE_URL")
@@ -137,57 +205,6 @@ func initDB() {
 
 	initSchema()
 	log.Printf("[trade-finance-go] database connected, schema initialized")
-
-	// Middleware clients
-	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
-	redisURL := getEnv("REDIS_URL", "localhost:6379")
-	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
-	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
-
-	log.Printf("[trade-finance-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
-		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
-
-	mux := http.NewServeMux()
-
-	// Health endpoints
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
-	})
-	mux.HandleFunc("/metrics", metricsHandler)
-
-	// Domain endpoints
-	mux.HandleFunc("/api/v1/service_configs", domainHandler)
-	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
-
-	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8297"),
-		Handler:      loggingMiddleware(corsMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
-
-	log.Printf("[trade-finance-go] ready on :%s", getEnv("PORT", "8297"))
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Printf("[trade-finance-go] shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
-	log.Printf("[trade-finance-go] stopped")
 }
 
 func initSchema() {
@@ -205,6 +222,7 @@ func initSchema() {
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(config_key, environment, tenant_id)
 	)`)
+	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default', status TEXT DEFAULT 'active', data JSONB DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS trade_transactions (id SERIAL PRIMARY KEY, trade_id TEXT, lc_number TEXT, applicant TEXT, beneficiary TEXT, amount NUMERIC(15,2), currency TEXT, status TEXT, incoterm TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
 	log.Printf("[%s] Domain table trade_transactions ensured", serviceName)
@@ -212,60 +230,48 @@ func initSchema() {
 }
 
 func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil { return fmt.Errorf("no db") }
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
 	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
 	return err
 }
 
 func createHandler(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-Id")
-	if tenantID == "" { tenantID = "platform" }
+	if tenantID == "" {
+		tenantID = "platform"
+	}
 	_ = nowISO()
 	_ = lcStatus(true, false, false)
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 	id := fmt.Sprintf("%s-%d", "trade_finance_go", time.Now().UnixNano())
 	dataBytes, _ := json.Marshal(body)
-		dataBytes = []byte(sanitizeInput(string(dataBytes)))
+	dataBytes = []byte(sanitizeInput(string(dataBytes)))
 	if err := dbInsert(id, "trade_finance_go", "default", "active", dataBytes); err != nil {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, err)
 	}
 	// Inter-service call
 	upstreamURL := os.Getenv("AML_ENGINE_URL")
-	if upstreamURL == "" { upstreamURL = "http://localhost:8120" }
+	if upstreamURL == "" {
+		upstreamURL = "http://localhost:8120"
+	}
 	result, err := callService("POST", upstreamURL+"/v1/screen", body)
 	if err != nil {
 		log.Fatalf("schema init failed: %v", err)
 	}
-	
+
 	cacheSet(tenantID+":"+"trade_finance_list", "", 1) // invalidate list cache
 	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "data": body, "source": dbSourceTag()})
 }
 func lcFee(amount float64, tenor int) float64 {
 	rate := 0.0015
-	if tenor > 180 { rate = 0.002 }
-	return math.Round(amount * rate * float64(tenor) / 365.0 * 100) / 100
-}
-
-	// Outbox for event sourcing
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		event_type VARCHAR(64) NOT NULL,
-		aggregate_id VARCHAR(128) NOT NULL,
-		payload JSONB NOT NULL,
-		published BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-	if err != nil {
-		log.Printf("outbox table creation (may already exist): %v", err)
+	if tenor > 180 {
+		rate = 0.002
 	}
-
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
+	return math.Round(amount*rate*float64(tenor)/365.0*100) / 100
 }
-
 func domainHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
@@ -278,9 +284,15 @@ func domainHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func lcStatus(issued bool, expired bool, utilized bool) string {
-	if utilized { return "utilized" }
-	if expired { return "expired" }
-	if issued { return "active" }
+	if utilized {
+		return "utilized"
+	}
+	if expired {
+		return "expired"
+	}
+	if issued {
+		return "active"
+	}
 	return "draft"
 }
 
@@ -302,16 +314,21 @@ func presentDocHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func guaranteeHandler(w http.ResponseWriter, r *http.Request) {
-	var req struct { Amount float64 `json:"amount"`; Type string `json:"type"`; Tenor int `json:"tenor"` }
+	var req struct {
+		Amount float64 `json:"amount"`
+		Type   string  `json:"type"`
+		Tenor  int     `json:"tenor"`
+	}
 	json.NewDecoder(r.Body).Decode(&req)
 	fee := req.Amount * 0.02 * float64(req.Tenor) / 365.0
-	jsonResp(w, 200, map[string]interface{}{"guarantee_ref": fmt.Sprintf("BG-%d", time.Now().UnixNano()), "type": req.Type, "amount": req.Amount, "fee": math.Round(fee*100)/100})
+	jsonResp(w, 200, map[string]interface{}{"guarantee_ref": fmt.Sprintf("BG-%d", time.Now().UnixNano()), "type": req.Type, "amount": req.Amount, "fee": math.Round(fee*100) / 100})
 }
+
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
@@ -325,46 +342,49 @@ func readyzHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"trade-finance-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"trade-finance-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"trade-finance-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"trade-finance-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"trade-finance-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"trade-finance-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
+
 // --- Inter-Service HTTP Client with Retry & Circuit Breaker ---
 type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
+	failures    int
+	lastFailure time.Time
+	threshold   int
+	resetAfter  time.Duration
+	mu          sync.Mutex
 }
 
 func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2 // half-open
-            return true
-        }
-        return false
-    }
-    return true
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures >= cb.threshold {
+		if time.Since(cb.lastFailure) > cb.resetAfter {
+			cb.failures = cb.threshold / 2 // half-open
+			return true
+		}
+		return false
+	}
+	return true
 }
 
 func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if cb.failures > 0 {
+		cb.failures--
+	}
 }
 
 func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.failures++
+	cb.lastFailure = time.Now()
 }
 
 var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
@@ -375,84 +395,85 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		_ = res
 	}
 
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
-        }
-        
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[inter-service] %s %s attempt %d failed: %v", method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
+	if !_cb.allow() {
+		return nil, fmt.Errorf("circuit breaker open for %s", url)
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	var lastErr error
+
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+		}
+
+		var req *http.Request
+		if body != nil {
+			jsonData, _ := json.Marshal(body)
+			req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
+		} else {
+			req, _ = http.NewRequest(method, url, nil)
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			_cb.recordFailure()
+			log.Printf("[inter-service] %s %s attempt %d failed: %v", method, url, attempt+1, err)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
+			_cb.recordFailure()
+			continue
+		}
+
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cb.recordSuccess()
+		return result, nil
+	}
+	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
 func callSanctionsScreen(entityName string, country string) (map[string]interface{}, error) {
-    return callService("POST", sanctionsURL+"/v1/screen", map[string]interface{}{
-        "entity_name": entityName, "country": country,
-        "lists": []string{"OFAC", "EU", "UN", "CBN"},
-    })
+	return callService("POST", sanctionsURL+"/v1/screen", map[string]interface{}{
+		"entity_name": entityName, "country": country,
+		"lists": []string{"OFAC", "EU", "UN", "CBN"},
+	})
 }
 
 func callFXConversion(fromCurrency string, toCurrency string, amount float64) (map[string]interface{}, error) {
-    return callService("POST", fxEngineURL+"/v1/convert", map[string]interface{}{
-        "from": fromCurrency, "to": toCurrency, "amount": amount,
-    })
+	return callService("POST", fxEngineURL+"/v1/convert", map[string]interface{}{
+		"from": fromCurrency, "to": toCurrency, "amount": amount,
+	})
 }
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
 }
 
 type responseWriter struct {
-    http.ResponseWriter
-    status int
+	http.ResponseWriter
+	status int
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
+
 // --- Distributed Tracing ---
 func traceMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -476,24 +497,32 @@ func init() {
 
 func cacheGet(key string) (string, bool) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
+	if err != nil {
+		return "", false
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
+	if err != nil || n < 3 {
+		return "", false
+	}
 	resp := string(buf[:n])
 	if resp[0] == '$' && resp[1] != '-' {
 		// Parse bulk string response
 		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+		if len(parts) >= 3 {
+			return parts[1], true
+		}
 	}
 	return "", false
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer conn.Close()
 	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
 		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
@@ -501,17 +530,25 @@ func cacheSet(key, value string, ttlSeconds int) {
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	if os.Getenv("TLS_ENABLED") != "true" {
+		return false, "", ""
+	}
 	cert := os.Getenv("TLS_CERT_PATH")
 	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
-	if key == "" { key = "/etc/54bank/certs/service.key" }
+	if cert == "" {
+		cert = "/etc/54bank/certs/service.crt"
+	}
+	if key == "" {
+		key = "/etc/54bank/certs/service.key"
+	}
 	return true, cert, key
 }
 
 func dbSourceTag() string {
-    if os.Getenv("DATABASE_URL") != "" { return "database" }
-    return "in-memory"
+	if os.Getenv("DATABASE_URL") != "" {
+		return "database"
+	}
+	return "in-memory"
 }
 
 // --- Rate Limiter (token bucket) ---
@@ -548,7 +585,20 @@ func min64f(a, b float64) float64 {
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
 		if r.Method == "OPTIONS" {
@@ -567,40 +617,153 @@ func getEnv(key, fallback string) string {
 }
 
 // --- JWT Validation (JWKS-aware) ---
-func jwtAuthMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        p := r.URL.Path
-        if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" || p == "/v1/degradation" {
-            next.ServeHTTP(w, r)
-            return
-        }
-        auth := r.Header.Get("Authorization")
-        if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-            return
-        }
-        token := strings.TrimPrefix(auth, "Bearer ")
-        // Validate JWT structure (header.payload.signature)
-        parts := strings.Split(token, ".")
-        if len(parts) != 3 {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
-            return
-        }
-        // In production: validate against Keycloak JWKS endpoint
-        // keycloakURL := os.Getenv("KEYCLOAK_URL")
-        // Decode payload for claims
-        r.Header.Set("X-User-Id", "validated")
-        next.ServeHTTP(w, r)
-    })
-}
-		next.ServeHTTP(w, r)
-	})
+
+// ── MIDDLEWARE: JWT Validation (JWKS / RS256) — fail-closed ────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
 }
 
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(jwtRealmURL())
+		}
+	}()
+}
+
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint (RS256
+// signature + expiry). Fail-closed: no token is accepted on structure alone.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":"trade-finance-go"}`)
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"malformed token"}`, http.StatusUnauthorized)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 // ── Binary RPC Server (stdlib, high-performance inter-service communication) ──
 // Length-prefixed binary protocol over TCP — ~10x faster than HTTP/JSON
@@ -699,12 +862,17 @@ func rpcCall(target string, method string, payload map[string]interface{}) (map[
 	return result, nil
 }
 
-
 func validateTradeFinance(lcAmount float64, expiryDays int, incoterm string) (bool, string) {
-	if lcAmount <= 0 { return false, "LC amount must be positive" }
-	if expiryDays < 1 { return false, "LC must have valid expiry" }
+	if lcAmount <= 0 {
+		return false, "LC amount must be positive"
+	}
+	if expiryDays < 1 {
+		return false, "LC must have valid expiry"
+	}
 	validTerms := map[string]bool{"FOB": true, "CIF": true, "CFR": true, "EXW": true, "DDP": true}
-	if !validTerms[incoterm] { return false, "Invalid incoterm: " + incoterm }
+	if !validTerms[incoterm] {
+		return false, "Invalid incoterm: " + incoterm
+	}
 	return true, "Trade finance application valid"
 }
 func computeLCFee(amount float64, durationDays int) float64 {
@@ -712,56 +880,62 @@ func computeLCFee(amount float64, durationDays int) float64 {
 	return amount * annualRate * float64(durationDays) / 365.0
 }
 
-
 // --- Alerting ---
 type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
+	rules []alertRule
+	mu    sync.RWMutex
 }
 
 type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
+	Name      string
+	Metric    string
+	Threshold float64
+	Severity  string
 }
 
 var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
+	rules: []alertRule{
+		{"high_error_rate", "error_rate", 0.05, "critical"},
+		{"high_latency", "p99_latency_ms", 5000, "warning"},
+		{"db_connection_failures", "db_failures", 3, "critical"},
+	},
 }
 
 func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
+	var fired []map[string]interface{}
+	errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
+	if errRate > 0.05 {
+		fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
+	}
+	return fired
 }
 
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
 
 func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
 }
 
 // --- Integration Tests ---
 func respondJSON(w http.ResponseWriter, code int, data interface{}) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(code)
-    json.NewEncoder(w).Encode(data)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(data)
 }
 
 func main() {
 	port := os.Getenv("PORT")
 
-	if port == "" { port = "8080" }
+	if port == "" {
+		port = "8080"
+	}
 	initDB()
-mux := http.NewServeMux()
+	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
 	mux.HandleFunc("/livez", livezHandler)
@@ -785,29 +959,122 @@ mux := http.NewServeMux()
 	_ = tlsKey
 	_ = tlsEnabled
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
 	// Start binary RPC server for inter-service calls
 	rpcSrv := newRPCServer("trade-finance-go")
 	go rpcSrv.serve("9093")
 	defer rpcSrv.stop()
 
 	quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[trade-finance-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[trade-finance-go] Server stopped gracefully")
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Println("[trade-finance-go] Shutdown signal received")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[trade-finance-go] Server stopped gracefully")
+}
+
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				break
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"alive":true,"service":"trade-finance-go"}`)
+}
+
+func listHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		jsonResp(w, 503, map[string]string{"error": "database_unavailable"})
+		return
+	}
+	rows, err := db.Query("SELECT id, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT 50", "trade_finance_go")
+	if err != nil {
+		jsonResp(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	items := []map[string]interface{}{}
+	for rows.Next() {
+		var id, status, data, createdAt string
+		if rows.Scan(&id, &status, &data, &createdAt) == nil {
+			items = append(items, map[string]interface{}{"id": id, "status": status, "data": data, "created_at": createdAt})
+		}
+	}
+	jsonResp(w, 200, map[string]interface{}{"items": items, "count": len(items), "source": dbSourceTag()})
+}
+
+func getByIdHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		jsonResp(w, 503, map[string]string{"error": "database_unavailable"})
+		return
+	}
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		jsonResp(w, 400, map[string]string{"error": "id required"})
+		return
+	}
+	var status, data, createdAt string
+	err := db.QueryRow("SELECT status, data, created_at FROM service_records WHERE id = $1 AND service = $2", id, "trade_finance_go").Scan(&status, &data, &createdAt)
+	if err != nil {
+		jsonResp(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	jsonResp(w, 200, map[string]interface{}{"id": id, "status": status, "data": data, "created_at": createdAt})
+}
+
+func statsHandler(w http.ResponseWriter, r *http.Request) {
+	var count int
+	if db != nil {
+		db.QueryRow("SELECT COUNT(*) FROM service_records WHERE service = $1", "trade_finance_go").Scan(&count)
+	}
+	jsonResp(w, 200, map[string]interface{}{"service": serviceName, "total_records": count, "source": dbSourceTag()})
+}
+
+func sanitizeInput(s string) string {
+	r := strings.NewReplacer("<", "&lt;", ">", "&gt;", "'", "&#39;", "\"", "&quot;")
+	out := r.Replace(s)
+	if len(out) > 10240 {
+		out = out[:10240]
+	}
+	return out
 }

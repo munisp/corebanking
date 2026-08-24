@@ -20,6 +20,9 @@ spec:
             - containerPort: 4317
               name: otlp-grpc
             - containerPort: 4318
+              name: otlp-http
+            - containerPort: 8889
+              name: prometheus
           livenessProbe:
             httpGet:
               path: /
@@ -32,9 +35,6 @@ spec:
               port: 13133
             initialDelaySeconds: 5
             periodSeconds: 10
-              name: otlp-http
-            - containerPort: 8889
-              name: prometheus
           volumeMounts:
             - name: config
               mountPath: /etc/otelcol

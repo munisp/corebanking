@@ -8,6 +8,7 @@
     "db:migrate": "bash scripts/migrate.sh up"
   },
   "devDependencies": {
+    "@types/node": "^24.13.3",
     "drizzle-kit": "^0.31.10",
     "drizzle-orm": "^0.36.4"
   }

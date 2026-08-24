@@ -38,12 +38,14 @@ class BallerineApiClient {
 
       const response = await this._axiosInstance.post(`/api/v1/internal/customers`, payload);
 
-      console.log(response.data);
+      // M-52: never dump raw provider responses (may contain PII) to logs.
+      this._logger.info(`Ballerine customer created — status=${response.status}`);
 
       return response.data;
     } catch (e) {
+      // M-54: provider error details stay in logs; callers get a generic error.
       this._logger.error(`Failed to create ballerine customer: ${e}`);
-      throw new Error(`Failed to create ballerine customer: ${e}`);
+      throw new Error("Failed to create ballerine customer.");
     }
   }
 
@@ -109,12 +111,12 @@ class BallerineApiClient {
         }
       );
 
-      this._logger.info(`Ballerine workflow created successfully: ${JSON.stringify(response.data)}`);
+      this._logger.info(`Ballerine workflow created successfully — status=${response.status}`);
 
       return response.data;
     } catch (error) {
       this._logger.error(`Failed to create Ballerine workflow: ${error}`);
-      throw new Error(`Failed to create Ballerine workflow: ${error}`);
+      throw new Error("Failed to create Ballerine workflow.");
     }
   }
 

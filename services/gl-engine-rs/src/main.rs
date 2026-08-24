@@ -1,8 +1,9 @@
 #![allow(unused)]
-use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -49,6 +50,12 @@ struct CreateRequest {
     extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TrialBalanceRequest {
+    #[serde(default)]
+    as_of: Option<String>,
+}
+
 struct AppState {
     db: PgPool,
 }
@@ -61,6 +68,9 @@ fn validate_double_entry(entries: &[JournalEntry]) -> Result<(), String> {
     for e in entries {
         if e.amount_kobo <= 0 {
             return Err(format!("amount_kobo must be positive (got {})", e.amount_kobo));
+        }
+        if e.debit_account == e.credit_account {
+            return Err("debit_account and credit_account must differ".to_string());
         }
     }
     // Each JournalEntry encodes one debit AND one credit of equal amount_kobo,
@@ -119,11 +129,21 @@ use std::sync::atomic::AtomicBool;
 static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
 static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
 
+fn mark_db_available(ok: bool) {
+    DB_AVAILABLE.store(ok, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn db_unavailable() -> HttpResponse {
+    mark_db_available(false);
+    HttpResponse::ServiceUnavailable().json(json!({"error": "gl_database_unavailable"}))
+}
+
 fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -142,7 +162,8 @@ async fn health(state: web::Data<AppState>) -> HttpResponse {
 
 // ── Middleware integration: TigerBeetle ledger + Kafka events ──────────────
 // Fire-and-forget raw HTTP over tokio (no extra crate dependency). A broker or
-// ledger outage is logged but never fails the journal posting.
+// ledger notification outage is logged but never fails the journal posting —
+// the journal is already durably committed to the GL database at that point.
 fn mw_tigerbeetle_url() -> String {
     std::env::var("TIGERBEETLE_URL").unwrap_or_else(|_| "http://tigerbeetle-adapter:3000".to_string())
 }
@@ -222,34 +243,124 @@ async fn mw_publish_event(entry_id: &str, count: usize) {
     mw_http_post(&url, body).await;
 }
 
-async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppState>) -> HttpResponse {
-    let _sanitized = sanitize_input("");
+// Balance sheet query: balances are always derived from persisted journal
+// lines — never from process memory. Natural-balance convention:
+// asset/expense: debits - credits; liability/equity/revenue: credits - debits.
+const BALANCE_SQL: &str = r#"
+    SELECT a.account_code, a.account_name, a.account_type, a.currency,
+           COALESCE(SUM(CASE
+               WHEN a.account_type IN ('asset', 'expense')
+                   THEN CASE WHEN l.dc = 'D' THEN l.amount_kobo ELSE -l.amount_kobo END
+               ELSE CASE WHEN l.dc = 'C' THEN l.amount_kobo ELSE -l.amount_kobo END
+           END), 0)::bigint AS balance_kobo
+    FROM gl_accounts a
+    LEFT JOIN gl_journal_lines l ON l.account_code = a.account_code
+    GROUP BY a.account_code, a.account_name, a.account_type, a.currency
+"#;
+
+fn row_to_account(r: &sqlx::postgres::PgRow) -> GLAccount {
+    GLAccount {
+        account_code: r.try_get::<String, _>("account_code").ok(),
+        account_name: r.try_get::<Option<String>, _>("account_name").ok().flatten(),
+        account_type: r.try_get::<Option<String>, _>("account_type").ok().flatten(),
+        parent_code: None,
+        currency: r.try_get::<Option<String>, _>("currency").ok().flatten(),
+        balance_kobo: Some(r.try_get::<i64, _>("balance_kobo").unwrap_or(0)),
+        blocked: Some(false),
+    }
+}
+
+async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let entries = body.into_inner();
     if let Err(e) = validate_double_entry(&entries) {
         return HttpResponse::BadRequest().json(json!({"error": e}));
     }
-    let entry_id = format!("JRN-{}", chrono::Utc::now().format("%Y%m%d%H%M%S"));
-    let mut accounts = state.accounts.lock().unwrap();
-    for entry in &entries {
-        if let Some(acc) = accounts.iter_mut().find(|a| a.account_code.as_deref() == Some(&entry.debit_account)) {
-            *acc.balance_kobo.get_or_insert(0) += entry.amount_kobo;
+    let entry_id = format!(
+        "JRN-{}-{}",
+        chrono::Utc::now().format("%Y%m%d%H%M%S"),
+        uuid::Uuid::new_v4().simple()
+    );
+    // Posting = a single DB transaction that inserts the journal header and all
+    // of its balanced lines. No commit, no "posted" status — fail closed.
+    let mut tx = match state.db.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            eprintln!("[gl-engine-rs] post_journal: begin tx failed: {}", e);
+            return db_unavailable();
         }
-        if let Some(acc) = accounts.iter_mut().find(|a| a.account_code.as_deref() == Some(&entry.credit_account)) {
-            *acc.balance_kobo.get_or_insert(0) -= entry.amount_kobo;
+    };
+    let narration = entries.first().map(|e| e.narration.clone()).unwrap_or_default();
+    let posted_by = entries.first().and_then(|e| e.posted_by.clone());
+    if let Err(e) = sqlx::query(
+        "INSERT INTO gl_journals (journal_id, narration, posted_by, status) VALUES ($1, $2, $3, 'posted')",
+    )
+    .bind(entry_id.as_str())
+    .bind(narration.as_str())
+    .bind(posted_by.as_deref())
+    .execute(&mut *tx)
+    .await
+    {
+        eprintln!("[gl-engine-rs] post_journal: insert journal failed: {}", e);
+        return db_unavailable();
+    }
+    for entry in &entries {
+        for (code, dc) in [(&entry.debit_account, "D"), (&entry.credit_account, "C")] {
+            let acct_type = classify_account(code);
+            if let Err(e) = sqlx::query(
+                "INSERT INTO gl_accounts (account_code, account_name, account_type, currency) \
+                 VALUES ($1, $1, $2, $3) ON CONFLICT (account_code) DO NOTHING",
+            )
+            .bind(code.as_str())
+            .bind(acct_type)
+            .bind(entry.currency.as_str())
+            .execute(&mut *tx)
+            .await
+            {
+                eprintln!("[gl-engine-rs] post_journal: upsert account failed: {}", e);
+                return db_unavailable();
+            }
+            if let Err(e) = sqlx::query(
+                "INSERT INTO gl_journal_lines (journal_id, account_code, dc, amount_kobo, currency, value_date) \
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(entry_id.as_str())
+            .bind(code.as_str())
+            .bind(dc)
+            .bind(entry.amount_kobo)
+            .bind(entry.currency.as_str())
+            .bind(entry.value_date.as_str())
+            .execute(&mut *tx)
+            .await
+            {
+                eprintln!("[gl-engine-rs] post_journal: insert line failed: {}", e);
+                return db_unavailable();
+            }
         }
     }
-    drop(accounts);
-    db_persist(&state, "post_journal", &json!({"action": "post_journal"})).await;
+    if let Err(e) = tx.commit().await {
+        eprintln!("[gl-engine-rs] post_journal: commit failed: {}", e);
+        return db_unavailable();
+    }
+    mark_db_available(true);
     mw_post_ledger(&entry_id, &entries).await;
     mw_publish_event(&entry_id, entries.len()).await;
     HttpResponse::Ok().json(json!({"entry_id": entry_id, "status": "posted", "entries": entries.len()}))
 }
 
-async fn trial_balance(body: web::Json<TrialBalanceRequest>, state: web::Data<AppState>) -> HttpResponse {
-    let accounts = state.accounts.lock().unwrap();
-    let tb = compute_trial_balance(&accounts);
-    db_persist(&state, "trial_balance", &json!({"action": "trial_balance"})).await;
-    HttpResponse::Ok().json(tb)
+async fn trial_balance(body: web::Json<TrialBalanceRequest>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    match sqlx::query(BALANCE_SQL).fetch_all(&state.db).await {
+        Ok(rows) => {
+            mark_db_available(true);
+            let accounts: Vec<GLAccount> = rows.iter().map(row_to_account).collect();
+            HttpResponse::Ok().json(compute_trial_balance(&accounts))
+        }
+        Err(e) => {
+            eprintln!("[gl-engine-rs] trial_balance: query failed: {}", e);
+            db_unavailable()
+        }
+    }
 }
 
 async fn chart_of_accounts(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
@@ -258,32 +369,64 @@ async fn chart_of_accounts(req: actix_web::HttpRequest, state: web::Data<AppStat
             .insert_header(("Retry-After", "1"))
             .json(serde_json::json!({"error": "rate_limit_exceeded"}));
     }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let accounts = state.accounts.lock().unwrap();
-    let grouped: std::collections::HashMap<&str, Vec<&GLAccount>> = accounts.iter().fold(
-        std::collections::HashMap::new(),
-        |mut map, acc| { map.entry(classify_account(acc.account_code.as_deref().unwrap_or(""))).or_default().push(acc); map }
-    );
-    // Inter-service call
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
-    match call_service_sync(&format!("{}/v1/screen", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("gl-engine-rs: upstream call ok"),
-        Err(e) => eprintln!("gl-engine-rs: upstream call failed: {}", e),
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    // Inter-service call (blocking client) — never block the async executor.
+    let upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8120".to_string());
+    let _ = tokio::task::spawn_blocking(move || {
+        call_service_sync(&format!("{}/v1/screen", upstream_url), "{}")
+    })
+    .await;
+    match sqlx::query(BALANCE_SQL).fetch_all(&state.db).await {
+        Ok(rows) => {
+            mark_db_available(true);
+            let accounts: Vec<GLAccount> = rows.iter().map(row_to_account).collect();
+            let grouped: std::collections::HashMap<&str, Vec<&GLAccount>> = accounts.iter().fold(
+                std::collections::HashMap::new(),
+                |mut map, acc| { map.entry(classify_account(acc.account_code.as_deref().unwrap_or(""))).or_default().push(acc); map }
+            );
+            HttpResponse::Ok().json(json!({"chart": grouped, "total_accounts": accounts.len()}))
+        }
+        Err(e) => {
+            eprintln!("[gl-engine-rs] chart_of_accounts: query failed: {}", e);
+            db_unavailable()
+        }
     }
-    db_persist(&state, "chart_of_accounts", &json!({"action": "chart_of_accounts"})).await;
-    HttpResponse::Ok().json(json!({"chart": grouped, "total_accounts": accounts.len()}))
 }
 
-async fn account_balance(path: web::Path<String>, state: web::Data<AppState>) -> HttpResponse {
+async fn account_balance(path: web::Path<String>, state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let code = path.into_inner();
-    let accounts = state.accounts.lock().unwrap();
-    match accounts.iter().find(|a| a.account_code.as_deref() == Some(&code)) {
-        Some(acc) => HttpResponse::Ok().json(json!({"account": acc, "classification": classify_account(&code)})),
-        None => HttpResponse::NotFound().json(json!({"error": "Account not found"})),
+    let result = sqlx::query(
+        r#"SELECT a.account_code, a.account_name, a.account_type, a.currency,
+                  COALESCE(SUM(CASE
+                      WHEN a.account_type IN ('asset', 'expense')
+                          THEN CASE WHEN l.dc = 'D' THEN l.amount_kobo ELSE -l.amount_kobo END
+                      ELSE CASE WHEN l.dc = 'C' THEN l.amount_kobo ELSE -l.amount_kobo END
+                  END), 0)::bigint AS balance_kobo
+           FROM gl_accounts a
+           LEFT JOIN gl_journal_lines l ON l.account_code = a.account_code
+           WHERE a.account_code = $1
+           GROUP BY a.account_code, a.account_name, a.account_type, a.currency"#,
+    )
+    .bind(code.as_str())
+    .fetch_optional(&state.db)
+    .await;
+    match result {
+        Ok(Some(row)) => {
+            mark_db_available(true);
+            let acc = row_to_account(&row);
+            HttpResponse::Ok().json(json!({"account": acc, "classification": classify_account(&code)}))
+        }
+        Ok(None) => HttpResponse::NotFound().json(json!({"error": "Account not found"})),
+        Err(e) => {
+            eprintln!("[gl-engine-rs] account_balance: query failed: {}", e);
+            db_unavailable()
+        }
     }
 }
 
-async fn validate_entry(body: web::Json<Vec<JournalEntry>>) -> HttpResponse {
+async fn validate_entry(body: web::Json<Vec<JournalEntry>>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     match validate_double_entry(&body) {
         Ok(_) => HttpResponse::Ok().json(json!({"valid": true})),
         Err(e) => HttpResponse::Ok().json(json!({"valid": false, "error": e})),
@@ -301,7 +444,8 @@ const RATE_LIMIT_PER_SECOND: u64 = 100;
 
 
 // --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
+async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -316,8 +460,12 @@ async fn alerts_endpoint() -> HttpResponse {
     }))
 }
 
-async fn readyz() -> HttpResponse {
-    HttpResponse::Ok().json(json!({"ready": true, "service": "gl-engine-rs"}))
+async fn readyz(state: web::Data<AppState>) -> HttpResponse {
+    // Readiness requires a live GL database — fail closed.
+    match sqlx::query("SELECT 1").execute(&state.db).await {
+        Ok(_) => HttpResponse::Ok().json(json!({"ready": true, "service": "gl-engine-rs"})),
+        Err(_) => HttpResponse::ServiceUnavailable().json(json!({"ready": false, "service": "gl-engine-rs"})),
+    }
 }
 async fn livez() -> HttpResponse {
     HttpResponse::Ok().json(json!({"alive": true}))
@@ -331,42 +479,188 @@ async fn prom_metrics() -> HttpResponse {
 }
 
 
-// --- Database Connection ---
-use tokio_postgres::NoTls;
+// --- JWT Auth Check ---
+// --- JWT Auth Check (fail-closed; R4-V4 remediation) ---
+// Canonical RS256/JWKS-primary verifier aligned with pin-block-engine-rs:
+// tokens are verified against the Keycloak JWKS (KEYCLOAK_JWKS_URL, or derived
+// from KEYCLOAK_REALM_URL) with a 300s cache and a 5s fetch timeout; HS256 via
+// JWT_SECRET remains as a fallback. 401 on missing/malformed/expired/
+// unknown-kid tokens; 503 when no verification backend is available. Verified
+// claims are stored in request extensions for downstream handlers.
 
-async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
-    match tokio_postgres::connect(db_url, NoTls).await {
-        Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
-            let _ = client.execute(
-                "CREATE TABLE IF NOT EXISTS service_records (
-                    id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
-                    status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
-                    created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
-                )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
-            Some(client)
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct VerifiedClaims(serde_json::Value);
+
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
+}
+
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
         }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
+    }
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
+        }
+        _ => None,
     }
 }
 
+async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpResponse> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => {
+            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwt_validation_unavailable",
+                "detail": "no JWKS endpoint configured"
+            })))
+        }
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
+            }
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "client init failed"
+        })))?;
+    let resp = client.get(&url).send().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+    })?;
+    if !resp.status().is_success() {
+        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "upstream returned error status"
+        })));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "malformed JWKS payload"
+        }))
+    })?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
+}
 
-// --- JWT Auth Check ---
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
+        }
+    }
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
+    }
+}
+
+async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks().await?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks().await?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => {
+                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                        }
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    })))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": format!("unsupported alg {:?}", other)
+        }))),
+    }
+}
+
+async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
     }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
-    }
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+    };
+    let claims = verify_jwt_token(token).await?;
+    req.extensions_mut().insert(VerifiedClaims(claims));
+    Ok(())
 }
 
 
@@ -403,17 +697,22 @@ fn sanitize_input(s: &str) -> String {
 }
 
 
+// Best-effort audit persistence via the GL pool. Never fails a request.
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    if let Some(ref client) = state.db_client {
-        let id = format!("{}_{}_{}", "gl_engine_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-        let svc_name = String::from("gl-engine-rs");
-        let status = String::from("active");
-        let data_str = serde_json::to_string(data).unwrap_or_default();
-        let _ = client.execute(
-            "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &svc_name, &endpoint, &status, &data_str],
-        ).await;
-    }
+    let id = format!("{}_{}_{}", "gl_engine_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let svc_name = String::from("gl-engine-rs");
+    let status = String::from("active");
+    let data_str = serde_json::to_string(data).unwrap_or_default();
+    let _ = sqlx::query(
+        "INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5::jsonb)",
+    )
+    .bind(id.as_str())
+    .bind(svc_name.as_str())
+    .bind(endpoint)
+    .bind(status.as_str())
+    .bind(data_str.as_str())
+    .execute(&state.db)
+    .await;
 }
 
 
@@ -589,19 +888,109 @@ fn mtls_config() -> (bool, String, String, String) {
     (enabled, cert, key, ca)
 }
 
+
+// --- Database schema (durable GL: accounts, journals, journal lines) ---
+async fn init_schema(pool: &PgPool) {
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    config_key VARCHAR(128) NOT NULL,
+    config_value JSONB NOT NULL,
+    environment VARCHAR(20) NOT NULL DEFAULT 'production',
+    status VARCHAR(32) NOT NULL DEFAULT 'active',
+    version INT NOT NULL DEFAULT 1,
+    description TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_by UUID,
+    tenant_id UUID,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(config_key, environment, tenant_id)
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_configs table");
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS outbox (
+    id BIGSERIAL PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    aggregate_id TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create outbox table");
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_records (
+    id TEXT PRIMARY KEY,
+    service TEXT NOT NULL,
+    type TEXT DEFAULT 'default',
+    status TEXT DEFAULT 'active',
+    data JSONB DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create service_records table");
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS gl_accounts (
+    account_code TEXT PRIMARY KEY,
+    account_name TEXT,
+    account_type TEXT NOT NULL DEFAULT 'unknown',
+    currency TEXT NOT NULL DEFAULT 'NGN',
+    blocked BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create gl_accounts table");
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS gl_journals (
+    journal_id TEXT PRIMARY KEY,
+    narration TEXT,
+    posted_by TEXT,
+    status TEXT NOT NULL DEFAULT 'posted',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create gl_journals table");
+
+    sqlx::query(r#"CREATE TABLE IF NOT EXISTS gl_journal_lines (
+    id BIGSERIAL PRIMARY KEY,
+    journal_id TEXT NOT NULL REFERENCES gl_journals(journal_id),
+    account_code TEXT NOT NULL REFERENCES gl_accounts(account_code),
+    dc CHAR(1) NOT NULL CHECK (dc IN ('D', 'C')),
+    amount_kobo BIGINT NOT NULL CHECK (amount_kobo > 0),
+    currency TEXT NOT NULL,
+    value_date TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )"#)
+    .execute(pool)
+    .await
+    .expect("Failed to create gl_journal_lines table");
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_gjl_account ON gl_journal_lines(account_code)")
+        .execute(pool)
+        .await
+        .expect("Failed to create gl_journal_lines account index");
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    env_logger::init();
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8101);
-    let state = web::Data::new(AppState {
-            accounts: Mutex::new(Vec::new()),
-            db_url: std::env::var("DATABASE_URL").ok(),
-            db_client: {
-            let db_url = std::env::var("DATABASE_URL").ok();
-            if let Some(url) = db_url {
-                init_db(&url).await.map(|c| std::sync::Arc::new(c))
-            } else { None }
-        },
-    });
+    // FAIL FAST: the GL must never run on in-memory state or default credentials.
+    let db_url = env::var("DATABASE_URL")
+        .expect("DATABASE_URL must be set — gl-engine-rs refuses to boot without durable storage");
+    let pool = PgPoolOptions::new()
+        .max_connections(10)
+        .connect(&db_url)
+        .await
+        .expect("failed to connect to DATABASE_URL — gl-engine-rs cannot run without the GL database");
+    init_schema(&pool).await;
+    let state = web::Data::new(AppState { db: pool });
     println!("gl-engine-rs listening on port {}", port);
     start_grpc_server("gl-engine-rs", 10424);
     HttpServer::new(move || {
@@ -632,18 +1021,17 @@ async fn main() -> std::io::Result<()> {
                 }
             })
             .app_data(state.clone())
-            .wrap(actix_web::middleware::DefaultHeaders::new()
-                .add(("X-Content-Type-Options", "nosniff"))
-                .add(("X-Frame-Options", "DENY"))
-                .add(("X-XSS-Protection", "1; mode=block"))
-                .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-                .add(("Content-Security-Policy", "default-src 'self'"))
-                .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
+            .route("/livez", web::get().to(livez))
+            .route("/metrics", web::get().to(prom_metrics))
+            .route("/alerts", web::get().to(alerts_endpoint))
+            .route("/v1/journals", web::post().to(post_journal))
+            .route("/v1/journals/validate", web::post().to(validate_entry))
+            .route("/v1/trial-balance", web::post().to(trial_balance))
+            .route("/v1/chart-of-accounts", web::get().to(chart_of_accounts))
+            .route("/v1/accounts/{code}", web::get().to(account_balance))
             .route("/api/v1/service_configs", web::get().to(list_records))
             .route("/api/v1/service_configs", web::post().to(create_record))
             .route("/api/v1/service_configs/{id}", web::get().to(get_record))
@@ -656,24 +1044,144 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS service_configs (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create service_configs table");
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let result = sqlx::query(
+        "SELECT id::text AS id, config_key, config_value::text AS config_value, environment, status, version, is_active \
+         FROM service_configs ORDER BY created_at DESC LIMIT 100",
+    )
+    .fetch_all(&data.db)
+    .await;
+    match result {
+        Ok(rows) => {
+            let items: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r.try_get::<String, _>("id").unwrap_or_default(),
+                        "config_key": r.try_get::<String, _>("config_key").unwrap_or_default(),
+                        "config_value": r.try_get::<String, _>("config_value").unwrap_or_default(),
+                        "environment": r.try_get::<String, _>("environment").unwrap_or_default(),
+                        "status": r.try_get::<String, _>("status").unwrap_or_default(),
+                        "version": r.try_get::<i32, _>("version").unwrap_or(0),
+                        "is_active": r.try_get::<bool, _>("is_active").unwrap_or(false),
+                    })
+                })
+                .collect();
+            HttpResponse::Ok().json(json!({"items": items, "count": items.len()}))
+        }
+        Err(e) => HttpResponse::ServiceUnavailable().json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let config_key = body
+        .extra
+        .get("config_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default")
+        .to_string();
+    let config_value = body
+        .extra
+        .get("config_value")
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+        .to_string();
+    let environment = body
+        .extra
+        .get("environment")
+        .and_then(|v| v.as_str())
+        .unwrap_or("production")
+        .to_string();
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    let result = sqlx::query(
+        "INSERT INTO service_configs (config_key, config_value, environment, status) \
+         VALUES ($1, $2::jsonb, $3, $4) RETURNING id::text AS id",
+    )
+    .bind(config_key.as_str())
+    .bind(config_value.as_str())
+    .bind(environment.as_str())
+    .bind(status.as_str())
+    .fetch_one(&data.db)
+    .await;
+    match result {
+        Ok(row) => {
+            let id: String = row.try_get("id").unwrap_or_default();
+            HttpResponse::Created().json(json!({"id": id, "config_key": config_key, "status": status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let result = sqlx::query(
+        "SELECT id::text AS id, config_key, config_value::text AS config_value, environment, status, version, is_active \
+         FROM service_configs WHERE id = $1::uuid",
+    )
+    .bind(id.as_str())
+    .fetch_optional(&data.db)
+    .await;
+    match result {
+        Ok(Some(r)) => HttpResponse::Ok().json(json!({
+            "id": r.try_get::<String, _>("id").unwrap_or_default(),
+            "config_key": r.try_get::<String, _>("config_key").unwrap_or_default(),
+            "config_value": r.try_get::<String, _>("config_value").unwrap_or_default(),
+            "environment": r.try_get::<String, _>("environment").unwrap_or_default(),
+            "status": r.try_get::<String, _>("status").unwrap_or_default(),
+            "version": r.try_get::<i32, _>("version").unwrap_or(0),
+            "is_active": r.try_get::<bool, _>("is_active").unwrap_or(false),
+        })),
+        Ok(None) => HttpResponse::NotFound().json(json!({"error": "not found"})),
+        Err(e) => HttpResponse::ServiceUnavailable().json(json!({"error": e.to_string()})),
+    }
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+
+    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
+        .bind(status.as_str())
+        .bind(id.as_str())
+        .execute(&data.db)
+        .await;
+
+    match result {
+        Ok(_) => {
+            let payload = serde_json::json!({"id": &id, "status": &status}).to_string();
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3::jsonb)")
+                .bind("service_configs.updated")
+                .bind(id.as_str())
+                .bind(payload.as_str())
+                .execute(&data.db).await.ok();
+            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
+        .bind(id.as_str())
+        .execute(&data.db)
+        .await
+        .ok();
+
+    let payload = serde_json::json!({"id": &id}).to_string();
+    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3::jsonb)")
+        .bind("service_configs.deleted")
+        .bind(id.as_str())
+        .bind(payload.as_str())
+        .execute(&data.db).await.ok();
+
+    HttpResponse::NoContent().finish()
+}
 
 #[cfg(test)]
 mod tests {
@@ -776,46 +1284,4 @@ mod tests {
         assert_eq!(classify_account("5001"), "expense");
         assert_eq!(classify_account("9999"), "unknown");
     }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

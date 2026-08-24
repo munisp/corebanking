@@ -24,21 +24,21 @@ type SubAccount struct {
 }
 
 type SweepInstruction struct {
-	ID          string    `json:"id"`
-	SubAccountID string  `json:"subAccountId"`
-	Amount      float64   `json:"amount"`
-	TargetAccount string  `json:"targetAccount"`
-	ExecutedAt  time.Time `json:"executedAt"`
-	Status      string    `json:"status"`
+	ID            string    `json:"id"`
+	SubAccountID  string    `json:"subAccountId"`
+	Amount        float64   `json:"amount"`
+	TargetAccount string    `json:"targetAccount"`
+	ExecutedAt    time.Time `json:"executedAt"`
+	Status        string    `json:"status"`
 }
 
 type AutoSettlement struct {
-	ID          string  `json:"id"`
-	VAID        string  `json:"virtualAccountId"`
-	Frequency   string  `json:"frequency"` // daily, weekly, monthly
-	SettlementAccount string `json:"settlementAccount"`
-	MinAmount   float64 `json:"minAmount"`
-	Enabled     bool    `json:"enabled"`
+	ID                string  `json:"id"`
+	VAID              string  `json:"virtualAccountId"`
+	Frequency         string  `json:"frequency"` // daily, weekly, monthly
+	SettlementAccount string  `json:"settlementAccount"`
+	MinAmount         float64 `json:"minAmount"`
+	Enabled           bool    `json:"enabled"`
 }
 
 var (

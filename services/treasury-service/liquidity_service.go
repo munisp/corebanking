@@ -40,9 +40,9 @@ func (s *LiquidityService) initializeDefaultPositions(tenantID string) {
 		CashReserves:     100000000000, // 100B NGN
 		CBNBalance:       135000000000, // 135B NGN (27% CRR)
 		NostroBalances: map[string]int64{
-			"USD": 50000000,  // 50M USD
-			"GBP": 10000000,  // 10M GBP
-			"EUR": 15000000,  // 15M EUR
+			"USD": 50000000, // 50M USD
+			"GBP": 10000000, // 10M GBP
+			"EUR": 15000000, // 15M EUR
 		},
 		VostroBalances: map[string]int64{
 			"USD": 20000000, // 20M USD
@@ -124,8 +124,8 @@ func (s *LiquidityService) GetCashFlowProjection(tenantID, daysStr string) []Cas
 
 	for i := 0; i < days; i++ {
 		date := time.Now().AddDate(0, 0, i)
-		inflows := int64(5000000000 + (i%7)*1000000000)   // 5-12B daily inflows
-		outflows := int64(4500000000 + (i%5)*800000000)   // 4.5-8.5B daily outflows
+		inflows := int64(5000000000 + (i%7)*1000000000) // 5-12B daily inflows
+		outflows := int64(4500000000 + (i%5)*800000000) // 4.5-8.5B daily outflows
 		netFlow := inflows - outflows
 		balance += netFlow
 
@@ -152,20 +152,20 @@ func (s *LiquidityService) GetLiquidityRatios(tenantID string) map[string]interf
 	}
 
 	return map[string]interface{}{
-		"lcr":                ngnPos.LCR,
-		"nsfr":               ngnPos.NSFR,
-		"crr":                ngnPos.CRR,
-		"lcrMinimum":         100.0,
-		"nsfrMinimum":        100.0,
-		"crrMinimum":         27.5,
-		"lcrStatus":          "compliant",
-		"nsfrStatus":         "compliant",
-		"crrStatus":          "compliant",
-		"liquidAssets":       ngnPos.CashReserves + ngnPos.CBNBalance,
-		"netCashOutflows":    ngnPos.TotalLiabilities * 30 / 365, // 30-day outflows
+		"lcr":                    ngnPos.LCR,
+		"nsfr":                   ngnPos.NSFR,
+		"crr":                    ngnPos.CRR,
+		"lcrMinimum":             100.0,
+		"nsfrMinimum":            100.0,
+		"crrMinimum":             27.5,
+		"lcrStatus":              "compliant",
+		"nsfrStatus":             "compliant",
+		"crrStatus":              "compliant",
+		"liquidAssets":           ngnPos.CashReserves + ngnPos.CBNBalance,
+		"netCashOutflows":        ngnPos.TotalLiabilities * 30 / 365, // 30-day outflows
 		"availableStableFunding": ngnPos.TotalLiabilities,
 		"requiredStableFunding":  ngnPos.TotalAssets * 87 / 100,
-		"timestamp":          time.Now().Format(time.RFC3339),
+		"timestamp":              time.Now().Format(time.RFC3339),
 	}
 }
 
@@ -208,13 +208,13 @@ func (s *LiquidityService) GetCRRPosition(tenantID string) map[string]interface{
 	actualCRR := ngnPos.CBNBalance
 
 	return map[string]interface{}{
-		"totalDeposits":   totalDeposits,
-		"crrRate":         27.5,
-		"requiredCRR":     requiredCRR,
-		"actualCRR":       actualCRR,
-		"surplus":         actualCRR - requiredCRR,
+		"totalDeposits":    totalDeposits,
+		"crrRate":          27.5,
+		"requiredCRR":      requiredCRR,
+		"actualCRR":        actualCRR,
+		"surplus":          actualCRR - requiredCRR,
 		"complianceStatus": "compliant",
 		"cbnAccountNumber": "0001234567890",
-		"lastUpdated":     time.Now().Format(time.RFC3339),
+		"lastUpdated":      time.Now().Format(time.RFC3339),
 	}
 }

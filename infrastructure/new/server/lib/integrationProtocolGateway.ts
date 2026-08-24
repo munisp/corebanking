@@ -20,8 +20,135 @@
  *           keycloak-admin-go:8117, temporal-orchestrator-py:8118,
  *           recon-engine-rs:8119, notification-router-go:8120,
  *           sanctions-engine-rs:8121
+ *
+ * REMEDIATION (silent mockware): write/security endpoints now proxy to the real
+ * upstream engines and FAIL FAST (502/503) when unavailable — security verdicts
+ * (sanctions screening, BVN/NIN verification) FAIL CLOSED and never synthesize a
+ * "clear"/"verified" result. Read endpoints are sourced from the database or the
+ * upstream service; demo seed data is only served when SEED_DATA_FALLBACK === "true"
+ * AND NODE_ENV !== "production", and is explicitly labelled as seed data.
  */
 import type { Express, Request, Response } from "express";
+import { desc } from "drizzle-orm";
+import { getDb } from "../db";
+import {
+  kycVerifications,
+  swiftMessages,
+  nipTransactions,
+  sanctionsScreenings,
+  temporalWorkflowExecutions,
+  reconciliationRuns,
+} from "../../drizzle/schema";
+import { logger } from "./logger";
+
+// ── Upstream service endpoints ───────────────────────────────────────────────
+
+const NIBSS_NIP_URL = process.env.NIBSS_NIP_URL ?? "http://localhost:8111";
+const SWIFT_ISO20022_URL = process.env.SWIFT_ISO20022_URL ?? "http://localhost:8112";
+const MOJALOOP_PROTOCOL_URL = process.env.MOJALOOP_PROTOCOL_URL ?? "http://localhost:8113";
+// BVN/NIN verification is served by bvn-nin-verification-go (/api/bvn/verify, /api/nin/verify)
+const IDENTITY_VERIFICATION_URL = process.env.IDENTITY_VERIFICATION_URL ?? "http://localhost:8281";
+const WHATSAPP_CLOUD_API_URL = process.env.WHATSAPP_CLOUD_API_URL ?? "http://localhost:8115";
+const TIGERBEETLE_PROTOCOL_URL = process.env.TIGERBEETLE_PROTOCOL_URL ?? "http://localhost:8116";
+const KEYCLOAK_ADMIN_URL = process.env.KEYCLOAK_ADMIN_URL ?? "http://localhost:8117";
+const NOTIFICATION_ROUTER_URL = process.env.NOTIFICATION_ROUTER_URL ?? "http://localhost:8120";
+// Sanctions screening service (repo convention: SANCTIONS_SCREENING_URL, POST /api/screen)
+const SANCTIONS_SCREENING_URL = process.env.SANCTIONS_SCREENING_URL ?? "http://localhost:8283";
+
+// Demo seed data is ONLY served when explicitly enabled outside production.
+const SEED_DATA_FALLBACK =
+  process.env.SEED_DATA_FALLBACK === "true" && process.env.NODE_ENV !== "production";
+
+type Db = NonNullable<Awaited<ReturnType<typeof getDb>>>;
+
+/** Run a DB read; returns null (and logs loudly) when the DB is unavailable or the query fails. */
+async function dbQuery<T>(label: string, run: (db: Db) => Promise<T[]>): Promise<T[] | null> {
+  const db = await getDb();
+  if (!db) {
+    logger.error(`${label}: database not available — cannot serve real data`);
+    return null;
+  }
+  try {
+    return await run(db);
+  } catch (err) {
+    logger.error(`${label}: database query failed`, { error: String(err) });
+    return null;
+  }
+}
+
+/** Serve labelled demo seed data only when the explicit non-prod fallback is enabled; otherwise 503. */
+function serveSeedOr503(res: Response, errorCode: string, seedPayload: Record<string, unknown>): void {
+  if (SEED_DATA_FALLBACK) {
+    res.json({
+      ...seedPayload,
+      seedData: true,
+      note: "Demo seed data (SEED_DATA_FALLBACK=true, non-production) — not live integration data",
+    });
+    return;
+  }
+  res.status(503).json({ error: errorCode });
+}
+
+/** Proxy a GET to an upstream integration service; on failure serve labelled seed data or 503. */
+async function proxyGetOrSeed(
+  res: Response,
+  url: string,
+  errorCode: string,
+  seedPayload: () => Record<string, unknown>,
+  timeoutMs = 5_000,
+): Promise<void> {
+  try {
+    const upstream = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!upstream.ok) throw new Error(`upstream returned HTTP ${upstream.status}`);
+    res.json(await upstream.json());
+  } catch (err) {
+    logger.warn("Integration upstream unavailable", { url, error: String(err) });
+    serveSeedOr503(res, errorCode, seedPayload());
+  }
+}
+
+/**
+ * Proxy a POST to an upstream integration service. FAIL FAST: on network error,
+ * timeout, or non-2xx the given failure status/payload is returned — no success
+ * is ever synthesized locally.
+ */
+async function proxyPostJson(
+  res: Response,
+  url: string,
+  body: unknown,
+  failureStatus: 502 | 503,
+  failurePayload: Record<string, unknown>,
+  timeoutMs = 10_000,
+): Promise<void> {
+  try {
+    const upstream = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body ?? {}),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const data = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!upstream.ok) {
+      logger.error("Integration upstream call failed", { url, status: upstream.status });
+      res.status(failureStatus).json(failurePayload);
+      return;
+    }
+    res.json(data);
+  } catch (err) {
+    logger.error("Integration upstream unavailable", { url, error: String(err) });
+    res.status(failureStatus).json(failurePayload);
+  }
+}
+
+/** Short-timeout liveness probe used by the protocol summary (no fabricated "active" status). */
+async function probeService(baseUrl: string): Promise<"active" | "unreachable"> {
+  try {
+    const res = await fetch(`${baseUrl}/healthz`, { signal: AbortSignal.timeout(2_000) });
+    return res.ok ? "active" : "unreachable";
+  } catch {
+    return "unreachable";
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GAP 1: NIBSS/NIP (ISO 8583)
@@ -72,6 +199,7 @@ interface SWIFTMessage {
   createdAt: string;
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const SWIFT_MESSAGES: SWIFTMessage[] = [
   { id: "SW-001", messageType: "MT103", direction: "outbound", senderBIC: "FIFTYFOURBANKNG", receiverBIC: "CITIUS33XXX", uetr: "97ed4827-7b6f-4491-a06f-b548d5a7512d", reference: "FT26050900001", amount: 500000, currency: "USD", valueDate: "2026-05-09", beneficiary: "Acme Corp LLC, New York", ordering: "54Bank Customer", status: "delivered", gpiStatus: "ACSC", charges: "SHA", createdAt: "2026-05-09T10:00:00Z" },
   { id: "SW-002", messageType: "MT202", direction: "outbound", senderBIC: "FIFTYFOURBANKNG", receiverBIC: "BABOROBB", uetr: "a1c2d3e4-f5g6-h7i8-j9k0-l1m2n3o4p5q6", reference: "CT26050900001", amount: 2000000, currency: "USD", valueDate: "2026-05-09", beneficiary: "Barclays London (cover)", ordering: "54Bank Treasury", status: "acknowledged", gpiStatus: "ACSP", charges: "OUR", createdAt: "2026-05-09T09:00:00Z" },
@@ -99,6 +227,7 @@ interface MojalooopTransfer {
   completedAt?: string;
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const MOJALOOP_TRANSFERS: MojalooopTransfer[] = [
   { transferId: "MLT-001", payerFsp: "54BANK", payeeFsp: "MTNMOMO", amount: 50000, currency: "NGN", ilpPacket: "AYIBgQAAAAAAAABkFGcuNTRiYW5rLm1vYmlsZS4xMjM0NQIDAQACQwA", condition: "HOr22-H3AfTDHrSkPjJtVPRdKouuMkDXTR4ejlQGkxA", fulfilment: "UNiIzx73k7-WCDQ7MVFBe51V7q7kRerUN2HVi6sCNrY", transferState: "COMMITTED", expirationDate: "2026-05-09T15:30:00Z", createdAt: "2026-05-09T14:30:00Z", completedAt: "2026-05-09T14:30:02Z" },
   { transferId: "MLT-002", payerFsp: "54BANK", payeeFsp: "OPAY", amount: 100000, currency: "NGN", ilpPacket: "AYIBgQAAAAAAAABkFGcuNTRiYW5rLm1vYmlsZS42Nzg5MAIDAQACQwA", condition: "IOr33-I4BgUEIsUkQkKuVPSeLpvvNkEYUS4fj7mQHyB", transferState: "COMMITTED", expirationDate: "2026-05-09T16:00:00Z", createdAt: "2026-05-09T15:00:00Z", completedAt: "2026-05-09T15:00:01Z" },
@@ -127,6 +256,7 @@ interface IdentityVerification {
   verifiedAt: string;
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const VERIFICATIONS: IdentityVerification[] = [
   { id: "VER-001", type: "bvn", idNumber: "22345678901", firstName: "JOHN", lastName: "OKO", middleName: "ADEWALE", dateOfBirth: "1990-03-15", gender: "Male", phone: "08012345678", enrollmentBank: "GTBank", photoMatch: true, livenessScore: 0.97, status: "verified", provider: "NIBSS", verifiedAt: "2026-05-09T14:00:00Z" },
   { id: "VER-002", type: "nin", idNumber: "12345678901", firstName: "GRACE", lastName: "OKAFOR", middleName: "NKEM", dateOfBirth: "1985-07-22", gender: "Female", phone: "08098765432", photoMatch: true, livenessScore: 0.94, status: "verified", provider: "NIMC", verifiedAt: "2026-05-09T14:10:00Z" },
@@ -152,6 +282,7 @@ interface WhatsAppMessage {
   errorCode?: string;
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const WHATSAPP_MESSAGES: WhatsAppMessage[] = [
   { id: "WA-001", waMessageId: "wamid.HBgLMjM0ODAxMjM0NTY3OBUCABEYEjVDRTU0MEI3RTA3", phoneNumber: "+2348012345678", direction: "outbound", templateName: "credit_alert_v2", templateLanguage: "en", messageType: "template", content: "Credit Alert: ₦500,000.00 from JOHN OKO. Bal: ₦2,450,000.00", status: "read", deliveredAt: "2026-05-09T14:30:02Z", readAt: "2026-05-09T14:30:15Z" },
   { id: "WA-002", waMessageId: "wamid.HBgLMjM0ODA5ODc2NTQzMhUCABEYEjVDRTU0MEI3RTA4", phoneNumber: "+2348098765432", direction: "outbound", templateName: "debit_alert_v2", templateLanguage: "en", messageType: "template", content: "Debit Alert: ₦150,000.00 to Grace Okafor. Bal: ₦1,300,000.00", status: "delivered", deliveredAt: "2026-05-09T15:00:01Z" },
@@ -177,6 +308,7 @@ interface TBTransfer {
   timestamp: string;
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const TB_ACCOUNTS = [
   { id: "TB-ACC-001", ledger: 1, code: 1001, debitsPending: 0, debitsPosted: 450000000000, creditsPending: 0, creditsPosted: 500000000000, flags: ["debits_must_not_exceed_credits"], description: "Customer Deposits Pool" },
   { id: "TB-ACC-002", ledger: 1, code: 2001, debitsPending: 0, debitsPosted: 150000000000, creditsPending: 50000000000, creditsPosted: 200000000000, flags: [], description: "Loan Disbursement Account" },
@@ -195,6 +327,7 @@ const TB_TRANSFERS = [
 // GAP 7: KEYCLOAK ADMIN
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const KC_REALMS = [
   { realm: "54bank", displayName: "54Bank Platform", enabled: true, users: 12450, clients: 28, groups: 15, roles: 42, sslRequired: "all", bruteForceProtected: true, loginWithEmail: true, duplicateEmails: false },
   { realm: "54bank-partners", displayName: "White-Label Partners", enabled: true, users: 340, clients: 8, groups: 5, roles: 18, sslRequired: "all", bruteForceProtected: true, loginWithEmail: true, duplicateEmails: false },
@@ -224,6 +357,7 @@ interface TemporalWorkflow {
   sagaCompensations?: string[];
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const TEMPORAL_WORKFLOWS: TemporalWorkflow[] = [
   { workflowId: "WF-EOD-20260509", workflowType: "EODBatchWorkflow", taskQueue: "eod-processing", status: "COMPLETED", startTime: "2026-05-09T00:00:00Z", closeTime: "2026-05-09T00:45:00Z", executionTime: "45m", input: { date: "2026-05-09" }, output: { accountsProcessed: 125000, interestAccrued: 45000000000, reconExceptions: 3 }, retryPolicy: { maxAttempts: 3, initialInterval: "1m", backoffCoefficient: 2 }, sagaCompensations: ["ReverseInterestAccrual", "RevertGLPostings", "UnlockAccounts"] },
   { workflowId: "WF-LOAN-DISB-001", workflowType: "LoanDisbursementSaga", taskQueue: "loan-processing", status: "COMPLETED", startTime: "2026-05-09T10:00:00Z", closeTime: "2026-05-09T10:00:15Z", executionTime: "15s", input: { loanId: "LN-2026-0451", amount: 5000000000, customerId: "CUST-001" }, output: { disbursed: true, accountCredited: true, glPosted: true }, retryPolicy: { maxAttempts: 5, initialInterval: "30s", backoffCoefficient: 2 }, sagaCompensations: ["ReverseDisbursement", "RevertGLEntry", "CancelLoanActivation"] },
@@ -251,6 +385,7 @@ interface ReconResult {
   matchRate: string;
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const RECON_RESULTS: ReconResult[] = [
   { id: "REC-001", date: "2026-05-09", type: "three_way", source1: "Core Banking (GL)", source2: "NIBSS Switch", source3: "TigerBeetle Ledger", totalRecords: 12847, matched: 12830, unmatched: 0, exceptions: 17, netDifference: 0, status: "exceptions_pending", matchRate: "99.87%" },
   { id: "REC-002", date: "2026-05-09", type: "nostro", source1: "Nostro GL (1101-1108)", source2: "Correspondent Bank Statements", totalRecords: 342, matched: 340, unmatched: 2, exceptions: 2, netDifference: 15000000, status: "exceptions_pending", matchRate: "99.42%" },
@@ -269,6 +404,7 @@ interface NotificationRoute {
   deliveryStats: { sent: number; delivered: number; failed: number; rate: string };
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const NOTIFICATION_ROUTES: NotificationRoute[] = [
   { id: "NR-001", eventType: "transaction.credit", channels: [{ channel: "whatsapp", priority: 1, template: "credit_alert_v2", fallbackTo: "sms" }, { channel: "sms", priority: 2, template: "CR:{amount} from {sender}. Bal:{balance}" }, { channel: "push", priority: 3, template: "credit_push_v1" }, { channel: "email", priority: 4, template: "credit_email_v2" }], retryPolicy: { maxAttempts: 3, backoff: "exponential" }, deliveryStats: { sent: 420000, delivered: 418200, failed: 1800, rate: "99.57%" } },
   { id: "NR-002", eventType: "transaction.debit", channels: [{ channel: "sms", priority: 1, template: "DR:{amount} to {recipient}. Bal:{balance}" }, { channel: "whatsapp", priority: 2, template: "debit_alert_v2" }, { channel: "push", priority: 3, template: "debit_push_v1" }], retryPolicy: { maxAttempts: 3, backoff: "exponential" }, deliveryStats: { sent: 380000, delivered: 377600, failed: 2400, rate: "99.37%" } },
@@ -295,6 +431,7 @@ interface SanctionsScreening {
   screenedAt: string;
 }
 
+// Demo seed data — only served behind SEED_DATA_FALLBACK in non-production.
 const SANCTIONS_RESULTS: SanctionsScreening[] = [
   { id: "SCR-001", entityName: "JOHN ADEWALE OKO", entityType: "individual", screeningType: "real_time", lists: ["OFAC_SDN", "EU_CONSOLIDATED", "UN_SECURITY_COUNCIL", "CBN_WATCHLIST"], matchScore: 0, matchType: "exact", status: "clear", screenedAt: "2026-05-09T14:30:00Z" },
   { id: "SCR-002", entityName: "AL-RASHID TRADING COMPANY", entityType: "organization", screeningType: "real_time", lists: ["OFAC_SDN", "EU_CONSOLIDATED", "UN_SECURITY_COUNCIL"], matchScore: 0.87, matchType: "fuzzy", status: "potential_match", matchedEntry: "AL RASHID TRADING CO (OFAC SDN #12345)", decision: "escalate", screenedAt: "2026-05-09T14:35:00Z" },
@@ -308,116 +445,431 @@ const SANCTIONS_RESULTS: SanctionsScreening[] = [
 
 export function registerIntegrationProtocolRoutes(app: Express) {
   // Gap 1: NIBSS/NIP
-  app.get("/api/integrations/nip/transactions", (_req: Request, res: Response) => {
-    res.json({ transactions: [], service: "nibss-nip-engine-go:8111", note: "Proxied to Go service in production" });
+  app.get("/api/integrations/nip/transactions", async (_req: Request, res: Response) => {
+    const rows = await dbQuery("nip/transactions", db =>
+      db.select().from(nipTransactions).orderBy(desc(nipTransactions.createdAt)).limit(100)
+    );
+    if (rows === null) {
+      res.status(503).json({ error: "nip_unavailable", success: false });
+      return;
+    }
+    res.json({ transactions: rows, total: rows.length, service: "nibss-nip-engine-go:8111", source: "database" });
   });
   app.get("/api/integrations/nip/response-codes", (_req: Request, res: Response) => {
     res.json({ responseCodes: NIP_RESPONSE_CODES, total: Object.keys(NIP_RESPONSE_CODES).length });
   });
-  app.post("/api/integrations/nip/name-enquiry", (req: Request, res: Response) => {
-    res.json({ success: true, service: "nibss-nip-engine-go:8111", protocol: "ISO_8583", mti: "0200" });
+  app.post("/api/integrations/nip/name-enquiry", async (req: Request, res: Response) => {
+    // Proxy to the real NIBSS NIP engine — never fabricate an account-name match.
+    await proxyPostJson(
+      res,
+      `${NIBSS_NIP_URL}/v1/nip/name-enquiry`,
+      req.body,
+      502,
+      { error: "nip_unavailable", success: false, service: "nibss-nip-engine-go:8111" },
+    );
   });
-  app.post("/api/integrations/nip/funds-transfer", (req: Request, res: Response) => {
-    res.json({ success: true, service: "nibss-nip-engine-go:8111", protocol: "ISO_8583", mti: "0200" });
+  app.post("/api/integrations/nip/funds-transfer", async (req: Request, res: Response) => {
+    // Proxy to the real NIBSS NIP engine — never fabricate a successful transfer.
+    await proxyPostJson(
+      res,
+      `${NIBSS_NIP_URL}/v1/nip/funds-transfer`,
+      req.body,
+      502,
+      { error: "nip_unavailable", success: false, service: "nibss-nip-engine-go:8111" },
+    );
   });
 
   // Gap 2: SWIFT/ISO 20022
-  app.get("/api/integrations/swift/messages", (_req: Request, res: Response) => {
-    res.json({ messages: SWIFT_MESSAGES, total: SWIFT_MESSAGES.length, protocols: ["MT103", "MT202", "MT760", "pacs.008", "pacs.009", "camt.053"] });
+  app.get("/api/integrations/swift/messages", async (_req: Request, res: Response) => {
+    const rows = await dbQuery("swift/messages", db =>
+      db.select().from(swiftMessages).orderBy(desc(swiftMessages.createdAt)).limit(100)
+    );
+    if (rows === null) {
+      serveSeedOr503(res, "swift_messages_unavailable", {
+        messages: SWIFT_MESSAGES,
+        total: SWIFT_MESSAGES.length,
+        protocols: ["MT103", "MT202", "MT760", "pacs.008", "pacs.009", "camt.053"],
+      });
+      return;
+    }
+    res.json({
+      messages: rows.map(m => ({
+        id: m.messageId,
+        messageType: m.messageType,
+        direction: m.direction,
+        senderBIC: m.senderBic,
+        receiverBIC: m.receiverBic,
+        reference: m.relatedTransferId ?? m.messageId,
+        amount: m.amount,
+        currency: m.currency,
+        valueDate: m.valueDate,
+        status: m.status,
+        rawXml: m.rawMessage,
+        createdAt: m.createdAt,
+      })),
+      total: rows.length,
+      protocols: ["MT103", "MT202", "MT760", "pacs.008", "pacs.009", "camt.053"],
+      source: "database",
+    });
   });
-  app.get("/api/integrations/swift/gpi-tracker", (req: Request, res: Response) => {
+  app.get("/api/integrations/swift/gpi-tracker", async (req: Request, res: Response) => {
     const uetr = req.query.uetr as string;
-    const msg = SWIFT_MESSAGES.find(m => m.uetr === uetr);
-    res.json(msg ? { found: true, message: msg } : { found: false });
+    if (!uetr) {
+      res.status(400).json({ error: "uetr query parameter required" });
+      return;
+    }
+    // gpi tracking is owned by swift-iso20022-rs — proxy; never fabricate tracking state.
+    await proxyGetOrSeed(
+      res,
+      `${SWIFT_ISO20022_URL}/gpi-tracker?uetr=${encodeURIComponent(uetr)}`,
+      "gpi_tracker_unavailable",
+      () => {
+        const msg = SWIFT_MESSAGES.find(m => m.uetr === uetr);
+        return msg ? { found: true, message: msg } : { found: false };
+      },
+    );
   });
 
   // Gap 3: Mojaloop FSPIOP
-  app.get("/api/integrations/mojaloop/transfers", (_req: Request, res: Response) => {
-    res.json({ transfers: MOJALOOP_TRANSFERS, total: MOJALOOP_TRANSFERS.length, protocol: "FSPIOP_1.1", ilp: "ILPv4" });
+  app.get("/api/integrations/mojaloop/transfers", async (_req: Request, res: Response) => {
+    await proxyGetOrSeed(
+      res,
+      `${MOJALOOP_PROTOCOL_URL}/transfers`,
+      "mojaloop_unavailable",
+      () => ({ transfers: MOJALOOP_TRANSFERS, total: MOJALOOP_TRANSFERS.length, protocol: "FSPIOP_1.1", ilp: "ILPv4" }),
+    );
   });
 
   // Gap 4: BVN/NIN
-  app.get("/api/integrations/identity/verifications", (_req: Request, res: Response) => {
-    res.json({ verifications: VERIFICATIONS, total: VERIFICATIONS.length, providers: ["NIBSS (BVN)", "NIMC (NIN)", "FRSC (Drivers License)", "NIS (Passport)"] });
+  app.get("/api/integrations/identity/verifications", async (_req: Request, res: Response) => {
+    const rows = await dbQuery("identity/verifications", db =>
+      db.select().from(kycVerifications).orderBy(desc(kycVerifications.createdAt)).limit(100)
+    );
+    if (rows === null) {
+      serveSeedOr503(res, "identity_verifications_unavailable", {
+        verifications: VERIFICATIONS,
+        total: VERIFICATIONS.length,
+        providers: ["NIBSS (BVN)", "NIMC (NIN)", "FRSC (Drivers License)", "NIS (Passport)"],
+      });
+      return;
+    }
+    res.json({
+      verifications: rows.map(v => ({
+        id: v.verificationId,
+        customerId: v.customerId,
+        type: v.verificationType,
+        idNumber: v.documentReference,
+        provider: v.provider,
+        photoMatch: (v.providerResponse as Record<string, unknown> | null)?.photoMatch ?? null,
+        livenessScore: v.matchScore,
+        status: v.status,
+        verifiedAt: v.verifiedAt,
+        expiresAt: v.expiresAt,
+      })),
+      total: rows.length,
+      providers: ["NIBSS (BVN)", "NIMC (NIN)", "FRSC (Drivers License)", "NIS (Passport)"],
+      source: "database",
+    });
   });
-  app.post("/api/integrations/identity/verify-bvn", (req: Request, res: Response) => {
+  app.post("/api/integrations/identity/verify-bvn", async (req: Request, res: Response) => {
     const { bvn } = req.body;
     if (!bvn || bvn.length !== 11) { res.status(400).json({ error: "BVN must be 11 digits" }); return; }
-    res.json({ success: true, provider: "NIBSS", verification: { bvnValid: true, photoMatch: true, livenessScore: 0.95 } });
+    // FAIL CLOSED: proxy to the real BVN verification service; never synthesize a match.
+    await proxyPostJson(
+      res,
+      `${IDENTITY_VERIFICATION_URL}/api/bvn/verify`,
+      req.body,
+      503,
+      {
+        error: "identity_verification_unavailable",
+        success: false,
+        provider: "NIBSS",
+        verification: { bvnValid: null, photoMatch: null, livenessScore: null },
+      },
+    );
   });
-  app.post("/api/integrations/identity/verify-nin", (req: Request, res: Response) => {
+  app.post("/api/integrations/identity/verify-nin", async (req: Request, res: Response) => {
     const { nin } = req.body;
     if (!nin || nin.length !== 11) { res.status(400).json({ error: "NIN must be 11 digits" }); return; }
-    res.json({ success: true, provider: "NIMC", verification: { ninValid: true, photoMatch: true, livenessScore: 0.93 } });
+    // FAIL CLOSED: proxy to the real NIN verification service; never synthesize a match.
+    await proxyPostJson(
+      res,
+      `${IDENTITY_VERIFICATION_URL}/api/nin/verify`,
+      req.body,
+      503,
+      {
+        error: "identity_verification_unavailable",
+        success: false,
+        provider: "NIMC",
+        verification: { ninValid: null, photoMatch: null, livenessScore: null },
+      },
+    );
   });
 
   // Gap 5: WhatsApp Cloud API
-  app.get("/api/integrations/whatsapp/messages", (_req: Request, res: Response) => {
-    res.json({ messages: WHATSAPP_MESSAGES, total: WHATSAPP_MESSAGES.length, apiVersion: "v18.0", deliveryRate: "99.5%" });
+  app.get("/api/integrations/whatsapp/messages", async (_req: Request, res: Response) => {
+    await proxyGetOrSeed(
+      res,
+      `${WHATSAPP_CLOUD_API_URL}/v1/messages`,
+      "whatsapp_unavailable",
+      () => ({ messages: WHATSAPP_MESSAGES, total: WHATSAPP_MESSAGES.length, apiVersion: "v18.0" }),
+    );
   });
-  app.post("/api/integrations/whatsapp/send-template", (req: Request, res: Response) => {
+  app.post("/api/integrations/whatsapp/send-template", async (req: Request, res: Response) => {
     const { phoneNumber, templateName, parameters } = req.body;
-    res.status(201).json({ success: true, waMessageId: `wamid.${Date.now()}`, status: "accepted", phoneNumber, templateName });
+    if (!phoneNumber || !templateName) {
+      res.status(400).json({ error: "phoneNumber and templateName are required" });
+      return;
+    }
+    // Proxy to the WhatsApp Cloud API service — never fabricate a waMessageId or delivery status.
+    try {
+      const upstream = await fetch(`${WHATSAPP_CLOUD_API_URL}/v1/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ to: phoneNumber, type: "template", template: { name: templateName, parameters } }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const data = (await upstream.json().catch(() => ({}))) as Record<string, unknown>;
+      if (!upstream.ok) {
+        logger.error("WhatsApp upstream rejected template send", { status: upstream.status });
+        res.status(502).json({ error: "whatsapp_unavailable", success: false });
+        return;
+      }
+      res.status(201).json({ success: true, ...data });
+    } catch (err) {
+      logger.error("WhatsApp upstream unavailable", { error: String(err) });
+      res.status(502).json({ error: "whatsapp_unavailable", success: false });
+    }
   });
 
   // Gap 6: TigerBeetle
-  app.get("/api/integrations/tigerbeetle/accounts", (_req: Request, res: Response) => {
-    res.json({ accounts: TB_ACCOUNTS, total: TB_ACCOUNTS.length, protocol: "TigerBeetle_0.15", flags: ["linked", "two_phase_commit", "debits_must_not_exceed_credits", "credits_must_not_exceed_debits"] });
+  app.get("/api/integrations/tigerbeetle/accounts", async (_req: Request, res: Response) => {
+    await proxyGetOrSeed(
+      res,
+      `${TIGERBEETLE_PROTOCOL_URL}/accounts`,
+      "tigerbeetle_unavailable",
+      () => ({ accounts: TB_ACCOUNTS, total: TB_ACCOUNTS.length, protocol: "TigerBeetle_0.15", flags: ["linked", "two_phase_commit", "debits_must_not_exceed_credits", "credits_must_not_exceed_debits"] }),
+    );
   });
-  app.get("/api/integrations/tigerbeetle/transfers", (_req: Request, res: Response) => {
-    res.json({ transfers: TB_TRANSFERS, total: TB_TRANSFERS.length });
+  app.get("/api/integrations/tigerbeetle/transfers", async (_req: Request, res: Response) => {
+    await proxyGetOrSeed(
+      res,
+      `${TIGERBEETLE_PROTOCOL_URL}/transfers`,
+      "tigerbeetle_unavailable",
+      () => ({ transfers: TB_TRANSFERS, total: TB_TRANSFERS.length }),
+    );
   });
 
   // Gap 7: Keycloak Admin
-  app.get("/api/integrations/keycloak/realms", (_req: Request, res: Response) => {
-    res.json({ realms: KC_REALMS, total: KC_REALMS.length });
+  app.get("/api/integrations/keycloak/realms", async (_req: Request, res: Response) => {
+    await proxyGetOrSeed(
+      res,
+      `${KEYCLOAK_ADMIN_URL}/realms`,
+      "keycloak_admin_unavailable",
+      () => ({ realms: KC_REALMS, total: KC_REALMS.length }),
+    );
   });
-  app.get("/api/integrations/keycloak/clients", (_req: Request, res: Response) => {
-    res.json({ clients: KC_CLIENTS, total: KC_CLIENTS.length });
+  app.get("/api/integrations/keycloak/clients", async (_req: Request, res: Response) => {
+    await proxyGetOrSeed(
+      res,
+      `${KEYCLOAK_ADMIN_URL}/clients`,
+      "keycloak_admin_unavailable",
+      () => ({ clients: KC_CLIENTS, total: KC_CLIENTS.length }),
+    );
   });
 
   // Gap 8: Temporal Workflows
-  app.get("/api/integrations/temporal/workflows", (_req: Request, res: Response) => {
-    res.json({ workflows: TEMPORAL_WORKFLOWS, total: TEMPORAL_WORKFLOWS.length, taskQueues: ["eod-processing", "loan-processing", "settlement-processing", "kyc-processing", "notification-processing"] });
+  app.get("/api/integrations/temporal/workflows", async (_req: Request, res: Response) => {
+    const rows = await dbQuery("temporal/workflows", db =>
+      db.select().from(temporalWorkflowExecutions).orderBy(desc(temporalWorkflowExecutions.startedAt)).limit(100)
+    );
+    if (rows === null) {
+      serveSeedOr503(res, "temporal_unavailable", {
+        workflows: TEMPORAL_WORKFLOWS,
+        total: TEMPORAL_WORKFLOWS.length,
+        taskQueues: ["eod-processing", "loan-processing", "settlement-processing", "kyc-processing", "notification-processing"],
+      });
+      return;
+    }
+    res.json({
+      workflows: rows.map(w => ({
+        workflowId: w.workflowId,
+        workflowRunId: w.workflowRunId,
+        workflowType: w.workflowType,
+        taskQueue: w.taskQueue,
+        status: (w.status ?? "").toUpperCase(),
+        startTime: w.startedAt,
+        closeTime: w.completedAt,
+        input: w.inputPayload,
+        output: w.resultPayload,
+        errorMessage: w.errorMessage,
+      })),
+      total: rows.length,
+      taskQueues: ["eod-processing", "loan-processing", "settlement-processing", "kyc-processing", "notification-processing"],
+      source: "database",
+    });
   });
 
   // Gap 9: Reconciliation
-  app.get("/api/integrations/reconciliation/results", (_req: Request, res: Response) => {
-    res.json({ results: RECON_RESULTS, total: RECON_RESULTS.length, algorithms: ["exact_match", "fuzzy_amount_tolerance", "reference_correlation", "timestamp_window"] });
+  app.get("/api/integrations/reconciliation/results", async (_req: Request, res: Response) => {
+    const rows = await dbQuery("reconciliation/results", db =>
+      db.select().from(reconciliationRuns).orderBy(desc(reconciliationRuns.createdAt)).limit(100)
+    );
+    if (rows === null) {
+      serveSeedOr503(res, "reconciliation_unavailable", {
+        results: RECON_RESULTS,
+        total: RECON_RESULTS.length,
+        algorithms: ["exact_match", "fuzzy_amount_tolerance", "reference_correlation", "timestamp_window"],
+      });
+      return;
+    }
+    res.json({
+      results: rows.map(r => ({
+        id: r.runId,
+        type: r.runType,
+        scope: r.scope,
+        totalRecords: r.totalEntriesChecked,
+        matched: r.matches,
+        unmatched: r.discrepancies,
+        exceptions: r.manualTriage,
+        autoRepaired: r.autoRepaired,
+        status: r.status,
+        startTime: r.startTime,
+        endTime: r.endTime,
+        durationMs: r.durationMs,
+        matchRate: r.totalEntriesChecked ? `${((r.matches ?? 0) / r.totalEntriesChecked * 100).toFixed(2)}%` : null,
+      })),
+      total: rows.length,
+      algorithms: ["exact_match", "fuzzy_amount_tolerance", "reference_correlation", "timestamp_window"],
+      source: "database",
+    });
   });
 
   // Gap 10: Notification Routing
-  app.get("/api/integrations/notifications/routes", (_req: Request, res: Response) => {
-    res.json({ routes: NOTIFICATION_ROUTES, total: NOTIFICATION_ROUTES.length, channels: ["whatsapp", "sms", "push", "email", "telegram", "in_app"] });
+  app.get("/api/integrations/notifications/routes", async (_req: Request, res: Response) => {
+    await proxyGetOrSeed(
+      res,
+      `${NOTIFICATION_ROUTER_URL}/routes`,
+      "notification_router_unavailable",
+      () => ({ routes: NOTIFICATION_ROUTES, total: NOTIFICATION_ROUTES.length, channels: ["whatsapp", "sms", "push", "email", "telegram", "in_app"] }),
+    );
   });
 
   // Gap 11: Sanctions Screening
-  app.get("/api/integrations/sanctions/screenings", (_req: Request, res: Response) => {
-    res.json({ screenings: SANCTIONS_RESULTS, total: SANCTIONS_RESULTS.length, lists: ["OFAC_SDN", "EU_CONSOLIDATED", "UN_SECURITY_COUNCIL", "CBN_WATCHLIST", "INTERPOL_RED", "NFIU_WATCHLIST"], matchAlgorithms: ["exact", "fuzzy", "phonetic", "alias", "transliteration"] });
+  app.get("/api/integrations/sanctions/screenings", async (_req: Request, res: Response) => {
+    const rows = await dbQuery("sanctions/screenings", db =>
+      db.select().from(sanctionsScreenings).orderBy(desc(sanctionsScreenings.createdAt)).limit(100)
+    );
+    if (rows === null) {
+      serveSeedOr503(res, "sanctions_screenings_unavailable", {
+        screenings: SANCTIONS_RESULTS,
+        total: SANCTIONS_RESULTS.length,
+        lists: ["OFAC_SDN", "EU_CONSOLIDATED", "UN_SECURITY_COUNCIL", "CBN_WATCHLIST", "INTERPOL_RED", "NFIU_WATCHLIST"],
+        matchAlgorithms: ["exact", "fuzzy", "phonetic", "alias", "transliteration"],
+      });
+      return;
+    }
+    res.json({
+      screenings: rows.map(s => ({
+        id: s.id,
+        entityName: s.entityName,
+        entityType: s.entityType,
+        lists: s.listsChecked,
+        matchScore: s.highestScore,
+        matchFound: s.matchFound === 1,
+        matchDetails: s.matchDetails,
+        status: s.status,
+        screenedBy: s.screenedBy,
+        screenedAt: s.createdAt,
+      })),
+      total: rows.length,
+      lists: ["OFAC_SDN", "EU_CONSOLIDATED", "UN_SECURITY_COUNCIL", "CBN_WATCHLIST", "INTERPOL_RED", "NFIU_WATCHLIST"],
+      matchAlgorithms: ["exact", "fuzzy", "phonetic", "alias", "transliteration"],
+      source: "database",
+    });
   });
-  app.post("/api/integrations/sanctions/screen", (req: Request, res: Response) => {
-    const { entityName, entityType } = req.body;
+  app.post("/api/integrations/sanctions/screen", async (req: Request, res: Response) => {
+    const { entityName, entityType, customerId, transactionId, tenantId } = req.body ?? {};
     if (!entityName) { res.status(400).json({ error: "entityName required" }); return; }
-    res.json({ entityName, entityType: entityType ?? "individual", matchScore: 0, status: "clear", lists: ["OFAC_SDN", "EU_CONSOLIDATED", "UN_SECURITY_COUNCIL", "CBN_WATCHLIST"], screenedAt: new Date().toISOString() });
+    // FAIL CLOSED: proxy to the real sanctions screening service.
+    // NEVER synthesize a "clear" verdict — on any failure the result is indeterminate.
+    try {
+      const upstream = await fetch(`${SANCTIONS_SCREENING_URL}/api/screen`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          name: entityName,
+          entity_type: entityType ?? "individual",
+          tenant_id: tenantId ?? "default",
+          triggered_by: "integration-protocol-gateway",
+          customer_id: customerId,
+          transaction_id: transactionId,
+          screen_type: "real_time",
+        }),
+        signal: AbortSignal.timeout(10_000),
+      });
+      const data = (await upstream.json().catch(() => ({}))) as {
+        id?: string;
+        risk_level?: string;
+        action?: "proceed" | "block" | "hold_and_review";
+        highest_score?: number;
+        match_count?: number;
+        matches?: unknown[];
+      };
+      if (!upstream.ok) {
+        logger.error("Sanctions screening service returned non-2xx — failing closed", { status: upstream.status, entityName });
+        res.status(503).json({ error: "screening_unavailable", status: "indeterminate", entityName });
+        return;
+      }
+      const status =
+        data.action === "block" ? "confirmed_match"
+        : data.action === "hold_and_review" ? "potential_match"
+        : data.action === "proceed" ? "clear"
+        : "indeterminate";
+      res.json({
+        entityName,
+        entityType: entityType ?? "individual",
+        screeningId: data.id ?? null,
+        matchScore: data.highest_score ?? null,
+        matchCount: data.match_count ?? 0,
+        matches: data.matches ?? [],
+        riskLevel: data.risk_level ?? null,
+        action: data.action ?? null,
+        status,
+        lists: ["OFAC_SDN", "EU_CONSOLIDATED", "UN_SECURITY_COUNCIL", "CBN_WATCHLIST"],
+        screenedAt: new Date().toISOString(),
+        source: "sanctions-screening-service",
+      });
+    } catch (err) {
+      logger.error("Sanctions screening service unreachable — failing closed", { error: String(err), entityName });
+      res.status(503).json({ error: "screening_unavailable", status: "indeterminate", entityName });
+    }
   });
 
-  // Summary endpoint
-  app.get("/api/integrations/protocol-summary", (_req: Request, res: Response) => {
+  // Summary endpoint — reports REAL liveness of each integration service (probed, not hardcoded).
+  app.get("/api/integrations/protocol-summary", async (_req: Request, res: Response) => {
+    const integrations = [
+      { gap: 1, name: "NIBSS/NIP", protocol: "ISO 8583", service: "nibss-nip-engine-go:8111", baseUrl: NIBSS_NIP_URL },
+      { gap: 2, name: "SWIFT/ISO 20022", protocol: "MT + MX (pacs/camt)", service: "swift-iso20022-rs:8112", baseUrl: SWIFT_ISO20022_URL },
+      { gap: 3, name: "Mojaloop", protocol: "FSPIOP 1.1 + ILPv4", service: "mojaloop-protocol-py:8113", baseUrl: MOJALOOP_PROTOCOL_URL },
+      { gap: 4, name: "BVN/NIN Verification", protocol: "NIBSS BVN API + NIMC NIN", service: "identity-verification-go:8114", baseUrl: IDENTITY_VERIFICATION_URL },
+      { gap: 5, name: "WhatsApp Business", protocol: "Cloud API v18.0", service: "whatsapp-cloud-api-go:8115", baseUrl: WHATSAPP_CLOUD_API_URL },
+      { gap: 6, name: "TigerBeetle", protocol: "TB Client 0.15", service: "tigerbeetle-protocol-rs:8116", baseUrl: TIGERBEETLE_PROTOCOL_URL },
+      { gap: 7, name: "Keycloak", protocol: "Admin REST API", service: "keycloak-admin-go:8117", baseUrl: KEYCLOAK_ADMIN_URL },
+      { gap: 8, name: "Temporal", protocol: "gRPC + Proto3", service: "temporal-orchestrator-py:8118", baseUrl: null },
+      { gap: 9, name: "Reconciliation", protocol: "3-way matching", service: "recon-engine-rs:8119", baseUrl: null },
+      { gap: 10, name: "Notification Routing", protocol: "Multi-channel + fallback", service: "notification-router-go:8120", baseUrl: NOTIFICATION_ROUTER_URL },
+      { gap: 11, name: "Sanctions Screening", protocol: "OFAC/EU/UN fuzzy match", service: "sanctions-engine-rs:8121", baseUrl: SANCTIONS_SCREENING_URL },
+    ];
+    const probed = await Promise.all(
+      integrations.map(async ({ baseUrl, ...rest }) => ({
+        ...rest,
+        status: baseUrl ? await probeService(baseUrl) : ("unknown" as const),
+      })),
+    );
     res.json({
       gapsClosed: 11,
-      integrations: [
-        { gap: 1, name: "NIBSS/NIP", protocol: "ISO 8583", service: "nibss-nip-engine-go:8111", status: "active" },
-        { gap: 2, name: "SWIFT/ISO 20022", protocol: "MT + MX (pacs/camt)", service: "swift-iso20022-rs:8112", status: "active" },
-        { gap: 3, name: "Mojaloop", protocol: "FSPIOP 1.1 + ILPv4", service: "mojaloop-protocol-py:8113", status: "active" },
-        { gap: 4, name: "BVN/NIN Verification", protocol: "NIBSS BVN API + NIMC NIN", service: "identity-verification-go:8114", status: "active" },
-        { gap: 5, name: "WhatsApp Business", protocol: "Cloud API v18.0", service: "whatsapp-cloud-api-go:8115", status: "active" },
-        { gap: 6, name: "TigerBeetle", protocol: "TB Client 0.15", service: "tigerbeetle-protocol-rs:8116", status: "active" },
-        { gap: 7, name: "Keycloak", protocol: "Admin REST API", service: "keycloak-admin-go:8117", status: "active" },
-        { gap: 8, name: "Temporal", protocol: "gRPC + Proto3", service: "temporal-orchestrator-py:8118", status: "active" },
-        { gap: 9, name: "Reconciliation", protocol: "3-way matching", service: "recon-engine-rs:8119", status: "active" },
-        { gap: 10, name: "Notification Routing", protocol: "Multi-channel + fallback", service: "notification-router-go:8120", status: "active" },
-        { gap: 11, name: "Sanctions Screening", protocol: "OFAC/EU/UN fuzzy match", service: "sanctions-engine-rs:8121", status: "active" },
-      ],
+      integrations: probed,
       middleware: "All 14 integrated per service",
     });
   });

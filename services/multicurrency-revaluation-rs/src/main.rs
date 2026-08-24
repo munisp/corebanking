@@ -1,7 +1,7 @@
+use postgres::{Client, NoTls};
 use std::env;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::{Arc, RwLock};
 
 fn get_env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
@@ -11,7 +11,7 @@ fn middleware_config() -> serde_json::Value {
     serde_json::json!({
         "kafka": {"broker": get_env("KAFKA_BROKER", "localhost:9092"), "topics": "fx.revaluation-completed,fx.rate-updated,fx.position-changed"},
         "redis": {"url": get_env("REDIS_URL", "redis://localhost:6379"), "purpose": "rate-cache,position-cache"},
-        "postgres": {"url": get_env("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"), "tables": "fx_rates,fx_positions,fx_revaluations,currency_accounts"},
+        "postgres": {"url": env::var("DATABASE_URL").expect("DATABASE_URL must be set - refusing to boot with default database credentials"), "tables": "fx_rates,fx_positions,fx_revaluations,currency_accounts"},
         "opensearch": {"url": get_env("OPENSEARCH_URL", "http://localhost:9200"), "index": "fx-revaluation-history"},
         "keycloak": {"url": get_env("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54link-dev", "role": "treasury-officer"},
         "permify": {"url": get_env("PERMIFY_URL", "http://localhost:3476"), "schema": "fx:revalue,fx:override-rate,fx:close-position"},
@@ -26,129 +26,378 @@ fn middleware_config() -> serde_json::Value {
     })
 }
 
-fn seed_data() -> serde_json::Value {
-    serde_json::json!({
-        "currencies": [
-            {"code": "NGN", "name": "Nigerian Naira", "type": "local", "decimalPlaces": 2, "isBaseCurrency": true},
-            {"code": "USD", "name": "US Dollar", "type": "major", "decimalPlaces": 2, "isBaseCurrency": false},
-            {"code": "GBP", "name": "British Pound", "type": "major", "decimalPlaces": 2, "isBaseCurrency": false},
-            {"code": "EUR", "name": "Euro", "type": "major", "decimalPlaces": 2, "isBaseCurrency": false},
-            {"code": "CNY", "name": "Chinese Yuan", "type": "emerging", "decimalPlaces": 2, "isBaseCurrency": false},
-            {"code": "XAF", "name": "CFA Franc", "type": "regional", "decimalPlaces": 0, "isBaseCurrency": false},
-            {"code": "GHS", "name": "Ghanaian Cedi", "type": "regional", "decimalPlaces": 2, "isBaseCurrency": false},
-        ],
-        "rates": [
-            {"pair": "USD/NGN", "bidRate": 1580.00, "askRate": 1585.00, "midRate": 1582.50, "cbnRate": 1550.00, "previousClose": 1575.00, "source": "NAFEM", "updatedAt": "2026-05-10T16:00:00Z"},
-            {"pair": "GBP/NGN", "bidRate": 1990.00, "askRate": 1998.00, "midRate": 1994.00, "cbnRate": 1960.00, "previousClose": 1985.00, "source": "NAFEM", "updatedAt": "2026-05-10T16:00:00Z"},
-            {"pair": "EUR/NGN", "bidRate": 1720.00, "askRate": 1726.00, "midRate": 1723.00, "cbnRate": 1700.00, "previousClose": 1715.00, "source": "NAFEM", "updatedAt": "2026-05-10T16:00:00Z"},
-            {"pair": "CNY/NGN", "bidRate": 218.00, "askRate": 220.00, "midRate": 219.00, "cbnRate": 215.00, "previousClose": 217.50, "source": "CBN", "updatedAt": "2026-05-10T16:00:00Z"},
-        ],
-        "positions": [
-            {"id": "POS-USD-001", "currency": "USD", "accountType": "nostro", "balance": 45000000.00, "localEquivalent": 71212500.00, "prevLocalEquivalent": 70875000.00, "revalPnL": 337500.00, "accountCount": 12500},
-            {"id": "POS-GBP-001", "currency": "GBP", "accountType": "nostro", "balance": 12000000.00, "localEquivalent": 23928000.00, "prevLocalEquivalent": 23820000.00, "revalPnL": 108000.00, "accountCount": 3200},
-            {"id": "POS-EUR-001", "currency": "EUR", "accountType": "nostro", "balance": 18000000.00, "localEquivalent": 31014000.00, "prevLocalEquivalent": 30870000.00, "revalPnL": 144000.00, "accountCount": 5800},
-            {"id": "POS-CNY-001", "currency": "CNY", "accountType": "vostro", "balance": 25000000.00, "localEquivalent": 5475000.00, "prevLocalEquivalent": 5437500.00, "revalPnL": 37500.00, "accountCount": 450},
-        ],
-        "revaluationRuns": [
-            {"id": "REVAL-2026-05-10", "businessDate": "2026-05-10", "status": "completed", "executedAt": "2026-05-10T22:01:15Z", "totalPositions": 4, "totalAccounts": 21950, "totalPnL": 627000.00, "pnlBreakdown": {"USD": 337500.00, "GBP": 108000.00, "EUR": 144000.00, "CNY": 37500.00}, "glEntries": [
-                {"debit": "GL-2200-DOM-FCY", "credit": "GL-4200-REVAL-GAIN", "amount": 627000.00, "narrative": "FX revaluation gain 2026-05-10"}
-            ]},
-            {"id": "REVAL-2026-05-09", "businessDate": "2026-05-09", "status": "completed", "executedAt": "2026-05-09T22:01:08Z", "totalPositions": 4, "totalAccounts": 21890, "totalPnL": -234000.00, "pnlBreakdown": {"USD": -180000.00, "GBP": 45000.00, "EUR": -120000.00, "CNY": 21000.00}, "glEntries": [
-                {"debit": "GL-5200-REVAL-LOSS", "credit": "GL-2200-DOM-FCY", "amount": 234000.00, "narrative": "FX revaluation loss 2026-05-09"}
-            ]},
-        ],
-        "stats": {
-            "totalCurrencies": 7, "activePairs": 4, "totalFCYBalance": 100000000.00,
-            "totalLocalEquivalent": 131629500.00, "netRevalPnLToday": 627000.00,
-            "netRevalPnLMTD": 393000.00, "totalAccountsRevalued": 21950,
-            "revaluationMethod": "closing-rate", "glAccountGain": "GL-4200-REVAL-GAIN",
-            "glAccountLoss": "GL-5200-REVAL-LOSS"
-        }
-    })
+fn source_unavailable(detail: &str) -> (u16, String) {
+    (503, serde_json::json!({
+        "error": "source_unavailable",
+        "detail": detail,
+    }).to_string())
 }
 
-fn handle_request(request: &str, data: &Arc<RwLock<serde_json::Value>>) -> (u16, String) {
+// FX rates, nostro positions and revaluation P&L are financial data: NEVER fabricate.
+// Rates come from the fx_rates table (populated by fx-service); positions from fx_positions;
+// run history from fx_revaluations. Any source failure => 503 source_unavailable.
+fn with_db<T>(f: impl FnOnce(&mut Client) -> Result<T, String>) -> Result<T, String> {
+    let url = env::var("DATABASE_URL")
+        .map_err(|_| "DATABASE_URL not set; refusing to fabricate FX data".to_string())?;
+    if url.is_empty() {
+        return Err("DATABASE_URL empty; refusing to fabricate FX data".to_string());
+    }
+    let mut client = Client::connect(&url, NoTls)
+        .map_err(|e| format!("postgres connect failed: {}", e))?;
+    f(&mut client)
+}
+
+fn load_rates(c: &mut Client) -> Result<Vec<(String, String, f64, String)>, String> {
+    let rows = c.query(
+        "SELECT from_currency, to_currency, rate::float8, COALESCE(updated_at::text, '') FROM fx_rates",
+        &[],
+    ).map_err(|e| format!("fx_rates query failed: {}", e))?;
+    Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect())
+}
+
+fn rate_ngn(rates: &[(String, String, f64, String)], ccy: &str) -> Option<f64> {
+    rates.iter()
+        .find(|(f, t, _, _)| f == ccy && t == "NGN")
+        .map(|(_, _, r, _)| *r)
+        .or_else(|| rates.iter().find(|(f, t, _, _)| f == "NGN" && t == ccy).map(|(_, _, r, _)| 1.0 / *r))
+}
+
+// --- JWT Auth Check (fail-closed; N-2 remediation) ---
+// Raw-socket variant of the canonical C-10 pattern (see jwt-validator-rs /
+// gl-engine-rs), extended to RS256: tokens are verified against the Keycloak JWKS
+// (KEYCLOAK_JWKS_URL, or derived from KEYCLOAK_REALM_URL) with a 300s cache and a
+// 5s fetch timeout (blocking client, matching falkordb-graph-engine-rs); HS256 via
+// JWT_SECRET is supported when JWKS is not configured. 401 on
+// missing/malformed/expired/unknown-kid tokens; 503 when the verification backend
+// (JWKS endpoint or JWT_SECRET) is unavailable.
+
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
+}
+
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
+        }
+    }
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
+        }
+        _ => None,
+    }
+}
+
+fn jwks_unavailable(detail: &str) -> (u16, String) {
+    (503, serde_json::json!({"error": "jwks_unavailable", "detail": detail}).to_string())
+}
+
+fn unauthorized(detail: &str) -> (u16, String) {
+    (401, serde_json::json!({"error": detail}).to_string())
+}
+
+fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, (u16, String)> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => return Err(jwks_unavailable("no JWKS endpoint configured")),
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
+            }
+        }
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| jwks_unavailable("client init failed"))?;
+    let resp = client.get(&url).send().map_err(|_| jwks_unavailable("fetch failed"))?;
+    if !resp.status().is_success() {
+        return Err(jwks_unavailable("upstream returned error status"));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().map_err(|_| jwks_unavailable("malformed JWKS payload"))?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
+}
+
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
+        }
+    }
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
+    }
+}
+
+fn verify_jwt_token(token: &str) -> Result<serde_json::Value, (u16, String)> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| unauthorized("malformed token header"))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(unauthorized("missing kid")),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks()?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks()?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => return Err(unauthorized("unknown kid")),
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| unauthorized("invalid jwk"))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(unauthorized("invalid or expired token")),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err((503, serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    }).to_string()))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(unauthorized("invalid or expired token")),
+            }
+        }
+        other => Err(unauthorized(&format!("unsupported alg {:?}", other))),
+    }
+}
+
+/// Extract a header value from the raw HTTP request text (case-insensitive name).
+fn raw_header<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    for line in request.lines().skip(1) {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim());
+            }
+        }
+    }
+    None
+}
+
+/// Fail-closed JWT gate for the raw TcpListener dispatch. Returns Ok(claims) or
+/// Err((status, body)) ready to be written to the socket.
+fn check_jwt(request: &str, path: &str) -> Result<serde_json::Value, (u16, String)> {
+    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
+        return Ok(serde_json::json!({}));
+    }
+    let header = match raw_header(request, "Authorization") {
+        Some(h) => h,
+        None => return Err(unauthorized("missing Authorization header")),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(unauthorized("invalid auth header")),
+    };
+    verify_jwt_token(token)
+}
+
+fn handle_request(request: &str) -> (u16, String) {
     let first_line = request.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
     if parts.len() < 2 { return (400, r#"{"error":"Bad request"}"#.to_string()); }
     let path = parts[1];
-    let d = data.read().unwrap();
+
+    // N-2: fail-closed JWT auth on every route except health probes.
+    if let Err(e) = check_jwt(request, path) {
+        return e;
+    }
 
     if path == "/healthz" {
+        let db_ok = with_db(|c| c.query_one("SELECT 1", &[]).map(|_| ()).map_err(|e| e.to_string())).is_ok();
         return (200, serde_json::json!({
-            "status": "healthy", "service": "multicurrency-revaluation",
-            "fx": {"currencies": d["stats"]["totalCurrencies"], "activePairs": d["stats"]["activePairs"], "todayPnL": d["stats"]["netRevalPnLToday"]},
+            "status": if db_ok { "healthy" } else { "degraded" }, "service": "multicurrency-revaluation",
+            "database": if db_ok { "connected" } else { "unavailable" },
             "middleware": middleware_config()
         }).to_string());
     }
-    if path == "/v1/currencies" { return (200, serde_json::json!({"items": d["currencies"], "total": d["currencies"].as_array().map_or(0, |a| a.len())}).to_string()); }
-    if path == "/v1/rates" { return (200, serde_json::json!({"items": d["rates"], "total": d["rates"].as_array().map_or(0, |a| a.len())}).to_string()); }
-    if path == "/v1/positions" { return (200, serde_json::json!({"items": d["positions"], "total": d["positions"].as_array().map_or(0, |a| a.len())}).to_string()); }
-    if path == "/v1/revaluation-runs" { return (200, serde_json::json!({"items": d["revaluationRuns"], "total": d["revaluationRuns"].as_array().map_or(0, |a| a.len())}).to_string()); }
-    if path == "/v1/stats" { return (200, d["stats"].to_string()); }
+    if path == "/v1/currencies" {
+        return match with_db(|c| {
+            let rows = c.query(
+                "SELECT code, name, type, decimal_places, is_base_currency FROM currencies ORDER BY code",
+                &[],
+            ).map_err(|e| format!("currencies query failed: {}", e))?;
+            Ok(rows.iter().map(|r| serde_json::json!({
+                "code": r.get::<usize, String>(0),
+                "name": r.get::<usize, String>(1),
+                "type": r.get::<usize, String>(2),
+                "decimalPlaces": r.get::<usize, i32>(3),
+                "isBaseCurrency": r.get::<usize, bool>(4),
+            })).collect::<Vec<_>>())
+        }) {
+            Ok(items) => (200, serde_json::json!({"items": items, "total": items.len()}).to_string()),
+            Err(e) => { eprintln!("[fx-reval] currencies unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
+    if path == "/v1/rates" {
+        return match with_db(|c| load_rates(c)) {
+            Ok(rates) => {
+                let items: Vec<serde_json::Value> = rates.iter().map(|(f, t, r, u)| serde_json::json!({
+                    "pair": format!("{}/{}", f, t),
+                    "midRate": r,
+                    "updatedAt": u,
+                })).collect();
+                (200, serde_json::json!({"items": items, "total": items.len()}).to_string())
+            }
+            Err(e) => { eprintln!("[fx-reval] rates unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
+    if path == "/v1/positions" {
+        return match with_db(|c| {
+            let rates = load_rates(c)?;
+            let rows = c.query(
+                "SELECT id, currency, account_type, balance::float8, account_count FROM fx_positions ORDER BY id",
+                &[],
+            ).map_err(|e| format!("fx_positions query failed: {}", e))?;
+            let mut items = Vec::new();
+            for r in &rows {
+                let id: String = r.get(0);
+                let ccy: String = r.get(1);
+                let acct: String = r.get(2);
+                let bal: f64 = r.get(3);
+                let count: i32 = r.get(4);
+                let local = if ccy == "NGN" { bal } else {
+                    match rate_ngn(&rates, &ccy) {
+                        Some(rate) => bal * rate,
+                        None => return Err(format!("no fx rate for {} — cannot compute local equivalent without fabricating", ccy)),
+                    }
+                };
+                // Previous close for P&L: only from real rate history; otherwise omit (never fabricate P&L).
+                let prev = c.query_opt(
+                    "SELECT rate::float8 FROM fx_rate_history WHERE from_currency = $1 AND to_currency = 'NGN' ORDER BY rate_date DESC LIMIT 1 OFFSET 1",
+                    &[&ccy],
+                ).ok().flatten().map(|pr| pr.get::<usize, f64>(0));
+                let mut item = serde_json::json!({
+                    "id": id, "currency": ccy, "accountType": acct,
+                    "balance": bal, "localEquivalent": local, "accountCount": count,
+                });
+                if let Some(p) = prev {
+                    item["prevLocalEquivalent"] = serde_json::json!(bal * p);
+                    item["revalPnL"] = serde_json::json!(bal * (item["localEquivalent"].as_f64().unwrap_or(0.0) / bal.max(1.0) - p));
+                }
+                items.push(item);
+            }
+            Ok(items)
+        }) {
+            Ok(items) => (200, serde_json::json!({"items": items, "total": items.len()}).to_string()),
+            Err(e) => { eprintln!("[fx-reval] positions unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
+    if path == "/v1/revaluation-runs" {
+        return match with_db(|c| {
+            let rows = c.query(
+                "SELECT id, business_date::text, status, executed_at::text, total_positions, total_accounts, total_pnl::float8 FROM fx_revaluations ORDER BY business_date DESC LIMIT 30",
+                &[],
+            ).map_err(|e| format!("fx_revaluations query failed: {}", e))?;
+            Ok(rows.iter().map(|r| serde_json::json!({
+                "id": r.get::<usize, String>(0),
+                "businessDate": r.get::<usize, String>(1),
+                "status": r.get::<usize, String>(2),
+                "executedAt": r.get::<usize, String>(3),
+                "totalPositions": r.get::<usize, i32>(4),
+                "totalAccounts": r.get::<usize, i32>(5),
+                "totalPnL": r.get::<usize, f64>(6),
+            })).collect::<Vec<_>>())
+        }) {
+            Ok(items) => (200, serde_json::json!({"items": items, "total": items.len()}).to_string()),
+            Err(e) => { eprintln!("[fx-reval] revaluation runs unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
+    if path == "/v1/stats" {
+        // Aggregate stats from the same real sources; any failure => 503.
+        return match with_db(|c| {
+            let rates = load_rates(c)?;
+            let row = c.query_one(
+                "SELECT COUNT(*)::int, COALESCE(SUM(balance),0)::float8 FROM fx_positions",
+                &[],
+            ).map_err(|e| format!("fx_positions aggregate failed: {}", e))?;
+            let n_pos: i32 = row.get(0);
+            let _total_fcy: f64 = row.get(1);
+            let latest_pnl: Option<f64> = c.query_opt(
+                "SELECT total_pnl::float8 FROM fx_revaluations ORDER BY business_date DESC LIMIT 1",
+                &[],
+            ).ok().flatten().map(|r| r.get(0));
+            Ok(serde_json::json!({
+                "activePairs": rates.len(),
+                "totalPositions": n_pos,
+                "netRevalPnLToday": latest_pnl,
+                "revaluationMethod": "closing-rate",
+            }))
+        }) {
+            Ok(stats) => (200, stats.to_string()),
+            Err(e) => { eprintln!("[fx-reval] stats unavailable: {}", e); source_unavailable(&e) }
+        };
+    }
     (404, r#"{"error":"Not found"}"#.to_string())
 }
 
 fn main() {
     let port = get_env("PORT", "8211");
-    let data = Arc::new(RwLock::new(seed_data()));
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).expect("Failed to bind");
-    eprintln!("[multicurrency-revaluation] Listening on :{} with 7 currencies, 4 rate pairs, 4 positions", port);
+    eprintln!("[multicurrency-revaluation] Listening on :{} — FX rates/positions from Postgres (fail-fast 503 when unavailable)", port);
 
     for stream in listener.incoming() {
         if let Ok(mut stream) = stream {
-            let data = Arc::clone(&data);
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 let request = String::from_utf8_lossy(&buf[..n]).to_string();
-                let (status, body) = handle_request(&request, &data);
+                let (status, body) = handle_request(&request);
                 let st = match status { 200 => "OK", 404 => "Not Found", _ => "Error" };
                 let resp = format!("HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Service: multicurrency-revaluation\r\n\r\n{}", status, st, body.len(), body);
                 let _ = stream.write_all(resp.as_bytes());
             });
         }
     }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

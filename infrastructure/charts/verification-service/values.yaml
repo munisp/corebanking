@@ -56,4 +56,7 @@ secrets:
   SHIELD_API_URL: "https://shield.verification.com"
   SHIELD_VERIFICATION_API_KEY: "placeholder"
   DEFAULT_CLIENT_ID: "54link-orchestrator"
-  DEFAULT_CLIENT_SECRET: "54link-orchestrator-secret"
+  # Keycloak client secret — NEVER committed. Inject at deploy time, e.g.
+  # helm --set secrets.DEFAULT_CLIENT_SECRET=... or via an external secret
+  # manager. The chart fails to render if this is empty.
+  DEFAULT_CLIENT_SECRET: ""

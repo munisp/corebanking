@@ -16,7 +16,7 @@ type AmountKobo int64
 
 func FromNaira(naira float64) AmountKobo { return AmountKobo(int64(naira * 100)) }
 func (a AmountKobo) Naira() float64      { return float64(a) / 100.0 }
-func (a AmountKobo) String() string       { return fmt.Sprintf("₦%d.%02d", a/100, abs64(int64(a)%100)) }
+func (a AmountKobo) String() string      { return fmt.Sprintf("₦%d.%02d", a/100, abs64(int64(a)%100)) }
 
 func abs64(x int64) int64 {
 	if x < 0 {
@@ -134,8 +134,8 @@ type AMLFactors struct {
 	CashIntensive     bool
 	IsStructuring     bool
 	HasAdverseMedia   bool
-	TxnAmountKobo    AmountKobo
-	AccountAgeMonths int
+	TxnAmountKobo     AmountKobo
+	AccountAgeMonths  int
 }
 
 // ComputeAMLRiskScore returns score (0-100) and list of triggered indicators.
@@ -264,13 +264,13 @@ func (sm *StateMachine) CanTransition(from, to string) bool {
 // BankingStateMachine provides standard banking transaction state transitions.
 var BankingStateMachine = &StateMachine{
 	Transitions: map[string][]string{
-		"draft":       {"submitted", "cancelled"},
-		"submitted":   {"under_review", "rejected", "cancelled"},
+		"draft":        {"submitted", "cancelled"},
+		"submitted":    {"under_review", "rejected", "cancelled"},
 		"under_review": {"approved", "rejected"},
-		"approved":    {"processing", "cancelled"},
-		"processing":  {"completed", "failed"},
-		"completed":   {"reversed"},
-		"failed":      {"submitted"},
+		"approved":     {"processing", "cancelled"},
+		"processing":   {"completed", "failed"},
+		"completed":    {"reversed"},
+		"failed":       {"submitted"},
 	},
 }
 
@@ -293,24 +293,24 @@ const (
 )
 
 type MakerCheckerRequest struct {
-	RequestID   string         `json:"request_id"`
-	Operation   string         `json:"operation"`
-	MakerID     string         `json:"maker_id"`
-	CheckerID   string         `json:"checker_id,omitempty"`
-	AmountKobo  AmountKobo     `json:"amount_kobo"`
-	Status      ApprovalStatus `json:"status"`
-	Payload     interface{}    `json:"payload"`
-	CreatedAt   time.Time      `json:"created_at"`
-	DecidedAt   *time.Time     `json:"decided_at,omitempty"`
+	RequestID  string         `json:"request_id"`
+	Operation  string         `json:"operation"`
+	MakerID    string         `json:"maker_id"`
+	CheckerID  string         `json:"checker_id,omitempty"`
+	AmountKobo AmountKobo     `json:"amount_kobo"`
+	Status     ApprovalStatus `json:"status"`
+	Payload    interface{}    `json:"payload"`
+	CreatedAt  time.Time      `json:"created_at"`
+	DecidedAt  *time.Time     `json:"decided_at,omitempty"`
 }
 
 // RequiresMakerChecker determines if operation needs dual authorization.
 func RequiresMakerChecker(operation string, amountKobo AmountKobo) bool {
 	// CBN requires dual control for transactions > ₦1M
 	thresholds := map[string]AmountKobo{
-		"transfer":     100_000_000, // ₦1M
+		"transfer":      100_000_000, // ₦1M
 		"loan_disburse": 100_000_000,
-		"gl_posting":   50_000_000,  // ₦500K for GL
+		"gl_posting":    50_000_000, // ₦500K for GL
 		"account_close": 0,          // Always requires checker
 	}
 	threshold, ok := thresholds[operation]
@@ -323,17 +323,17 @@ func RequiresMakerChecker(operation string, amountKobo AmountKobo) bool {
 // ─── Audit Trail ────────────────────────────────────────────────────────────
 
 type AuditEntry struct {
-	ID          string    `json:"id"`
-	Timestamp   time.Time `json:"timestamp"`
-	Service     string    `json:"service"`
-	Operation   string    `json:"operation"`
-	ActorID     string    `json:"actor_id"`
-	EntityID    string    `json:"entity_id"`
-	EntityType  string    `json:"entity_type"`
-	OldState    string    `json:"old_state,omitempty"`
-	NewState    string    `json:"new_state,omitempty"`
-	IPAddress   string    `json:"ip_address,omitempty"`
-	Immutable   bool      `json:"immutable"` // always true
+	ID         string    `json:"id"`
+	Timestamp  time.Time `json:"timestamp"`
+	Service    string    `json:"service"`
+	Operation  string    `json:"operation"`
+	ActorID    string    `json:"actor_id"`
+	EntityID   string    `json:"entity_id"`
+	EntityType string    `json:"entity_type"`
+	OldState   string    `json:"old_state,omitempty"`
+	NewState   string    `json:"new_state,omitempty"`
+	IPAddress  string    `json:"ip_address,omitempty"`
+	Immutable  bool      `json:"immutable"` // always true
 }
 
 // ─── PII Masking (NDPR) ─────────────────────────────────────────────────────

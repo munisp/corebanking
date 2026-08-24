@@ -1,20 +1,123 @@
 """
 Identity Verification Service
 Integrations with NIMC, BVN, Nigerian Immigration, FRSC
+
+Fail-closed behavior: if an identity provider (NIMC/NIBSS/Immigration/FRSC)
+is unreachable or not configured, verification endpoints return HTTP 503 with
+{"verified": None, "status": "provider_unavailable", "confidence": 0}.
+No fallback path may ever produce a synthetic verification verdict.
+
+Verdict honesty: an HTTP 200 from a provider is NOT proof of verification.
+verified=True is set ONLY when the provider's response BODY explicitly affirms
+the match via a documented verdict field (see extract_provider_verdict):
+  - body["status"] == "verified"  (string, case-insensitive), or
+  - body["match"] is True         (boolean), or
+  - body["verified"] is True      (boolean)
+An explicit negative verdict yields verified=False/status="not_verified".
+An ambiguous or absent verdict yields verified=None/status="indeterminate" —
+callers must NOT treat it as a pass.
 """
 
 import os
 import json
+import hmac
+import hashlib
+import base64
+import time
 import httpx
-import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Depends
 from pydantic import BaseModel
 import structlog
 
 logger = structlog.get_logger()
+
+
+def validate_jwt(authorization: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Validate a Bearer JWT with real HS256 signature verification (stdlib).
+
+    Mirrors the canonical pattern in services/shared/auth/jwt_validation.py and
+    sibling Python services (e.g. docling-service). FAILS CLOSED: returns
+    (None, reason) whenever the token cannot be cryptographically verified, is
+    expired, is missing exp, or JWT_SECRET is not configured. Never
+    warn-and-allow.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = authorization[7:]
+
+    def _b64url_decode(s: str) -> bytes:
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        payload = json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if time.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
+
+
+async def get_current_tenant(authorization: str = Header(None)) -> str:
+    """Require a valid Bearer JWT and derive the tenant from verified claims.
+
+    H-33: tenant identity comes ONLY from verified token claims — never from a
+    caller-supplied x-tenant-id header, which is attacker-controlled.
+    """
+    claims, err = validate_jwt(authorization or "")
+    if err is not None:
+        raise HTTPException(status_code=401, detail=f"Unauthorized: {err}")
+    tenant_id = claims.get("tenant_id") or claims.get("tenant")
+    if not tenant_id:
+        raise HTTPException(status_code=401, detail="Token missing tenant claim")
+    return tenant_id
+
+
+def _mask_identifier(value: Any) -> str:
+    """M-52/M-53: mask government identifiers (BVN/NIN) — last 3 chars only."""
+    if not isinstance(value, str) or not value:
+        return "***"
+    return "***" + value[-3:]
+
+
+def _mask_audit_record(record: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of an audit record with BVN/NIN masked in request/response."""
+    masked = dict(record)
+    for section in ("request", "response"):
+        data = record.get(section)
+        if isinstance(data, dict):
+            scrubbed = dict(data)
+            for key in ("nin", "bvn"):
+                if key in scrubbed:
+                    scrubbed[key] = _mask_identifier(scrubbed[key])
+            masked[section] = scrubbed
+    return masked
+
 
 audit_log = []
 
@@ -33,6 +136,52 @@ IMMIGRATION_API_URL = os.getenv("IMMIGRATION_API_URL", "https://api.immigration.
 IMMIGRATION_API_KEY = os.getenv("IMMIGRATION_API_KEY", "")
 FRSC_API_URL = os.getenv("FRSC_API_URL", "https://api.frsc.gov.ng/v1")
 FRSC_API_KEY = os.getenv("FRSC_API_KEY", "")
+
+PROVIDER_UNAVAILABLE_BODY = {
+    "verified": None,
+    "status": "provider_unavailable",
+    "confidence": 0,
+}
+
+# Explicit negative verdict strings (anything else string-valued is ambiguous).
+_NEGATIVE_VERDICTS = {"not_verified", "unverified", "rejected", "no_match", "failed", "mismatch"}
+
+
+def extract_provider_verdict(data: Any) -> Optional[bool]:
+    """Parse the provider's verification verdict from its response body.
+
+    Returns True  — only on an EXPLICIT affirmation:
+                    status == "verified", or match is True, or verified is True.
+    Returns False — on an explicit negative (status in a known negative set,
+                    or match/verified explicitly False).
+    Returns None  — ambiguous or absent verdict; callers must report
+                    verified=None, status="indeterminate" and never treat the
+                    identity as verified.
+    """
+    if not isinstance(data, dict):
+        return None
+    status = data.get("status")
+    if isinstance(status, str):
+        s = status.strip().lower()
+        if s == "verified":
+            return True
+        if s in _NEGATIVE_VERDICTS:
+            return False
+    for key in ("match", "verified"):
+        val = data.get(key)
+        if isinstance(val, bool):
+            return val
+    return None
+
+
+class ProviderUnavailableError(Exception):
+    """Raised when an identity provider cannot be reached. Carries the source."""
+
+    def __init__(self, source: str, detail: str):
+        self.source = source
+        self.detail = detail
+        super().__init__(f"{source} provider unavailable: {detail}")
+
 
 class NINVerificationRequest(BaseModel):
     nin: str  # 11-digit National Identification Number
@@ -61,20 +210,17 @@ async def persist_verification_audit(record: Dict[str, Any]):
         del audit_log[0 : len(audit_log) - 1000]
 
 
-def build_fallback_match(primary_id: str, supplied_fields: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = "".join(ch for ch in primary_id if ch.isdigit())
-    checksum = sum(int(ch) for ch in normalized[-4:]) if normalized else 0
-    confidence = min(96, 58 + checksum)
-    verified = len(normalized) >= 8 and checksum % 2 == 0
-    return {
-        "verified": verified,
-        "confidence_score": confidence,
-        "fallback": True,
-        "matched_fields": {k: v for k, v in supplied_fields.items() if v},
-    }
-
-
 async def call_provider(url: str, payload: Dict[str, Any], auth_key: str, source: str) -> Dict[str, Any]:
+    """Call a real identity provider.
+
+    verified=True is returned ONLY when the provider's response body contains
+    an explicit affirmative verdict (see extract_provider_verdict) — never on
+    HTTP 200 alone. Ambiguous/absent verdict -> verified=None with
+    status="indeterminate". Provider unreachable -> raises
+    ProviderUnavailableError (callers translate to HTTP 503). Confidence comes
+    only from the provider's own match_score and only for affirmed verdicts;
+    it is None otherwise.
+    """
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -87,33 +233,41 @@ async def call_provider(url: str, payload: Dict[str, Any], auth_key: str, source
                 timeout=20.0,
             )
         if response.status_code == 200:
-            data = response.json()
+            try:
+                data = response.json()
+            except Exception:
+                data = {}
+            verdict = extract_provider_verdict(data)
             return {
-                "verified": True,
+                "verified": verdict,  # True only on explicit body affirmation
+                "status": "verified" if verdict is True else ("not_verified" if verdict is False else "indeterminate"),
                 "provider_status": response.status_code,
                 "provider_data": data,
                 "source": source,
                 "fallback": False,
-                "confidence_score": data.get("match_score", 92),
+                "confidence_score": data.get("match_score") if verdict is True else None,
             }
+        # Non-200: the provider responded but did not affirm the identity.
         return {
             "verified": False,
+            "status": "not_verified",
             "provider_status": response.status_code,
             "provider_data": response.json() if response.content else {},
             "source": source,
             "fallback": False,
-            "confidence_score": 25,
+            "confidence_score": None,
         }
+    except ProviderUnavailableError:
+        raise
     except Exception as exc:
-        logger.warning("provider_call_failed", source=source, error=str(exc))
-        return {
-            "verified": False,
-            "provider_status": 0,
-            "provider_data": {"error": str(exc)},
-            "source": source,
-            "fallback": True,
-            "confidence_score": 40,
-        }
+        logger.error("provider_call_failed", source=source, url=url, error=str(exc))
+        raise ProviderUnavailableError(source, str(exc))
+
+
+def provider_unavailable_response(exc: ProviderUnavailableError) -> HTTPException:
+    detail = dict(PROVIDER_UNAVAILABLE_BODY)
+    detail["source"] = exc.source
+    return HTTPException(status_code=503, detail=detail)
 
 
 @app.get("/health")
@@ -133,9 +287,13 @@ async def readiness_check():
 
 
 @app.get("/api/v1/verify/audit")
-async def get_verification_audit(limit: int = 50):
+async def get_verification_audit(limit: int = 50, tenant_id: str = Depends(get_current_tenant)):
+    """H-33: requires a verified Bearer JWT; the tenant is derived from verified
+    token claims (not caller-supplied headers) and results are scoped to that
+    tenant only. BVN/NIN values are masked (last 3 chars) in the response."""
     bounded = max(1, min(limit, 200))
-    return {"records": audit_log[-bounded:], "total": min(len(audit_log), bounded)}
+    scoped = [r for r in audit_log if r.get("tenant_id") == tenant_id][-bounded:]
+    return {"records": [_mask_audit_record(r) for r in scoped], "total": len(scoped)}
 
 @app.post("/api/v1/verify/nin")
 async def verify_nin(request: NINVerificationRequest, x_tenant_id: str = Header(...)):
@@ -145,12 +303,13 @@ async def verify_nin(request: NINVerificationRequest, x_tenant_id: str = Header(
         "last_name": request.last_name,
         "date_of_birth": request.date_of_birth,
     }
-    provider = await call_provider(f"{NIMC_API_URL}/verify", payload, NIMC_API_KEY, "NIMC")
-    if provider["fallback"]:
-        fallback = build_fallback_match(request.nin, payload)
-        provider.update(fallback)
+    try:
+        provider = await call_provider(f"{NIMC_API_URL}/verify", payload, NIMC_API_KEY, "NIMC")
+    except ProviderUnavailableError as exc:
+        raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
+        "status": provider.get("status"),
         "nin": request.nin,
         "full_name": provider.get("provider_data", {}).get("full_name"),
         "date_of_birth": provider.get("provider_data", {}).get("date_of_birth") or request.date_of_birth,
@@ -173,12 +332,13 @@ async def verify_bvn(request: BVNVerificationRequest, x_tenant_id: str = Header(
         "last_name": request.last_name,
         "date_of_birth": request.date_of_birth,
     }
-    provider = await call_provider(f"{BVN_API_URL}/verify", payload, BVN_API_KEY, "NIBSS_BVN")
-    if provider["fallback"]:
-        fallback = build_fallback_match(request.bvn, payload)
-        provider.update(fallback)
+    try:
+        provider = await call_provider(f"{BVN_API_URL}/verify", payload, BVN_API_KEY, "NIBSS_BVN")
+    except ProviderUnavailableError as exc:
+        raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
+        "status": provider.get("status"),
         "bvn": request.bvn,
         "full_name": provider.get("provider_data", {}).get("full_name"),
         "date_of_birth": provider.get("provider_data", {}).get("date_of_birth") or request.date_of_birth,
@@ -199,12 +359,13 @@ async def verify_passport(request: PassportVerificationRequest, x_tenant_id: str
         "surname": request.surname,
         "given_names": request.given_names,
     }
-    provider = await call_provider(f"{IMMIGRATION_API_URL}/verify", payload, IMMIGRATION_API_KEY, "NIGERIAN_IMMIGRATION")
-    if provider["fallback"]:
-        fallback = build_fallback_match(request.passport_number, payload)
-        provider.update(fallback)
+    try:
+        provider = await call_provider(f"{IMMIGRATION_API_URL}/verify", payload, IMMIGRATION_API_KEY, "NIGERIAN_IMMIGRATION")
+    except ProviderUnavailableError as exc:
+        raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
+        "status": provider.get("status"),
         "passport_number": request.passport_number,
         "surname": provider.get("provider_data", {}).get("surname") or request.surname,
         "given_names": provider.get("provider_data", {}).get("given_names") or request.given_names,
@@ -226,12 +387,13 @@ async def verify_drivers_license(request: DriversLicenseVerificationRequest, x_t
         "license_number": request.license_number,
         "date_of_birth": request.date_of_birth,
     }
-    provider = await call_provider(f"{FRSC_API_URL}/verify", payload, FRSC_API_KEY, "FRSC")
-    if provider["fallback"]:
-        fallback = build_fallback_match(request.license_number, payload)
-        provider.update(fallback)
+    try:
+        provider = await call_provider(f"{FRSC_API_URL}/verify", payload, FRSC_API_KEY, "FRSC")
+    except ProviderUnavailableError as exc:
+        raise provider_unavailable_response(exc)
     response = {
         "verified": provider["verified"],
+        "status": provider.get("status"),
         "license_number": request.license_number,
         "full_name": provider.get("provider_data", {}).get("full_name"),
         "date_of_birth": provider.get("provider_data", {}).get("date_of_birth") or request.date_of_birth,

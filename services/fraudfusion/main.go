@@ -27,14 +27,14 @@ func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 }
 
 type FraudCase struct {
-	ID            string  `json:"id"`
-	TransactionID string  `json:"transactionId"`
-	RiskScore     float64 `json:"riskScore"`
-	RiskLevel     string  `json:"riskLevel"`
+	ID            string   `json:"id"`
+	TransactionID string   `json:"transactionId"`
+	RiskScore     float64  `json:"riskScore"`
+	RiskLevel     string   `json:"riskLevel"`
 	Models        []string `json:"models"`
-	Action        string  `json:"action"`
-	ReviewedAt    string  `json:"reviewedAt,omitempty"`
-	Status        string  `json:"status"`
+	Action        string   `json:"action"`
+	ReviewedAt    string   `json:"reviewedAt,omitempty"`
+	Status        string   `json:"status"`
 }
 
 var (

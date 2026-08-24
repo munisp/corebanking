@@ -12,6 +12,7 @@ Features:
 
 import os
 import json
+import hmac
 import shutil
 import logging
 from datetime import datetime
@@ -22,6 +23,71 @@ import pickle
 import hashlib
 
 logger = logging.getLogger(__name__)
+
+# Artifacts whose integrity is verified against the sha256 sidecar manifest
+# before any deserialization is allowed.
+MANIFEST_NAME = "manifest.json"
+INTEGRITY_FILES = ("model.pkl", "scaler.pkl")
+
+
+def sha256_file(path: str) -> str:
+    """Streaming SHA-256 of a file."""
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_within(base_dir: str, path: str) -> str:
+    """Realpath containment check: `path` must resolve inside `base_dir`.
+
+    Fails closed on any traversal outside the configured model store.
+    """
+    base = os.path.realpath(base_dir)
+    real = os.path.realpath(path)
+    if real != base and not real.startswith(base + os.sep):
+        raise ValueError("Path escapes the configured model store")
+    return real
+
+
+def write_integrity_manifest(artifact_dir: str, names=INTEGRITY_FILES) -> None:
+    """Write a sha256 sidecar manifest for the given artifact files."""
+    manifest = {
+        name: sha256_file(os.path.join(artifact_dir, name))
+        for name in names
+        if os.path.exists(os.path.join(artifact_dir, name))
+    }
+    with open(os.path.join(artifact_dir, MANIFEST_NAME), "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def verify_integrity_manifest(artifact_dir: str, names=INTEGRITY_FILES) -> None:
+    """Verify artifact hashes against the sha256 sidecar manifest.
+
+    Fails closed: a missing/invalid manifest or any hash mismatch raises
+    ValueError and the caller must not deserialize the artifacts.
+    """
+    manifest_path = os.path.join(artifact_dir, MANIFEST_NAME)
+    if not os.path.exists(manifest_path):
+        raise ValueError("Artifact integrity manifest missing")
+    try:
+        with open(manifest_path, "r") as f:
+            manifest = json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ValueError("Artifact integrity manifest unreadable") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("Artifact integrity manifest malformed")
+    for name in names:
+        artifact = os.path.join(artifact_dir, name)
+        expected = manifest.get(name)
+        if not expected or not isinstance(expected, str):
+            raise ValueError(f"Artifact '{name}' not covered by integrity manifest")
+        if not os.path.exists(artifact):
+            raise ValueError(f"Artifact '{name}' missing")
+        actual = sha256_file(artifact)
+        if not hmac.compare_digest(expected, actual):
+            raise ValueError(f"Artifact '{name}' failed integrity verification")
 
 
 class ModelStage(Enum):
@@ -200,6 +266,11 @@ class ModelRegistry:
         Returns:
             ModelMetadata for the registered model
         """
+        # Fail closed: registered artifact paths must live inside the
+        # configured model store — no registry-supplied path may point at
+        # arbitrary filesystem locations.
+        artifact_path = resolve_within(self.base_path, artifact_path)
+
         metadata = ModelMetadata(
             model_id=model_id,
             model_type=model_type,
@@ -371,16 +442,21 @@ class ModelRegistry:
                 self._loaded_thresholds[cache_key]
             )
         
-        # Load from disk
-        artifact_path = metadata.artifact_path
-        
+        # Load from disk — fail closed:
+        #  1. The registry-supplied artifact path must resolve inside the
+        #     configured model store (realpath containment, no traversal).
+        #  2. Every artifact must match the sha256 sidecar manifest written
+        #     at training/registration time before any deserialization.
+        artifact_path = resolve_within(self.base_path, metadata.artifact_path)
+        verify_integrity_manifest(artifact_path)
+
         model_path = os.path.join(artifact_path, "model.pkl")
         with open(model_path, 'rb') as f:
-            model = pickle.load(f)
-        
+            model = pickle.load(f)  # noqa: S301 - integrity-verified artifact
+
         scaler_path = os.path.join(artifact_path, "scaler.pkl")
         with open(scaler_path, 'rb') as f:
-            scaler = pickle.load(f)
+            scaler = pickle.load(f)  # noqa: S301 - integrity-verified artifact
         
         threshold = metadata.optimal_threshold
         
@@ -430,9 +506,12 @@ class ModelRegistry:
             if m.model_id != model_id
         ]
         
-        # Delete artifacts
-        if delete_artifacts and model.artifact_path and os.path.exists(model.artifact_path):
-            shutil.rmtree(model.artifact_path)
+        # Delete artifacts — containment-checked so a poisoned registry entry
+        # can never turn delete_model into an arbitrary-directory delete.
+        if delete_artifacts and model.artifact_path:
+            safe_path = resolve_within(self.base_path, model.artifact_path)
+            if os.path.isdir(safe_path):
+                shutil.rmtree(safe_path)
         
         # Clear from cache
         self.clear_cache(model_id)

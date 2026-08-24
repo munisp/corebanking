@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -284,15 +287,56 @@ func (c *notificationServiceClient) SendEmail(ctx context.Context, email, subjec
 }
 
 type auditServiceClient struct {
-	baseURL string
+	baseURL    string
+	httpClient *http.Client
 }
 
 func NewAuditServiceClient(baseURL string) AuditService {
-	return &auditServiceClient{baseURL: baseURL}
+	return &auditServiceClient{
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
 }
 
+// LogEvent persists the event to the audit-service (POST /audits, the same
+// append-only audit trail used platform-wide). W7-C-14: previously every
+// escrow audit event was silently discarded here. Failures are logged AND
+// returned so callers can decide whether the operation may proceed.
 func (c *auditServiceClient) LogEvent(ctx context.Context, event AuditEvent) error {
-	// Implementation would call audit service
+	payload := map[string]interface{}{
+		"actor_id":   event.ActorID,
+		"tenant_id":  event.TenantID,
+		"event_type": event.EventType,
+		"event_data": map[string]interface{}{
+			"entity_type":    event.EntityType,
+			"entity_id":      event.EntityID,
+			"actor_type":     event.ActorType,
+			"details":        event.Details,
+			"previous_state": event.PreviousState,
+			"new_state":      event.NewState,
+		},
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[audit] failed to marshal audit event %s/%s: %v", event.EntityType, event.EventType, err)
+		return fmt.Errorf("marshal audit event: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/audits", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build audit request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		log.Printf("[audit] failed to deliver audit event %s/%s: %v", event.EntityType, event.EventType, err)
+		return fmt.Errorf("deliver audit event: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		log.Printf("[audit] audit service rejected event %s/%s: status %d", event.EntityType, event.EventType, resp.StatusCode)
+		return fmt.Errorf("audit service returned status %d", resp.StatusCode)
+	}
 	return nil
 }
 
@@ -446,8 +490,11 @@ func (a *EscrowActivities) ProcessMilestoneRelease(ctx context.Context, input Mi
 }
 
 func (a *EscrowActivities) EscalateDispute(ctx context.Context, input EscalateInput) error {
-	// Implementation would escalate dispute
-	return nil
+	// W7-C-05: real escalation — state transition to "escalated", audit event
+	// and party notifications all happen inside EscrowService.EscalateDispute.
+	// Errors propagate so Temporal retries instead of silently succeeding.
+	_, err := a.escrowService.EscalateDispute(ctx, input.DisputeID, input.Reason)
+	return err
 }
 
 func (a *EscrowActivities) CalculateFee(ctx context.Context, input FeeInput) (*FeeResult, error) {

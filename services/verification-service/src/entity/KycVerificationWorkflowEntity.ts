@@ -16,8 +16,23 @@ export class KycVerificationWorkflowEntity extends BaseEntity {
   @Column()
   client_id!: string;
 
+  /**
+   * M-53: for KYC flows this stores an AES-256-GCM envelope ("enc:v1:...") of the
+   * applicant's government identifier (NIN/UIN) — never plaintext. Use
+   * utils/fieldEncryption.encryptField/decryptField. (KYB flows store the CAC
+   * registration number, a public corporate identifier, as plaintext.)
+   */
   @Column()
   client_app_user_id!: string;
+
+  /**
+   * M-53: keyed HMAC-SHA256 lookup hash of the plaintext identifier, enabling
+   * equality queries over encrypted values without offline brute-force risk.
+   * Nullable so existing rows (pre-encryption) do not break schema sync; new
+   * KYC rows always set it.
+   */
+  @Column({ nullable: true, default: null })
+  client_app_user_id_hash?: string | null;
 
   @Column({ type: "enum", enum: VerificationWorkflowStatus, default: VerificationWorkflowStatus.RUNNING })
   status!: VerificationWorkflowStatus;

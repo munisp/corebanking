@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    /* Language and Environment */
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+
+    /* Modules — package.json sets "type": "module"; sources use
+       extensionless relative imports, so Bundler resolution applies. */
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "resolveJsonModule": true,
+
+    /* Interop Constraints */
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Node.js runtime globals (process, Buffer, node: builtins) */
+    "types": ["node"],
+
+    /* Type Checking — consistent with sibling TS services (strict) */
+    "strict": true,
+    "skipLibCheck": true,
+
+    /* Emit — this package only runs drizzle-kit scripts; no build emit */
+    "noEmit": true
+  },
+  "include": [
+    "server",
+    "shared",
+    "drizzle",
+    "drizzle.config.ts",
+    "scripts",
+    "e2e"
+  ],
+  "exclude": ["node_modules"]
+}

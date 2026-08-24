@@ -352,10 +352,10 @@ func (s *MergedAgriService) CBNAgriReturnsCreate(w http.ResponseWriter, r *http.
 
 func (s *MergedAgriService) CBNAgriReturnsStats(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"totalReturns":   156,
+		"totalReturns":    156,
 		"pendingDeadline": 4,
-		"overdueCount":   0,
-		"autoFiledCTR":   342,
+		"overdueCount":    0,
+		"autoFiledCTR":    342,
 		"complianceScore": 98.5,
 	})
 }
@@ -386,11 +386,11 @@ func (s *MergedAgriService) InteractiveUSSDAgriCreate(w http.ResponseWriter, r *
 
 func (s *MergedAgriService) InteractiveUSSDAgriStats(w http.ResponseWriter, r *http.Request) {
 	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"totalFarmers":  45000,
+		"totalFarmers":   45000,
 		"activePolicies": 12500,
-		"pendingClaims": 89,
-		"avgYield":      4.2,
-		"totalHectares": 250000,
+		"pendingClaims":  89,
+		"avgYield":       4.2,
+		"totalHectares":  250000,
 	})
 }
 
@@ -598,8 +598,8 @@ func (s *MergedAgriService) AgriBankingUSSD(w http.ResponseWriter, r *http.Reque
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 	s.jsonResponse(w, http.StatusOK, map[string]interface{}{
-		"sessionId": body["sessionId"],
-		"response":  "Welcome to 54Link Agriculture Banking. Press 1 for Loans, 2 for Insurance, 3 for Market Prices.",
+		"sessionId":  body["sessionId"],
+		"response":   "Welcome to 54Link Agriculture Banking. Press 1 for Loans, 2 for Insurance, 3 for Market Prices.",
 		"endSession": false,
 	})
 }

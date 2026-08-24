@@ -7,22 +7,40 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 import random
 import string
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import time
+import threading
+import signal
+import socket as _socket
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("load-test-runner-py")
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/load_test_runner_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -32,10 +50,14 @@ PORT = int(os.getenv("PORT", "8369"))
 
 db_conn = None
 
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -168,25 +190,22 @@ def release_db(conn):
             pass
 
 def init_schema():
-    conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+    """Create the tables this service actually uses. Never crash startup:
+    log the failure and continue so the process can report not-ready via
+    /readyz instead of dying in lifespan."""
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"init_schema: database unavailable: {e}")
+        return
     try:
         cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "load-test-runner-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
-
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -195,13 +214,14 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
-    conn.commit()
-    logger.info("Schema initialized")
+        conn.commit()
+        logger.info("Schema initialized")
+    except Exception as e:
+        logger.error(f"init_schema failed: {e}")
 
 
 @asynccontextmanager
@@ -217,9 +237,67 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="load-test-runner-py", version="1.0.0", lifespan=lifespan)
 
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -270,40 +348,72 @@ def metrics():
 
 
 @app.get("/api/v1/service_configs")
-def list_records(x_tenant_id: Optional[str] = Header(None)):
+def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
-        return [], 0
+        return {"items": [], "total": 0, "page": page, "limit": limit}
     try:
         cur = conn.cursor()
         offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("load-test-runner-py", limit, offset))
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (limit, offset))
         rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("load-test-runner-py",))
+        items = [
+            {"id": str(row[0]), "status": row[1], "tenant_id": str(row[2]) if row[2] else None, "created_at": str(row[3])}
+            for row in rows
+        ]
+        cur.execute("SELECT COUNT(*) FROM service_configs")
         total = cur.fetchone()[0]
-        return items, total
+        return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
     except Exception as e:
         logger.error(f"DB query failed: {e}")
-        return [], 0
-
+        raise HTTPException(status_code=503, detail="config_unavailable")
 # --- JWT Auth ---
 def validate_jwt(headers):
-    auth = headers.get("Authorization", "")
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    Canonical implementation: services/shared/auth/jwt_validation.py.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
     if not auth.startswith("Bearer "):
         return None, "Missing Bearer token"
     token = auth[7:]
+    import hmac, hashlib, base64, json as _json, time as _t
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
     parts = token.split(".")
     if len(parts) != 3:
         return None, "Invalid token format"
-    # In production: verify JWT signature with JWT_SECRET
-    return {"sub": "authenticated"}, None
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if _t.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
 
 # --- Domain Logic ---
 def gen_id():
@@ -501,80 +611,6 @@ records: list = []
 audit_log: list = []
 domain_stats: dict = {"processed_today": 0}
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
-
-    def respond(self, code, data):
-        if code >= 400:
-            inc_errors()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
-        add_security_headers(self)
-        self.end_headers()
-        self.wfile.write(json.dumps(data, default=str).encode())
-
-    def do_GET(self):
-        _cache_key = f"load_test_runner_{self.path}"
-        _cached = cache_get(_cache_key)
-        if _cached and self.path not in ("/healthz", "/readyz", "/livez", "/metrics", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-Cache", "HIT")
-            add_security_headers(self)
-            self.end_headers()
-            self.wfile.write(_cached.encode() if isinstance(_cached, str) else _cached)
-            return
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[load-test-runner-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-
-        if path == "/healthz":
-            db = get_db()
-            self.respond(200, {
-                "status": "healthy",
-                "service": "load-test-runner-py",
-                "version": "2.0.0",
-                "db": "connected" if db else "not_configured",
-                "uptime_secs": round(time.time() - START_TIME),
-            })
-        elif path == "/readyz":
-            self.respond(200, {"ready": True})
-        elif path == "/livez":
-            self.respond(200, {"alive": True})
-        elif path == "/v1/degradation":
-            self.respond(200, {"service": "load-test-runner-py", **_degrade.status()})
-        elif path == "/v1/alerts":
-            self.respond(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-        elif path == "/metrics":
-            body = (
-                f'# HELP requests_total Total requests\n'
-                f'# TYPE requests_total counter\n'
-                f'requests_total{{service="load-test-runner-py"}} {request_count}\n'
-                f'# HELP errors_total Total errors\n'
-                f'# TYPE errors_total counter\n'
-                f'errors_total{{service="load-test-runner-py"}} {error_count}\n'
-            )
-        else:
-            cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
-
-    records = [
-        {"id": str(r["id"]), "status": r["status"], "created_at": r["created_at"].isoformat()}
-        for r in rows
-    ]
-    return {"data": records, "count": len(records)}
-
-
 @app.post("/api/v1/service_configs", status_code=201)
 def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
     tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
@@ -637,82 +673,6 @@ def delete_record(record_id: str):
             ("service_configs.deleted", record_id, payload)
         )
     conn.commit()
-
-    def do_POST(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[load-test-runner-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(length).decode())) if length > 0 else {}
-
-        # JWT auth check (monitoring mode: warn but allow)
-        claims, err = validate_jwt(dict(self.headers))
-        if err:
-            self.respond(401, {"error": "unauthorized", "detail": err})
-            # Inter-service call
-            try:
-                _upstream = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-                call_service("POST", f"{_upstream}/v1/screen", {"service": SERVICE_NAME, "action": "notify"})
-            except Exception as _e:
-                logger.warning(f"inter-service call failed: {_e}")
-            return
-
-        if path == "/v1/create":
-            result = db_insert("load_test_runner_py", body)
-            cache_set(f"load-test-runner-py:last_post", str(body))
-            self.respond(201, {"created": True, "data": result})
-        elif path == "/v1/load-test-runner/update":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid:
-                    if "status" in body:
-                        rec["status"] = body["status"]
-                    rec["data"].update({k: v for k, v in body.items() if k != "id"})
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    audit_log.append({"id": gen_id(), "action": "update", "record_id": rid,
-                                     "actor": body.get("updated_by", "system"), "timestamp": now_iso()})
-                    self.respond(200, {"updated": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found: {rid}"})
-
-        elif path == "/v1/load-test-runner/process":
-            rid = body.get("id", "")
-            for rec in records:
-                if rec["id"] == rid and rec["status"] in ("pending", "active"):
-                    rec["status"] = "completed"
-                    rec["data"]["processed_at"] = now_iso()
-                    rec["data"]["processing_result"] = "success"
-                    rec["data"]["score"] = round(0.85 + random.random() * 0.14, 3)
-                    rec["updated_at"] = now_iso()
-                    rec["version"] += 1
-                    domain_stats["processed_today"] += 1
-                    audit_log.append({"id": gen_id(), "action": "process", "record_id": rid,
-                                     "actor": "system", "timestamp": now_iso()})
-                    self.respond(200, {"processed": True, "record": rec})
-                    return
-            self.respond(404, {"error": f"Record not found or not processable: {rid}"})
-        elif path == "/v1/load-test-runner/health-checks":
-            result = run_health_checks(body.get("services", []))
-            self.respond(200, result)
-        elif path == "/v1/load-test-runner/sla-metrics":
-            result = compute_sla_metrics(body.get("uptime_records", []), body.get("period_hours", 720))
-            self.respond(200, result)
-
-
-
-        else:
-            self.respond(404, {"error": "Not found"})
-
-
 
 # --- Graceful Shutdown ---
 server = None

@@ -55,11 +55,11 @@ func main() {
 			"service":     "ml-security-service",
 			"status":      "healthy",
 			"uptime_secs": int(time.Since(startTime).Seconds()),
-			"models": []string{"lstm-anomaly-v3", "isolation-forest-v2", "autoencoder-fraud-v1", "graph-neural-net-v2"},
+			"models":      []string{"lstm-anomaly-v3", "isolation-forest-v2", "autoencoder-fraud-v1", "graph-neural-net-v2"},
 			"middleware": map[string]string{
-				"kafka":   "security.events, security.decisions",
-				"redis":   "model_cache, feature_store",
-				"mlflow":  getEnv("MLFLOW_URL", "http://mlflow:5000"),
+				"kafka":  "security.events, security.decisions",
+				"redis":  "model_cache, feature_store",
+				"mlflow": getEnv("MLFLOW_URL", "http://mlflow:5000"),
 			},
 		})
 	})

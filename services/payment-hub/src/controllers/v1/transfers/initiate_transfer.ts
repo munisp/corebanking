@@ -9,6 +9,9 @@ import { sanctionsScreeningApiClient } from "../../../lib/SanctionsScreeningApiC
 import { asyncHandler } from "../../../middlewares/async";
 import { readEnv } from "../../../config/readEnv.config";
 import { daprClient } from "../../../services/daprClient";
+import { PrometheusService } from "../../../services/prometheus";
+import { AppDataSource } from "../../../database/dataSource";
+import { SanctionsBlockedAlert } from "../../../models/SanctionsBlockedAlert";
 import ApiError from "../../../utils/ApiError";
 import {
   AppAmsEnum,
@@ -153,17 +156,66 @@ export const initiate_transfer = asyncHandler(async (req, res) => {
         risk_level: "critical",
         transaction_ids: (payload as any).reference ? [(payload as any).reference] : [],
       });
-      void daprClient.publishGeneralEvent("sanctions.match-blocked", {
-        tenantId,
+      // W7-C-16: `sanctions.match-blocked` has no consumer anywhere in the
+      // platform, so the durable alert row below is the system of record — a
+      // blocked sanction must never vanish because the event bus dropped or
+      // nobody consumed the message. Persist first, then publish, then alert.
+      const alert = new SanctionsBlockedAlert();
+      alert.tenant_id = String(tenantId);
+      alert.party = party;
+      alert.screened_name = name;
+      alert.customer_id = customerId ?? null;
+      alert.screening_id = result.id ?? null;
+      alert.transfer_reference = (payload as any).reference ?? null;
+      alert.amount_kobo = String(amountKobo);
+      alert.risk_level = result.risk_level;
+      alert.action = result.action;
+      alert.reason = reason;
+      alert.event_published = false;
+      try {
+        await AppDataSource.manager.save(alert);
+      } catch (dbErr) {
+        // The transfer is still blocked below; an alert persistence failure is
+        // itself a reportable incident, never a silent drop.
+        logger.error(
+          `ALERT persistence failed for sanctions-blocked transfer reference=${(payload as any).reference || "unknown"} screeningId=${result.id}: ${JSON.stringify(dbErr)}`,
+        );
+      }
+
+      try {
+        await daprClient.publishGeneralEvent("sanctions.match-blocked", {
+          tenantId,
+          party,
+          screenedName: name,
+          customerId,
+          screeningId: result.id,
+          riskLevel: result.risk_level,
+          action: result.action,
+          reason,
+          alertId: alert.id ?? null,
+          timestamp: new Date().toISOString(),
+        });
+        if (alert.id) {
+          await AppDataSource.manager.update(
+            SanctionsBlockedAlert,
+            { id: alert.id },
+            { event_published: true },
+          );
+        }
+      } catch (pubErr) {
+        logger.error(
+          `sanctions.match-blocked publish failed reference=${(payload as any).reference || "unknown"} screeningId=${result.id}: ${JSON.stringify(pubErr)}`,
+        );
+      }
+
+      logger.error(
+        `ALERT sanctions.match-blocked tenant=${tenantId} party=${party} screenedName=${name} action=${result.action} riskLevel=${result.risk_level} screeningId=${result.id} reason=${reason}`,
+      );
+      PrometheusService.getInstance().recordSanctionsBlocked(
+        String(tenantId),
         party,
-        screenedName: name,
-        customerId,
-        screeningId: result.id,
-        riskLevel: result.risk_level,
-        action: result.action,
-        reason,
-        timestamp: new Date().toISOString(),
-      }).catch(() => {});
+        result.action,
+      );
 
       throw new ApiError(
         httpStatus.FORBIDDEN,
@@ -205,6 +257,28 @@ export const initiate_transfer = asyncHandler(async (req, res) => {
     logger.info(
       `High-value transfer queued for approval approvalId=${approval.id} amount=₦${transferAmountNgn} threshold=₦${HIGH_VALUE_THRESHOLD_NGN} levels=${approval.levelsRequired}`,
     );
+
+    // W7-C-17: emit the high-value transaction event that kyc-event-consumer-py
+    // subscribes to on Kafka topic "transactions.high-value" (reached through
+    // the Kafka-backed Dapr "pubsub" component). Without this publisher the
+    // AML/KYC refresh trigger for high-value transactions never fires. A
+    // publish failure is logged, never silently dropped.
+    try {
+      await daprClient.publishGeneralEvent("transactions.high-value", {
+        customerId: keycloakId,
+        tenantId,
+        reference,
+        approvalId: approval.id,
+        amountKobo,
+        currency: (payload as any).currency || "NGN",
+        thresholdNgn: HIGH_VALUE_THRESHOLD_NGN,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (pubErr) {
+      logger.error(
+        `Failed to publish transactions.high-value reference=${reference} approvalId=${approval.id}: ${JSON.stringify(pubErr)}`,
+      );
+    }
 
     return res.status(202).json({
       approvalId: approval.id,

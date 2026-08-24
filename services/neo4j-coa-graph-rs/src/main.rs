@@ -1,69 +1,100 @@
 #![allow(unused)]
-use tokio_postgres;
-use actix_web::dev::Service;
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+//! 54link-dev Chart-of-Accounts Graph — Rust
+//! CoA nodes/edges are REAL GL data (glAccounts / coaEdges tables). Basel CAR
+//! is computed from live GL balances; any source failure => 503.
+
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use std::sync::atomic::{AtomicU64, AtomicI64, AtomicI32, AtomicBool, Ordering as AtomicOrdering};
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct COANode {
+    code: String,
+    name: String,
+    category: String,
+    subcategory: String,
+    balance: f64,
+    currency: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct COAEdge {
+    from_code: String,
+    to_code: String,
+    relation_type: String,
+    weight: f64,
+    metadata: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+struct TransactionFlow {
+    debit_account: String,
+    credit_account: String,
+    amount: f64,
+    currency: String,
+    narration: String,
 }
 
 struct AppState {
-    db: PgPool,
+    db: Option<PgPool>,
+    edges_mem: std::sync::Mutex<Vec<COAEdge>>,
 }
 
-fn seed_coa_nodes() -> Vec<COANode> {
-    vec![
-        COANode { code: "1001".into(), name: "Cash in Vault - Local Currency".into(), category: "asset".into(), subcategory: "cash".into(), balance: 2_850_000_000.0, currency: "NGN".into() },
-        COANode { code: "1005".into(), name: "Cash Reserve Requirement (CRR)".into(), category: "asset".into(), subcategory: "cash_cbn".into(), balance: 18_500_000_000.0, currency: "NGN".into() },
-        COANode { code: "1201".into(), name: "Treasury Bills (NTBs)".into(), category: "asset".into(), subcategory: "investments_govt".into(), balance: 25_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "1301".into(), name: "Overdrafts - Corporate".into(), category: "asset".into(), subcategory: "loans_corporate".into(), balance: 28_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "1302".into(), name: "Term Loans - Corporate".into(), category: "asset".into(), subcategory: "loans_corporate".into(), balance: 45_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "1306".into(), name: "SME Loans".into(), category: "asset".into(), subcategory: "loans_sme".into(), balance: 12_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "1307".into(), name: "Agricultural Loans (ABP)".into(), category: "asset".into(), subcategory: "loans_agric".into(), balance: 8_500_000_000.0, currency: "NGN".into() },
-        COANode { code: "1355".into(), name: "IFRS 9 ECL Stage 1".into(), category: "asset".into(), subcategory: "provision_ecl".into(), balance: -800_000_000.0, currency: "NGN".into() },
-        COANode { code: "1356".into(), name: "IFRS 9 ECL Stage 2".into(), category: "asset".into(), subcategory: "provision_ecl".into(), balance: -1_200_000_000.0, currency: "NGN".into() },
-        COANode { code: "1357".into(), name: "IFRS 9 ECL Stage 3".into(), category: "asset".into(), subcategory: "provision_ecl".into(), balance: -2_500_000_000.0, currency: "NGN".into() },
-        COANode { code: "2101".into(), name: "Demand Deposits - Current".into(), category: "liability".into(), subcategory: "deposits_demand".into(), balance: 85_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "2102".into(), name: "Savings Deposits".into(), category: "liability".into(), subcategory: "deposits_savings".into(), balance: 45_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "2206".into(), name: "Subordinated Debt (Tier 2)".into(), category: "liability".into(), subcategory: "borrowings_sub".into(), balance: 8_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "3002".into(), name: "Issued & Paid-up Capital".into(), category: "equity".into(), subcategory: "share_capital".into(), balance: 25_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "3004".into(), name: "Statutory Reserve".into(), category: "equity".into(), subcategory: "reserves".into(), balance: 12_000_000_000.0, currency: "NGN".into() },
-        COANode { code: "3006".into(), name: "Retained Earnings".into(), category: "equity".into(), subcategory: "retained".into(), balance: 18_500_000_000.0, currency: "NGN".into() },
-        COANode { code: "4101".into(), name: "Interest on Loans - Corporate".into(), category: "income".into(), subcategory: "interest_loans".into(), balance: 18_500_000_000.0, currency: "NGN".into() },
-        COANode { code: "5101".into(), name: "Interest on Deposits - Savings".into(), category: "expense".into(), subcategory: "interest_deposits".into(), balance: 3_500_000_000.0, currency: "NGN".into() },
-        COANode { code: "5301".into(), name: "Staff Costs - Salaries".into(), category: "expense".into(), subcategory: "staff_costs".into(), balance: 12_000_000_000.0, currency: "NGN".into() },
-    ]
+fn source_unavailable(detail: &str) -> HttpResponse {
+    HttpResponse::ServiceUnavailable().json(json!({
+        "error": "source_unavailable",
+        "detail": detail,
+    }))
 }
 
-fn seed_coa_edges() -> Vec<COAEdge> {
-    vec![
-        COAEdge { from_code: "2101".into(), to_code: "1301".into(), relation_type: "FLOWS_TO".into(), weight: 0.35, metadata: json!({"flow": "deposits_fund_loans"}) },
-        COAEdge { from_code: "1301".into(), to_code: "4101".into(), relation_type: "FLOWS_TO".into(), weight: 0.18, metadata: json!({"flow": "loans_generate_interest"}) },
-        COAEdge { from_code: "2102".into(), to_code: "5101".into(), relation_type: "FLOWS_TO".into(), weight: 0.08, metadata: json!({"flow": "savings_interest_expense"}) },
-        COAEdge { from_code: "1355".into(), to_code: "1301".into(), relation_type: "PROVISION_FOR".into(), weight: 1.0, metadata: json!({"standard": "IFRS9_ECL_stage1"}) },
-        COAEdge { from_code: "1356".into(), to_code: "1302".into(), relation_type: "PROVISION_FOR".into(), weight: 1.0, metadata: json!({"standard": "IFRS9_ECL_stage2"}) },
-        COAEdge { from_code: "1357".into(), to_code: "1307".into(), relation_type: "PROVISION_FOR".into(), weight: 1.0, metadata: json!({"standard": "IFRS9_ECL_stage3"}) },
-        COAEdge { from_code: "3002".into(), to_code: "1301".into(), relation_type: "BACKS_RWA".into(), weight: 0.15, metadata: json!({"framework": "Basel_III_CET1"}) },
-    ]
+// Load the chart of accounts from the real GL. Never seed fake balances.
+async fn fetch_nodes(db: &PgPool) -> Result<Vec<COANode>, String> {
+    let rows = sqlx::query(
+        r#"SELECT "glAccountCode", "name", "category", COALESCE("subcategory", ''), balance::float8, "currency"
+           FROM "glAccounts" ORDER BY "glAccountCode""#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("glAccounts query failed: {}", e))?;
+    if rows.is_empty() {
+        return Err("glAccounts is empty — no chart of accounts available".into());
+    }
+    Ok(rows
+        .iter()
+        .map(|r| COANode {
+            code: r.get("glAccountCode"),
+            name: r.get("name"),
+            category: r.get("category"),
+            subcategory: r.get(3),
+            balance: r.get(4),
+            currency: r.get("currency"),
+        })
+        .collect())
+}
+
+// Graph edges come from the coaEdges table when present; otherwise empty
+// (never fabricate flows).
+async fn fetch_edges(db: &PgPool) -> Result<Vec<COAEdge>, String> {
+    let rows = sqlx::query(
+        r#"SELECT from_code, to_code, relation_type, weight::float8, COALESCE(metadata::text, '{}')
+           FROM "coaEdges""#,
+    )
+    .fetch_all(db)
+    .await
+    .map_err(|e| format!("coaEdges query failed: {}", e))?;
+    Ok(rows
+        .iter()
+        .map(|r| COAEdge {
+            from_code: r.get("from_code"),
+            to_code: r.get("to_code"),
+            relation_type: r.get("relation_type"),
+            weight: r.get(3),
+            metadata: serde_json::from_str(r.get::<String, _>(4).as_str()).unwrap_or(json!({})),
+        })
+        .collect())
 }
 
 fn compute_basel_iii(nodes: &[COANode]) -> serde_json::Value {
@@ -118,6 +149,9 @@ fn sanitize_input(s: &str) -> String {
     s.replace("<script>", "").replace("</script>", "").replace("javascript:", "").chars().take(10240).collect()
 }
 
+static RL_TOKENS: AtomicI64 = AtomicI64::new(100);
+static RL_LAST: AtomicI64 = AtomicI64::new(0);
+
 fn rl_allow() -> bool {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     if now > RL_LAST.load(AtomicOrdering::Relaxed) {
@@ -127,132 +161,225 @@ fn rl_allow() -> bool {
     RL_TOKENS.fetch_sub(1, AtomicOrdering::Relaxed) > 0
 }
 
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
-    let path = req.path();
-    if path.starts_with("/healthz") || path.starts_with("/readyz") || path.starts_with("/livez") || path.starts_with("/metrics") {
-        return Ok(());
-    }
-    match req.headers().get("Authorization") {
-        Some(v) if v.to_str().unwrap_or("").starts_with("Bearer ") => Ok(()),
-        _ => Err(HttpResponse::Unauthorized().json(json!({"error": "unauthorized"}))),
-    }
+// --- JWT Auth Check (fail-closed; R4-V1 remediation) ---
+// Canonical pattern aligned with the C-10-repaired fleet (jwt-validator-rs /
+// gl-engine-rs) and extended to RS256: tokens are verified against the Keycloak
+// JWKS (KEYCLOAK_JWKS_URL, or derived from KEYCLOAK_REALM_URL) with a 300s cache
+// and a 5s fetch timeout; HS256 via JWT_SECRET is supported when JWKS is not
+// configured. 401 on missing/malformed/expired/unknown-kid tokens; 503 when the
+// verification backend (JWKS endpoint or JWT_SECRET) is unavailable. Verified
+// claims are stored in request extensions for downstream handlers.
+
+#[derive(Debug, Clone)]
+struct VerifiedClaims(serde_json::Value);
+
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
 }
 
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
 
-// --- Circuit Breaker + Retry for gRPC/HTTP calls ---
-use std::sync::atomic::{AtomicI32, AtomicI64};
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
 
-static CB_FAILURES: AtomicI32 = AtomicI32::new(0);
-static CB_LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
-const CB_THRESHOLD: i32 = 5;
-const CB_RESET_SECS: i64 = 30;
-
-fn cb_allow() -> bool {
-    let failures = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
-    if failures >= CB_THRESHOLD {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64).unwrap_or(0);
-        let last = CB_LAST_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
-        if now - last > CB_RESET_SECS {
-            CB_FAILURES.store(CB_THRESHOLD / 2, std::sync::atomic::Ordering::Relaxed);
-            return true;
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
         }
-        return false;
     }
-    true
-}
-
-fn cb_record_success() {
-    let f = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
-    if f > 0 { CB_FAILURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
-}
-
-fn cb_record_failure() {
-    CB_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64).unwrap_or(0);
-    CB_LAST_FAILURE.store(now, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn call_service_with_retry(url: &str, body: &str, retries: u32) -> Result<String, String> {
-    if !cb_allow() {
-        return Err(format!("circuit breaker open for {}", url));
-    }
-    for attempt in 0..retries {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
         }
-        match call_service_sync(url, body) {
-            Ok(resp) => { cb_record_success(); return Ok(resp); }
-            Err(e) => {
-                cb_record_failure();
-                eprintln!("[inter-service] {} attempt {} failed: {}", url, attempt + 1, e);
+        _ => None,
+    }
+}
+
+async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpResponse> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => {
+            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwt_validation_unavailable",
+                "detail": "no JWKS endpoint configured"
+            })))
+        }
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
             }
         }
     }
-    Err(format!("all {} retries exhausted for {}", retries, url))
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "client init failed"
+        })))?;
+    let resp = client.get(&url).send().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+    })?;
+    if !resp.status().is_success() {
+        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "upstream returned error status"
+        })));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "malformed JWKS payload"
+        }))
+    })?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
 }
 
-fn call_service_sync(url: &str, payload: &str) -> Result<String, String> {
-    let tcp = std::net::TcpStream::connect_timeout(
-        &url.replace("http://", "").replace("https://", "").parse().unwrap_or_else(|_| "127.0.0.1:8080".parse().unwrap()),
-        std::time::Duration::from_secs(5),
-    );
-    match tcp {
-        Ok(mut stream) => {
-            use std::io::Write;
-            let req = format!("POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}", payload.len(), payload);
-            let _ = stream.write_all(req.as_bytes());
-            Ok("ok".to_string())
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
         }
-        Err(e) => Err(format!("connection failed: {}", e)),
+    }
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
     }
 }
 
-async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
-    let id = format!("{}_{}_{}", "neo4j_coa_graph_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
-    let svc_name = String::from("neo4j-coa-graph-rs");
-    if let Some(client) = &state.db_client {
-        let _ = client.execute(
-            "INSERT INTO records (id, service, tenant, status, data, created_at) VALUES ($1, $2, 'default', 'active', $3, NOW()) ON CONFLICT (id) DO UPDATE SET data = $3",
-            &[&id, &svc_name, &data.to_string()],
-        ).await;
-    } else {
-        let mut recs = state.records.lock().unwrap();
-        recs.push(json!({"id": id, "service": svc_name, "data": data}));
+async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks().await?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks().await?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => {
+                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                        }
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    })))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": format!("unsupported alg {:?}", other)
+        }))),
     }
 }
 
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<serde_json::Value, actix_web::HttpResponse> {
+    let path = req.path();
+    // This service exposes its probes at /ready and /live (not /readyz, /livez); they stay unauthenticated.
+    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" || path == "/ready" || path == "/live" {
+        return Ok(serde_json::json!({}));
+    }
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+    };
+    let claims = verify_jwt_token(token).await?;
+    req.extensions_mut().insert(VerifiedClaims(claims.clone()));
+    Ok(claims)
+}
 
-// --- Graceful Degradation ---
-use std::sync::atomic::AtomicBool;
+static REQUEST_COUNT: AtomicU64 = AtomicU64::new(0);
+static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
-static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
 
 fn degradation_mode() -> &'static str {
-    if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
+    if DB_AVAILABLE.load(AtomicOrdering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     HttpResponse::Ok().json(json!({
-        "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
-        "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
+        "db_available": DB_AVAILABLE.load(AtomicOrdering::Relaxed),
         "mode": degradation_mode(),
     }))
 }
 
-async fn health() -> HttpResponse {
+async fn health(state: web::Data<AppState>) -> HttpResponse {
+    let db_ok = match &state.db {
+        Some(pool) => sqlx::query("SELECT 1").execute(pool).await.is_ok(),
+        None => false,
+    };
+    DB_AVAILABLE.store(db_ok, AtomicOrdering::Relaxed);
     HttpResponse::Ok().json(json!({
-        "status": "healthy", "service": "neo4j-coa-graph-rs",
+        "status": if db_ok { "healthy" } else { "degraded" },
+        "service": "neo4j-coa-graph-rs",
+        "database": if db_ok { "connected" } else { "unavailable" },
         "capabilities": ["coa_graph", "neo4j_cypher", "pagerank", "basel_iii", "path_traversal"],
     }))
 }
 
-async fn ready() -> HttpResponse { HttpResponse::Ok().json(json!({"ready": true, "service": "neo4j-coa-graph-rs"})) }
-async fn live() -> HttpResponse { HttpResponse::Ok().json(json!({"live": true})) }
+async fn ready(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; } HttpResponse::Ok().json(json!({"ready": true, "service": "neo4j-coa-graph-rs"})) }
+async fn live(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; } HttpResponse::Ok().json(json!({"live": true})) }
 async fn metrics() -> HttpResponse {
     let r = REQUEST_COUNT.load(AtomicOrdering::Relaxed);
     let e = ERROR_COUNT.load(AtomicOrdering::Relaxed);
@@ -260,47 +387,76 @@ async fn metrics() -> HttpResponse {
         "# TYPE requests_total counter\nrequests_total{{service=\"neo4j-coa-graph-rs\"}} {}\n# TYPE errors_total counter\nerrors_total{{service=\"neo4j-coa-graph-rs\"}} {}\n", r, e))
 }
 
+async fn load_graph(state: &web::Data<AppState>) -> Result<(Vec<COANode>, Vec<COAEdge>), HttpResponse> {
+    let db = match &state.db {
+        Some(d) => d,
+        None => return Err(source_unavailable("DATABASE_URL not configured; refusing to serve a fabricated chart of accounts")),
+    };
+    let nodes = match fetch_nodes(db).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("[neo4j-coa-graph-rs] node load failed: {}", e);
+            return Err(source_unavailable(&e));
+        }
+    };
+    // Edges: DB table, merged with any edges recorded at runtime via transaction-flow.
+    let db_edges = fetch_edges(db).await.unwrap_or_else(|e| {
+        eprintln!("[neo4j-coa-graph-rs] edge load failed (continuing with runtime edges): {}", e);
+        Vec::new()
+    });
+    let mut edges = db_edges;
+    edges.extend(state.edges_mem.lock().unwrap().iter().cloned());
+    Ok((nodes, edges))
+}
+
 async fn coa_graph(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let nodes = state.nodes.lock().unwrap().clone();
-    let edges = state.edges.lock().unwrap().clone();
-    db_persist(&state, "coa_graph", &json!({"action": "get_graph"})).await;
-    HttpResponse::Ok().json(json!({"nodes": nodes, "edges": edges, "total_nodes": nodes.len(), "total_edges": edges.len()}))
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    match load_graph(&state).await {
+        Ok((nodes, edges)) => HttpResponse::Ok().json(json!({"nodes": nodes, "edges": edges, "total_nodes": nodes.len(), "total_edges": edges.len()})),
+        Err(resp) => { ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed); resp }
+    }
 }
 
 async fn coa_pagerank(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let nodes = state.nodes.lock().unwrap().clone();
-    let edges = state.edges.lock().unwrap().clone();
-    let rankings = compute_pagerank(&nodes, &edges, 20, 0.85);
-    let named: Vec<serde_json::Value> = rankings.iter().map(|(code, rank)| {
-        let name = nodes.iter().find(|n| n.code == *code).map(|n| n.name.clone()).unwrap_or_default();
-        json!({"code": code, "name": name, "rank": rank})
-    }).collect();
-    HttpResponse::Ok().json(json!({"algorithm": "pagerank", "iterations": 20, "damping": 0.85, "rankings": named}))
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    match load_graph(&state).await {
+        Ok((nodes, edges)) => {
+            let rankings = compute_pagerank(&nodes, &edges, 20, 0.85);
+            let named: Vec<serde_json::Value> = rankings.iter().map(|(code, rank)| {
+                let name = nodes.iter().find(|n| n.code == *code).map(|n| n.name.clone()).unwrap_or_default();
+                json!({"code": code, "name": name, "rank": rank})
+            }).collect();
+            HttpResponse::Ok().json(json!({"algorithm": "pagerank", "iterations": 20, "damping": 0.85, "rankings": named}))
+        }
+        Err(resp) => { ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed); resp }
+    }
 }
 
 async fn coa_basel(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let nodes = state.nodes.lock().unwrap().clone();
-    let result = compute_basel_iii(&nodes);
-    HttpResponse::Ok().json(result)
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    match load_graph(&state).await {
+        Ok((nodes, _)) => HttpResponse::Ok().json(compute_basel_iii(&nodes)),
+        Err(resp) => { ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed); resp }
+    }
 }
 
 async fn coa_traverse(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let _ = sanitize_input("");
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let from = body.get("from").and_then(|v| v.as_str()).unwrap_or("");
     let to = body.get("to").and_then(|v| v.as_str()).unwrap_or("");
-    let edges = state.edges.lock().unwrap().clone();
+    let edges = match load_graph(&state).await {
+        Ok((_, edges)) => edges,
+        Err(resp) => { ERROR_COUNT.fetch_add(1, AtomicOrdering::Relaxed); return resp; }
+    };
     // BFS traversal
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
@@ -320,7 +476,6 @@ async fn coa_traverse(req: actix_web::HttpRequest, state: web::Data<AppState>, b
             }
         }
     }
-    db_persist(&state, "traverse", &json!({"from": from, "to": to})).await;
     HttpResponse::Ok().json(json!({"from": from, "to": to, "path": result_path, "hops": if result_path.is_empty() { 0 } else { result_path.len() - 1 }}))
 }
 
@@ -328,42 +483,71 @@ async fn transaction_flow(req: actix_web::HttpRequest, state: web::Data<AppState
     REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
     let _ = sanitize_input("");
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let txn = body.into_inner();
-    let mut edges = state.edges.lock().unwrap();
-    edges.push(COAEdge {
+    state.edges_mem.lock().unwrap().push(COAEdge {
         from_code: txn.debit_account.clone(), to_code: txn.credit_account.clone(),
         relation_type: "TRANSACTION".into(), weight: txn.amount,
         metadata: json!({"narration": txn.narration, "currency": txn.currency}),
     });
-    drop(edges);
-    db_persist(&state, "transaction_flow", &json!({"debit": &txn.debit_account, "credit": &txn.credit_account, "amount": txn.amount})).await;
-    let gl_url = env::var("GL_ENGINE_URL").unwrap_or_else(|_| "http://gl-engine-rs:8080".into());
-    let _ = call_service_sync(&format!("{}/v1/notify", gl_url), r#"{"source": "neo4j-coa-graph-rs", "action": "transaction_flow"}"#);
     HttpResponse::Created().json(json!({"recorded": true, "debit": txn.debit_account, "credit": txn.credit_account, "amount": txn.amount}))
 }
 
-async fn create_node(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<COANode>) -> HttpResponse {
-    REQUEST_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-    let _ = sanitize_input("");
-    if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"})); }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let node = body.into_inner();
-    let code = node.code.clone();
-    state.nodes.lock().unwrap().push(node);
-    db_persist(&state, "create_node", &json!({"code": &code})).await;
-    HttpResponse::Created().json(json!({"created": true, "code": code}))
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    log::info!("[neo4j-coa-graph-rs] starting");
+
+    // Fail-fast policy: CoA/Basel endpoints 503 without the GL database.
+    let db = match env::var("DATABASE_URL") {
+        Ok(url) if !url.is_empty() => {
+            match PgPoolOptions::new()
+                .max_connections(10)
+                .acquire_timeout(std::time::Duration::from_secs(5))
+                .connect(&url)
+                .await
+            {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    log::error!("[neo4j-coa-graph-rs] DB connect failed: {} — CoA endpoints will 503", e);
+                    None
+                }
+            }
+        }
+        _ => {
+            log::warn!("[neo4j-coa-graph-rs] DATABASE_URL not set — CoA endpoints will 503");
+            None
+        }
+    };
+
+    let port: u16 = env::var("PORT").unwrap_or_else(|_| "8112".to_string()).parse().unwrap_or(8112);
+    let state = web::Data::new(AppState { db, edges_mem: std::sync::Mutex::new(Vec::new()) });
+
+    println!("neo4j-coa-graph-rs listening on port {}", port);
+    start_grpc_server("neo4j-coa-graph-rs", 10386);
+    HttpServer::new(move || {
+        App::new()
+            .app_data(state.clone())
+            .wrap(actix_web::middleware::DefaultHeaders::new()
+                .add(("X-Content-Type-Options", "nosniff"))
+                .add(("X-Frame-Options", "DENY"))
+                .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
+                .add(("Content-Security-Policy", "default-src 'self'"))
+                .add(("X-XSS-Protection", "1; mode=block"))
+                .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .route("/v1/degradation", web::get().to(degradation_status))
+            .route("/health", web::get().to(health))
+            .route("/ready", web::get().to(ready))
+            .route("/live", web::get().to(live))
+            .route("/metrics", web::get().to(metrics))
+            .route("/v1/coa/graph", web::get().to(coa_graph))
+            .route("/v1/coa/pagerank", web::get().to(coa_pagerank))
+            .route("/v1/coa/basel", web::get().to(coa_basel))
+            .route("/v1/coa/traverse", web::post().to(coa_traverse))
+            .route("/v1/coa/transaction-flow", web::post().to(transaction_flow))
+    })
+    .bind(("0.0.0.0", port))?.run().await
 }
-
-
-// Multi-tenant: extract tenant ID from request
-fn get_tenant_id(req: &actix_web::HttpRequest) -> String {
-    req.headers().get("X-Tenant-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("platform")
-        .to_string()
-}
-
 
 // --- gRPC Server (binary protocol, length-prefixed) ---
 fn start_grpc_server(service_name: &'static str, port: u16) {
@@ -394,82 +578,6 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
     });
 }
 
-fn grpc_call(target: &str, method: &str, payload: &str) -> Result<String, String> {
-    if !cb_allow() { return Err("circuit breaker open".to_string()); }
-    use std::io::{Read, Write};
-    for attempt in 0..3u32 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
-        }
-        match std::net::TcpStream::connect_timeout(
-            &target.parse().map_err(|e| format!("{}", e))?,
-            std::time::Duration::from_secs(5),
-        ) {
-            Ok(mut stream) => {
-                let data = format!(r#"{{"method":"{}","payload":{}}}"#, method, payload);
-                let data_bytes = data.as_bytes();
-                let len_bytes = (data_bytes.len() as u32).to_be_bytes();
-                if stream.write_all(&len_bytes).is_err() { cb_record_failure(); continue; }
-                if stream.write_all(data_bytes).is_err() { cb_record_failure(); continue; }
-                let mut resp_len_buf = [0u8; 4];
-                if stream.read_exact(&mut resp_len_buf).is_err() { cb_record_failure(); continue; }
-                let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-                let mut resp_buf = vec![0u8; resp_len];
-                if stream.read_exact(&mut resp_buf).is_err() { cb_record_failure(); continue; }
-                cb_record_success();
-                return Ok(String::from_utf8_lossy(&resp_buf).to_string());
-            }
-            Err(e) => { cb_record_failure(); eprintln!("gRPC {} attempt {} failed: {}", target, attempt+1, e); }
-        }
-    }
-    Err(format!("gRPC retries exhausted for {}", target))
-}
-
-
-// --- mTLS Configuration ---
-fn mtls_config() -> (bool, String, String, String) {
-    let enabled = env::var("MTLS_ENABLED").unwrap_or_default() == "true";
-    let cert = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/service.crt".to_string());
-    let key = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/service.key".to_string());
-    let ca = env::var("TLS_CA_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/ca.crt".to_string());
-    (enabled, cert, key, ca)
-}
-
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-    log::info!("[neo4j-coa-graph-rs] starting");
-
-    let db_name = "neo4j-coa-graph-rs".replace("-", "_");
-    let default_url = format!("postgres://postgres:postgres@localhost:5432/{}", db_name);
-    let database_url = env::var("DATABASE_URL").unwrap_or(default_url);
-
-    println!("neo4j-coa-graph-rs listening on port {}", port);
-    start_grpc_server("neo4j-coa-graph-rs", 10386);
-    HttpServer::new(move || {
-        App::new()
-            .app_data(state.clone())
-            .wrap(actix_web::middleware::DefaultHeaders::new()
-                .add(("X-Content-Type-Options", "nosniff"))
-                .add(("X-Frame-Options", "DENY"))
-                .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-                .add(("Content-Security-Policy", "default-src 'self'"))
-                .add(("X-XSS-Protection", "1; mode=block"))
-                .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
-            .route("/v1/degradation", web::get().to(degradation_status))
-            .route("/health", web::get().to(health))
-            .route("/ready", web::get().to(ready))
-            .route("/live", web::get().to(live))
-            .route("/metrics", web::get().to(metrics))
-            .route("/api/v1/service_configs", web::get().to(list_records))
-            .route("/api/v1/service_configs", web::post().to(create_record))
-            .route("/api/v1/service_configs/{id}", web::get().to(get_record))
-            .route("/api/v1/service_configs/{id}", web::put().to(update_record))
-            .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
-    })
-    .bind(("0.0.0.0", port))?.run().await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,46 +591,4 @@ mod tests {
     fn test_rate_limiter() {
         assert!(rl_allow());
     }
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

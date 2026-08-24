@@ -24,7 +24,7 @@ type PenaltyRecord struct {
 type RotationSchedule struct {
 	ID          string   `json:"id"`
 	GroupID     string   `json:"groupId"`
-	CycleNumber int     `json:"cycleNumber"`
+	CycleNumber int      `json:"cycleNumber"`
 	Order       []string `json:"memberOrder"`
 	CurrentIdx  int      `json:"currentRecipientIndex"`
 	NextPayDate string   `json:"nextPayoutDate"`
@@ -42,9 +42,9 @@ type GroupAnalytics struct {
 }
 
 var (
-	esuEnhMu   sync.RWMutex
-	penalties  []PenaltyRecord
-	rotations  []RotationSchedule
+	esuEnhMu  sync.RWMutex
+	penalties []PenaltyRecord
+	rotations []RotationSchedule
 )
 
 func RegisterEsusuEnhancements(mux *http.ServeMux) {

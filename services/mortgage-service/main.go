@@ -2,7 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"math/big"
+	"strings"
+	"sync"
 
 	// "encoding/json"
 	"fmt"
@@ -103,7 +111,9 @@ const (
 	StatusOfferIssued         MortgageStatus = "offer_issued"
 	StatusOfferAccepted       MortgageStatus = "offer_accepted"
 	StatusDisbursementPending MortgageStatus = "disbursement_pending"
+	StatusDisbursing          MortgageStatus = "disbursing"
 	StatusDisbursed           MortgageStatus = "disbursed"
+	StatusCompensationFailed  MortgageStatus = "compensation_failed"
 	StatusActive              MortgageStatus = "active"
 	StatusInArrears           MortgageStatus = "in_arrears"
 	StatusDefault             MortgageStatus = "default"
@@ -362,6 +372,226 @@ func loadConfig() *Config {
 	}
 }
 
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + required exp claim). Fail-closed: any verification
+// problem yields 401. Identity headers (X-User-Id, X-Keycloak-ID, X-Tenant-ID,
+// X-User-Role) are overwritten from verified claims — caller-supplied values
+// are never trusted.
+func jwtAuthMiddleware() gin.HandlerFunc {
+	ensureJWKSRefresh()
+	return func(c *gin.Context) {
+		r := c.Request
+		p := r.URL.Path
+		if isProbePath(p) {
+			c.Next()
+			return
+		}
+		auth := c.GetHeader("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "missing bearer token"})
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token format"})
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token header"})
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid token header"})
+			return
+		}
+		if header.Alg != "RS256" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unsupported token algorithm"})
+			return
+		}
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			// Unknown key — refresh once and retry (key rotation).
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unknown signing key"})
+				return
+			}
+		}
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid signature encoding"})
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid signature"})
+			return
+		}
+		claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid claims encoding"})
+			return
+		}
+		var claims map[string]interface{}
+		if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid claims"})
+			return
+		}
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "token missing exp claim"})
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "token expired"})
+			return
+		}
+		// Identity headers come ONLY from verified claims; overwrite or drop any
+		// caller-supplied values before invoking the handler.
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			r.Header.Set("X-User-Id", sub)
+			r.Header.Set("X-Keycloak-ID", sub)
+		} else {
+			r.Header.Del("X-User-Id")
+			r.Header.Del("X-Keycloak-ID")
+		}
+		if tenant := tenantFromClaims(claims); tenant != "" {
+			r.Header.Set("X-Tenant-ID", tenant)
+		} else {
+			r.Header.Del("X-Tenant-ID")
+		}
+		r.Header.Del("X-User-Role")
+		if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
+			if roleList, ok := ra["roles"].([]interface{}); ok {
+				roles := make([]string, 0, len(roleList))
+				for _, v := range roleList {
+					if s, ok := v.(string); ok {
+						roles = append(roles, s)
+					}
+				}
+				if len(roles) > 0 {
+					r.Header.Set("X-User-Role", strings.Join(roles, ","))
+				}
+			}
+		}
+		c.Set("jwt_claims", claims)
+		c.Next()
+	}
+}
+
+// --- JWT Validation (Keycloak JWKS, RS256, fail-closed) ---
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+var jwksRefreshOnce sync.Once
+
+// jwtRealmURL returns the Keycloak realm base URL used to fetch JWKS keys.
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+// fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil || len(nBytes) == 0 {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil || len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process.
+func ensureJWKSRefresh() {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(jwtRealmURL())
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(jwtRealmURL())
+			}
+		}()
+	})
+}
+
+// isProbePath reports whether p is a health/metrics endpoint that must remain
+// unauthenticated for orchestrators (exact or suffixed probe paths).
+func isProbePath(p string) bool {
+	switch p {
+	case "/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics", "/ping":
+		return true
+	}
+	for _, s := range []string{"/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics"} {
+		if strings.HasSuffix(p, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 func main() {
 	godotenv.Load()
 
@@ -384,6 +614,7 @@ func main() {
 
 	// Initialize Gin router
 	router := gin.Default()
+	router.Use(jwtAuthMiddleware())
 	router.Use(corsMiddleware())
 	router.Use(loggingMiddleware())
 	router.Use(tenantMiddleware())
@@ -414,7 +645,18 @@ func main() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	srv.Shutdown(ctx)
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("ERROR: HTTP server shutdown: %v", err)
+	}
+
+	// Stop the event pipeline after in-flight requests drain: halt the
+	// background flusher, flush buffered events with a timeout, then close.
+	// Never return from main with the producer still running.
+	if kafkaClient != nil {
+		if err := kafkaClient.Close(); err != nil {
+			log.Printf("ERROR: Kafka client close (buffered events may be unpublished): %v", err)
+		}
+	}
 }
 
 func registerRoutes(router *gin.Engine) {
@@ -660,7 +902,7 @@ func createMortgageApplication(c *gin.Context) {
 	}
 
 	// Publish event to Kafka
-	kafkaClient.PublishEvent("mortgages.applications", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.created",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -796,7 +1038,7 @@ func submitMortgageApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.applications", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -868,7 +1110,7 @@ func underwriteApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.underwriting", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.underwriting", MortgageEvent{
 		Type:       "mortgage.underwriting.completed",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -913,7 +1155,7 @@ func submitToCreditCommittee(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusCreditCommittee)
 
 	// Publish event for workflow
-	kafkaClient.PublishEvent("mortgages.credit-committee", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.credit-committee", MortgageEvent{
 		Type:       "mortgage.credit_committee.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -974,7 +1216,7 @@ func approveApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.approvals", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.approvals", MortgageEvent{
 		Type:       "mortgage.application.approved",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1018,7 +1260,7 @@ func declineApplication(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusDeclined)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.applications", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.declined",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1058,7 +1300,7 @@ func issueOffer(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusOfferIssued)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.offers", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.offers", MortgageEvent{
 		Type:       "mortgage.offer.issued",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1099,7 +1341,7 @@ func acceptOffer(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusOfferAccepted)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.offers", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.offers", MortgageEvent{
 		Type:       "mortgage.offer.accepted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1111,6 +1353,19 @@ func acceptOffer(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "offer_accepted"})
 }
 
+// disburseMortgage runs the disbursement as a saga:
+//
+//  1. CLAIM (atomic): UPDATE ... WHERE status IN (offer_accepted,
+//     disbursement_pending) RETURNING — exactly one concurrent request can
+//     claim the mortgage; the double-disbursement race is closed at the DB.
+//  2. The amount ALWAYS comes from the approved mortgage record returned by
+//     the claim — never from the request body.
+//  3. FORWARD: create the TigerBeetle disbursement transfer (deterministic
+//     transfer ID, idempotent under retry).
+//  4. COMMIT: persist status=disbursed + schedule.
+//  5. COMPENSATION: any post-claim failure reverses the ledger transfer and
+//     rolls the claim back. If the reversal itself fails the mortgage is
+//     marked compensation_failed and an ALERT is logged — never silent.
 func disburseMortgage(c *gin.Context) {
 	start := time.Now()
 	id := c.Param("id")
@@ -1127,23 +1382,59 @@ func disburseMortgage(c *gin.Context) {
 		return
 	}
 
-	app, err := fetchMortgageApplication(id, tenantID)
+	// Step 1 — atomic claim. A nil app with nil error means another request
+	// holds or has completed the disbursement.
+	app, err := claimMortgageForDisbursement(id, tenantID)
 	if err != nil {
-		c.JSON(404, gin.H{"error": "application not found"})
+		log.Printf("ERROR: disbursement claim failed for mortgage %s: %v", id, err)
+		c.JSON(500, gin.H{"error": "failed to initiate disbursement"})
+		return
+	}
+	if app == nil {
+		c.JSON(409, gin.H{"error": "mortgage not ready for disbursement or disbursement already in progress"})
 		return
 	}
 
-	if app.Status != StatusOfferAccepted && app.Status != StatusDisbursementPending {
-		c.JSON(400, gin.H{"error": "mortgage not ready for disbursement"})
-		return
+	// compensate rolls back every side effect of a failed disbursement. A
+	// failed compensation is surfaced as status=compensation_failed + ALERT.
+	compensate := func(transferID string, cause error) {
+		if transferID != "" {
+			if _, rerr := tbClient.ReverseDisbursementTransfer(
+				tenantID, app.PrincipalAccountID, req.DisbursementAccountID,
+				app.ApprovedAmount, app.ID, transferID,
+			); rerr != nil {
+				log.Printf("ALERT: COMPENSATION FAILED for mortgage %s disbursement (transfer %s): reversal error: %v (original failure: %v) — manual reconciliation required",
+					app.ID, transferID, rerr, cause)
+				if merr := markDisbursementCompensationFailed(app.ID, tenantID); merr != nil {
+					log.Printf("ALERT: could not mark mortgage %s compensation_failed: %v", app.ID, merr)
+				}
+				return
+			}
+			log.Printf("Compensated failed disbursement for mortgage %s: reversed transfer %s (cause: %v)", app.ID, transferID, cause)
+		}
+		if rerr := releaseDisbursementClaim(app.ID, tenantID, StatusDisbursementPending); rerr != nil {
+			log.Printf("ALERT: failed to release disbursement claim for mortgage %s: %v", app.ID, rerr)
+			if merr := markDisbursementCompensationFailed(app.ID, tenantID); merr != nil {
+				log.Printf("ALERT: could not mark mortgage %s compensation_failed: %v", app.ID, merr)
+			}
+		}
 	}
 
+	// Step 2 — server-side amount from the approved record. A client-supplied
+	// amount that disagrees is rejected (fail closed), never silently used.
 	disbursementAmount := app.ApprovedAmount
-	if req.DisbursementAmount > 0 {
-		disbursementAmount = req.DisbursementAmount
+	if req.DisbursementAmount > 0 && req.DisbursementAmount != disbursementAmount {
+		compensate("", fmt.Errorf("client-supplied amount %.2f disagrees with approved %.2f", req.DisbursementAmount, disbursementAmount))
+		c.JSON(400, gin.H{"error": "disbursement amount does not match the approved amount"})
+		return
+	}
+	if disbursementAmount <= 0 || app.PrincipalAccountID == "" {
+		compensate("", fmt.Errorf("mortgage %s has no approved amount or principal ledger account", app.ID))
+		c.JSON(400, gin.H{"error": "mortgage has no approved amount or ledger account"})
+		return
 	}
 
-	// Create TigerBeetle transfer for disbursement
+	// Step 3 — forward: move the funds in TigerBeetle.
 	transferID, err := tbClient.CreateDisbursementTransfer(
 		tenantID,
 		app.PrincipalAccountID,
@@ -1152,12 +1443,13 @@ func disburseMortgage(c *gin.Context) {
 		app.ID,
 	)
 	if err != nil {
-		log.Printf("Failed to create disbursement transfer: %v", err)
-		c.JSON(500, gin.H{"error": "failed to process disbursement"})
+		log.Printf("Failed to create disbursement transfer for mortgage %s: %v", app.ID, err)
+		compensate("", err)
+		c.JSON(502, gin.H{"error": "failed to process disbursement"})
 		return
 	}
 
-	// Update application
+	// Step 4 — commit the disbursed state.
 	now := time.Now()
 	maturityDate := now.AddDate(0, app.ApprovedTenorMonths, 0)
 	app.Status = StatusDisbursed
@@ -1168,23 +1460,29 @@ func disburseMortgage(c *gin.Context) {
 	app.MonthlyPayment = calculateMonthlyPayment(disbursementAmount, app.InterestRate, app.ApprovedTenorMonths)
 
 	if err := saveDisbursementDetails(app, transferID); err != nil {
+		compensate(transferID, err)
 		c.JSON(500, gin.H{"error": "failed to save disbursement details"})
 		return
 	}
 
-	// Generate repayment schedule
+	// Generate repayment schedule — a money-path write; failure means the
+	// disbursement terms are uncollectible, so compensate rather than proceed.
 	schedule := generateRepaymentSchedule(app)
 	if err := saveRepaymentSchedule(app.ID, schedule); err != nil {
-		log.Printf("Failed to save repayment schedule: %v", err)
+		log.Printf("Failed to save repayment schedule for mortgage %s: %v", app.ID, err)
+		compensate(transferID, err)
+		c.JSON(500, gin.H{"error": "failed to save repayment schedule"})
+		return
 	}
 
 	// Create escrow account entries
 	if err := setupEscrowAccount(app); err != nil {
-		log.Printf("Failed to setup escrow account: %v", err)
+		log.Printf("ERROR: Failed to setup escrow account for mortgage %s: %v", app.ID, err)
 	}
 
-	// Publish event
-	kafkaClient.PublishEvent("mortgages.disbursements", MortgageEvent{
+	// Publish event — failures are persisted to the outbox for retry, never
+	// silently dropped.
+	if err := kafkaClient.PublishEventReliably("mortgages.disbursements", MortgageEvent{
 		Type:       "mortgage.disbursed",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1196,7 +1494,9 @@ func disburseMortgage(c *gin.Context) {
 			"monthly_payment": app.MonthlyPayment,
 			"maturity_date":   maturityDate,
 		},
-	})
+	}); err != nil {
+		log.Printf("ERROR: disbursement event for mortgage %s could not be published or outboxed: %v", app.ID, err)
+	}
 
 	mortgageDisbursementsTotal.WithLabelValues(string(app.ProductType), tenantID).Inc()
 	mortgageAmountDisbursed.WithLabelValues(string(app.ProductType), tenantID).Add(disbursementAmount)
@@ -1204,17 +1504,15 @@ func disburseMortgage(c *gin.Context) {
 
 	// Record journal entry in Chart of Accounts
 	amountInKobo := int64(disbursementAmount * 100)
-	_, err = coaClient.RecordLoanDisbursement(
+	if _, err := coaClient.RecordLoanDisbursement(
 		tenantID,
 		req.DisbursedBy,
 		"finance_admin",
 		app.ID,
 		amountInKobo,
 		req.DisbursementAccountID,
-	)
-	if err != nil {
-		log.Printf("WARNING: Failed to record journal entry for mortgage disbursement %s: %v", app.ID, err)
-		// Don't fail the disbursement if journal entry fails
+	); err != nil {
+		log.Printf("ERROR: Failed to record journal entry for mortgage disbursement %s: %v — GL reconciliation required", app.ID, err)
 	}
 
 	c.JSON(200, gin.H{
@@ -1251,7 +1549,7 @@ func addPropertyDetails(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.properties", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.properties", MortgageEvent{
 		Type:       "mortgage.property.added",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1325,7 +1623,7 @@ func submitValuation(c *gin.Context) {
 	ltv := app.RequestedAmount / req.MarketValue * 100
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.valuations", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.valuations", MortgageEvent{
 		Type:       "mortgage.valuation.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1379,7 +1677,7 @@ func verifyTitle(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.title-verification", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.title-verification", MortgageEvent{
 		Type:       "mortgage.title.verified",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1430,7 +1728,7 @@ func verifyNHFContribution(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.nhf", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.nhf", MortgageEvent{
 		Type:       "mortgage.nhf.verified",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1633,11 +1931,14 @@ func recordPayment(c *gin.Context) {
 		return
 	}
 
-	// Update arrears status if applicable
-	updateArrearsStatus(id, tenantID)
+	// Update arrears status if applicable — recalculation failures are
+	// logged, never silently dropped (the daily servicing workflow retries).
+	if err := updateArrearsStatus(id, tenantID); err != nil {
+		log.Printf("Failed to update arrears status for mortgage %s after payment: %v", id, err)
+	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.payments", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.payments", MortgageEvent{
 		Type:       "mortgage.payment.received",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -1756,7 +2057,7 @@ func processPrepayment(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.prepayments", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.prepayments", MortgageEvent{
 		Type:       "mortgage.prepayment.processed",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -1821,7 +2122,7 @@ func initiateRefinancing(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.refinancing", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.refinancing", MortgageEvent{
 		Type:       "mortgage.refinancing.initiated",
 		MortgageID: newApp.ID,
 		TenantID:   tenantID,
@@ -1912,7 +2213,7 @@ func restructureMortgage(c *gin.Context) {
 	saveRepaymentSchedule(id, newSchedule)
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.restructuring", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.restructuring", MortgageEvent{
 		Type:       "mortgage.restructured",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -1965,7 +2266,7 @@ func requestForbearance(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEvent("mortgages.forbearance", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.forbearance", MortgageEvent{
 		Type:       "mortgage.forbearance.requested",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -2099,7 +2400,20 @@ func calculateLTV(c *gin.Context) {
 // Middleware functions
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := c.Request.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+				c.Writer.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-Request-ID")
 

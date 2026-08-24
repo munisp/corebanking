@@ -25,8 +25,7 @@ export type TranscribeResult = {
 
 export async function transcribeAudio(params: TranscribeParams): Promise<TranscribeResult> {
   // Ollama does not require an API key
-    // (key is optional for Ollama)
-  }
+  // (key is optional for Ollama)
 
   // Download the audio file from the URL
   const audioResponse = await fetch(params.audioUrl);

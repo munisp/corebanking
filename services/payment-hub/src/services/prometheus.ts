@@ -11,6 +11,12 @@ export class PrometheusService {
     labelNames: ["method", "route", "status_code"],
   });
 
+  private static readonly sanctionsBlockedTotal = new client.Counter({
+    name: "sanctions_blocked_transfers_total",
+    help: "Transfers blocked or held by sanctions screening (each one is persisted to sanctions_blocked_alerts)",
+    labelNames: ["tenant", "party", "action"],
+  });
+
   private constructor() {} // prevent instantiation from outside
 
   /** Singleton accessor */
@@ -29,6 +35,7 @@ export class PrometheusService {
 
     client.collectDefaultMetrics({ register: this.register });
     this.register.registerMetric(this.requestCount);
+    this.register.registerMetric(this.sanctionsBlockedTotal);
 
     logger.info("Prometheus metrics initialized successfully");
   }
@@ -36,6 +43,11 @@ export class PrometheusService {
   /** Record a new request */
   recordRequest(method: string, route: string, statusCode: number): void {
     PrometheusService.requestCount.labels(method, route, String(statusCode)).inc();
+  }
+
+  /** W7-C-16: count every sanctions-blocked/held transfer for alerting rules. */
+  recordSanctionsBlocked(tenant: string, party: string, action: string): void {
+    PrometheusService.sanctionsBlockedTotal.labels(tenant, party, action).inc();
   }
 
   /** Expose metrics for Prometheus to scrape */

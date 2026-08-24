@@ -152,9 +152,9 @@ func (c *TigerBeetleClient) CreditVANAccount(ctx context.Context, van *VirtualAc
 		Ledger:        getLedgerForPurpose(van.Purpose),
 		Code:          TransferCodeCredit,
 		Flags:         0,
-		UserData128:   van.VAN,           // VAN number — enables per-VAN transfer queries
+		UserData128:   van.VAN, // VAN number — enables per-VAN transfer queries
 		UserData64:    payment.TransactionRef,
-		UserData32:    van.ReferenceID,   // loan ID, merchant ID, etc.
+		UserData32:    van.ReferenceID, // loan ID, merchant ID, etc.
 	}
 
 	return c.createTransfer(ctx, &transfer)
@@ -416,13 +416,13 @@ func (c *TigerBeetleClient) ReconcileVANBalance(ctx context.Context, van *Virtua
 
 	diff := van.TotalReceived - ledgerTotal
 	result := &ReconciliationResult{
-		VANID:        van.ID,
-		VAN:          van.VAN,
-		LocalBalance: van.TotalReceived,
+		VANID:         van.ID,
+		VAN:           van.VAN,
+		LocalBalance:  van.TotalReceived,
 		LedgerBalance: ledgerTotal,
-		Difference:   diff,
-		IsReconciled: diff > -0.01 && diff < 0.01,
-		ReconciledAt: time.Now(),
+		Difference:    diff,
+		IsReconciled:  diff > -0.01 && diff < 0.01,
+		ReconciledAt:  time.Now(),
 	}
 	if result.IsReconciled {
 		result.Difference = 0

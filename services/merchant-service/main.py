@@ -11,10 +11,28 @@ from datetime import datetime, timedelta
 from enum import Enum
 import uvicorn
 import asyncpg
+import hashlib
 import os
+import secrets
 import sys
 from decimal import Decimal
 import json
+
+from merchant_settlement import (
+    router as settlement_router,
+    set_db_pool as settlement_set_db_pool,
+    create_settlement_tables,
+)
+from merchant_kyb import (
+    router as kyb_router,
+    set_db_pool as kyb_set_db_pool,
+    create_kyb_tables,
+)
+from docling_kyb_integration import DoclingKYBProcessor
+from kyb_document_endpoints import (
+    router as kyb_documents_router,
+    init_kyb_endpoints,
+)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../shared/python'))
 
@@ -28,6 +46,206 @@ app = FastAPI(
     description="Complete merchant management and settlement service",
     version="1.0.0"
 )
+
+# --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
+# RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
+# is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE
+# are configured. Fail-closed: missing/malformed/expired/unknown-kid tokens are rejected;
+# a JWKS outage with a cold cache yields "jwks_unavailable" (surfaced as HTTP 503).
+import os as _jwt_os
+import base64 as _jwt_b64
+import hashlib as _jwt_hash
+import hmac as _jwt_hmac
+import json as _jwt_json
+import time as _jwt_time
+import urllib.request as _jwt_urlreq
+
+_JWT_JWKS_URL = _jwt_os.environ.get("KEYCLOAK_JWKS_URL", "")
+_JWT_SECRET = _jwt_os.environ.get("JWT_SECRET", "")
+_JWT_ISSUER = _jwt_os.environ.get("JWT_ISSUER", "")
+_JWT_AUDIENCE = _jwt_os.environ.get("JWT_AUDIENCE", "")
+try:
+    _JWT_JWKS_TTL = int(_jwt_os.environ.get("JWKS_CACHE_TTL_SECONDS", "300"))
+except ValueError:
+    _JWT_JWKS_TTL = 300
+_jwks_cache = {"fetched_at": 0.0, "keys": {}}
+
+
+def _jwt_b64url_decode(segment):
+    segment += "=" * (-len(segment) % 4)
+    return _jwt_b64.urlsafe_b64decode(segment.encode())
+
+
+def _jwt_fetch_jwks():
+    now = _jwt_time.time()
+    if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < _JWT_JWKS_TTL:
+        return _jwks_cache["keys"], None
+    try:
+        with _jwt_urlreq.urlopen(_JWT_JWKS_URL, timeout=5) as resp:
+            data = _jwt_json.loads(resp.read())
+        keys = {k.get("kid"): k for k in data.get("keys", []) if k.get("kid")}
+    except Exception:
+        if _jwks_cache["keys"]:
+            return _jwks_cache["keys"], None  # stale cache: signatures are still really verified
+        return None, "jwks_unavailable"
+    _jwks_cache["keys"] = keys
+    _jwks_cache["fetched_at"] = now
+    return keys, None
+
+
+def _jwt_verify_rs256(signing_input, signature, jwk):
+    """Pure-stdlib RS256 (PKCS#1 v1.5 + SHA-256) verification against a JWK."""
+    try:
+        n = int.from_bytes(_jwt_b64url_decode(jwk["n"]), "big")
+        e = int.from_bytes(_jwt_b64url_decode(jwk["e"]), "big")
+    except Exception:
+        return False
+    k = (n.bit_length() + 7) // 8
+    if len(signature) != k:
+        return False
+    em = pow(int.from_bytes(signature, "big"), e, n).to_bytes(k, "big")
+    digest_info = bytes.fromhex("3031300d060960864801650304020105000420") + _jwt_hash.sha256(signing_input).digest()
+    if k < len(digest_info) + 11:
+        return False
+    expected = b"\x00\x01" + b"\xff" * (k - len(digest_info) - 3) + b"\x00" + digest_info
+    return _jwt_hmac.compare_digest(em, expected)
+
+
+def _jwt_check_claims(payload):
+    exp = payload.get("exp")
+    if exp is None:
+        return "Token missing exp claim"
+    try:
+        if _jwt_time.time() >= float(exp):
+            return "Token expired"
+    except (TypeError, ValueError):
+        return "Invalid token expiry"
+    if _JWT_ISSUER and payload.get("iss") != _JWT_ISSUER:
+        return "Invalid token issuer"
+    if _JWT_AUDIENCE:
+        aud = payload.get("aud")
+        if isinstance(aud, str):
+            aud = [aud]
+        if not isinstance(aud, list) or _JWT_AUDIENCE not in aud:
+            return "Invalid token audience"
+    return None
+
+
+def validate_jwt(headers):
+    """Validate a Bearer JWT from a headers mapping.
+
+    Returns (claims, None) on success or (None, reason) on failure. Fails closed:
+    any token that cannot be cryptographically verified is rejected, and when
+    neither KEYCLOAK_JWKS_URL nor JWT_SECRET is configured the result is
+    (None, "auth_not_configured").
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = auth[7:]
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    try:
+        header = _jwt_json.loads(_jwt_b64url_decode(parts[0]))
+        payload = _jwt_json.loads(_jwt_b64url_decode(parts[1]))
+        signature = _jwt_b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    alg = header.get("alg")
+    signing_input = (parts[0] + "." + parts[1]).encode()
+    if alg == "RS256":
+        if not _JWT_JWKS_URL:
+            return None, "auth_not_configured"
+        keys, ferr = _jwt_fetch_jwks()
+        if ferr:
+            return None, ferr
+        jwk = keys.get(header.get("kid"))
+        if jwk is None:
+            _jwks_cache["fetched_at"] = 0.0  # one forced refresh for an unknown kid
+            keys, ferr = _jwt_fetch_jwks()
+            if ferr:
+                return None, ferr
+            jwk = keys.get(header.get("kid"))
+            if jwk is None:
+                return None, "Unknown token key id"
+        if not _jwt_verify_rs256(signing_input, signature, jwk):
+            return None, "Invalid token signature"
+    elif alg == "HS256":
+        if not _JWT_SECRET or _JWT_SECRET.startswith("${"):
+            return None, "auth_not_configured"
+        expected = _jwt_hmac.new(_JWT_SECRET.encode(), signing_input, _jwt_hash.sha256).digest()
+        if not _jwt_hmac.compare_digest(expected, signature):
+            return None, "Invalid token signature"
+    else:
+        return None, "Unsupported token algorithm"
+    err = _jwt_check_claims(payload)
+    if err:
+        return None, err
+    return payload, None
+
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
+# Mount the settlement and KYB routers so the real endpoints serve traffic.
+app.include_router(settlement_router)
+app.include_router(kyb_router)
+app.include_router(kyb_documents_router)
 
 allowed_origins = [origin.strip() for origin in os.getenv("ALLOWED_ORIGINS", "https://app.54link-dev.internal,https://admin.54link-dev.internal,https://pwa.54link-dev.internal").split(",") if origin.strip()]
 app.add_middleware(
@@ -94,6 +312,11 @@ class MerchantUpdate(BaseModel):
     contact_person_phone: Optional[str] = None
 
 class MerchantResponse(BaseModel):
+    """Merchant as returned by list/get endpoints.
+
+    NEVER contains the API key or its hash — only the last-4 identifier.
+    The full key is returned exactly once, at creation (MerchantCreatedResponse).
+    """
     id: int
     merchant_id: str
     tenant_id: str
@@ -102,9 +325,13 @@ class MerchantResponse(BaseModel):
     business_phone: str
     status: MerchantStatus
     kyb_status: KYBStatus
-    api_key: Optional[str] = None
+    api_key_last4: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+
+class MerchantCreatedResponse(MerchantResponse):
+    """Creation response — the ONLY place the full API key is ever returned."""
+    api_key: str
 
 class KYBVerificationRequest(BaseModel):
     merchant_id: str
@@ -181,6 +408,8 @@ async def startup():
 
         async with db_pool.acquire() as conn:
             await conn.execute("""
+                CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
                 CREATE TABLE IF NOT EXISTS merchants (
                     id SERIAL PRIMARY KEY,
                     merchant_id VARCHAR(50) UNIQUE NOT NULL,
@@ -200,9 +429,21 @@ async def startup():
                     status VARCHAR(20) DEFAULT 'pending',
                     kyb_status VARCHAR(20) DEFAULT 'not_started',
                     api_key VARCHAR(255),
+                    api_key_hash VARCHAR(64),
+                    api_key_last4 VARCHAR(4),
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                -- Upgrades for pre-existing deployments (plaintext api_key no
+                -- longer written; only a SHA-256 hash + last-4 are stored).
+                ALTER TABLE merchants ADD COLUMN IF NOT EXISTS api_key_hash VARCHAR(64);
+                ALTER TABLE merchants ADD COLUMN IF NOT EXISTS api_key_last4 VARCHAR(4);
+                UPDATE merchants
+                    SET api_key_hash = encode(digest(api_key, 'sha256'), 'hex'),
+                        api_key_last4 = right(api_key, 4),
+                        api_key = NULL
+                WHERE api_key IS NOT NULL;
 
                 CREATE INDEX IF NOT EXISTS idx_merchants_merchant_id ON merchants(merchant_id);
                 CREATE INDEX IF NOT EXISTS idx_merchants_tenant_id ON merchants(tenant_id);
@@ -235,9 +476,16 @@ async def startup():
                     bank_code VARCHAR(20),
                     account_name VARCHAR(255),
                     status VARCHAR(20) DEFAULT 'pending',
+                    claimed_at TIMESTAMP,
                     processed_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+
+                -- Upgrades for pre-existing deployments (atomic claim uses
+                -- claimed_at; all status transitions touch updated_at).
+                ALTER TABLE merchant_settlements ADD COLUMN IF NOT EXISTS claimed_at TIMESTAMP;
+                ALTER TABLE merchant_settlements ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 
                 CREATE INDEX IF NOT EXISTS idx_settlements_merchant_id ON merchant_settlements(merchant_id);
                 CREATE INDEX IF NOT EXISTS idx_settlements_status ON merchant_settlements(status);
@@ -312,6 +560,22 @@ async def startup():
                 CREATE INDEX IF NOT EXISTS idx_kyb_documents_type ON kyb_documents(document_type);
             """)
 
+            # Settlement/KYB router tables + one-payout-per-settlement guard.
+            await create_settlement_tables(conn)
+            await create_kyb_tables(conn)
+            await conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_payouts_settlement
+                ON merchant_payouts(settlement_id);
+            """)
+
+        # Inject live dependencies into the mounted routers.
+        settlement_set_db_pool(db_pool)
+        kyb_set_db_pool(db_pool)
+        init_kyb_endpoints(
+            db_pool,
+            DoclingKYBProcessor(os.getenv("DOCLING_URL", "http://docling-service:8010")),
+        )
+
         print("Merchant service started successfully")
     except Exception as e:
         print(f"DB unavailable at startup, service running in degraded mode: {e}", file=sys.stderr)
@@ -327,38 +591,61 @@ async def shutdown():
 async def health_check():
     return {"status": "healthy", "service": "merchant-service"}
 
+def _generate_api_key() -> tuple:
+    """Generate an unpredictable live API key (CSPRNG).
+
+    Returns (plaintext_key, sha256_hash, last4). Only the hash and last-4 are
+    ever stored; the plaintext is returned to the caller exactly once.
+    """
+    plaintext = "sk_live_" + secrets.token_urlsafe(32)
+    key_hash = hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+    return plaintext, key_hash, plaintext[-4:]
+
+
+def _scrub_api_key(record: dict) -> dict:
+    """Remove key material from a merchants row before returning it."""
+    record.pop("api_key", None)
+    record.pop("api_key_hash", None)
+    return record
+
+
 # Merchant Management Endpoints
-@app.post("/api/v1/merchants", response_model=MerchantResponse, status_code=201)
+@app.post("/api/v1/merchants", response_model=MerchantCreatedResponse, status_code=201)
 async def create_merchant(
     merchant: MerchantCreate,
     db=Depends(get_db)
 ):
-    """Create a new merchant account"""
+    """Create a new merchant account.
+
+    The full API key is returned ONLY in this response; afterwards only the
+    SHA-256 hash and last-4 characters are stored/retrievable.
+    """
     merchant_id = f"MER{int(datetime.now().timestamp())}"
-    api_key = f"sk_live_{merchant_id}_{int(datetime.now().timestamp())}"
-    
+    api_key, api_key_hash, api_key_last4 = _generate_api_key()
+
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             INSERT INTO merchants (
                 merchant_id, tenant_id, business_name, business_email, business_phone,
                 business_address, business_type, registration_number, tax_id,
                 contact_person_name, contact_person_email, contact_person_phone,
-                industry, website, api_key
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                industry, website, api_key, api_key_hash, api_key_last4
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             RETURNING *
         """, merchant_id, merchant.tenant_id, merchant.business_name, merchant.business_email,
             merchant.business_phone, merchant.business_address, merchant.business_type,
             merchant.registration_number, merchant.tax_id, merchant.contact_person_name,
             merchant.contact_person_email, merchant.contact_person_phone, merchant.industry,
-            merchant.website, api_key)
-        
+            merchant.website, None, api_key_hash, api_key_last4)
+
         # Initialize fee configuration with defaults
         await conn.execute("""
             INSERT INTO merchant_fee_config (merchant_id)
             VALUES ($1)
         """, merchant_id)
 
-        merchant_payload = dict(row)
+        merchant_payload = _scrub_api_key(dict(row))
+        merchant_payload["api_key"] = api_key  # shown exactly once, at creation
 
     publish_merchant_event(
         event_type="MERCHANT_CREATED",
@@ -404,7 +691,8 @@ async def list_merchants(
     
     async with db.acquire() as conn:
         rows = await conn.fetch(query, *params)
-        return [dict(row) for row in rows]
+        # Never return key material (full key or hash) in list responses.
+        return [_scrub_api_key(dict(row)) for row in rows]
 
 @app.get("/api/v1/merchants/{merchant_id}", response_model=MerchantResponse)
 async def get_merchant(merchant_id: str, db=Depends(get_db)):
@@ -416,7 +704,7 @@ async def get_merchant(merchant_id: str, db=Depends(get_db)):
         )
         if not row:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        return dict(row)
+        return _scrub_api_key(dict(row))
 
 @app.put("/api/v1/merchants/{merchant_id}")
 async def update_merchant(
@@ -454,7 +742,7 @@ async def update_merchant(
         row = await conn.fetchrow(query, *params)
         if not row:
             raise HTTPException(status_code=404, detail="Merchant not found")
-        updated = dict(row)
+        updated = _scrub_api_key(dict(row))
     publish_merchant_event(
         event_type="MERCHANT_UPDATED",
         tenant_id=updated.get("tenant_id", "tenant-demo"),

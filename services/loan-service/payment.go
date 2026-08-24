@@ -10,13 +10,13 @@ import (
 )
 
 type PaymentStruct struct {
-	Recipient  string `json:"recipient"`
-	Amount string `json:"amount"`
-	Note   string `json:"note"`
-	TenantID   string `json:"tenant_id"`
-	KeycloakID   string `json:"keycloak_id"`
-	LedgerID   string `json:"ledger_id"`
-	MintAccountID   string `json:"mint_account_id"`
+	Recipient     string `json:"recipient"`
+	Amount        string `json:"amount"`
+	Note          string `json:"note"`
+	TenantID      string `json:"tenant_id"`
+	KeycloakID    string `json:"keycloak_id"`
+	LedgerID      string `json:"ledger_id"`
+	MintAccountID string `json:"mint_account_id"`
 }
 
 func Payment(payload *PaymentStruct) ([]byte, error) {

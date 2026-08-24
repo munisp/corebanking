@@ -50,18 +50,18 @@ func main() {
 	mux.HandleFunc("/v1/sync/accounts", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"syncedAccounts": 18432,
+			"syncedAccounts":  18432,
 			"pendingAccounts": 0,
-			"lastAccountId": "ACC-018432",
+			"lastAccountId":   "ACC-018432",
 		})
 	})
 
 	mux.HandleFunc("/v1/sync/transfers", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"syncedTransfers": 4821903,
+			"syncedTransfers":  4821903,
 			"pendingTransfers": 0,
-			"lastTransferId": "TXN-4821903",
+			"lastTransferId":   "TXN-4821903",
 		})
 	})
 

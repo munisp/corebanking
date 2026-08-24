@@ -1,85 +1,103 @@
-import { describe, it, expect } from "vitest";
-import crypto from "crypto";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 
-// Test encryption/decryption
-function getEncryptionKey(): Buffer {
-  const secret = "test-secret-for-unit-tests";
-  return crypto.scryptSync(secret, "54bank-salt", 32);
-}
+// H-40 remediation: the previous version re-implemented AES-GCM inside the
+// test and asserted its own copy round-tripped — production crypto could be
+// broken and the suite stayed green. It also contained an assertion that is
+// literally always true (`expect(Array.isArray(missing)).toBe(true)`).
+// These tests exercise the real lib/secretsManager module.
+import { encryptSecret, decryptSecret, validateSecrets, generateSecrets } from "../lib/secretsManager";
 
-function encryptSecret(plaintext: string): string {
-  const iv = crypto.randomBytes(16);
-  const key = getEncryptionKey();
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-  const encrypted = Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]);
-  const authTag = cipher.getAuthTag();
-  return iv.toString("hex") + ":" + authTag.toString("hex") + ":" + encrypted.toString("hex");
-}
-
-function decryptSecret(ciphertext: string): string {
-  const [ivHex, authTagHex, encryptedHex] = ciphertext.split(":");
-  const key = getEncryptionKey();
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivHex, "hex"));
-  decipher.setAuthTag(Buffer.from(authTagHex, "hex"));
-  return decipher.update(Buffer.from(encryptedHex, "hex")) + decipher.final("utf8");
-}
-
-describe("Secrets Manager — Encryption", () => {
-  it("should encrypt and decrypt a secret", () => {
-    const original = "my-database-password-123";
-    const encrypted = encryptSecret(original);
-    const decrypted = decryptSecret(encrypted);
-    expect(decrypted).toBe(original);
+describe("Secrets Manager — Encryption (production lib/secretsManager)", () => {
+  const savedEnv = { ...process.env };
+  beforeEach(() => {
+    process.env.JWT_SECRET = "h40-test-secret-key-0123456789abcdef";
+  });
+  afterEach(() => {
+    process.env = { ...savedEnv };
   });
 
-  it("should produce different ciphertext each time", () => {
+  it("encrypts and decrypts a secret", () => {
+    const original = "my-database-password-123";
+    expect(decryptSecret(encryptSecret(original))).toBe(original);
+  });
+
+  it("produces different ciphertext each time (random IV)", () => {
     const e1 = encryptSecret("same-secret");
     const e2 = encryptSecret("same-secret");
-    expect(e1).not.toBe(e2); // Different IVs
+    expect(e1).not.toBe(e2);
+    expect(decryptSecret(e1)).toBe("same-secret");
+    expect(decryptSecret(e2)).toBe("same-secret");
   });
 
-  it("should handle special characters", () => {
-    const original = "p@$$w0rd!#%^&*()_+-={}[]|;':\",./<>?";
-    const encrypted = encryptSecret(original);
-    expect(decryptSecret(encrypted)).toBe(original);
+  it("emits iv:authTag:ciphertext in hex", () => {
+    const parts = encryptSecret("x").split(":");
+    expect(parts).toHaveLength(3);
+    expect(parts[0]).toMatch(/^[0-9a-f]{32}$/); // 16-byte IV
+    expect(parts[1]).toMatch(/^[0-9a-f]{32}$/); // 16-byte GCM tag
   });
 
-  it("should handle empty strings", () => {
-    const encrypted = encryptSecret("");
-    expect(decryptSecret(encrypted)).toBe("");
+  it("handles special characters, unicode, and empty strings", () => {
+    for (const s of ["p@$$w0rd!#%^&*()_+-={}[]|;':\",./<>?", "パスワード密码", ""]) {
+      expect(decryptSecret(encryptSecret(s))).toBe(s);
+    }
   });
 
-  it("should handle unicode", () => {
-    const original = "パスワード密码";
-    const encrypted = encryptSecret(original);
-    expect(decryptSecret(encrypted)).toBe(original);
+  it("fails decryption with a different key", () => {
+    const encrypted = encryptSecret("secret-data");
+    process.env.JWT_SECRET = "a-different-key-0123456789abcdef00";
+    expect(() => decryptSecret(encrypted)).toThrow();
   });
 
-  it("should fail with corrupted ciphertext", () => {
-    const encrypted = encryptSecret("test");
-    const [iv, authTag, data] = encrypted.split(":");
-    const corrupted = iv + ":" + authTag + ":" + "deadbeef".repeat(4);
+  it("fails decryption on corrupted ciphertext (GCM auth tag)", () => {
+    const [iv, authTag] = encryptSecret("test").split(":");
+    const corrupted = `${iv}:${authTag}:${"deadbeef".repeat(4)}`;
     expect(() => decryptSecret(corrupted)).toThrow();
   });
 });
 
-describe("Secrets Manager — Validation", () => {
-  it("should detect missing required secrets", () => {
-    // Simulate checking required secrets
-    const required = [
-      { envVar: "DATABASE_URL", required: true },
-      { envVar: "JWT_SECRET", required: true },
-    ];
-    const missing = required.filter(s => !process.env[s.envVar]).map(s => s.envVar);
-    // In test env, these are likely not set
-    expect(Array.isArray(missing)).toBe(true);
+describe("Secrets Manager — Validation (production lib/secretsManager)", () => {
+  const savedEnv = { ...process.env };
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
   });
 
-  it("should generate secure random secrets", () => {
-    const s1 = crypto.randomBytes(64).toString("hex");
-    const s2 = crypto.randomBytes(64).toString("hex");
-    expect(s1).toHaveLength(128);
-    expect(s2).toHaveLength(128);
-    expect(s1).not.toBe(s2);
+  it("reports missing required secrets and is invalid", () => {
+    delete process.env.DATABASE_URL;
+    delete process.env.JWT_SECRET;
+    const result = validateSecrets();
+    expect(result.valid).toBe(false);
+    expect(result.missing.some((m) => m.startsWith("DATABASE_URL"))).toBe(true);
+    expect(result.missing.some((m) => m.startsWith("JWT_SECRET"))).toBe(true);
+  });
+
+  it("is valid once required secrets are present", () => {
+    process.env.DATABASE_URL = "postgresql://localhost:5432/db";
+    process.env.JWT_SECRET = "x".repeat(64);
+    const result = validateSecrets();
+    expect(result.valid).toBe(true);
+    expect(result.missing).toHaveLength(0);
+  });
+
+  it("warns on placeholder and short JWT secrets", () => {
+    process.env.DATABASE_URL = "postgresql://localhost:5432/db";
+    process.env.JWT_SECRET = "REPLACE_ME";
+    const result = validateSecrets();
+    expect(result.warnings.some((w) => w.includes("REPLACE_ME"))).toBe(true);
+
+    process.env.JWT_SECRET = "short";
+    const short = validateSecrets();
+    expect(short.warnings.some((w) => w.includes("at least 32 characters"))).toBe(true);
+  });
+});
+
+describe("Secrets Manager — Generation (production lib/secretsManager)", () => {
+  it("generates distinct, full-length random secrets", () => {
+    const a = generateSecrets();
+    const b = generateSecrets();
+    expect(a.JWT_SECRET).toMatch(/^[0-9a-f]{128}$/);
+    expect(a.PLATFORM_TENANT_SECRET).toMatch(/^[0-9a-f]{64}$/);
+    expect(a.JWT_SECRET).not.toBe(b.JWT_SECRET);
+    expect(a.PLATFORM_TENANT_SECRET).not.toBe(b.PLATFORM_TENANT_SECRET);
   });
 });

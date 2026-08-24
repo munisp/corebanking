@@ -52,26 +52,26 @@ func (s *InvestmentService) initializeDefaultInvestments(tenantID string) {
 
 	// FGN Bonds
 	s.investments["inv-002"] = &Investment{
-		InvestmentID:   "inv-002",
-		TenantID:       tenantID,
-		InvestmentType: "bond",
-		Issuer:         "Federal Government of Nigeria",
-		IssuerID:       "FGN",
-		FaceValue:      100000000000, // 100B NGN
-		PurchasePrice:  98000000000,  // 98B NGN
-		CurrentValue:   102000000000, // 102B NGN
-		Currency:       "NGN",
-		CouponRate:     14.5,
-		YieldRate:      15.2,
-		PurchaseDate:   time.Now().AddDate(-1, 0, 0),
-		MaturityDate:   time.Now().AddDate(4, 0, 0),
-		Status:         "active",
-		Portfolio:      "available_for_sale",
-		UnrealizedPnL:  4000000000,
+		InvestmentID:    "inv-002",
+		TenantID:        tenantID,
+		InvestmentType:  "bond",
+		Issuer:          "Federal Government of Nigeria",
+		IssuerID:        "FGN",
+		FaceValue:       100000000000, // 100B NGN
+		PurchasePrice:   98000000000,  // 98B NGN
+		CurrentValue:    102000000000, // 102B NGN
+		Currency:        "NGN",
+		CouponRate:      14.5,
+		YieldRate:       15.2,
+		PurchaseDate:    time.Now().AddDate(-1, 0, 0),
+		MaturityDate:    time.Now().AddDate(4, 0, 0),
+		Status:          "active",
+		Portfolio:       "available_for_sale",
+		UnrealizedPnL:   4000000000,
 		AccruedInterest: 3625000000,
-		Metadata:       make(map[string]interface{}),
-		CreatedAt:      time.Now().AddDate(-1, 0, 0),
-		UpdatedAt:      time.Now(),
+		Metadata:        make(map[string]interface{}),
+		CreatedAt:       time.Now().AddDate(-1, 0, 0),
+		UpdatedAt:       time.Now(),
 	}
 
 	// Commercial Paper
@@ -239,15 +239,15 @@ func (s *InvestmentService) GetPortfolioSummary(tenantID string) map[string]inte
 	}
 
 	return map[string]interface{}{
-		"totalValue":          totalValue,
-		"totalPurchasePrice":  totalPurchasePrice,
-		"totalUnrealizedPnL":  totalUnrealizedPnL,
+		"totalValue":           totalValue,
+		"totalPurchasePrice":   totalPurchasePrice,
+		"totalUnrealizedPnL":   totalUnrealizedPnL,
 		"totalAccruedInterest": totalAccruedInterest,
-		"avgYield":            avgYield,
-		"investmentCount":     count,
-		"byType":              byType,
-		"byPortfolio":         byPortfolio,
-		"timestamp":           time.Now().Format(time.RFC3339),
+		"avgYield":             avgYield,
+		"investmentCount":      count,
+		"byType":               byType,
+		"byPortfolio":          byPortfolio,
+		"timestamp":            time.Now().Format(time.RFC3339),
 	}
 }
 
@@ -299,9 +299,9 @@ func (s *InvestmentService) GetPortfolioYield(tenantID string) map[string]interf
 	}
 
 	return map[string]interface{}{
-		"avgYieldByType":    avgYieldByType,
-		"benchmarkRate":     18.0, // CBN MPR
+		"avgYieldByType":      avgYieldByType,
+		"benchmarkRate":       18.0, // CBN MPR
 		"spreadOverBenchmark": 2.5,
-		"timestamp":         time.Now().Format(time.RFC3339),
+		"timestamp":           time.Now().Format(time.RFC3339),
 	}
 }

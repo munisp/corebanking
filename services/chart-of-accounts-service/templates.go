@@ -12,34 +12,34 @@ import (
 type BankType string
 
 const (
-	BankTypeCommercial BankType = "commercial"
-	BankTypeMFB        BankType = "mfb"
-	BankTypeFintech    BankType = "fintech"
-	BankTypeMortgage   BankType = "mortgage"
+	BankTypeCommercial   BankType = "commercial"
+	BankTypeMFB          BankType = "mfb"
+	BankTypeFintech      BankType = "fintech"
+	BankTypeMortgage     BankType = "mortgage"
 	BankTypeAgricultural BankType = "agricultural"
-	BankTypeDevelopment BankType = "development"
+	BankTypeDevelopment  BankType = "development"
 )
 
 type AccountTemplate struct {
-	ID          string                 `json:"id"`
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	BankType    BankType               `json:"bank_type"`
-	IsDefault   bool                   `json:"is_default"`
-	Accounts    []TemplateAccount      `json:"accounts"`
-	CreatedAt   time.Time              `json:"created_at"`
-	UpdatedAt   time.Time              `json:"updated_at"`
+	ID          string            `json:"id"`
+	Name        string            `json:"name"`
+	Description string            `json:"description"`
+	BankType    BankType          `json:"bank_type"`
+	IsDefault   bool              `json:"is_default"`
+	Accounts    []TemplateAccount `json:"accounts"`
+	CreatedAt   time.Time         `json:"created_at"`
+	UpdatedAt   time.Time         `json:"updated_at"`
 }
 
 type TemplateAccount struct {
-	Code        string            `json:"code"`
-	Name        string            `json:"name"`
-	Description string            `json:"description"`
-	Type        AccountType       `json:"type"`
-	ParentCode  string            `json:"parent_code,omitempty"`
-	Currency    string            `json:"currency"`
-	CBNCode     string            `json:"cbn_code,omitempty"`
-	Tags        []string          `json:"tags,omitempty"`
+	Code        string      `json:"code"`
+	Name        string      `json:"name"`
+	Description string      `json:"description"`
+	Type        AccountType `json:"type"`
+	ParentCode  string      `json:"parent_code,omitempty"`
+	Currency    string      `json:"currency"`
+	CBNCode     string      `json:"cbn_code,omitempty"`
+	Tags        []string    `json:"tags,omitempty"`
 }
 
 type TemplateService struct {

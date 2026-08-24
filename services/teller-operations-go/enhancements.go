@@ -19,21 +19,21 @@ type TillLimit struct {
 }
 
 type CashReconciliation struct {
-	ID            string    `json:"id"`
-	SessionID     string    `json:"sessionId"`
-	TellerID      string    `json:"tellerId"`
-	ExpectedCash  float64   `json:"expectedCash"`
-	ActualCash    float64   `json:"actualCash"`
-	Difference    float64   `json:"difference"`
-	Status        string    `json:"status"` // balanced, short, over
-	Notes         string    `json:"notes"`
-	ReconciledAt  time.Time `json:"reconciledAt"`
-	ApprovedBy    string    `json:"approvedBy,omitempty"`
+	ID           string    `json:"id"`
+	SessionID    string    `json:"sessionId"`
+	TellerID     string    `json:"tellerId"`
+	ExpectedCash float64   `json:"expectedCash"`
+	ActualCash   float64   `json:"actualCash"`
+	Difference   float64   `json:"difference"`
+	Status       string    `json:"status"` // balanced, short, over
+	Notes        string    `json:"notes"`
+	ReconciledAt time.Time `json:"reconciledAt"`
+	ApprovedBy   string    `json:"approvedBy,omitempty"`
 }
 
 type TransactionReversal struct {
 	ID            string    `json:"id"`
-	OriginalTxnID string   `json:"originalTransactionId"`
+	OriginalTxnID string    `json:"originalTransactionId"`
 	SessionID     string    `json:"sessionId"`
 	Amount        float64   `json:"amount"`
 	Reason        string    `json:"reason"`
@@ -47,8 +47,8 @@ type QueueTicket struct {
 	ID          string    `json:"id"`
 	CustomerID  string    `json:"customerId"`
 	ServiceType string    `json:"serviceType"` // deposit, withdrawal, transfer, inquiry
-	Priority    int       `json:"priority"`     // 1=VIP, 2=Priority, 3=Regular
-	Status      string    `json:"status"`       // waiting, serving, completed, no_show
+	Priority    int       `json:"priority"`    // 1=VIP, 2=Priority, 3=Regular
+	Status      string    `json:"status"`      // waiting, serving, completed, no_show
 	WindowNum   int       `json:"windowNumber,omitempty"`
 	WaitTime    int       `json:"waitTimeMinutes"`
 	CreatedAt   time.Time `json:"createdAt"`
@@ -69,12 +69,12 @@ type Receipt struct {
 }
 
 var (
-	reconMu       sync.RWMutex
+	reconMu         sync.RWMutex
 	reconciliations []CashReconciliation
-	reversals     []TransactionReversal
-	queue         []QueueTicket
-	receipts      []Receipt
-	tillLimits    = map[string]TillLimit{
+	reversals       []TransactionReversal
+	queue           []QueueTicket
+	receipts        []Receipt
+	tillLimits      = map[string]TillLimit{
 		"NGN": {Currency: "NGN", MinBalance: 50000, MaxBalance: 5000000, AlertAt: 4000000},
 		"USD": {Currency: "USD", MinBalance: 100, MaxBalance: 50000, AlertAt: 40000},
 		"GBP": {Currency: "GBP", MinBalance: 100, MaxBalance: 30000, AlertAt: 25000},
@@ -86,27 +86,27 @@ var (
 )
 
 type ChequeBook struct {
-	ID           string    `json:"id"`
-	AccountID    string    `json:"accountId"`
-	CustomerName string    `json:"customerName"`
-	SeriesStart  string    `json:"seriesStart"`
-	SeriesEnd    string    `json:"seriesEnd"`
-	LeafCount    int       `json:"leafCount"`
-	Status       string    `json:"status"` // requested, printed, dispatched, collected, exhausted
-	RequestedAt  time.Time `json:"requestedAt"`
+	ID           string     `json:"id"`
+	AccountID    string     `json:"accountId"`
+	CustomerName string     `json:"customerName"`
+	SeriesStart  string     `json:"seriesStart"`
+	SeriesEnd    string     `json:"seriesEnd"`
+	LeafCount    int        `json:"leafCount"`
+	Status       string     `json:"status"` // requested, printed, dispatched, collected, exhausted
+	RequestedAt  time.Time  `json:"requestedAt"`
 	CollectedAt  *time.Time `json:"collectedAt,omitempty"`
 }
 
 type ChequeLeaf struct {
-	ID           string    `json:"id"`
-	ChequeBookID string    `json:"chequeBookId"`
-	ChequeNumber string    `json:"chequeNumber"`
-	Amount       float64   `json:"amount"`
-	Payee        string    `json:"payee"`
-	Status       string    `json:"status"` // unused, presented, cleared, returned, stopped
+	ID           string     `json:"id"`
+	ChequeBookID string     `json:"chequeBookId"`
+	ChequeNumber string     `json:"chequeNumber"`
+	Amount       float64    `json:"amount"`
+	Payee        string     `json:"payee"`
+	Status       string     `json:"status"` // unused, presented, cleared, returned, stopped
 	PresentedAt  *time.Time `json:"presentedAt,omitempty"`
 	ClearedAt    *time.Time `json:"clearedAt,omitempty"`
-	ReturnReason string    `json:"returnReason,omitempty"`
+	ReturnReason string     `json:"returnReason,omitempty"`
 }
 
 func RegisterEnhancedRoutes(mux *http.ServeMux) {

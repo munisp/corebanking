@@ -30,7 +30,12 @@ const jwtUtil = {
     const parts = token.split(".");
     if (parts.length !== 3) throw Object.assign(new Error("Invalid token"), { name: "JsonWebTokenError" });
     const sig = crypto.createHmac("sha256", secret).update(`${parts[0]}.${parts[1]}`).digest("base64url");
-    if (sig !== parts[2]) throw Object.assign(new Error("Invalid signature"), { name: "JsonWebTokenError" });
+    // Constant-time comparison to prevent signature timing oracles.
+    const expected = Buffer.from(sig, "utf8");
+    const presented = Buffer.from(parts[2], "utf8");
+    if (expected.length !== presented.length || !crypto.timingSafeEqual(expected, presented)) {
+      throw Object.assign(new Error("Invalid signature"), { name: "JsonWebTokenError" });
+    }
     const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
     if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
       throw Object.assign(new Error("Token expired"), { name: "TokenExpiredError" });
@@ -53,7 +58,22 @@ function parseExpiry(s: string): number {
 }
 
 // JWT Configuration
-const JWT_SECRET = process.env.JWT_SECRET || process.env.PLATFORM_TENANT_SECRET || crypto.randomBytes(32).toString("hex");
+const IS_PRODUCTION = process.env.NODE_ENV === "production";
+const CONFIGURED_JWT_SECRET = process.env.JWT_SECRET || process.env.PLATFORM_TENANT_SECRET;
+let JWT_SECRET: string;
+if (CONFIGURED_JWT_SECRET) {
+  JWT_SECRET = CONFIGURED_JWT_SECRET;
+} else if (IS_PRODUCTION) {
+  // Fail closed: never run production with an ephemeral, per-process signing secret.
+  throw new Error(
+    "FATAL: JWT_SECRET or PLATFORM_TENANT_SECRET must be set when NODE_ENV=production. Refusing to start with a random per-process secret."
+  );
+} else {
+  JWT_SECRET = crypto.randomBytes(32).toString("hex");
+  logger.warn(
+    "JWT_SECRET/PLATFORM_TENANT_SECRET not set — using a random per-process secret. All tokens are invalidated on restart. NEVER use this in production."
+  );
+}
 const JWT_EXPIRY = process.env.JWT_EXPIRY || "8h";
 const JWT_REFRESH_EXPIRY = process.env.JWT_REFRESH_EXPIRY || "7d";
 
@@ -111,30 +131,23 @@ function generateTokens(user: AuthUser) {
   return { accessToken, refreshToken };
 }
 
-// Default admin user for first-time setup
-const DEFAULT_ADMIN = {
-  email: "admin@54bank.ng",
-  password: "admin",
-  name: "Platform Administrator",
-  role: "admin",
-};
-
-// Default operator users
-const DEFAULT_USERS = [
-  { email: "ops@54bank.ng", password: "ops123", name: "Operations Manager", role: "operations" },
-  { email: "compliance@54bank.ng", password: "comp123", name: "Compliance Officer", role: "compliance" },
-  { email: "treasury@54bank.ng", password: "treas123", name: "Treasury Analyst", role: "treasury" },
-  { email: "branch@54bank.ng", password: "branch123", name: "Branch Manager", role: "branch" },
-  { email: "auditor@54bank.ng", password: "audit123", name: "Internal Auditor", role: "auditor" },
-];
-
-// In-memory user store for when DB is unavailable
+// In-memory user store (empty by default; only populated in explicit non-production demo mode).
+// No hardcoded default credentials exist in this codebase. In production this map is always
+// empty and authentication is DB-only.
 const inMemoryUsers: Map<string, { user: AuthUser; passwordHash: string; salt: string }> = new Map();
 
-// Initialize default users
-function initDefaultUsers() {
-  const allDefaults = [DEFAULT_ADMIN, ...DEFAULT_USERS];
-  for (const u of allDefaults) {
+// Demo users for local development/testing ONLY. These are never seeded in production and
+// never seeded unless BANKING_DEMO_MODE=true is explicitly set outside production.
+const DEMO_MODE = !IS_PRODUCTION && process.env.BANKING_DEMO_MODE === "true";
+const DEMO_USERS = [
+  { email: "demo-ops@example.invalid", password: crypto.randomBytes(16).toString("hex"), name: "Demo Operations", role: "operations" },
+  { email: "demo-auditor@example.invalid", password: crypto.randomBytes(16).toString("hex"), name: "Demo Auditor", role: "auditor" },
+];
+
+// Initialize demo users (only when explicitly opted in outside production)
+function initDemoUsers() {
+  if (!DEMO_MODE) return;
+  for (const u of DEMO_USERS) {
     const { hash, salt } = hashPassword(u.password);
     inMemoryUsers.set(u.email, {
       user: {
@@ -148,9 +161,10 @@ function initDefaultUsers() {
       salt,
     });
   }
+  logger.warn("BANKING_DEMO_MODE enabled: seeded in-memory demo users with random passwords. Never enable this in production.");
 }
 
-initDefaultUsers();
+initDemoUsers();
 
 // Brute force protection
 const loginAttempts: Map<string, { count: number; lockedUntil: number }> = new Map();
@@ -340,30 +354,7 @@ export function registerAuthRoutes(app: Express) {
       });
     }
 
-    // Try in-memory users first (includes defaults)
-    const memUser = inMemoryUsers.get(email);
-    if (memUser && verifyPassword(password, memUser.passwordHash, memUser.salt)) {
-      const tokens = generateTokens(memUser.user);
-      res.cookie("access_token", tokens.accessToken, {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
-        sameSite: "lax",
-        maxAge: 8 * 60 * 60 * 1000,
-      });
-      recordLoginAttempt(email, true);
-      logAuthEvent("login_success", email, req.ip || "unknown", req.headers["user-agent"] || "unknown", true, memUser.user.role);
-      return res.json({
-        user: {
-          id: memUser.user.id,
-          name: memUser.user.name,
-          email: memUser.user.email,
-          role: memUser.user.role,
-        },
-        ...tokens,
-      });
-    }
-
-    // Try DB users
+    // Try DB users first (authoritative source of truth)
     const db = await getDb();
     if (db) {
       try {
@@ -397,6 +388,32 @@ export function registerAuthRoutes(app: Express) {
         }
       } catch (err) {
         logger.warn("DB user lookup failed", { error: String(err) });
+      }
+    }
+
+    // In-memory demo users — only reachable outside production with BANKING_DEMO_MODE=true.
+    // This map is always empty in production, so this block can never authenticate anyone there.
+    if (DEMO_MODE) {
+      const memUser = inMemoryUsers.get(email);
+      if (memUser && verifyPassword(password, memUser.passwordHash, memUser.salt)) {
+        const tokens = generateTokens(memUser.user);
+        res.cookie("access_token", tokens.accessToken, {
+          httpOnly: true,
+          secure: false,
+          sameSite: "lax",
+          maxAge: 8 * 60 * 60 * 1000,
+        });
+        recordLoginAttempt(email, true);
+        logAuthEvent("login_success", email, req.ip || "unknown", req.headers["user-agent"] || "unknown", true, memUser.user.role);
+        return res.json({
+          user: {
+            id: memUser.user.id,
+            name: memUser.user.name,
+            email: memUser.user.email,
+            role: memUser.user.role,
+          },
+          ...tokens,
+        });
       }
     }
 

@@ -1,34 +1,35 @@
-#![allow(unused)]
-use tokio_postgres;
-use actix_web::dev::Service;
-use actix_web::{web, App, HttpServer, HttpResponse, middleware};
+use actix_web::{web, App, HttpServer, HttpResponse};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use std::env;
-use uuid::Uuid;
-use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
-#[derive(Debug, Serialize, Deserialize)]
-struct Record {
-    id: String,
-    status: String,
-    tenant_id: String,
-    created_at: DateTime<Utc>,
-}
+// ─── Domain types ───────────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-struct CreateRequest {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(flatten)]
-    extra: std::collections::HashMap<String, serde_json::Value>,
+#[derive(Clone, Serialize, Deserialize)]
+struct WatchlistEntry {
+    list_id: String,
+    list_name: String,
+    entity_name: String,
+    entity_type: String,
+    aliases: Vec<String>,
 }
 
 struct AppState {
-    db: PgPool,
+    start_time: Instant,
+    watchlist: Mutex<Vec<WatchlistEntry>>,
+    records: Mutex<Vec<serde_json::Value>>,
+    db_client: Option<Arc<tokio_postgres::Client>>,
 }
+
+#[derive(Deserialize)]
+struct ScreenRequest {
+    entity_name: Option<String>,
+    name: Option<String>,
+    threshold: Option<f64>,
+}
+
+// ─── Matching ───────────────────────────────────────────────────────────────
 
 fn fuzzy_match_score(name1: &str, name2: &str) -> f64 {
     let n1 = name1.to_lowercase(); let n2 = name2.to_lowercase();
@@ -38,265 +39,444 @@ fn fuzzy_match_score(name1: &str, name2: &str) -> f64 {
     let matches = words1.iter().filter(|w| words2.contains(w)).count();
     matches as f64 / words1.len().max(words2.len()) as f64
 }
+
 fn is_hit(score: f64, threshold: f64) -> bool { score >= threshold }
+
 fn sanctions_list_priority(list: &str) -> u8 {
     match list { "OFAC_SDN" => 1, "UN_CONSOLIDATED" => 2, "EU_SANCTIONS" => 3, "CBN_SANCTIONS" => 4, _ => 5 }
 }
 
+// ─── JWT auth (real HS256 verification, fail closed) ────────────────────────
 
-// --- Graceful Degradation ---
-use std::sync::atomic::AtomicBool;
+// --- JWT Auth Check (fail-closed; R4-V4 remediation) ---
+// Canonical RS256/JWKS-primary verifier aligned with pin-block-engine-rs:
+// tokens are verified against the Keycloak JWKS (KEYCLOAK_JWKS_URL, or derived
+// from KEYCLOAK_REALM_URL) with a 300s cache and a 5s fetch timeout; HS256 via
+// JWT_SECRET remains as a fallback. 401 on missing/malformed/expired/
+// unknown-kid tokens; 503 when no verification backend is available. Verified
+// claims are stored in request extensions for downstream handlers.
 
-static DB_AVAILABLE: AtomicBool = AtomicBool::new(true);
-static CACHE_AVAILABLE: AtomicBool = AtomicBool::new(true);
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct VerifiedClaims(serde_json::Value);
 
-fn degradation_mode() -> &'static str {
-    if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
 }
 
-async fn degradation_status() -> HttpResponse {
-    HttpResponse::Ok().json(json!({
-        "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
-        "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
-        "mode": degradation_mode(),
-    }))
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-async fn health() -> HttpResponse {
-    HttpResponse::Ok().insert_header(("content-security-policy", "default-src 'self'")).json(json!({
-        "status": "healthy",
-        "service": "sanctions-screening-rs",
-        "version": "1.0.0",
-        "description": "OFAC/EU/UN/CBN sanctions screening",
-    }))
-}
-
-async fn screen_name(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    let _sanitized = sanitize_input("");
-    if !rl_allow() {
-        return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
+        }
     }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let input = body.into_inner();
-    let name1_s = input.get("name1").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let name1 = name1_s.as_str();
-    let name2_s = input.get("name2").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let name2 = name2_s.as_str();
-    let result = fuzzy_match_score(name1, name2);
-    // Inter-service call: aml_risk
-    let _upstream_url = std::env::var("AML_ENGINE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
-    match call_service_sync(&format!("{}/v1/risk_profile", _upstream_url), "{}") {
-        Ok(_resp) => eprintln!("sanctions-screening-rs: aml_risk ok"),
-        Err(e) => eprintln!("sanctions-screening-rs: aml_risk failed: {}", e),
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
+        }
+        _ => None,
     }
-
-    let _result_data = json!({"endpoint": "screen_name"});
-    db_persist(&state, "screen_name", &_result_data).await;
-
-    HttpResponse::Ok().json(json!({
-        "service": "sanctions-screening-rs",
-        "endpoint": "screen_name",
-        "result": json!({"value": result}),
-    }))
 }
 
-async fn batch_screen(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    if !rl_allow() {
-        return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
-    }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let input = body.into_inner();
-    let score = input.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let threshold = input.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let result = is_hit(score, threshold);
-    let _result_data = json!({"endpoint": "batch_screen"});
-    db_persist(&state, "batch_screen", &_result_data).await;
-
-    HttpResponse::Ok().json(json!({
-        "service": "sanctions-screening-rs",
-        "endpoint": "batch_screen",
-        "result": json!({"value": result}),
-    }))
-}
-
-async fn list_update(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
-    if !rl_allow() {
-        return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
-    }
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let input = body.into_inner();
-    let list_s = input.get("list").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let list = list_s.as_str();
-    let result = sanctions_list_priority(list);
-    let _result_data = json!({"endpoint": "list_update"});
-    db_persist(&state, "list_update", &_result_data).await;
-
-    HttpResponse::Ok().json(json!({
-        "service": "sanctions-screening-rs",
-        "endpoint": "list_update",
-        "result": json!({"value": format!("{:?}", result)}),
-    }))
-}
-
-async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
-    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
-    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
-    let offset = (page - 1) * limit;
-    if let Some(ref client) = state.db_client {
-        match client.query(
-            "SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-            &[&"sanctions_screening_rs", &(limit as i64), &(offset as i64)]
-        ).await {
-            Ok(rows) => {
-                let items: Vec<serde_json::Value> = rows.iter().map(|r| {
-                    json!({
-                        "id": r.get::<_, String>(0),
-                        "service": r.get::<_, String>(1),
-                        "type": r.get::<_, String>(2),
-                        "status": r.get::<_, String>(3),
-                        "data": r.get::<_, String>(4),
-                    })
-                }).collect();
-                let total: i64 = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = $1", &[&"sanctions_screening_rs"]).await.map(|r| r.get(0)).unwrap_or(0);
-                return HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "database"}));
+async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpResponse> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => {
+            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwt_validation_unavailable",
+                "detail": "no JWKS endpoint configured"
+            })))
+        }
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
             }
-            Err(e) => { eprintln!("DB query failed: {} — fallback to in-memory", e); }
         }
     }
-    let records = state.records.lock().unwrap();
-    let total = records.len();
-    let items: Vec<&serde_json::Value> = records.iter().skip(offset).take(limit).collect();
-    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "limit": limit, "source": "in-memory"}))
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "client init failed"
+        })))?;
+    let resp = client.get(&url).send().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+    })?;
+    if !resp.status().is_success() {
+        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "upstream returned error status"
+        })));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "malformed JWKS payload"
+        }))
+    })?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
 }
 
-async fn stats(state: web::Data<AppState>) -> HttpResponse {
-    if let Some(ref client) = state.db_client {
-        if let Ok(row) = client.query_one("SELECT COUNT(*) FROM service_records WHERE service = $1", &[&"sanctions_screening_rs"]).await {
-            let total: i64 = row.get(0);
-            return HttpResponse::Ok().json(json!({"total": total, "service": env!("CARGO_PKG_NAME"), "source": "database"}));
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
         }
     }
-    let records = state.records.lock().unwrap();
-    HttpResponse::Ok().json(json!({"total": records.len(), "service": env!("CARGO_PKG_NAME"), "source": "in-memory"}))
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
+    }
 }
 
-
-// --- Production Hardening: readyz / livez / metrics ---
-static _REQ_COUNT: AtomicU64 = AtomicU64::new(0);
-static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_START: AtomicU64 = AtomicU64::new(0);
-static _RATE_WINDOW_COUNT: AtomicU64 = AtomicU64::new(0);
-const RATE_LIMIT_PER_SECOND: u64 = 100;
-
-
-
-// --- Alerting ---
-async fn alerts_endpoint() -> HttpResponse {
-    let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
-    let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
-    let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
-    let mut fired = Vec::<serde_json::Value>::new();
-    if error_rate > 0.05 {
-        fired.push(json!({"rule": "high_error_rate", "value": error_rate, "severity": "critical"}));
+async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks().await?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks().await?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => {
+                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                        }
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    })))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": format!("unsupported alg {:?}", other)
+        }))),
     }
-    HttpResponse::Ok().json(json!({
-        "alerts": fired,
-        "rules": 3,
-        "error_rate": error_rate,
-    }))
+}
+
+async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+    let path = req.path();
+    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
+        return Ok(());
+    }
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+    };
+    let claims = verify_jwt_token(token).await?;
+    req.extensions_mut().insert(VerifiedClaims(claims));
+    Ok(())
+}
+
+// ─── Handlers ───────────────────────────────────────────────────────────────
+
+async fn health(state: web::Data<AppState>) -> HttpResponse {
+    let watchlist = state.watchlist.lock().unwrap();
+    let mut lists: Vec<String> = watchlist.iter().map(|e| e.list_name.clone()).collect();
+    lists.sort_by_key(|l| sanctions_list_priority(l));
+    lists.dedup();
+    HttpResponse::Ok()
+        .insert_header(("content-security-policy", "default-src 'self'"))
+        .json(json!({
+            "status": "healthy",
+            "service": "sanctions-screening-rs",
+            "version": "1.0.0",
+            "description": "OFAC/EU/UN/CBN sanctions screening",
+            "watchlist_entries": watchlist.len(),
+            "lists_loaded": lists,
+        }))
 }
 
 async fn readyz() -> HttpResponse {
     HttpResponse::Ok().json(json!({"ready": true, "service": "sanctions-screening-rs"}))
 }
+
 async fn livez() -> HttpResponse {
     HttpResponse::Ok().json(json!({"alive": true}))
 }
-async fn prom_metrics() -> HttpResponse {
-    let r = _REQ_COUNT.load(AtomicOrdering::Relaxed);
-    let e = _ERR_COUNT.load(AtomicOrdering::Relaxed);
-    let body = format!(
-        "# TYPE requests_total counter\nrequests_total{{service=\"sanctions-screening-rs\"}} {}\n         # TYPE errors_total counter\nerrors_total{{service=\"sanctions-screening-rs\"}} {}\n", r, e);
+
+async fn metrics() -> HttpResponse {
+    let body = "# TYPE requests_total counter\nrequests_total{service=\"sanctions-screening-rs\"} 0\n";
     HttpResponse::Ok().content_type("text/plain").body(body)
 }
 
+async fn degradation_status(state: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    HttpResponse::Ok().json(json!({
+        "db_available": state.db_client.is_some(),
+        "mode": if state.db_client.is_some() { "normal" } else { "degraded" },
+    }))
+}
 
-// --- Database Connection ---
+/// POST /v1/sanctions/screen — screen a name against the REAL DB-backed
+/// watchlist. Fails closed (503 indeterminate) when no watchlist is loaded.
+async fn screen_name(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<ScreenRequest>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let name = match body.entity_name.as_deref().or(body.name.as_deref()) {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => return HttpResponse::UnprocessableEntity().json(json!({"error": "entity_name_required"})),
+    };
+    let threshold = body.threshold.unwrap_or(0.8);
+
+    let (matches, lists_screened) = {
+        let watchlist = state.watchlist.lock().unwrap();
+        if watchlist.is_empty() {
+            // FAIL CLOSED: without a real watchlist there is no safe-negative.
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "watchlist_unavailable",
+                "status": "indeterminate",
+                "detail": "no sanctions watchlist loaded from DATABASE_URL; screening cannot be performed",
+            }));
+        }
+        let mut matches: Vec<serde_json::Value> = Vec::new();
+        for entry in watchlist.iter() {
+            let score = fuzzy_match_score(&name, &entry.entity_name);
+            let alias_score = entry.aliases.iter().map(|a| fuzzy_match_score(&name, a)).fold(0.0_f64, f64::max);
+            let best = score.max(alias_score);
+            if is_hit(best, threshold) {
+                matches.push(json!({
+                    "list": entry.list_name,
+                    "entity_name": entry.entity_name,
+                    "entity_type": entry.entity_type,
+                    "match_score": (best * 100.0).round() / 100.0,
+                }));
+            }
+        }
+        matches.sort_by(|a, b| {
+            b["match_score"].as_f64().partial_cmp(&a["match_score"].as_f64()).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut lists: Vec<String> = watchlist.iter().map(|e| e.list_name.clone()).collect();
+        lists.sort();
+        lists.dedup();
+        (matches, lists)
+    };
+
+    let best_score = matches.first().and_then(|m| m["match_score"].as_f64()).unwrap_or(0.0);
+    let status = if matches.is_empty() { "clear" } else { "potential_match" };
+    db_persist(&state, "screen_name", &json!({"entity_name": name, "status": status})).await;
+    HttpResponse::Ok().json(json!({
+        "service": "sanctions-screening-rs",
+        "entity_name": name,
+        "status": status,
+        "match_score": best_score,
+        "matches": matches,
+        "lists_screened": lists_screened,
+    }))
+}
+
+// ─── compliance_records CRUD (in-memory; audit persisted when DB present) ───
+
+async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let records = state.records.lock().unwrap();
+    let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
+    let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
+    let total = records.len();
+    let items: Vec<&serde_json::Value> = records.iter().skip((page - 1) * limit).take(limit).collect();
+    HttpResponse::Ok().json(json!({
+        "items": items,
+        "total": total,
+        "page": page,
+        "source": if state.db_client.is_some() { "database" } else { "in-memory" },
+    }))
+}
+
+async fn create_record(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let mut rec = body.into_inner();
+    rec["id"] = json!(uuid::Uuid::new_v4().to_string());
+    rec["created_at"] = json!(chrono::Utc::now().to_rfc3339());
+    state.records.lock().unwrap().push(rec.clone());
+    db_persist(&state, "create_record", &rec).await;
+    HttpResponse::Created().json(rec)
+}
+
+async fn get_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let records = state.records.lock().unwrap();
+    match records.iter().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
+        Some(r) => HttpResponse::Ok().json(r),
+        None => HttpResponse::NotFound().json(json!({"error": "not found"})),
+    }
+}
+
+async fn update_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>, body: web::Json<serde_json::Value>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let mut records = state.records.lock().unwrap();
+    match records.iter_mut().find(|r| r.get("id").and_then(|v| v.as_str()) == Some(id.as_str())) {
+        Some(r) => {
+            if let Some(obj) = body.into_inner().as_object() {
+                for (k, v) in obj {
+                    if k != "id" { r[k.as_str()] = v.clone(); }
+                }
+            }
+            HttpResponse::Ok().json(r.clone())
+        }
+        None => HttpResponse::NotFound().json(json!({"error": "not found"})),
+    }
+}
+
+async fn delete_record(req: actix_web::HttpRequest, state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let mut records = state.records.lock().unwrap();
+    let before = records.len();
+    records.retain(|r| r.get("id").and_then(|v| v.as_str()) != Some(id.as_str()));
+    if records.len() == before {
+        return HttpResponse::NotFound().json(json!({"error": "not found"}));
+    }
+    HttpResponse::NoContent().finish()
+}
+
+// ─── Persistence ────────────────────────────────────────────────────────────
+
 use tokio_postgres::NoTls;
+
+/// Returns true when the deployment is production-like (fail closed: unknown => production).
+fn is_production_env() -> bool {
+    let env_name = std::env::var("APP_ENV")
+        .or_else(|_| std::env::var("ENVIRONMENT"))
+        .unwrap_or_else(|_| "production".to_string())
+        .to_ascii_lowercase();
+    !matches!(env_name.as_str(), "dev" | "development" | "test" | "testing" | "staging" | "local")
+}
+
+/// FAIL CLOSED (M-46): outbound DB connections carrying watchlist data must use
+/// TLS with certificate verification in production. Plaintext (NoTls) is only
+/// tolerated outside production with the explicit DB_ALLOW_INSECURE_NO_TLS=true
+/// opt-in. Note: sslmode=verify-full/verify-ca requires a TLS-capable Postgres
+/// connector; with NoTls the driver refuses such URLs, which is the intended
+/// fail-closed behavior until a TLS connector is provisioned.
+fn enforce_db_tls_policy(db_url: &str) {
+    let url_l = db_url.to_ascii_lowercase();
+    if url_l.contains("sslmode=verify-full") || url_l.contains("sslmode=verify-ca") {
+        return;
+    }
+    let allow_insecure = std::env::var("DB_ALLOW_INSECURE_NO_TLS")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if is_production_env() || !allow_insecure {
+        eprintln!(
+            "FATAL: DATABASE_URL must enable TLS with certificate verification \
+             (sslmode=verify-full or sslmode=verify-ca). Plaintext DB connections are only \
+             allowed outside production with DB_ALLOW_INSECURE_NO_TLS=true."
+        );
+        std::process::exit(1);
+    }
+    eprintln!("WARNING: connecting to Postgres without TLS — non-production opt-in only");
+}
 
 async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
     match tokio_postgres::connect(db_url, NoTls).await {
         Ok((client, connection)) => {
-            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); }});
+            tokio::spawn(async move { if let Err(e) = connection.await { eprintln!("DB connection error: {}", e); } });
             let _ = client.execute(
                 "CREATE TABLE IF NOT EXISTS service_records (
                     id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default',
                     status TEXT DEFAULT 'active', data JSONB DEFAULT '{}',
                     created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
                 )", &[]).await;
-            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
+            // Watchlist table (schema only — entries are loaded from the DB,
+            // never seeded/fabricated by this service).
+            let _ = client.execute(
+                "CREATE TABLE IF NOT EXISTS watchlist_entries (
+                    list_id TEXT NOT NULL, list_name TEXT NOT NULL,
+                    entity_name TEXT NOT NULL, entity_type TEXT DEFAULT 'individual',
+                    aliases TEXT DEFAULT '[]'
+                )", &[]).await;
             Some(client)
         }
-        Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
+        Err(e) => { eprintln!("DB connect failed: {} — watchlist unavailable (fail closed)", e); None }
     }
 }
 
-
-// --- JWT Auth Check ---
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
-    let path = req.path();
-    if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
-        return Ok(());
-    }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
+async fn load_watchlist(client: &tokio_postgres::Client) -> Vec<WatchlistEntry> {
+    let rows = match client.query(
+        "SELECT list_id, list_name, entity_name, entity_type, aliases FROM watchlist_entries", &[],
+    ).await {
+        Ok(r) => r,
+        Err(e) => { eprintln!("watchlist load failed: {}", e); return Vec::new(); }
+    };
+    rows.iter().map(|row| {
+        let aliases_raw: String = row.get::<_, String>(4);
+        WatchlistEntry {
+            list_id: row.get(0),
+            list_name: row.get(1),
+            entity_name: row.get(2),
+            entity_type: row.get(3),
+            aliases: serde_json::from_str(&aliases_raw).unwrap_or_default(),
         }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
-    }
+    }).collect()
 }
-
-
-// --- Security Headers Middleware ---
-#[allow(dead_code)]
-fn add_security_headers(resp: &mut actix_web::HttpResponse) {
-    let hdrs = resp.headers_mut();
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("x-content-type-options"),
-        actix_web::http::header::HeaderValue::from_static("nosniff"),
-    );
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("x-frame-options"),
-        actix_web::http::header::HeaderValue::from_static("DENY"),
-    );
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("x-xss-protection"),
-        actix_web::http::header::HeaderValue::from_static("1; mode=block"),
-    );
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("strict-transport-security"),
-        actix_web::http::header::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
-    );
-    hdrs.insert(
-        actix_web::http::header::HeaderName::from_static("referrer-policy"),
-        actix_web::http::header::HeaderValue::from_static("strict-origin-when-cross-origin"),
-    );
-}
-
-fn sanitize_input(s: &str) -> String {
-    let s = s.replace('<', "&lt;").replace('>', "&gt;")
-        .replace('\'', "&#39;").replace('"', "&quot;");
-    if s.len() > 10000 { s[..10000].to_string() } else { s }
-}
-
 
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
-        let id = format!("{}_{}_{}", "sanctions_screening_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let id = uuid::Uuid::new_v4().to_string();
         let svc_name = String::from("sanctions-screening-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
@@ -307,235 +487,43 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
     }
 }
 
-
-
-// --- Circuit Breaker + Retry for gRPC/HTTP calls ---
-use std::sync::atomic::{AtomicI32, AtomicI64};
-
-static CB_FAILURES: AtomicI32 = AtomicI32::new(0);
-static CB_LAST_FAILURE: AtomicI64 = AtomicI64::new(0);
-const CB_THRESHOLD: i32 = 5;
-const CB_RESET_SECS: i64 = 30;
-
-fn cb_allow() -> bool {
-    let failures = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
-    if failures >= CB_THRESHOLD {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64).unwrap_or(0);
-        let last = CB_LAST_FAILURE.load(std::sync::atomic::Ordering::Relaxed);
-        if now - last > CB_RESET_SECS {
-            CB_FAILURES.store(CB_THRESHOLD / 2, std::sync::atomic::Ordering::Relaxed);
-            return true;
-        }
-        return false;
-    }
-    true
-}
-
-fn cb_record_success() {
-    let f = CB_FAILURES.load(std::sync::atomic::Ordering::Relaxed);
-    if f > 0 { CB_FAILURES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed); }
-}
-
-fn cb_record_failure() {
-    CB_FAILURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64).unwrap_or(0);
-    CB_LAST_FAILURE.store(now, std::sync::atomic::Ordering::Relaxed);
-}
-
-fn call_service_with_retry(url: &str, body: &str, retries: u32) -> Result<String, String> {
-    if !cb_allow() {
-        return Err(format!("circuit breaker open for {}", url));
-    }
-    for attempt in 0..retries {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
-        }
-        match call_service_sync(url, body) {
-            Ok(resp) => { cb_record_success(); return Ok(resp); }
-            Err(e) => {
-                cb_record_failure();
-                eprintln!("[inter-service] {} attempt {} failed: {}", url, attempt + 1, e);
-            }
-        }
-    }
-    Err(format!("all {} retries exhausted for {}", retries, url))
-}
-
-fn call_service_sync(url: &str, body: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    let url_parsed = url.strip_prefix("http://").unwrap_or(url);
-    let (host_port, path) = url_parsed.split_once('/').unwrap_or((url_parsed, "/"));
-    let host_port = if !host_port.contains(':') { format!("{}:8080", host_port) } else { host_port.to_string() };
-    match std::net::TcpStream::connect_timeout(&host_port.parse().map_err(|e| format!("{}", e))?, std::time::Duration::from_secs(5)) {
-        Ok(mut stream) => {
-            let host = host_port.split(':').next().unwrap_or("localhost");
-            let req = format!("POST /{} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", path, host, body.len(), body);
-            stream.write_all(req.as_bytes()).map_err(|e| format!("{}", e))?;
-            let mut resp = String::new();
-            stream.read_to_string(&mut resp).map_err(|e| format!("{}", e))?;
-            Ok(resp)
-        }
-        Err(e) => Err(format!("connection failed: {}", e))
-    }
-}
-
-
-static _RL_TOKENS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(100);
-static _RL_LAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-
-fn rl_allow() -> bool {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
-    if now - _RL_LAST.load(std::sync::atomic::Ordering::Relaxed) >= 1000 {
-        _RL_TOKENS.store(100, std::sync::atomic::Ordering::Relaxed);
-        _RL_LAST.store(now, std::sync::atomic::Ordering::Relaxed);
-    }
-    if _RL_TOKENS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 0 {
-        _RL_TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        return false;
-    }
-    true
-}
-
-
-// Multi-tenant: extract tenant ID from request
-fn get_tenant_id(req: &actix_web::HttpRequest) -> String {
-    req.headers().get("X-Tenant-Id")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("platform")
-        .to_string()
-}
-
-
-// --- gRPC Server (binary protocol, length-prefixed) ---
-fn start_grpc_server(service_name: &'static str, port: u16) {
-    std::thread::spawn(move || {
-        let listener = match std::net::TcpListener::bind(format!("0.0.0.0:{}", port)) {
-            Ok(l) => l,
-            Err(e) => { eprintln!("[{}] gRPC bind :{} failed: {}", service_name, port, e); return; }
-        };
-        eprintln!("[{}] gRPC server on :{}", service_name, port);
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                std::thread::spawn(move || {
-                    use std::io::{Read, Write};
-                    let mut len_buf = [0u8; 4];
-                    if stream.read_exact(&mut len_buf).is_err() { return; }
-                    let msg_len = u32::from_be_bytes(len_buf) as usize;
-                    if msg_len > 4 * 1024 * 1024 { return; }
-                    let mut payload = vec![0u8; msg_len];
-                    if stream.read_exact(&mut payload).is_err() { return; }
-                    let resp = format!(r#"{{"status":"ok","service":"{}"}}"#, service_name);
-                    let resp_bytes = resp.as_bytes();
-                    let resp_len = (resp_bytes.len() as u32).to_be_bytes();
-                    let _ = stream.write_all(&resp_len);
-                    let _ = stream.write_all(resp_bytes);
-                });
-            }
-        }
-    });
-}
-
-fn grpc_call(target: &str, method: &str, payload: &str) -> Result<String, String> {
-    if !cb_allow() { return Err("circuit breaker open".to_string()); }
-    use std::io::{Read, Write};
-    for attempt in 0..3u32 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(200 * (1 << attempt)));
-        }
-        match std::net::TcpStream::connect_timeout(
-            &target.parse().map_err(|e| format!("{}", e))?,
-            std::time::Duration::from_secs(5),
-        ) {
-            Ok(mut stream) => {
-                let data = format!(r#"{{"method":"{}","payload":{}}}"#, method, payload);
-                let data_bytes = data.as_bytes();
-                let len_bytes = (data_bytes.len() as u32).to_be_bytes();
-                if stream.write_all(&len_bytes).is_err() { cb_record_failure(); continue; }
-                if stream.write_all(data_bytes).is_err() { cb_record_failure(); continue; }
-                let mut resp_len_buf = [0u8; 4];
-                if stream.read_exact(&mut resp_len_buf).is_err() { cb_record_failure(); continue; }
-                let resp_len = u32::from_be_bytes(resp_len_buf) as usize;
-                let mut resp_buf = vec![0u8; resp_len];
-                if stream.read_exact(&mut resp_buf).is_err() { cb_record_failure(); continue; }
-                cb_record_success();
-                return Ok(String::from_utf8_lossy(&resp_buf).to_string());
-            }
-            Err(e) => { cb_record_failure(); eprintln!("gRPC {} attempt {} failed: {}", target, attempt+1, e); }
-        }
-    }
-    Err(format!("gRPC retries exhausted for {}", target))
-}
-
-
-// --- mTLS Configuration ---
-fn mtls_config() -> (bool, String, String, String) {
-    let enabled = env::var("MTLS_ENABLED").unwrap_or_default() == "true";
-    let cert = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/service.crt".to_string());
-    let key = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/service.key".to_string());
-    let ca = env::var("TLS_CA_PATH").unwrap_or_else(|_| "/etc/54link-dev/certs/ca.crt".to_string());
-    (enabled, cert, key, ca)
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8125);
+    let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8125);
     let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
-        match init_db(&url).await {
-            Some(c) => { println!("sanctions-screening-rs: connected to Postgres"); Some(std::sync::Arc::new(c)) }
-            None => None,
-        }
+        enforce_db_tls_policy(&url);
+        init_db(&url).await.map(Arc::new)
     } else { None };
+    let watchlist = if let Some(ref c) = db_client {
+        let wl = load_watchlist(c).await;
+        println!("sanctions-screening-rs: loaded {} watchlist entries", wl.len());
+        wl
+    } else {
+        println!("sanctions-screening-rs: DATABASE_URL not set — screening will fail closed (503)");
+        Vec::new()
+    };
     let state = web::Data::new(AppState {
+        start_time: Instant::now(),
+        watchlist: Mutex::new(watchlist),
         records: Mutex::new(Vec::new()),
-        db_url: std::env::var("DATABASE_URL").ok(),
         db_client,
     });
-    println!("sanctions-screening-rs listening on port {}", port);
-    start_grpc_server("sanctions-screening-rs", 10343);
+    println!("sanctions-screening-rs on port {}", port);
     HttpServer::new(move || {
         App::new()
-                .wrap(
-                    actix_web::middleware::DefaultHeaders::new()
-                        .add(("X-Content-Type-Options", "nosniff"))
-                        .add(("X-Frame-Options", "DENY"))
-                        .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
-                        .add(("Content-Security-Policy", "default-src 'self'"))
-                        .add(("X-XSS-Protection", "1; mode=block"))
-                        .add(("Referrer-Policy", "strict-origin-when-cross-origin"))
-                )
-            .wrap_fn(|req, srv| {
-                _REQ_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-                let trace_id = req.headers().get("X-Trace-Id")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("none")
-                    .to_string();
-                eprintln!("[sanctions-screening-rs] {} {} trace={}", req.method(), req.path(), trace_id);
-                let fut = srv.call(req);
-                async move {
-                    let res = fut.await?;
-                    if res.status().is_server_error() || res.status().is_client_error() {
-                        _ERR_COUNT.fetch_add(1, AtomicOrdering::Relaxed);
-                    }
-                    Ok(res)
-                }
-            })
-            .app_data(state.clone())
             .wrap(actix_web::middleware::DefaultHeaders::new()
                 .add(("X-Content-Type-Options", "nosniff"))
                 .add(("X-Frame-Options", "DENY"))
-                .add(("X-XSS-Protection", "1; mode=block"))
                 .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
                 .add(("Content-Security-Policy", "default-src 'self'"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .app_data(state.clone())
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
-            .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
+            .route("/livez", web::get().to(livez))
             .route("/metrics", web::get().to(metrics))
+            .route("/v1/sanctions/screen", web::post().to(screen_name))
             .route("/api/v1/compliance_records", web::get().to(list_records))
             .route("/api/v1/compliance_records", web::post().to(create_record))
             .route("/api/v1/compliance_records/{id}", web::get().to(get_record))
@@ -546,91 +534,4 @@ async fn main() -> std::io::Result<()> {
     .shutdown_timeout(30)
     .run()
     .await
-}
-
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS compliance_records (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    record_type VARCHAR(32) NOT NULL,
-    entity_type VARCHAR(20) NOT NULL,
-    entity_id UUID NOT NULL,
-    regulation VARCHAR(64) NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    risk_rating VARCHAR(20) DEFAULT 'medium',
-    findings JSONB DEFAULT '[]',
-    remediation_actions JSONB DEFAULT '[]',
-    due_date DATE,
-    completed_at TIMESTAMPTZ,
-    reviewer_id UUID,
-    tenant_id UUID NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create compliance_records table");
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_is_hit() { let r = is_hit(100.0); assert!(r == true || r == false); }
-    #[test]
-    fn test_circuit_breaker_opens() {
-        for _ in 0..5 { cb_record_failure(); }
-        assert!(!cb_allow());
-    }
-
-    #[test]
-    fn test_degradation_mode() {
-        DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(degradation_mode(), "normal");
-        DB_AVAILABLE.store(false, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(degradation_mode(), "degraded");
-        DB_AVAILABLE.store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
-}
-
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE compliance_records SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("compliance_records.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE compliance_records SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("compliance_records.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
 }

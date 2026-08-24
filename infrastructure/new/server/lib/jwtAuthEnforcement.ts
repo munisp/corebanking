@@ -4,6 +4,8 @@
  * refresh token rotation, and session management.
  */
 import type { Express, Request, Response, NextFunction } from "express";
+import { decodeJWT, isTokenExpired, getJwksKeys, verifyTokenSignature } from "./jwtAuthMiddleware";
+import { logger } from "./logger";
 
 interface JWTConfig {
   issuer: string;
@@ -40,10 +42,34 @@ interface RouteProtection {
 }
 
 const JWT_CONFIG: JWTConfig = {
-  issuer: process.env.KEYCLOAK_ISSUER ?? "https://identity.54bank.app/realms/54bank",
+  // N-10-followup: fail-closed — the expected token issuer must be supplied
+  // via the KEYCLOAK_ISSUER env var. No hardcoded identity-host default:
+  // module load throws when unset so tokens can never be validated against
+  // an attacker-influenced or stale default issuer.
+  issuer: (() => {
+    const issuer = process.env.KEYCLOAK_ISSUER;
+    if (!issuer) {
+      throw new Error(
+        "[AUTH] KEYCLOAK_ISSUER is not set — refusing to initialize JWT enforcement without an explicit token issuer (fail-closed)"
+      );
+    }
+    return issuer;
+  })(),
   audience: process.env.KEYCLOAK_AUDIENCE ?? "54bank-platform",
   realm: "54bank",
-  publicKeyUrl: process.env.KEYCLOAK_JWKS_URL ?? "https://identity.54bank.app/realms/54bank/protocol/openid-connect/certs",
+  // N-10: the JWKS endpoint must be supplied via the KEYCLOAK_JWKS_URL env var.
+  // Fail-closed: no hardcoded host/insecure default — module load throws when
+  // the variable is unset so tokens can never be verified against an
+  // attacker-influenced or stale default endpoint.
+  publicKeyUrl: (() => {
+    const jwksUrl = process.env.KEYCLOAK_JWKS_URL;
+    if (!jwksUrl) {
+      throw new Error(
+        "[AUTH] KEYCLOAK_JWKS_URL is not set — refusing to initialize JWT enforcement without an explicit JWKS endpoint (fail-closed)"
+      );
+    }
+    return jwksUrl;
+  })(),
   tokenExpiry: 900,
   refreshExpiry: 86400,
   algorithms: ["RS256"],
@@ -127,11 +153,52 @@ export function registerJWTAuthEnforcement(app: Express) {
     res.json({ items: KEYCLOAK_ROLES, total: KEYCLOAK_ROLES.length, totalUsers: KEYCLOAK_ROLES.reduce((s, r) => s + r.users, 0) });
   });
 
-  // Token validation endpoint
+  // Token validation endpoint — REAL validation: cryptographically verifies the
+  // presented bearer token against the same Keycloak realm JWKS (RS256) path used
+  // by the auth middleware (lib/jwtAuthMiddleware.ts). Returns 401 + {valid:false}
+  // for missing/malformed/invalid/expired tokens; fails closed when the JWKS is
+  // unavailable. Never returns {valid:true} unconditionally.
   app.post("/api/auth/v1/validate", (req: Request, res: Response) => {
-    const token = req.headers.authorization?.replace("Bearer ", "");
-    if (!token) return res.status(401).json({ error: "No token provided" });
-    res.json({ valid: true, issuer: JWT_CONFIG.issuer, expiresIn: JWT_CONFIG.tokenExpiry, roles: ["operator"], tenantId: req.headers["x-tenant-id"] ?? "TEN-PLATFORM-ADMIN" });
+    void (async () => {
+      const authHeader = req.headers.authorization;
+      const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
+      if (!token) {
+        return res.status(401).json({ valid: false, error: "No token provided", code: "AUTH_MISSING_TOKEN" });
+      }
+
+      const payload = decodeJWT(token);
+      if (!payload) {
+        return res.status(401).json({ valid: false, error: "Invalid token", code: "AUTH_INVALID_TOKEN" });
+      }
+
+      try {
+        const keys = await getJwksKeys();
+        if (!verifyTokenSignature(token, keys)) {
+          return res.status(401).json({ valid: false, error: "Invalid token signature", code: "AUTH_INVALID_SIGNATURE" });
+        }
+      } catch (err) {
+        // Fail closed: cannot verify — do not claim validity.
+        logger.error("[AUTH-VALIDATE] JWKS unavailable — failing closed", { error: String(err) });
+        return res.status(401).json({ valid: false, error: "Token verification unavailable", code: "AUTH_VERIFICATION_UNAVAILABLE" });
+      }
+
+      if (isTokenExpired(payload)) {
+        return res.status(401).json({ valid: false, error: "Token expired", code: "AUTH_TOKEN_EXPIRED" });
+      }
+
+      res.json({
+        valid: true,
+        issuer: payload.iss ?? JWT_CONFIG.issuer,
+        expiresAt: payload.exp,
+        roles: payload.realm_access?.roles ?? [],
+        tenantId: payload.tenant_id ?? "default",
+      });
+    })().catch((err) => {
+      logger.error("[AUTH-VALIDATE] Unexpected error — failing closed", { error: String(err) });
+      if (!res.headersSent) {
+        res.status(401).json({ valid: false, error: "Token validation failed", code: "AUTH_VERIFICATION_ERROR" });
+      }
+    });
   });
 
   // Stats

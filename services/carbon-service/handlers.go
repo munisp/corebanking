@@ -98,11 +98,11 @@ func createProject(c *gin.Context) {
 		TenantID:  tenantID,
 		Timestamp: time.Now(),
 		Metadata: map[string]interface{}{
-			"project_name": req.ProjectName,
-			"project_type": req.ProjectType,
-			"location": req.Location,
-			"registry": req.Registry,
-			"registry_id": req.RegistryID,
+			"project_name":  req.ProjectName,
+			"project_type":  req.ProjectType,
+			"location":      req.Location,
+			"registry":      req.Registry,
+			"registry_id":   req.RegistryID,
 			"total_credits": req.TotalCredits,
 		},
 	}
@@ -712,7 +712,7 @@ func settleTrade(c *gin.Context) {
 	tenantID := c.GetHeader("X-Tenant-ID")
 
 	var req struct {
-		Pin     string  `json:"pin" binding:"required"`
+		Pin string `json:"pin" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -757,7 +757,7 @@ func settleTrade(c *gin.Context) {
 		Note:   "CARBON_CREDITS_PAYMENT/" + AmountString,
 		Pin:    req.Pin,
 	})
-	
+
 	if err != nil {
 		c.JSON(400, gin.H{"error": "Payment failed."})
 		return
@@ -781,9 +781,9 @@ func settleTrade(c *gin.Context) {
 	}
 
 	c.JSON(200, gin.H{
-		"trade_id":        tradeID,
-		"status":          "settled",
-		"settlement_date": settlementDate,
+		"trade_id":         tradeID,
+		"status":           "settled",
+		"settlement_date":  settlementDate,
 		"payment_response": res,
 	})
 }

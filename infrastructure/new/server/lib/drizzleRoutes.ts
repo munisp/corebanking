@@ -775,8 +775,17 @@ export function registerDrizzleRoutes(app: any) {
     // LIST with pagination
     app.get(config.basePath, async (req: any, res: any) => {
       try {
-        const page = parseInt(req.query.page as string) || 1;
-        const limit = Math.min(parseInt(req.query.limit as string) || 25, 100);
+        // L-08: bounded, NaN-safe pagination. Reject non-integer input with 400;
+        // clamp page >= 1 and limit to 1..100.
+        const rawPage = req.query.page as string | undefined;
+        const rawLimit = req.query.limit as string | undefined;
+        const pageNum = rawPage === undefined ? 1 : Number(rawPage);
+        const limitNum = rawLimit === undefined ? 25 : Number(rawLimit);
+        if (!Number.isInteger(pageNum) || pageNum < 1 || !Number.isInteger(limitNum) || limitNum < 1) {
+          return res.status(400).json({ error: "Invalid pagination: 'page' and 'limit' must be positive integers" });
+        }
+        const page = pageNum;
+        const limit = Math.min(limitNum, 100);
         const result = await repo.findAll({ page, limit });
         res.json({
           ...result,

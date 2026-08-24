@@ -334,6 +334,9 @@ async function runKybOcrJob(
     };
     updateOcrJob(sessionId, jobId, { status: "completed", result: ocrResult });
   } catch (err: any) {
-    updateOcrJob(sessionId, jobId, { status: "failed", error: err.message });
+    // M-54: provider/upstream error details stay in server logs; the client only
+    // ever sees a generic failure message.
+    logger.error(`[kybOcrJob:${jobId}] document processing failed`, { error: String(err?.message ?? err) });
+    updateOcrJob(sessionId, jobId, { status: "failed", error: "Document processing failed" });
   }
 }

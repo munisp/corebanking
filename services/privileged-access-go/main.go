@@ -15,6 +15,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/IBM/sarama"
 	"log"
 	"net"
 	"net/http"
@@ -27,12 +28,11 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/lib/pq"
 	"crypto/rsa"
 	"encoding/base64"
+	_ "github.com/lib/pq"
 	"math/big"
 )
-
 
 func secureRandHex(n int) string {
 	b := make([]byte, n)
@@ -95,13 +95,13 @@ type Action struct {
 }
 
 type AccessPolicy struct {
-	Resource         string   `json:"resource"`
-	MaxDuration      int      `json:"max_duration_minutes"`
-	RequiredApprovers int     `json:"required_approvers"`
-	AllowedRoles     []string `json:"allowed_roles"`
-	RequiresMFA      bool     `json:"requires_mfa"`
-	RequiresTicket   bool     `json:"requires_ticket"`
-	BlockedHours     []int    `json:"blocked_hours"`
+	Resource          string   `json:"resource"`
+	MaxDuration       int      `json:"max_duration_minutes"`
+	RequiredApprovers int      `json:"required_approvers"`
+	AllowedRoles      []string `json:"allowed_roles"`
+	RequiresMFA       bool     `json:"requires_mfa"`
+	RequiresTicket    bool     `json:"requires_ticket"`
+	BlockedHours      []int    `json:"blocked_hours"`
 }
 
 var (
@@ -639,9 +639,9 @@ func handleRevokeSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body struct {
-		Token    string `json:"session_token"`
+		Token     string `json:"session_token"`
 		RevokerID string `json:"revoker_id"`
-		Reason   string `json:"reason"`
+		Reason    string `json:"reason"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -759,10 +759,10 @@ func recordActivity() {
 // ─── EventBus ───────────────────────────────────────────────────────────────
 
 type EventBusImpl struct {
-	topic    string
-	source   string
-	mu       sync.Mutex
-	events   []map[string]interface{}
+	topic  string
+	source string
+	mu     sync.Mutex
+	events []map[string]interface{}
 }
 
 func newEventBus(topic, source string) *EventBusImpl {
@@ -806,7 +806,6 @@ func hashString(s string) string {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
 type jwksCache struct {
@@ -840,9 +839,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -850,12 +853,55 @@ func fetchJWKS(realmURL string) {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
+// expectedIssuer returns the expected JWT issuer: KEYCLOAK_ISSUER when set,
+// otherwise KEYCLOAK_REALM_URL. Empty means issuer validation is skipped
+// (a startup warning is logged by warnIfAuthUnconfigured).
+func expectedIssuer() string {
+	if iss := os.Getenv("KEYCLOAK_ISSUER"); iss != "" {
+		return iss
+	}
+	return os.Getenv("KEYCLOAK_REALM_URL")
+}
+
+// audienceMatches checks the expected audience against the JWT aud claim,
+// which may be a string or an array of strings.
+func audienceMatches(aud interface{}, expected string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == expected
+	case []interface{}:
+		for _, a := range v {
+			if a == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func init() {
+	warnIfAuthUnconfigured()
+}
+
+func warnIfAuthUnconfigured() {
+	if os.Getenv("KEYCLOAK_ISSUER") == "" && os.Getenv("KEYCLOAK_REALM_URL") == "" {
+		log.Printf("WARNING: KEYCLOAK_ISSUER/KEYCLOAK_REALM_URL unset - JWT iss claim will NOT be validated")
+	}
+	if os.Getenv("EXPECTED_AUDIENCE") == "" {
+		log.Printf("WARNING: EXPECTED_AUDIENCE unset - JWT aud claim will NOT be validated")
+	}
+}
+
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	// Initial JWKS fetch
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -880,7 +926,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -914,14 +962,63 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		var claims map[string]interface{}
 		json.Unmarshal(claimsBytes, &claims)
 		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
+		}
+		// Validate issuer/audience when configured (M-55)
+		if iss := expectedIssuer(); iss != "" {
+			if claims["iss"] != iss {
+				http.Error(w, `{"error":"invalid issuer"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		if aud := os.Getenv("EXPECTED_AUDIENCE"); aud != "" {
+			if !audienceMatches(claims["aud"], aud) {
+				http.Error(w, `{"error":"invalid audience"}`, http.StatusUnauthorized)
+				return
+			}
 		}
 		// Pass claims in context
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// enforceTenantClaim cross-checks a client-supplied tenant identifier against
+// the verified JWT claims (C-15). When the token carries a tenant (or
+// tenant_id) claim and it does not match the requested tenant, the request is
+// rejected with 403 and false is returned. Fail-closed (wave-7.5): an empty
+// requested tenant, missing verified claims, or a token without a tenant claim
+// is rejected instead of being allowed.
+func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
+	if requestedTenant == "" {
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return false
+	}
+	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
+	if claims == nil {
+		http.Error(w, `{"error":"unauthorized: no verified token claims"}`, http.StatusUnauthorized)
+		return false
+	}
+	claimTenant, _ := claims["tenant"].(string)
+	if claimTenant == "" {
+		claimTenant, _ = claims["tenant_id"].(string)
+	}
+	if claimTenant == "" {
+		http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+		return false
+	}
+	if claimTenant != requestedTenant {
+		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 // ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
@@ -942,28 +1039,75 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	if len(ids) == 0 {
+		return
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
 
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
 
 func main() {
 	port := os.Getenv("PORT")
@@ -1001,14 +1145,14 @@ func main() {
 	mux.HandleFunc("/livez", livezHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
 
-	mux.HandleFunc("/api/v1/pam/request", handleRequestAccess)
-	mux.HandleFunc("/api/v1/pam/approve", handleApproveRequest)
-	mux.HandleFunc("/api/v1/pam/validate", handleValidateSession)
-	mux.HandleFunc("/api/v1/pam/revoke", handleRevokeSession)
-	mux.HandleFunc("/api/v1/pam/requests", handleListRequests)
-	mux.HandleFunc("/api/v1/pam/sessions", handleActiveSessions)
-	mux.HandleFunc("/api/v1/pam/policies", handleListPolicies)
-	mux.HandleFunc("/api/v1/pam/stats", handleStats)
+	mux.Handle("/api/v1/pam/request", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleRequestAccess)))
+	mux.Handle("/api/v1/pam/approve", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleApproveRequest)))
+	mux.Handle("/api/v1/pam/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleValidateSession)))
+	mux.Handle("/api/v1/pam/revoke", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleRevokeSession)))
+	mux.Handle("/api/v1/pam/requests", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleListRequests)))
+	mux.Handle("/api/v1/pam/sessions", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleActiveSessions)))
+	mux.Handle("/api/v1/pam/policies", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleListPolicies)))
+	mux.Handle("/api/v1/pam/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 
 	handler := panicRecoveryMiddleware(rateLimitMiddleware(loggingMiddleware(mux)))
 
@@ -1060,4 +1204,13 @@ func panicRecoveryMiddleware(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(w, r)
 	})
+}
+
+// jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
+// scripts/fix-go-wire-jwt.py).
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
 }

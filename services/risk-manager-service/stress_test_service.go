@@ -1,11 +1,25 @@
 package main
 
+// StressTestService — regulatory capital stress testing.
+//
+// Data integrity doctrine:
+//   - Baseline capital, risk-weighted exposure and baseline CAR are computed
+//     from REAL portfolio data in Postgres (equity GL balances + loan book).
+//   - Shock impacts are a documented parametric model applied to the REAL
+//     exposure base — never a hardcoded ₦200bn/18.5% baseline.
+//   - When portfolio data is missing/insufficient the run is recorded as
+//     status="failed" with error="insufficient_data". No pre-baked "passed".
+
 import (
+	"database/sql"
 	"errors"
+	"fmt"
+	"os"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 )
 
 // StressTestService handles stress testing operations
@@ -13,119 +27,61 @@ type StressTestService struct {
 	tenantID string
 	tests    map[string]*StressTest
 	mu       sync.RWMutex
+	db       *sql.DB
 }
 
-// NewStressTestService creates a new stress test service
+// NewStressTestService creates a new stress test service. No historical
+// "passed" runs are seeded; the store starts empty.
 func NewStressTestService(tenantID string) *StressTestService {
 	svc := &StressTestService{
 		tenantID: tenantID,
 		tests:    make(map[string]*StressTest),
 	}
-	svc.initializeDefaultData(tenantID)
+	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
+		if db, err := sql.Open("postgres", dsn); err == nil && db.Ping() == nil {
+			svc.db = db
+		} else {
+			fmt.Printf("[stress-test] DATABASE_URL set but unreachable; runs will fail with insufficient_data\n")
+		}
+	}
 	return svc
 }
 
-func (s *StressTestService) initializeDefaultData(tenantID string) {
-	// Interest rate shock scenario
-	s.tests["st-001"] = &StressTest{
-		TestID:          "st-001",
-		TenantID:        tenantID,
-		TestName:        "Interest Rate Shock +300bp",
-		TestType:        "sensitivity",
-		Scenario:        "interest_rate_shock",
-		Parameters: map[string]float64{
-			"interestRateShock": 300,
-			"horizon":           1,
-		},
-		BaselineCapital: 200000000000,
-		StressedCapital: 185000000000,
-		CapitalImpact:   -15000000000,
-		CapitalRatio:    18.5,
-		StressedRatio:   17.1,
-		Status:          "passed",
-		RunDate:         time.Now().AddDate(0, 0, -7),
-		RunBy:           "risk-officer-001",
-		Metadata:        make(map[string]interface{}),
-		CreatedAt:       time.Now().AddDate(0, -1, 0),
-		UpdatedAt:       time.Now().AddDate(0, 0, -7),
+// portfolioBaseline loads the real capital and exposure base.
+// Returns capital (kobo), loan book (kobo), fx exposure (kobo), error.
+func (s *StressTestService) portfolioBaseline(tenantID string) (int64, int64, int64, error) {
+	if s.db == nil {
+		return 0, 0, 0, errors.New("no database connection")
 	}
-
-	// Economic recession scenario
-	s.tests["st-002"] = &StressTest{
-		TestID:          "st-002",
-		TenantID:        tenantID,
-		TestName:        "Economic Recession Scenario",
-		TestType:        "scenario",
-		Scenario:        "economic_recession",
-		Parameters: map[string]float64{
-			"gdpDecline":        -5.0,
-			"unemploymentRise":  8.0,
-			"nplIncrease":       3.0,
-			"interestRateShock": 200,
-		},
-		BaselineCapital: 200000000000,
-		StressedCapital: 165000000000,
-		CapitalImpact:   -35000000000,
-		CapitalRatio:    18.5,
-		StressedRatio:   15.3,
-		Status:          "passed",
-		RunDate:         time.Now().AddDate(0, 0, -14),
-		RunBy:           "risk-officer-001",
-		Metadata:        make(map[string]interface{}),
-		CreatedAt:       time.Now().AddDate(0, -1, 0),
-		UpdatedAt:       time.Now().AddDate(0, 0, -14),
+	// Capital: equity-category GL balances.
+	var capital int64
+	err := s.db.QueryRow(
+		`SELECT COALESCE(SUM("balance_kobo"),0) FROM "glAccounts" WHERE "tenantId" = $1 AND "category" = 'equity'`,
+		tenantID).Scan(&capital)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("capital query failed: %w", err)
 	}
-
-	// FX depreciation scenario
-	s.tests["st-003"] = &StressTest{
-		TestID:          "st-003",
-		TenantID:        tenantID,
-		TestName:        "Naira Depreciation 30%",
-		TestType:        "sensitivity",
-		Scenario:        "fx_depreciation",
-		Parameters: map[string]float64{
-			"ngnDepreciation": 30.0,
-			"horizon":         1,
-		},
-		BaselineCapital: 200000000000,
-		StressedCapital: 190000000000,
-		CapitalImpact:   -10000000000,
-		CapitalRatio:    18.5,
-		StressedRatio:   17.6,
-		Status:          "passed",
-		RunDate:         time.Now().AddDate(0, 0, -7),
-		RunBy:           "risk-officer-002",
-		Metadata:        make(map[string]interface{}),
-		CreatedAt:       time.Now().AddDate(0, -1, 0),
-		UpdatedAt:       time.Now().AddDate(0, 0, -7),
+	// Loan book: outstanding balances of active loans.
+	var loanBook int64
+	err = s.db.QueryRow(
+		`SELECT COALESCE(SUM(outstanding_balance_kobo),0) FROM loans WHERE tenant_id = $1 AND status IN ('active','disbursed')`,
+		tenantID).Scan(&loanBook)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("loan book query failed: %w", err)
 	}
-
-	// Severe stress scenario - warning
-	s.tests["st-004"] = &StressTest{
-		TestID:          "st-004",
-		TenantID:        tenantID,
-		TestName:        "Severe Combined Stress",
-		TestType:        "scenario",
-		Scenario:        "severe_combined",
-		Parameters: map[string]float64{
-			"gdpDecline":        -10.0,
-			"unemploymentRise":  15.0,
-			"nplIncrease":       5.0,
-			"interestRateShock": 400,
-			"ngnDepreciation":   50.0,
-		},
-		BaselineCapital: 200000000000,
-		StressedCapital: 140000000000,
-		CapitalImpact:   -60000000000,
-		CapitalRatio:    18.5,
-		StressedRatio:   13.0,
-		Status:          "warning",
-		RunDate:         time.Now().AddDate(0, 0, -14),
-		RunBy:           "risk-officer-001",
-		Metadata:        make(map[string]interface{}),
-		CreatedAt:       time.Now().AddDate(0, -1, 0),
-		UpdatedAt:       time.Now().AddDate(0, 0, -14),
+	// FX exposure: absolute net executed FX positions per currency (NGN value).
+	var fxExposure int64
+	err = s.db.QueryRow(
+		`SELECT COALESCE(SUM(ABS(buy_amount)),0) FROM fx_deals WHERE tenant_id = $1 AND status IN ('executed','settled') AND buy_currency <> 'NGN'`,
+		tenantID).Scan(&fxExposure)
+	if err != nil {
+		// FX data optional: zero exposure, not an error.
+		fxExposure = 0
 	}
+	if capital <= 0 && loanBook <= 0 {
+		return 0, 0, 0, errors.New("no capital or loan data on record for tenant")
+	}
+	return capital, loanBook, fxExposure, nil
 }
 
 // ListTests returns stress tests based on filters
@@ -146,7 +102,7 @@ func (s *StressTestService) ListTests(tenantID, testType string) []*StressTest {
 	return result
 }
 
-// GetTest retrieves a test by ID
+// GetTest retrieves a stress test by ID
 func (s *StressTestService) GetTest(tenantID, testID string) (*StressTest, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -181,7 +137,15 @@ func (s *StressTestService) CreateTest(tenantID, userID string, req *CreateStres
 	return test, nil
 }
 
-// RunTest runs a stress test
+// RunTest runs a stress test against the REAL portfolio baseline.
+// Parametric impact model (explicit, documented assumptions):
+//
+//	interestRateShock (bp): 0.025% of the loan book per bp (≈2.5y duration)
+//	ngnDepreciation (%):    30% pass-through on the real FX exposure per %
+//	nplIncrease (%):        50% LGD on the shocked share of the loan book
+//	gdpDecline (%):         20% of the loan book per % of GDP decline
+//
+// Status thresholds (CBN): >=15% passed, >=10% warning, else failed.
 func (s *StressTestService) RunTest(tenantID, testID, userID string) (*StressTest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -191,41 +155,61 @@ func (s *StressTestService) RunTest(tenantID, testID, userID string) (*StressTes
 		return nil, errors.New("test not found")
 	}
 
-	// Simulate stress test calculation
-	test.BaselineCapital = 200000000000
-	test.CapitalRatio = 18.5
+	test.RunDate = time.Now()
+	test.RunBy = userID
+	test.UpdatedAt = time.Now()
 
-	// Calculate impact based on parameters
+	capital, loanBook, fxExposure, err := s.portfolioBaseline(tenantID)
+	if err != nil {
+		// Fail closed: never run a regulatory stress test on invented data.
+		test.Status = "failed"
+		test.Metadata["error"] = "insufficient_data"
+		test.Metadata["errorDetail"] = err.Error()
+		return test, nil
+	}
+
+	// RWA approximation: 100% weight on loan book, 50% on FX exposure.
+	rwa := float64(loanBook) + 0.5*float64(fxExposure)
+	if rwa <= 0 {
+		test.Status = "failed"
+		test.Metadata["error"] = "insufficient_data"
+		test.Metadata["errorDetail"] = "zero risk-weighted exposure on record"
+		return test, nil
+	}
+
+	test.BaselineCapital = capital
+	test.CapitalRatio = float64(capital) / rwa * 100
+
 	var totalImpact float64
 	if shock, ok := test.Parameters["interestRateShock"]; ok {
-		totalImpact += shock * 50000000 // 50M per bp
+		totalImpact += shock * 0.00025 * float64(loanBook) // per bp
 	}
 	if depreciation, ok := test.Parameters["ngnDepreciation"]; ok {
-		totalImpact += depreciation * 333333333 // ~333M per 1%
+		totalImpact += (depreciation / 100) * 0.30 * float64(fxExposure)
 	}
 	if nplIncrease, ok := test.Parameters["nplIncrease"]; ok {
-		totalImpact += nplIncrease * 5000000000 // 5B per 1%
+		totalImpact += (nplIncrease / 100) * 0.50 * float64(loanBook) // LGD 50%
 	}
 	if gdpDecline, ok := test.Parameters["gdpDecline"]; ok {
-		totalImpact += -gdpDecline * 2000000000 // 2B per 1%
+		totalImpact += (gdpDecline / 100) * 0.20 * float64(loanBook)
 	}
 
 	test.CapitalImpact = -int64(totalImpact)
 	test.StressedCapital = test.BaselineCapital + test.CapitalImpact
-	test.StressedRatio = float64(test.StressedCapital) / float64(test.BaselineCapital) * test.CapitalRatio
+	test.StressedRatio = float64(test.StressedCapital) / rwa * 100
 
-	// Determine status
-	if test.StressedRatio >= 15.0 {
+	switch {
+	case test.StressedRatio >= 15.0:
 		test.Status = "passed"
-	} else if test.StressedRatio >= 10.0 {
+	case test.StressedRatio >= 10.0:
 		test.Status = "warning"
-	} else {
+	default:
 		test.Status = "failed"
 	}
-
-	test.RunDate = time.Now()
-	test.RunBy = userID
-	test.UpdatedAt = time.Now()
+	test.Metadata["model"] = "parametric_v1"
+	test.Metadata["loanBook_kobo"] = loanBook
+	test.Metadata["fxExposure_kobo"] = fxExposure
+	test.Metadata["rwa_kobo"] = int64(rwa)
 
 	return test, nil
 }
@@ -301,14 +285,14 @@ func (s *StressTestService) GetResults(tenantID string) map[string]interface{} {
 		}
 
 		results = append(results, map[string]interface{}{
-			"testID":          test.TestID,
-			"testName":        test.TestName,
-			"scenario":        test.Scenario,
-			"baselineRatio":   test.CapitalRatio,
-			"stressedRatio":   test.StressedRatio,
-			"capitalImpact":   test.CapitalImpact,
-			"status":          test.Status,
-			"runDate":         test.RunDate.Format("2006-01-02"),
+			"testID":        test.TestID,
+			"testName":      test.TestName,
+			"scenario":      test.Scenario,
+			"baselineRatio": test.CapitalRatio,
+			"stressedRatio": test.StressedRatio,
+			"capitalImpact": test.CapitalImpact,
+			"status":        test.Status,
+			"runDate":       test.RunDate.Format("2006-01-02"),
 		})
 	}
 

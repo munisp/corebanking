@@ -4,6 +4,7 @@
  */
 
 import net from "net";
+import { randomUUID } from "crypto";
 import { logger } from "./logger";
 import { appCache } from "./cache";
 
@@ -46,7 +47,7 @@ function sendCommand(cmd: string): Promise<string> {
       reject(new Error("Redis not connected"));
       return;
     }
-    const id = `${Date.now()}-${Math.random()}`;
+    const id = `${Date.now()}-${randomUUID()}`;
     pendingCallbacks.set(id, resolve);
     redisSocket.write(cmd + "\r\n");
     setTimeout(() => {

@@ -92,10 +92,10 @@ func (p *CQRSProjection) MarshalJSON() ([]byte, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return json.Marshal(map[string]interface{}{
-		"name":        p.name,
+		"name":         p.name,
 		"entity_count": len(p.state),
-		"version":     p.version,
-		"last_update": p.lastUpdate.Format(time.RFC3339),
+		"version":      p.version,
+		"last_update":  p.lastUpdate.Format(time.RFC3339),
 	})
 }
 
@@ -106,12 +106,12 @@ type SagaOrchestratorV2 struct {
 }
 
 type SagaInstanceV2 struct {
-	ID        string            `json:"id"`
-	Type      string            `json:"type"`
-	Status    string            `json:"status"`
-	Steps     []SagaStepV2      `json:"steps"`
-	CreatedAt string            `json:"created_at"`
-	UpdatedAt string            `json:"updated_at"`
+	ID        string       `json:"id"`
+	Type      string       `json:"type"`
+	Status    string       `json:"status"`
+	Steps     []SagaStepV2 `json:"steps"`
+	CreatedAt string       `json:"created_at"`
+	UpdatedAt string       `json:"updated_at"`
 }
 
 type SagaStepV2 struct {

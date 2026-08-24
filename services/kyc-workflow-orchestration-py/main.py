@@ -5,23 +5,40 @@ Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorizati
 
 import os
 import json
-import uuid
 import logging
-from datetime import datetime, timezone
-from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from http.server import ThreadingHTTPServer
+import time
+import threading
+import signal
+import socket as _socket
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("kyc-workflow-orchestration-py")
+SERVICE_NAME = "kyc-workflow-orchestration-py"
 
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/kyc_workflow_orchestration_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -105,20 +122,94 @@ def release_db(conn):
             pass
 
 def init_schema():
-    conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+    """Create the tables this service actually uses. Never crash startup."""
     try:
         conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1")
-        return {"status": "ready"}
     except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
+        logger.error(f"init_schema: database unavailable: {e}")
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("""CREATE TABLE IF NOT EXISTS kyc_records (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            aggregate_id VARCHAR(128) NOT NULL,
+            payload JSONB NOT NULL,
+            published BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        conn.commit()
+        logger.info("Schema initialized")
+    except Exception as e:
+        logger.error(f"init_schema failed: {e}")
+
+
+app = FastAPI(title="kyc-workflow-orchestration-py", version="1.0.0")
+
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+app.add_middleware(CORSMiddleware, allow_origins=[o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:3000"], allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/livez")
@@ -153,8 +244,7 @@ _rl_last_refill = [0.0]
 
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -387,21 +477,79 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
+
+# --- JWT Auth ---
+def validate_jwt(headers):
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    Canonical implementation: services/shared/auth/jwt_validation.py.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = auth[7:]
+    import hmac, hashlib, base64, json as _json, time as _t
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if _t.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
 
-    def respond(self, code, data):
+    def _json(self, code, data):
         if code >= 400:
             inc_errors()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
         add_security_headers(self)
         self.end_headers()
         self.wfile.write(json.dumps(data, default=str).encode())
 
+    def respond(self, code, data):
+        self._json(code, data)
+
     def do_GET(self):
+
+        # N-1: fail-closed JWT auth on the live GET path (probe endpoints exempt).
+        _n1_path = urlparse(self.path).path.rstrip("/") or "/"
+        if _n1_path not in ("/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"):
+            _n1_claims, _n1_err = validate_jwt(dict(self.headers))
+            if _n1_err:
+                self._json(401, {"error": "unauthorized", "detail": _n1_err})
+                return
         _cache_key = f"kyc_workflow_orchestration_{self.path}"
         _cached = cache_get(_cache_key)
         if _cached and self.path not in ("/healthz", "/readyz", "/livez", "/metrics", "/health"):
@@ -438,10 +586,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/livez":
             self.respond(200, {"alive": True})
         elif path == "/v1/degradation":
-                self._json(200, {"service": "kyc-workflow-orchestration-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
+            self._json(200, {"service": "kyc-workflow-orchestration-py", **_degrade.status()})
+        elif path == "/v1/alerts":
+            self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
+        elif path == "/metrics":
             body = (
                 f'# HELP requests_total Total requests\n'
                 f'# TYPE requests_total counter\n'
@@ -450,9 +598,25 @@ class Handler(BaseHTTPRequestHandler):
                 f'# TYPE errors_total counter\n'
                 f'errors_total{{service=\"kyc-workflow-orchestration-py\"}} {error_count}\n'
             )
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(body.encode())
+        elif path in ("/api/v1/kyc_records", "/v1/config"):
+            # Real data from Postgres; loud 503 when unavailable.
+            try:
+                conn = get_db()
+                with conn.cursor() as cur:
+                    cur.execute("SELECT id, status, created_at FROM kyc_records ORDER BY created_at DESC LIMIT 50")
+                    rows = cur.fetchall()
+                items = [{"id": str(r[0]), "status": r[1], "created_at": str(r[2])} for r in rows]
+                self._json(200, {"items": items, "total": len(items), "source": "database"})
+            except Exception as e:
+                logger.error(f"config query failed: {e}")
+                self._json(503, {"error": "config_unavailable"})
         else:
-            cur.execute("SELECT id, status, created_at FROM kyc_records ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
+            # Never fabricate a response for an unimplemented endpoint.
+            self._json(501, {"error": "not_implemented", "path": path})
 
     def do_POST(self):
         trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
@@ -470,25 +634,14 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length > 0 else b"{}"
         body = json.loads(sanitize_input(raw.decode("utf-8")))
 
-        # JWT auth check (monitoring mode: warn but allow)
+        # JWT auth check — real signature verification, fail closed
         claims, err = validate_jwt(dict(self.headers))
         if err:
             self.respond(401, {"error": "unauthorized", "detail": err})
             return
 
-        if path == "/v1/create":
-            result = db_insert("kyc_workflow_orchestration_py", body)
-            _call_sanctions_check_result = call_sanctions_check(body.get("data", {}))
-            _call_liveness_check_result = call_liveness_check(body.get("data", {}))
-            _call_document_verify_result = call_document_verify(body.get("data", {}))
-            _auto_decision_result = auto_decision(body.get("data", {}))
-            _compute_verification_score_result = compute_verification_score(body.get("data", {}))
-            _compute_risk_assessment_result = compute_risk_assessment(body.get("data", {}))
-            _check_sla_breach_result = check_sla_breach(body.get("data", {}))
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-            self.respond(201, {"created": True, "data": result})
-        else:
-            self.respond(404, {"error": "not_found", "path": path})
+        # No POST endpoints are backed by real persistence in this handler.
+        self.respond(501, {"error": "not_implemented", "path": path})
 
 # --- Graceful Shutdown ---
 server = None
@@ -562,5 +715,11 @@ def init_tracing(service_name):
 signal.signal(signal.SIGINT, shutdown_handler)
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    logger.info(json.dumps({"service": SERVICE_NAME, "port": PORT, "message": "starting"}))
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

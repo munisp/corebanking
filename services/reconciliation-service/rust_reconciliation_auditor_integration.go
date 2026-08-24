@@ -20,11 +20,11 @@ type RustReconciliationAuditorInput struct {
 }
 
 type RustReconciliationAuditorOutput struct {
-	Classification string   `json:"classification"`
-	Severity       string   `json:"severity"`
-	AutoResolvable bool     `json:"auto_resolvable"`
-	WithinTolerance bool    `json:"within_tolerance"`
-	Reasons        []string `json:"reasons"`
+	Classification  string   `json:"classification"`
+	Severity        string   `json:"severity"`
+	AutoResolvable  bool     `json:"auto_resolvable"`
+	WithinTolerance bool     `json:"within_tolerance"`
+	Reasons         []string `json:"reasons"`
 }
 
 func reconciliationAuditorWorkDir() string {

@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from "axios";
-import * as https from "https";
+import { createSecureHttpsAgent } from "../lib/secureHttpsAgent";
 import { readEnv } from "../config/readEnv.config";
 import { IKycVerificationPayload, IKycVerificationResponse, IKybVerificationPayload, IKybVerificationResponse } from "../types/verification";
 
@@ -14,9 +14,7 @@ class VerificationService {
         "x-client-id": readEnv("VERIFICATION_SVC_CLIENT_ID"),
         "x-client-secret": readEnv("VERIFICATION_SVC_CLIENT_SECRET"),
       },
-      httpsAgent: new https.Agent({
-        rejectUnauthorized: false,
-      }),
+      httpsAgent: createSecureHttpsAgent(),
     });
   }
 

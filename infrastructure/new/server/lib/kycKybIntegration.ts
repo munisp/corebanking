@@ -8,8 +8,19 @@
  * Integrated services: account-opening, loan-origination, trade-finance, card-management,
  *   payments-hub, agent-banking, diaspora-banking, mortgage, virtual-accounts, escrow,
  *   supply-chain-finance, factoring, syndicated-loans, wealth-mgmt, custody, insurance
+ *
+ * REMEDIATION (silent mockware): the KYC gate check no longer derives allow/block
+ * verdicts from hardcoded in-memory "verified" trigger records. It reads the
+ * customer's real KYC verification record from the database
+ * (kyc_enforcement_verifications) and FAILS CLOSED: when no record exists, the
+ * database is unavailable, or the record is not verified/expired, the operation
+ * is blocked. A verified verdict is never synthesized.
  */
 import type { Express, Request, Response } from "express";
+import { desc, eq } from "drizzle-orm";
+import { getDb } from "../db";
+import { kycEnforcementVerifications } from "../../drizzle/schema";
+import { logger } from "./logger";
 
 // ── Types ──
 
@@ -346,6 +357,52 @@ const kycOverrides: KYCOverride[] = [
   },
 ];
 
+// ── Real KYC status lookup (fail closed) ─────────────────────────────────────
+
+type KycGateVerdict =
+  | { outcome: "verified"; level: string; verifiedAt: Date | null; expiresAt: Date | null }
+  | { outcome: "not_verified"; status: string }
+  | { outcome: "unknown" };
+
+/**
+ * Looks up the customer's actual KYC verification record from the database
+ * (latest kyc_enforcement_verifications row). FAIL CLOSED: any database error,
+ * missing record, non-verified status, or expired record is treated as NOT
+ * cleared. A "verified" outcome is only returned when a real, current,
+ * verified record exists.
+ */
+async function lookupCustomerKycStatus(customerId: string): Promise<KycGateVerdict> {
+  const db = await getDb();
+  if (!db) {
+    logger.error("[KYC-GATE] Database unavailable — failing closed (kyc_status_unknown)", { customerId });
+    return { outcome: "unknown" };
+  }
+  let rows;
+  try {
+    rows = await db
+      .select()
+      .from(kycEnforcementVerifications)
+      .where(eq(kycEnforcementVerifications.customerId, customerId))
+      .orderBy(desc(kycEnforcementVerifications.createdAt))
+      .limit(1);
+  } catch (err) {
+    logger.error("[KYC-GATE] KYC record lookup failed — failing closed (kyc_status_unknown)", { customerId, error: String(err) });
+    return { outcome: "unknown" };
+  }
+  const record = rows[0];
+  if (!record) {
+    logger.warn("[KYC-GATE] No KYC record found for customer — failing closed", { customerId });
+    return { outcome: "unknown" };
+  }
+  if (record.status !== "verified") {
+    return { outcome: "not_verified", status: record.status };
+  }
+  if (record.expiresAt && new Date(record.expiresAt) < new Date()) {
+    return { outcome: "not_verified", status: "expired" };
+  }
+  return { outcome: "verified", level: record.level, verifiedAt: record.verifiedAt, expiresAt: record.expiresAt };
+}
+
 // ── API Registration ──
 
 export function registerKYCKYBIntegration(app: Express) {
@@ -512,7 +569,7 @@ export function registerKYCKYBIntegration(app: Express) {
     res.json({ ...gate, message: `KYC gate for ${gate.serviceName} is now: ${gate.gateStatus}` });
   });
 
-  app.post("/api/platform/kyc-gates/check", (req: Request, res: Response) => {
+  app.post("/api/platform/kyc-gates/check", async (req: Request, res: Response) => {
     const { serviceId, customerId, operation } = req.body || {};
     if (!serviceId || !customerId) {
       return res.status(400).json({ error: "serviceId and customerId required" });
@@ -522,8 +579,26 @@ export function registerKYCKYBIntegration(app: Express) {
     if (gate.gateStatus === "disabled") {
       return res.json({ allowed: true, reason: "KYC gate disabled for this service", gateStatus: "disabled" });
     }
-    const kycVerified = kycTriggers.some(t => t.customerId === customerId && t.status === "completed" && t.result === "verified");
+
+    // Real KYC status from the database — verdicts are NEVER synthesized from
+    // in-memory seed triggers. Unknown/error → blocked (fail closed).
+    const kyc = await lookupCustomerKycStatus(customerId);
+    const kycVerified = kyc.outcome === "verified";
     const allowed = kycVerified || gate.gateStatus === "monitoring";
+
+    const reason = kycVerified
+      ? "KYC verified — operation permitted"
+      : kyc.outcome === "unknown"
+        ? "kyc_status_unknown"
+        : `KYC verification required — operation blocked (status: ${kyc.status})`;
+
+    if (!allowed) {
+      logger.warn("[KYC-GATE] Operation blocked", {
+        serviceId, customerId, operation: operation || "unknown",
+        reason, gateStatus: gate.gateStatus,
+      });
+    }
+
     res.json({
       allowed,
       serviceId: gate.serviceId,
@@ -531,10 +606,12 @@ export function registerKYCKYBIntegration(app: Express) {
       customerId,
       operation: operation || "unknown",
       kycVerified,
+      kycStatus: kyc.outcome === "verified" ? "verified" : kyc.outcome === "unknown" ? "unknown" : kyc.status,
+      kycLevel: kyc.outcome === "verified" ? kyc.level : undefined,
       gateStatus: gate.gateStatus,
       minimumLevel: gate.minimumKYCLevel,
       blockOnFailure: gate.blockOnFailure,
-      reason: allowed ? "KYC verified — operation permitted" : "KYC verification required — operation blocked",
+      reason: allowed && !kycVerified ? "KYC gate in monitoring mode — violation logged" : reason,
       kafkaEvent: !allowed ? { topic: "kyc.gate.blocked", payload: { serviceId, customerId, operation } } : undefined,
     });
   });

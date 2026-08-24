@@ -13,8 +13,8 @@ describe("Database-backed Routes", () => {
   ];
 
   for (const table of tables) {
-    it(`/api/db/${table} returns source=database with items`, async () => {
-      if (!serverUp) return;
+    it(`/api/db/${table} returns source=database with items`, async (ctx) => {
+      if (!serverUp) return ctx.skip();
       const resp = await fetch(`${BASE}/api/db/${table}`);
       expect(resp.status).toBe(200);
       const data = await resp.json() as any;
@@ -24,8 +24,8 @@ describe("Database-backed Routes", () => {
     });
   }
 
-  it("/api/db/customers returns Nigerian banking data", async () => {
-    if (!serverUp) return;
+  it("/api/db/customers returns Nigerian banking data", async (ctx) => {
+    if (!serverUp) return ctx.skip();
     const resp = await fetch(`${BASE}/api/db/customers`);
     const data = await resp.json() as any;
     expect(data.items.length).toBeGreaterThan(0);
@@ -33,27 +33,28 @@ describe("Database-backed Routes", () => {
     expect(first.name || first.customerId).toBeTruthy();
   });
 
-  it("/api/db/accounts returns accounts with balances", async () => {
-    if (!serverUp) return;
+  it("/api/db/accounts returns accounts with balances", async (ctx) => {
+    if (!serverUp) return ctx.skip();
     const resp = await fetch(`${BASE}/api/db/accounts`);
     const data = await resp.json() as any;
     expect(data.items.length).toBeGreaterThan(0);
   });
 
-  it("supports pagination via page and limit params", async () => {
-    if (!serverUp) return;
+  it("supports pagination via page and limit params", async (ctx) => {
+    if (!serverUp) return ctx.skip();
     const resp = await fetch(`${BASE}/api/db/customers?page=1&limit=2`);
     const data = await resp.json() as any;
     expect(data.items.length).toBeLessThanOrEqual(2);
     expect(data.page).toBe(1);
   });
 
-  it("returns count endpoint for tables", async () => {
-    if (!serverUp) return;
+  it("returns count endpoint for tables", async (ctx) => {
+    if (!serverUp) return ctx.skip();
     const resp = await fetch(`${BASE}/api/db/customers/count`);
-    if (resp.ok) {
-      const data = await resp.json() as any;
-      expect(data.count || data.total).toBeGreaterThanOrEqual(0);
-    }
+    expect(resp.status).toBe(200);
+    const data = await resp.json() as any;
+    const count = data.count ?? data.total;
+    expect(typeof count, "count endpoint must return a numeric count/total").toBe("number");
+    expect(count).toBeGreaterThanOrEqual(0);
   });
 });

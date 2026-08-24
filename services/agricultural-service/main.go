@@ -1,14 +1,22 @@
 package main
 
 import (
+	"context"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"math"
+	"math/big"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -550,8 +558,12 @@ func (s *AgriculturalService) ListFarmers(w http.ResponseWriter, r *http.Request
 	tenantID := r.Header.Get("X-Tenant-ID")
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 10 }
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
 	offset := (page - 1) * limit
 
 	var total int
@@ -638,8 +650,12 @@ func (s *AgriculturalService) ListFarms(w http.ResponseWriter, r *http.Request) 
 	tenantID := r.Header.Get("X-Tenant-ID")
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 10 }
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
 	offset := (page - 1) * limit
 
 	var total int
@@ -1000,8 +1016,12 @@ func (s *AgriculturalService) ListLoans(w http.ResponseWriter, r *http.Request) 
 	tenantID := r.Header.Get("X-Tenant-ID")
 	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	if page < 1 { page = 1 }
-	if limit < 1 || limit > 100 { limit = 10 }
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
 	offset := (page - 1) * limit
 
 	var total int
@@ -1822,26 +1842,26 @@ func (s *AgriculturalService) GetRiskAnalytics(w http.ResponseWriter, r *http.Re
 // ==================== PARTNERS & PROGRAMS ====================
 
 type Program struct {
-	ID              string    `json:"id"`
-	TenantID        string    `json:"tenant_id"`
-	Name            string    `json:"name"`
-	ProgramType     string    `json:"program_type"` // ABP, AGSMEIS, CACS, ACGSF, custom
-	Description     string    `json:"description"`
-	FundingSource   string    `json:"funding_source"`
-	MaxLoanAmount   float64   `json:"max_loan_amount"`
-	InterestRate    float64   `json:"interest_rate"`
-	TenorDays       int       `json:"tenor_days"`
-	TargetFarmers   int       `json:"target_farmers"`
-	EligibilityCriteria []string `json:"eligibility_criteria"`
-	Status          string    `json:"status"` // active, paused, closed
-	StartDate       time.Time `json:"start_date"`
-	EndDate         *time.Time `json:"end_date"`
-	CreatedAt       time.Time `json:"created_at"`
+	ID                  string     `json:"id"`
+	TenantID            string     `json:"tenant_id"`
+	Name                string     `json:"name"`
+	ProgramType         string     `json:"program_type"` // ABP, AGSMEIS, CACS, ACGSF, custom
+	Description         string     `json:"description"`
+	FundingSource       string     `json:"funding_source"`
+	MaxLoanAmount       float64    `json:"max_loan_amount"`
+	InterestRate        float64    `json:"interest_rate"`
+	TenorDays           int        `json:"tenor_days"`
+	TargetFarmers       int        `json:"target_farmers"`
+	EligibilityCriteria []string   `json:"eligibility_criteria"`
+	Status              string     `json:"status"` // active, paused, closed
+	StartDate           time.Time  `json:"start_date"`
+	EndDate             *time.Time `json:"end_date"`
+	CreatedAt           time.Time  `json:"created_at"`
 }
 
 func (s *AgriculturalService) ListCooperatives(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT id, tenant_id, name, registration_no, state, lga, member_count, total_farm_size, 
 		credit_limit, outstanding_loan, repayment_rate, status, created_at
@@ -1855,8 +1875,8 @@ func (s *AgriculturalService) ListCooperatives(w http.ResponseWriter, r *http.Re
 	cooperatives := make([]Cooperative, 0)
 	for rows.Next() {
 		var c Cooperative
-		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.RegistrationNo, &c.State, &c.LGA, 
-			&c.MemberCount, &c.TotalFarmSize, &c.CreditLimit, &c.OutstandingLoan, 
+		err := rows.Scan(&c.ID, &c.TenantID, &c.Name, &c.RegistrationNo, &c.State, &c.LGA,
+			&c.MemberCount, &c.TotalFarmSize, &c.CreditLimit, &c.OutstandingLoan,
 			&c.RepaymentRate, &c.Status, &c.CreatedAt)
 		if err != nil {
 			continue
@@ -1874,7 +1894,7 @@ func (s *AgriculturalService) ListCooperatives(w http.ResponseWriter, r *http.Re
 
 func (s *AgriculturalService) ListPartners(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT id, tenant_id, name, partner_type, contact_name, contact_phone, email, address, rating, total_deals, status, created_at
 		FROM partners WHERE tenant_id = $1 ORDER BY created_at DESC`, tenantID)
@@ -1890,7 +1910,7 @@ func (s *AgriculturalService) ListPartners(w http.ResponseWriter, r *http.Reques
 		var rating float64
 		var totalDeals int
 		var createdAt time.Time
-		err := rows.Scan(&id, &tenantID, &name, &partnerType, &contactName, &contactPhone, 
+		err := rows.Scan(&id, &tenantID, &name, &partnerType, &contactName, &contactPhone,
 			&email, &address, &rating, &totalDeals, &status, &createdAt)
 		if err != nil {
 			continue
@@ -1912,7 +1932,7 @@ func (s *AgriculturalService) ListPartners(w http.ResponseWriter, r *http.Reques
 
 func (s *AgriculturalService) RegisterPartner(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	var partner map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&partner); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -1928,7 +1948,7 @@ func (s *AgriculturalService) RegisterPartner(w http.ResponseWriter, r *http.Req
 	_, err := s.db.ExecContext(r.Context(),
 		`INSERT INTO partners (id, tenant_id, name, partner_type, contact_name, contact_phone, email, address, rating, total_deals, status, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-		partnerID, tenantID, partner["name"], partner["partner_type"], partner["contact_name"], 
+		partnerID, tenantID, partner["name"], partner["partner_type"], partner["contact_name"],
 		partner["contact_phone"], partner["email"], partner["address"], 0.0, 0, "active", time.Now())
 
 	if err != nil {
@@ -1949,7 +1969,7 @@ func (s *AgriculturalService) GetPartner(w http.ResponseWriter, r *http.Request)
 	var rating float64
 	var totalDeals int
 	var createdAt time.Time
-	
+
 	err := s.db.QueryRowContext(r.Context(),
 		`SELECT id, tenant_id, name, partner_type, contact_name, contact_phone, email, address, rating, total_deals, status, created_at
 		FROM partners WHERE id = $1`, partnerID).Scan(&id, &tenantID, &name, &partnerType,
@@ -1971,7 +1991,7 @@ func (s *AgriculturalService) GetPartner(w http.ResponseWriter, r *http.Request)
 
 func (s *AgriculturalService) ListPrograms(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	rows, err := s.db.QueryContext(r.Context(),
 		`SELECT id, tenant_id, name, program_type, description, funding_source, max_loan_amount, interest_rate, 
 		tenor_days, target_farmers, status, start_date, end_date, created_at
@@ -1985,7 +2005,7 @@ func (s *AgriculturalService) ListPrograms(w http.ResponseWriter, r *http.Reques
 	programs := make([]Program, 0)
 	for rows.Next() {
 		var p Program
-		err := rows.Scan(&p.ID, &p.TenantID, &p.Name, &p.ProgramType, &p.Description, &p.FundingSource, 
+		err := rows.Scan(&p.ID, &p.TenantID, &p.Name, &p.ProgramType, &p.Description, &p.FundingSource,
 			&p.MaxLoanAmount, &p.InterestRate, &p.TenorDays, &p.TargetFarmers, &p.Status, &p.StartDate, &p.EndDate, &p.CreatedAt)
 		if err != nil {
 			continue
@@ -2003,7 +2023,7 @@ func (s *AgriculturalService) ListPrograms(w http.ResponseWriter, r *http.Reques
 
 func (s *AgriculturalService) CreateProgram(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
-	
+
 	var program Program
 	if err := json.NewDecoder(r.Body).Decode(&program); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
@@ -2056,11 +2076,235 @@ func (s *AgriculturalService) GetProgram(w http.ResponseWriter, r *http.Request)
 
 // ==================== MAIN ====================
 
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + required exp claim). Fail-closed: any verification
+// problem yields 401. Identity headers (X-User-Id, X-Keycloak-ID, X-Tenant-ID,
+// X-User-Role) are overwritten from verified claims — caller-supplied values
+// are never trusted.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	ensureJWKSRefresh()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if isProbePath(p) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			// Unknown key — refresh once and retry (key rotation).
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+		claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			http.Error(w, `{"error":"invalid claims encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		var claims map[string]interface{}
+		if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+			http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
+			return
+		}
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		// Identity headers come ONLY from verified claims; overwrite or drop any
+		// caller-supplied values before invoking the handler.
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			r.Header.Set("X-User-Id", sub)
+			r.Header.Set("X-Keycloak-ID", sub)
+		} else {
+			r.Header.Del("X-User-Id")
+			r.Header.Del("X-Keycloak-ID")
+		}
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
+		}
+		r.Header.Set("X-Tenant-ID", tenant)
+		r.Header.Del("X-User-Role")
+		if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
+			if roleList, ok := ra["roles"].([]interface{}); ok {
+				roles := make([]string, 0, len(roleList))
+				for _, v := range roleList {
+					if s, ok := v.(string); ok {
+						roles = append(roles, s)
+					}
+				}
+				if len(roles) > 0 {
+					r.Header.Set("X-User-Role", strings.Join(roles, ","))
+				}
+			}
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// --- JWT Validation (Keycloak JWKS, RS256, fail-closed) ---
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+var jwksRefreshOnce sync.Once
+
+// jwtRealmURL returns the Keycloak realm base URL used to fetch JWKS keys.
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+// fetchJWKS refreshes the RSA public keys used to verify Bearer tokens.
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil || len(nBytes) == 0 {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil || len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process.
+func ensureJWKSRefresh() {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(jwtRealmURL())
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(jwtRealmURL())
+			}
+		}()
+	})
+}
+
+// isProbePath reports whether p is a health/metrics endpoint that must remain
+// unauthenticated for orchestrators (exact or suffixed probe paths).
+func isProbePath(p string) bool {
+	switch p {
+	case "/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics", "/ping":
+		return true
+	}
+	for _, s := range []string{"/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics"} {
+		if strings.HasSuffix(p, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 func main() {
 	// Database connection
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		dbURL = "postgres://postgres:postgres@localhost:5432/agricultural_db?sslmode=disable"
+		log.Fatalf("[agricultural-service] DATABASE_URL env var is required; refusing to start with default database credentials")
 	}
 
 	db, err := sql.Open("postgres", dbURL)
@@ -2152,5 +2396,5 @@ func main() {
 
 	log.Printf("Agricultural Service starting on port %s", port)
 	log.Printf("Total endpoints registered: 350+ across 15 service modules")
-	log.Fatal(http.ListenAndServe(":"+port, r))
+	log.Fatal(http.ListenAndServe(":"+port, jwtAuthMiddleware(r)))
 }

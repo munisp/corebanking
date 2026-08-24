@@ -13,27 +13,80 @@ fn default_tenant() -> String {
     std::env::var("TENANT_ID").unwrap_or_else(|_| "54link-dev-platform-prod".to_string())
 }
 
+fn tigerbeetle_url() -> Option<String> {
+    std::env::var("TIGERBEETLE_URL").ok().filter(|u| !u.is_empty())
+}
+
+// Post a REAL double-entry transfer to the TigerBeetle adapter.
+// Returns Ok(response_body) only when the ledger accepted the transfer;
+// Err otherwise. Money movement is never fabricated: callers must not mutate
+// loan state when this fails.
+async fn post_ledger_transfer(
+    transfer_id: &str,
+    debit_account: &str,
+    credit_account: &str,
+    amount_ngn: f64,
+    currency: &str,
+    narration: &str,
+) -> Result<serde_json::Value, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let base = tigerbeetle_url().ok_or_else(|| "TIGERBEETLE_URL not configured".to_string())?;
+    let url = format!("{}/transfers", base.trim_end_matches('/'));
+    let amount_kobo = (amount_ngn * 100.0).round() as i64;
+    let body = serde_json::json!({
+        "transfers": [{
+            "id": transfer_id,
+            "debitAccount": debit_account,
+            "creditAccount": credit_account,
+            "amount": amount_kobo,
+            "currency": currency,
+            "narration": narration,
+        }]
+    })
+    .to_string();
+
+    let stripped = url.strip_prefix("http://").ok_or_else(|| "TIGERBEETLE_URL must be http://".to_string())?;
+    let (hostport, path) = match stripped.find('/') {
+        Some(i) => (&stripped[..i], &stripped[i..]),
+        None => (stripped, "/"),
+    };
+    let addr = if hostport.contains(':') { hostport.to_string() } else { format!("{}:80", hostport) };
+    let mut stream = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => return Err(format!("ledger connect failed: {}", e)),
+        Err(_) => return Err("ledger connect timed out".to_string()),
+    };
+    let req = format!(
+        "POST {} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        path, hostport, body.len(), body
+    );
+    stream.write_all(req.as_bytes()).await.map_err(|e| format!("ledger write failed: {}", e))?;
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.map_err(|e| format!("ledger read failed: {}", e))?;
+    let status_ok = resp.starts_with("HTTP/1.1 2") || resp.starts_with("HTTP/1.0 2");
+    if !status_ok {
+        return Err(format!("ledger rejected transfer: {}", resp.lines().next().unwrap_or("unknown")));
+    }
+    let json_start = resp.find("\r\n\r\n").map(|i| i + 4).unwrap_or(0);
+    let parsed: serde_json::Value = serde_json::from_str(&resp[json_start..]).unwrap_or(serde_json::json!({}));
+    if parsed.get("error").is_some() {
+        return Err(format!("ledger error: {}", parsed["error"]));
+    }
+    Ok(parsed)
+}
+
 pub async fn healthz() -> HttpResponse {
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "service": "agriculture-banking-rs",
         "timestamp": now(),
-        "middleware": serde_json::json!({
-            "kafka": { "status": "connected", "topics": ["agriculture_banking.events", "agriculture_banking.audit"] },
-            "dapr": { "status": "connected", "appId": "agriculture-banking-sidecar" },
-            "fluvio": { "status": "connected", "topic": "agriculture-banking-stream" },
-            "temporal": { "status": "connected", "namespace": "agriculture_banking" },
-            "postgres": { "status": "connected", "database": "ndsep_db", "schema": "agriculture_banking" },
-            "keycloak": { "status": "connected", "realm": "54link-dev" },
-            "permify": { "status": "connected", "schema": "agriculture_banking_authz" },
-            "redis": { "status": "connected", "prefix": "agriculture_banking:" },
-            "mojaloop": { "status": "connected", "participant": "agriculture_banking" },
-            "opensearch": { "status": "connected", "index": "agriculture_banking-*" },
-            "openappsec": { "status": "connected", "policy": "agriculture-banking-protection" },
-            "apisix": { "status": "connected", "upstream": "agriculture_banking" },
-            "tigerbeetle": { "status": "connected", "cluster": "54link-dev-ledger" },
-            "lakehouse": { "status": "connected", "table": "agriculture_banking_iceberg" }
-        })
+        "database": "postgres",
+        "ledger": if tigerbeetle_url().is_some() { "configured" } else { "not_configured" },
     }))
 }
 
@@ -220,14 +273,54 @@ pub async fn update_agri_loan(state: web::Data<AppState>, path: web::Path<String
 
 pub async fn disburse_agri_loan(state: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
     let id = path.into_inner();
+
+    // Phase 1: validate + capture disbursement details (lock released before await).
+    let (principal, currency, current_status) = {
+        let loans = state.agri_loans.lock().unwrap();
+        match loans.iter().find(|l| l.id == id) {
+            Some(loan) => {
+                if loan.approval_status != "approved" {
+                    return HttpResponse::BadRequest().json(serde_json::json!({
+                        "message": "Loan must be approved before disbursement"
+                    }));
+                }
+                (loan.principal_amount, loan.currency.clone(), loan.status.clone())
+            }
+            None => return HttpResponse::NotFound().json(serde_json::json!({"message": "Agri-loan not found"})),
+        }
+    };
+
+    // Phase 2: post the REAL ledger transfer FIRST. Money movement must exist
+    // before the loan is marked disbursed; on failure return 502 and leave
+    // the loan status unchanged.
+    let transfer_id = format!("DSB-{}", id);
+    let ledger = match post_ledger_transfer(
+        &transfer_id,
+        "agri-loan-receivable",
+        "farmer-settlement-account",
+        principal,
+        &currency,
+        &format!("Agri loan disbursement {}", id),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!("[agriculture-banking-rs] disbursement ledger post failed for {}: {}", id, e);
+            return HttpResponse::BadGateway().json(serde_json::json!({
+                "error": "ledger_unavailable",
+                "detail": e,
+                "loanId": id,
+                "status": current_status,
+                "message": "Disbursement NOT applied: ledger transfer could not be posted"
+            }));
+        }
+    };
+
+    // Phase 3: ledger accepted — now mutate the loan.
     let mut loans = state.agri_loans.lock().unwrap();
     match loans.iter_mut().find(|l| l.id == id) {
         Some(loan) => {
-            if loan.approval_status != "approved" {
-                return HttpResponse::BadRequest().json(serde_json::json!({
-                    "message": "Loan must be approved before disbursement"
-                }));
-            }
             loan.status = "disbursed".to_string();
             loan.disbursement_date = Some(now());
             loan.updated_at = now();
@@ -238,7 +331,8 @@ pub async fn disburse_agri_loan(state: web::Data<AppState>, path: web::Path<Stri
                     "credit": "farmer-settlement-account",
                     "amount": loan.principal_amount,
                     "currency": loan.currency,
-                    "middleware": ["TigerBeetle", "Kafka", "Temporal"]
+                    "transferId": transfer_id,
+                    "ledgerResponse": ledger,
                 }
             }))
         }
@@ -252,15 +346,51 @@ pub async fn repay_agri_loan(state: web::Data<AppState>, path: web::Path<String>
     if req.amount <= 0.0 {
         return HttpResponse::BadRequest().json(serde_json::json!({"message": "Repayment amount must be positive"}));
     }
+
+    // Phase 1: validate + compute application (lock released before await).
+    let (payment, currency) = {
+        let loans = state.agri_loans.lock().unwrap();
+        match loans.iter().find(|l| l.id == id) {
+            Some(loan) => {
+                if loan.status != "disbursed" {
+                    return HttpResponse::BadRequest().json(serde_json::json!({
+                        "message": "Loan must be disbursed before repayment"
+                    }));
+                }
+                (req.amount.min(loan.outstanding_balance), loan.currency.clone())
+            }
+            None => return HttpResponse::NotFound().json(serde_json::json!({"message": "Agri-loan not found"})),
+        }
+    };
+
+    // Phase 2: post the REAL repayment transfer to the ledger first.
+    let transfer_id = format!("RPY-{}-{}", id, Uuid::new_v4().to_string()[..8].to_uppercase());
+    let ledger = match post_ledger_transfer(
+        &transfer_id,
+        "farmer-settlement-account",
+        "agri-loan-receivable",
+        payment,
+        &currency,
+        &format!("Agri loan repayment {}", id),
+    )
+    .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            eprintln!("[agriculture-banking-rs] repayment ledger post failed for {}: {}", id, e);
+            return HttpResponse::BadGateway().json(serde_json::json!({
+                "error": "ledger_unavailable",
+                "detail": e,
+                "loanId": id,
+                "message": "Repayment NOT applied: ledger transfer could not be posted"
+            }));
+        }
+    };
+
+    // Phase 3: ledger accepted — apply the repayment.
     let mut loans = state.agri_loans.lock().unwrap();
     match loans.iter_mut().find(|l| l.id == id) {
         Some(loan) => {
-            if loan.status != "disbursed" {
-                return HttpResponse::BadRequest().json(serde_json::json!({
-                    "message": "Loan must be disbursed before repayment"
-                }));
-            }
-            let payment = req.amount.min(loan.outstanding_balance);
             loan.outstanding_balance -= payment;
             loan.total_repaid += payment;
             if loan.outstanding_balance <= 0.01 {
@@ -275,7 +405,8 @@ pub async fn repay_agri_loan(state: web::Data<AppState>, path: web::Path<String>
                     "debit": "farmer-settlement-account",
                     "credit": "agri-loan-receivable",
                     "amount": payment,
-                    "middleware": ["TigerBeetle", "Kafka"]
+                    "transferId": transfer_id,
+                    "ledgerResponse": ledger,
                 }
             }))
         }

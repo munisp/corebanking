@@ -1,3 +1,6 @@
+import hmac
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, responses, Header
 from sqlalchemy.orm import Session
 from schemas.v1 import CreateAuth, SetupPassword, Context
@@ -19,9 +22,42 @@ DEFAULT_SUPER_ADMIN_NAME = config.DEFAULT_SUPER_ADMIN_NAME
 DEFAULT_SUPER_ADMIN_EMAIL = config.DEFAULT_SUPER_ADMIN_EMAIL
 DEFAULT_SUPER_ADMIN_PASSWORD = config.DEFAULT_SUPER_ADMIN_PASSWORD
 
+def _bootstrap_guard(bootstrap_admin_token: str) -> None:
+    """Fail-closed guard for the admin bootstrap endpoint.
+
+    Seeding a SUPERADMIN is only allowed:
+      - outside production (ENVIRONMENT/FLASK_ENV != "production"), AND
+      - when the BOOTSTRAP_ADMIN_TOKEN env var is configured AND the caller
+        presents a matching x-bootstrap-admin-token header.
+    Otherwise the endpoint is indistinguishable from non-existent (404) or
+    forbidden (403 on token mismatch).
+    """
+    environment = os.getenv("ENVIRONMENT", os.getenv("FLASK_ENV", "development")).lower()
+    expected_token = os.getenv("BOOTSTRAP_ADMIN_TOKEN", "")
+    if environment == "production" or not expected_token:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not bootstrap_admin_token or not hmac.compare_digest(
+        bootstrap_admin_token, expected_token
+    ):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
 @system_router.post("/seed/admin")
-def seed_default_admin(db: Session = Depends(get_session)):
-    """Seed default admin route handler."""
+def seed_default_admin(
+    db: Session = Depends(get_session),
+    bootstrap_admin_token: str = Header(None, alias="x-bootstrap-admin-token"),
+):
+    """Seed default admin route handler (bootstrap-gated, non-production only)."""
+
+    _bootstrap_guard(bootstrap_admin_token)
+
+    if not DEFAULT_SUPER_ADMIN_PASSWORD:
+        logger.error("DEFAULT_SUPER_ADMIN_PASSWORD is not configured; refusing to seed admin")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Admin bootstrap is not configured on this service.",
+            code="AUTH-SYSTEM-CONFIG-5000",
+        )
 
     try:
         auth_service = AuthService(db)
@@ -48,8 +84,12 @@ def seed_default_admin(db: Session = Depends(get_session)):
 
         auth_service.setup_password(setup_password_payload, context)
 
+        auth_data = auth.to_dict()
+        # The stored api_secret is a salted hash — never expose it.
+        auth_data.pop("api_secret", None)
+
         return responses.JSONResponse(
-            content={"message": "success", "auth": auth.to_dict()}, status_code=200
+            content={"message": "success", "auth": auth_data}, status_code=200
         )
     except HTTPException as e:
         raise e

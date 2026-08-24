@@ -6,15 +6,22 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +57,10 @@ func NewKafkaClient() *KafkaClient {
 	return k
 }
 
+// kafkaBufferCap bounds the offline retry buffer; when full, the oldest
+// message is dropped with a loud log (never silent unbounded growth).
+const kafkaBufferCap = 10000
+
 func (k *KafkaClient) connect() {
 	parts := strings.Split(k.Brokers, ",")
 	for _, broker := range parts {
@@ -57,7 +68,9 @@ func (k *KafkaClient) connect() {
 		conn, err := net.DialTimeout("tcp", host, 3*time.Second)
 		if err == nil {
 			conn.Close()
+			k.mu.Lock()
 			k.connected = true
+			k.mu.Unlock()
 			log.Printf("[kafka] Connected to %s", host)
 			k.flushBuffer()
 			return
@@ -66,45 +79,91 @@ func (k *KafkaClient) connect() {
 	log.Printf("[kafka] Connection failed, using buffer mode")
 }
 
-func (k *KafkaClient) flushBuffer() {
+func (k *KafkaClient) isConnected() bool {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	for _, msg := range k.buffer {
-		k.doPublish(msg.Topic, msg.Key, msg.Payload)
-	}
-	k.buffer = nil
+	return k.connected
 }
 
-func (k *KafkaClient) doPublish(topic, key string, payload any) {
+func (k *KafkaClient) bufferAppend(msg kafkaMsg) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if len(k.buffer) >= kafkaBufferCap {
+		dropped := k.buffer[0]
+		k.buffer = k.buffer[1:]
+		log.Printf("[kafka] buffer full (%d) — DROPPED oldest message topic=%s key=%s", kafkaBufferCap, dropped.Topic, dropped.Key)
+	}
+	k.buffer = append(k.buffer, msg)
+}
+
+func (k *KafkaClient) flushBuffer() {
+	k.mu.Lock()
+	msgs := k.buffer
+	k.buffer = nil
+	k.mu.Unlock()
+	for _, msg := range msgs {
+		if err := k.doPublish(msg.Topic, msg.Key, msg.Payload); err != nil {
+			log.Printf("[kafka] flush: publish still failing for topic=%s key=%s: %v — re-buffered", msg.Topic, msg.Key, err)
+			k.bufferAppend(msg)
+		}
+	}
+}
+
+// doPublish posts one record via the Kafka REST proxy. The response body is
+// always drained/closed and the status checked: any failure is returned as an
+// error (never silently dropped, never a leaked connection).
+func (k *KafkaClient) doPublish(topic, key string, payload any) error {
 	restURL := envOr("KAFKA_REST_PROXY_URL", "")
 	if restURL == "" {
-		return
+		return fmt.Errorf("kafka REST proxy not configured (set KAFKA_REST_PROXY_URL)")
 	}
-	body, _ := json.Marshal(map[string]any{
+	body, err := json.Marshal(map[string]any{
 		"records": []map[string]any{
 			{"key": key, "value": payload},
 		},
 	})
+	if err != nil {
+		return fmt.Errorf("kafka publish marshal: %w", err)
+	}
 	fullTopic := fmt.Sprintf("%s.%s", k.TopicPrefix, topic)
-	req, _ := http.NewRequest("POST",
+	req, err := http.NewRequest("POST",
 		fmt.Sprintf("%s/topics/%s", restURL, fullTopic), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("kafka publish request build: %w", err)
+	}
 	req.Header.Set("Content-Type", "application/vnd.kafka.json.v2+json")
-	k.httpClient.Do(req)
+	resp, err := k.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("kafka publish to %s: %w", fullTopic, err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) // drain so the connection can be reused
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("kafka publish to %s: unexpected status %d", fullTopic, resp.StatusCode)
+	}
+	return nil
 }
 
+// Publish delivers the message via the REST proxy. The message is appended to
+// the retry buffer ONLY when publishing fails — a successful publish is never
+// duplicated into the buffer. When the message could only be buffered (not
+// delivered) an error is returned so callers can fail loudly.
 func (k *KafkaClient) Publish(topic string, key string, payload any) error {
-	if k.connected {
-		k.doPublish(topic, key, payload)
+	if k.isConnected() {
+		if err := k.doPublish(topic, key, payload); err != nil {
+			log.Printf("[kafka] publish failed: %v — buffering for retry", err)
+			k.bufferAppend(kafkaMsg{Topic: topic, Key: key, Payload: payload})
+			return err
+		}
+		return nil
 	}
-	k.mu.Lock()
-	k.buffer = append(k.buffer, kafkaMsg{Topic: topic, Key: key, Payload: payload})
-	k.mu.Unlock()
-	return nil
+	k.bufferAppend(kafkaMsg{Topic: topic, Key: key, Payload: payload})
+	return fmt.Errorf("kafka not connected — message buffered for retry")
 }
 
 func (k *KafkaClient) ListTopics() ([]string, error) {
 	restURL := envOr("KAFKA_REST_PROXY_URL", "")
-	if restURL == "" || !k.connected {
+	if restURL == "" || !k.isConnected() {
 		return nil, fmt.Errorf("kafka not connected")
 	}
 	resp, err := k.httpClient.Get(fmt.Sprintf("%s/topics", restURL))
@@ -118,7 +177,7 @@ func (k *KafkaClient) ListTopics() ([]string, error) {
 }
 
 func (k *KafkaClient) Health() string {
-	if k.connected {
+	if k.isConnected() {
 		parts := strings.Split(k.Brokers, ",")
 		for _, broker := range parts {
 			conn, err := net.DialTimeout("tcp", strings.TrimSpace(broker), 2*time.Second)
@@ -127,7 +186,9 @@ func (k *KafkaClient) Health() string {
 				return "connected"
 			}
 		}
+		k.mu.Lock()
 		k.connected = false
+		k.mu.Unlock()
 	}
 	return "configured"
 }
@@ -414,6 +475,9 @@ type KeycloakClient struct {
 	introspectEndpoint string
 	jwksURI            string
 	httpClient         *http.Client
+	jwksMu             sync.Mutex
+	jwksKeys           map[string]*rsa.PublicKey
+	jwksFetchedAt      time.Time
 }
 
 func NewKeycloakClient() *KeycloakClient {
@@ -487,42 +551,138 @@ func (k *KeycloakClient) ValidateToken(token string) (*TokenClaims, error) {
 		}
 	}
 
-	// Offline JWT payload decode
+	// Offline path: only acceptable with an RS256 signature verified against the
+	// realm JWKS. If the signature cannot be verified, fail closed.
+	return k.verifyOfflineJWT(token)
+}
+
+type jwksKeySet struct {
+	Keys []struct {
+		Kty string `json:"kty"`
+		Kid string `json:"kid"`
+		Use string `json:"use"`
+		Alg string `json:"alg"`
+		N   string `json:"n"`
+		E   string `json:"e"`
+	} `json:"keys"`
+}
+
+// rsaKeyForKid returns the RSA public key for the given key ID, refreshing the
+// cached JWKS when stale or when the kid is unknown. Fails closed when the JWKS
+// endpoint is unavailable.
+func (k *KeycloakClient) rsaKeyForKid(kid string) (*rsa.PublicKey, error) {
+	k.jwksMu.Lock()
+	fresh := len(k.jwksKeys) > 0 && time.Since(k.jwksFetchedAt) < 5*time.Minute
+	cached, hit := k.jwksKeys[kid]
+	k.jwksMu.Unlock()
+	if fresh && hit {
+		return cached, nil
+	}
+	if k.jwksURI == "" {
+		return nil, fmt.Errorf("keycloak jwks_uri unavailable; cannot verify token offline")
+	}
+	resp, err := k.httpClient.Get(k.jwksURI)
+	if err != nil {
+		return nil, fmt.Errorf("fetch jwks: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("fetch jwks: unexpected status %d", resp.StatusCode)
+	}
+	var set jwksKeySet
+	if err := json.NewDecoder(resp.Body).Decode(&set); err != nil {
+		return nil, fmt.Errorf("decode jwks: %w", err)
+	}
+	keys := make(map[string]*rsa.PublicKey, len(set.Keys))
+	for _, jk := range set.Keys {
+		if jk.Kty != "RSA" || jk.N == "" || jk.E == "" {
+			continue
+		}
+		nBytes, err := base64.RawURLEncoding.DecodeString(jk.N)
+		if err != nil {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(jk.E)
+		if err != nil {
+			continue
+		}
+		eInt := new(big.Int).SetBytes(eBytes)
+		if !eInt.IsInt64() || eInt.Int64() < 3 || eInt.Int64() > 1<<31 {
+			continue
+		}
+		keys[jk.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: int(eInt.Int64())}
+	}
+	k.jwksMu.Lock()
+	k.jwksKeys = keys
+	k.jwksFetchedAt = time.Now()
+	k.jwksMu.Unlock()
+	key, ok := keys[kid]
+	if !ok {
+		return nil, fmt.Errorf("no jwks key found for kid %q", kid)
+	}
+	return key, nil
+}
+
+// verifyOfflineJWT parses a JWT, verifies its RS256 signature against the
+// realm JWKS (kid-matched) and enforces expiration. Any failure is an error;
+// no claims are ever granted without a verified signature.
+func (k *KeycloakClient) verifyOfflineJWT(token string) (*TokenClaims, error) {
 	parts := strings.Split(token, ".")
-	if len(parts) == 3 {
-		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-		if err == nil {
-			var claims map[string]any
-			if json.Unmarshal(payload, &claims) == nil {
-				roles := []string{}
-				if ra, ok := claims["realm_access"].(map[string]any); ok {
-					if r, ok := ra["roles"].([]any); ok {
-						for _, role := range r {
-							roles = append(roles, fmt.Sprintf("%v", role))
-						}
-					}
-				}
-				if len(roles) == 0 {
-					roles = []string{"operator"}
-				}
-				expFloat, _ := claims["exp"].(float64)
-				return &TokenClaims{
-					Sub:       fmt.Sprintf("%v", claims["sub"]),
-					Email:     fmt.Sprintf("%v", claims["email"]),
-					Roles:     roles,
-					TenantID:  envOr("TENANT_ID", "54bank-platform-prod"),
-					ExpiresAt: int64(expFloat),
-				}, nil
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("malformed jwt: expected 3 segments")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("malformed jwt header: %w", err)
+	}
+	var header struct {
+		Alg string `json:"alg"`
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("malformed jwt header: %w", err)
+	}
+	if header.Alg != "RS256" {
+		return nil, fmt.Errorf("unsupported jwt alg %q", header.Alg)
+	}
+	key, err := k.rsaKeyForKid(header.Kid)
+	if err != nil {
+		return nil, fmt.Errorf("jwt key resolution failed: %w", err)
+	}
+	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("malformed jwt signature: %w", err)
+	}
+	sum := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(key, crypto.SHA256, sum[:], sig); err != nil {
+		return nil, fmt.Errorf("jwt signature verification failed: %w", err)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("malformed jwt payload: %w", err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("malformed jwt claims: %w", err)
+	}
+	expFloat, ok := claims["exp"].(float64)
+	if !ok || time.Now().Unix() >= int64(expFloat) {
+		return nil, fmt.Errorf("jwt expired or missing exp claim")
+	}
+	roles := []string{}
+	if ra, ok := claims["realm_access"].(map[string]any); ok {
+		if r, ok := ra["roles"].([]any); ok {
+			for _, role := range r {
+				roles = append(roles, fmt.Sprintf("%v", role))
 			}
 		}
 	}
-
 	return &TokenClaims{
-		Sub:       "user-default",
-		Email:     "operator@54bank.app",
-		Roles:     []string{"operator", "admin"},
+		Sub:       fmt.Sprintf("%v", claims["sub"]),
+		Email:     fmt.Sprintf("%v", claims["email"]),
+		Roles:     roles,
 		TenantID:  envOr("TENANT_ID", "54bank-platform-prod"),
-		ExpiresAt: time.Now().Add(time.Hour).Unix(),
+		ExpiresAt: int64(expFloat),
 	}, nil
 }
 
@@ -584,7 +744,7 @@ func (p *PermifyClient) connect() {
 			return
 		}
 	}
-	log.Printf("[permify] Connection failed, using allow-all fallback")
+	log.Printf("[permify] Connection failed; permission checks will DENY by default (fail-closed)")
 }
 
 func (p *PermifyClient) doPost(path string, body any) (map[string]any, error) {
@@ -603,31 +763,37 @@ func (p *PermifyClient) doPost(path string, body any) (map[string]any, error) {
 	return result, nil
 }
 
+// Check evaluates a permission against Permify. It is fail-closed: any error
+// (Permify unreachable, HTTP error, malformed response) results in a denial
+// with a non-nil error.
 func (p *PermifyClient) Check(ctx context.Context, check PermissionCheck) (bool, error) {
-	if p.connected {
-		entityParts := strings.SplitN(check.Entity, ":", 2)
-		subParts := strings.SplitN(check.Subject, ":", 2)
-		entityType, entityID := entityParts[0], ""
-		if len(entityParts) > 1 {
-			entityID = entityParts[1]
-		}
-		subType, subID := subParts[0], ""
-		if len(subParts) > 1 {
-			subID = subParts[1]
-		}
-		result, err := p.doPost(fmt.Sprintf("/v1/tenants/%s/permissions/check", p.TenantID), map[string]any{
-			"metadata": map[string]any{"snap_token": "", "schema_version": "", "depth": 20},
-			"entity":   map[string]any{"type": entityType, "id": entityID},
-			"permission": check.Permission,
-			"subject":   map[string]any{"type": subType, "id": subID, "relation": ""},
-		})
-		if err == nil {
-			if can, ok := result["can"].(string); ok {
-				return can == "CHECK_RESULT_ALLOWED", nil
-			}
-		}
+	if !p.connected {
+		return false, fmt.Errorf("permify unavailable; denying permission %q on %q", check.Permission, check.Entity)
 	}
-	return true, nil // allow-all fallback
+	entityParts := strings.SplitN(check.Entity, ":", 2)
+	subParts := strings.SplitN(check.Subject, ":", 2)
+	entityType, entityID := entityParts[0], ""
+	if len(entityParts) > 1 {
+		entityID = entityParts[1]
+	}
+	subType, subID := subParts[0], ""
+	if len(subParts) > 1 {
+		subID = subParts[1]
+	}
+	result, err := p.doPost(fmt.Sprintf("/v1/tenants/%s/permissions/check", p.TenantID), map[string]any{
+		"metadata":   map[string]any{"snap_token": "", "schema_version": "", "depth": 20},
+		"entity":     map[string]any{"type": entityType, "id": entityID},
+		"permission": check.Permission,
+		"subject":    map[string]any{"type": subType, "id": subID, "relation": ""},
+	})
+	if err != nil {
+		return false, fmt.Errorf("permify check failed: %w", err)
+	}
+	can, ok := result["can"].(string)
+	if !ok {
+		return false, fmt.Errorf("permify check: malformed response (missing 'can')")
+	}
+	return can == "CHECK_RESULT_ALLOWED", nil
 }
 
 func (p *PermifyClient) WriteRelation(ctx context.Context, entity, relation, subject string) error {
@@ -674,19 +840,25 @@ func (p *PermifyClient) Health() string {
 // ── APISIX ─────────────────────────────────────────────────────────────────────
 
 type APISIXClient struct {
-	AdminURL   string
-	AdminKey   string
-	GatewayURL string
-	connected  bool
-	httpClient *http.Client
+	AdminURL    string
+	AdminKey    string
+	GatewayURL  string
+	connected   bool
+	httpClient  *http.Client
 	localRoutes map[string]RouteConfig
 	mu          sync.Mutex
 }
 
 func NewAPISIXClient() *APISIXClient {
+	// H-23-residual: fail closed — never fall back to a static default admin
+	// key. The service refuses to start without APISIX_ADMIN_KEY.
+	adminKey := os.Getenv("APISIX_ADMIN_KEY")
+	if adminKey == "" {
+		log.Fatalf("APISIX_ADMIN_KEY is not set; refusing to start with a default APISIX admin key")
+	}
 	a := &APISIXClient{
 		AdminURL:    envOr("APISIX_ADMIN_URL", "http://apisix-admin:9180"),
-		AdminKey:    envOr("APISIX_ADMIN_KEY", "change-me-in-production"),
+		AdminKey:    adminKey,
 		GatewayURL:  envOr("APISIX_PUBLIC_URL", "https://api.54bank.app/gateway"),
 		connected:   false,
 		httpClient:  &http.Client{Timeout: 5 * time.Second},
@@ -816,12 +988,78 @@ func (m *MojaloupClient) connect() {
 	log.Printf("[mojaloop] Hub unreachable, using offline mode")
 }
 
+// minorUnitsToDecimal renders integer minor units (e.g. kobo) as a 2dp
+// decimal string for wire protocols (Mojaloop FSPIOP) — no float math.
+func minorUnitsToDecimal(minor int64) string {
+	sign := ""
+	if minor < 0 {
+		sign = "-"
+		minor = -minor
+	}
+	return fmt.Sprintf("%s%d.%02d", sign, minor/100, minor%100)
+}
+
+// ParseDecimalToMinorUnits parses a decimal string into integer minor units.
+// Anything with more than 2 decimal places (or otherwise malformed) is
+// rejected — money is never rounded silently through a float.
+func ParseDecimalToMinorUnits(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty amount")
+	}
+	neg := false
+	if strings.HasPrefix(s, "-") || strings.HasPrefix(s, "+") {
+		neg = s[0] == '-'
+		s = s[1:]
+	}
+	parts := strings.SplitN(s, ".", 2)
+	if parts[0] == "" {
+		return 0, fmt.Errorf("invalid amount %q", s)
+	}
+	whole, err := strconv.ParseInt(parts[0], 10, 62)
+	if err != nil {
+		return 0, fmt.Errorf("invalid amount %q", s)
+	}
+	var frac int64
+	if len(parts) == 2 {
+		if len(parts[1]) > 2 {
+			return 0, fmt.Errorf("amount %q has more than 2 decimal places", s)
+		}
+		fs := parts[1]
+		for len(fs) < 2 {
+			fs += "0"
+		}
+		if fs != "" {
+			frac, err = strconv.ParseInt(fs, 10, 64)
+			if err != nil {
+				return 0, fmt.Errorf("invalid amount %q", s)
+			}
+		}
+	}
+	minor := whole*100 + frac
+	if neg {
+		minor = -minor
+	}
+	return minor, nil
+}
+
+// mojaloopTransferID is a deterministic id: sha256 over the natural business
+// key of the transfer (hex). Replays of the same transfer collapse to one id.
+func mojaloopTransferID(req TransferRequest) string {
+	natural := strings.Join([]string{
+		req.TransactionID, req.PayerFSP, req.PayeeFSP,
+		strconv.FormatInt(req.AmountMinor, 10), req.Currency,
+	}, "|")
+	sum := sha256.Sum256([]byte(natural))
+	return "MOJA-" + hex.EncodeToString(sum[:16])
+}
+
 type TransferRequest struct {
-	PayerFSP      string  `json:"payerFsp"`
-	PayeeFSP      string  `json:"payeeFsp"`
-	Amount        float64 `json:"amount"`
-	Currency      string  `json:"currency"`
-	TransactionID string  `json:"transactionId"`
+	PayerFSP      string `json:"payerFsp"`
+	PayeeFSP      string `json:"payeeFsp"`
+	AmountMinor   int64  `json:"amount_minor"` // integer minor units (kobo) — never float
+	Currency      string `json:"currency"`
+	TransactionID string `json:"transactionId"`
 }
 
 func (m *MojaloupClient) fspiopHeaders(destination string) http.Header {
@@ -834,32 +1072,51 @@ func (m *MojaloupClient) fspiopHeaders(destination string) http.Header {
 	return h
 }
 
+// InitiateTransfer posts a real FSPIOP transfer to the Mojaloop hub. Amounts
+// are integer minor units rendered as a 2dp decimal string (no float math).
+// When the hub is unreachable or rejects the transfer it fails loudly — a
+// transfer id is NEVER returned for a transfer the hub did not accept.
 func (m *MojaloupClient) InitiateTransfer(ctx context.Context, req TransferRequest) (string, error) {
-	transferID := fmt.Sprintf("MOJA-%d", time.Now().UnixMilli())
-
-	if m.connected {
-		body := map[string]any{
-			"transferId": transferID,
-			"payerFsp":   req.PayerFSP,
-			"payeeFsp":   req.PayeeFSP,
-			"amount": map[string]any{
-				"amount":   fmt.Sprintf("%.2f", req.Amount),
-				"currency": req.Currency,
-			},
-			"ilpPacket":  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(`{"amount":"%.2f","destination":"%s"}`, req.Amount, req.PayeeFSP))),
-			"condition":  base64.URLEncoding.EncodeToString([]byte(transferID)),
-			"expiration": time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339),
-		}
-		data, _ := json.Marshal(body)
-		httpReq, _ := http.NewRequestWithContext(ctx, "POST",
-			fmt.Sprintf("%s/transfers", m.Endpoint), bytes.NewReader(data))
-		for k, v := range m.fspiopHeaders(req.PayeeFSP) {
-			httpReq.Header[k] = v
-		}
-		resp, err := m.httpClient.Do(httpReq)
-		if err == nil {
-			resp.Body.Close()
-		}
+	if req.AmountMinor <= 0 {
+		return "", fmt.Errorf("transfer amount must be positive integer minor units")
+	}
+	if !m.connected {
+		return "", fmt.Errorf("mojaloop hub not connected — transfer NOT initiated")
+	}
+	transferID := mojaloopTransferID(req)
+	amountStr := minorUnitsToDecimal(req.AmountMinor)
+	body := map[string]any{
+		"transferId": transferID,
+		"payerFsp":   req.PayerFSP,
+		"payeeFsp":   req.PayeeFSP,
+		"amount": map[string]any{
+			"amount":   amountStr,
+			"currency": req.Currency,
+		},
+		"ilpPacket":  base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf(`{"amount":"%s","destination":"%s"}`, amountStr, req.PayeeFSP))),
+		"condition":  base64.URLEncoding.EncodeToString([]byte(transferID)),
+		"expiration": time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339),
+	}
+	data, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("mojaloop transfer marshal: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/transfers", m.Endpoint), bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("mojaloop transfer request build: %w", err)
+	}
+	for k, v := range m.fspiopHeaders(req.PayeeFSP) {
+		httpReq.Header[k] = v
+	}
+	resp, err := m.httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("mojaloop transfer request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("mojaloop transfer rejected: HTTP %d", resp.StatusCode)
 	}
 	return transferID, nil
 }
@@ -1042,81 +1299,124 @@ func (t *TigerBeetleClient) connect() {
 	resp, err := t.httpClient.Get(fmt.Sprintf("%s/health", t.HTTPAddress))
 	if err == nil {
 		resp.Body.Close()
+		t.mu.Lock()
 		t.connected = true
+		t.mu.Unlock()
 		log.Printf("[tigerbeetle] Connected via HTTP at %s", t.HTTPAddress)
 		return
 	}
 	conn, err := net.DialTimeout("tcp", t.Addresses, 2*time.Second)
 	if err == nil {
 		conn.Close()
+		t.mu.Lock()
 		t.connected = true
+		t.mu.Unlock()
 		log.Printf("[tigerbeetle] Reachable at %s", t.Addresses)
 		return
 	}
-	log.Printf("[tigerbeetle] Connection failed, using in-memory ledger")
+	log.Printf("[tigerbeetle] Connection failed, posting calls will fail fast")
 }
 
 type LedgerEntry struct {
-	DebitAccount  string  `json:"debitAccount"`
-	CreditAccount string  `json:"creditAccount"`
-	Amount        float64 `json:"amount"`
-	Code          string  `json:"code"`
-	Ledger        uint32  `json:"ledger"`
+	DebitAccount  string `json:"debitAccount"`
+	CreditAccount string `json:"creditAccount"`
+	AmountMinor   int64  `json:"amount_minor"` // integer minor units (kobo) — never float
+	Code          string `json:"code"`
+	Ledger        uint32 `json:"ledger"`
+}
+
+// newUUIDv4 returns a random UUIDv4 using crypto/rand. A CSPRNG failure is an
+// error — never fall back to predictable (timestamp/counter-based) ids.
+func newUUIDv4() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("crypto/rand unavailable: %w", err)
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
+}
+
+// CreateTransfer posts a real transfer to the TigerBeetle HTTP bridge and
+// fails loudly on any error. Previously this function discarded the HTTP
+// result and always appended to an in-memory shadow ledger, returning success
+// even when nothing was posted — silent mockware on the money path.
+func (t *TigerBeetleClient) isConnected() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.connected
+}
+
+func (t *TigerBeetleClient) markDisconnected() {
+	t.mu.Lock()
+	t.connected = false
+	t.mu.Unlock()
 }
 
 func (t *TigerBeetleClient) CreateTransfer(ctx context.Context, entry LedgerEntry) (string, error) {
-	transferID := fmt.Sprintf("TB-%d", time.Now().UnixMilli())
-
-	if t.connected {
-		transfer := map[string]any{
-			"id":                transferID,
-			"debit_account_id":  entry.DebitAccount,
-			"credit_account_id": entry.CreditAccount,
-			"amount":            entry.Amount,
-			"ledger":            entry.Ledger,
-			"code":              entry.Code,
-		}
-		data, _ := json.Marshal(map[string]any{"transfers": []any{transfer}})
-		req, _ := http.NewRequestWithContext(ctx, "POST",
-			fmt.Sprintf("%s/transfers/create", t.HTTPAddress), bytes.NewReader(data))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := t.httpClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
+	if entry.AmountMinor <= 0 {
+		return "", fmt.Errorf("transfer amount must be positive integer minor units")
 	}
-	t.mu.Lock()
-	t.transfers = append(t.transfers, map[string]any{
-		"id": transferID, "debit": entry.DebitAccount, "credit": entry.CreditAccount,
-		"amount": entry.Amount, "timestamp": NowISO(),
-	})
-	t.mu.Unlock()
+	// Collision-proof, non-predictable transfer id: UUIDv4 from crypto/rand.
+	u, err := newUUIDv4()
+	if err != nil {
+		return "", err
+	}
+	transferID := "TB-" + u
+
+	if !t.isConnected() {
+		return "", fmt.Errorf("tigerbeetle unavailable: not connected (addresses=%s)", t.Addresses)
+	}
+	transfer := map[string]any{
+		"id":                transferID,
+		"debit_account_id":  entry.DebitAccount,
+		"credit_account_id": entry.CreditAccount,
+		"amount":            entry.AmountMinor,
+		"ledger":            entry.Ledger,
+		"code":              entry.Code,
+	}
+	data, _ := json.Marshal(map[string]any{"transfers": []any{transfer}})
+	req, _ := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/transfers/create", t.HTTPAddress), bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		t.markDisconnected()
+		return "", fmt.Errorf("tigerbeetle transfer failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("tigerbeetle transfer rejected: HTTP %d", resp.StatusCode)
+	}
 	return transferID, nil
 }
 
+// CreateAccount creates a real account via the TigerBeetle HTTP bridge and
+// fails loudly on any error. Previously it discarded the HTTP result and
+// always recorded a shadow in-memory account with zero balances.
 func (t *TigerBeetleClient) CreateAccount(ctx context.Context, id int64, ledger uint32, code uint16) error {
-	if t.connected {
-		account := map[string]any{"id": id, "ledger": ledger, "code": code}
-		data, _ := json.Marshal(map[string]any{"accounts": []any{account}})
-		req, _ := http.NewRequestWithContext(ctx, "POST",
-			fmt.Sprintf("%s/accounts/create", t.HTTPAddress), bytes.NewReader(data))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := t.httpClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
+	if !t.isConnected() {
+		return fmt.Errorf("tigerbeetle unavailable: not connected (addresses=%s)", t.Addresses)
 	}
-	t.mu.Lock()
-	t.accounts[id] = map[string]any{
-		"id": id, "ledger": ledger, "code": code,
-		"debits_posted": 0, "credits_posted": 0,
+	account := map[string]any{"id": id, "ledger": ledger, "code": code}
+	data, _ := json.Marshal(map[string]any{"accounts": []any{account}})
+	req, _ := http.NewRequestWithContext(ctx, "POST",
+		fmt.Sprintf("%s/accounts/create", t.HTTPAddress), bytes.NewReader(data))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		t.markDisconnected()
+		return fmt.Errorf("tigerbeetle account create failed: %w", err)
 	}
-	t.mu.Unlock()
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("tigerbeetle account create rejected: HTTP %d", resp.StatusCode)
+	}
 	return nil
 }
 
 func (t *TigerBeetleClient) Health() string {
-	if t.connected {
+	if t.isConnected() {
 		resp, err := t.httpClient.Get(fmt.Sprintf("%s/health", t.HTTPAddress))
 		if err == nil {
 			resp.Body.Close()
@@ -1127,7 +1427,7 @@ func (t *TigerBeetleClient) Health() string {
 			conn.Close()
 			return "connected"
 		}
-		t.connected = false
+		t.markDisconnected()
 	}
 	return "configured"
 }
@@ -1142,7 +1442,8 @@ type PostgresClient struct {
 
 func NewPostgresClient() *PostgresClient {
 	return &PostgresClient{
-		ConnectionString: envOr("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"),
+		// M-04: no compiled-in credentials; env-only.
+		ConnectionString: envOr("DATABASE_URL", ""),
 		connected:        false,
 	}
 }
@@ -1223,8 +1524,15 @@ func DecodeBody(r *http.Request, v any) error {
 	return json.Unmarshal(body, v)
 }
 
+// GenID returns a collision-proof, non-predictable id: 128 bits from
+// crypto/rand, hex-encoded. CSPRNG failure is fatal — a timestamp-derived id
+// is never an acceptable fallback for financial records.
 func GenID(prefix string) string {
-	return fmt.Sprintf("%s-%08X", prefix, uint32(time.Now().UnixNano()))
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("crypto/rand unavailable, refusing to generate weak id: %v", err))
+	}
+	return fmt.Sprintf("%s-%X", prefix, b[:])
 }
 
 func NowISO() string {
@@ -1249,7 +1557,20 @@ func EnvOr(key, fallback string) string {
 // CORSMiddleware adds CORS headers for development.
 func CORSMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,PATCH,OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type,Authorization,X-Tenant-ID")
 		if r.Method == "OPTIONS" {

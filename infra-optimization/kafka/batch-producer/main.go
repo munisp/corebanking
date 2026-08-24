@@ -18,22 +18,22 @@ import (
 )
 
 type ProducerConfig struct {
-	Brokers       string
-	BatchSize     int
-	LingerMs      int
-	Compression   string
-	Acks          string
-	MaxInFlight   int
-	BufferMemory  int64
-	RetryBackoff  time.Duration
-	MaxRetries    int
+	Brokers      string
+	BatchSize    int
+	LingerMs     int
+	Compression  string
+	Acks         string
+	MaxInFlight  int
+	BufferMemory int64
+	RetryBackoff time.Duration
+	MaxRetries   int
 }
 
 func defaultConfig() ProducerConfig {
 	return ProducerConfig{
 		Brokers:      envOr("KAFKA_BROKERS", "kafka-1:9092,kafka-2:9092,kafka-3:9092"),
-		BatchSize:    1048576,  // 1MB batch
-		LingerMs:     5,        // Wait 5ms to fill batch
+		BatchSize:    1048576, // 1MB batch
+		LingerMs:     5,       // Wait 5ms to fill batch
 		Compression:  "lz4",   // LZ4 for speed, zstd for ratio
 		Acks:         "1",     // Leader ack only for speed (use "all" for critical)
 		MaxInFlight:  5,
@@ -59,12 +59,12 @@ type TopicBatch struct {
 }
 
 type BatchAggregator struct {
-	batches     map[string]*TopicBatch
-	mu          sync.RWMutex
-	maxBatch    int
-	lingerMs    int
-	produced    int64
-	dropped     int64
+	batches  map[string]*TopicBatch
+	mu       sync.RWMutex
+	maxBatch int
+	lingerMs int
+	produced int64
+	dropped  int64
 }
 
 func NewBatchAggregator(maxBatch, lingerMs int) *BatchAggregator {

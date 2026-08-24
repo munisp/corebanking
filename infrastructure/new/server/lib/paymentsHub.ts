@@ -104,10 +104,17 @@ export function calculateFee(type: string, amount: number): { fee: number; vat: 
     else feeKey = "nip_above_50000";
   }
   const schedule = PAYMENT_FEES[feeKey] || PAYMENT_FEES["internal"];
-  const rawFee = schedule.fixed + (amount * schedule.percentage / 100);
-  const fee = Math.min(rawFee, schedule.cap || rawFee);
-  const vat = fee * 0.075; // 7.5% VAT on banking fees
-  return { fee: Math.round(fee * 100) / 100, vat: Math.round(vat * 100) / 100 };
+  // M-28: all money math in integer minor units (kobo). No raw float arithmetic:
+  // fee = fixed + amount * percentage, capped; VAT = 7.5% of the fee.
+  // percentage is expressed in basis points (0.05% => 5 bps, 0.5% => 50 bps).
+  const amountKobo = Math.round(amount * 100);
+  const fixedKobo = Math.round(schedule.fixed * 100);
+  const bps = Math.round(schedule.percentage * 100);
+  const capKobo = Math.round(schedule.cap * 100);
+  const rawFeeKobo = fixedKobo + Math.round((amountKobo * bps) / 10_000);
+  const feeKobo = capKobo > 0 ? Math.min(rawFeeKobo, capKobo) : rawFeeKobo;
+  const vatKobo = Math.round((feeKobo * 75) / 1000); // 7.5% VAT on banking fees
+  return { fee: feeKobo / 100, vat: vatKobo / 100 };
 }
 
 export function checkLimit(channel: string, tier: string, amount: number): { allowed: boolean; limit?: PaymentLimit; reason?: string } {

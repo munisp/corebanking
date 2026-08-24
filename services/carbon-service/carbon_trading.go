@@ -28,45 +28,45 @@ type CarbonCredit struct {
 
 // CarbonProject represents a carbon offset project
 type CarbonProject struct {
-	ID                string
-	TenantID          string
-	ProjectName       string
-	ProjectType       string // "Renewable Energy", "Forestry", "Energy Efficiency"
-	Location          string
-	Developer         string
-	Registry          string
-	TotalCredits      float64
-	AvailableCredits  float64
-	RetiredCredits    float64
-	PricePerCredit    float64
-	Vintage           int
+	ID                 string
+	TenantID           string
+	ProjectName        string
+	ProjectType        string // "Renewable Energy", "Forestry", "Energy Efficiency"
+	Location           string
+	Developer          string
+	Registry           string
+	TotalCredits       float64
+	AvailableCredits   float64
+	RetiredCredits     float64
+	PricePerCredit     float64
+	Vintage            int
 	VerificationStatus string // "verified", "pending", "rejected"
-	CertificationBody string
-	CreatedAt         time.Time
+	CertificationBody  string
+	CreatedAt          time.Time
 }
 
 // CarbonTrade represents a trade transaction
 type CarbonTrade struct {
-	ID              string
-	TenantID        string
-	TradeType       string // "buy", "sell"
-	BuyerID         string
-	SellerID        string
-	ProjectID       string
-	Quantity        float64
-	PricePerCredit  float64
-	TotalAmount     float64
-	Status          string // "pending", "completed", "cancelled"
-	TradeDate       time.Time
-	SettlementDate  *time.Time
-	TransferStatus  string // "pending", "completed"
+	ID             string
+	TenantID       string
+	TradeType      string // "buy", "sell"
+	BuyerID        string
+	SellerID       string
+	ProjectID      string
+	Quantity       float64
+	PricePerCredit float64
+	TotalAmount    float64
+	Status         string // "pending", "completed", "cancelled"
+	TradeDate      time.Time
+	SettlementDate *time.Time
+	TransferStatus string // "pending", "completed"
 }
 
 // FootprintCalculation represents carbon footprint assessment
 type FootprintCalculation struct {
 	EntityID        string
 	TenantID        string
-	Period          string // "2024-Q1"
+	Period          string  // "2024-Q1"
 	TotalEmissions  float64 // tonnes CO2e
 	Scope1Emissions float64 // Direct emissions
 	Scope2Emissions float64 // Indirect from energy
@@ -92,17 +92,17 @@ func (c *FootprintCalculator) CalculateFootprint(
 	period string,
 	activityData map[string]float64,
 ) (*FootprintCalculation, error) {
-	
+
 	// Emission factors (kg CO2e per unit)
 	emissionFactors := map[string]float64{
-		"electricity_kwh":     0.5,   // kg CO2e per kWh
-		"natural_gas_m3":      2.0,   // kg CO2e per m³
-		"diesel_liters":       2.68,  // kg CO2e per liter
-		"petrol_liters":       2.31,  // kg CO2e per liter
-		"air_travel_km":       0.255, // kg CO2e per km
-		"road_freight_km":     0.062, // kg CO2e per tonne-km
-		"waste_tonnes":        21.0,  // kg CO2e per tonne
-		"water_m3":            0.34,  // kg CO2e per m³
+		"electricity_kwh": 0.5,   // kg CO2e per kWh
+		"natural_gas_m3":  2.0,   // kg CO2e per m³
+		"diesel_liters":   2.68,  // kg CO2e per liter
+		"petrol_liters":   2.31,  // kg CO2e per liter
+		"air_travel_km":   0.255, // kg CO2e per km
+		"road_freight_km": 0.062, // kg CO2e per tonne-km
+		"waste_tonnes":    21.0,  // kg CO2e per tonne
+		"water_m3":        0.34,  // kg CO2e per m³
 	}
 
 	breakdown := make(map[string]float64)
@@ -168,7 +168,7 @@ func (i *CreditIssuer) IssueCredits(
 	quantity float64,
 	vintage int,
 ) ([]*CarbonCredit, error) {
-	
+
 	if project.VerificationStatus != "verified" {
 		return nil, fmt.Errorf("project must be verified before issuing credits")
 	}
@@ -243,7 +243,7 @@ func (t *TradingEngine) ExecuteTrade(
 	pricePerCredit float64,
 	tenantID string,
 ) (*CarbonTrade, error) {
-	
+
 	// Validate trade parameters
 	if quantity <= 0 {
 		return nil, fmt.Errorf("quantity must be positive")
@@ -343,7 +343,7 @@ func (r *CreditRetirement) RetireCredits(
 	retirementReason string,
 	beneficiary string,
 ) error {
-	
+
 	// Validate ownership and availability
 	availableCredits := r.getOwnerCredits(ownerID, projectID)
 	if availableCredits < quantity {
@@ -390,7 +390,7 @@ func (r *CreditRetirement) generateRetirementCertificate(
 	reason string,
 	beneficiary string,
 ) string {
-	
+
 	certificateID := fmt.Sprintf("RET%d", time.Now().UnixNano())
 
 	// In production, generate PDF certificate
@@ -431,7 +431,7 @@ func (e *ESGReporter) GenerateESGReport(
 	tenantID string,
 	period string,
 ) (map[string]interface{}, error) {
-	
+
 	// Get carbon footprint data
 	footprint := e.getFootprintData(entityID, period)
 
@@ -448,16 +448,16 @@ func (e *ESGReporter) GenerateESGReport(
 	esgScore := e.calculateESGScore(footprint, offsetCredits, renewablePercentage)
 
 	report := map[string]interface{}{
-		"entity_id":             entityID,
-		"period":                period,
-		"total_emissions":       footprint,
-		"offset_credits":        offsetCredits,
-		"net_emissions":         footprint - offsetCredits,
-		"carbon_intensity":      carbonIntensity,
-		"renewable_percentage":  renewablePercentage,
-		"esg_score":             esgScore,
-		"carbon_neutral":        footprint <= offsetCredits,
-		"report_date":           time.Now(),
+		"entity_id":            entityID,
+		"period":               period,
+		"total_emissions":      footprint,
+		"offset_credits":       offsetCredits,
+		"net_emissions":        footprint - offsetCredits,
+		"carbon_intensity":     carbonIntensity,
+		"renewable_percentage": renewablePercentage,
+		"esg_score":            esgScore,
+		"carbon_neutral":       footprint <= offsetCredits,
+		"report_date":          time.Now(),
 	}
 
 	return report, nil
@@ -478,7 +478,7 @@ func (e *ESGReporter) calculateCarbonIntensity(entityID string, period string) f
 	// In production, get actual revenue data
 	emissions := e.getFootprintData(entityID, period)
 	revenue := 50000000.0 // ₦50M
-	
+
 	return emissions / revenue * 1000000 // tonnes CO2e per million Naira
 }
 
@@ -514,8 +514,8 @@ type RegistryClient struct {
 
 func NewRegistryClient(registryType string, apiKey string) *RegistryClient {
 	baseURLs := map[string]string{
-		"Verra":          "https://registry.verra.org/api",
-		"Gold Standard":  "https://registry.goldstandard.org/api",
+		"Verra":         "https://registry.verra.org/api",
+		"Gold Standard": "https://registry.goldstandard.org/api",
 	}
 
 	return &RegistryClient{

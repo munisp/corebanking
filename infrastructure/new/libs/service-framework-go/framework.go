@@ -119,11 +119,11 @@ func Retry(cfg RetryConfig, fn func() error) error {
 // --- Token Bucket Rate Limiter ---
 
 type RateLimiter struct {
-	mu       sync.Mutex
-	tokens   float64
+	mu        sync.Mutex
+	tokens    float64
 	maxTokens float64
-	rate     float64
-	lastTime time.Time
+	rate      float64
+	lastTime  time.Time
 }
 
 func NewRateLimiter(maxTokens, refillRate float64) *RateLimiter {

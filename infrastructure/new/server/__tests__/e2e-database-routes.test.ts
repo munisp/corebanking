@@ -23,8 +23,8 @@ describe("E2E: Database Routes — Core Tables", () => {
   ];
 
   for (const table of coreTables) {
-    it(`/api/db/${table} returns source=database with items`, async () => {
-      if (!serverUp) return;
+    it(`/api/db/${table} returns source=database with items`, async (ctx) => {
+      if (!serverUp) return ctx.skip();
       const { status, json, isJson } = await fetchJson(`/api/db/${table}`);
       expect(status).toBe(200);
       expect(isJson).toBe(true);
@@ -34,8 +34,8 @@ describe("E2E: Database Routes — Core Tables", () => {
     });
   }
 
-  it("supports pagination via page and limit params", async () => {
-    if (!serverUp) return;
+  it("supports pagination via page and limit params", async (ctx) => {
+    if (!serverUp) return ctx.skip();
     const { status, json } = await fetchJson("/api/db/customers?page=1&limit=2");
     expect(status).toBe(200);
     expect(json.source).toBe("database");
@@ -44,8 +44,8 @@ describe("E2E: Database Routes — Core Tables", () => {
     expect(json.items.length).toBeLessThanOrEqual(2);
   });
 
-  it("returns total count for customers", async () => {
-    if (!serverUp) return;
+  it("returns total count for customers", async (ctx) => {
+    if (!serverUp) return ctx.skip();
     const { json } = await fetchJson("/api/db/customers");
     expect(json.total).toBeGreaterThan(0);
   });
@@ -57,8 +57,8 @@ describe("E2E: Database Routes — Regulatory & Compliance", () => {
   const regulatoryTables = ["aml-alerts", "kyc-verifications", "regulatory-reports", "sanctions-screenings"];
 
   for (const table of regulatoryTables) {
-    it(`/api/db/${table} returns database data`, async () => {
-      if (!serverUp) return;
+    it(`/api/db/${table} returns database data`, async (ctx) => {
+      if (!serverUp) return ctx.skip();
       const { status, json, isJson } = await fetchJson(`/api/db/${table}`);
       expect(status).toBe(200);
       expect(isJson).toBe(true);
@@ -76,8 +76,8 @@ describe("E2E: Database Routes — Channel Banking", () => {
   ];
 
   for (const table of channelTables) {
-    it(`/api/db/${table} returns data from Postgres`, async () => {
-      if (!serverUp) return;
+    it(`/api/db/${table} returns data from Postgres`, async (ctx) => {
+      if (!serverUp) return ctx.skip();
       const { status, json, isJson } = await fetchJson(`/api/db/${table}`);
       expect(status).toBe(200);
       expect(isJson).toBe(true);
@@ -92,8 +92,8 @@ describe("E2E: Database Routes — Agriculture & Cooperative Banking", () => {
   const agriTables = ["agri-loans", "cooperative-management", "livestock-management"];
 
   for (const table of agriTables) {
-    it(`/api/db/${table} returns data from Postgres`, async () => {
-      if (!serverUp) return;
+    it(`/api/db/${table} returns data from Postgres`, async (ctx) => {
+      if (!serverUp) return ctx.skip();
       const { status, json, isJson } = await fetchJson(`/api/db/${table}`);
       expect(status).toBe(200);
       expect(isJson).toBe(true);

@@ -74,39 +74,39 @@ var DefaultOfflinePINConfig = OfflinePINConfig{
 
 // OfflinePINData represents encrypted PIN data stored on device
 type OfflinePINData struct {
-	UserID              string    `json:"user_id"`
-	DeviceID            string    `json:"device_id"`
-	EncryptedPINHash    string    `json:"encrypted_pin_hash"`
-	Salt                string    `json:"salt"`
-	IV                  string    `json:"iv"`
-	CreatedAt           time.Time `json:"created_at"`
-	ExpiresAt           time.Time `json:"expires_at"`
-	LastSyncAt          time.Time `json:"last_sync_at"`
-	FailedAttempts      int       `json:"failed_attempts"`
+	UserID              string     `json:"user_id"`
+	DeviceID            string     `json:"device_id"`
+	EncryptedPINHash    string     `json:"encrypted_pin_hash"`
+	Salt                string     `json:"salt"`
+	IV                  string     `json:"iv"`
+	CreatedAt           time.Time  `json:"created_at"`
+	ExpiresAt           time.Time  `json:"expires_at"`
+	LastSyncAt          time.Time  `json:"last_sync_at"`
+	FailedAttempts      int        `json:"failed_attempts"`
 	LockedUntil         *time.Time `json:"locked_until,omitempty"`
-	OfflineTransactions int       `json:"offline_transactions"`
-	OfflineAmount       float64   `json:"offline_amount"`
-	Version             int       `json:"version"`
-	Checksum            string    `json:"checksum"`
+	OfflineTransactions int        `json:"offline_transactions"`
+	OfflineAmount       float64    `json:"offline_amount"`
+	Version             int        `json:"version"`
+	Checksum            string     `json:"checksum"`
 }
 
 // OfflinePINVerificationResult represents the result of offline PIN verification
 type OfflinePINVerificationResult struct {
-	Valid              bool      `json:"valid"`
-	RemainingAttempts  int       `json:"remaining_attempts"`
+	Valid              bool       `json:"valid"`
+	RemainingAttempts  int        `json:"remaining_attempts"`
 	LockedUntil        *time.Time `json:"locked_until,omitempty"`
-	RequiresOnlineSync bool      `json:"requires_online_sync"`
-	Message            string    `json:"message"`
+	RequiresOnlineSync bool       `json:"requires_online_sync"`
+	Message            string     `json:"message"`
 }
 
 // OfflinePINService handles offline PIN verification
 type OfflinePINService struct {
-	db            *pgxpool.Pool
-	config        OfflinePINConfig
-	masterKey     []byte
-	deviceKeys    map[string][]byte
-	mutex         sync.RWMutex
-	smsProvider   SMSProvider
+	db          *pgxpool.Pool
+	config      OfflinePINConfig
+	masterKey   []byte
+	deviceKeys  map[string][]byte
+	mutex       sync.RWMutex
+	smsProvider SMSProvider
 }
 
 // SMSProvider interface for sending SMS alerts
@@ -433,14 +433,14 @@ func (s *OfflinePINService) generateChecksum(data *OfflinePINData) string {
 
 // BiometricData represents stored biometric template
 type BiometricData struct {
-	UserID           string    `json:"user_id"`
-	DeviceID         string    `json:"device_id"`
-	BiometricType    string    `json:"biometric_type"` // fingerprint, face, iris
-	EncryptedTemplate string   `json:"encrypted_template"`
-	IV               string    `json:"iv"`
-	CreatedAt        time.Time `json:"created_at"`
-	ExpiresAt        time.Time `json:"expires_at"`
-	Checksum         string    `json:"checksum"`
+	UserID            string    `json:"user_id"`
+	DeviceID          string    `json:"device_id"`
+	BiometricType     string    `json:"biometric_type"` // fingerprint, face, iris
+	EncryptedTemplate string    `json:"encrypted_template"`
+	IV                string    `json:"iv"`
+	CreatedAt         time.Time `json:"created_at"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	Checksum          string    `json:"checksum"`
 }
 
 // BiometricOfflinePINService handles biometric-based offline auth
@@ -521,18 +521,18 @@ func (s *BiometricOfflinePINService) VerifyBiometric(ctx context.Context, data *
 
 // OfflineTransaction represents a transaction performed offline
 type OfflineTransaction struct {
-	TransactionID   string    `json:"transaction_id"`
-	UserID          string    `json:"user_id"`
-	DeviceID        string    `json:"device_id"`
-	Type            string    `json:"type"`
-	Amount          float64   `json:"amount"`
-	Recipient       string    `json:"recipient,omitempty"`
-	Description     string    `json:"description"`
-	CreatedAt       time.Time `json:"created_at"`
-	PINVerifiedAt   time.Time `json:"pin_verified_at"`
-	Signature       string    `json:"signature"`
-	SyncStatus      string    `json:"sync_status"` // pending, synced, failed
-	SyncAttempts    int       `json:"sync_attempts"`
+	TransactionID   string     `json:"transaction_id"`
+	UserID          string     `json:"user_id"`
+	DeviceID        string     `json:"device_id"`
+	Type            string     `json:"type"`
+	Amount          float64    `json:"amount"`
+	Recipient       string     `json:"recipient,omitempty"`
+	Description     string     `json:"description"`
+	CreatedAt       time.Time  `json:"created_at"`
+	PINVerifiedAt   time.Time  `json:"pin_verified_at"`
+	Signature       string     `json:"signature"`
+	SyncStatus      string     `json:"sync_status"` // pending, synced, failed
+	SyncAttempts    int        `json:"sync_attempts"`
 	LastSyncAttempt *time.Time `json:"last_sync_attempt,omitempty"`
 }
 
@@ -675,13 +675,13 @@ func (s *SecureStorage) Delete(key string) error {
 
 // MigrationToken represents a token for migrating PIN data
 type MigrationToken struct {
-	Token     string    `json:"token"`
-	UserID    string    `json:"user_id"`
-	FromDevice string   `json:"from_device"`
-	ToDevice  string    `json:"to_device"`
-	CreatedAt time.Time `json:"created_at"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Used      bool      `json:"used"`
+	Token      string    `json:"token"`
+	UserID     string    `json:"user_id"`
+	FromDevice string    `json:"from_device"`
+	ToDevice   string    `json:"to_device"`
+	CreatedAt  time.Time `json:"created_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Used       bool      `json:"used"`
 }
 
 // GenerateMigrationToken generates a token for migrating to a new device
@@ -807,4 +807,4 @@ CREATE INDEX IF NOT EXISTS idx_offline_pin_expires ON offline_pin_data(expires_a
 CREATE INDEX IF NOT EXISTS idx_migration_tokens_expires ON pin_migration_tokens(expires_at);
 CREATE INDEX IF NOT EXISTS idx_offline_txn_sync_status ON offline_transactions(sync_status);
 CREATE INDEX IF NOT EXISTS idx_offline_txn_user ON offline_transactions(user_id);
-`;
+`

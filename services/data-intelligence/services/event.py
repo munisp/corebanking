@@ -9,7 +9,9 @@ class EventService:
     def get_event_by_id(self, event_id, tenant_id: str):
         return self._event_repo.get_event_by_id(event_id, tenant_id)
 
-    def create_event(self, topic: str = "default", raw: dict = {}):
+    def create_event(self, topic: str = "default", raw: dict = None):
+        if raw is None:
+            raw = {}
         return self._event_repo.create_event(topic=topic, raw=raw)
 
     def update_event(self, event_id, update_data, tenant_id: str):

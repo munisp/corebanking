@@ -14,6 +14,20 @@ from urllib.error import URLError
 
 # ─── MIDDLEWARE CONFIGURATION ────────────────────────────────────────────────
 
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
 MIDDLEWARE_CONFIG = {
     "kafka": {
         "endpoint": os.environ.get("KAFKA_BROKERS", "localhost:9092"),
@@ -39,7 +53,7 @@ MIDDLEWARE_CONFIG = {
         ],
     },
     "postgres": {
-        "endpoint": os.environ.get("DATABASE_URL", "postgresql://ndsep_user:ndsep_secure_2026@localhost:5432/ndsep_db"),
+        "endpoint": _require_env("DATABASE_URL"),
         "purpose": "Primary data source for KPI calculations and trend queries",
     },
     "keycloak": {

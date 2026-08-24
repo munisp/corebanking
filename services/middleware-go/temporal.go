@@ -14,24 +14,24 @@ import (
 type WorkflowStatus string
 
 const (
-	WorkflowPending    WorkflowStatus = "pending"
-	WorkflowRunning    WorkflowStatus = "running"
-	WorkflowCompleted  WorkflowStatus = "completed"
-	WorkflowFailed     WorkflowStatus = "failed"
-	WorkflowCancelled  WorkflowStatus = "cancelled"
+	WorkflowPending      WorkflowStatus = "pending"
+	WorkflowRunning      WorkflowStatus = "running"
+	WorkflowCompleted    WorkflowStatus = "completed"
+	WorkflowFailed       WorkflowStatus = "failed"
+	WorkflowCancelled    WorkflowStatus = "cancelled"
 	WorkflowCompensating WorkflowStatus = "compensating"
 )
 
 type SagaStep struct {
-	Name         string                 `json:"name"`
-	Status       WorkflowStatus         `json:"status"`
-	StartedAt    *time.Time             `json:"startedAt,omitempty"`
-	CompletedAt  *time.Time             `json:"completedAt,omitempty"`
-	Input        map[string]interface{} `json:"input,omitempty"`
-	Output       map[string]interface{} `json:"output,omitempty"`
-	Error        string                 `json:"error,omitempty"`
-	Compensated  bool                   `json:"compensated"`
-	RetryCount   int                    `json:"retryCount"`
+	Name        string                 `json:"name"`
+	Status      WorkflowStatus         `json:"status"`
+	StartedAt   *time.Time             `json:"startedAt,omitempty"`
+	CompletedAt *time.Time             `json:"completedAt,omitempty"`
+	Input       map[string]interface{} `json:"input,omitempty"`
+	Output      map[string]interface{} `json:"output,omitempty"`
+	Error       string                 `json:"error,omitempty"`
+	Compensated bool                   `json:"compensated"`
+	RetryCount  int                    `json:"retryCount"`
 }
 
 type SagaWorkflow struct {

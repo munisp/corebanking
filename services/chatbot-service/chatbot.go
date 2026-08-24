@@ -46,34 +46,34 @@ var (
 type Intent string
 
 const (
-	IntentGreeting         Intent = "greeting"
-	IntentBalance          Intent = "balance_inquiry"
-	IntentTransfer         Intent = "transfer_money"
+	IntentGreeting           Intent = "greeting"
+	IntentBalance            Intent = "balance_inquiry"
+	IntentTransfer           Intent = "transfer_money"
 	IntentTransactionHistory Intent = "transaction_history"
-	IntentLoanInquiry      Intent = "loan_inquiry"
-	IntentLoanApplication  Intent = "loan_application"
-	IntentCardServices     Intent = "card_services"
-	IntentAccountInfo      Intent = "account_info"
-	IntentBillPayment      Intent = "bill_payment"
-	IntentComplaint        Intent = "complaint"
-	IntentFeedback         Intent = "feedback"
-	IntentHelp             Intent = "help"
-	IntentHumanAgent       Intent = "human_agent"
-	IntentUnknown          Intent = "unknown"
+	IntentLoanInquiry        Intent = "loan_inquiry"
+	IntentLoanApplication    Intent = "loan_application"
+	IntentCardServices       Intent = "card_services"
+	IntentAccountInfo        Intent = "account_info"
+	IntentBillPayment        Intent = "bill_payment"
+	IntentComplaint          Intent = "complaint"
+	IntentFeedback           Intent = "feedback"
+	IntentHelp               Intent = "help"
+	IntentHumanAgent         Intent = "human_agent"
+	IntentUnknown            Intent = "unknown"
 )
 
 // ChatMessage represents a chat message
 type ChatMessage struct {
-	ID          string                 `json:"id"`
-	SessionID   string                 `json:"session_id"`
-	UserID      string                 `json:"user_id"`
-	Role        string                 `json:"role"` // user, bot, agent
-	Content     string                 `json:"content"`
-	Intent      Intent                 `json:"intent,omitempty"`
-	Entities    map[string]interface{} `json:"entities,omitempty"`
-	QuickReplies []QuickReply          `json:"quick_replies,omitempty"`
-	Attachments []Attachment           `json:"attachments,omitempty"`
-	Timestamp   time.Time              `json:"timestamp"`
+	ID           string                 `json:"id"`
+	SessionID    string                 `json:"session_id"`
+	UserID       string                 `json:"user_id"`
+	Role         string                 `json:"role"` // user, bot, agent
+	Content      string                 `json:"content"`
+	Intent       Intent                 `json:"intent,omitempty"`
+	Entities     map[string]interface{} `json:"entities,omitempty"`
+	QuickReplies []QuickReply           `json:"quick_replies,omitempty"`
+	Attachments  []Attachment           `json:"attachments,omitempty"`
+	Timestamp    time.Time              `json:"timestamp"`
 }
 
 // QuickReply represents a quick reply option
@@ -91,16 +91,16 @@ type Attachment struct {
 
 // ChatSession represents a chat session
 type ChatSession struct {
-	ID           string                 `json:"id"`
-	UserID       string                 `json:"user_id"`
-	TenantID     string                 `json:"tenant_id"`
-	Status       string                 `json:"status"` // active, escalated, closed
-	Context      map[string]interface{} `json:"context"`
-	Messages     []*ChatMessage         `json:"messages"`
-	AgentID      string                 `json:"agent_id,omitempty"`
-	CreatedAt    time.Time              `json:"created_at"`
-	UpdatedAt    time.Time              `json:"updated_at"`
-	EscalatedAt  *time.Time             `json:"escalated_at,omitempty"`
+	ID          string                 `json:"id"`
+	UserID      string                 `json:"user_id"`
+	TenantID    string                 `json:"tenant_id"`
+	Status      string                 `json:"status"` // active, escalated, closed
+	Context     map[string]interface{} `json:"context"`
+	Messages    []*ChatMessage         `json:"messages"`
+	AgentID     string                 `json:"agent_id,omitempty"`
+	CreatedAt   time.Time              `json:"created_at"`
+	UpdatedAt   time.Time              `json:"updated_at"`
+	EscalatedAt *time.Time             `json:"escalated_at,omitempty"`
 }
 
 // ChatbotService handles chatbot interactions

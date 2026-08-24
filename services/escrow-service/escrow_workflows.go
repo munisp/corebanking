@@ -276,12 +276,16 @@ func EscrowLifecycleWorkflow(ctx workflow.Context, input EscrowLifecycleInput) (
 		}
 	}
 
-	// Calculate final fee
+	// Calculate final fee — a money calculation; a failure here must fail the
+	// workflow (Temporal retries) rather than record a zero/garbage fee.
 	var feeResult FeeResult
-	_ = workflow.ExecuteActivity(ctx, CalculateFeeActivity, FeeInput{
+	if err := workflow.ExecuteActivity(ctx, CalculateFeeActivity, FeeInput{
 		ContractID: input.ContractID,
 		Amount:     result.TotalReleased,
-	}).Get(ctx, &feeResult)
+	}).Get(ctx, &feeResult); err != nil {
+		logger.Error("Fee calculation failed", "error", err, "contract_id", input.ContractID)
+		return nil, err
+	}
 	result.FeeCollected = feeResult.FeeAmount
 
 	// Record completion
@@ -557,20 +561,29 @@ func DisputeResolutionWorkflow(ctx workflow.Context, input DisputeResolutionInpu
 	result.AmountToSeller = resolution.AmountToSeller
 	result.ResolvedBy = resolution.ResolvedBy
 
-	// Process fund transfers based on resolution
+	// Process fund transfers based on resolution. These move money: errors
+	// MUST propagate (failing the workflow so Temporal retries/alerts) — a
+	// silently dropped refund or release strands funds in escrow.
 	if resolution.AmountToBuyer > 0 {
-		_ = workflow.ExecuteActivity(ctx, RefundFundsActivity, RefundInput{
+		if err := workflow.ExecuteActivity(ctx, RefundFundsActivity, RefundInput{
 			ContractID: input.ContractID,
 			Amount:     resolution.AmountToBuyer,
 			Reason:     "Dispute resolution - buyer portion",
-		})
+		}).Get(ctx, nil); err != nil {
+			logger.Error("Dispute refund to buyer failed", "error", err, "dispute_id", input.DisputeID, "amount", resolution.AmountToBuyer)
+			return nil, err
+		}
 	}
 
 	if resolution.AmountToSeller > 0 {
-		_ = workflow.ExecuteActivity(ctx, ReleaseFundsActivity, ReleaseInput{
+		var releaseResult ReleaseResult
+		if err := workflow.ExecuteActivity(ctx, ReleaseFundsActivity, ReleaseInput{
 			ContractID: input.ContractID,
 			Amount:     resolution.AmountToSeller,
-		})
+		}).Get(ctx, &releaseResult); err != nil {
+			logger.Error("Dispute release to seller failed", "error", err, "dispute_id", input.DisputeID, "amount", resolution.AmountToSeller)
+			return nil, err
+		}
 	}
 
 	// Record audit log

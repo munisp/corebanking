@@ -2,8 +2,19 @@ package fundsaga
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 )
+
+// testFXRateProvider is the deterministic rate source used by tests:
+// 1 NGN = 0.0013 USD → 13 basis points of minor units.
+func testFXRateProvider(fromCurrency, toCurrency string, valueDate time.Time) (int64, error) {
+	if fromCurrency == "NGN" && toCurrency == "USD" {
+		return 13, nil
+	}
+	return 0, fmt.Errorf("no test rate for %s/%s", fromCurrency, toCurrency)
+}
 
 func TestLoanRepaymentSaga_DoubleEntry(t *testing.T) {
 	steps, state := LoanRepaymentSaga("borrower", "loan-acct", "interest-acct", 90000, 10000)
@@ -126,7 +137,13 @@ func TestAllSagasExecuteWithCompensation(t *testing.T) {
 		{"P2P", func() ([]SagaStep, *SagaState) { return P2PTransferSaga("A", "B", 10000) }},
 		{"Salary", func() ([]SagaStep, *SagaState) { return BulkSalarySaga("C", []string{"D"}, []AmountKobo{10000}) }},
 		{"Loan", func() ([]SagaStep, *SagaState) { return LoanDisbursementSaga("L", "B", 50000) }},
-		{"Remittance", func() ([]SagaStep, *SagaState) { return CrossBorderRemittanceSaga("S", "R", 100000, 13, "USD") }},
+		{"Remittance", func() ([]SagaStep, *SagaState) {
+			steps, state, err := CrossBorderRemittanceSaga("S", "R", 100000, "USD")
+			if err != nil {
+				return nil, nil
+			}
+			return steps, state
+		}},
 		{"Fee", func() ([]SagaStep, *SagaState) { return FeeCollectionSaga("C", "F", 500, "monthly") }},
 		{"Repayment", func() ([]SagaStep, *SagaState) { return LoanRepaymentSaga("B", "L", "I", 90000, 10000) }},
 		{"StandingOrder", func() ([]SagaStep, *SagaState) { return StandingOrderSaga("A", "B", 5000, "SO-1") }},
@@ -140,6 +157,7 @@ func TestAllSagasExecuteWithCompensation(t *testing.T) {
 		{"Closure", func() ([]SagaStep, *SagaState) { return AccountClosureSaga("CU", "SE", 100000, 500, 200) }},
 	}
 
+	installTestBackends(t)
 	for _, sf := range factories {
 		t.Run(sf.name+"_success", func(t *testing.T) {
 			steps, state := sf.factory()
@@ -150,8 +168,109 @@ func TestAllSagasExecuteWithCompensation(t *testing.T) {
 			if result.Status != "completed" {
 				t.Errorf("saga %s status = %s, want completed", sf.name, result.Status)
 			}
+			if len(state.PendingIDs) == 0 {
+				t.Errorf("saga %s completed without any pending transfer IDs", sf.name)
+			}
 		})
 	}
+}
+
+// --- Fail-fast behavior: without real backends, fund movement must NOT
+// report "completed". ---
+
+func TestSagaFailsFastWithoutLedger(t *testing.T) {
+	// Ensure no ledger backend is configured.
+	ConfigureLedger(nil)
+	ConfigureLocks(nil)
+	ConfigureGLPoster(nil)
+	ConfigureEventEmitter(nil)
+
+	steps, state := P2PTransferSaga("sender", "receiver", 50000)
+	result, err := ExecuteSaga(context.Background(), steps, state)
+	if err == nil {
+		t.Fatal("expected saga to fail without ledger/lock backends")
+	}
+	if result.Status == "completed" {
+		t.Fatalf("saga reported %q without moving any funds", result.Status)
+	}
+	if len(state.PendingIDs) != 0 {
+		t.Errorf("fabricated pending IDs present: %v", state.PendingIDs)
+	}
+}
+
+func TestCommitWithoutPendingTransfersFails(t *testing.T) {
+	ConfigureLedger(&recordingLedger{})
+	step := StepCommitTransfer()
+	state := &SagaState{TransferID: "T-1", Metadata: map[string]interface{}{}}
+	if err := step.Forward(context.Background(), state); err == nil {
+		t.Fatal("commit with no pending transfers must fail")
+	}
+	ConfigureLedger(nil)
+}
+
+// --- Test doubles (test-only; production uses the TigerBeetle backend) ---
+
+type recordingLocks struct{}
+
+func (recordingLocks) Acquire(ctx context.Context, keys []string, ttl time.Duration) (func(), error) {
+	return func() {}, nil
+}
+
+type recordingLedger struct {
+	pendingCreated int
+	posted         int
+	voided         int
+}
+
+func (r *recordingLedger) CreatePendingTransfers(ctx context.Context, transfers []LedgerTransfer, timeoutSecs uint32) ([]string, error) {
+	r.pendingCreated += len(transfers)
+	ids := make([]string, len(transfers))
+	for i := range transfers {
+		ids[i] = fmt.Sprintf("TEST-PEND-%d", i)
+	}
+	return ids, nil
+}
+
+func (r *recordingLedger) PostPendingTransfers(ctx context.Context, pendingIDs []string) error {
+	r.posted += len(pendingIDs)
+	return nil
+}
+
+func (r *recordingLedger) VoidPendingTransfers(ctx context.Context, pendingIDs []string) error {
+	r.voided += len(pendingIDs)
+	return nil
+}
+
+func (r *recordingLedger) CreateReversalTransfers(ctx context.Context, legs []TransferLeg, reference string) error {
+	return nil
+}
+
+// installTestBackends wires recording doubles so the full pipeline can be
+// exercised end-to-end, and registers cleanup to remove them afterwards.
+func installTestBackends(t *testing.T) {
+	t.Helper()
+	ConfigureLocks(recordingLocks{})
+	ConfigureLedger(&recordingLedger{})
+	ConfigureGLPoster(func(ctx context.Context, state *SagaState) error { return nil })
+	ConfigureEventEmitter(func(ctx context.Context, topic, eventType string, state *SagaState) error { return nil })
+	ConfigureScheduleUpdater(func(ctx context.Context, orderRef, transferID string) error { return nil })
+	ConfigureMandateValidator(func(ctx context.Context, mandateRef string, amount AmountKobo) error { return nil })
+	ConfigurePolicyActivator(func(ctx context.Context, policyRef string, active bool) error { return nil })
+	ConfigureAccountFreezer(func(ctx context.Context, accountID string, frozen bool) error { return nil })
+	ConfigureAccountArchiver(func(ctx context.Context, accountID string, archived bool) error { return nil })
+	ConfigureFXRateSource(testFXRateProvider)
+	t.Cleanup(func() {
+		ConfigureLedger(nil)
+		ConfigureLocks(nil)
+		ConfigureGLPoster(nil)
+		ConfigureEventEmitter(nil)
+		ConfigureScheduleUpdater(nil)
+		ConfigureMandateValidator(nil)
+		ConfigurePolicyActivator(nil)
+		ConfigureAccountFreezer(nil)
+		ConfigureAccountArchiver(nil)
+		ConfigureFXRateSource(nil)
+	})
 }
 
 func assertDoubleEntry(t *testing.T, legs []TransferLeg) {

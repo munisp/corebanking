@@ -107,11 +107,11 @@ func (pm *PoolManager) HealthCheck(ctx context.Context) {
 // --- Partition Advisor ---
 
 type PartitionAdvice struct {
-	Table       string `json:"table"`
-	Strategy    string `json:"strategy"`
-	Key         string `json:"key"`
-	Interval    string `json:"interval"`
-	Reason      string `json:"reason"`
+	Table    string `json:"table"`
+	Strategy string `json:"strategy"`
+	Key      string `json:"key"`
+	Interval string `json:"interval"`
+	Reason   string `json:"reason"`
 }
 
 func getPartitionAdvice() []PartitionAdvice {

@@ -45,18 +45,18 @@ func (s *CreditServer) multicurrencyRevaluationHandler(w http.ResponseWriter, r 
 	}
 	defer rows.Close()
 	type entry struct {
-		ID             string  `json:"id"`
-		Currency       string  `json:"currency"`
-		BaseCurrency   string  `json:"base_currency"`
-		BookRate       float64 `json:"book_rate"`
-		MarketRate     float64 `json:"market_rate"`
-		BookValue      float64 `json:"book_value"`
-		MarketValue    float64 `json:"market_value"`
-		UnrealizedPnL  float64 `json:"unrealized_pnl"`
-		PositionType   string  `json:"position_type"`
-		AccountID      string  `json:"account_id"`
-		Status         string  `json:"status"`
-		RevaluationDate string `json:"revaluation_date"`
+		ID              string  `json:"id"`
+		Currency        string  `json:"currency"`
+		BaseCurrency    string  `json:"base_currency"`
+		BookRate        float64 `json:"book_rate"`
+		MarketRate      float64 `json:"market_rate"`
+		BookValue       float64 `json:"book_value"`
+		MarketValue     float64 `json:"market_value"`
+		UnrealizedPnL   float64 `json:"unrealized_pnl"`
+		PositionType    string  `json:"position_type"`
+		AccountID       string  `json:"account_id"`
+		Status          string  `json:"status"`
+		RevaluationDate string  `json:"revaluation_date"`
 	}
 	items := make([]entry, 0)
 	for rows.Next() {
@@ -271,9 +271,9 @@ func (s *CreditServer) etdStatsHandler(w http.ResponseWriter, r *http.Request) {
 		FROM etd_trades WHERE tenant_id=$1 AND status='open'`, tid).
 		Scan(&total, &totalValue)
 	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"openTrades":  total,
-		"totalValue":  totalValue,
-		"currency":    "NGN",
+		"openTrades": total,
+		"totalValue": totalValue,
+		"currency":   "NGN",
 	})
 }
 

@@ -22,6 +22,12 @@ import hashlib
 
 import numpy as np
 import pandas as pd
+
+from .model_registry import (
+    resolve_within,
+    verify_integrity_manifest,
+    write_integrity_manifest,
+)
 from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
@@ -523,42 +529,54 @@ class FraudModelTrainer:
         }
     
     def _save_model(self, model_id: str) -> str:
-        """Save model and scaler to disk"""
+        """Save model and scaler to disk, with a sha256 integrity manifest."""
         models_dir = os.getenv("ML_MODELS_DIR", "/home/ubuntu/54link-dev_platform/54link-dev-unified-platform/services/ml-service/models_store")
         model_dir = os.path.join(models_dir, "fraud", model_id)
         os.makedirs(model_dir, exist_ok=True)
-        
+
         # Save model
         model_path = os.path.join(model_dir, "model.pkl")
         with open(model_path, 'wb') as f:
             pickle.dump(self.model, f)
-        
+
         # Save scaler
         scaler_path = os.path.join(model_dir, "scaler.pkl")
         with open(scaler_path, 'wb') as f:
             pickle.dump(self.scaler, f)
-        
+
         # Save threshold
         threshold_path = os.path.join(model_dir, "threshold.json")
         with open(threshold_path, 'w') as f:
             json.dump({'optimal_threshold': self.optimal_threshold}, f)
-        
+
         # Save feature names
         features_path = os.path.join(model_dir, "features.json")
         with open(features_path, 'w') as f:
             json.dump({'feature_names': self.feature_names}, f)
-        
+
+        # Save sha256 sidecar manifest — verified before any future load.
+        write_integrity_manifest(model_dir)
+
         return model_dir
-    
+
     def load_model(self, model_dir: str):
-        """Load model from disk"""
+        """Load model from disk — fail closed.
+
+        The directory must resolve inside the configured model store and all
+        artifacts must match the sha256 sidecar manifest before any
+        deserialization happens.
+        """
+        models_dir = os.getenv("ML_MODELS_DIR", "/home/ubuntu/54link-dev_platform/54link-dev-unified-platform/services/ml-service/models_store")
+        model_dir = resolve_within(models_dir, model_dir)
+        verify_integrity_manifest(model_dir)
+
         model_path = os.path.join(model_dir, "model.pkl")
         with open(model_path, 'rb') as f:
-            self.model = pickle.load(f)
-        
+            self.model = pickle.load(f)  # noqa: S301 - integrity-verified artifact
+
         scaler_path = os.path.join(model_dir, "scaler.pkl")
         with open(scaler_path, 'rb') as f:
-            self.scaler = pickle.load(f)
+            self.scaler = pickle.load(f)  # noqa: S301 - integrity-verified artifact
         
         threshold_path = os.path.join(model_dir, "threshold.json")
         if os.path.exists(threshold_path):

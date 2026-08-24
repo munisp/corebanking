@@ -2,8 +2,22 @@
  * Real Database Persistence Layer — Drizzle ORM → Postgres with tenant RLS.
  * Provides tenant-scoped CRUD operations with Row-Level Security policies,
  * connection pooling, migration management, and automatic audit logging.
+ *
+ * Health doctrine: /api/database/v1/health runs a real SELECT 1 probe via
+ * ../db and reports real connection counts from pg_stat_activity. Redis and
+ * Kafka sections reflect the real client helpers (getRedisStatus /
+ * getKafkaStatus). TigerBeetle and OpenSearch report "unavailable" because no
+ * real client is registered in this process — nothing here reports
+ * "connected" without a successful probe. When Postgres itself is down the
+ * endpoint fails fast with 503.
  */
 import type { Express, Request, Response, NextFunction } from "express";
+import { sql } from "drizzle-orm";
+import { getDb } from "../db";
+import { logger } from "./logger";
+import { checkDatabaseHealth } from "./postgresRepository";
+import { getRedisStatus } from "./redisClient";
+import { getKafkaStatus } from "./kafkaClient";
 
 // ── Connection Pool Configuration ──
 const DB_CONFIG = {
@@ -11,7 +25,6 @@ const DB_CONFIG = {
   port: parseInt(process.env.DATABASE_PORT ?? "5432"),
   database: process.env.DATABASE_NAME ?? "54bank_platform",
   user: process.env.DATABASE_USER ?? "54bank_app",
-  password: process.env.DATABASE_PASSWORD ?? "54bank_secure_2026",
   maxConnections: parseInt(process.env.DATABASE_POOL_MAX ?? "50"),
   minConnections: parseInt(process.env.DATABASE_POOL_MIN ?? "5"),
   idleTimeoutMs: parseInt(process.env.DATABASE_IDLE_TIMEOUT ?? "30000"),
@@ -134,42 +147,68 @@ const CORE_TABLES: TableSchema[] = [
   },
 ];
 
-// ── Migration Registry ──
-interface Migration {
-  version: string;
-  name: string;
-  sql: string;
-  status: "pending" | "applied" | "failed";
-  appliedAt?: string;
-}
-
-const migrations: Migration[] = [
-  { version: "001", name: "enable_extensions", sql: "CREATE EXTENSION IF NOT EXISTS pgcrypto; CREATE EXTENSION IF NOT EXISTS pg_trgm;", status: "applied", appliedAt: "2026-01-15T10:00:00Z" },
-  { version: "002", name: "create_customers", sql: "CREATE TABLE IF NOT EXISTS customers (...);", status: "applied", appliedAt: "2026-01-15T10:01:00Z" },
-  { version: "003", name: "create_accounts", sql: "CREATE TABLE IF NOT EXISTS accounts (...);", status: "applied", appliedAt: "2026-01-15T10:02:00Z" },
-  { version: "004", name: "create_transactions", sql: "CREATE TABLE IF NOT EXISTS transactions (...);", status: "applied", appliedAt: "2026-01-15T10:03:00Z" },
-  { version: "005", name: "create_audit_trail", sql: "CREATE TABLE IF NOT EXISTS audit_trail (...);", status: "applied", appliedAt: "2026-01-15T10:04:00Z" },
-  { version: "006", name: "enable_rls_all_tables", sql: "ALTER TABLE customers ENABLE ROW LEVEL SECURITY; ...", status: "applied", appliedAt: "2026-02-01T08:00:00Z" },
-  { version: "007", name: "create_rls_policies", sql: "CREATE POLICY tenant_isolation ON customers USING (tenant_id = current_setting('app.tenant_id'));", status: "applied", appliedAt: "2026-02-01T08:01:00Z" },
-  { version: "008", name: "add_tigerbeetle_refs", sql: "ALTER TABLE accounts ADD COLUMN IF NOT EXISTS tigerbeetle_account_id BIGINT;", status: "applied", appliedAt: "2026-03-10T09:00:00Z" },
-];
-
-// ── Connection Pool State ──
-interface PoolStats {
-  totalConnections: number;
-  idleConnections: number;
-  activeConnections: number;
-  waitingClients: number;
+// ── Real connection stats from pg_stat_activity ──
+interface RealPoolStats {
+  totalConnections: number | null;
+  idleConnections: number | null;
+  activeConnections: number | null;
+  waitingClients: number | null;
   maxConnections: number;
 }
 
-const poolStats: PoolStats = {
-  totalConnections: 12,
-  idleConnections: 8,
-  activeConnections: 4,
-  waitingClients: 0,
-  maxConnections: DB_CONFIG.maxConnections,
-};
+async function getRealPoolStats(): Promise<RealPoolStats> {
+  const fallback: RealPoolStats = {
+    totalConnections: null,
+    idleConnections: null,
+    activeConnections: null,
+    waitingClients: null,
+    maxConnections: DB_CONFIG.maxConnections,
+  };
+  const db = await getDb();
+  if (!db) return fallback;
+  try {
+    const result = await db.execute(sql`
+      SELECT
+        COUNT(*)::int AS total,
+        COUNT(*) FILTER (WHERE state = 'idle')::int AS idle,
+        COUNT(*) FILTER (WHERE state = 'active')::int AS active,
+        COUNT(*) FILTER (WHERE wait_event_type = 'Lock')::int AS waiting
+      FROM pg_stat_activity
+      WHERE datname = current_database()
+    `);
+    const row = (result.rows as Array<{ total: number; idle: number; active: number; waiting: number }>)[0];
+    if (!row) return fallback;
+    return {
+      totalConnections: Number(row.total),
+      idleConnections: Number(row.idle),
+      activeConnections: Number(row.active),
+      waitingClients: Number(row.waiting),
+      maxConnections: DB_CONFIG.maxConnections,
+    };
+  } catch (error) {
+    logger.warn("[DB-Persistence] pg_stat_activity probe failed", { error: String(error) });
+    return fallback;
+  }
+}
+
+// ── Real migration history from the drizzle migrations table ──
+interface MigrationRow {
+  id: number;
+  hash: string;
+  created_at: number | string | null;
+}
+
+async function getRealMigrations(): Promise<{ items: MigrationRow[]; available: boolean }> {
+  const db = await getDb();
+  if (!db) return { items: [], available: false };
+  try {
+    const result = await db.execute(sql`SELECT id, hash, created_at FROM "drizzle"."__drizzle_migrations" ORDER BY created_at ASC`);
+    return { items: result.rows as MigrationRow[], available: true };
+  } catch (error) {
+    logger.warn("[DB-Persistence] drizzle migration history not readable", { error: String(error) });
+    return { items: [], available: false };
+  }
+}
 
 // ── Tenant Context Middleware ──
 function tenantContextMiddleware(req: Request, _res: Response, next: NextFunction) {
@@ -181,24 +220,65 @@ function tenantContextMiddleware(req: Request, _res: Response, next: NextFunctio
 export function registerDatabasePersistence(app: Express) {
   app.use(tenantContextMiddleware);
 
-  // Database health and stats
-  app.get("/api/database/v1/health", (_req: Request, res: Response) => {
+  // Database health and stats — every section is backed by a real probe.
+  app.get("/api/database/v1/health", async (_req: Request, res: Response) => {
+    const pgHealth = await checkDatabaseHealth();
+    const redis = getRedisStatus();
+    const kafka = getKafkaStatus();
+
+    if (!pgHealth.healthy) {
+      return res.status(503).json({
+        status: "unavailable",
+        error: "database_unavailable",
+        host: DB_CONFIG.host,
+        database: DB_CONFIG.database,
+        postgres: { status: "unavailable", latencyMs: pgHealth.latencyMs },
+        middleware: {
+          postgres: { status: "unavailable" },
+          tigerbeetle: { status: "unavailable", reason: "no TigerBeetle client is registered in this process" },
+          redis: { status: redis.connected ? "connected" : "unavailable", mode: redis.mode },
+          opensearch: { status: "unavailable", reason: "no OpenSearch client is registered in this process" },
+          kafka: { status: kafka.connected ? "connected" : "unavailable", mode: kafka.mode },
+        },
+      });
+    }
+
+    const pool = await getRealPoolStats();
+    const migrations = await getRealMigrations();
+
+    const redisHits = redis.stats.hits;
+    const redisTotal = redis.stats.hits + redis.stats.misses;
+
+    const middleware = {
+      postgres: { status: "connected", latencyMs: pgHealth.latencyMs, tables: CORE_TABLES.map((t) => t.name) },
+      tigerbeetle: { status: "unavailable", reason: "no TigerBeetle client is registered in this process" },
+      redis: {
+        status: redis.connected ? "connected" : "unavailable",
+        mode: redis.mode,
+        latencyMs: redis.latencyMs,
+        cacheHitRate: redisTotal > 0 ? `${Math.round((redisHits / redisTotal) * 1000) / 10}%` : null,
+      },
+      opensearch: { status: "unavailable", reason: "no OpenSearch client is registered in this process" },
+      kafka: {
+        status: kafka.connected ? "connected" : "unavailable",
+        mode: kafka.mode,
+        brokers: kafka.brokers.length,
+        error: kafka.error,
+      },
+    };
+
+    const degraded = !redis.connected || !kafka.connected;
+
     res.json({
-      status: "connected",
+      status: degraded ? "degraded" : "connected",
       host: DB_CONFIG.host,
       database: DB_CONFIG.database,
-      pool: poolStats,
+      pool,
       ssl: DB_CONFIG.ssl,
       rlsPolicies: RLS_POLICIES.length,
       tables: CORE_TABLES.length,
-      migrationsApplied: migrations.filter((m) => m.status === "applied").length,
-      middleware: {
-        postgres: { status: "connected", tables: CORE_TABLES.map((t) => t.name) },
-        tigerbeetle: { status: "connected", linkedAccounts: 4500 },
-        redis: { status: "connected", cacheHitRate: "94.2%" },
-        opensearch: { status: "connected", replicatedTables: CORE_TABLES.length },
-        kafka: { status: "connected", cdcTopics: CORE_TABLES.map((t) => `cdc.${t.name}`) },
-      },
+      migrationsApplied: migrations.available ? migrations.items.length : null,
+      middleware,
     });
   });
 
@@ -221,13 +301,34 @@ export function registerDatabasePersistence(app: Express) {
     res.json({ items: RLS_POLICIES, total: RLS_POLICIES.length });
   });
 
-  // Migrations
-  app.get("/api/database/v1/migrations", (_req: Request, res: Response) => {
-    res.json({ items: migrations, total: migrations.length, applied: migrations.filter((m) => m.status === "applied").length, pending: migrations.filter((m) => m.status === "pending").length });
+  // Migrations — real history from the drizzle migrations table; never a
+  // hardcoded "applied" list.
+  app.get("/api/database/v1/migrations", async (_req: Request, res: Response) => {
+    const db = await getDb();
+    if (!db) {
+      return res.status(503).json({ error: "database_unavailable", message: "Migration history requires a live Postgres connection" });
+    }
+    const { items, available } = await getRealMigrations();
+    if (!available) {
+      return res.json({
+        items: [],
+        total: 0,
+        applied: null,
+        pending: null,
+        status: "unavailable",
+        message: "No drizzle migration history table found (drizzle.__drizzle_migrations) — applied migrations are not reported from a hardcoded list",
+      });
+    }
+    res.json({ items, total: items.length, applied: items.length, pending: 0, status: "ok" });
   });
 
-  // Pool stats
-  app.get("/api/database/v1/pool", (_req: Request, res: Response) => {
-    res.json({ ...poolStats, config: { host: DB_CONFIG.host, database: DB_CONFIG.database, maxConnections: DB_CONFIG.maxConnections, idleTimeoutMs: DB_CONFIG.idleTimeoutMs, ssl: DB_CONFIG.ssl } });
+  // Pool stats — real counts from pg_stat_activity; null when not measurable.
+  app.get("/api/database/v1/pool", async (_req: Request, res: Response) => {
+    const db = await getDb();
+    if (!db) {
+      return res.status(503).json({ error: "database_unavailable", message: "Pool stats require a live Postgres connection" });
+    }
+    const stats = await getRealPoolStats();
+    res.json({ ...stats, config: { host: DB_CONFIG.host, database: DB_CONFIG.database, maxConnections: DB_CONFIG.maxConnections, idleTimeoutMs: DB_CONFIG.idleTimeoutMs, ssl: DB_CONFIG.ssl } });
   });
 }

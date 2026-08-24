@@ -9,6 +9,7 @@ import * as z from "zod";
 import type * as activities from "../activities";
 import { KycWorkflowArgs, KycWorkflowResult } from "../types/workflow";
 import { VerificationWorkflowStatus } from "../utils/enums";
+import { maskIdentifier } from "../utils/piiMask";
 import { PostVerifyKycValidationSchema } from "../validations/schemas";
 
 export const process_liveness_verification_event_signal = defineSignal<
@@ -54,7 +55,8 @@ export async function livenessKycWorkflow(
     startToCloseTimeout: "2m",
   }).validateLivenessProof;
 
-  console.log(`[livenessKycWorkflow] started — id=${args.id} UIN=${args.UIN} callBackUrl=${args.callBackUrl} metadata=${JSON.stringify(args.metadata)}`);
+  // M-52: never log full NIN/UIN — masked (last 3 chars only).
+  console.log(`[livenessKycWorkflow] started — id=${args.id} UIN=${maskIdentifier(args.UIN)} callBackUrl=${args.callBackUrl} metadata=${JSON.stringify(args.metadata)}`);
 
   try {
     let process_liveness_verification_event_signal_payload: z.infer<

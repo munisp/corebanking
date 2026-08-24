@@ -4,6 +4,8 @@ version = "1.0.0"
 edition = "2021"
 
 [dependencies]
+jsonwebtoken = "9.3.0"
+reqwest = { version = "0.12.22", features = ["json"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 tokio-postgres = { version = "0.7.13", features = ["default"] }
@@ -14,3 +16,4 @@ tokio = { version = "1.43.1", features = ["full"] }
 sqlx = { version = "0.8.3", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 log = "0.4.27"
 env_logger = "0.11.8"
+sha2 = "0.10.8"

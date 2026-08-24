@@ -123,26 +123,26 @@ func (pc *PermissionCache) cleanup() {
 // --- Batch Checker ---
 
 type CheckRequest struct {
-	Entity     string `json:"entity"`
-	EntityID   string `json:"entityId"`
-	Permission string `json:"permission"`
+	Entity      string `json:"entity"`
+	EntityID    string `json:"entityId"`
+	Permission  string `json:"permission"`
 	SubjectType string `json:"subjectType"`
-	SubjectID  string `json:"subjectId"`
+	SubjectID   string `json:"subjectId"`
 }
 
 type CheckResult struct {
 	CheckRequest
-	Allowed  bool   `json:"allowed"`
-	Cached   bool   `json:"cached"`
+	Allowed   bool  `json:"allowed"`
+	Cached    bool  `json:"cached"`
 	LatencyUs int64 `json:"latencyUs"`
 }
 
 type BatchChecker struct {
-	cache       *PermissionCache
-	permifyURL  string
-	checked     int64
-	allowed     int64
-	denied      int64
+	cache      *PermissionCache
+	permifyURL string
+	checked    int64
+	allowed    int64
+	denied     int64
 }
 
 func NewBatchChecker() *BatchChecker {
@@ -245,12 +245,12 @@ func handleCacheStats(bc *BatchChecker) http.HandlerFunc {
 		cacheSize := len(bc.cache.entries)
 		bc.cache.mu.RUnlock()
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"checked":    atomic.LoadInt64(&bc.checked),
-			"allowed":    atomic.LoadInt64(&bc.allowed),
-			"denied":     atomic.LoadInt64(&bc.denied),
-			"cacheHits":  atomic.LoadInt64(&bc.cache.hits),
+			"checked":     atomic.LoadInt64(&bc.checked),
+			"allowed":     atomic.LoadInt64(&bc.allowed),
+			"denied":      atomic.LoadInt64(&bc.denied),
+			"cacheHits":   atomic.LoadInt64(&bc.cache.hits),
 			"cacheMisses": atomic.LoadInt64(&bc.cache.misses),
-			"cacheSize":  cacheSize,
+			"cacheSize":   cacheSize,
 		})
 	}
 }

@@ -55,31 +55,54 @@ local _M = {
     schema = schema,
 }
 
+-- M-42: extract the tenant slug from a token's iss claim
+-- (".../realms/54link_<tenant>"). Used on UNVERIFIED claims only to select
+-- which realm's keys to verify against; the tenant applied upstream always
+-- comes from authorizer-verified claims.
+local function tenant_from_issuer(iss)
+    if not iss or type(iss) ~= "string" then
+        return nil
+    end
+    return iss:match("/realms/54link_([^/]+)$")
+end
+
+local function tenant_from_token(token)
+    local ok, jwt_obj = pcall(jwt.load_jwt, jwt, token)
+    if not ok or not jwt_obj or not jwt_obj.payload then
+        return nil
+    end
+    return tenant_from_issuer(jwt_obj.payload.iss)
+end
+
 local function fetch_data_from_authorizer(authorizer_url, token, tenant_id, keycloak_realm, keycloak_public_key)
     local httpc = http.new()
-    local res, err = httpc:request_uri(authorizer_url .. "/" .. "validate/" .. token, {
+    local res, err = httpc:request_uri(authorizer_url .. "/" .. "validate", {
         method = "GET",
         headers = {
+            -- M-43: token is sent via the Authorization header only, never in
+            -- the URL (path tokens leak into access logs).
+            ["Authorization"] = "Bearer " .. token,
             ["x-tenant-id"] = tenant_id, -- Add the x-tenant-id header
             ["x-keycloak-realm"] = keycloak_realm, -- Add the x-keycloak-realm header
             ["x-keycloak-pub-key"] = keycloak_public_key, -- Add the x-tenant-id header
         },
+        ssl_verify = true, -- M-46: TLS verification is never disabled
     })
 
     if not res then
-        return nil, nil, "failed to verify token: " .. err
+        return nil, "failed to verify token: " .. err
     end
 
     if res.status ~= 200 then
-        return nil, nil, "failed to verify token, status: " .. res.status
+        return nil, "failed to verify token, status: " .. res.status
     end
 
     local result = core.json.decode(res.body)
     if not result or not result.keycloak_id then
-        return nil, nil, "failed to verify token"
+        return nil, "failed to verify token"
     end
 
-    return result.keycloak_id
+    return result
 end
 
 local function fetch_mint_account_data(mint_account_url, tenant_id, ledger_id, keycloak_id)
@@ -91,6 +114,7 @@ local function fetch_mint_account_data(mint_account_url, tenant_id, ledger_id, k
             ["x-ledger-id"] = ledger_id, -- Add the x-ledger-id header
             ["x-keycloak-id"] = keycloak_id, -- Add the x-keycloak-id header
         },
+        ssl_verify = true, -- M-46: TLS verification is never disabled
     })
 
     if not res then
@@ -135,7 +159,7 @@ local function get_billing_status(conf, tenant_id)
     local res, err = httpc:request_uri(conf.billing_url .. "/billing/status", {
         method = "GET",
         headers = { ["x-tenant-id"] = tenant_id },
-        ssl_verify = false,
+        ssl_verify = true, -- M-46: TLS verification is never disabled
     })
     if not res then
         return nil, "billing service unreachable: " .. (err or "unknown")
@@ -172,6 +196,7 @@ local function fetch_tenant_keycloak_public_key(keycloak_public_key_url, tenant_
         headers = {
             ["x-tenant-id"] = tenant_id, -- Add the x-tenant-id header
         },
+        ssl_verify = true, -- M-46: TLS verification is never disabled
     })
 
     if not res then
@@ -207,28 +232,37 @@ local function get_cookie(ctx, cookie_name)
     return nil
 end
 
+-- Returns a short, non-reversible fingerprint of a token for log correlation.
+-- Raw bearer tokens must NEVER be written to logs.
+local function token_fingerprint(token)
+    if not token then
+        return "null"
+    end
+    local ok, str = pcall(require, "resty.string")
+    if ok then
+        return str.to_hex(ngx.sha1_bin(token)):sub(1, 8)
+    end
+    -- Fallback: log length only (no token material).
+    return "len=" .. #token
+end
+
 -- Helper function to retrieve token from the request context
 local function get_token(ctx)
-    -- Try to get the token from query parameter
-    local token = core.request.get_uri_args(ctx).token
+    -- M-43: tokens are NEVER accepted from URL query parameters — they leak
+    -- into access logs, browser history and upstream logs. Cookie first,
+    -- then the Authorization header.
+    local token = get_cookie(ctx, "access_token")
 
-    -- Fallback to cookies if token is not in query parameter
-    if not token then
-        token = get_cookie(ctx, "access_token")
-
-        if token then 
-            core.log.warn("Token from cookie: " .. token)
-        else
-            core.log.warn("Token from cookie: null")
-        end
+    if token then
+        core.log.warn("Token from cookie: sha1:" .. token_fingerprint(token))
     end
 
-     -- Fallback to Authorization header if token is still not found
+    -- Fallback to Authorization header if token is not in the cookie
     if not token then
         local auth_header = core.request.header(ctx, "Authorization")
         if auth_header and auth_header:match("^Bearer%s+(%S+)$") then
             token = auth_header:match("^Bearer%s+(%S+)$")
-            core.log.warn("Token from Authorization header: " .. token)
+            core.log.warn("Token from Authorization header: sha1:" .. token_fingerprint(token))
         else
             core.log.warn("Token from Authorization header: null")
         end
@@ -244,17 +278,48 @@ function _M.access(conf, ctx)
         return
     end
 
-    local tenant_id = core.request.header(ctx, "x-tenant-id")
-
-    if not tenant_id then
-        core.log.warn("Tenant ID not found")
-        return 400, {message = "Missing tenant identifier"}
+    local token = get_token(ctx)
+    if not token then
+        core.log.warn("JWT token not found")
+        return 401, {message = "Missing JWT token"}
     end
 
-    local keycloak_realm = "54link_" .. tenant_id
+    -- M-42: tenant context is derived from the token, NEVER trusted from the
+    -- client x-tenant-id header. The unverified claims only select which
+    -- realm's keys to verify against; the tenant applied upstream comes from
+    -- the authorizer-verified claims below.
+    local bootstrap_tenant = tenant_from_token(token)
+    if not bootstrap_tenant then
+        core.log.warn("Could not derive tenant from token claims")
+        return 401, {message = "Invalid token"}
+    end
+
+    local keycloak_realm = "54link_" .. bootstrap_tenant
     local ledger_id = "1"
 
-    -- Billing gate — checked before auth to return 402 at the edge (fail-open on service error)
+    local keycloak_public_key, _, pub_key_err = fetch_tenant_keycloak_public_key(conf.keycloak_public_key_url, bootstrap_tenant)
+    if not keycloak_public_key then
+        return 401, {message = pub_key_err}
+    end
+
+    local claims, authorizer_err = fetch_data_from_authorizer(conf.authorizer_url, token, bootstrap_tenant, keycloak_realm, keycloak_public_key)
+    if not claims then
+        return 401, {message = authorizer_err}
+    end
+
+    -- Cross-check: the VERIFIED token's issuer must map back to the same
+    -- tenant used for key selection (defense in depth on top of the
+    -- authorizer's own iss validation).
+    local tenant_id = tenant_from_issuer(claims.iss)
+    if not tenant_id or tenant_id ~= bootstrap_tenant then
+        core.log.warn("Verified token issuer tenant mismatch")
+        return 401, {message = "Invalid token"}
+    end
+
+    local keycloak_id = claims.keycloak_id
+
+    -- Billing gate — evaluated against the VERIFIED tenant, after auth
+    -- (fail-open on service error)
     if conf.billing_url then
         local billing_status, billing_err = get_billing_status(conf, tenant_id)
         if billing_err then
@@ -266,25 +331,10 @@ function _M.access(conf, ctx)
         end
     end
 
-    local token = get_token(ctx)
-    if not token then
-        core.log.warn("JWT token not found")
-        return 401, {message = "Missing JWT token"}
-    end
-
-    local keycloak_public_key, _, pub_key_err = fetch_tenant_keycloak_public_key(conf.keycloak_public_key_url, tenant_id)
-    if not keycloak_public_key then
-        return 401, {message = pub_key_err}
-    end
-
-    local keycloak_id, _, authorizer_err = fetch_data_from_authorizer(conf.authorizer_url, token, tenant_id, keycloak_realm, keycloak_public_key)
-    if not keycloak_id then
-        return 401, {message = authorizer_err}
-    end
-
+    -- Overwrite any client-supplied tenant/identity headers with verified values.
     core.request.set_header(ctx, "x-tenant-id", tenant_id)
     core.request.set_header(ctx, "x-keycloak-id", keycloak_id)
-    core.request.set_header(ctx, "x-keycloak-realm", "54link_" .. tenant_id)
+    core.request.set_header(ctx, "x-keycloak-realm", keycloak_realm)
     core.request.set_header(ctx, "x-keycloak-pub-key", keycloak_public_key)
     core.request.set_header(ctx, "x-ledger-id", ledger_id)
 

@@ -1,45 +1,937 @@
 package main
 
 import (
-	"context"
-	"database/sql"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
-
 	"bytes"
+	"context"
+	"crypto"
 	"crypto/rand"
-	"encoding/hex"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"github.com/IBM/sarama"
+	_ "github.com/lib/pq"
 )
 
 var db *sql.DB
 
 var serviceName = "liveness-orchestrator-go"
 
-// Inference engine URL (liveness-inference-py)
-var inferenceURL = getEnv("INFERENCE_URL", "http://localhost:8230")
-
-// callMotionAnalysis calls the Python inference service for multi-frame motion analysis
-func callMotionAnalysis(referenceFrame string, actionFrames []string, challengeType string, devicePlatform string, deviceModel string) (map[string]interface{}, error) {
-	payload := map[string]interface{}{
-		"referenceFrame": referenceFrame,
-		"actionFrames":   actionFrames,
-		"challengeType":  challengeType,
-		"devicePlatform": devicePlatform,
-		"deviceModel":    deviceModel,
+// Inference engine URL (liveness-inference-py). Both env vars are honored;
+// the default matches infrastructure/new/server/index.ts (LIVENESS_INFERENCE_URL).
+func inferenceURL() string {
+	if v := os.Getenv("INFERENCE_URL"); v != "" {
+		return v
 	}
-	jsonData, _ := json.Marshal(payload)
+	return getEnv("LIVENESS_INFERENCE_URL", "http://localhost:8230")
+}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Post(inferenceURL+"/v1/motion/analyze", "application/json", bytes.NewBuffer(jsonData))
+// ─── Domain Types ───────────────────────────────────────────────────────────
+
+type Challenge struct {
+	ID        string  `json:"id"`
+	Type      string  `json:"type"`
+	Status    string  `json:"status"` // pending | passed | failed
+	Score     float64 `json:"score"`
+	Attempts  int     `json:"attempts"`
+	StartedAt string  `json:"startedAt,omitempty"`
+	// Nonce is a single-use, CSPRNG-generated value bound to the session ID,
+	// challenge ID and subject (H-19 replay protection). It is rotated after
+	// every failed attempt.
+	Nonce string `json:"nonce,omitempty"`
+}
+
+type LivenessSession struct {
+	ID               string           `json:"id"`
+	CustomerID       string           `json:"customerId"`
+	TenantID         string           `json:"tenantId,omitempty"`
+	Status           string           `json:"status"` // pending | in_progress | completed | failed
+	Mode             string           `json:"mode"`   // active | passive | hybrid
+	Challenges       []Challenge      `json:"challenges,omitempty"`
+	ChallengesTotal  int              `json:"challengesTotal"`
+	ChallengesPassed int              `json:"challengesPassed"`
+	OverallScore     float64          `json:"overallScore"`
+	IsLive           bool             `json:"isLive"`
+	Verdict          string           `json:"verdict,omitempty"` // LIVE | SPOOF | UNKNOWN
+	DevicePlatform   string           `json:"devicePlatform,omitempty"`
+	DeviceModel      string           `json:"deviceModel,omitempty"`
+	IPAddress        string           `json:"ipAddress,omitempty"`
+	Attempts         int              `json:"attempts"`
+	MaxAttempts      int              `json:"maxAttempts"`
+	StartedAt        string           `json:"startedAt"`
+	ExpiresAt        string           `json:"expiresAt,omitempty"`
+	CompletedAt      string           `json:"completedAt,omitempty"`
+	AntiSpoof        *AntiSpoofResult `json:"antiSpoof,omitempty"`
+	KafkaEventID     string           `json:"kafkaEventId,omitempty"`
+}
+
+type AntiSpoofResult struct {
+	IsSpoof    bool    `json:"isSpoof"`
+	SpoofType  string  `json:"spoofType"`
+	Confidence float64 `json:"confidence"`
+}
+
+type FaceMatchRequest struct {
+	CustomerID string `json:"customerId"`
+	Image1     string `json:"image1"`
+	Image2     string `json:"image2"`
+	Purpose    string `json:"purpose,omitempty"`
+}
+
+type FaceMatchResponse struct {
+	ID              string  `json:"id"`
+	Matched         bool    `json:"matched"`
+	SimilarityScore float64 `json:"similarityScore"`
+	Confidence      float64 `json:"confidence"`
+	Engine          string  `json:"engine"`
+	CreatedAt       string  `json:"createdAt"`
+}
+
+type serviceStats struct {
+	mu               sync.Mutex
+	TotalSessions    int64 `json:"totalSessions"`
+	TotalFaceMatches int64 `json:"totalFaceMatches"`
+	CompletedLive    int64 `json:"completedLive"`
+	CompletedSpoof   int64 `json:"completedSpoof"`
+	EngineErrors     int64 `json:"engineErrors"`
+}
+
+var stats serviceStats
+
+const passThreshold = 0.55
+
+var (
+	sessionsMu sync.Mutex
+	sessions   = map[string]*LivenessSession{} // active-session cache; Postgres is the system of record
+)
+
+func generateID(prefix string) string {
+	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+}
+
+func respondJSON(w http.ResponseWriter, code int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Service", serviceName)
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(data)
+}
+
+func getEnv(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// ─── Inference Engine Client ────────────────────────────────────────────────
+//
+// All liveness/face-match verdicts come from the real inference engine.
+// This service is fail-closed: any engine error yields isLive=false /
+// matched=false plus HTTP 503. Similarity and liveness scores are NEVER
+// synthesized locally.
+
+var engineClient = &http.Client{Timeout: 30 * time.Second}
+
+func callEngine(path string, payload map[string]interface{}) (map[string]interface{}, error) {
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	url := inferenceURL() + path
+	resp, err := engineClient.Post(url, "application/json", bytes.NewReader(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("inference engine call %s failed: %w", path, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("inference engine %s returned status %d", path, resp.StatusCode)
+	}
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("inference engine %s returned invalid JSON: %w", path, err)
+	}
+	return result, nil
+}
+
+func engineBool(m map[string]interface{}, keys ...string) (bool, bool) {
+	for _, k := range keys {
+		if v, ok := m[k].(bool); ok {
+			return v, true
+		}
+	}
+	return false, false
+}
+
+func engineFloat(m map[string]interface{}, keys ...string) (float64, bool) {
+	for _, k := range keys {
+		if v, ok := m[k].(float64); ok {
+			return v, true
+		}
+	}
+	return 0, false
+}
+
+func generateChallenges(count int) []Challenge {
+	pool := []string{"blink", "turn_left", "turn_right", "smile", "nod"}
+	if count <= 0 {
+		count = 3
+	}
+	if count > len(pool) {
+		count = len(pool)
+	}
+	out := make([]Challenge, 0, count)
+	for i := 0; i < count; i++ {
+		out = append(out, Challenge{
+			ID:     fmt.Sprintf("CH-%d-%d", time.Now().UnixNano(), i),
+			Type:   pool[i],
+			Status: "pending",
+			Nonce:  generateNonce(),
+		})
+	}
+	return out
+}
+
+// ─── Challenge nonce binding (H-19 replay protection) ───────────────────────
+//
+// Every challenge carries a single-use nonce bound to (session ID, challenge
+// ID, subject). The nonce is stored at challenge creation and consumed
+// atomically at submission; reuse is rejected. Postgres is the store of
+// record (multi-replica safe). When no database is configured (single-process
+// mode) an in-memory binding map provides the same guarantee locally.
+
+var (
+	noncesMu      sync.Mutex
+	nonceBindings = map[string]string{} // nonce -> sessionID|challengeID|customerID (db == nil mode only)
+)
+
+func generateNonce() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		log.Fatalf("[%s] crypto/rand unavailable: %v", serviceName, err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b)
+}
+
+func nonceBinding(sessionID, challengeID, customerID string) string {
+	return sessionID + "|" + challengeID + "|" + customerID
+}
+
+// storeChallengeNonce records a freshly issued nonce. With a database, the
+// primary key guarantees global uniqueness; a collision is an error.
+func storeChallengeNonce(nonce, sessionID, challengeID, customerID string) error {
+	if db == nil {
+		noncesMu.Lock()
+		nonceBindings[nonce] = nonceBinding(sessionID, challengeID, customerID)
+		noncesMu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO liveness_challenge_nonces (nonce, session_id, challenge_id, customer_id) VALUES ($1,$2,$3,$4)`,
+		nonce, sessionID, challengeID, customerID)
+	return err
+}
+
+// consumeChallengeNonce atomically marks a nonce used, enforcing single-use
+// and binding to session ID + challenge ID + subject. Returns false on
+// replay, unknown nonce, or binding mismatch (fail closed on store errors).
+func consumeChallengeNonce(nonce, sessionID, challengeID, customerID string) bool {
+	if nonce == "" {
+		return false
+	}
+	if db == nil {
+		key := nonceBinding(sessionID, challengeID, customerID)
+		noncesMu.Lock()
+		defer noncesMu.Unlock()
+		binding, ok := nonceBindings[nonce]
+		if !ok || binding != key {
+			return false
+		}
+		delete(nonceBindings, nonce)
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	res, err := db.ExecContext(ctx,
+		`UPDATE liveness_challenge_nonces SET consumed_at = NOW()
+		 WHERE nonce = $1 AND session_id = $2 AND challenge_id = $3 AND customer_id = $4 AND consumed_at IS NULL`,
+		nonce, sessionID, challengeID, customerID)
+	if err != nil {
+		log.Printf("[%s] nonce consume failed (fail closed): %v", serviceName, err)
+		return false
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return false
+	}
+	return true
+}
+
+// rotateChallengeNonce issues a fresh single-use nonce for a challenge after
+// a failed attempt so legitimate retries remain possible while replays of a
+// consumed nonce stay rejected. Fail closed: on store error the challenge is
+// left without a usable nonce and the submission is rejected.
+func rotateChallengeNonce(session *LivenessSession, challengeIdx int) (string, bool) {
+	newNonce := generateNonce()
+	if err := storeChallengeNonce(newNonce, session.ID, session.Challenges[challengeIdx].ID, session.CustomerID); err != nil {
+		log.Printf("[%s] nonce rotation failed: %v", serviceName, err)
+		return "", false
+	}
+	session.Challenges[challengeIdx].Nonce = newNonce
+	return newNonce, true
+}
+
+// ─── Event Publishing (outbox; relay publishes to Kafka) ────────────────────
+
+func publishEvent(eventType, aggregateID, customerID, tenantID string, data map[string]interface{}) string {
+	eventID := generateID("EVT")
+	if db == nil {
+		log.Printf("[%s] publishEvent %s: no db — event NOT recorded", serviceName, eventType)
+		return ""
+	}
+	payload, err := json.Marshal(map[string]interface{}{
+		"eventId": eventID, "type": eventType, "customerId": customerID,
+		"tenantId": tenantID, "data": data, "timestamp": time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
+		eventType, aggregateID, string(payload)); err != nil {
+		log.Printf("[%s] outbox insert failed for %s: %v", serviceName, eventType, err)
+		return ""
+	}
+	return eventID
+}
+
+// ─── Session Persistence ────────────────────────────────────────────────────
+
+func persistSession(s *LivenessSession) {
+	if db == nil {
+		return
+	}
+	payload, err := json.Marshal(s)
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err = db.ExecContext(ctx,
+		`INSERT INTO liveness_sessions (id, customer_id, tenant_id, status, mode, is_live, verdict, overall_score, payload, started_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9, NOW())
+		 ON CONFLICT (id) DO UPDATE SET status=$4, is_live=$6, verdict=$7, overall_score=$8, payload=$9, updated_at=NOW()`,
+		s.ID, s.CustomerID, s.TenantID, s.Status, s.Mode, s.IsLive, s.Verdict, s.OverallScore, string(payload))
+	if err != nil {
+		log.Printf("[%s] persist session %s failed: %v", serviceName, s.ID, err)
+	}
+}
+
+// ─── Handlers ───────────────────────────────────────────────────────────────
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, 200, map[string]interface{}{
+		"status": "healthy", "service": serviceName, "version": "2.0.0",
+		"inferenceEngine": inferenceURL(),
+	})
+}
+
+func livezHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
+}
+
+func handleCreateSession(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		CustomerID     string `json:"customerId"`
+		TenantID       string `json:"tenantId"`
+		Mode           string `json:"mode"`
+		ChallengeCount int    `json:"challengeCount"`
+		DevicePlatform string `json:"devicePlatform"`
+		DeviceModel    string `json:"deviceModel"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.CustomerID == "" {
+		respondJSON(w, 400, map[string]string{"error": "customerId is required"})
+		return
+	}
+	if body.Mode == "" {
+		body.Mode = "hybrid"
+	}
+	if body.ChallengeCount == 0 {
+		body.ChallengeCount = 3
+	}
+
+	now := time.Now().UTC()
+	session := &LivenessSession{
+		ID:             generateID("SES"),
+		CustomerID:     body.CustomerID,
+		TenantID:       body.TenantID,
+		Status:         "pending",
+		Mode:           body.Mode,
+		Challenges:     generateChallenges(body.ChallengeCount),
+		DevicePlatform: body.DevicePlatform,
+		DeviceModel:    body.DeviceModel,
+		IPAddress:      r.RemoteAddr,
+		StartedAt:      now.Format(time.RFC3339),
+		ExpiresAt:      now.Add(5 * time.Minute).Format(time.RFC3339),
+		MaxAttempts:    3,
+	}
+	session.ChallengesTotal = len(session.Challenges)
+	session.KafkaEventID = publishEvent("session_created", session.ID, body.CustomerID, body.TenantID, nil)
+
+	// H-19: bind each challenge nonce to this session + subject. Fail closed:
+	// if the nonce store is unavailable the session is not usable.
+	for i := range session.Challenges {
+		if err := storeChallengeNonce(session.Challenges[i].Nonce, session.ID, session.Challenges[i].ID, session.CustomerID); err != nil {
+			log.Printf("[%s] failed to store challenge nonce: %v", serviceName, err)
+			respondJSON(w, 503, map[string]string{"error": "challenge nonce store unavailable"})
+			return
+		}
+	}
+
+	sessionsMu.Lock()
+	sessions[session.ID] = session
+	sessionsMu.Unlock()
+	stats.mu.Lock()
+	stats.TotalSessions++
+	stats.mu.Unlock()
+	persistSession(session)
+
+	respondJSON(w, 201, session)
+}
+
+func handleListSessions(w http.ResponseWriter, r *http.Request) {
+	listHandler(w, r)
+}
+
+// listHandler reads persisted liveness sessions from Postgres.
+func listHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	rows, err := db.QueryContext(r.Context(),
+		`SELECT payload FROM liveness_sessions ORDER BY started_at DESC LIMIT 100`)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var out []json.RawMessage
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			continue
+		}
+		out = append(out, json.RawMessage(p))
+	}
+	respondJSON(w, 200, map[string]interface{}{"sessions": out, "total": len(out)})
+}
+
+func handleGetSession(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
+	if id == "" || id == r.URL.Path {
+		respondJSON(w, 400, map[string]string{"error": "session id required"})
+		return
+	}
+	sessionsMu.Lock()
+	s, ok := sessions[id]
+	sessionsMu.Unlock()
+	if ok {
+		respondJSON(w, 200, s)
+		return
+	}
+	if db != nil {
+		var payload string
+		err := db.QueryRowContext(r.Context(),
+			`SELECT payload FROM liveness_sessions WHERE id = $1`, id).Scan(&payload)
+		if err == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(200)
+			w.Write([]byte(payload))
+			return
+		}
+	}
+	respondJSON(w, 404, map[string]string{"error": "session not found"})
+}
+
+// scoreActiveChallenge submits frames to the inference engine for a real
+// verdict. Fail-closed: engine errors fail the challenge and mark the session
+// not-live; no local score synthesis.
+func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	var body struct {
+		SessionID   string `json:"sessionId"`
+		ChallengeID string `json:"challengeId"`
+		Nonce       string `json:"nonce"`
+		FrameBase64 string `json:"frameBase64"`
+		FrameIndex  int    `json:"frameIndex"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+
+	sessionsMu.Lock()
+	session, exists := sessions[body.SessionID]
+	sessionsMu.Unlock()
+	if !exists {
+		respondJSON(w, 404, map[string]string{"error": "session not found"})
+		return
+	}
+
+	// H-19: locate the challenge and consume the single-use nonce BEFORE any
+	// engine work. Replay, unknown nonce, or session/subject mismatch => reject.
+	challengeIdx := -1
+	for i := range session.Challenges {
+		if session.Challenges[i].ID == body.ChallengeID {
+			challengeIdx = i
+			break
+		}
+	}
+	if challengeIdx < 0 {
+		respondJSON(w, 404, map[string]string{"error": "challenge not found"})
+		return
+	}
+	if session.Challenges[challengeIdx].Status != "pending" {
+		respondJSON(w, 409, map[string]string{"error": "challenge already completed"})
+		return
+	}
+	if !consumeChallengeNonce(body.Nonce, session.ID, body.ChallengeID, session.CustomerID) {
+		log.Printf("[%s] rejected replayed/invalid nonce for session=%s challenge=%s", serviceName, session.ID, body.ChallengeID)
+		respondJSON(w, 401, map[string]string{"error": "invalid_or_reused_nonce"})
+		return
+	}
+
+	engineResp, err := callEngine("/v1/liveness/check", map[string]interface{}{
+		"image":          body.FrameBase64,
+		"frameBase64":    body.FrameBase64,
+		"sessionId":      body.SessionID,
+		"challengeId":    body.ChallengeID,
+		"devicePlatform": session.DevicePlatform,
+		"deviceModel":    session.DeviceModel,
+	})
+	if err != nil {
+		stats.mu.Lock()
+		stats.EngineErrors++
+		stats.mu.Unlock()
+		log.Printf("[%s] inference engine error: %v", serviceName, err)
+		// The submitted nonce is consumed; rotate so a legitimate retry is
+		// still possible with a fresh single-use nonce.
+		sessionsMu.Lock()
+		nextNonce, _ := rotateChallengeNonce(session, challengeIdx)
+		sessionsMu.Unlock()
+		respondJSON(w, 503, map[string]interface{}{
+			"error": "inference_engine_unavailable", "isLive": false,
+			"sessionStatus": "failed", "detail": err.Error(),
+			"nextNonce": nextNonce,
+		})
+		return
+	}
+
+	isLive, _ := engineBool(engineResp, "isLive", "is_live")
+	score, _ := engineFloat(engineResp, "score", "overallScore", "overall_score")
+
+	sessionsMu.Lock()
+	session.Status = "in_progress"
+	session.Attempts++
+	for i := range session.Challenges {
+		if session.Challenges[i].ID == body.ChallengeID {
+			session.Challenges[i].Attempts++
+			session.Challenges[i].Score = score
+			if isLive {
+				session.Challenges[i].Status = "passed"
+				session.ChallengesPassed++
+			} else {
+				session.Challenges[i].Status = "failed"
+			}
+		}
+	}
+	if session.ChallengesTotal > 0 && session.ChallengesPassed == session.ChallengesTotal {
+		session.Status = "completed"
+		session.IsLive = true
+		session.Verdict = "LIVE"
+		session.OverallScore = score
+		session.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+	} else if session.Attempts >= session.MaxAttempts*max(session.ChallengesTotal, 1) {
+		session.Status = "failed"
+		session.IsLive = false
+		session.Verdict = "SPOOF"
+		session.CompletedAt = time.Now().UTC().Format(time.RFC3339)
+	}
+	// H-19: failed attempts consume the submitted nonce; rotate so the next
+	// legitimate attempt uses a fresh single-use nonce and replays stay dead.
+	var nextNonce string
+	if session.Challenges[challengeIdx].Status == "pending" {
+		if n, ok := rotateChallengeNonce(session, challengeIdx); ok {
+			nextNonce = n
+		}
+	}
+	respSession := *session
+	sessionsMu.Unlock()
+
+	persistSession(&respSession)
+	if respSession.Status == "completed" || respSession.Status == "failed" {
+		publishEvent("session_completed", respSession.ID, respSession.CustomerID, respSession.TenantID,
+			map[string]interface{}{"verdict": respSession.Verdict, "score": respSession.OverallScore})
+	}
+
+	respondJSON(w, 200, map[string]interface{}{
+		"challengeId":   body.ChallengeID,
+		"isLive":        isLive,
+		"score":         score,
+		"sessionStatus": respSession.Status,
+		"overallScore":  respSession.OverallScore,
+		"passThreshold": passThreshold,
+		"nextNonce":     nextNonce,
+	})
+}
+
+func handleSubmitChallenge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	var body struct {
+		SessionID      string   `json:"sessionId"`
+		ChallengeID    string   `json:"challengeId"`
+		Nonce          string   `json:"nonce"`
+		ReferenceFrame string   `json:"referenceFrame"`
+		ActionFrames   []string `json:"actionFrames"`
+		ChallengeType  string   `json:"challengeType"`
+		DevicePlatform string   `json:"devicePlatform"`
+		DeviceModel    string   `json:"deviceModel"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+
+	sessionsMu.Lock()
+	session, exists := sessions[body.SessionID]
+	sessionsMu.Unlock()
+	if !exists {
+		respondJSON(w, 404, map[string]string{"error": "session not found"})
+		return
+	}
+
+	// H-19: the challenge must belong to this session, be pending, and carry a
+	// valid single-use nonce bound to session ID + subject.
+	challengeIdx := -1
+	for i := range session.Challenges {
+		if session.Challenges[i].ID == body.ChallengeID {
+			challengeIdx = i
+			break
+		}
+	}
+	if challengeIdx < 0 {
+		respondJSON(w, 404, map[string]string{"error": "challenge not found"})
+		return
+	}
+	if session.Challenges[challengeIdx].Status != "pending" {
+		respondJSON(w, 409, map[string]string{"error": "challenge already completed"})
+		return
+	}
+	if !consumeChallengeNonce(body.Nonce, session.ID, body.ChallengeID, session.CustomerID) {
+		log.Printf("[%s] rejected replayed/invalid nonce for session=%s challenge=%s", serviceName, session.ID, body.ChallengeID)
+		respondJSON(w, 401, map[string]string{"error": "invalid_or_reused_nonce"})
+		return
+	}
+
+	// Real multi-frame motion analysis by the inference engine.
+	engineResp, err := callEngine("/v1/motion/analyze", map[string]interface{}{
+		"referenceFrame": body.ReferenceFrame,
+		"actionFrames":   body.ActionFrames,
+		"challengeType":  body.ChallengeType,
+		"devicePlatform": body.DevicePlatform,
+		"deviceModel":    body.DeviceModel,
+	})
+	if err != nil {
+		stats.mu.Lock()
+		stats.EngineErrors++
+		stats.mu.Unlock()
+		log.Printf("[%s] motion analysis error: %v", serviceName, err)
+		// Rotate the consumed nonce so a legitimate retry can use a fresh one.
+		sessionsMu.Lock()
+		nextNonce, _ := rotateChallengeNonce(session, challengeIdx)
+		sessionsMu.Unlock()
+		respondJSON(w, 503, map[string]interface{}{
+			"error": "inference_engine_unavailable", "isLive": false, "detail": err.Error(),
+			"nextNonce": nextNonce,
+		})
+		return
+	}
+	isLive, _ := engineBool(engineResp, "isLive", "is_live", "passed")
+	score, _ := engineFloat(engineResp, "score", "motionScore", "motion_score")
+
+	// H-19: rotate the nonce after every submission; the consumed value can
+	// never be replayed.
+	sessionsMu.Lock()
+	nextNonce, _ := rotateChallengeNonce(session, challengeIdx)
+	sessionsMu.Unlock()
+
+	respondJSON(w, 200, map[string]interface{}{
+		"challengeId": body.ChallengeID,
+		"isLive":      isLive,
+		"score":       score,
+		"nextNonce":   nextNonce,
+	})
+}
+
+func handlePassiveLiveness(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	var body struct {
+		CustomerID     string `json:"customerId"`
+		TenantID       string `json:"tenantId"`
+		ImageBase64    string `json:"imageBase64"`
+		DevicePlatform string `json:"devicePlatform"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.ImageBase64 == "" {
+		respondJSON(w, 400, map[string]string{"error": "imageBase64 is required"})
+		return
+	}
+
+	// Fail-closed: engine error means isLive=false and HTTP 503. Never fall
+	// back to a synthesized score.
+	engineResp, err := callEngine("/v1/liveness/passive", map[string]interface{}{
+		"image":          body.ImageBase64,
+		"imageBase64":    body.ImageBase64,
+		"customerId":     body.CustomerID,
+		"devicePlatform": body.DevicePlatform,
+	})
+	if err != nil {
+		stats.mu.Lock()
+		stats.EngineErrors++
+		stats.mu.Unlock()
+		log.Printf("[%s] passive liveness engine error: %v", serviceName, err)
+		respondJSON(w, 503, map[string]interface{}{
+			"error": "inference_engine_unavailable", "isLive": false, "verdict": "UNKNOWN",
+			"detail": err.Error(),
+		})
+		return
+	}
+
+	isLive, _ := engineBool(engineResp, "isLive", "is_live")
+	score, _ := engineFloat(engineResp, "score", "overallScore", "overall_score")
+	verdict := "SPOOF"
+	if isLive {
+		verdict = "LIVE"
+	}
+
+	now := time.Now().UTC().Format(time.RFC3339)
+	session := &LivenessSession{
+		ID:             generateID("PLV"),
+		CustomerID:     body.CustomerID,
+		TenantID:       body.TenantID,
+		Status:         "completed",
+		Mode:           "passive",
+		OverallScore:   score,
+		IsLive:         isLive,
+		Verdict:        verdict,
+		DevicePlatform: body.DevicePlatform,
+		StartedAt:      now,
+		CompletedAt:    now,
+		AntiSpoof:      &AntiSpoofResult{IsSpoof: !isLive, SpoofType: "none", Confidence: score},
+	}
+	session.KafkaEventID = publishEvent("passive_liveness_completed", session.ID, body.CustomerID, body.TenantID,
+		map[string]interface{}{"score": score, "isLive": isLive})
+
+	stats.mu.Lock()
+	stats.TotalSessions++
+	if isLive {
+		stats.CompletedLive++
+	} else {
+		stats.CompletedSpoof++
+	}
+	stats.mu.Unlock()
+	sessionsMu.Lock()
+	sessions[session.ID] = session
+	sessionsMu.Unlock()
+	persistSession(session)
+
+	respondJSON(w, 200, session)
+}
+
+func handleFaceMatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	var body FaceMatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondJSON(w, 400, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if body.Image1 == "" || body.Image2 == "" {
+		respondJSON(w, 400, map[string]string{"error": "image1 and image2 are required"})
+		return
+	}
+
+	// Real face-match via the inference engine. Similarity is NEVER synthesized.
+	engineResp, err := callEngine("/v1/face-match", map[string]interface{}{
+		"image1":     body.Image1,
+		"image2":     body.Image2,
+		"customerId": body.CustomerID,
+		"purpose":    body.Purpose,
+	})
+	if err != nil {
+		stats.mu.Lock()
+		stats.EngineErrors++
+		stats.mu.Unlock()
+		log.Printf("[%s] face-match engine error: %v", serviceName, err)
+		respondJSON(w, 503, map[string]interface{}{
+			"error": "face_match_engine_unavailable", "matched": false, "detail": err.Error(),
+		})
+		return
+	}
+
+	sim, simOK := engineFloat(engineResp, "similarity_score", "similarityScore", "similarity")
+	matched, matchedOK := engineBool(engineResp, "matched", "match")
+	if !matchedOK {
+		if !simOK {
+			respondJSON(w, 502, map[string]interface{}{
+				"error": "face_match_engine_invalid_response", "matched": false,
+				"detail": "engine returned neither a match verdict nor a similarity score",
+			})
+			return
+		}
+		matched = sim >= 68.0
+	}
+
+	result := FaceMatchResponse{
+		ID:              generateID("FM"),
+		Matched:         matched,
+		SimilarityScore: sim,
+		Confidence:      sim / 100.0,
+		Engine:          inferenceURL(),
+		CreatedAt:       time.Now().UTC().Format(time.RFC3339),
+	}
+
+	stats.mu.Lock()
+	stats.TotalFaceMatches++
+	stats.mu.Unlock()
+	if db != nil {
+		payload, _ := json.Marshal(result)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if _, err := db.ExecContext(ctx,
+			`INSERT INTO face_matches (id, customer_id, matched, similarity_score, payload)
+			 VALUES ($1,$2,$3,$4,$5)`, result.ID, body.CustomerID, matched, sim, string(payload)); err != nil {
+			log.Printf("[%s] persist face-match failed: %v", serviceName, err)
+		}
+		cancel()
+	}
+	publishEvent("face_match_completed", result.ID, body.CustomerID, "", map[string]interface{}{
+		"matched": matched, "similarity": sim, "purpose": body.Purpose,
+	})
+
+	respondJSON(w, 200, result)
+}
+
+func handleGetFaceMatches(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	rows, err := db.QueryContext(r.Context(),
+		`SELECT payload FROM face_matches ORDER BY created_at DESC LIMIT 100`)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var out []json.RawMessage
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			continue
+		}
+		out = append(out, json.RawMessage(p))
+	}
+	respondJSON(w, 200, map[string]interface{}{"faceMatches": out, "total": len(out)})
+}
+
+func handleGetEvents(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return
+	}
+	rows, err := db.QueryContext(r.Context(),
+		`SELECT event_type, aggregate_id, published, created_at FROM outbox ORDER BY created_at DESC LIMIT 100`)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	var out []map[string]interface{}
+	for rows.Next() {
+		var et, agg string
+		var pub bool
+		var created time.Time
+		if err := rows.Scan(&et, &agg, &pub, &created); err != nil {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"eventType": et, "aggregateId": agg, "published": pub, "createdAt": created,
+		})
+	}
+	respondJSON(w, 200, map[string]interface{}{"events": out, "total": len(out)})
+}
+
+func handleGetStats(w http.ResponseWriter, r *http.Request) {
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+	respondJSON(w, 200, map[string]interface{}{
+		"totalSessions":    stats.TotalSessions,
+		"totalFaceMatches": stats.TotalFaceMatches,
+		"completedLive":    stats.CompletedLive,
+		"completedSpoof":   stats.CompletedSpoof,
+		"engineErrors":     stats.EngineErrors,
+	})
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// ── MIDDLEWARE: JWT Validation (JWKS / RS256) ───────────────────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
 	if err != nil {
 		log.Printf("[middleware] JWKS fetch failed: %v", err)
 		return
@@ -61,162 +953,79 @@ func callMotionAnalysis(referenceFrame string, actionFrames []string, challengeT
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
-		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
-		jwtCache.keys[k.Kid] = pub
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 	}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	if body.Mode == "" {
-		body.Mode = "hybrid"
-	}
-	if body.ChallengeCount == 0 {
-		body.ChallengeCount = 3
-	}
-
-	sessionID := generateID("SES")
-	now := time.Now().UTC().Format(time.RFC3339)
-	expires := time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339)
-
-	challenges := generateChallenges(body.ChallengeCount)
-
-	session := &LivenessSession{
-		ID:              sessionID,
-		CustomerID:      body.CustomerID,
-		TenantID:        body.TenantID,
-		Status:          StatusPending,
-		Mode:            body.Mode,
-		Challenges:      challenges,
-		ChallengesTotal: len(challenges),
-		ChallengesPassed: 0,
-		DevicePlatform:  body.DevicePlatform,
-		DeviceModel:     body.DeviceModel,
-		IPAddress:       r.RemoteAddr,
-		StartedAt:       now,
-		ExpiresAt:       expires,
-		MaxAttempts:     3,
-		KafkaEventID:    publishEvent("session_created", sessionID, body.CustomerID, body.TenantID, nil),
-	}
-
-	mu.Lock()
-	sessions[sessionID] = session
-	stats.TotalSessions++
-	stats.ActiveSessions++
-	stats.TotalChallenges += int64(len(challenges))
-	mu.Unlock()
-
-	dbData, _ := json.Marshal(map[string]string{"service": "liveness_orchestrator_go", "action": "create"})
-	if dbErr := dbInsert(fmt.Sprintf("liveness_orchestrator_go-%d", time.Now().UnixNano()), "liveness_orchestrator_go", "default", "active", dbData); dbErr != nil {
-		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-	cacheSet("liveness_orchestrator_list", "", 1) // invalidate cache on write
-	}
-	respondJSON(w, 201, session)
+	jwtCache.updated = time.Now()
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
-func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		respondJSON(w, 405, map[string]string{"error": "POST required"})
-		return
-	}
-	var body struct {
-		SessionID    string `json:"sessionId"`
-		ChallengeID  string `json:"challengeId"`
-		FrameBase64  string `json:"frameBase64"`
-		FrameIndex   int    `json:"frameIndex"`
-	}
-	json.NewDecoder(r.Body).Decode(&body)
+func jwtRealmURL() string {
+	return getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+}
 
-	mu.Lock()
-	session, exists := sessions[body.SessionID]
-	if !exists {
-		mu.Unlock()
-		respondJSON(w, 404, map[string]string{"error": "Session not found"})
-		return
-	}
-
-	session.Status = StatusInProgress
-	session.Attempts++
-
-	var challenge *Challenge
-	for i := range session.Challenges {
-		if session.Challenges[i].ID == body.ChallengeID {
-			challenge = &session.Challenges[i]
-			break
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(jwtRealmURL())
 		}
-	}
+	}()
+}
 
-	if challenge == nil {
-		mu.Unlock()
-		respondJSON(w, 404, map[string]string{"error": "Challenge not found"})
-		return
-	}
-
-	challenge.Attempts++
-	challenge.StartedAt = time.Now().UTC().Format(time.RFC3339)
-
-	// Call liveness-inference-py for ML inference with noise-aware scoring
-	inferenceResult, inferenceErr := callInferenceEngine(
-		body.FrameBase64, body.SessionID,
-		session.DevicePlatform, session.DeviceModel,
-	)
-
-	var score float64
-	var noiseInfo *NoiseAssessment
-	var userGuidance string
-	var modeFallback string
-
-	if inferenceErr != nil {
-		// Fallback: if inference engine is unavailable, use conservative scoring
-		log.Printf("[WARN] inference engine error: %v — using fallback scoring", inferenceErr)
-		score = 0.70 // conservative score on engine failure
-	} else if inferenceResult.Error != "" {
-		// Image quality too low or no face detected
-		if inferenceResult.Error == "image_quality_too_low" {
-			challenge.Status = "failed"
-			challenge.Score = 0.0
-			noiseInfo = inferenceResult.NoiseAssessment
-			userGuidance = inferenceResult.UserGuidance
-			mu.Unlock()
-			respondJSON(w, 200, map[string]interface{}{
-				"challengeId":      challenge.ID,
-				"status":           "retry",
-				"score":            0.0,
-				"error":            inferenceResult.Error,
-				"noiseAssessment":  noiseInfo,
-				"userGuidance":     userGuidance,
-				"recommendedAction": inferenceResult.NoiseAssessment.RecommendedAction,
-				"sessionStatus":    session.Status,
-			})
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + expiry). Fail-closed: no token is accepted on structure
+// alone.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
+			next.ServeHTTP(w, r)
 			return
 		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":%q}`, serviceName)
 			return
 		}
-		token := auth[7:]
+		token := strings.TrimPrefix(auth, "Bearer ")
 		parts := strings.Split(token, ".")
 		if len(parts) != 3 {
-			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"malformed token","service":%q}`, serviceName)
 			return
 		}
-		// Decode header for kid
 		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 		if err != nil {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
 		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
 
 		jwtCache.mu.RLock()
 		pub, ok := jwtCache.keys[header.Kid]
 		jwtCache.mu.RUnlock()
 		if !ok {
-			// Try refresh
-			fetchJWKS(realmURL)
+			fetchJWKS(jwtRealmURL())
 			jwtCache.mu.RLock()
 			pub, ok = jwtCache.keys[header.Kid]
 			jwtCache.mu.RUnlock()
@@ -225,163 +1034,63 @@ func handleSubmitFrame(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		session.CompletedAt = time.Now().UTC().Format(time.RFC3339)
-		stats.ActiveSessions--
-		publishEvent("session_completed", session.ID, session.CustomerID, session.TenantID, map[string]interface{}{
-			"verdict": session.Verdict, "score": session.OverallScore,
-		})
-	}
-	mu.Unlock()
 
-	responsePayload := map[string]interface{}{
-		"challengeId":   challenge.ID,
-		"status":        challenge.Status,
-		"score":         challenge.Score,
-		"sessionStatus": session.Status,
-		"overallScore":  session.OverallScore,
-		"isLive":        session.IsLive,
-		"passThreshold": passThreshold,
-	}
-	if noiseInfo != nil {
-		responsePayload["noiseAssessment"] = noiseInfo
-	}
-	if userGuidance != "" {
-		responsePayload["userGuidance"] = userGuidance
-	}
-	if modeFallback != "" {
-		responsePayload["modeFallback"] = modeFallback
-	}
-	respondJSON(w, 200, responsePayload)
-}
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
 
-func handlePassiveLiveness(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		respondJSON(w, 405, map[string]string{"error": "POST required"})
-		return
-	}
-	var body struct {
-		CustomerID     string `json:"customerId"`
-		TenantID       string `json:"tenantId"`
-		ImageBase64    string `json:"imageBase64"`
-		DevicePlatform string `json:"devicePlatform"`
-	}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	sessionID := generateID("PLV")
-	now := time.Now().UTC().Format(time.RFC3339)
-
-	// Call liveness-inference-py for passive liveness with noise compensation
-	inferenceResult, inferenceErr := callInferenceEngine(
-		body.ImageBase64, sessionID, body.DevicePlatform, "",
-	)
-
-	var score float64
-	var isLive bool
-	var noiseInfo *NoiseAssessment
-
-	if inferenceErr != nil {
-		log.Printf("[WARN] inference engine error for passive: %v — using fallback", inferenceErr)
-		score = 0.80
-		isLive = true
-	} else {
-		score = inferenceResult.OverallScore
-		isLive = inferenceResult.IsLive
-		noiseInfo = inferenceResult.NoiseAssessment
-	}
-
-	antiSpoof := &AntiSpoofResult{
-		IsSpoof:            !isLive,
-		SpoofType:         "none",
-		Confidence:        score,
-		TextureScore:      0.89,
-		DepthScore:        0.87,
-		FrequencyScore:    0.91,
-		MoireDetected:     false,
-		DeepfakeProbability: 0.04,
-	}
-	_ = noiseInfo
-
-	session := &LivenessSession{
-		ID:             sessionID,
-		CustomerID:     body.CustomerID,
-		TenantID:       body.TenantID,
-		Status:         StatusCompleted,
-		Mode:           "passive",
-		OverallScore:   score,
-		IsLive:         isLive,
-		Verdict:        map[bool]string{true: "LIVE", false: "SPOOF"}[isLive],
-		DevicePlatform: body.DevicePlatform,
-		StartedAt:      now,
-		CompletedAt:    now,
-		AntiSpoof:      antiSpoof,
-		FaceQuality:    0.92,
-		KafkaEventID:   publishEvent("passive_liveness_completed", sessionID, body.CustomerID, body.TenantID, map[string]interface{}{"score": score, "isLive": isLive}),
-	}
-
-	mu.Lock()
-	sessions[sessionID] = session
-	stats.TotalSessions++
-	if isLive {
-		stats.CompletedLive++
-	} else {
-		stats.CompletedSpoof++
-	}
-	mu.Unlock()
-
-	respondJSON(w, 200, session)
-}
-
-func handleFaceMatch(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		respondJSON(w, 405, map[string]string{"error": "POST required"})
-		return
-	}
-	var body FaceMatchRequest
-	json.NewDecoder(r.Body).Decode(&body)
-
-	// In production: calls liveness-inference-py POST /v1/face-match
-	matchID := generateID("FM")
-	sim := 92.5 + float64(len(body.Image1+body.Image2)%8)
-	if sim > 99.9 {
-		sim = 99.9
-	}
-	matched := sim >= 68.0
-
-	result := FaceMatchResponse{
-		ID:              matchID,
-		Matched:         matched,
-		SimilarityScore: sim,
-		Confidence:      sim / 100.0,
-		ProcessingMs:    23.5,
-	}
-
-	mu.Lock()
-	faceMatches = append(faceMatches, result)
-	stats.TotalFaceMatches++
-	mu.Unlock()
-
-	publishEvent("face_match_completed", matchID, body.CustomerID, "", map[string]interface{}{
-		"matched": matched, "similarity": sim, "purpose": body.Purpose,
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// handleSubmitChallenge handles multi-frame active liveness challenge submission.
-// Accepts reference frame + action frames, calls motion analysis, scores the challenge.
-func handleSubmitChallenge(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		respondJSON(w, 405, map[string]string{"error": "POST required"})
-		return
+// ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
+//
+// Events are marked published ONLY after a confirmed Kafka produce. On Kafka
+// failure rows stay unpublished and are retried — nothing is silently lost.
+
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
 	}
-	var body struct {
-		SessionID      string   `json:"sessionId"`
-		ChallengeID    string   `json:"challengeId"`
-		ReferenceFrame string   `json:"referenceFrame"`
-		ActionFrames   []string `json:"actionFrames"`
-		ChallengeType  string   `json:"challengeType"`
-		DevicePlatform string   `json:"devicePlatform"`
-		DeviceModel    string   `json:"deviceModel"`
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
 	}
-	json.NewDecoder(r.Body).Decode(&body)
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
 
 func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 	go func() {
@@ -399,387 +1108,55 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
-	var ids []string
+	var publishedIDs []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
-		ids = append(ids, id)
-	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
-	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
-}
-
-
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("[liveness-orchestrator-go] starting on :8006")
-
-	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/liveness_orchestrator_go?sslmode=disable")
-	var err error
-	db, err = sql.Open("postgres", dsn)
-	if err != nil {
-		log.Fatalf("database connection failed: %v", err)
-	}
-	defer db.Close()
-
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("database ping failed: %v", err)
-	}
-
-	initSchema()
-	log.Printf("[liveness-orchestrator-go] database connected, schema initialized")
-
-	// Middleware clients
-	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
-	redisURL := getEnv("REDIS_URL", "localhost:6379")
-	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
-	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
-
-	log.Printf("[liveness-orchestrator-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
-		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
-
-	mux := http.NewServeMux()
-
-	// Health endpoints
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
-	})
-	mux.HandleFunc("/metrics", metricsHandler)
-
-	// Domain endpoints
-	mux.HandleFunc("/api/v1/kyc_records", domainHandler)
-	mux.HandleFunc("/api/v1/kyc_records/", domainDetailHandler)
-
-	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8006"),
-		Handler:      loggingMiddleware(corsMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
-
-	log.Printf("[liveness-orchestrator-go] ready on :%s", getEnv("PORT", "8006"))
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Printf("[liveness-orchestrator-go] shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
-	log.Printf("[liveness-orchestrator-go] stopped")
-}
-
-func initSchema() {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS kyc_records (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    customer_id UUID NOT NULL,
-    verification_type VARCHAR(32) NOT NULL,
-    document_type VARCHAR(32),
-    document_number VARCHAR(64),
-    status VARCHAR(20) NOT NULL DEFAULT 'pending',
-    risk_score INT DEFAULT 0,
-    risk_level VARCHAR(20) DEFAULT 'low',
-    bvn VARCHAR(11),
-    nin VARCHAR(11),
-    verified_name VARCHAR(200),
-    date_of_birth DATE,
-    address TEXT,
-    lga VARCHAR(100),
-    state VARCHAR(50),
-    country VARCHAR(3) DEFAULT 'NGA',
-    selfie_match_score REAL,
-    document_match_score REAL,
-    pep_check BOOLEAN DEFAULT FALSE,
-    sanctions_check BOOLEAN DEFAULT FALSE,
-    adverse_media_check BOOLEAN DEFAULT FALSE,
-    reviewer_id UUID,
-    reviewed_at TIMESTAMPTZ,
-    expires_at TIMESTAMPTZ,
-    tenant_id UUID NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-	if err != nil {
-		log.Fatalf("schema init failed: %v", err)
-	}
-
-	// Outbox for event sourcing
-	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
-		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-		event_type VARCHAR(64) NOT NULL,
-		aggregate_id VARCHAR(128) NOT NULL,
-		payload JSONB NOT NULL,
-		published BOOLEAN DEFAULT FALSE,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-	)`)
-	if err != nil {
-		log.Printf("outbox table creation (may already exist): %v", err)
-	}
-
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_kyc_records_tenant ON kyc_records(tenant_id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_kyc_records_status ON kyc_records(status)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_kyc_records_created ON kyc_records(created_at DESC)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
-}
-
-func domainHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		listRecords(w, r)
-	case "POST":
-		createRecord(w, r)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-	}
-}
-
-func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/kyc_records/"), "/")
-	id := parts[0]
-	if id == "" {
-		http.Error(w, `{"error":"id required"}`, http.StatusBadRequest)
-		return
-	}
-
-	switch r.Method {
-	case "GET":
-		getRecord(w, r, id)
-	case "PUT", "PATCH":
-		updateRecord(w, r, id)
-	case "DELETE":
-		deleteRecord(w, r, id)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
-	}
-}
-
-func listRecords(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.Header.Get("X-Tenant-ID")
-	limit := 50
-	offset := 0
-
-	query := `SELECT id, status, created_at FROM kyc_records WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
-	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
-	if err != nil {
-		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var records []map[string]interface{}
-	for rows.Next() {
-		var id, status string
-		var createdAt time.Time
-		if err := rows.Scan(&id, &status, &createdAt); err != nil {
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
 			continue
 		}
-		records = append(records, map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{"data": records, "count": len(records)})
-}
-
-func createRecord(w http.ResponseWriter, r *http.Request) {
-	var body map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
-		return
-	}
-
-// --- Production Hardening ---
-var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
-)
-
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if err := db.Ping(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"liveness-orchestrator-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"liveness-orchestrator-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"liveness-orchestrator-go\"} %.0f\n", time.Since(_bootTime).Seconds())
-}
-
-
-// --- Counting Middleware ---
-func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
-}
-
-type responseWriter struct {
-    http.ResponseWriter
-    status int
-}
-
-func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
-}
-
-
-// --- Distributed Tracing ---
-func traceMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		start := time.Now()
-		next.ServeHTTP(w, r)
-		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
-			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+		msg := &sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
 		}
-	})
-}
-
-// --- Redis Caching Layer ---
-var redisAddr string
-
-func init() {
-	redisAddr = os.Getenv("REDIS_URL")
-	if redisAddr == "" {
-		redisAddr = "localhost:6379"
-	}
-}
-
-func cacheGet(key string) (string, bool) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
-	defer conn.Close()
-	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
-	resp := string(buf[:n])
-	if resp[0] == '$' && resp[1] != '-' {
-		// Parse bulk string response
-		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
-	}
-	return "", false
-}
-
-func cacheSet(key, value string, ttlSeconds int) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
-	defer conn.Close()
-	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
-		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
-}
-
-// --- mTLS Configuration ---
-func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
-	cert := os.Getenv("TLS_CERT_PATH")
-	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54bank/certs/service.crt" }
-	if key == "" { key = "/etc/54bank/certs/service.key" }
-	return true, cert, key
-}
-
-// --- CORS + Security Headers Middleware ---
-func securityHeadersMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusNoContent)
-			return
+		if _, _, err := producer.SendMessage(msg); err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
 		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+		publishedIDs = append(publishedIDs, id)
 	}
-	return fallback
-}
-
-
-func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil { return fmt.Errorf("no db") }
-	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
-	return err
-}
-
-func dbList(service string, limit int) ([]map[string]interface{}, error) {
-	cacheKey := fmt.Sprintf("%s_list_%d", service, limit)
-	if cached, ok := cacheGet(cacheKey); ok {
-		var result []map[string]interface{}
-		if err := json.Unmarshal([]byte(cached), &result); err == nil {
-			return result, nil
+	for _, id := range publishedIDs {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
 		}
 	}
-	if db == nil { return nil, fmt.Errorf("no db") }
-	rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT $2", service, limit)
-	if err != nil { return nil, err }
-	defer rows.Close()
-	var items []map[string]interface{}
-	for rows.Next() {
-		var id, svc, typ, status, data string
-		var createdAt time.Time
-		if rows.Scan(&id, &svc, &typ, &status, &data, &createdAt) == nil {
-			items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "created_at": createdAt})
-		}
+	if len(publishedIDs) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(publishedIDs), topic)
 	}
-	return items, nil
 }
 
-
+// --- Rate Limiting ---
 var _rlTokens int64 = 100
 var _rlLastRefill int64 = 0
 
 func rlAllow() bool {
 	nowr := time.Now().UnixMilli()
-	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
 		atomic.StoreInt64(&_rlTokens, 100)
 		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
@@ -801,197 +1178,189 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- JWT Validation (JWKS-aware) ---
-func jwtAuthMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        p := r.URL.Path
-        if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" || p == "/v1/degradation" {
-            next.ServeHTTP(w, r)
-            return
-        }
-        auth := r.Header.Get("Authorization")
-        if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-            return
-        }
-        token := strings.TrimPrefix(auth, "Bearer ")
-        // Validate JWT structure (header.payload.signature)
-        parts := strings.Split(token, ".")
-        if len(parts) != 3 {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(401)
-            fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
-            return
-        }
-        // In production: validate against Keycloak JWKS endpoint
-        // keycloakURL := os.Getenv("KEYCLOAK_URL")
-        // Decode payload for claims
-        r.Header.Set("X-User-Id", "validated")
-        next.ServeHTTP(w, r)
-    })
+// --- Production Hardening ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": "database not initialized"})
+		return
+	}
+	if err := db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"liveness-orchestrator-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"liveness-orchestrator-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"liveness-orchestrator-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func securityHeadersMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		next.ServeHTTP(w, r)
 	})
 }
 
+func initSchema() {
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS liveness_sessions (
+		id VARCHAR(64) PRIMARY KEY,
+		customer_id VARCHAR(128),
+		tenant_id VARCHAR(128),
+		status VARCHAR(20) NOT NULL DEFAULT 'pending',
+		mode VARCHAR(20),
+		is_live BOOLEAN DEFAULT FALSE,
+		verdict VARCHAR(16),
+		overall_score REAL,
+		payload JSONB,
+		started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Fatalf("schema init failed: %v", err)
+	}
 
-func validateLivenessCheck(responseTime int, statusCode int) (bool, string) {
-	if statusCode >= 500 { return false, "Service unhealthy: 5xx response" }
-	if responseTime > 5000 { return false, "Service unhealthy: response > 5s" }
-	return true, "Service healthy"
-}
-func computeHealthScore(successRate float64, avgLatency int, errorRate float64) float64 {
-	score := successRate * 40 / 100
-	if avgLatency < 100 { score += 30 } else if avgLatency < 500 { score += 20 } else if avgLatency < 1000 { score += 10 }
-	score += (1 - errorRate) * 30
-	return score
-}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS face_matches (
+		id VARCHAR(64) PRIMARY KEY,
+		customer_id VARCHAR(128),
+		matched BOOLEAN NOT NULL,
+		similarity_score REAL,
+		payload JSONB,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Fatalf("schema init failed: %v", err)
+	}
 
+	// Single-use challenge nonces (H-19 replay protection)
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS liveness_challenge_nonces (
+		nonce VARCHAR(64) PRIMARY KEY,
+		session_id VARCHAR(64) NOT NULL,
+		challenge_id VARCHAR(64) NOT NULL,
+		customer_id VARCHAR(128) NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		consumed_at TIMESTAMPTZ
+	)`)
+	if err != nil {
+		log.Fatalf("schema init failed: %v", err)
+	}
 
-// --- Circuit Breaker + Retry (Production) ---
-type circuitBreaker struct {
-    failures    int
-    lastFailure time.Time
-    threshold   int
-    resetAfter  time.Duration
-    mu          sync.Mutex
-}
+	// Outbox for event sourcing
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS outbox (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		event_type VARCHAR(64) NOT NULL,
+		aggregate_id VARCHAR(128) NOT NULL,
+		payload JSONB NOT NULL,
+		published BOOLEAN DEFAULT FALSE,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("outbox table creation (may already exist): %v", err)
+	}
 
-func (cb *circuitBreaker) allow() bool {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures >= cb.threshold {
-        if time.Since(cb.lastFailure) > cb.resetAfter {
-            cb.failures = cb.threshold / 2
-            return true
-        }
-        return false
-    }
-    return true
-}
-
-func (cb *circuitBreaker) recordSuccess() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    if cb.failures > 0 { cb.failures-- }
-}
-
-func (cb *circuitBreaker) recordFailure() {
-    cb.mu.Lock()
-    defer cb.mu.Unlock()
-    cb.failures++
-    cb.lastFailure = time.Now()
-}
-
-var _cb = &circuitBreaker{threshold: 5, resetAfter: 30 * time.Second}
-
-func callServiceWithRetry(method, url string, body interface{}) (map[string]interface{}, error) {
-    if !_cb.allow() {
-        return nil, fmt.Errorf("circuit breaker open for %s", url)
-    }
-    client := &http.Client{Timeout: 15 * time.Second}
-    var lastErr error
-    for attempt := 0; attempt < 3; attempt++ {
-        if attempt > 0 {
-            time.Sleep(time.Duration(1<<uint(attempt)) * 200 * time.Millisecond)
-        }
-        var req *http.Request
-        if body != nil {
-            jsonData, _ := json.Marshal(body)
-            req, _ = http.NewRequest(method, url, bytes.NewBuffer(jsonData))
-        } else {
-            req, _ = http.NewRequest(method, url, nil)
-        }
-        req.Header.Set("Content-Type", "application/json")
-        req.Header.Set("X-Source-Service", serviceName)
-        resp, err := client.Do(req)
-        if err != nil {
-            lastErr = err
-            _cb.recordFailure()
-            log.Printf("[%s] %s %s attempt %d failed: %v", serviceName, method, url, attempt+1, err)
-            continue
-        }
-        defer resp.Body.Close()
-        if resp.StatusCode >= 500 {
-            lastErr = fmt.Errorf("upstream %s returned %d", url, resp.StatusCode)
-            _cb.recordFailure()
-            continue
-        }
-        var result map[string]interface{}
-        json.NewDecoder(resp.Body).Decode(&result)
-        _cb.recordSuccess()
-        return result, nil
-    }
-    return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
-}
-
-// --- Alerting ---
-type alertManager struct {
-    rules []alertRule
-    mu    sync.RWMutex
-}
-
-type alertRule struct {
-    Name      string
-    Metric    string
-    Threshold float64
-    Severity  string
-}
-
-var _alertMgr = &alertManager{
-    rules: []alertRule{
-        {"high_error_rate", "error_rate", 0.05, "critical"},
-        {"high_latency", "p99_latency_ms", 5000, "warning"},
-        {"db_connection_failures", "db_failures", 3, "critical"},
-    },
-}
-
-func (am *alertManager) check() []map[string]interface{} {
-    var fired []map[string]interface{}
-    errRate := float64(atomic.LoadUint64(&_errCount)) / float64(max64(atomic.LoadUint64(&_reqCount), 1))
-    if errRate > 0.05 {
-        fired = append(fired, map[string]interface{}{"rule": "high_error_rate", "value": errRate, "severity": "critical"})
-    }
-    return fired
-}
-
-func max64(a, b uint64) uint64 { if a > b { return a }; return b }
-
-func alertsHandler(w http.ResponseWriter, r *http.Request) {
-    jsonResp(w, 200, map[string]interface{}{"alerts": _alertMgr.check(), "rules": len(_alertMgr.rules)})
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_liveness_sessions_started ON liveness_sessions(started_at DESC)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
 }
 
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.Printf("[%s] starting", serviceName)
 
-	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL != "" {
-		var dbErr error
-		db, dbErr = sql.Open("postgres", dbURL)
-		if dbErr != nil {
-			log.Printf("[%s] DB open failed: %v", serviceName, dbErr)
-		} else {
-			db.SetMaxOpenConns(10)
-			db.SetMaxIdleConns(5)
-			db.Exec("CREATE TABLE IF NOT EXISTS service_records (id TEXT PRIMARY KEY, service TEXT, type TEXT, status TEXT, data TEXT, created_at TIMESTAMPTZ DEFAULT NOW())")
-			log.Printf("[%s] DB connected", serviceName)
-		}
+	// PostgreSQL connection
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[liveness-orchestrator-go] DATABASE_URL env var is required; refusing to start with default database credentials")
 	}
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8231"
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Fatalf("database connection failed: %v", err)
 	}
+	defer db.Close()
+
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		log.Fatalf("database ping failed: %v", err)
+	}
+
+	initSchema()
+	log.Printf("[%s] database connected, schema initialized", serviceName)
+
+	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
+	log.Printf("[%s] inference engine: %s", serviceName, inferenceURL())
+	log.Printf("[%s] middleware: keycloak=%s kafka=%s", serviceName, jwtRealmURL(), kafkaBrokers)
+
+	startJWKSRefresh()
+
+	relayCtx, stopRelay := context.WithCancel(context.Background())
+	defer stopRelay()
+	startOutboxRelay(relayCtx, kafkaBrokers, "liveness.sessions")
+
+	port := getEnv("PORT", "8231")
 
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", healthHandler)
 	mux.HandleFunc("/readyz", readyzHandler)
-
 	mux.HandleFunc("/livez", livezHandler)
-
 	mux.HandleFunc("/metrics", metricsHandler)
-
-	mux.HandleFunc("/v1/alerts", alertsHandler)
-	mux.HandleFunc("/healthz", handleHealthz)
 	mux.HandleFunc("/v1/sessions", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "POST" {
 			handleCreateSession(w, r)
@@ -1008,33 +1377,26 @@ func main() {
 	mux.HandleFunc("/v1/events", handleGetEvents)
 	mux.HandleFunc("/v1/stats", handleGetStats)
 
-	log.Printf("Liveness Orchestrator (Go) on :%s", port)
-	log.Printf("Integrations: inference-py:8230, scoring-rs:8226, face-match-rs:8227")
-	log.Printf("Kafka topics: liveness.sessions, liveness.challenges, liveness.face-match")
-	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
-	_ = tlsCert
-	_ = tlsKey
-	_ = tlsEnabled
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[liveness-orchestrator-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[liveness-orchestrator-go] Server stopped gracefully")
-}
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
 
-func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		log.Printf("[%s] ready on :%s", serviceName, port)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Printf("[%s] shutdown signal received", serviceName)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Printf("[%s] stopped", serviceName)
+}

@@ -38,7 +38,7 @@ func defaultRedisConfig() RedisConfig {
 // --- Pipeline Batcher ---
 
 type PipelineCommand struct {
-	Op    string `json:"op"`    // SET, GET, HSET, HGET, INCR, EXPIRE, DEL
+	Op    string `json:"op"` // SET, GET, HSET, HGET, INCR, EXPIRE, DEL
 	Key   string `json:"key"`
 	Value string `json:"value,omitempty"`
 	Field string `json:"field,omitempty"`

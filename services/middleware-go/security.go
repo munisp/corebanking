@@ -52,6 +52,14 @@ func (s *SigningService) SignTransaction(txnID, signerID, signerRole string, dat
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// One signature per signer per transaction — a single signer must never
+	// be able to stack signatures towards a multi-sig quorum.
+	for _, existing := range s.signatures[txnID] {
+		if existing.SignerID == signerID {
+			return nil, fmt.Errorf("signer %s already signed transaction %s", signerID, txnID)
+		}
+	}
+
 	mac := hmac.New(sha256.New, s.hmacKey)
 	mac.Write(data)
 	sig := hex.EncodeToString(mac.Sum(nil))
@@ -82,31 +90,46 @@ func (s *SigningService) VerifySignature(txnID string, data []byte) (bool, error
 
 	mac := hmac.New(sha256.New, s.hmacKey)
 	mac.Write(data)
-	expected := hex.EncodeToString(mac.Sum(nil))
+	expected := mac.Sum(nil)
 
 	for _, sig := range sigs {
-		if sig.Signature == expected {
+		got, err := hex.DecodeString(sig.Signature)
+		if err != nil {
+			continue
+		}
+		// Constant-time comparison — never == on MACs (timing side channel).
+		if hmac.Equal(got, expected) {
 			return true, nil
 		}
 	}
 	return false, nil
 }
 
+// RequireMultiSig enforces signer UNIQUENESS: the quorum must be met by
+// distinct signer IDs — one signer signing N times must not satisfy an
+// N-of-M policy.
 func (s *SigningService) RequireMultiSig(txnID string, requiredCount int) (bool, int) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	sigs := s.signatures[txnID]
-	return len(sigs) >= requiredCount, len(sigs)
+	distinct := make(map[string]struct{}, len(sigs))
+	for _, sig := range sigs {
+		if sig.SignerID == "" {
+			continue
+		}
+		distinct[sig.SignerID] = struct{}{}
+	}
+	return len(distinct) >= requiredCount, len(distinct)
 }
 
 // --- Fraud Detection Engine (D2) ---
 
 type FraudScore struct {
 	TransactionID string    `json:"transactionId"`
-	Score         float64   `json:"score"`          // 0-100, higher = more risky
-	RiskLevel     string    `json:"riskLevel"`       // "low", "medium", "high", "critical"
+	Score         float64   `json:"score"`     // 0-100, higher = more risky
+	RiskLevel     string    `json:"riskLevel"` // "low", "medium", "high", "critical"
 	Factors       []string  `json:"factors"`
-	Decision      string    `json:"decision"`        // "allow", "review", "block"
+	Decision      string    `json:"decision"` // "allow", "review", "block"
 	Timestamp     time.Time `json:"timestamp"`
 }
 
@@ -119,8 +142,8 @@ type FraudDetector struct {
 }
 
 type FraudThresholds struct {
-	HighValueAmount    float64 `json:"highValueAmount"`    // NGN
-	VelocityWindow     int     `json:"velocityWindow"`     // seconds
+	HighValueAmount    float64 `json:"highValueAmount"` // NGN
+	VelocityWindow     int     `json:"velocityWindow"`  // seconds
 	MaxVelocityCount   int     `json:"maxVelocityCount"`
 	GeoVelocityMinutes int     `json:"geoVelocityMinutes"` // impossible travel
 }

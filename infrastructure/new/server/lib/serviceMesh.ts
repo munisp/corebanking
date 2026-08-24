@@ -7,6 +7,12 @@
  * Architecture:
  *   Client → Express BFF → Service Registry → Upstream (Go/Rust/Python)
  *                                          ↘ Seed Data (fallback)
+ *
+ * Doctrine: registry status is PROBED live — each entry is checked via
+ * HTTP GET <healthEndpoint> with a 2s timeout (Promise.allSettled).
+ * Unreachable services report "down"; services that have never been probed
+ * report "unknown". Nothing is reported "healthy" without a successful
+ * probe, and circuit state reflects real consecutive probe failures.
  */
 
 interface ServiceRegistryEntry {
@@ -17,36 +23,36 @@ interface ServiceRegistryEntry {
   apiEndpoints: string[];
   status: "healthy" | "degraded" | "down" | "unknown";
   lastHealthCheck: string;
-  responseTimeMs: number;
+  responseTimeMs: number | null;
   consecutiveFailures: number;
   circuitState: "closed" | "open" | "half_open";
 }
 
-// All 186 services in the registry
-const serviceRegistry: ServiceRegistryEntry[] = [
+// Registry configuration (ports, endpoints) — static wiring, not telemetry.
+const serviceRegistryConfig: Array<Omit<ServiceRegistryEntry, "status" | "lastHealthCheck" | "responseTimeMs" | "consecutiveFailures" | "circuitState">> = [
   // Core Banking (Go)
-  { name: "core-banking-go", language: "go", port: 8100, healthEndpoint: "/healthz", apiEndpoints: ["/v1/accounts", "/v1/accounts/:id", "/v1/accounts/:id/balance"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 3, consecutiveFailures: 0, circuitState: "closed" },
-  { name: "payments-hub-go", language: "go", port: 8101, healthEndpoint: "/healthz", apiEndpoints: ["/v1/payments", "/v1/payments/:id", "/v1/payments/batch"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 5, consecutiveFailures: 0, circuitState: "closed" },
-  { name: "account-opening-go", language: "go", port: 8102, healthEndpoint: "/healthz", apiEndpoints: ["/v1/applications", "/v1/applications/:id/approve"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 8, consecutiveFailures: 0, circuitState: "closed" },
-  { name: "nibss-gateway-go", language: "go", port: 8103, healthEndpoint: "/healthz", apiEndpoints: ["/v1/nip/transfer", "/v1/nip/lookup", "/v1/nip/status"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 12, consecutiveFailures: 0, circuitState: "closed" },
-  { name: "settlement-engine-rs", language: "rust", port: 8104, healthEndpoint: "/healthz", apiEndpoints: ["/v1/settlements", "/v1/settlements/:id/close", "/v1/windows"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 2, consecutiveFailures: 0, circuitState: "closed" },
-  { name: "mojaloop-connector-go", language: "go", port: 8124, healthEndpoint: "/healthz", apiEndpoints: ["/v1/participants", "/v1/parties", "/v1/quotes", "/v1/transfers"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 15, consecutiveFailures: 0, circuitState: "closed" },
+  { name: "core-banking-go", language: "go", port: 8100, healthEndpoint: "/healthz", apiEndpoints: ["/v1/accounts", "/v1/accounts/:id", "/v1/accounts/:id/balance"] },
+  { name: "payments-hub-go", language: "go", port: 8101, healthEndpoint: "/healthz", apiEndpoints: ["/v1/payments", "/v1/payments/:id", "/v1/payments/batch"] },
+  { name: "account-opening-go", language: "go", port: 8102, healthEndpoint: "/healthz", apiEndpoints: ["/v1/applications", "/v1/applications/:id/approve"] },
+  { name: "nibss-gateway-go", language: "go", port: 8103, healthEndpoint: "/healthz", apiEndpoints: ["/v1/nip/transfer", "/v1/nip/lookup", "/v1/nip/status"] },
+  { name: "settlement-engine-rs", language: "rust", port: 8104, healthEndpoint: "/healthz", apiEndpoints: ["/v1/settlements", "/v1/settlements/:id/close", "/v1/windows"] },
+  { name: "mojaloop-connector-go", language: "go", port: 8124, healthEndpoint: "/healthz", apiEndpoints: ["/v1/participants", "/v1/parties", "/v1/quotes", "/v1/transfers"] },
   // TigerBeetle (Rust)
-  { name: "tigerbeetle-ledger-rs", language: "rust", port: 8200, healthEndpoint: "/healthz", apiEndpoints: ["/v1/accounts", "/v1/transfers", "/v1/balances"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 1, consecutiveFailures: 0, circuitState: "closed" },
+  { name: "tigerbeetle-ledger-rs", language: "rust", port: 8200, healthEndpoint: "/healthz", apiEndpoints: ["/v1/accounts", "/v1/transfers", "/v1/balances"] },
   // KYC/AML (Python)
-  { name: "kyc-engine-py", language: "python", port: 8110, healthEndpoint: "/healthz", apiEndpoints: ["/v1/verify/bvn", "/v1/verify/nin", "/v1/verify/document"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 45, consecutiveFailures: 0, circuitState: "closed" },
+  { name: "kyc-engine-py", language: "python", port: 8110, healthEndpoint: "/healthz", apiEndpoints: ["/v1/verify/bvn", "/v1/verify/nin", "/v1/verify/document"] },
   // Fraud (Rust)
-  { name: "fraud-detection-rs", language: "rust", port: 8115, healthEndpoint: "/healthz", apiEndpoints: ["/v1/score", "/v1/rules", "/v1/alerts"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 3, consecutiveFailures: 0, circuitState: "closed" },
+  { name: "fraud-detection-rs", language: "rust", port: 8115, healthEndpoint: "/healthz", apiEndpoints: ["/v1/score", "/v1/rules", "/v1/alerts"] },
   // Lakehouse (Rust)
-  { name: "lakehouse-rs", language: "rust", port: 8126, healthEndpoint: "/healthz", apiEndpoints: ["/v1/datasets", "/v1/query", "/v1/ingest"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 120, consecutiveFailures: 0, circuitState: "closed" },
+  { name: "lakehouse-rs", language: "rust", port: 8126, healthEndpoint: "/healthz", apiEndpoints: ["/v1/datasets", "/v1/query", "/v1/ingest"] },
   // Lending (Go)
-  { name: "lending-engine-go", language: "go", port: 8105, healthEndpoint: "/healthz", apiEndpoints: ["/v1/loans", "/v1/loans/:id/disburse", "/v1/loans/:id/repay"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 8, consecutiveFailures: 0, circuitState: "closed" },
+  { name: "lending-engine-go", language: "go", port: 8105, healthEndpoint: "/healthz", apiEndpoints: ["/v1/loans", "/v1/loans/:id/disburse", "/v1/loans/:id/repay"] },
   // GL (Rust)
-  { name: "gl-engine-rs", language: "rust", port: 8201, healthEndpoint: "/healthz", apiEndpoints: ["/v1/journal", "/v1/trial-balance", "/v1/gl-accounts"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 4, consecutiveFailures: 0, circuitState: "closed" },
+  { name: "gl-engine-rs", language: "rust", port: 8201, healthEndpoint: "/healthz", apiEndpoints: ["/v1/journal", "/v1/trial-balance", "/v1/gl-accounts"] },
   // Postgres Optimization (Go/Rust/Python)
-  { name: "postgres-query-optimizer-go", language: "go", port: 8272, healthEndpoint: "/healthz", apiEndpoints: ["/v1/query-profiles", "/v1/index-advisory"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 5, consecutiveFailures: 0, circuitState: "closed" },
-  { name: "postgres-query-cache-rs", language: "rust", port: 8273, healthEndpoint: "/healthz", apiEndpoints: ["/v1/slow-queries", "/v1/plan-cache"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 2, consecutiveFailures: 0, circuitState: "closed" },
-  { name: "postgres-vacuum-py", language: "python", port: 8274, healthEndpoint: "/healthz", apiEndpoints: ["/v1/table-stats", "/v1/vacuum-schedule"], status: "healthy", lastHealthCheck: new Date().toISOString(), responseTimeMs: 15, consecutiveFailures: 0, circuitState: "closed" },
+  { name: "postgres-query-optimizer-go", language: "go", port: 8272, healthEndpoint: "/healthz", apiEndpoints: ["/v1/query-profiles", "/v1/index-advisory"] },
+  { name: "postgres-query-cache-rs", language: "rust", port: 8273, healthEndpoint: "/healthz", apiEndpoints: ["/v1/slow-queries", "/v1/plan-cache"] },
+  { name: "postgres-vacuum-py", language: "python", port: 8274, healthEndpoint: "/healthz", apiEndpoints: ["/v1/table-stats", "/v1/vacuum-schedule"] },
 ];
 
 interface ProxyConfig {
@@ -76,16 +82,84 @@ const proxyRoutes: ProxyConfig[] = [
   { method: "GET", expressPath: "/api/gl/journal", upstream: "gl-engine-rs", upstreamPort: 8201, upstreamPath: "/v1/journal", timeoutMs: 5000, retries: 2, circuitBreakerThreshold: 5, fallbackToSeedData: true },
 ];
 
+// ─── LIVE HEALTH PROBING ────────────────────────────────────────────────────
+
+const PROBE_TIMEOUT_MS = 2000;
+const CIRCUIT_BREAKER_THRESHOLD = 3;
+
+// Real runtime probe state, updated on every probe cycle.
+const runtimeState = new Map<string, { consecutiveFailures: number }>();
+
+function serviceUrl(name: string, port: number, healthEndpoint: string): string {
+  const envKey = `SERVICE_URL_${name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+  const fromEnv = process.env[envKey];
+  if (fromEnv) return fromEnv.replace(/\/$/, "") + healthEndpoint;
+  return `http://127.0.0.1:${port}${healthEndpoint}`;
+}
+
+async function probeService(url: string): Promise<{ ok: boolean; latencyMs: number }> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+  const start = Date.now();
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    return { ok: res.ok, latencyMs: Date.now() - start };
+  } catch {
+    return { ok: false, latencyMs: Date.now() - start };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function probeRegistry(): Promise<ServiceRegistryEntry[]> {
+  const results = await Promise.allSettled(
+    serviceRegistryConfig.map(async (cfg): Promise<ServiceRegistryEntry> => {
+      const state = runtimeState.get(cfg.name) ?? { consecutiveFailures: 0 };
+      const probe = await probeService(serviceUrl(cfg.name, cfg.port, cfg.healthEndpoint));
+
+      state.consecutiveFailures = probe.ok ? 0 : state.consecutiveFailures + 1;
+      runtimeState.set(cfg.name, state);
+
+      return {
+        ...cfg,
+        status: probe.ok ? "healthy" : "down",
+        lastHealthCheck: new Date().toISOString(),
+        responseTimeMs: probe.latencyMs,
+        consecutiveFailures: state.consecutiveFailures,
+        circuitState: probe.ok ? "closed" : state.consecutiveFailures >= CIRCUIT_BREAKER_THRESHOLD ? "open" : "half_open",
+      };
+    })
+  );
+
+  return results.map(r =>
+    r.status === "fulfilled"
+      ? r.value
+      : null
+  ).filter((e): e is ServiceRegistryEntry => e !== null);
+}
+
 export function registerServiceMesh(app: any) {
-  app.get("/api/platform/service-mesh/registry", (_req: any, res: any) => {
-    res.json({ items: serviceRegistry, total: serviceRegistry.length, healthy: serviceRegistry.filter(s => s.status === "healthy").length });
+  app.get("/api/platform/service-mesh/registry", async (_req: any, res: any) => {
+    const items = await probeRegistry();
+    res.json({ items, total: items.length, healthy: items.filter(s => s.status === "healthy").length });
   });
   app.get("/api/platform/service-mesh/proxy-routes", (_req: any, res: any) => {
     res.json({ items: proxyRoutes, total: proxyRoutes.length });
   });
-  app.get("/api/platform/service-mesh/stats", (_req: any, res: any) => {
-    const healthy = serviceRegistry.filter(s => s.status === "healthy").length;
-    const avgResponse = serviceRegistry.reduce((s, e) => s + e.responseTimeMs, 0) / serviceRegistry.length;
-    res.json({ totalServices: serviceRegistry.length, healthy, degraded: serviceRegistry.filter(s => s.status === "degraded").length, down: serviceRegistry.filter(s => s.status === "down").length, proxyRoutes: proxyRoutes.length, avgResponseMs: Math.round(avgResponse * 10) / 10, circuitsOpen: serviceRegistry.filter(s => s.circuitState === "open").length });
+  app.get("/api/platform/service-mesh/stats", async (_req: any, res: any) => {
+    const items = await probeRegistry();
+    const probed = items.filter(s => s.responseTimeMs !== null);
+    const avgResponse = probed.length > 0 ? probed.reduce((s, e) => s + (e.responseTimeMs ?? 0), 0) / probed.length : null;
+    res.json({
+      totalServices: items.length,
+      healthy: items.filter(s => s.status === "healthy").length,
+      degraded: items.filter(s => s.status === "degraded").length,
+      down: items.filter(s => s.status === "down").length,
+      unknown: items.filter(s => s.status === "unknown").length,
+      proxyRoutes: proxyRoutes.length,
+      avgResponseMs: avgResponse === null ? null : Math.round(avgResponse * 10) / 10,
+      circuitsOpen: items.filter(s => s.circuitState === "open").length,
+      note: "All statuses are live /healthz probes (2s timeout) — a service is never reported healthy without a successful probe",
+    });
   });
 }

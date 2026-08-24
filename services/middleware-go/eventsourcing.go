@@ -112,10 +112,10 @@ func (s *KafkaEventStore) Subscribe(ctx context.Context, eventTypes []string, ha
 // Standard event types for banking domains
 const (
 	// Teller events
-	EventTellerSessionOpened    = "teller.session.opened"
-	EventTellerDeposit          = "teller.deposit.completed"
-	EventTellerWithdrawal       = "teller.withdrawal.completed"
-	EventTellerSessionClosed    = "teller.session.closed"
+	EventTellerSessionOpened = "teller.session.opened"
+	EventTellerDeposit       = "teller.deposit.completed"
+	EventTellerWithdrawal    = "teller.withdrawal.completed"
+	EventTellerSessionClosed = "teller.session.closed"
 
 	// Loan events
 	EventLoanApplicationCreated = "loan.application.created"
@@ -125,35 +125,35 @@ const (
 	EventLoanDefaulted          = "loan.defaulted"
 
 	// Trade finance events
-	EventLCIssued               = "trade.lc.issued"
-	EventLCConfirmed            = "trade.lc.confirmed"
-	EventLCDrawing              = "trade.lc.drawing"
-	EventLCSettled              = "trade.lc.settled"
+	EventLCIssued    = "trade.lc.issued"
+	EventLCConfirmed = "trade.lc.confirmed"
+	EventLCDrawing   = "trade.lc.drawing"
+	EventLCSettled   = "trade.lc.settled"
 
 	// Transfer events
-	EventTransferInitiated      = "transfer.initiated"
-	EventTransferCompleted      = "transfer.completed"
-	EventTransferFailed         = "transfer.failed"
+	EventTransferInitiated = "transfer.initiated"
+	EventTransferCompleted = "transfer.completed"
+	EventTransferFailed    = "transfer.failed"
 
 	// Account events
-	EventAccountCreated         = "account.created"
-	EventAccountFrozen          = "account.frozen"
-	EventAccountClosed          = "account.closed"
+	EventAccountCreated = "account.created"
+	EventAccountFrozen  = "account.frozen"
+	EventAccountClosed  = "account.closed"
 
 	// Dispute events
-	EventDisputeOpened          = "dispute.opened"
-	EventDisputeResolved        = "dispute.resolved"
-	EventChargebackInitiated    = "dispute.chargeback.initiated"
+	EventDisputeOpened       = "dispute.opened"
+	EventDisputeResolved     = "dispute.resolved"
+	EventChargebackInitiated = "dispute.chargeback.initiated"
 
 	// Islamic banking events
-	EventMurabahaCreated        = "islamic.murabaha.created"
-	EventMurabahaActivated      = "islamic.murabaha.activated"
-	EventSukukIssued            = "islamic.sukuk.issued"
+	EventMurabahaCreated   = "islamic.murabaha.created"
+	EventMurabahaActivated = "islamic.murabaha.activated"
+	EventSukukIssued       = "islamic.sukuk.issued"
 
 	// Agriculture events
-	EventFarmerRegistered       = "agriculture.farmer.registered"
-	EventAgriLoanDisbursed      = "agriculture.loan.disbursed"
-	EventInsuranceClaimed       = "agriculture.insurance.claimed"
+	EventFarmerRegistered  = "agriculture.farmer.registered"
+	EventAgriLoanDisbursed = "agriculture.loan.disbursed"
+	EventInsuranceClaimed  = "agriculture.insurance.claimed"
 )
 
 func EmitEvent(store EventStore, aggregateType, aggregateID, eventType, actor string, payload map[string]interface{}) error {

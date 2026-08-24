@@ -5,23 +5,62 @@ Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorizati
 
 import os
 import json
-import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import hashlib
+import time
+import threading
+import signal
+import socket as _socket
+import urllib.request
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("document-intelligence-py")
 
+# Engine configuration (real settings; no fabricated results)
+PADDLEOCR_CONFIG = {
+    "engine": "paddleocr_v4",
+    "lang": os.environ.get("PADDLEOCR_LANG", "en"),
+    "use_gpu": os.environ.get("PADDLEOCR_USE_GPU", "false") == "true",
+}
+VLM_CONFIG = {
+    "model": os.environ.get("VLM_MODEL", "qwen-vl-max"),
+    "supported_classes": ["invoice", "bank_statement", "id_card", "passport", "cheque", "contract", "audited_financials", "utility_bill"],
+    "fraud_checks": ["font_inconsistency", "metadata_anomaly", "template_mismatch", "erasure_marks"],
+}
+DOCLING_CONFIG = {
+    "version": os.environ.get("DOCLING_VERSION", "2.x"),
+    "structured_templates": {
+        "memart": ["parties", "objects", "share_capital", "directors", "signatures"],
+        "invoice": ["seller", "buyer", "line_items", "totals", "tax"],
+        "bank_statement": ["account", "period", "opening_balance", "transactions", "closing_balance"],
+        "audited_financials": ["auditor", "opinion", "balance_sheet", "income_statement", "notes"],
+    },
+}
+
 # Configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/document_intelligence_py")
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
 KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
 KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
@@ -31,10 +70,14 @@ PORT = int(os.getenv("PORT", "8233"))
 
 db_conn = None
 
+# Rate limiter state (module-level, guarded by _rl_lock)
+_rl_tokens = 100
+_rl_lock = threading.Lock()
+_rl_last_refill = [0.0]
+
 def _rl_allow():
     global _rl_tokens
-    import time as _t
-    now = _t.time()
+    now = time.time()
     with _rl_lock:
         if now - _rl_last_refill[0] >= 1.0:
             _rl_tokens = 100
@@ -159,7 +202,6 @@ def get_db():
 
 def release_db(conn):
     """Return a connection to the pool."""
-    global _db_pool
     if _db_pool and conn:
         try:
             _db_pool.putconn(conn)
@@ -167,25 +209,22 @@ def release_db(conn):
             pass
 
 def init_schema():
-    conn = get_db()
-    if not conn:
-        record["id"] = str(uuid.uuid4())
-        record["created_at"] = datetime.now(timezone.utc).isoformat()
-        return record
+    """Create the tables this service actually uses. Never crash startup:
+    log the failure and continue so the process can report not-ready via
+    /readyz instead of dying in lifespan."""
+    try:
+        conn = get_db()
+    except Exception as e:
+        logger.error(f"init_schema: database unavailable: {e}")
+        return
     try:
         cur = conn.cursor()
-        data = json.dumps(record)
-        cur.execute("INSERT INTO records (data, service) VALUES (%s, %s) RETURNING id, created_at",
-                    (data, "document-intelligence-py"))
-        row = cur.fetchone()
-        record["id"] = str(row[0])
-        record["created_at"] = str(row[1])
-        return record
-    except Exception as e:
-        logger.error(f"DB insert failed: {e}")
-        record["id"] = str(uuid.uuid4())
-        return record
-
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id UUID,
+            status VARCHAR(32) DEFAULT 'active',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("""CREATE TABLE IF NOT EXISTS outbox (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             event_type VARCHAR(64) NOT NULL,
@@ -194,20 +233,21 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
-
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
-    conn.commit()
-    logger.info("Schema initialized")
+        conn.commit()
+        logger.info("Schema initialized")
+    except Exception as e:
+        logger.error(f"init_schema failed: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_schema()
-    logger.info(f"[document-intelligence-py] ready on :%d", PORT)
-    logger.info(f"[document-intelligence-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
+    logger.info("[document-intelligence-py] ready on :%d", PORT)
+    logger.info("[document-intelligence-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
     yield
     if db_conn:
@@ -216,9 +256,67 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="document-intelligence-py", version="1.0.0", lifespan=lifespan)
 
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -269,150 +367,168 @@ def metrics():
 
 
 @app.get("/api/v1/service_configs")
-def list_records(x_tenant_id: Optional[str] = Header(None)):
+def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
     conn = get_db()
     if not conn:
-        return [], 0
+        return {"items": [], "total": 0, "page": page, "limit": limit}
     try:
         cur = conn.cursor()
         offset = (page - 1) * limit
-        cur.execute("SELECT id, data, created_at FROM records WHERE service = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    ("document-intelligence-py", limit, offset))
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (limit, offset))
         rows = cur.fetchall()
-        items = []
-        for row in rows:
-            item = json.loads(row[1]) if isinstance(row[1], str) else row[1]
-            item["id"] = str(row[0])
-            item["created_at"] = str(row[2])
-            items.append(item)
-        cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", ("document-intelligence-py",))
+        items = [
+            {"id": str(row[0]), "status": row[1], "tenant_id": str(row[2]) if row[2] else None, "created_at": str(row[3])}
+            for row in rows
+        ]
+        cur.execute("SELECT COUNT(*) FROM service_configs")
         total = cur.fetchone()[0]
-        return items, total
+        return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
     except Exception as e:
         logger.error(f"DB query failed: {e}")
-        return [], 0
-
+        raise HTTPException(status_code=503, detail="config_unavailable")
 # --- JWT Auth ---
 def validate_jwt(headers):
-    auth = headers.get("Authorization", "")
+    """Validate Bearer JWT with real HS256 signature verification (stdlib).
+
+    Fails closed: returns (None, reason) whenever the token cannot be
+    cryptographically verified, is expired, is missing exp, or JWT_SECRET is
+    not configured. Never warn-and-allow.
+    Canonical implementation: services/shared/auth/jwt_validation.py.
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
     if not auth.startswith("Bearer "):
         return None, "Missing Bearer token"
     token = auth[7:]
+    import hmac, base64, json as _json, time as _t
+    def _b64url_decode(s):
+        s += "=" * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode())
     parts = token.split(".")
     if len(parts) != 3:
         return None, "Invalid token format"
-    # In production: verify JWT signature with JWT_SECRET
-    return {"sub": "authenticated"}, None
+    secret = os.environ.get("JWT_SECRET", "")
+    if not secret or secret.startswith("${"):
+        return None, "auth_not_configured"
+    try:
+        header = _json.loads(_b64url_decode(parts[0]))
+        payload = _json.loads(_b64url_decode(parts[1]))
+        signature = _b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    if header.get("alg") != "HS256":
+        return None, "Unsupported token algorithm"
+    expected = hmac.new(secret.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256).digest()
+    if not hmac.compare_digest(expected, signature):
+        return None, "Invalid token signature"
+    exp = payload.get("exp")
+    if exp is None:
+        return None, "Token missing exp claim"
+    try:
+        if _t.time() >= float(exp):
+            return None, "Token expired"
+    except (TypeError, ValueError):
+        return None, "Invalid token expiry"
+    issuer = os.environ.get("JWT_ISSUER", "")
+    if issuer and payload.get("iss") != issuer:
+        return None, "Invalid token issuer"
+    return payload, None
 
 # --- Domain Logic ---
-def simulate_paddleocr_extraction(image_b64, doc_type, template):
-    img_size = len(image_b64) if image_b64 else 0
-    seed = int(hashlib.sha256((image_b64 or "empty")[:100].encode()).hexdigest()[:8], 16)
-    confidence = 0.85 + (seed % 12) / 100.0
+def ocr_extract(image_b64, doc_type, template):
+    """Real OCR extraction via the configured upstream OCR pipeline.
 
-    fields = {}
-    for field_name in template.get("fields", []):
-        fields[field_name] = {"value": "", "confidence": confidence - 0.02 + (hash(field_name) % 5) / 100.0,
-            "bbox": [0, 0, 100, 20], "recognized": True}
-
-    text_lines = max(5, img_size // 1000)
-    tables = 1 if doc_type in ("audited_financials", "bank_statement") else 0
-
-    return {
-        "engine": "paddleocr_v4",
-        "config": PADDLEOCR_CONFIG,
-        "text_lines_detected": text_lines,
-        "tables_detected": tables,
-        "layout_regions": [
-            {"type": "text", "bbox": [0, 0, 1, 1], "confidence": confidence},
-        ],
-        "fields": fields,
-        "raw_text": "",
-        "overall_confidence": round(confidence, 4),
-        "processing_ms": 450 + (seed % 800),
-    }
+    No fabricated results: when no OCR pipeline is configured the endpoint
+    fails fast with 501 not_implemented; when the pipeline is unreachable it
+    fails with 503 model_unavailable.
+    """
+    upstream = os.environ.get("OCR_SERVICE_URL", "").strip()
+    if not upstream:
+        raise HTTPException(status_code=501, detail={
+            "error": "not_implemented",
+            "message": "no OCR pipeline configured (set OCR_SERVICE_URL)"})
+    try:
+        return call_service("POST", upstream.rstrip("/") + "/v1/ocr/extract",
+                            {"image_b64": image_b64, "doc_type": doc_type,
+                             "template": template, "config": PADDLEOCR_CONFIG})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={
+            "error": "model_unavailable",
+            "message": f"OCR pipeline unreachable: {e}"})
 
 
-def simulate_vlm_classification(image_b64, expected_class=None):
-    seed = int(hashlib.sha256((image_b64 or "empty")[:100].encode()).hexdigest()[:8], 16)
-    confidence = 0.90 + (seed % 8) / 100.0
+def vlm_classify(image_b64, expected_class=None):
+    """Real VLM document classification/quality/fraud check via upstream model.
 
-    predicted = expected_class or VLM_CONFIG["supported_classes"][seed % len(VLM_CONFIG["supported_classes"])]
-    alternatives = [{"class": c, "confidence": round(0.01 + (hash(c) % 3) / 100, 4)}
-        for c in VLM_CONFIG["supported_classes"] if c != predicted][:3]
-
-    blur_score = (seed % 20) / 100.0
-    quality = "high" if blur_score < 0.1 else "medium" if blur_score < 0.2 else "low"
-
-    fraud_indicators = {}
-    for check in VLM_CONFIG["fraud_checks"]:
-        fraud_indicators[check] = {"detected": False, "confidence": 0.95 + (hash(check) % 5) / 100.0}
-
-    tampering = (seed % 50) == 0
-    if tampering:
-        fraud_indicators["digital_tampering"]["detected"] = True
-
-    return {
-        "engine": "vlm",
-        "model": VLM_CONFIG["model"],
-        "classification": {
-            "predicted_class": predicted,
-            "confidence": round(confidence, 4),
-            "alternatives": alternatives,
-        },
-        "quality_assessment": {
-            "overall_quality": quality,
-            "resolution_adequate": True,
-            "blur_score": round(blur_score, 4),
-            "lighting": "good" if blur_score < 0.15 else "poor",
-            "orientation": "correct",
-            "cropping_adequate": True,
-            "ocr_readable": quality != "low",
-        },
-        "fraud_detection": {
-            "fraud_detected": tampering,
-            "overall_confidence": round(0.95 + (seed % 4) / 100.0, 4),
-            "indicators": fraud_indicators,
-            "recommendation": "reject" if tampering else "accept",
-        },
-    }
+    No fabricated results: 501 when no VLM pipeline is configured, 503 when
+    the pipeline is unreachable.
+    """
+    upstream = os.environ.get("VLM_SERVICE_URL", "").strip()
+    if not upstream:
+        raise HTTPException(status_code=501, detail={
+            "error": "not_implemented",
+            "message": "no VLM pipeline configured (set VLM_SERVICE_URL)"})
+    try:
+        return call_service("POST", upstream.rstrip("/") + "/v1/vlm/classify",
+                            {"image_b64": image_b64,
+                             "expected_class": expected_class,
+                             "config": VLM_CONFIG})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={
+            "error": "model_unavailable",
+            "message": f"VLM pipeline unreachable: {e}"})
 
 
-def simulate_docling_parsing(doc_type, content_b64=None):
-    template_name = doc_type if doc_type in DOCLING_CONFIG["structured_templates"] else "memart"
-    sections = DOCLING_CONFIG["structured_templates"][template_name]
+def docling_parse(doc_type, content_b64=None):
+    """Real structured document parsing via the configured docling service.
 
-    seed = int(hashlib.sha256((content_b64 or "empty")[:50].encode()).hexdigest()[:8], 16)
-    confidence = 0.85 + (seed % 10) / 100.0
+    No fabricated results: 501 when no parsing pipeline is configured, 503
+    when the pipeline is unreachable.
+    """
+    upstream = os.environ.get("DOCLING_SERVICE_URL", "").strip()
+    if not upstream:
+        raise HTTPException(status_code=501, detail={
+            "error": "not_implemented",
+            "message": "no docling pipeline configured (set DOCLING_SERVICE_URL)"})
+    try:
+        return call_service("POST", upstream.rstrip("/") + "/v1/parse",
+                            {"doc_type": doc_type, "content_b64": content_b64,
+                             "config": DOCLING_CONFIG})
+    except Exception as e:
+        raise HTTPException(status_code=503, detail={
+            "error": "model_unavailable",
+            "message": f"docling pipeline unreachable: {e}"})
 
-    parsed_sections = {}
-    for section in sections:
-        parsed_sections[section] = {
-            "extracted": True,
-            "confidence": round(confidence - 0.02 + (hash(section) % 5) / 100, 4),
-            "content": f"[Extracted content for {section}]",
-            "page_numbers": [1],
-            "tables": [],
-        }
 
-    return {
-        "engine": "docling",
-        "version": DOCLING_CONFIG["version"],
-        "document_type": doc_type,
-        "template": template_name,
-        "total_pages": 1 + (seed % 50),
-        "sections": parsed_sections,
-        "metadata": {
-            "language": "en",
-            "format": "pdf",
-            "encrypted": False,
-            "scanned": seed % 3 == 0,
-        },
-        "cross_references": [],
-        "tables_extracted": seed % 5,
-        "overall_confidence": round(confidence, 4),
-        "processing_ms": 1200 + (seed % 3000),
-    }
+class _OcrRequest(BaseModel):
+    image_b64: str
+    doc_type: str = "generic"
+    template: Dict[str, Any] = {}
+
+
+class _VlmRequest(BaseModel):
+    image_b64: str
+    expected_class: Optional[str] = None
+
+
+class _ParseRequest(BaseModel):
+    doc_type: str
+    content_b64: Optional[str] = None
+
+
+@app.post("/v1/ocr/extract")
+def ocr_extract_route(req: _OcrRequest):
+    return ocr_extract(req.image_b64, req.doc_type, req.template)
+
+
+@app.post("/v1/vlm/classify")
+def vlm_classify_route(req: _VlmRequest):
+    return vlm_classify(req.image_b64, req.expected_class)
+
+
+@app.post("/v1/docling/parse")
+def docling_parse_route(req: _ParseRequest):
+    return docling_parse(req.doc_type, req.content_b64)
 
 
 
@@ -528,26 +644,6 @@ def grpc_call(target, method, payload, retries=3):
             except: pass
     return None
 
-def call_service(method, url, body=None, retries=3, timeout=15):
-    """HTTP inter-service call with retry + circuit breaker."""
-    if not _grpc_cb.allow():
-        return None
-    import urllib.request, urllib.error
-    for attempt in range(retries):
-        try:
-            data = json.dumps(body).encode() if body else None
-            req = urllib.request.Request(url, data=data, method=method,
-                                         headers={"Content-Type": "application/json"})
-            resp = urllib.request.urlopen(req, timeout=timeout)
-            _grpc_cb.record_success()
-            return json.loads(resp.read())
-        except Exception as e:
-            _grpc_cb.record_failure()
-            if attempt < retries - 1:
-                time.sleep((2 ** attempt) * 0.2)
-            logger.warning(f"HTTP {method} {url} attempt {attempt+1} failed: {e}")
-    return None
-
 # gRPC service registry
 GRPC_REGISTRY = {
     "core-banking": 9090, "payments-hub": 9091, "gl-engine": 9092,
@@ -607,110 +703,6 @@ class _DegradationState:
             }
 
 _degrade = _DegradationState()
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        logger.info(f"{self.command} {self.path} {args[0] if args else ''}")
-
-    def respond(self, code, data):
-        if code >= 400:
-            inc_errors()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Trace-Id", trace_id if 'trace_id' in dir() else "unknown")
-        add_security_headers(self)
-        self.end_headers()
-        self.wfile.write(json.dumps(data, default=str).encode())
-
-    def do_GET(self):
-        _cache_key = f"document_intelligence_{self.path}"
-        _cached = cache_get(_cache_key)
-        if _cached and self.path not in ("/healthz", "/readyz", "/livez", "/metrics", "/health"):
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("X-Cache", "HIT")
-            add_security_headers(self)
-            self.end_headers()
-            self.wfile.write(_cached.encode() if isinstance(_cached, str) else _cached)
-            return
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[document-intelligence-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-
-        if path == "/healthz":
-            db = get_db()
-            self.respond(200, {
-                "status": "healthy",
-                "service": "document-intelligence-py",
-                "version": "2.0.0",
-                "db": "connected" if db else "not_configured",
-                "uptime_secs": round(time.time() - START_TIME),
-            })
-        elif path == "/readyz":
-            self.respond(200, {"ready": True})
-        elif path == "/livez":
-            self.respond(200, {"alive": True})
-        elif path == "/v1/degradation":
-                self._json(200, {"service": "document-intelligence-py", **_degrade.status()})
-            elif path == "/v1/alerts":
-                self._json(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-            elif path == "/metrics":
-            body = (
-                f'# HELP requests_total Total requests\n'
-                f'# TYPE requests_total counter\n'
-                f'requests_total{{service=\"document-intelligence-py\"}} {request_count}\n'
-                f'# HELP errors_total Total errors\n'
-                f'# TYPE errors_total counter\n'
-                f'errors_total{{service=\"document-intelligence-py\"}} {error_count}\n'
-            )
-        else:
-            cur.execute("SELECT id, status, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
-        rows = cur.fetchall()
-
-    def do_POST(self):
-        trace_id = self.headers.get("X-Trace-Id") or self.headers.get("traceparent") or f"{int(__import__('time').time()*1000)}-{os.getpid()}"
-        logger.info(f"[document-intelligence-py] {self.command} {self.path} trace={trace_id}")
-        inc_requests()
-        if not _rl_allow():
-            self.send_response(429)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "rate_limit_exceeded"}).encode())
-            return
-        path = urlparse(self.path).path
-        length = int(self.headers.get("Content-Length", 0))
-        body = json.loads(sanitize_input(self.rfile.read(length).decode() if isinstance(self.rfile.read(length), bytes) else str(self.rfile.read(length)))) if length > 0 else {}
-
-        # JWT auth check (monitoring mode: warn but allow)
-        claims, err = validate_jwt(dict(self.headers))
-        if err:
-            self.respond(401, {"error": "unauthorized", "detail": err})
-            # Inter-service call
-            try:
-                _upstream = os.environ.get("AML_ENGINE_URL", "http://localhost:8120")
-                call_service("POST", f"{_upstream}/v1/screen", {"service": SERVICE_NAME, "action": "notify"})
-            except Exception as _e:
-                log_event("WARN", f"inter-service call failed: {_e}")
-            return
-
-        if path == "/v1/create":
-            result = db_insert("document_intelligence_py", body)
-            _simulate_vlm_classification_result = simulate_vlm_classification(body.get("data", {}))
-            _simulate_paddleocr_extraction_result = simulate_paddleocr_extraction(body.get("data", {}))
-            _simulate_docling_parsing_result = simulate_docling_parsing(body.get("data", {}))
-            cache_set(f"{self.get_tenant_id()}:last_post", str(body))
-            self.respond(201, {"created": True, "data": result})
-        else:
-            self.respond(404, {"error": "not_found", "path": path})
 
 # --- Graceful Shutdown ---
 server = None

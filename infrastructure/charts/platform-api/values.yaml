@@ -75,7 +75,10 @@ secrets:
   VERIFICATION_SVC_URL: "http://verification-service.54link-dev.svc.cluster.local:8383"
   VERIFICATION_SVC_IDP: "liveness"
   VERIFICATION_SVC_CLIENT_ID: "54link-orchestrator"
-  VERIFICATION_SVC_CLIENT_SECRET: "54link-orchestrator-secret"
+  # Keycloak client secret — NEVER committed. Inject at deploy time, e.g.
+  # helm --set secrets.VERIFICATION_SVC_CLIENT_SECRET=... or via an external
+  # secret manager. The chart fails to render if this is empty.
+  VERIFICATION_SVC_CLIENT_SECRET: ""
   BILLING_SVC_URL: "http://platform-tenant.54link-dev.svc.cluster.local:9523"
   BUSINESS_SVC_URL: "http://workflow-operations.54link-dev.svc.cluster.local:9677"
   BVN_NIN_SVC_URL: "http://compliance-kyc-aml.54link-dev.svc.cluster.local:9219"

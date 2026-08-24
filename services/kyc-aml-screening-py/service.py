@@ -3,16 +3,34 @@
 BVN verification, PEP/sanctions watchlist screening, risk scoring, and
 enhanced due diligence triggers. Nigerian regulatory compliance (CBN KYC Tiers).
 
+Real-dependency behavior (no silent mockware):
+- BVN verification calls the real NIBSS BVN API (NIBSS_BVN_API_URL + NIBSS_API_KEY).
+  Missing config or upstream failure -> HTTP 503 {"error": "bvn_provider_unavailable"}.
+- PEP/sanctions screening loads watchlists from Postgres (screening_watchlist table,
+  seeded from the official OFAC SDN / UN Consolidated lists when WATCHLIST_AUTO_SEED=true).
+  Missing/empty lists -> HTTP 503 {"error": "sanctions_list_unavailable"} (fail closed).
+- /healthz actively probes every dependency and reports per-component status.
+- Demo seed records (KYC_SEED_DEMO_DATA=true, non-production only) use
+  OBVIOUSLY SYNTHETIC identities ("Demo Person A", BVN "00000000001") marked
+  demo=true — no real-looking names, BVNs, or phone numbers.
+- A KYC record created with empty/insufficient identity data is NEVER
+  auto-cleared: its screening_status is "incomplete".
+
 Middleware: Kafka, Redis, Postgres, OpenSearch, NIBSS BVN Validation.
 """
 
 from __future__ import annotations
-import os, uuid, json, re
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timezone, timedelta
+import os, uuid, json, re, csv, io, socket, difflib
+import urllib.request, urllib.error
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from enum import Enum
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional
+import os
+import json
+import re
 
 
 def now_iso() -> str:
@@ -20,6 +38,36 @@ def now_iso() -> str:
 
 def gen_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
+
+
+# ── Configuration ──
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+NIBSS_BVN_API_URL = os.environ.get("NIBSS_BVN_API_URL", "")
+NIBSS_API_KEY = os.environ.get("NIBSS_API_KEY", "")
+KAFKA_BROKERS = os.environ.get("KAFKA_BROKERS", "")
+REDIS_URL = os.environ.get("REDIS_URL", "")
+OPENSEARCH_URL = os.environ.get("OPENSEARCH_ENDPOINT", "")
+KEYCLOAK_URL = os.environ.get("KEYCLOAK_REALM_URL", "")
+APP_ENV = os.environ.get("APP_ENV", "production").lower()
+WATCHLIST_AUTO_SEED = os.environ.get("WATCHLIST_AUTO_SEED", "").lower() == "true"
+WATCHLIST_CACHE_TTL_SECONDS = int(os.environ.get("WATCHLIST_CACHE_TTL_SECONDS", "300"))
+FUZZY_MATCH_THRESHOLD = float(os.environ.get("SCREENING_MATCH_THRESHOLD", "80"))
+HTTP_PROBE_TIMEOUT = float(os.environ.get("HEALTH_PROBE_TIMEOUT_SECONDS", "3"))
+
+# Official downloadable sanctions sources (used only when WATCHLIST_AUTO_SEED=true)
+OFAC_SDN_CSV_URL = os.environ.get(
+    "OFAC_SDN_CSV_URL", "https://www.treasury.gov/ofac/downloads/sdn.csv")
+UN_CONSOLIDATED_XML_URL = os.environ.get(
+    "UN_CONSOLIDATED_XML_URL", "https://scsanctions.un.org/resources/xml/en/consolidated.xml")
+
+
+class BVNProviderUnavailable(Exception):
+    """Raised when the NIBSS BVN API is not configured or unreachable."""
+
+
+class ScreeningUnavailable(Exception):
+    """Raised when sanctions/PEP watchlists cannot be loaded (fail closed)."""
 
 
 # ── Enums ──
@@ -41,6 +89,8 @@ class ScreeningStatus(str, Enum):
     PEP_MATCH = "pep_match"
     SANCTIONS_MATCH = "sanctions_match"
     PENDING_REVIEW = "pending_review"
+    # Identity data was insufficient to run screening — never treat as clear.
+    INCOMPLETE = "incomplete"
 
 
 # ── Models ──
@@ -73,6 +123,7 @@ class KYCRecord:
     documents: list[dict]
     created_at: str
     updated_at: str
+    demo: bool = False
 
 @dataclass
 class ScreeningResult:
@@ -87,21 +138,163 @@ class ScreeningResult:
     screened_at: str
 
 
-# ── Watchlist Data (simulated) ──
+# ── Watchlist Store (Postgres-backed, seeded from OFAC/UN) ──
 
-PEP_LIST = [
-    {"name": "Goodluck Ebele Jonathan", "category": "Former Head of State", "country": "NG", "risk": "high"},
-    {"name": "Atiku Abubakar", "category": "Former Vice President", "country": "NG", "risk": "high"},
-    {"name": "Aliko Dangote", "category": "Prominent Business Person", "country": "NG", "risk": "medium"},
-    {"name": "Ngozi Okonjo-Iweala", "category": "Former Finance Minister / WTO DG", "country": "NG", "risk": "medium"},
-    {"name": "Abdulsalami Abubakar", "category": "Former Head of State", "country": "NG", "risk": "high"},
-]
+WATCHLIST_DDL = """
+CREATE TABLE IF NOT EXISTS screening_watchlist (
+    id SERIAL PRIMARY KEY,
+    list_type VARCHAR(16) NOT NULL,          -- 'pep' or 'sanctions'
+    name TEXT NOT NULL,
+    category TEXT,
+    country VARCHAR(8),
+    reason TEXT,
+    risk VARCHAR(16),
+    list_name VARCHAR(64),
+    source VARCHAR(32),
+    loaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+"""
 
-SANCTIONS_LIST = [
-    {"name": "Hushpuppi Ramon Abbas", "list": "OFAC SDN", "country": "NG", "reason": "Fraud / Money Laundering"},
-    {"name": "Invictus Obi", "list": "FBI Most Wanted", "country": "NG", "reason": "BEC Fraud"},
-    {"name": "Test Sanctioned Person", "list": "UN Sanctions", "country": "NG", "reason": "Terrorism Financing"},
-]
+_watchlist_cache: dict = {"loaded_at": None, "pep": [], "sanctions": []}
+
+
+def _get_db_connection():
+    try:
+        import psycopg2
+    except ImportError:
+        raise ScreeningUnavailable("psycopg2 driver not installed")
+    if not DATABASE_URL:
+        raise ScreeningUnavailable("DATABASE_URL not configured")
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        conn.autocommit = True
+        return conn
+    except Exception as e:
+        raise ScreeningUnavailable(f"screening database unreachable: {e}")
+
+
+def _download(url: str, max_bytes: int = 40 * 1024 * 1024) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": "54link-kyc-aml-screening/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read(max_bytes)
+
+
+def _parse_ofac_sdn_csv(raw: bytes) -> list[dict]:
+    """Parse the OFAC SDN CSV. Column 2 holds the primary name."""
+    entries = []
+    reader = csv.reader(io.StringIO(raw.decode("utf-8", errors="replace")))
+    for row in reader:
+        if len(row) >= 2 and row[1].strip():
+            remarks = row[-1] if row else ""
+            entries.append({
+                "name": row[1].strip(),
+                "list_name": "OFAC SDN",
+                "category": "sanctioned_entity",
+                "country": "",
+                "reason": remarks[:200] if remarks else "OFAC SDN listing",
+                "risk": "prohibited",
+                "source": "ofac",
+            })
+    return entries
+
+
+def _parse_un_consolidated_xml(raw: bytes) -> list[dict]:
+    """Parse the UN Consolidated Sanctions list (XML)."""
+    entries = []
+    root = ET.fromstring(raw.decode("utf-8", errors="replace"))
+    for node in root.iter():
+        tag = node.tag.split("}")[-1].upper()
+        if tag not in ("INDIVIDUAL", "ENTITY"):
+            continue
+        first = node.findtext(".//FIRST_NAME") or ""
+        second = node.findtext(".//SECOND_NAME") or ""
+        third = node.findtext(".//THIRD_NAME") or ""
+        fourth = node.findtext(".//FOURTH_NAME") or ""
+        entity_name = node.findtext(".//NAME/ENTITY_NAME") or ""
+        name = " ".join(p for p in [first, second, third, fourth] if p).strip() or entity_name.strip()
+        if not name:
+            continue
+        nationality = node.findtext(".//NATIONALITY/VALUE") or ""
+        entries.append({
+            "name": name,
+            "list_name": "UN Consolidated",
+            "category": "individual" if tag == "INDIVIDUAL" else "entity",
+            "country": nationality[:3] if nationality else "",
+            "reason": "UN Security Council sanctions listing",
+            "risk": "prohibited",
+            "source": "un",
+        })
+    return entries
+
+
+def _seed_watchlists(conn) -> int:
+    """Seed the screening_watchlist table from official OFAC/UN downloads.
+
+    Only runs when WATCHLIST_AUTO_SEED=true and the table is empty.
+    Returns number of rows inserted.
+    """
+    inserted = 0
+    with conn.cursor() as cur:
+        for list_type, url, parser in (
+            ("sanctions", OFAC_SDN_CSV_URL, _parse_ofac_sdn_csv),
+            ("sanctions", UN_CONSOLIDATED_XML_URL, _parse_un_consolidated_xml),
+        ):
+            try:
+                entries = parser(_download(url))
+            except Exception as e:
+                print(f"[kyc-aml] watchlist seed download failed for {url}: {e}")
+                continue
+            for e in entries:
+                cur.execute(
+                    "INSERT INTO screening_watchlist (list_type, name, category, country, reason, risk, list_name, source) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (list_type, e["name"], e.get("category"), e.get("country"),
+                     e.get("reason"), e.get("risk"), e.get("list_name"), e.get("source")),
+                )
+                inserted += 1
+    return inserted
+
+
+def load_watchlists(force: bool = False) -> tuple[list[dict], list[dict]]:
+    """Load PEP and sanctions watchlists from Postgres.
+
+    Fails closed: raises ScreeningUnavailable if the table is missing, empty,
+    or the database is unreachable. Never returns synthetic entries.
+    """
+    cached_at = _watchlist_cache["loaded_at"]
+    if (not force and cached_at and
+            (datetime.now(timezone.utc) - cached_at).total_seconds() < WATCHLIST_CACHE_TTL_SECONDS):
+        return _watchlist_cache["pep"], _watchlist_cache["sanctions"]
+
+    conn = _get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(WATCHLIST_DDL)
+            cur.execute("SELECT COUNT(*) FROM screening_watchlist")
+            count = cur.fetchone()[0]
+            if count == 0 and WATCHLIST_AUTO_SEED and APP_ENV != "production":
+                seeded = _seed_watchlists(conn)
+                print(f"[kyc-aml] seeded {seeded} watchlist entries from OFAC/UN downloads")
+                count = seeded
+            if count == 0:
+                raise ScreeningUnavailable(
+                    "screening_watchlist table is empty — load OFAC/UN data before screening")
+            cur.execute(
+                "SELECT list_type, name, category, country, reason, risk, list_name "
+                "FROM screening_watchlist WHERE name IS NOT NULL AND name <> ''"
+            )
+            pep, sanctions = [], []
+            for list_type, name, category, country, reason, risk, list_name in cur.fetchall():
+                entry = {"name": name, "category": category or "", "country": country or "",
+                         "reason": reason or "", "risk": risk or "high", "list": list_name or ""}
+                (pep if list_type == "pep" else sanctions).append(entry)
+    finally:
+        conn.close()
+
+    if not sanctions and not pep:
+        raise ScreeningUnavailable("no usable watchlist entries loaded")
+    _watchlist_cache.update({"loaded_at": datetime.now(timezone.utc), "pep": pep, "sanctions": sanctions})
+    return pep, sanctions
 
 
 # ── State ──
@@ -113,12 +306,49 @@ screening_results: list[ScreeningResult] = []
 # ── Business Logic ──
 
 def verify_bvn(bvn: str) -> tuple[bool, str]:
-    """Simulate NIBSS BVN validation. Real implementation calls NIBSS API."""
+    """Verify a BVN against the real NIBSS BVN validation API.
+
+    Fails closed: raises BVNProviderUnavailable when the provider is not
+    configured or cannot be reached. Never returns a synthetic verdict.
+    """
     if not re.match(r"^\d{11}$", bvn):
         return False, "BVN must be exactly 11 digits"
-    if bvn.startswith("000"):
-        return False, "BVN starting with 000 is reserved/invalid"
-    return True, "BVN verified successfully"
+    if not NIBSS_BVN_API_URL or not NIBSS_API_KEY:
+        raise BVNProviderUnavailable(
+            "NIBSS BVN API not configured (set NIBSS_BVN_API_URL and NIBSS_API_KEY)")
+    payload = json.dumps({"bvn": bvn}).encode()
+    req = urllib.request.Request(
+        NIBSS_BVN_API_URL.rstrip("/") + "/validate",
+        data=payload, method="POST",
+        headers={
+            "Authorization": f"Bearer {NIBSS_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # A well-formed provider rejection (e.g. BVN not found) is a real verdict.
+        if e.code in (400, 404):
+            try:
+                data = json.loads(e.read().decode())
+            except Exception:
+                data = {}
+            return False, data.get("message", "BVN not found")
+        raise BVNProviderUnavailable(f"NIBSS BVN API returned HTTP {e.code}")
+    except Exception as e:
+        raise BVNProviderUnavailable(f"NIBSS BVN API unreachable: {e}")
+
+    verified = bool(
+        data.get("verified", False)
+        or str(data.get("status", "")).lower() == "verified"
+        or str(data.get("responseCode", "")) == "00"
+    )
+    message = (data.get("message") or data.get("responseMessage")
+               or ("BVN verified successfully" if verified else "BVN verification failed"))
+    return verified, message
 
 def compute_risk_score(record: dict) -> tuple[int, str]:
     """Compute customer risk score (0-100). Higher = riskier."""
@@ -161,38 +391,65 @@ def compute_risk_score(record: dict) -> tuple[int, str]:
 
     return min(score, 100), level
 
+
+def _normalize_name(name: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", (name or "").lower())).strip()
+
+
+def _match_score(query: str, candidate: str) -> float:
+    """Fuzzy name match score 0-100 using normalized token overlap + difflib ratio."""
+    q, c = _normalize_name(query), _normalize_name(candidate)
+    if not q or not c:
+        return 0.0
+    if q == c:
+        return 100.0
+    q_parts, c_parts = set(q.split()), set(c.split())
+    overlap = q_parts & c_parts
+    token_score = len(overlap) / max(len(q_parts), len(c_parts)) * 100.0
+    seq_score = difflib.SequenceMatcher(None, q, c).ratio() * 100.0
+    score = max(token_score, seq_score)
+    # Substring containment of a full normalized name is a strong signal.
+    if (q in c or c in q) and min(len(q), len(c)) >= 6:
+        score = max(score, 85.0)
+    # Two or more shared tokens keeps precision on multi-part names.
+    if len(overlap) >= 2:
+        score = max(score, min(90.0, token_score + 15.0))
+    return score
+
+
 def screen_name(name: str) -> tuple[list[dict], str]:
-    """Screen name against PEP and sanctions lists using fuzzy matching."""
+    """Screen name against PEP and sanctions lists loaded from Postgres.
+
+    Fails closed: raises ScreeningUnavailable when watchlists cannot be loaded;
+    callers must treat this as 'cannot clear', never auto-clear.
+    """
+    pep_list, sanctions_list = load_watchlists()
     matches = []
-    name_lower = name.lower().strip()
-    name_parts = set(name_lower.split())
 
     # Check PEP list
-    for pep in PEP_LIST:
-        pep_parts = set(pep["name"].lower().split())
-        overlap = name_parts & pep_parts
-        if len(overlap) >= 2 or name_lower == pep["name"].lower():
+    for pep in pep_list:
+        score = _match_score(name, pep["name"])
+        if score >= FUZZY_MATCH_THRESHOLD:
             matches.append({
                 "type": "PEP",
                 "matchedName": pep["name"],
-                "category": pep["category"],
-                "country": pep["country"],
-                "riskLevel": pep["risk"],
-                "matchScore": round(len(overlap) / max(len(name_parts), len(pep_parts)) * 100, 1),
+                "category": pep.get("category", ""),
+                "country": pep.get("country", ""),
+                "riskLevel": pep.get("risk", "high"),
+                "matchScore": round(score, 1),
             })
 
     # Check sanctions list
-    for sanc in SANCTIONS_LIST:
-        sanc_parts = set(sanc["name"].lower().split())
-        overlap = name_parts & sanc_parts
-        if len(overlap) >= 2 or name_lower == sanc["name"].lower():
+    for sanc in sanctions_list:
+        score = _match_score(name, sanc["name"])
+        if score >= FUZZY_MATCH_THRESHOLD:
             matches.append({
                 "type": "SANCTIONS",
                 "matchedName": sanc["name"],
-                "list": sanc["list"],
-                "country": sanc["country"],
-                "reason": sanc["reason"],
-                "matchScore": 100.0 if name_lower == sanc["name"].lower() else round(len(overlap) / max(len(name_parts), len(sanc_parts)) * 100, 1),
+                "list": sanc.get("list", ""),
+                "country": sanc.get("country", ""),
+                "reason": sanc.get("reason", ""),
+                "matchScore": round(score, 1),
             })
 
     if any(m["type"] == "SANCTIONS" for m in matches):
@@ -216,55 +473,289 @@ KYC_TIER_LIMITS = {
 }
 
 
-# ── Seed Data ──
+# ── Seed Data (demo only — explicit opt-in, never in production) ──
 
 def _seed():
+    # OBVIOUSLY SYNTHETIC demo identities. No real names, BVNs, phone numbers,
+    # or ID numbers: every field is a placeholder and every record carries
+    # demo=True plus "DEMO-" identifiers.
     kyc_records.extend([
         KYCRecord(
-            id="KYC-001", customer_id="CUST-001", bvn="22012345678", full_name="Fatima Abdullahi",
-            date_of_birth="1990-03-15", phone="+2348012345678", email="fatima@example.com",
-            tier="tier3", bvn_verified=True, bvn_verification_date="2026-01-05",
-            id_type="national_id", id_number="NIN-A12345678", id_verified=True,
-            address="12 Adeola Odeku, VI, Lagos", address_verified=True,
-            risk_score=20, risk_level="low", screening_status="clear", screening_notes=[],
+            id="DEMO-KYC-001", customer_id="DEMO-CUST-001", bvn="00000000001", full_name="Demo Person A",
+            date_of_birth="1970-01-01", phone="+2340000000001", email="demo.person.a@example.invalid",
+            tier="tier3", bvn_verified=True, bvn_verification_date="1970-01-01",
+            id_type="demo_id", id_number="DEMO-00000001", id_verified=True,
+            address="0 Demo Street, Demo City", address_verified=True,
+            risk_score=20, risk_level="low", screening_status="clear", screening_notes=["demo record — not a real screening"],
             pep_check=True, sanctions_check=True, edd_required=False,
-            last_screening_date="2026-01-05", documents=[
-                {"type": "national_id", "status": "verified", "uploadedAt": "2026-01-05"},
-                {"type": "utility_bill", "status": "verified", "uploadedAt": "2026-01-05"},
+            last_screening_date="1970-01-01", documents=[
+                {"type": "demo_id", "status": "demo", "uploadedAt": "1970-01-01"},
             ],
-            created_at="2026-01-05T10:00:00Z", updated_at="2026-01-05T10:00:00Z",
+            created_at="1970-01-01T00:00:00Z", updated_at="1970-01-01T00:00:00Z",
+            demo=True,
         ),
         KYCRecord(
-            id="KYC-002", customer_id="CUST-002", bvn="22098765432", full_name="Ibrahim Musa",
-            date_of_birth="1985-07-22", phone="+2348087654321", email="ibrahim@example.com",
-            tier="tier2", bvn_verified=True, bvn_verification_date="2026-01-10",
-            id_type="drivers_license", id_number="DL-B98765432", id_verified=True,
-            address="45 Wuse II, Abuja", address_verified=False,
-            risk_score=35, risk_level="low", screening_status="clear", screening_notes=[],
+            id="DEMO-KYC-002", customer_id="DEMO-CUST-002", bvn="00000000002", full_name="Demo Person B",
+            date_of_birth="1970-01-01", phone="+2340000000002", email="demo.person.b@example.invalid",
+            tier="tier2", bvn_verified=True, bvn_verification_date="1970-01-01",
+            id_type="demo_id", id_number="DEMO-00000002", id_verified=True,
+            address="0 Demo Avenue, Demo Town", address_verified=False,
+            risk_score=35, risk_level="low", screening_status="clear", screening_notes=["demo record — not a real screening"],
             pep_check=True, sanctions_check=True, edd_required=False,
-            last_screening_date="2026-01-10", documents=[
-                {"type": "drivers_license", "status": "verified", "uploadedAt": "2026-01-10"},
+            last_screening_date="1970-01-01", documents=[
+                {"type": "demo_id", "status": "demo", "uploadedAt": "1970-01-01"},
             ],
-            created_at="2026-01-10T14:00:00Z", updated_at="2026-01-10T14:00:00Z",
+            created_at="1970-01-01T00:00:00Z", updated_at="1970-01-01T00:00:00Z",
+            demo=True,
         ),
         KYCRecord(
-            id="KYC-003", customer_id="CUST-003", bvn="22055512345", full_name="Chioma Okafor",
-            date_of_birth="1995-11-30", phone="+2349011223344", email="chioma@example.com",
-            tier="tier1", bvn_verified=True, bvn_verification_date="2026-02-01",
+            id="DEMO-KYC-003", customer_id="DEMO-CUST-003", bvn="00000000003", full_name="Demo Person C",
+            date_of_birth="1970-01-01", phone="+2340000000003", email="demo.person.c@example.invalid",
+            tier="tier1", bvn_verified=True, bvn_verification_date="1970-01-01",
             id_type=None, id_number=None, id_verified=False,
             address=None, address_verified=False,
-            risk_score=50, risk_level="medium", screening_status="pending_review",
-            screening_notes=["Tier 1 only — encourage ID submission for upgrade"],
+            risk_score=50, risk_level="medium", screening_status="incomplete",
+            screening_notes=["demo record — insufficient identity data, screening not run"],
             pep_check=False, sanctions_check=False, edd_required=False,
-            last_screening_date="2026-02-01", documents=[],
-            created_at="2026-02-01T09:00:00Z", updated_at="2026-02-01T09:00:00Z",
+            last_screening_date="1970-01-01", documents=[],
+            created_at="1970-01-01T00:00:00Z", updated_at="1970-01-01T00:00:00Z",
+            demo=True,
         ),
     ])
 
-_seed()
+# Demo records are clearly synthetic (Demo Person A/B/C, BVN 0000000000N,
+# demo=True markers) and only load behind an explicit opt-in, never in production.
+if os.environ.get("KYC_SEED_DEMO_DATA", "").lower() == "true" and APP_ENV != "production":
+    _seed()
+
+
+# ── Health Probes (real dependency checks, short timeouts) ──
+
+def _probe_tcp(host: str, port: int, timeout: float = 2.0) -> tuple[bool, str]:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _probe_http(url: str, timeout: float = HTTP_PROBE_TIMEOUT) -> tuple[bool, str]:
+    if not url:
+        return False, "not_configured"
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status < 500, f"http_{resp.status}"
+        except urllib.error.HTTPError as e:
+            # Any HTTP response means the service is reachable.
+            return e.code < 500, f"http_{e.code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _probe_kafka() -> tuple[bool, str]:
+    if not KAFKA_BROKERS:
+        return False, "not_configured"
+    host, _, port = KAFKA_BROKERS.split(",")[0].partition(":")
+    return _probe_tcp(host, int(port or "9092"))
+
+
+def _probe_redis() -> tuple[bool, str]:
+    if not REDIS_URL:
+        return False, "not_configured"
+    host, _, port = REDIS_URL.rsplit(":", 1)
+    try:
+        with socket.create_connection((host, int(port)), timeout=2.0) as s:
+            s.sendall(b"PING\r\n")
+            pong = s.recv(16)
+            return pong.startswith(b"+PONG"), ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _probe_postgres() -> tuple[bool, str]:
+    try:
+        conn = _get_db_connection()
+    except ScreeningUnavailable as e:
+        return False, str(e)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+    finally:
+        conn.close()
+
+
+def build_health() -> dict:
+    """Probe every dependency and report per-component status."""
+    probes = {
+        "kafka": _probe_kafka,
+        "postgres": _probe_postgres,
+        "redis": _probe_redis,
+        "opensearch": lambda: _probe_http(OPENSEARCH_URL),
+        "keycloak": lambda: _probe_http(KEYCLOAK_URL),
+        "nibss_bvn": lambda: (
+            (False, "not_configured") if not NIBSS_BVN_API_URL
+            else _probe_http(NIBSS_BVN_API_URL)),
+    }
+    middleware = {}
+    all_ok = True
+    for name, probe in probes.items():
+        try:
+            ok, detail = probe()
+        except Exception as e:
+            ok, detail = False, str(e)
+        middleware[name] = {"status": "connected" if ok else "unavailable"}
+        if detail:
+            middleware[name]["detail"] = detail
+        if not ok:
+            all_ok = False
+    return middleware, all_ok
 
 
 # ── HTTP Handler ──
+
+# --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
+# RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
+# is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE
+# are configured. Fail-closed: missing/malformed/expired/unknown-kid tokens are rejected;
+# a JWKS outage with a cold cache yields "jwks_unavailable" (surfaced as HTTP 503).
+import os as _jwt_os
+import base64 as _jwt_b64
+import hashlib as _jwt_hash
+import hmac as _jwt_hmac
+import json as _jwt_json
+import time as _jwt_time
+import urllib.request as _jwt_urlreq
+
+_JWT_JWKS_URL = _jwt_os.environ.get("KEYCLOAK_JWKS_URL", "")
+_JWT_SECRET = _jwt_os.environ.get("JWT_SECRET", "")
+_JWT_ISSUER = _jwt_os.environ.get("JWT_ISSUER", "")
+_JWT_AUDIENCE = _jwt_os.environ.get("JWT_AUDIENCE", "")
+try:
+    _JWT_JWKS_TTL = int(_jwt_os.environ.get("JWKS_CACHE_TTL_SECONDS", "300"))
+except ValueError:
+    _JWT_JWKS_TTL = 300
+_jwks_cache = {"fetched_at": 0.0, "keys": {}}
+
+
+def _jwt_b64url_decode(segment):
+    segment += "=" * (-len(segment) % 4)
+    return _jwt_b64.urlsafe_b64decode(segment.encode())
+
+
+def _jwt_fetch_jwks():
+    now = _jwt_time.time()
+    if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < _JWT_JWKS_TTL:
+        return _jwks_cache["keys"], None
+    try:
+        with _jwt_urlreq.urlopen(_JWT_JWKS_URL, timeout=5) as resp:
+            data = _jwt_json.loads(resp.read())
+        keys = {k.get("kid"): k for k in data.get("keys", []) if k.get("kid")}
+    except Exception:
+        if _jwks_cache["keys"]:
+            return _jwks_cache["keys"], None  # stale cache: signatures are still really verified
+        return None, "jwks_unavailable"
+    _jwks_cache["keys"] = keys
+    _jwks_cache["fetched_at"] = now
+    return keys, None
+
+
+def _jwt_verify_rs256(signing_input, signature, jwk):
+    """Pure-stdlib RS256 (PKCS#1 v1.5 + SHA-256) verification against a JWK."""
+    try:
+        n = int.from_bytes(_jwt_b64url_decode(jwk["n"]), "big")
+        e = int.from_bytes(_jwt_b64url_decode(jwk["e"]), "big")
+    except Exception:
+        return False
+    k = (n.bit_length() + 7) // 8
+    if len(signature) != k:
+        return False
+    em = pow(int.from_bytes(signature, "big"), e, n).to_bytes(k, "big")
+    digest_info = bytes.fromhex("3031300d060960864801650304020105000420") + _jwt_hash.sha256(signing_input).digest()
+    if k < len(digest_info) + 11:
+        return False
+    expected = b"\x00\x01" + b"\xff" * (k - len(digest_info) - 3) + b"\x00" + digest_info
+    return _jwt_hmac.compare_digest(em, expected)
+
+
+def _jwt_check_claims(payload):
+    exp = payload.get("exp")
+    if exp is None:
+        return "Token missing exp claim"
+    try:
+        if _jwt_time.time() >= float(exp):
+            return "Token expired"
+    except (TypeError, ValueError):
+        return "Invalid token expiry"
+    if _JWT_ISSUER and payload.get("iss") != _JWT_ISSUER:
+        return "Invalid token issuer"
+    if _JWT_AUDIENCE:
+        aud = payload.get("aud")
+        if isinstance(aud, str):
+            aud = [aud]
+        if not isinstance(aud, list) or _JWT_AUDIENCE not in aud:
+            return "Invalid token audience"
+    return None
+
+
+def validate_jwt(headers):
+    """Validate a Bearer JWT from a headers mapping.
+
+    Returns (claims, None) on success or (None, reason) on failure. Fails closed:
+    any token that cannot be cryptographically verified is rejected, and when
+    neither KEYCLOAK_JWKS_URL nor JWT_SECRET is configured the result is
+    (None, "auth_not_configured").
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = auth[7:]
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    try:
+        header = _jwt_json.loads(_jwt_b64url_decode(parts[0]))
+        payload = _jwt_json.loads(_jwt_b64url_decode(parts[1]))
+        signature = _jwt_b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    alg = header.get("alg")
+    signing_input = (parts[0] + "." + parts[1]).encode()
+    if alg == "RS256":
+        if not _JWT_JWKS_URL:
+            return None, "auth_not_configured"
+        keys, ferr = _jwt_fetch_jwks()
+        if ferr:
+            return None, ferr
+        jwk = keys.get(header.get("kid"))
+        if jwk is None:
+            _jwks_cache["fetched_at"] = 0.0  # one forced refresh for an unknown kid
+            keys, ferr = _jwt_fetch_jwks()
+            if ferr:
+                return None, ferr
+            jwk = keys.get(header.get("kid"))
+            if jwk is None:
+                return None, "Unknown token key id"
+        if not _jwt_verify_rs256(signing_input, signature, jwk):
+            return None, "Invalid token signature"
+    elif alg == "HS256":
+        if not _JWT_SECRET or _JWT_SECRET.startswith("${"):
+            return None, "auth_not_configured"
+        expected = _jwt_hmac.new(_JWT_SECRET.encode(), signing_input, _jwt_hash.sha256).digest()
+        if not _jwt_hmac.compare_digest(expected, signature):
+            return None, "Invalid token signature"
+    else:
+        return None, "Unsupported token algorithm"
+    err = _jwt_check_claims(payload)
+    if err:
+        return None, err
+    return payload, None
+
 
 class KYCAMLHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
@@ -281,27 +772,22 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps(data, default=str).encode())
 
     def do_GET(self):
+
+        # N-1: fail-closed JWT auth on the live request path (probe endpoints exempt).
+        _n1_path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if _n1_path not in ("/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"):
+            _n1_claims, _n1_err = validate_jwt(dict(self.headers))
+            if _n1_err:
+                self._respond(401, {"error": "unauthorized", "detail": _n1_err})
+                return
         path = self.path.split("?")[0].rstrip("/")
 
         if path == "/healthz":
-            self._respond(200, {"status": "ok", "service": "kyc-aml-screening",
-            "middleware": {
-                "kafka": {"status": "connected", "topics": ["kyc_aml_screening.events", "kyc_aml_screening.audit"]},
-                "dapr": {"status": "connected", "appId": "kyc_aml_screening-sidecar"},
-                "fluvio": {"status": "connected", "topic": "kyc_aml_screening-stream"},
-                "temporal": {"status": "connected", "namespace": "kyc_aml_screening"},
-                "postgres": {"status": "connected", "database": "ndsep_db", "schema": "kyc_aml_screening"},
-                "keycloak": {"status": "connected", "realm": "54link-dev"},
-                "permify": {"status": "connected", "schema": "kyc_aml_screening_authz"},
-                "redis": {"status": "connected", "prefix": "kyc_aml_screening:"},
-                "mojaloop": {"status": "connected", "participant": "kyc_aml_screening"},
-                "opensearch": {"status": "connected", "index": "kyc_aml_screening-*"},
-                "openappsec": {"status": "connected", "policy": "kyc_aml_screening-protection"},
-                "apisix": {"status": "connected", "upstream": "kyc_aml_screening"},
-                "tigerbeetle": {"status": "connected", "cluster": "54link-dev-ledger"},
-                "lakehouse": {"status": "connected", "table": "kyc_aml_screening_iceberg"}
-            }, "port": "8136",
-                                "middleware": ["Kafka", "Redis", "Postgres", "OpenSearch", "NIBSS BVN"]})
+            middleware, all_ok = build_health()
+            self._respond(200, {"status": "ok" if all_ok else "degraded",
+                                "service": "kyc-aml-screening",
+                                "middleware": middleware,
+                                "port": os.environ.get("PORT", "8136")})
         elif path == "/v1/kyc/records":
             self._respond(200, {"items": [asdict(r) for r in kyc_records], "total": len(kyc_records)})
         elif path.startswith("/v1/kyc/records/"):
@@ -319,6 +805,14 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             self._respond(404, {"message": "Not found"})
 
     def do_POST(self):
+
+        # N-1: fail-closed JWT auth on the live request path (probe endpoints exempt).
+        _n1_path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if _n1_path not in ("/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"):
+            _n1_claims, _n1_err = validate_jwt(dict(self.headers))
+            if _n1_err:
+                self._respond(401, {"error": "unauthorized", "detail": _n1_err})
+                return
         path = self.path.split("?")[0].rstrip("/")
         body = self._read_json()
 
@@ -339,7 +833,11 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
 
     def _verify_bvn(self, body: dict):
         bvn = body.get("bvn", "")
-        valid, message = verify_bvn(bvn)
+        try:
+            valid, message = verify_bvn(bvn)
+        except BVNProviderUnavailable as e:
+            self._respond(503, {"error": "bvn_provider_unavailable", "message": str(e)})
+            return
         self._respond(200, {
             "bvn": bvn,
             "valid": valid,
@@ -353,9 +851,28 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             self._respond(400, {"message": "bvn is required"})
             return
 
-        bvn_valid, bvn_msg = verify_bvn(bvn)
-        full_name = body.get("fullName", "")
-        matches, screening_status = screen_name(full_name) if full_name else ([], "clear")
+        try:
+            bvn_valid, bvn_msg = verify_bvn(bvn)
+        except BVNProviderUnavailable as e:
+            self._respond(503, {"error": "bvn_provider_unavailable", "message": str(e)})
+            return
+
+        # Insufficient identity data (no usable full name) means screening
+        # CANNOT run — the record is "incomplete", never "clear".
+        full_name = (body.get("fullName") or "").strip()
+        screening_ran = bool(full_name)
+        if screening_ran:
+            try:
+                matches, screening_status = screen_name(full_name)
+            except ScreeningUnavailable as e:
+                # Fail closed: cannot clear the customer, so do not create the record.
+                self._respond(503, {"error": "sanctions_list_unavailable", "message": str(e)})
+                return
+            screening_notes = [m["matchedName"] + f" ({m['type']})" for m in matches]
+        else:
+            matches = []
+            screening_status = ScreeningStatus.INCOMPLETE.value
+            screening_notes = ["insufficient identity data (fullName missing) — screening not run; do not treat as clear"]
 
         risk_data = {"bvn_verified": bvn_valid, "pep_match": screening_status == "pep_match",
                      "sanctions_match": screening_status == "sanctions_match",
@@ -377,22 +894,28 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             address=None, address_verified=False,
             risk_score=score, risk_level=level,
             screening_status=screening_status,
-            screening_notes=[m["matchedName"] + f" ({m['type']})" for m in matches],
-            pep_check=True, sanctions_check=True,
+            screening_notes=screening_notes,
+            # Only claim checks that actually ran.
+            pep_check=screening_ran, sanctions_check=screening_ran,
             edd_required=level in ("high", "prohibited") or screening_status == "pep_match",
-            last_screening_date=now_iso()[:10], documents=[],
+            last_screening_date=now_iso()[:10] if screening_ran else "",
+            documents=[],
             created_at=now_iso(), updated_at=now_iso(),
         )
         kyc_records.append(rec)
         self._respond(201, asdict(rec))
 
     def _screen_customer(self, body: dict):
-        name = body.get("name", "")
+        name = (body.get("name") or "").strip()
         if not name:
             self._respond(400, {"message": "name is required"})
             return
 
-        matches, status = screen_name(name)
+        try:
+            matches, status = screen_name(name)
+        except ScreeningUnavailable as e:
+            self._respond(503, {"error": "sanctions_list_unavailable", "message": str(e)})
+            return
         score = 0
         if status == "sanctions_match":
             score = 100
@@ -418,8 +941,20 @@ class KYCAMLHandler(BaseHTTPRequestHandler):
             self._respond(400, {"message": "Maximum 100 names per batch"})
             return
 
+        try:
+            load_watchlists()  # fail closed before screening any name
+        except ScreeningUnavailable as e:
+            self._respond(503, {"error": "sanctions_list_unavailable", "message": str(e)})
+            return
+
         results = []
         for name in names:
+            name = (name or "").strip() if isinstance(name, str) else ""
+            if not name:
+                # Never auto-clear an empty identity.
+                results.append({"name": name, "status": ScreeningStatus.INCOMPLETE.value,
+                                "matchCount": 0, "matches": []})
+                continue
             matches, status = screen_name(name)
             results.append({"name": name, "status": status, "matchCount": len(matches),
                             "matches": matches})

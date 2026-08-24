@@ -14,8 +14,8 @@ import (
 	"sync"
 	"time"
 
-	tb "github.com/tigerbeetle/tigerbeetle-go"
 	_ "github.com/lib/pq"
+	tb "github.com/tigerbeetle/tigerbeetle-go"
 )
 
 // Re-export SDK types so downstream services import only this package.

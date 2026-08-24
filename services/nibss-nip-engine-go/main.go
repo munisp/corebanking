@@ -1,20 +1,29 @@
 // 54link-dev NIBSS/NIP Integration Engine — Go
-// Replaces generic CRUD scaffold with actual NIP protocol implementation:
-//   - ISO 8583 message format (MTI 0200/0210/0220/0420)
-//   - Direct Debit mandate lifecycle (create → approve → activate → execute → cancel)
-//   - NIP Instant Payment processing (TSQ, nameEnquiry, fundsTransfer)
-//   - NIBSS settlement reconciliation
-//   - Response code handling (00 = approved, 51 = insufficient funds, etc.)
+// NIP Instant Payment processing (TSQ, nameEnquiry, fundsTransfer) against
+// the real NIBSS endpoint, plus direct-debit mandate bookkeeping and
+// response-code reference data.
 //
-// Middleware: All 14
+// Fail-fast guarantee: funds transfers and name enquiries are proxied to
+// the real NIBSS NIP endpoint (NIBSS_BASE_URL). When NIBSS is not
+// configured or unreachable, handlers return HTTP 503 with
+// ResponseCode "96" (system malfunction) and Status "failed" — a transfer
+// is NEVER reported successful without a real NIBSS approval, and a name
+// is NEVER fabricated.
 package main
 
 import (
+	"bytes"
+	"crypto"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,25 +45,25 @@ type ISO8583Message struct {
 }
 
 type NIPTransaction struct {
-	ID                string `json:"id"`
-	SessionID         string `json:"sessionId"`
-	Type              string `json:"type"` // nameEnquiry | fundsTransfer | tsq
-	SourceBank        string `json:"sourceBank"`
-	SourceBankCode    string `json:"sourceBankCode"`
-	SourceAccount     string `json:"sourceAccount"`
-	DestBank          string `json:"destinationBank"`
-	DestBankCode      string `json:"destinationBankCode"`
-	DestAccount       string `json:"destinationAccount"`
-	BeneficiaryName   string `json:"beneficiaryName"`
-	Amount            int64  `json:"amountKobo"`
-	Narration         string `json:"narration"`
-	ResponseCode      string `json:"responseCode"`
-	ResponseMessage   string `json:"responseMessage"`
-	Status            string `json:"status"` // initiated | processing | successful | failed | reversed
-	ChannelCode       string `json:"channelCode"`
-	MTI               string `json:"mti"`
-	CreatedAt         string `json:"createdAt"`
-	CompletedAt       string `json:"completedAt,omitempty"`
+	ID              string `json:"id"`
+	SessionID       string `json:"sessionId"`
+	Type            string `json:"type"` // nameEnquiry | fundsTransfer | tsq
+	SourceBank      string `json:"sourceBank"`
+	SourceBankCode  string `json:"sourceBankCode"`
+	SourceAccount   string `json:"sourceAccount"`
+	DestBank        string `json:"destinationBank"`
+	DestBankCode    string `json:"destinationBankCode"`
+	DestAccount     string `json:"destinationAccount"`
+	BeneficiaryName string `json:"beneficiaryName"`
+	Amount          int64  `json:"amountKobo"`
+	Narration       string `json:"narration"`
+	ResponseCode    string `json:"responseCode"`
+	ResponseMessage string `json:"responseMessage"`
+	Status          string `json:"status"` // initiated | processing | successful | failed | reversed
+	ChannelCode     string `json:"channelCode"`
+	MTI             string `json:"mti"`
+	CreatedAt       string `json:"createdAt"`
+	CompletedAt     string `json:"completedAt,omitempty"`
 }
 
 type DirectDebitMandate struct {
@@ -85,19 +94,19 @@ type NIBSSResponseCode struct {
 }
 
 type SettlementReport struct {
-	ID            string `json:"id"`
-	Date          string `json:"settlementDate"`
-	TotalCredits  int64  `json:"totalCreditsKobo"`
-	TotalDebits   int64  `json:"totalDebitsKobo"`
-	NetPosition   int64  `json:"netPositionKobo"`
-	TxnCount      int    `json:"transactionCount"`
-	Status        string `json:"status"` // pending | settled | disputed
-	ReconcileMatch int   `json:"reconciledMatches"`
-	Exceptions    int    `json:"exceptions"`
+	ID             string `json:"id"`
+	Date           string `json:"settlementDate"`
+	TotalCredits   int64  `json:"totalCreditsKobo"`
+	TotalDebits    int64  `json:"totalDebitsKobo"`
+	NetPosition    int64  `json:"netPositionKobo"`
+	TxnCount       int    `json:"transactionCount"`
+	Status         string `json:"status"` // pending | settled | disputed
+	ReconcileMatch int    `json:"reconciledMatches"`
+	Exceptions     int    `json:"exceptions"`
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SEED DATA
+// REFERENCE DATA (NIBSS response-code table — static standard, not fake state)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 var responseCodes = []NIBSSResponseCode{
@@ -132,37 +141,313 @@ var responseCodes = []NIBSSResponseCode{
 }
 
 var (
+	// Transaction log: only real NIBSS-processed attempts are recorded
+	// (including failures). No fabricated history is seeded.
 	nipTransactions []NIPTransaction
 	mandates        []DirectDebitMandate
 	settlements     []SettlementReport
 	mu              sync.RWMutex
 )
 
-func init() {
-	nipTransactions = []NIPTransaction{
-		{ID: "NIP-001", SessionID: "000000260509143001234567890", Type: "nameEnquiry", SourceBank: "54link-dev", SourceBankCode: "054", SourceAccount: "0012345678", DestBank: "GTBank", DestBankCode: "058", DestAccount: "0211234567", BeneficiaryName: "JOHN ADEWALE OKO", Amount: 0, Narration: "", ResponseCode: "00", ResponseMessage: "Approved", Status: "successful", ChannelCode: "2", MTI: "0200", CreatedAt: "2026-05-09T14:30:00Z", CompletedAt: "2026-05-09T14:30:01Z"},
-		{ID: "NIP-002", SessionID: "000000260509143101234567891", Type: "fundsTransfer", SourceBank: "54link-dev", SourceBankCode: "054", SourceAccount: "0012345678", DestBank: "GTBank", DestBankCode: "058", DestAccount: "0211234567", BeneficiaryName: "JOHN ADEWALE OKO", Amount: 50000000, Narration: "Salary May 2026", ResponseCode: "00", ResponseMessage: "Approved", Status: "successful", ChannelCode: "2", MTI: "0200", CreatedAt: "2026-05-09T14:31:00Z", CompletedAt: "2026-05-09T14:31:02Z"},
-		{ID: "NIP-003", SessionID: "000000260509150001234567892", Type: "fundsTransfer", SourceBank: "54link-dev", SourceBankCode: "054", SourceAccount: "0098765432", DestBank: "Access Bank", DestBankCode: "044", DestAccount: "0756123456", BeneficiaryName: "GRACE NKEM OKAFOR", Amount: 150000000, Narration: "Invoice INV-2026-045", ResponseCode: "00", ResponseMessage: "Approved", Status: "successful", ChannelCode: "2", MTI: "0200", CreatedAt: "2026-05-09T15:00:00Z", CompletedAt: "2026-05-09T15:00:01Z"},
-		{ID: "NIP-004", SessionID: "000000260509151001234567893", Type: "fundsTransfer", SourceBank: "54link-dev", SourceBankCode: "054", SourceAccount: "0045678901", DestBank: "Zenith Bank", DestBankCode: "057", DestAccount: "2098765432", BeneficiaryName: "", Amount: 25000000, Narration: "Transfer to self", ResponseCode: "51", ResponseMessage: "Insufficient funds", Status: "failed", ChannelCode: "1", MTI: "0210", CreatedAt: "2026-05-09T15:10:00Z"},
-		{ID: "NIP-005", SessionID: "000000260509152001234567894", Type: "tsq", SourceBank: "54link-dev", SourceBankCode: "054", SourceAccount: "", DestBank: "UBA", DestBankCode: "033", DestAccount: "", BeneficiaryName: "", Amount: 0, Narration: "TSQ for NIP-002", ResponseCode: "00", ResponseMessage: "Original transaction successful", Status: "successful", ChannelCode: "2", MTI: "0420", CreatedAt: "2026-05-09T15:20:00Z", CompletedAt: "2026-05-09T15:20:00Z"},
-	}
+// ═══════════════════════════════════════════════════════════════════════════════
+// NIBSS NIP CLIENT (real HTTP adapter)
+// ═══════════════════════════════════════════════════════════════════════════════
 
-	mandates = []DirectDebitMandate{
-		{ID: "DDM-001", MandateRef: "54BK/DD/2026/00001", DebtorAccount: "0012345678", DebtorBank: "GTBank", DebtorBankCode: "058", DebtorName: "Acme Corp Ltd", CreditorAccount: "0054000001", CreditorBank: "54link-dev", CreditorName: "54link-dev Platform Fees", Amount: 2500000000, Frequency: "monthly", StartDate: "2026-01-01", EndDate: "2026-12-31", Status: "active", LastExecution: "2026-05-01", NextExecution: "2026-06-01", ExecutionCount: 5, CreatedAt: "2025-12-15T10:00:00Z"},
-		{ID: "DDM-002", MandateRef: "54BK/DD/2026/00002", DebtorAccount: "2098765432", DebtorBank: "Zenith Bank", DebtorBankCode: "057", DebtorName: "TechStart Solutions", CreditorAccount: "0054000001", CreditorBank: "54link-dev", CreditorName: "54link-dev SaaS Subscription", Amount: 500000000, Frequency: "monthly", StartDate: "2026-03-01", EndDate: "2027-02-28", Status: "active", LastExecution: "2026-05-01", NextExecution: "2026-06-01", ExecutionCount: 3, CreatedAt: "2026-02-20T14:00:00Z"},
-		{ID: "DDM-003", MandateRef: "54BK/DD/2026/00003", DebtorAccount: "0145678901", DebtorBank: "UBA", DebtorBankCode: "033", DebtorName: "MicroLend Finance", CreditorAccount: "0054000002", CreditorBank: "54link-dev", CreditorName: "54link-dev Loan Repayment", Amount: 1200000000, Frequency: "monthly", StartDate: "2026-04-01", EndDate: "2027-03-31", Status: "pending_approval", CreatedAt: "2026-04-28T09:00:00Z"},
-	}
+var errNIBSSNotConfigured = fmt.Errorf("NIBSS NIP endpoint not configured (set NIBSS_BASE_URL)")
 
-	settlements = []SettlementReport{
-		{ID: "STL-20260509", Date: "2026-05-09", TotalCredits: 45670000000, TotalDebits: 38920000000, NetPosition: 6750000000, TxnCount: 12847, Status: "pending", ReconcileMatch: 12830, Exceptions: 17},
-		{ID: "STL-20260508", Date: "2026-05-08", TotalCredits: 52340000000, TotalDebits: 49870000000, NetPosition: 2470000000, TxnCount: 14523, Status: "settled", ReconcileMatch: 14523, Exceptions: 0},
-		{ID: "STL-20260507", Date: "2026-05-07", TotalCredits: 39880000000, TotalDebits: 41200000000, NetPosition: -1320000000, TxnCount: 11234, Status: "settled", ReconcileMatch: 11230, Exceptions: 4},
+type nibssClient struct {
+	baseURL   string
+	apiKey    string
+	basicUser string
+	basicPass string
+	http      *http.Client
+}
+
+func newNIBSSClient() *nibssClient {
+	timeout := 10 * time.Second
+	if v := os.Getenv("NIBSS_TIMEOUT_SECS"); v != "" {
+		if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
+			timeout = n
+		}
 	}
+	return &nibssClient{
+		baseURL:   os.Getenv("NIBSS_BASE_URL"),
+		apiKey:    os.Getenv("NIBSS_API_KEY"),
+		basicUser: os.Getenv("NIBSS_USERNAME"),
+		basicPass: os.Getenv("NIBSS_PASSWORD"),
+		http:      &http.Client{Timeout: timeout},
+	}
+}
+
+var nibss = newNIBSSClient()
+
+// nibssUpstreamResponse mirrors the NIBSS NIP JSON response shape.
+type nibssUpstreamResponse struct {
+	ResponseCode    string `json:"responseCode"`
+	ResponseMessage string `json:"responseMessage"`
+	SessionID       string `json:"sessionId"`
+	BeneficiaryName string `json:"beneficiaryName"`
+	AccountName     string `json:"accountName"`
+	Status          string `json:"status"`
+}
+
+// call posts to the NIBSS NIP endpoint and decodes the response. Any
+// transport error, non-2xx status, or undecodable body is an error — the
+// caller must NOT treat the operation as successful.
+func (c *nibssClient) call(path string, payload map[string]interface{}) (*nibssUpstreamResponse, error) {
+	if c.baseURL == "" {
+		return nil, errNIBSSNotConfigured
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest("POST", c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("x-api-key", c.apiKey)
+	}
+	if c.basicUser != "" {
+		req.SetBasicAuth(c.basicUser, c.basicPass)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("NIBSS call %s failed: %w", path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("NIBSS %s returned HTTP %d", path, resp.StatusCode)
+	}
+	var out nibssUpstreamResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("NIBSS %s response undecodable: %w", path, err)
+	}
+	return &out, nil
+}
+
+func nibssNameEnquiryPath() string {
+	if v := os.Getenv("NIBSS_NAME_ENQUIRY_PATH"); v != "" {
+		return v
+	}
+	return "/nip/name-enquiry"
+}
+
+func nibssFundsTransferPath() string {
+	if v := os.Getenv("NIBSS_FUNDS_TRANSFER_PATH"); v != "" {
+		return v
+	}
+	return "/nip/funds-transfer"
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JWT AUTHENTICATION (Keycloak JWKS / RS256, fail-closed)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[auth] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[auth] JWKS fetch returned HTTP %d", resp.StatusCode)
+		return
+	}
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[auth] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
+		if err != nil || len(nBytes) == 0 {
+			continue
+		}
+		eBytes, err := base64.RawURLEncoding.DecodeString(k.E)
+		if err != nil || len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
+	jwtCache.updated = time.Now()
+	log.Printf("[auth] JWKS refreshed: %d keys", len(jwtCache.keys))
+}
+
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(jwtRealmURL())
+		}
+	}()
+}
+
+// verifyBearerToken performs full RS256 verification against the realm JWKS.
+// Any verification problem (malformed token, unknown key, bad signature,
+// missing/expired exp) is an error — the caller rejects with 401.
+func verifyBearerToken(token string) (map[string]interface{}, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, fmt.Errorf("invalid token format")
+	}
+	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return nil, fmt.Errorf("invalid token header encoding")
+	}
+	var header struct {
+		Kid string `json:"kid"`
+		Alg string `json:"alg"`
+	}
+	if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+		return nil, fmt.Errorf("invalid token header")
+	}
+	if header.Alg != "RS256" {
+		return nil, fmt.Errorf("unsupported token algorithm %q", header.Alg)
+	}
+	jwtCache.mu.RLock()
+	pub, ok := jwtCache.keys[header.Kid]
+	jwtCache.mu.RUnlock()
+	if !ok {
+		// Unknown key — refresh once (key rotation) and retry.
+		fetchJWKS(jwtRealmURL())
+		jwtCache.mu.RLock()
+		pub, ok = jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			return nil, fmt.Errorf("unknown signing key")
+		}
+	}
+	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return nil, fmt.Errorf("invalid signature encoding")
+	}
+	hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+		return nil, fmt.Errorf("invalid signature")
+	}
+	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid claims encoding")
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+		return nil, fmt.Errorf("invalid claims")
+	}
+	exp, ok := claims["exp"].(float64)
+	if !ok {
+		return nil, fmt.Errorf("token missing exp claim")
+	}
+	if time.Now().Unix() >= int64(exp) {
+		return nil, fmt.Errorf("token expired")
+	}
+	return claims, nil
+}
+
+// jwtAuthMiddleware wraps money-path handlers with real JWT verification.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			respondJSON(w, 401, map[string]string{"error": "unauthorized", "detail": "missing bearer token"})
+			return
+		}
+		claims, err := verifyBearerToken(strings.TrimPrefix(auth, "Bearer "))
+		if err != nil {
+			respondJSON(w, 401, map[string]string{"error": "unauthorized", "detail": err.Error()})
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			r.Header.Set("X-User-Id", sub)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HANDLERS
 // ═══════════════════════════════════════════════════════════════════════════════
+
+// sessionIDFromIdempotencyKey derives a deterministic 30-digit NIP session ID
+// from the caller-supplied Idempotency-Key (sha256). Retries with the same
+// key map to the same session ID instead of a fresh time-based ID.
+func sessionIDFromIdempotencyKey(key string) string {
+	sum := sha256.Sum256([]byte("54bank/nibss-nip/session/" + key))
+	var digits [30]byte
+	for i := range digits {
+		digits[i] = '0' + sum[i]%(10)
+	}
+	return string(digits[:])
+}
+
+// findTransactionBySessionID returns a previously recorded transaction with
+// the given session ID, if any (idempotent-replay detection).
+func findTransactionBySessionID(sessionID string) (NIPTransaction, bool) {
+	mu.RLock()
+	defer mu.RUnlock()
+	for _, txn := range nipTransactions {
+		if txn.SessionID == sessionID {
+			return txn, true
+		}
+	}
+	return NIPTransaction{}, false
+}
+
+func newSessionID() string {
+	return fmt.Sprintf("%026d", time.Now().UnixNano())
+}
+
+func recordTransaction(txn NIPTransaction) {
+	mu.Lock()
+	txn.ID = fmt.Sprintf("NIP-%06d", len(nipTransactions)+1)
+	nipTransactions = append(nipTransactions, txn)
+	mu.Unlock()
+}
+
+// nipFailure responds 503 with NIBSS response code 96 (system malfunction)
+// and records the failed attempt. Nothing is reported successful.
+func nipFailure(w http.ResponseWriter, txn NIPTransaction, cause error) {
+	log.Printf("[nip] %s FAILED: %v", txn.Type, cause)
+	txn.ResponseCode = "96"
+	txn.ResponseMessage = "System malfunction"
+	txn.Status = "failed"
+	txn.CompletedAt = time.Now().Format(time.RFC3339)
+	recordTransaction(txn)
+	respondJSON(w, http.StatusServiceUnavailable, txn)
+}
 
 func handleNameEnquiry(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -175,20 +460,71 @@ func handleNameEnquiry(w http.ResponseWriter, r *http.Request) {
 		ChannelCode  string `json:"channelCode"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-
-	sessionID := fmt.Sprintf("0000002605091%d", time.Now().UnixNano()%10000000000)
-	txn := NIPTransaction{
-		ID: fmt.Sprintf("NIP-%03d", len(nipTransactions)+1), SessionID: sessionID,
-		Type: "nameEnquiry", SourceBank: "54link-dev", SourceBankCode: "054",
-		DestBankCode: req.DestBankCode, DestAccount: req.AccountNo,
-		BeneficiaryName: "RESOLVED NAME", ResponseCode: "00", ResponseMessage: "Approved",
-		Status: "successful", ChannelCode: req.ChannelCode, MTI: "0200",
-		CreatedAt: time.Now().Format(time.RFC3339), CompletedAt: time.Now().Format(time.RFC3339),
+	if req.DestBankCode == "" || req.AccountNo == "" {
+		respondJSON(w, 400, map[string]string{"error": "destinationBankCode and accountNumber are required", "responseCode": "30"})
+		return
 	}
-	mu.Lock()
-	nipTransactions = append(nipTransactions, txn)
-	mu.Unlock()
-	respondJSON(w, 200, txn)
+
+	// When an Idempotency-Key is supplied, the session ID is derived from it
+	// (sha256) and a replay returns the recorded enquiry result.
+	sessionID := newSessionID()
+	if key := strings.TrimSpace(r.Header.Get("Idempotency-Key")); key != "" {
+		sessionID = sessionIDFromIdempotencyKey(key)
+		if existing, ok := findTransactionBySessionID(sessionID); ok {
+			w.Header().Set("X-Idempotent-Replayed", "true")
+			respondJSON(w, 200, existing)
+			return
+		}
+	}
+
+	txn := NIPTransaction{
+		SessionID: sessionID,
+		Type:      "nameEnquiry", SourceBank: "54link-dev", SourceBankCode: "054",
+		DestBankCode: req.DestBankCode, DestAccount: req.AccountNo,
+		Status: "processing", ChannelCode: req.ChannelCode, MTI: "0200",
+		CreatedAt: time.Now().Format(time.RFC3339),
+	}
+
+	upstream, err := nibss.call(nibssNameEnquiryPath(), map[string]interface{}{
+		"sessionId":           txn.SessionID,
+		"destinationBankCode": req.DestBankCode,
+		"accountNumber":       req.AccountNo,
+		"channelCode":         req.ChannelCode,
+	})
+	if err != nil {
+		nipFailure(w, txn, err)
+		return
+	}
+
+	// Use ONLY the name resolved by NIBSS — never a placeholder.
+	txn.ResponseCode = upstream.ResponseCode
+	txn.ResponseMessage = upstream.ResponseMessage
+	if upstream.SessionID != "" {
+		txn.SessionID = upstream.SessionID
+	}
+	name := upstream.BeneficiaryName
+	if name == "" {
+		name = upstream.AccountName
+	}
+	txn.BeneficiaryName = name
+	if upstream.ResponseCode == "00" && name != "" {
+		txn.Status = "successful"
+	} else if upstream.ResponseCode == "00" {
+		// Approved code but no name — treat as failure rather than invent one.
+		txn.ResponseCode = "25"
+		txn.ResponseMessage = "Unable to locate record"
+		txn.Status = "failed"
+	} else {
+		txn.Status = "failed"
+	}
+	txn.CompletedAt = time.Now().Format(time.RFC3339)
+	recordTransaction(txn)
+
+	status := 200
+	if txn.Status != "successful" {
+		status = 502
+	}
+	respondJSON(w, status, txn)
 }
 
 func handleFundsTransfer(w http.ResponseWriter, r *http.Request) {
@@ -205,20 +541,69 @@ func handleFundsTransfer(w http.ResponseWriter, r *http.Request) {
 		ChannelCode   string `json:"channelCode"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+	if req.SourceAccount == "" || req.DestBankCode == "" || req.DestAccount == "" || req.Amount <= 0 {
+		respondJSON(w, 400, map[string]string{"error": "sourceAccount, destinationBankCode, destinationAccount and a positive amountKobo are required", "responseCode": "30"})
+		return
+	}
 
-	sessionID := fmt.Sprintf("0000002605091%d", time.Now().UnixNano()%10000000000)
+	// A funds transfer is state-changing: it REQUIRES an Idempotency-Key.
+	// The NIP session ID is derived from the key (sha256), so a client retry
+	// (or a replayed request) collapses onto the same session ID and returns
+	// the recorded outcome instead of executing a duplicate NIP transfer.
+	idempKey := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if idempKey == "" {
+		respondJSON(w, 400, map[string]string{"error": "Idempotency-Key header is required for funds transfers", "responseCode": "30"})
+		return
+	}
+	sessionID := sessionIDFromIdempotencyKey(idempKey)
+	if existing, ok := findTransactionBySessionID(sessionID); ok {
+		w.Header().Set("X-Idempotent-Replayed", "true")
+		respondJSON(w, 200, existing)
+		return
+	}
+
 	txn := NIPTransaction{
-		ID: fmt.Sprintf("NIP-%03d", len(nipTransactions)+1), SessionID: sessionID,
-		Type: "fundsTransfer", SourceBank: "54link-dev", SourceBankCode: "054",
+		SessionID: sessionID,
+		Type:      "fundsTransfer", SourceBank: "54link-dev", SourceBankCode: "054",
 		SourceAccount: req.SourceAccount, DestBankCode: req.DestBankCode,
 		DestAccount: req.DestAccount, Amount: req.Amount, Narration: req.Narration,
-		ResponseCode: "00", ResponseMessage: "Approved", Status: "successful",
-		ChannelCode: req.ChannelCode, MTI: "0200",
-		CreatedAt: time.Now().Format(time.RFC3339), CompletedAt: time.Now().Format(time.RFC3339),
+		Status: "processing", ChannelCode: req.ChannelCode, MTI: "0200",
+		CreatedAt: time.Now().Format(time.RFC3339),
 	}
-	mu.Lock()
-	nipTransactions = append(nipTransactions, txn)
-	mu.Unlock()
+
+	upstream, err := nibss.call(nibssFundsTransferPath(), map[string]interface{}{
+		"sessionId":           txn.SessionID,
+		"sourceAccount":       req.SourceAccount,
+		"destinationBankCode": req.DestBankCode,
+		"destinationAccount":  req.DestAccount,
+		"amountKobo":          req.Amount,
+		"narration":           req.Narration,
+		"channelCode":         req.ChannelCode,
+	})
+	if err != nil {
+		// No NIBSS call completed: no balance checked, no funds moved, and we
+		// say exactly that (503 / 96 / failed).
+		nipFailure(w, txn, err)
+		return
+	}
+
+	txn.ResponseCode = upstream.ResponseCode
+	txn.ResponseMessage = upstream.ResponseMessage
+	if upstream.SessionID != "" {
+		txn.SessionID = upstream.SessionID
+	}
+	if upstream.ResponseCode == "00" {
+		txn.Status = "successful"
+	} else {
+		txn.Status = "failed"
+	}
+	txn.CompletedAt = time.Now().Format(time.RFC3339)
+	recordTransaction(txn)
+
+	if txn.Status != "successful" {
+		respondJSON(w, 502, txn)
+		return
+	}
 	respondJSON(w, 200, txn)
 }
 
@@ -237,13 +622,17 @@ func handleTSQ(w http.ResponseWriter, r *http.Request) {
 
 func handleMandates(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
+		mu.RLock()
+		defer mu.RUnlock()
 		respondJSON(w, 200, map[string]interface{}{"mandates": mandates, "total": len(mandates)})
 		return
 	}
 	// POST — create mandate
 	var req DirectDebitMandate
 	json.NewDecoder(r.Body).Decode(&req)
+	mu.Lock()
 	req.ID = fmt.Sprintf("DDM-%03d", len(mandates)+1)
+	mu.Unlock()
 	req.Status = "created"
 	req.CreatedAt = time.Now().Format(time.RFC3339)
 	mu.Lock()
@@ -259,6 +648,8 @@ func handleTransactions(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSettlements(w http.ResponseWriter, r *http.Request) {
+	mu.RLock()
+	defer mu.RUnlock()
 	respondJSON(w, 200, map[string]interface{}{"settlements": settlements, "total": len(settlements)})
 }
 
@@ -267,24 +658,34 @@ func handleResponseCodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	nibssStatus := "configured"
+	if nibss.baseURL == "" {
+		nibssStatus = "not_configured"
+	}
 	respondJSON(w, 200, map[string]interface{}{
 		"status": "healthy", "service": "nibss-nip-engine-go", "version": "2.0.0",
 		"protocol": "ISO_8583", "nipVersion": "2.0",
 		"capabilities": []string{"nameEnquiry", "fundsTransfer", "tsq", "directDebit", "settlement"},
-		"middleware": middlewareStatus(),
+		"nibss":        nibssStatus,
+		"middleware":   middlewareStatus(),
 	})
 }
 
+// middlewareStatus reports what is actually configured (env presence), not
+// fabricated "connected" states.
 func middlewareStatus() map[string]string {
+	cfg := func(env string) string {
+		if os.Getenv(env) != "" {
+			return "configured"
+		}
+		return "not_configured"
+	}
 	return map[string]string{
-		"kafka": "topics: nip.transactions, nip.settlements, nip.mandates",
-		"postgres": "tables: nip_transactions, nip_mandates, nip_settlements",
-		"redis": "session_dedup, rate_limit",
-		"temporal": "workflows: MandateExecution, SettlementRecon, ReversalSaga",
-		"tigerbeetle": "ledger: nip_clearing_account",
-		"permify": "nip:initiate_transfer, nip:approve_mandate",
-		"opensearch": "index: nip-transactions-2026",
-		"apisix": "rate_limit: 1000/s per bank_code",
+		"nibss":       cfg("NIBSS_BASE_URL"),
+		"kafka":       cfg("KAFKA_BROKERS"),
+		"postgres":    cfg("DATABASE_URL"),
+		"redis":       cfg("REDIS_URL"),
+		"tigerbeetle": cfg("TIGERBEETLE_ADDRESSES"),
 	}
 }
 
@@ -299,15 +700,30 @@ func main() {
 	if port == "" {
 		port = "8111"
 	}
+	startJWKSRefresh()
 	http.HandleFunc("/healthz", handleHealthz)
-	http.HandleFunc("/v1/nip/name-enquiry", handleNameEnquiry)
-	http.HandleFunc("/v1/nip/funds-transfer", handleFundsTransfer)
-	http.HandleFunc("/v1/nip/tsq", handleTSQ)
-	http.HandleFunc("/v1/nip/transactions", handleTransactions)
-	http.HandleFunc("/v1/nip/mandates", handleMandates)
-	http.HandleFunc("/v1/nip/settlements", handleSettlements)
-	http.HandleFunc("/v1/nip/response-codes", handleResponseCodes)
+	// Money-path endpoints require a verified RS256 Bearer token (fail-closed).
+	http.Handle("/v1/nip/name-enquiry", jwtAuthMiddleware(http.HandlerFunc(handleNameEnquiry)))
+	http.Handle("/v1/nip/funds-transfer", jwtAuthMiddleware(http.HandlerFunc(handleFundsTransfer)))
+	http.Handle("/v1/nip/tsq", jwtAuthMiddleware(http.HandlerFunc(handleTSQ)))
+	http.Handle("/v1/nip/transactions", jwtAuthMiddleware(http.HandlerFunc(handleTransactions)))
+	http.Handle("/v1/nip/mandates", jwtAuthMiddleware(http.HandlerFunc(handleMandates)))
+	http.Handle("/v1/nip/settlements", jwtAuthMiddleware(http.HandlerFunc(handleSettlements)))
+	http.Handle("/v1/nip/response-codes", jwtAuthMiddleware(http.HandlerFunc(handleResponseCodes)))
 
+	if nibss.baseURL == "" {
+		log.Printf("WARNING: NIBSS_BASE_URL not set — name-enquiry and funds-transfer will return 503 (responseCode 96)")
+	}
 	log.Printf("NIBSS/NIP Engine (Go) on :%s — ISO 8583 + Direct Debit", port)
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	// Slowloris hardening: explicit server timeouts (ReadHeader/Read/Write/Idle).
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+	log.Fatal(server.ListenAndServe())
 }

@@ -7,6 +7,10 @@ use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use std::env;
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use serde_json::json;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use tokio::sync::Mutex;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -27,7 +31,10 @@ struct CreateRequest {
 }
 
 struct AppState {
-    db: PgPool,
+    db: Option<PgPool>,
+    buckets: Mutex<HashMap<String, (u64, u64)>>,
+    db_url: Option<String>,
+    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
 }
 
 fn tokens_available(bucket_size: u64, refill_rate: f64, elapsed_ms: u64, current: u64) -> u64 {
@@ -55,7 +62,8 @@ fn degradation_mode() -> &'static str {
     if DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed) { "normal" } else { "degraded" }
 }
 
-async fn degradation_status() -> HttpResponse {
+async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -69,28 +77,28 @@ async fn health() -> HttpResponse {
 
 async fn check_rate(req: actix_web::HttpRequest, body: web::Json<serde_json::Value>, state: web::Data<AppState>) -> HttpResponse {
     let _sanitized = sanitize_input("");
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let client_id = body.get("client_id").and_then(|v| v.as_str()).unwrap_or("unknown");
     let base_rate = body.get("base_rate").and_then(|v| v.as_u64()).unwrap_or(100);
     let error_rate = body.get("error_rate").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let latency_p99 = body.get("latency_p99").and_then(|v| v.as_f64()).unwrap_or(100.0);
     let limit = adaptive_limit(base_rate, error_rate, latency_p99);
-    let mut buckets = state.buckets.lock().unwrap();
+    let mut buckets = state.buckets.lock().await;
     let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     let (tokens, _) = buckets.entry(client_id.to_string()).or_insert((limit, now_ms));
     let allowed = *tokens > 0;
     if allowed { *tokens -= 1; }
     db_persist(&state, "check_rate", &json!({"action": "check_rate"})).await;
     let upstream = std::env::var("METRICS_URL").unwrap_or_else(|_| "http://kpi-threshold-monitor-rs:8080".to_string());
-    let _ = call_service_sync(&format!("{}/v1/notify", upstream), r#"{"source": "adaptive-rate-limiter-rs", "action": "check_rate"}"#);
+    let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), r#"{"source": "adaptive-rate-limiter-rs", "action": "check_rate"}"#)).await;
     HttpResponse::Ok().json(json!({"client_id": client_id, "allowed": allowed, "remaining": tokens, "limit": limit, "adaptive_factor": limit as f64 / base_rate as f64}))
 }
 
 async fn stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
-    let buckets = state.buckets.lock().unwrap();
+    let buckets = state.buckets.lock().await;
     db_persist(&state, "stats", &json!({"action": "stats"})).await;
     HttpResponse::Ok().json(json!({"active_clients": buckets.len(), "service": "adaptive-rate-limiter-rs"}))
 }
@@ -158,20 +166,207 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
 
 
 // --- JWT Auth Check ---
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
+// --- JWT Auth Check (fail-closed; R4-V4 remediation) ---
+// Canonical RS256/JWKS-primary verifier aligned with pin-block-engine-rs:
+// tokens are verified against the Keycloak JWKS (KEYCLOAK_JWKS_URL, or derived
+// from KEYCLOAK_REALM_URL) with a 300s cache and a 5s fetch timeout; HS256 via
+// JWT_SECRET remains as a fallback. 401 on missing/malformed/expired/
+// unknown-kid tokens; 503 when no verification backend is available. Verified
+// claims are stored in request extensions for downstream handlers.
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct VerifiedClaims(serde_json::Value);
+
+/// Verified tenant id from JWT claims stored in request extensions (never from
+/// raw request headers or caller-supplied body fields).
+#[allow(dead_code)]
+fn claims_tenant(req: &actix_web::HttpRequest) -> Option<String> {
+    let ext = req.extensions();
+    let claims = ext.get::<VerifiedClaims>()?;
+    claims
+        .0
+        .get("tenant_id")
+        .or_else(|| claims.0.get("tenant"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
+}
+
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
+        }
+    }
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
+        }
+        _ => None,
+    }
+}
+
+async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpResponse> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => {
+            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwt_validation_unavailable",
+                "detail": "no JWKS endpoint configured"
+            })))
+        }
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
+            }
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "client init failed"
+        })))?;
+    let resp = client.get(&url).send().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+    })?;
+    if !resp.status().is_success() {
+        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "upstream returned error status"
+        })));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "malformed JWKS payload"
+        }))
+    })?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
+}
+
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
+        }
+    }
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
+    }
+}
+
+async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks().await?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks().await?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => {
+                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                        }
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    })))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": format!("unsupported alg {:?}", other)
+        }))),
+    }
+}
+
+async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
     }
-    match req.headers().get("Authorization") {
-        Some(val) => {
-            if let Ok(s) = val.to_str() {
-                if s.starts_with("Bearer ") { return Ok(()); }
-            }
-            Err(HttpResponse::Unauthorized().json(json!({"error": "invalid auth header"})))
-        }
-        None => Err(HttpResponse::Unauthorized().json(json!({"error": "missing Authorization header"})))
+    let header = match req.headers().get("Authorization").and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing Authorization header"}))),
+    };
+    let token = match header.strip_prefix("Bearer ") {
+        Some(t) if !t.is_empty() => t,
+        _ => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
+    };
+    let claims = verify_jwt_token(token).await?;
+    // Fail-closed (wave-7.5): tenant identity comes ONLY from verified claims;
+    // tokens without a tenant claim are rejected before any query runs.
+    if claims.get("tenant_id").or_else(|| claims.get("tenant")).and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+        return Err(actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})));
     }
+    req.extensions_mut().insert(VerifiedClaims(claims));
+    Ok(())
 }
 
 
@@ -397,7 +592,15 @@ fn mtls_config() -> (bool, String, String, String) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8200);
+    let db_pool: Option<PgPool> = match std::env::var("DATABASE_URL") {
+        Ok(url) => match PgPoolOptions::new().max_connections(5).acquire_timeout(std::time::Duration::from_secs(5)).connect(&url).await {
+            Ok(pool) => { init_schema(&pool).await; Some(pool) }
+            Err(e) => { eprintln!("[adaptive-rate-limiter-rs] pg pool connect failed: {} — SQL CRUD endpoints will return 503", e); None }
+        },
+        Err(_) => { eprintln!("[adaptive-rate-limiter-rs] DATABASE_URL not set — SQL CRUD endpoints will return 503"); None }
+    };
     let state = web::Data::new(AppState {
+        db: db_pool,
         buckets: Mutex::new(HashMap::new()),
         db_url: std::env::var("DATABASE_URL").ok(),
             db_client: {
@@ -454,6 +657,8 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/service_configs/{id}", web::get().to(get_record))
             .route("/api/v1/service_configs/{id}", web::put().to(update_record))
             .route("/api/v1/service_configs/{id}", web::delete().to(delete_record))
+            .route("/v1/ratelimit/check", web::post().to(check_rate))
+            .route("/v1/ratelimit/stats", web::get().to(stats))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -479,6 +684,7 @@ async fn init_schema(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("Failed to create service_configs table");
+}
 
 #[cfg(test)]
 mod tests {
@@ -528,14 +734,117 @@ mod tests {
 
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
+async fn metrics() -> HttpResponse {
+    HttpResponse::Ok().json(json!({
+        "service": "adaptive-rate-limiter-rs",
+        "requests_total": _REQ_COUNT.load(AtomicOrdering::Relaxed),
+        "errors_total": _ERR_COUNT.load(AtomicOrdering::Relaxed),
+    }))
+}
+
+async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let tenant_id = match claims_tenant(&req) {
+        Some(t) if !t.is_empty() => t,
+        _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
+    };
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
+
+    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT 50")
+        .bind(tenant_id)
+        .fetch_all(pool)
+        .await;
+
+    match rows {
+        Ok(rows) => {
+            let records: Vec<serde_json::Value> = rows.iter().map(|r| {
+                serde_json::json!({
+                    "id": r.get::<Uuid, _>("id").to_string(),
+                    "status": r.get::<String, _>("status"),
+                    "created_at": r.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+                })
+            }).collect();
+            let count = records.len();
+            HttpResponse::Ok().json(serde_json::json!({"data": records, "count": count}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let tenant_id = match claims_tenant(&req) {
+        Some(t) if !t.is_empty() => t,
+        _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
+    };
+
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
+
+    let result = sqlx::query_scalar::<_, Uuid>(
+        "INSERT INTO service_configs (tenant_id, status) VALUES ($1::uuid, $2) RETURNING id"
+    )
+    .bind(&tenant_id)
+    .bind(&status)
+    .fetch_one(pool)
+    .await;
+
+    match result {
+        Ok(id) => {
+            let payload = serde_json::json!({"id": id.to_string(), "status": &status, "tenant_id": &tenant_id});
+            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
+                .bind("service_configs.created")
+                .bind(id.to_string())
+                .bind(&payload)
+                .execute(pool).await.ok();
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "status": "created"}))
+        }
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let id = path.into_inner();
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
+    let result = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_optional(pool)
+        .await;
+
+    match result {
+        Ok(Some(row)) => HttpResponse::Ok().json(serde_json::json!({
+            "id": row.get::<Uuid, _>("id").to_string(),
+            "status": row.get::<String, _>("status"),
+            "created_at": row.get::<DateTime<Utc>, _>("created_at").to_rfc3339()
+        })),
+        Ok(None) => HttpResponse::NotFound().json(serde_json::json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    }
+}
+
+async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
 
     let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
         .bind(&status)
         .bind(&id)
-        .execute(&data.db)
+        .execute(pool)
         .await;
 
     match result {
@@ -545,18 +854,23 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
                 .bind("service_configs.updated")
                 .bind(&id)
                 .bind(&payload)
-                .execute(&data.db).await.ok();
+                .execute(pool).await.ok();
             HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
         }
         Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
     }
 }
 
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
+async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
+    let pool = match data.db.as_ref() {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "database_unavailable"})),
+    };
     sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
-        .execute(&data.db)
+        .execute(pool)
         .await
         .ok();
 
@@ -565,7 +879,7 @@ async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> Ht
         .bind("service_configs.deleted")
         .bind(&id)
         .bind(&payload)
-        .execute(&data.db).await.ok();
+        .execute(pool).await.ok();
 
     HttpResponse::NoContent().finish()
 }

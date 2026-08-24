@@ -1,8 +1,7 @@
 FROM rust:1.77-slim AS builder
 WORKDIR /app
 COPY Cargo.toml .
-COPY main.rs src/main.rs
-RUN mkdir src && mv src/main.rs src/ || true
+COPY src/ src/
 RUN cargo build --release
 
 FROM debian:bookworm-slim

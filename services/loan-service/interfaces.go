@@ -8,28 +8,29 @@ type CreditDecisionEngine struct {
 	maxDebtToIncomeRatio float64
 	maxLoanToValueRatio  float64
 }
+
 // LoanApplication represents a loan application
 type LoanApplication struct {
-	ID                      string     `json:"id"`
-	TenantID                string     `json:"tenant_id"`
-	LoanApplicationID       string     `json:"loan_application_id"`
-	Status                  string     `json:"status"`
-	ApplicantID             string     `json:"applicant_id"`
-	LoanAmount              float64    `json:"loan_amount" binding:"required"`
-	LoanPurpose             string     `json:"loan_purpose" binding:"required"`
-	LoanType                string     `json:"loan_type"`
-	LoanInterestRatePercent float64    `json:"interest_rate_percent"`
-	RequestedTerm           int        `json:"requested_term" binding:"required"`
-	MonthlyIncome           float64    `json:"monthly_income" binding:"required"`
-	ExistingDebt            float64    `json:"existing_debt"`
-	CollateralValue         float64    `json:"collateral_value"`
-	CreditScore             int        `json:"credit_score"`
-	EmploymentStatus        string     `json:"employment_status"`
-	EmploymentDuration      int        `json:"employment_duration"`
-	BankStatementScore      float64    `json:"bank_statement_score"`
-	BVNVerified             bool       `json:"bvn_verified"`
-	NINVerified             bool       `json:"nin_verified"`
-	LoanStartedAt           *time.Time `json:"loan_started_at"`
+	ID                      string        `json:"id"`
+	TenantID                string        `json:"tenant_id"`
+	LoanApplicationID       string        `json:"loan_application_id"`
+	Status                  string        `json:"status"`
+	ApplicantID             string        `json:"applicant_id"`
+	LoanAmount              float64       `json:"loan_amount" binding:"required"`
+	LoanPurpose             string        `json:"loan_purpose" binding:"required"`
+	LoanType                string        `json:"loan_type"`
+	LoanInterestRatePercent float64       `json:"interest_rate_percent"`
+	RequestedTerm           int           `json:"requested_term" binding:"required"`
+	MonthlyIncome           float64       `json:"monthly_income" binding:"required"`
+	ExistingDebt            float64       `json:"existing_debt"`
+	CollateralValue         float64       `json:"collateral_value"`
+	CreditScore             int           `json:"credit_score"`
+	EmploymentStatus        string        `json:"employment_status"`
+	EmploymentDuration      int           `json:"employment_duration"`
+	BankStatementScore      float64       `json:"bank_statement_score"`
+	BVNVerified             bool          `json:"bvn_verified"`
+	NINVerified             bool          `json:"nin_verified"`
+	LoanStartedAt           *time.Time    `json:"loan_started_at"`
 	Payments                []LoanPayment `json:"payments"`
 }
 
@@ -46,7 +47,7 @@ type LoanPayment struct {
 
 // CreditDecision represents the automated decision
 type CreditDecision struct {
-	Decision           string  // "APPROVED", "DECLINED", "REFER"
+	Decision           string // "APPROVED", "DECLINED", "REFER"
 	ApprovedAmount     float64
 	InterestRate       float64
 	ApprovedTerm       int
@@ -59,13 +60,13 @@ type CreditDecision struct {
 
 // RepaymentSchedule represents a loan repayment schedule
 type RepaymentSchedule struct {
-	LoanAmount      float64
-	InterestRate    float64
-	Term            int
-	MonthlyPayment  float64
-	TotalInterest   float64
-	TotalPayment    float64
-	Schedule        []RepaymentInstallment
+	LoanAmount     float64
+	InterestRate   float64
+	Term           int
+	MonthlyPayment float64
+	TotalInterest  float64
+	TotalPayment   float64
+	Schedule       []RepaymentInstallment
 }
 
 // RepaymentInstallment represents a single payment

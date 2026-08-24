@@ -626,26 +626,26 @@ func (d *AccountDocument) ToMap() map[string]interface{} {
 }
 
 type TransactionDocument struct {
-	TransactionID      string    `json:"transaction_id"`
-	TenantID           string    `json:"tenant_id"`
-	Reference          string    `json:"reference"`
-	AccountID          string    `json:"account_id"`
-	AccountNumber      string    `json:"account_number"`
-	CustomerID         string    `json:"customer_id"`
-	CustomerName       string    `json:"customer_name"`
-	Type               string    `json:"type"`
-	Direction          string    `json:"direction"`
-	Amount             float64   `json:"amount"`
-	Currency           string    `json:"currency"`
-	Status             string    `json:"status"`
-	Channel            string    `json:"channel"`
-	Narration          string    `json:"narration"`
-	CounterpartyName   string    `json:"counterparty_name"`
-	CounterpartyAccount string   `json:"counterparty_account"`
-	CounterpartyBank   string    `json:"counterparty_bank"`
-	CreatedAt          time.Time `json:"created_at"`
-	ValueDate          time.Time `json:"value_date"`
-	BranchID           string    `json:"branch_id"`
+	TransactionID       string    `json:"transaction_id"`
+	TenantID            string    `json:"tenant_id"`
+	Reference           string    `json:"reference"`
+	AccountID           string    `json:"account_id"`
+	AccountNumber       string    `json:"account_number"`
+	CustomerID          string    `json:"customer_id"`
+	CustomerName        string    `json:"customer_name"`
+	Type                string    `json:"type"`
+	Direction           string    `json:"direction"`
+	Amount              float64   `json:"amount"`
+	Currency            string    `json:"currency"`
+	Status              string    `json:"status"`
+	Channel             string    `json:"channel"`
+	Narration           string    `json:"narration"`
+	CounterpartyName    string    `json:"counterparty_name"`
+	CounterpartyAccount string    `json:"counterparty_account"`
+	CounterpartyBank    string    `json:"counterparty_bank"`
+	CreatedAt           time.Time `json:"created_at"`
+	ValueDate           time.Time `json:"value_date"`
+	BranchID            string    `json:"branch_id"`
 }
 
 func (d *TransactionDocument) ToMap() map[string]interface{} {
@@ -934,45 +934,45 @@ func (d *NotificationDocument) ToMap() map[string]interface{} {
 }
 
 type TradeFinanceDocument struct {
-	TradeID            string    `json:"trade_id"`
-	TenantID           string    `json:"tenant_id"`
-	Reference          string    `json:"reference"`
-	CustomerID         string    `json:"customer_id"`
-	CustomerName       string    `json:"customer_name"`
-	Type               string    `json:"type"`
-	InstrumentType     string    `json:"instrument_type"`
-	Amount             float64   `json:"amount"`
-	Currency           string    `json:"currency"`
-	Status             string    `json:"status"`
-	Counterparty       string    `json:"counterparty"`
-	CounterpartyCountry string   `json:"counterparty_country"`
-	GoodsDescription   string    `json:"goods_description"`
-	PortOfLoading      string    `json:"port_of_loading"`
-	PortOfDischarge    string    `json:"port_of_discharge"`
-	IssueDate          time.Time `json:"issue_date"`
-	ExpiryDate         time.Time `json:"expiry_date"`
-	ShipmentDate       time.Time `json:"shipment_date"`
+	TradeID             string    `json:"trade_id"`
+	TenantID            string    `json:"tenant_id"`
+	Reference           string    `json:"reference"`
+	CustomerID          string    `json:"customer_id"`
+	CustomerName        string    `json:"customer_name"`
+	Type                string    `json:"type"`
+	InstrumentType      string    `json:"instrument_type"`
+	Amount              float64   `json:"amount"`
+	Currency            string    `json:"currency"`
+	Status              string    `json:"status"`
+	Counterparty        string    `json:"counterparty"`
+	CounterpartyCountry string    `json:"counterparty_country"`
+	GoodsDescription    string    `json:"goods_description"`
+	PortOfLoading       string    `json:"port_of_loading"`
+	PortOfDischarge     string    `json:"port_of_discharge"`
+	IssueDate           time.Time `json:"issue_date"`
+	ExpiryDate          time.Time `json:"expiry_date"`
+	ShipmentDate        time.Time `json:"shipment_date"`
 }
 
 func (d *TradeFinanceDocument) ToMap() map[string]interface{} {
 	return map[string]interface{}{
-		"trade_id":            d.TradeID,
-		"tenant_id":           d.TenantID,
-		"reference":           d.Reference,
-		"customer_id":         d.CustomerID,
-		"customer_name":       d.CustomerName,
-		"type":                d.Type,
-		"instrument_type":     d.InstrumentType,
-		"amount":              d.Amount,
-		"currency":            d.Currency,
-		"status":              d.Status,
-		"counterparty":        d.Counterparty,
+		"trade_id":             d.TradeID,
+		"tenant_id":            d.TenantID,
+		"reference":            d.Reference,
+		"customer_id":          d.CustomerID,
+		"customer_name":        d.CustomerName,
+		"type":                 d.Type,
+		"instrument_type":      d.InstrumentType,
+		"amount":               d.Amount,
+		"currency":             d.Currency,
+		"status":               d.Status,
+		"counterparty":         d.Counterparty,
 		"counterparty_country": d.CounterpartyCountry,
-		"goods_description":   d.GoodsDescription,
-		"port_of_loading":     d.PortOfLoading,
-		"port_of_discharge":   d.PortOfDischarge,
-		"issue_date":          d.IssueDate,
-		"expiry_date":         d.ExpiryDate,
-		"shipment_date":       d.ShipmentDate,
+		"goods_description":    d.GoodsDescription,
+		"port_of_loading":      d.PortOfLoading,
+		"port_of_discharge":    d.PortOfDischarge,
+		"issue_date":           d.IssueDate,
+		"expiry_date":          d.ExpiryDate,
+		"shipment_date":        d.ShipmentDate,
 	}
 }

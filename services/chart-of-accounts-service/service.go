@@ -756,15 +756,15 @@ func (s *ChartOfAccountsService) GetAccountBalancesBatch(ctx context.Context, ac
 		pendingD := tbAcc.DebitsPending.BigInt()
 		pendingC := tbAcc.CreditsPending.BigInt()
 		bal := &AccountBalance{
-			AccountID:     acc.ID,
-			AccountCode:   acc.Code,
-			AccountName:   acc.Name,
-			Currency:      acc.Currency,
-			DebitBalance:  debits.Int64(),
-			CreditBalance: credits.Int64(),
-			PendingDebits: pendingD.Int64(),
+			AccountID:      acc.ID,
+			AccountCode:    acc.Code,
+			AccountName:    acc.Name,
+			Currency:       acc.Currency,
+			DebitBalance:   debits.Int64(),
+			CreditBalance:  credits.Int64(),
+			PendingDebits:  pendingD.Int64(),
 			PendingCredits: pendingC.Int64(),
-			AsOfDate:      time.Now(),
+			AsOfDate:       time.Now(),
 		}
 		if acc.NormalBalance == NormalBalanceDebit {
 			bal.NetBalance = bal.DebitBalance - bal.CreditBalance

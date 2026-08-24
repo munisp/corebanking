@@ -65,10 +65,10 @@ func main() {
 
 	mux.HandleFunc("/v1/metering/stats", func(w http.ResponseWriter, _ *http.Request) {
 		respondJSON(w, 200, map[string]interface{}{
-			"requestsToday":  485000,
-			"avgLatencyMs":   42,
+			"requestsToday":   485000,
+			"avgLatencyMs":    42,
 			"quotaViolations": 0,
-			"activeClients":  128,
+			"activeClients":   128,
 		})
 	})
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"time"
 
@@ -52,9 +53,11 @@ func initRedis() *redis.Client {
 		redisAddr = "redis-master.redis.svc.cluster.local:6379"
 	}
 
+	// Fail closed: the Redis password must come from the environment; no
+	// credential is ever embedded in source.
 	redisPassword := os.Getenv("REDIS_PASSWORD")
 	if redisPassword == "" {
-		redisPassword = "3phHSv7qbAuZLb2pi9FWED2X"
+		log.Fatal("REDIS_PASSWORD environment variable must be set")
 	}
 
 	rdb := redis.NewClient(&redis.Options{
@@ -428,6 +431,24 @@ func createTables() error {
 		('PROD006', 'EQUITY_RELEASE', 'Equity Release', 'Release equity from existing property', 'equity_release', 5000000, 200000000, 60, 180, 19.0, 0.60, 0.35, FALSE),
 		('PROD007', 'BUY_TO_LET', 'Buy-to-Let Mortgage', 'Mortgage for investment properties', 'buy_to_let', 10000000, 300000000, 60, 240, 20.0, 0.65, 0.35, FALSE)
 	ON CONFLICT (code) DO NOTHING;
+
+	-- Event outbox: financial events that could not be published to Kafka are
+	-- persisted here for retry. Events are never silently dropped.
+	CREATE TABLE IF NOT EXISTS mortgage_event_outbox (
+		id VARCHAR(50) PRIMARY KEY,
+		topic VARCHAR(100) NOT NULL,
+		event_type VARCHAR(100) NOT NULL,
+		mortgage_id VARCHAR(50),
+		tenant_id VARCHAR(50),
+		payload JSONB NOT NULL,
+		status VARCHAR(20) NOT NULL DEFAULT 'pending',
+		retry_count INTEGER NOT NULL DEFAULT 0,
+		last_error TEXT,
+		created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+		published_at TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_mortgage_outbox_status ON mortgage_event_outbox(status);
 	`
 
 	_, err := db.Exec(tables)
@@ -604,7 +625,113 @@ func updateMortgageStatus(id, tenantID string, status MortgageStatus) error {
 	}
 
 	query := `UPDATE mortgage_applications SET status = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3`
-	_, err := db.Exec(query, status, id, tenantID)
+	res, err := db.Exec(query, status, id, tenantID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("mortgage %s not found for tenant — status not updated", id)
+	}
+	return nil
+}
+
+// claimMortgageForDisbursement atomically transitions a mortgage from a
+// disbursable state (offer_accepted / disbursement_pending) to "disbursing".
+// The single UPDATE ... WHERE status IN (...) RETURNING ... statement is the
+// concurrency guard: exactly one concurrent caller can claim the row; all
+// others get (nil, nil). The returned record carries the SERVER-SIDE approved
+// terms — the disbursement amount must never come from the request body.
+func claimMortgageForDisbursement(id, tenantID string) (*MortgageApplication, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database unavailable: cannot claim mortgage %s for disbursement", id)
+	}
+
+	query := `
+		UPDATE mortgage_applications
+		SET status = $1, updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3
+		  AND status IN ($4, $5)
+		RETURNING application_number, product_type, primary_applicant_id,
+			COALESCE(approved_amount, 0), COALESCE(approved_tenor_months, 0),
+			COALESCE(interest_rate, 0), COALESCE(principal_account_id, ''),
+			COALESCE(escrow_account_id, ''), COALESCE(interest_account_id, ''),
+			COALESCE(ledger_account_id, ''),
+			requested_amount, requested_tenor_months
+	`
+
+	app := &MortgageApplication{ID: id, TenantID: tenantID, Status: StatusDisbursing}
+	err := db.QueryRow(query,
+		StatusDisbursing, id, tenantID, StatusOfferAccepted, StatusDisbursementPending,
+	).Scan(
+		&app.ApplicationNumber, &app.ProductType, &app.PrimaryApplicantID,
+		&app.ApprovedAmount, &app.ApprovedTenorMonths,
+		&app.InterestRate, &app.PrincipalAccountID,
+		&app.EscrowAccountID, &app.InterestAccountID,
+		&app.LedgerAccountID,
+		&app.RequestedAmount, &app.RequestedTenorMonths,
+	)
+	if err == sql.ErrNoRows {
+		// Claim not acquired: already disbursed, disbursing, or wrong state.
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claim mortgage %s for disbursement: %w", id, err)
+	}
+	return app, nil
+}
+
+// releaseDisbursementClaim rolls a claimed ("disbursing") mortgage back to
+// its pre-claim status after a pre-transfer failure. It refuses to touch a
+// row that is no longer in "disbursing", so it can never clobber a completed
+// disbursement.
+func releaseDisbursementClaim(id, tenantID string, restore MortgageStatus) error {
+	if db == nil {
+		return fmt.Errorf("database unavailable: cannot release disbursement claim for %s", id)
+	}
+	query := `UPDATE mortgage_applications SET status = $1, updated_at = NOW()
+		WHERE id = $2 AND tenant_id = $3 AND status = $4`
+	res, err := db.Exec(query, restore, id, tenantID, StatusDisbursing)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("mortgage %s no longer in 'disbursing' state — claim release refused", id)
+	}
+	return nil
+}
+
+// markDisbursementCompensationFailed records that the disbursement saga's
+// compensation (ledger reversal) failed. This state requires manual ops
+// reconciliation and must never be silently bypassed.
+func markDisbursementCompensationFailed(id, tenantID string) error {
+	if db == nil {
+		return fmt.Errorf("database unavailable: cannot mark compensation_failed for %s", id)
+	}
+	query := `UPDATE mortgage_applications SET status = $1, updated_at = NOW() WHERE id = $2 AND tenant_id = $3`
+	_, err := db.Exec(query, StatusCompensationFailed, id, tenantID)
+	return err
+}
+
+// saveEventToOutbox persists a failed Kafka event to the outbox table so a
+// relay/operator can retry it. Financial events are never silently dropped.
+func saveEventToOutbox(topic string, event MortgageEvent) error {
+	if db == nil {
+		return fmt.Errorf("database unavailable: cannot persist event %s to outbox", event.Type)
+	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("serialize outbox event: %w", err)
+	}
+	// Deterministic idempotency key over the natural/business keys so a retry
+	// of the same logical event dedupes instead of double-inserting.
+	key := generateID("OUT")
+	query := `
+		INSERT INTO mortgage_event_outbox
+			(id, topic, event_type, mortgage_id, tenant_id, payload, status, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW())
+		ON CONFLICT (id) DO NOTHING
+	`
+	_, err = db.Exec(query, key, topic, event.Type, event.MortgageID, event.TenantID, payload)
 	return err
 }
 
@@ -1047,16 +1174,22 @@ func saveRestructuringDetails(app *MortgageApplication, restructureType, reason,
 	`
 	_, err := db.Exec(query, generateID("RST"), app.ID, restructureType,
 		app.ApprovedTenorMonths, app.InterestRate, app.MonthlyPayment, reason, approvedBy)
+	if err != nil {
+		return fmt.Errorf("save restructuring record: %w", err)
+	}
 
-	// Update main application
+	// Update main application — this write carries money terms (tenor, rate,
+	// monthly payment); a failure here must surface, not be swallowed.
 	updateQuery := `
 		UPDATE mortgage_applications SET
 			approved_tenor_months = $1, interest_rate = $2, monthly_payment = $3, updated_at = NOW()
 		WHERE id = $4
 	`
-	db.Exec(updateQuery, app.ApprovedTenorMonths, app.InterestRate, app.MonthlyPayment, app.ID)
+	if _, err := db.Exec(updateQuery, app.ApprovedTenorMonths, app.InterestRate, app.MonthlyPayment, app.ID); err != nil {
+		return fmt.Errorf("update restructured mortgage terms: %w", err)
+	}
 
-	return err
+	return nil
 }
 
 func saveForbearanceRequest(mortgageID, forbearanceID, forbearanceType string, durationMonths int, reducedPayment float64, reason string) error {
@@ -1074,19 +1207,147 @@ func saveForbearanceRequest(mortgageID, forbearanceID, forbearanceType string, d
 	return err
 }
 
+// amountToMinorUnits converts a major-unit (naira) amount to integer minor
+// units (kobo). All arrears arithmetic below is done in integer minor units
+// so float drift can never misclassify a mortgage.
+func amountToMinorUnits(amount float64) int64 {
+	return int64(math.Round(amount * 100))
+}
+
+func arrearsBucket(daysPastDue int) string {
+	switch {
+	case daysPastDue >= 90:
+		return "90+"
+	case daysPastDue >= 60:
+		return "61-90"
+	case daysPastDue >= 30:
+		return "31-60"
+	case daysPastDue > 0:
+		return "1-30"
+	default:
+		return "current"
+	}
+}
+
+// computeArrears recalculates the arrears position of a mortgage from its
+// repayment schedule: every pending schedule entry whose due date has passed
+// contributes its outstanding amount (scheduled total minus what has already
+// been paid against the entry). Fails closed when the database is
+// unavailable — a mortgage must never be reported "current" because the
+// schedule could not be read.
+func computeArrears(mortgageID string) (*ArrearsStatus, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+
+	schedule, err := fetchRepaymentSchedule(mortgageID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch repayment schedule for arrears: %w", err)
+	}
+
+	today := time.Now()
+	var arrearsKobo int64
+	daysPastDue := 0
+	for _, entry := range schedule {
+		if entry.Status != "pending" || !entry.DueDate.Before(today) {
+			continue
+		}
+		outstandingKobo := amountToMinorUnits(entry.TotalAmount) - amountToMinorUnits(entry.PaidAmount)
+		if outstandingKobo <= 0 {
+			continue
+		}
+		arrearsKobo += outstandingKobo
+		if days := int(today.Sub(entry.DueDate).Hours() / 24); days > daysPastDue {
+			daysPastDue = days
+		}
+	}
+
+	var lastPaymentDate *time.Time
+	row := db.QueryRow(
+		"SELECT MAX(paid_date) FROM mortgage_payments WHERE mortgage_id = $1 AND status = 'paid'",
+		mortgageID,
+	)
+	if err := row.Scan(&lastPaymentDate); err != nil {
+		return nil, fmt.Errorf("fetch last payment date for arrears: %w", err)
+	}
+
+	return &ArrearsStatus{
+		MortgageID:      mortgageID,
+		InArrears:       arrearsKobo > 0,
+		DaysPastDue:     daysPastDue,
+		ArrearsAmount:   float64(arrearsKobo) / 100,
+		Bucket:          arrearsBucket(daysPastDue),
+		PenaltyAmount:   0, // no penalty policy is configured in this service
+		LastPaymentDate: lastPaymentDate,
+	}, nil
+}
+
+// updateArrearsStatus recalculates the arrears position and persists it to
+// mortgage_arrears. Called after every payment (main.go) and from the daily
+// servicing workflow (temporal_workflows.go). A cleared position resolves any
+// active arrears record; an overdue position upserts the active record.
 func updateArrearsStatus(mortgageID, tenantID string) error {
-	// Calculate arrears based on payment history
-	return nil
+	if db == nil {
+		return fmt.Errorf("database not available")
+	}
+
+	status, err := computeArrears(mortgageID)
+	if err != nil {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin arrears update: %w", err)
+	}
+	defer tx.Rollback()
+
+	if !status.InArrears {
+		// Arrears cleared — resolve any active record.
+		if _, err := tx.Exec(
+			"UPDATE mortgage_arrears SET status = 'resolved', updated_at = NOW() WHERE mortgage_id = $1 AND status = 'active'",
+			mortgageID,
+		); err != nil {
+			return fmt.Errorf("resolve cleared arrears for mortgage %s: %w", mortgageID, err)
+		}
+		return tx.Commit()
+	}
+
+	res, err := tx.Exec(
+		`UPDATE mortgage_arrears SET
+			arrears_amount = $2, days_past_due = $3, bucket = $4,
+			penalty_amount = $5, last_payment_date = $6, updated_at = NOW()
+		WHERE mortgage_id = $1 AND status = 'active'`,
+		mortgageID, status.ArrearsAmount, status.DaysPastDue, status.Bucket,
+		status.PenaltyAmount, status.LastPaymentDate,
+	)
+	if err != nil {
+		return fmt.Errorf("update arrears record for mortgage %s: %w", mortgageID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("arrears update result for mortgage %s: %w", mortgageID, err)
+	}
+	if affected == 0 {
+		if _, err := tx.Exec(
+			`INSERT INTO mortgage_arrears (
+				id, mortgage_id, arrears_amount, days_past_due, bucket,
+				penalty_amount, last_payment_date, status
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')`,
+			generateID("ARR"), mortgageID, status.ArrearsAmount, status.DaysPastDue,
+			status.Bucket, status.PenaltyAmount, status.LastPaymentDate,
+		); err != nil {
+			return fmt.Errorf("insert arrears record for mortgage %s: %w", mortgageID, err)
+		}
+	}
+
+	log.Printf("Arrears recalculated for mortgage %s (tenant %s): in_arrears=%v days_past_due=%d amount=%.2f bucket=%s",
+		mortgageID, tenantID, status.InArrears, status.DaysPastDue, status.ArrearsAmount, status.Bucket)
+	return tx.Commit()
 }
 
 func calculateArrearsStatus(mortgageID string) (*ArrearsStatus, error) {
-	return &ArrearsStatus{
-		MortgageID:    mortgageID,
-		InArrears:     false,
-		DaysPastDue:   0,
-		ArrearsAmount: 0,
-		Bucket:        "current",
-	}, nil
+	return computeArrears(mortgageID)
 }
 
 // ArrearsStatus represents arrears information

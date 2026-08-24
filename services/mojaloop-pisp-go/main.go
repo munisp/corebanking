@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/IBM/sarama"
 	"log"
 	"net/http"
 	"os"
@@ -13,17 +14,16 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/lib/pq"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	_ "github.com/lib/pq"
 	"math/big"
 	"sync"
 )
 
 var db *sql.DB
-
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
 
@@ -58,9 +58,13 @@ func fetchJWKS(realmURL string) {
 	for _, k := range jwks.Keys {
 		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
 		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
+		if len(eBytes) == 0 {
+			continue
+		}
 		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
 		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 		jwtCache.keys[k.Kid] = pub
 	}
@@ -68,12 +72,66 @@ func fetchJWKS(realmURL string) {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
+// expectedIssuer returns the expected JWT issuer: KEYCLOAK_ISSUER when set,
+// otherwise KEYCLOAK_REALM_URL. Empty means issuer validation is skipped
+// (a startup warning is logged by warnIfAuthUnconfigured).
+func expectedIssuer() string {
+	if iss := os.Getenv("KEYCLOAK_ISSUER"); iss != "" {
+		return iss
+	}
+	return os.Getenv("KEYCLOAK_REALM_URL")
+}
+
+// audienceMatches checks the expected audience against the JWT aud claim,
+// which may be a string or an array of strings.
+func audienceMatches(aud interface{}, expected string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == expected
+	case []interface{}:
+		for _, a := range v {
+			if a == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func init() {
+	warnIfAuthUnconfigured()
+}
+
+func warnIfAuthUnconfigured() {
+	if os.Getenv("KEYCLOAK_ISSUER") == "" && os.Getenv("KEYCLOAK_REALM_URL") == "" {
+		log.Printf("WARNING: KEYCLOAK_ISSUER/KEYCLOAK_REALM_URL unset - JWT iss claim will NOT be validated")
+	}
+	if os.Getenv("EXPECTED_AUDIENCE") == "" {
+		log.Printf("WARNING: EXPECTED_AUDIENCE unset - JWT aud claim will NOT be validated")
+	}
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	// Initial JWKS fetch
 	go fetchJWKS(realmURL)
 	// Refresh every 5 minutes
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(realmURL)
+		}
 	}()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Skip health endpoints
@@ -98,7 +156,9 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
 			return
 		}
-		var header struct { Kid string `json:"kid"` }
+		var header struct {
+			Kid string `json:"kid"`
+		}
 		json.Unmarshal(headerBytes, &header)
 
 		jwtCache.mu.RLock()
@@ -132,14 +192,72 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		var claims map[string]interface{}
 		json.Unmarshal(claimsBytes, &claims)
 		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
 			return
 		}
+		// Validate issuer/audience when configured (M-55)
+		if iss := expectedIssuer(); iss != "" {
+			if claims["iss"] != iss {
+				http.Error(w, `{"error":"invalid issuer"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		if aud := os.Getenv("EXPECTED_AUDIENCE"); aud != "" {
+			if !audienceMatches(claims["aud"], aud) {
+				http.Error(w, `{"error":"invalid audience"}`, http.StatusUnauthorized)
+				return
+			}
+		}
 		// Pass claims in context
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
+		}
+		r.Header.Set("X-Tenant-ID", tenant)
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// enforceTenantClaim cross-checks a client-supplied tenant identifier against
+// the verified JWT claims (C-15). When the token carries a tenant (or
+// tenant_id) claim and it does not match the requested tenant, the request is
+// rejected with 403 and false is returned. Fail-closed (wave-7.5): an empty
+// requested tenant, missing verified claims, or a token without a tenant claim
+// is rejected instead of being allowed.
+func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
+	if requestedTenant == "" {
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return false
+	}
+	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
+	if claims == nil {
+		http.Error(w, `{"error":"unauthorized: no verified token claims"}`, http.StatusUnauthorized)
+		return false
+	}
+	claimTenant, _ := claims["tenant"].(string)
+	if claimTenant == "" {
+		claimTenant, _ = claims["tenant_id"].(string)
+	}
+	if claimTenant == "" {
+		http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+		return false
+	}
+	if claimTenant != requestedTenant {
+		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)
+		return false
+	}
+	return true
 }
 
 // ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
@@ -160,35 +278,86 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	if len(ids) == 0 {
+		return
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
 
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("[mojaloop-pisp-go] starting on :8267")
 
 	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/mojaloop_pisp_go?sslmode=disable")
+	// DATABASE_URL is REQUIRED — no credential-bearing default. Fail fast at startup.
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Fatalf("[mojaloop-pisp-go] DATABASE_URL env var is required; refusing to start with default database credentials")
+	}
 	var err error
 	db, err = sql.Open("postgres", dsn)
 	if err != nil {
@@ -229,8 +398,8 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	// Domain endpoints
-	mux.HandleFunc("/api/v1/service_configs", domainHandler)
-	mux.HandleFunc("/api/v1/service_configs/", domainDetailHandler)
+	mux.Handle("/api/v1/service_configs", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(domainHandler)))
+	mux.Handle("/api/v1/service_configs/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(domainDetailHandler)))
 
 	server := &http.Server{
 		Addr:         ":" + getEnv("PORT", "8267"),
@@ -330,10 +499,13 @@ func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
 
 func listRecords(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
+	if !enforceTenantClaim(w, r, tenantID) {
+		return
+	}
 	limit := 50
 	offset := 0
 
-	query := `SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	query := `SELECT id, status, created_at FROM service_configs WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -363,8 +535,12 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := r.Header.Get("X-Tenant-ID")
+	if !enforceTenantClaim(w, r, tenantID) {
+		return
+	}
 	if tenantID == "" {
-		tenantID = "default"
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return
 	}
 	body["tenant_id"] = tenantID
 
@@ -491,7 +667,20 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
 		if r.Method == "OPTIONS" {
@@ -507,4 +696,13 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
+// scripts/fix-go-wire-jwt.py).
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
 }

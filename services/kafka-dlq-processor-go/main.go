@@ -1,10 +1,11 @@
 package main
 
 import (
-	"database/sql"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/IBM/sarama"
 	"log"
 	"net/http"
 	"os"
@@ -14,11 +15,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-	"crypto"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
-	"math/big"
 
 	_ "github.com/lib/pq"
 )
@@ -31,12 +27,12 @@ var serviceName = "kafka-dlq-processor-go"
 
 // --- Monetary Safety ---
 func nairaToKobo(naira float64) int64 { return int64(naira * 100) }
-func koboToNaira(kobo int64) float64 { return float64(kobo) / 100.0 }
+func koboToNaira(kobo int64) float64  { return float64(kobo) / 100.0 }
 
 // --- Watchdog ---
 var watchdogLastPing atomic.Int64
 
-func watchdogPing() { watchdogLastPing.Store(time.Now().UnixMilli()) }
+func watchdogPing()         { watchdogLastPing.Store(time.Now().UnixMilli()) }
 func watchdogHealthy() bool { return time.Now().UnixMilli()-watchdogLastPing.Load() < 60000 }
 func startWatchdog(interval time.Duration) {
 	watchdogPing()
@@ -50,12 +46,12 @@ func startWatchdog(interval time.Duration) {
 
 // --- Circuit Breaker ---
 type CircuitBreaker struct {
-	mu            sync.Mutex
-	failures      int
-	threshold     int
-	resetTimeout  time.Duration
-	state         string
-	lastFailure   time.Time
+	mu           sync.Mutex
+	failures     int
+	threshold    int
+	resetTimeout time.Duration
+	state        string
+	lastFailure  time.Time
 }
 
 func newCircuitBreaker() *CircuitBreaker {
@@ -113,9 +109,13 @@ func (rl *RateLimiter) Allow(ip string) bool {
 	reqs := rl.requests[ip]
 	var valid []time.Time
 	for _, t := range reqs {
-		if now.Sub(t) < rl.window { valid = append(valid, t) }
+		if now.Sub(t) < rl.window {
+			valid = append(valid, t)
+		}
 	}
-	if len(valid) >= rl.max { return false }
+	if len(valid) >= rl.max {
+		return false
+	}
 	rl.requests[ip] = append(valid, now)
 	return true
 }
@@ -133,7 +133,9 @@ type EventBus struct {
 
 func newEventBus(topic string) *EventBus {
 	broker := os.Getenv("KAFKA_BROKERS")
-	if broker == "" { broker = "localhost:9092" }
+	if broker == "" {
+		broker = "localhost:9092"
+	}
 	return &EventBus{broker: broker, topic: topic, service: serviceName}
 }
 
@@ -158,7 +160,9 @@ var eventBus = newEventBus("platform.events")
 func sanitizeInput(s string) string {
 	s = strings.ReplaceAll(s, "<", "&lt;")
 	s = strings.ReplaceAll(s, ">", "&gt;")
-	if len(s) > 1000 { s = s[:1000] }
+	if len(s) > 1000 {
+		s = s[:1000]
+	}
 	return s
 }
 
@@ -211,124 +215,6 @@ func panicRecoveryMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-
-// ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
-
-type jwksCache struct {
-	mu      sync.RWMutex
-	keys    map[string]*rsa.PublicKey
-	updated time.Time
-}
-
-var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
-
-func fetchJWKS(realmURL string) {
-	resp, err := http.Get(realmURL + "/protocol/openid-connect/certs")
-	if err != nil {
-		log.Printf("[middleware] JWKS fetch failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	var jwks struct {
-		Keys []struct {
-			Kid string `json:"kid"`
-			N   string `json:"n"`
-			E   string `json:"e"`
-		} `json:"keys"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
-		log.Printf("[middleware] JWKS decode failed: %v", err)
-		return
-	}
-	jwtCache.mu.Lock()
-	defer jwtCache.mu.Unlock()
-	for _, k := range jwks.Keys {
-		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
-		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
-		if len(eBytes) == 0 { continue }
-		var eInt int
-		for _, b := range eBytes { eInt = eInt<<8 | int(b) }
-		pub := &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
-		jwtCache.keys[k.Kid] = pub
-	}
-	jwtCache.updated = time.Now()
-	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
-}
-
-func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
-	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
-	}()
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip health endpoints
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
-			next.ServeHTTP(w, r)
-			return
-		}
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
-			return
-		}
-		token := auth[7:]
-		parts := strings.Split(token, ".")
-		if len(parts) != 3 {
-			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode header for kid
-		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-		if err != nil {
-			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
-			return
-		}
-		var header struct { Kid string `json:"kid"` }
-		json.Unmarshal(headerBytes, &header)
-
-		jwtCache.mu.RLock()
-		pub, ok := jwtCache.keys[header.Kid]
-		jwtCache.mu.RUnlock()
-		if !ok {
-			// Try refresh
-			fetchJWKS(realmURL)
-			jwtCache.mu.RLock()
-			pub, ok = jwtCache.keys[header.Kid]
-			jwtCache.mu.RUnlock()
-			if !ok {
-				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
-				return
-			}
-		}
-		// Verify signature (RS256)
-		signingInput := parts[0] + "." + parts[1]
-		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
-		if err != nil {
-			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
-			return
-		}
-		hash := sha256.Sum256([]byte(signingInput))
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
-			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode claims
-		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
-		var claims map[string]interface{}
-		json.Unmarshal(claimsBytes, &claims)
-		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
-			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
-			return
-		}
-		// Pass claims in context
-		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
 // ── MIDDLEWARE: Outbox Relay (Kafka) ────────────────────────────────────────
 
 func startOutboxRelay(ctx context.Context, brokers string, topic string) {
@@ -347,32 +233,81 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	if len(ids) == 0 {
+		return
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
 
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
+
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
+	if err != nil {
+		return nil, err
+	}
+	kafkaProducer = p
+	return kafkaProducer, nil
+}
 
 func main() {
 	port := os.Getenv("PORT")
-	if port == "" { port = "8080" }
+	if port == "" {
+		port = "8080"
+	}
 
 	startWatchdog(10 * time.Second)
 

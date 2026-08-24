@@ -178,14 +178,14 @@ func (s *OfficerService) GetOfficerDeals(tenantID, officerID string, fxService *
 	}
 
 	return map[string]interface{}{
-		"officerID":       officerID,
-		"officerName":     officer.FirstName + " " + officer.LastName,
-		"desk":            officer.Desk,
-		"fxDeals":         officerFXDeals,
-		"fxDealCount":     len(officerFXDeals),
-		"interbankDeals":  officerInterbankDeals,
-		"interbankCount":  len(officerInterbankDeals),
-		"dealingLimit":    officer.DealingLimit,
-		"timestamp":       time.Now().Format(time.RFC3339),
+		"officerID":      officerID,
+		"officerName":    officer.FirstName + " " + officer.LastName,
+		"desk":           officer.Desk,
+		"fxDeals":        officerFXDeals,
+		"fxDealCount":    len(officerFXDeals),
+		"interbankDeals": officerInterbankDeals,
+		"interbankCount": len(officerInterbankDeals),
+		"dealingLimit":   officer.DealingLimit,
+		"timestamp":      time.Now().Format(time.RFC3339),
 	}
 }

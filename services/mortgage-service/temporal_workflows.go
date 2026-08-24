@@ -126,7 +126,7 @@ func (w *MortgageOriginationWorkflow) Execute(ctx context.Context) error {
 		w.Steps[i].Status = "completed"
 
 		// Publish step completion event
-		kafkaClient.PublishEvent("mortgages.workflows", MortgageEvent{
+		kafkaClient.PublishEventReliably("mortgages.workflows", MortgageEvent{
 			Type:       fmt.Sprintf("mortgage.workflow.step.%s.completed", step.Name),
 			MortgageID: w.ApplicationID,
 			TenantID:   w.TenantID,
@@ -144,7 +144,7 @@ func (w *MortgageOriginationWorkflow) Execute(ctx context.Context) error {
 	w.Status = "completed"
 
 	// Publish workflow completion event
-	kafkaClient.PublishEvent("mortgages.workflows", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.workflows", MortgageEvent{
 		Type:       "mortgage.workflow.origination.completed",
 		MortgageID: w.ApplicationID,
 		TenantID:   w.TenantID,
@@ -161,123 +161,143 @@ func (w *MortgageOriginationWorkflow) Execute(ctx context.Context) error {
 func (w *MortgageOriginationWorkflow) executeIdentityVerification(ctx context.Context) error {
 	// Verify BVN and NIN
 	log.Printf("Verifying identity for application %s", w.ApplicationID)
-	
+
 	// In production, this would call BVN/NIN verification APIs
 	// Simulate verification delay
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeCreditCheck(ctx context.Context) error {
 	// Check credit bureau (CRC, FirstCentral, etc.)
 	log.Printf("Running credit check for application %s", w.ApplicationID)
-	
+
 	// In production, this would call credit bureau APIs
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeIncomeVerification(ctx context.Context) error {
 	// Verify income through bank statements, payslips, etc.
 	log.Printf("Verifying income for application %s", w.ApplicationID)
-	
+
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executePropertyValuation(ctx context.Context) error {
 	// Trigger property valuation
 	log.Printf("Initiating property valuation for application %s", w.ApplicationID)
-	
+
 	// In production, this would integrate with valuation service
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeTitleVerification(ctx context.Context) error {
 	// Verify property title
 	log.Printf("Verifying property title for application %s", w.ApplicationID)
-	
+
 	// In production, this would integrate with land registry
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeUnderwriting(ctx context.Context) error {
 	// Run underwriting engine
 	log.Printf("Running underwriting for application %s", w.ApplicationID)
-	
+
 	app, err := fetchMortgageApplication(w.ApplicationID, w.TenantID)
 	if err != nil {
 		return err
 	}
-	
+
 	engine := NewMortgageUnderwritingEngine()
 	decision := engine.Underwrite(app)
-	
+
 	if decision.Decision == "DECLINED" {
 		return fmt.Errorf("underwriting declined: %v", decision.DeclineReasons)
 	}
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeCreditCommitteeReview(ctx context.Context) error {
 	// Submit to credit committee for review
 	log.Printf("Submitting to credit committee for application %s", w.ApplicationID)
-	
+
 	// In production, this would create a task for credit committee
 	// and wait for approval signal
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeOfferGeneration(ctx context.Context) error {
 	// Generate offer letter
 	log.Printf("Generating offer letter for application %s", w.ApplicationID)
-	
+
 	app, err := fetchMortgageApplication(w.ApplicationID, w.TenantID)
 	if err != nil {
 		return err
 	}
-	
-	_ = generateOfferLetter(app)
-	
+
+	// The generated offer must be acted on — emit it so downstream offer
+	// delivery actually happens; a discarded offer letter is a silent drop.
+	offer := generateOfferLetter(app)
+	if offer == nil {
+		return fmt.Errorf("offer letter generation returned nil for application %s", w.ApplicationID)
+	}
+	if err := kafkaClient.PublishEventReliably(TopicMortgageOffers, MortgageEvent{
+		Type:       EventOfferIssued,
+		MortgageID: app.ID,
+		TenantID:   app.TenantID,
+		Status:     string(StatusOfferIssued),
+		Amount:     offer.ApprovedAmount,
+		Timestamp:  time.Now(),
+		Metadata: map[string]interface{}{
+			"offer_id":        offer.ID,
+			"monthly_payment": offer.MonthlyPayment,
+			"offer_expiry":    offer.OfferExpiry,
+		},
+	}); err != nil {
+		return fmt.Errorf("publish offer event for application %s: %w", w.ApplicationID, err)
+	}
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeOfferAcceptance(ctx context.Context) error {
 	// Wait for offer acceptance
 	log.Printf("Waiting for offer acceptance for application %s", w.ApplicationID)
-	
+
 	// In production, this would wait for customer acceptance signal
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeDocumentation(ctx context.Context) error {
 	// Verify all documentation is complete
 	log.Printf("Verifying documentation for application %s", w.ApplicationID)
-	
+
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
 func (w *MortgageOriginationWorkflow) executeDisbursement(ctx context.Context) error {
 	// Execute disbursement
 	log.Printf("Executing disbursement for application %s", w.ApplicationID)
-	
+
 	// In production, this would trigger the actual disbursement
 	time.Sleep(100 * time.Millisecond)
-	
+
 	return nil
 }
 
@@ -368,7 +388,7 @@ func (w *MortgageServicingWorkflow) checkDuePayments(ctx context.Context) error 
 	for _, entry := range schedule {
 		if entry.Status == "pending" && entry.DueDate.Truncate(24*time.Hour).Equal(today) {
 			// Payment is due today - send reminder
-			kafkaClient.PublishEvent("mortgages.notifications", MortgageEvent{
+			kafkaClient.PublishEventReliably("mortgages.notifications", MortgageEvent{
 				Type:       "mortgage.payment.due",
 				MortgageID: w.MortgageID,
 				TenantID:   w.TenantID,
@@ -407,27 +427,37 @@ func (w *MortgageServicingWorkflow) updateArrearsStatus(ctx context.Context) err
 	}
 
 	if arrearsAmount > 0 {
-		// Update arrears status
-		app, _ := fetchMortgageApplication(w.MortgageID, w.TenantID)
-		
+		// Update arrears status — a failed read here must fail the step
+		// (Temporal retries), never classify against a zero-value record.
+		app, err := fetchMortgageApplication(w.MortgageID, w.TenantID)
+		if err != nil {
+			return fmt.Errorf("fetch mortgage %s for arrears processing: %w", w.MortgageID, err)
+		}
+
 		// Determine bucket
 		var bucket string
+		var newStatus MortgageStatus
 		switch {
 		case daysPastDue >= 90:
 			bucket = "90+"
-			updateMortgageStatus(w.MortgageID, w.TenantID, StatusDefault)
+			newStatus = StatusDefault
 		case daysPastDue >= 60:
 			bucket = "61-90"
-			updateMortgageStatus(w.MortgageID, w.TenantID, StatusInArrears)
+			newStatus = StatusInArrears
 		case daysPastDue >= 30:
 			bucket = "31-60"
-			updateMortgageStatus(w.MortgageID, w.TenantID, StatusInArrears)
+			newStatus = StatusInArrears
 		default:
 			bucket = "1-30"
 		}
+		if newStatus != "" {
+			if err := updateMortgageStatus(w.MortgageID, w.TenantID, newStatus); err != nil {
+				return fmt.Errorf("update mortgage %s status to %s: %w", w.MortgageID, newStatus, err)
+			}
+		}
 
-		// Publish arrears event
-		kafkaClient.PublishEvent("mortgages.arrears", MortgageEvent{
+		// Publish arrears event (outbox-backed; failures logged, never dropped)
+		if err := kafkaClient.PublishEventReliably("mortgages.arrears", MortgageEvent{
 			Type:       "mortgage.arrears.detected",
 			MortgageID: w.MortgageID,
 			TenantID:   w.TenantID,
@@ -437,10 +467,40 @@ func (w *MortgageServicingWorkflow) updateArrearsStatus(ctx context.Context) err
 				"days_past_due": daysPastDue,
 				"bucket":        bucket,
 			},
-		})
+		}); err != nil {
+			log.Printf("ERROR: arrears event for mortgage %s neither published nor outboxed: %v", w.MortgageID, err)
+		}
 
-		// Update IFRS 9 classification
-		_ = classifyMortgageIFRS9(app, daysPastDue)
+		// IFRS 9 classification is a regulatory output — propagate failures
+		// and emit the classification; never discard it.
+		classification, err := classifyMortgageIFRS9(app, daysPastDue)
+		if err != nil {
+			return fmt.Errorf("ifrs9 classification for mortgage %s: %w", w.MortgageID, err)
+		}
+		if err := kafkaClient.PublishEventReliably("mortgages.ifrs9", MortgageEvent{
+			Type:       "mortgage.ifrs9.classified",
+			MortgageID: w.MortgageID,
+			TenantID:   w.TenantID,
+			Amount:     classification.ExpectedCreditLoss,
+			Timestamp:  time.Now(),
+			Metadata: map[string]interface{}{
+				"stage":                int(classification.Stage),
+				"days_past_due":        classification.DaysPastDue,
+				"exposure_at_default":  classification.ExposureAtDefault,
+				"expected_credit_loss": classification.ExpectedCreditLoss,
+				"reason":               classification.Reason,
+			},
+		}); err != nil {
+			return fmt.Errorf("publish ifrs9 classification for mortgage %s: %w", w.MortgageID, err)
+		}
+	}
+
+	// W7-C-11: persist the recalculated position to mortgage_arrears — the
+	// scheduled recalculation must not stop at status flips and events. Runs
+	// on every daily servicing pass, including when arrears have cleared
+	// (active records are resolved).
+	if err := updateArrearsStatus(w.MortgageID, w.TenantID); err != nil {
+		return fmt.Errorf("persist arrears status for mortgage %s: %w", w.MortgageID, err)
 	}
 
 	return nil
@@ -540,7 +600,7 @@ func (w *MortgageCollectionsWorkflow) Execute(ctx context.Context, daysPastDue i
 
 func (w *MortgageCollectionsWorkflow) executeStage1(ctx context.Context) error {
 	// Stage 1: Soft reminder (SMS, Email, Push notification)
-	kafkaClient.PublishEvent("mortgages.collections", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.collections", MortgageEvent{
 		Type:       "mortgage.collections.reminder",
 		MortgageID: w.MortgageID,
 		TenantID:   w.TenantID,
@@ -556,7 +616,7 @@ func (w *MortgageCollectionsWorkflow) executeStage1(ctx context.Context) error {
 
 func (w *MortgageCollectionsWorkflow) executeStage2(ctx context.Context) error {
 	// Stage 2: Formal notice + phone call
-	kafkaClient.PublishEvent("mortgages.collections", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.collections", MortgageEvent{
 		Type:       "mortgage.collections.formal_notice",
 		MortgageID: w.MortgageID,
 		TenantID:   w.TenantID,
@@ -572,7 +632,7 @@ func (w *MortgageCollectionsWorkflow) executeStage2(ctx context.Context) error {
 
 func (w *MortgageCollectionsWorkflow) executeStage3(ctx context.Context) error {
 	// Stage 3: Legal notice + demand letter
-	kafkaClient.PublishEvent("mortgages.collections", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.collections", MortgageEvent{
 		Type:       "mortgage.collections.legal_notice",
 		MortgageID: w.MortgageID,
 		TenantID:   w.TenantID,
@@ -587,10 +647,13 @@ func (w *MortgageCollectionsWorkflow) executeStage3(ctx context.Context) error {
 }
 
 func (w *MortgageCollectionsWorkflow) executeStage4(ctx context.Context) error {
-	// Stage 4: Foreclosure initiation
-	updateMortgageStatus(w.MortgageID, w.TenantID, StatusForeclosure)
+	// Stage 4: Foreclosure initiation — the status transition is a financial
+	// state change; a failed write must fail the step, not be swallowed.
+	if err := updateMortgageStatus(w.MortgageID, w.TenantID, StatusForeclosure); err != nil {
+		return fmt.Errorf("mark mortgage %s foreclosure: %w", w.MortgageID, err)
+	}
 
-	kafkaClient.PublishEvent("mortgages.collections", MortgageEvent{
+	kafkaClient.PublishEventReliably("mortgages.collections", MortgageEvent{
 		Type:       "mortgage.foreclosure.initiated",
 		MortgageID: w.MortgageID,
 		TenantID:   w.TenantID,
@@ -629,23 +692,28 @@ func (w *MortgageRateResetWorkflow) Execute(ctx context.Context, newBaseRate flo
 		return err
 	}
 
-	// Regenerate repayment schedule
+	// Regenerate repayment schedule — this rewrites money terms; a failed
+	// write must fail the step (Temporal retries), never be swallowed.
 	newSchedule := generateRepaymentSchedule(app)
-	saveRepaymentSchedule(w.MortgageID, newSchedule)
+	if err := saveRepaymentSchedule(w.MortgageID, newSchedule); err != nil {
+		return fmt.Errorf("save repayment schedule after rate change for %s: %w", w.MortgageID, err)
+	}
 
-	// Notify customer
-	kafkaClient.PublishEvent("mortgages.rate-changes", MortgageEvent{
+	// Notify customer (outbox-backed; failures logged, never silently dropped)
+	if err := kafkaClient.PublishEventReliably("mortgages.rate-changes", MortgageEvent{
 		Type:       "mortgage.rate.changed",
 		MortgageID: w.MortgageID,
 		TenantID:   w.TenantID,
 		Timestamp:  time.Now(),
 		Metadata: map[string]interface{}{
-			"old_rate":        event.OldRate,
-			"new_rate":        event.NewRate,
-			"effective_date":  event.EffectiveDate,
-			"new_payment":     app.MonthlyPayment,
+			"old_rate":       event.OldRate,
+			"new_rate":       event.NewRate,
+			"effective_date": event.EffectiveDate,
+			"new_payment":    app.MonthlyPayment,
 		},
-	})
+	}); err != nil {
+		log.Printf("ERROR: rate-change event for mortgage %s neither published nor outboxed: %v", w.MortgageID, err)
+	}
 
 	return nil
 }

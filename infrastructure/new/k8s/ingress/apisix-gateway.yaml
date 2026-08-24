@@ -39,7 +39,16 @@ data:
       admin:
         admin_key:
           - name: admin
-            key: REPLACE_WITH_ADMIN_KEY
+            # H-23: NO static/hardcoded admin API key lives in this file.
+            # The value below is a template placeholder rendered at pod start
+            # (see the render-config initContainer in the Deployment below) from
+            # the APISIX_ADMIN_KEY environment variable, which is injected from
+            # the `apisix-admin-key` Secret (key: `admin-key`). There is NO
+            # default/fallback: if the Secret is absent the pod refuses to start
+            # (fail-closed). Create/rotate the key with:
+            #   kubectl -n apisix create secret generic apisix-admin-key \
+            #     --from-literal=admin-key="$(openssl rand -hex 32)"
+            key: ${APISIX_ADMIN_KEY}
             role: admin
 
     etcd:
@@ -92,6 +101,41 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534
+        fsGroup: 65534
+      initContainers:
+        # Renders conf/config.yaml from the ConfigMap template, injecting the
+        # admin API key from the apisix-admin-key Secret. Fail-closed: the
+        # initContainer exits non-zero when APISIX_ADMIN_KEY is unset, so APISIX
+        # never starts with a missing/static admin key.
+        - name: render-config
+          image: apache/apisix:3.8.0-debian
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+          env:
+            - name: APISIX_ADMIN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: apisix-admin-key
+                  key: admin-key
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              if [ -z "${APISIX_ADMIN_KEY:-}" ]; then
+                echo "FATAL: APISIX_ADMIN_KEY is not set (Secret apisix-admin-key/admin-key missing) — refusing to start APISIX without an admin API key" >&2
+                exit 1
+              fi
+              sed "s|\${APISIX_ADMIN_KEY}|${APISIX_ADMIN_KEY}|g" \
+                /etc/apisix-config-template/config.yaml > /rendered-conf/config.yaml
+              echo "Rendered APISIX config with admin key from Secret (value not logged)."
+          volumeMounts:
+            - name: apisix-config
+              mountPath: /etc/apisix-config-template
+              readOnly: true
+            - name: apisix-conf
+              mountPath: /rendered-conf
       containers:
         - name: apisix
           image: apache/apisix:3.8.0-debian
@@ -122,13 +166,17 @@ spec:
             initialDelaySeconds: 30
             periodSeconds: 15
           volumeMounts:
-            - name: apisix-config
+            # Rendered config (with the Secret-injected admin key) produced by
+            # the render-config initContainer — NOT the raw ConfigMap template.
+            - name: apisix-conf
               mountPath: /usr/local/apisix/conf/config.yaml
               subPath: config.yaml
       volumes:
         - name: apisix-config
           configMap:
             name: apisix-config
+        - name: apisix-conf
+          emptyDir: {}
 
 ---
 # APISIX Service

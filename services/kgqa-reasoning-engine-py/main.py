@@ -10,15 +10,18 @@ import os
 import json
 import uuid
 import logging
-from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+import re
+import time
+import threading
+import urllib.request
 
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
@@ -28,6 +31,28 @@ TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54link-dev/certs/ca.crt")
 PORT = int(os.environ.get("PORT", "8080"))
 SERVICE_NAME = "kgqa-reasoning-engine-py"
 logger = logging.getLogger(SERVICE_NAME)
+
+# Configuration
+def _require_env(name):
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
+    val = os.environ.get(name, "").strip()
+    if not val or val.startswith("${"):
+        raise RuntimeError(
+            f"FATAL: required environment variable {name} is not set; "
+            "refusing to start with an insecure default"
+        )
+    return val
+
+
+DATABASE_URL = _require_env("DATABASE_URL")
+KEYCLOAK_URL = os.getenv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
+KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
+REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
+OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
+PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s')
 
 db_conn = None
@@ -130,9 +155,204 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="kgqa-reasoning-engine-py", version="1.0.0", lifespan=lifespan)
 
+# --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
+# RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
+# is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE
+# are configured. Fail-closed: missing/malformed/expired/unknown-kid tokens are rejected;
+# a JWKS outage with a cold cache yields "jwks_unavailable" (surfaced as HTTP 503).
+import os as _jwt_os
+import base64 as _jwt_b64
+import hashlib as _jwt_hash
+import hmac as _jwt_hmac
+import json as _jwt_json
+import time as _jwt_time
+import urllib.request as _jwt_urlreq
+
+_JWT_JWKS_URL = _jwt_os.environ.get("KEYCLOAK_JWKS_URL", "")
+_JWT_SECRET = _jwt_os.environ.get("JWT_SECRET", "")
+_JWT_ISSUER = _jwt_os.environ.get("JWT_ISSUER", "")
+_JWT_AUDIENCE = _jwt_os.environ.get("JWT_AUDIENCE", "")
+try:
+    _JWT_JWKS_TTL = int(_jwt_os.environ.get("JWKS_CACHE_TTL_SECONDS", "300"))
+except ValueError:
+    _JWT_JWKS_TTL = 300
+_jwks_cache = {"fetched_at": 0.0, "keys": {}}
+
+
+def _jwt_b64url_decode(segment):
+    segment += "=" * (-len(segment) % 4)
+    return _jwt_b64.urlsafe_b64decode(segment.encode())
+
+
+def _jwt_fetch_jwks():
+    now = _jwt_time.time()
+    if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < _JWT_JWKS_TTL:
+        return _jwks_cache["keys"], None
+    try:
+        with _jwt_urlreq.urlopen(_JWT_JWKS_URL, timeout=5) as resp:
+            data = _jwt_json.loads(resp.read())
+        keys = {k.get("kid"): k for k in data.get("keys", []) if k.get("kid")}
+    except Exception:
+        if _jwks_cache["keys"]:
+            return _jwks_cache["keys"], None  # stale cache: signatures are still really verified
+        return None, "jwks_unavailable"
+    _jwks_cache["keys"] = keys
+    _jwks_cache["fetched_at"] = now
+    return keys, None
+
+
+def _jwt_verify_rs256(signing_input, signature, jwk):
+    """Pure-stdlib RS256 (PKCS#1 v1.5 + SHA-256) verification against a JWK."""
+    try:
+        n = int.from_bytes(_jwt_b64url_decode(jwk["n"]), "big")
+        e = int.from_bytes(_jwt_b64url_decode(jwk["e"]), "big")
+    except Exception:
+        return False
+    k = (n.bit_length() + 7) // 8
+    if len(signature) != k:
+        return False
+    em = pow(int.from_bytes(signature, "big"), e, n).to_bytes(k, "big")
+    digest_info = bytes.fromhex("3031300d060960864801650304020105000420") + _jwt_hash.sha256(signing_input).digest()
+    if k < len(digest_info) + 11:
+        return False
+    expected = b"\x00\x01" + b"\xff" * (k - len(digest_info) - 3) + b"\x00" + digest_info
+    return _jwt_hmac.compare_digest(em, expected)
+
+
+def _jwt_check_claims(payload):
+    exp = payload.get("exp")
+    if exp is None:
+        return "Token missing exp claim"
+    try:
+        if _jwt_time.time() >= float(exp):
+            return "Token expired"
+    except (TypeError, ValueError):
+        return "Invalid token expiry"
+    if _JWT_ISSUER and payload.get("iss") != _JWT_ISSUER:
+        return "Invalid token issuer"
+    if _JWT_AUDIENCE:
+        aud = payload.get("aud")
+        if isinstance(aud, str):
+            aud = [aud]
+        if not isinstance(aud, list) or _JWT_AUDIENCE not in aud:
+            return "Invalid token audience"
+    return None
+
+
+def validate_jwt(headers):
+    """Validate a Bearer JWT from a headers mapping.
+
+    Returns (claims, None) on success or (None, reason) on failure. Fails closed:
+    any token that cannot be cryptographically verified is rejected, and when
+    neither KEYCLOAK_JWKS_URL nor JWT_SECRET is configured the result is
+    (None, "auth_not_configured").
+    """
+    auth = headers.get("Authorization", headers.get("authorization", ""))
+    if not auth.startswith("Bearer "):
+        return None, "Missing Bearer token"
+    token = auth[7:]
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, "Invalid token format"
+    try:
+        header = _jwt_json.loads(_jwt_b64url_decode(parts[0]))
+        payload = _jwt_json.loads(_jwt_b64url_decode(parts[1]))
+        signature = _jwt_b64url_decode(parts[2])
+    except Exception:
+        return None, "Invalid token encoding"
+    alg = header.get("alg")
+    signing_input = (parts[0] + "." + parts[1]).encode()
+    if alg == "RS256":
+        if not _JWT_JWKS_URL:
+            return None, "auth_not_configured"
+        keys, ferr = _jwt_fetch_jwks()
+        if ferr:
+            return None, ferr
+        jwk = keys.get(header.get("kid"))
+        if jwk is None:
+            _jwks_cache["fetched_at"] = 0.0  # one forced refresh for an unknown kid
+            keys, ferr = _jwt_fetch_jwks()
+            if ferr:
+                return None, ferr
+            jwk = keys.get(header.get("kid"))
+            if jwk is None:
+                return None, "Unknown token key id"
+        if not _jwt_verify_rs256(signing_input, signature, jwk):
+            return None, "Invalid token signature"
+    elif alg == "HS256":
+        if not _JWT_SECRET or _JWT_SECRET.startswith("${"):
+            return None, "auth_not_configured"
+        expected = _jwt_hmac.new(_JWT_SECRET.encode(), signing_input, _jwt_hash.sha256).digest()
+        if not _jwt_hmac.compare_digest(expected, signature):
+            return None, "Invalid token signature"
+    else:
+        return None, "Unsupported token algorithm"
+    err = _jwt_check_claims(payload)
+    if err:
+        return None, err
+    return payload, None
+
+# --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
+import inspect as _jwt_inspect
+from starlette.middleware.base import BaseHTTPMiddleware as _JWTBaseHTTPMiddleware
+from starlette.responses import JSONResponse as _JWTJSONResponse
+
+# Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
+_JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
+
+
+def _jwt_set_scope_header(scope, name, value):
+    """Overwrite (or remove, when value is None) a request header in the ASGI scope so
+    downstream handlers see identity derived ONLY from verified token claims."""
+    encoded = name.lower().encode("latin-1")
+    headers = [(k, v) for k, v in scope.get("headers", []) if k != encoded]
+    if value is not None:
+        headers.append((encoded, str(value).encode("latin-1")))
+    scope["headers"] = headers
+
+
+class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
+    """Fail-closed JWT authentication for all domain routes.
+
+    Only the probe paths /health, /ready, /metrics (and their k8s variants
+    /healthz, /readyz, /livez) plus CORS preflight (OPTIONS) are exempt. On
+    success the verified claims are stored on request.state.jwt_claims and the
+    tenant identity headers (x-tenant-id / x-tenant) in the ASGI scope are
+    overwritten with the verified claim values, so downstream header readers
+    receive ONLY the authenticated tenant. Failure: 401 JSON (503 when the JWKS
+    endpoint is unreachable with a cold cache). Works with sync or async
+    validate_jwt implementations.
+    """
+
+    async def dispatch(self, request, call_next):
+        if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
+            return await call_next(request)
+        try:
+            if _jwt_inspect.iscoroutinefunction(validate_jwt):
+                claims, err = await validate_jwt(request.headers)
+            else:
+                claims, err = validate_jwt(request.headers)
+        except Exception as exc:
+            return _JWTJSONResponse(status_code=503, content={"error": "auth_unavailable", "detail": str(exc)})
+        if not claims:
+            status = 503 if err == "jwks_unavailable" else 401
+            return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        request.state.jwt_claims = claims
+        tenant = claims.get("tenant_id") or claims.get("tenant")
+        _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
+        _jwt_set_scope_header(request.scope, "x-tenant", tenant)
+        subject = claims.get("sub") or claims.get("keycloak_id")
+        if subject:
+            _jwt_set_scope_header(request.scope, "x-keycloak-id", subject)
+        return await call_next(request)
+
+
+app.add_middleware(JWTAuthMiddleware)
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()] or ["http://localhost:3000"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -705,136 +925,33 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        trace_id = f"trace-{int(time.time()*1e9)}"
-        logger.info(f"[{SERVICE_NAME}] {self.command} {self.path} trace={trace_id}")
 
-    def respond(self, status, data):
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        self.send_header("Content-Security-Policy", "default-src 'self'")
-        self.send_header("X-XSS-Protection", "1; mode=block")
-        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
-        self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
+def db_query():
+    """Read real config rows from Postgres. Raises on failure (fail fast)."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT 50")
+        rows = cur.fetchall()
+    return [{"id": str(r[0]), "status": r[1],
+             "tenant_id": str(r[2]) if len(r) > 2 and r[2] else None,
+             "created_at": str(r[3] if len(r) > 3 else r[-1])} for r in rows]
 
-    def do_GET(self):
-        inc_requests()
-        path = self.path.split("?")[0]
 
-        if path == "/healthz":
-            self.respond(200, {
-                "status": "healthy",
-                "service": SERVICE_NAME,
-                "version": "1.0.0",
-                "capabilities": [
-                    "epr_kgqa", "nl_to_cypher", "regulatory_reasoning",
-                    "entity_extraction", "question_classification",
-                    "knowledge_graph_qa", "vector_similarity_search"
-                ],
-                "regulatoryKB": list(REGULATORY_KB.keys()),
-            })
-        elif path == "/readyz":
-            self.respond(200, {"ready": True, "service": SERVICE_NAME})
-        elif path == "/livez":
-            self.respond(200, {"live": True})
-        elif path == "/v1/degradation":
-            self.respond(200, {"service": "kgqa-reasoning-engine-py", **_degrade.status()})
-        elif path == "/v1/alerts":
-            self.respond(200, {"alerts": check_alerts(), "rules": len(_ALERT_RULES)})
-        elif path == "/metrics":
-            body = f'# TYPE requests_total counter\nrequests_total{{service="{SERVICE_NAME}"}} {request_count}\n# TYPE errors_total counter\nerrors_total{{service="{SERVICE_NAME}"}} {error_count}\n'
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(body.encode())
-        else:
-            items, total = [], 0
-            pool = get_db()
-            if pool:
-                try:
-                    conn = pool.getconn()
-                    cur = conn.cursor()
-                    cur.execute("SELECT data FROM records WHERE service = %s ORDER BY created_at DESC LIMIT 20", (SERVICE_NAME,))
-                    items = [row[0] for row in cur.fetchall()]
-                    cur.execute("SELECT COUNT(*) FROM records WHERE service = %s", (SERVICE_NAME,))
-                    total = cur.fetchone()[0]
-                    pool.putconn(conn)
-                except Exception:
-                    pass
-            self.respond(200, {"service": SERVICE_NAME, "items": items, "total": total, "source": "database" if pool else "in-memory"})
-
-    def do_POST(self):
-        inc_requests()
-        path = self.path.split("?")[0]
-        content_length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(content_length) if content_length > 0 else b"{}"
-        body = json.loads(sanitize_input(raw.decode("utf-8")))
-
-        if path in ["/healthz", "/readyz", "/livez", "/metrics"]:
-            self.do_GET()
-            return
-
-        if not rl_allow():
-            inc_errors()
-            self.send_response(429)
-            self.send_header("Retry-After", "1")
-            self.end_headers()
-            self.wfile.write(b'{"error":"rate_limit_exceeded"}')
-            return
-
-        if not check_jwt(self.headers):
-            inc_errors()
-            self.respond(401, {"error": "unauthorized"})
-            return
-
-        if path == "/v1/kgqa/ask":
-            question = body.get("question", "")
-            if not question:
-                inc_errors()
-                self.respond(400, {"error": "question is required"})
-                return
-            result = process_question(question)
-            db_insert(SERVICE_NAME, {"tenant_id": self.get_tenant_id(), "action": "kgqa_ask", "question": question, "confidence": result.get("confidence", 0)})
-            cache_set(f"{self.get_tenant_id()}:kgqa_{question[:50]}", json.dumps(result))
-            self.respond(200, result)
-
-        elif path == "/v1/kgqa/extract-entities":
-            text = body.get("text", "")
-            entities = extract_entities(text)
-            self.respond(200, {"entities": entities, "text": text})
-
-        elif path == "/v1/kgqa/classify":
-            question = body.get("question", "")
-            qtype, intent = classify_question(question)
-            self.respond(200, {"questionType": qtype, "intent": intent})
-
-        elif path == "/v1/kgqa/cypher":
-            question = body.get("question", "")
-            entities = extract_entities(question)
-            qtype, intent = classify_question(question)
-            cypher = generate_cypher(question, entities, qtype, intent)
-            self.respond(200, {"cypher": cypher, "entities": entities, "questionType": qtype})
-
-        elif path == "/v1/kgqa/regulatory":
-            topic = body.get("topic", "").upper()
-            if topic in REGULATORY_KB:
-                self.respond(200, {"topic": topic, "regulation": REGULATORY_KB[topic]})
-            else:
-                self.respond(200, {"topic": topic, "available": list(REGULATORY_KB.keys()), "message": "Topic not found"})
-
-        elif path == "/v1/create":
-            result = db_insert(SERVICE_NAME, body)
-            cache_set(f"{self.get_tenant_id()}:last_post", json.dumps(body))
-            self.respond(201, {"created": True, "service": SERVICE_NAME})
-
-        else:
-            self.respond(404, {"error": "not found", "path": path})
-
+def db_insert(record_id, body):
+    """Persist a record to Postgres with an outbox event. Raises on failure."""
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO service_configs (id, status) VALUES (%s::uuid, %s) ON CONFLICT (id) DO NOTHING",
+            (record_id, (body or {}).get("status", "active") if isinstance(body, dict) else "active"),
+        )
+        payload = json.dumps({"id": str(record_id), "data": body}, default=str)
+        cur.execute(
+            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+            ("record.created", str(record_id), payload),
+        )
+    conn.commit()
+    return True
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 

@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from "axios";
-import * as https from "https";
+import { createSecureHttpsAgent } from "../lib/secureHttpsAgent";
 import { readEnv } from "../config/readEnv.config";
 
 interface BVNVerification {
@@ -36,7 +36,7 @@ class BvnNinService {
     this._axiosInstance = axios.create({
       baseURL: readEnv("BVN_NIN_SVC_URL"),
       headers: { "content-type": "application/json" },
-      httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+      httpsAgent: createSecureHttpsAgent(),
       timeout: 20000,
     });
   }

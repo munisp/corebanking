@@ -9,12 +9,12 @@
 // events as published. This guarantees at-least-once delivery.
 //
 // Flow:
-//   1. Business logic + outbox INSERT in same DB transaction
-//   2. Transaction commits atomically
-//   3. Relay goroutine polls for unpublished events
-//   4. Relay publishes to Kafka
-//   5. Relay marks events as published
-//   6. Consumers must be idempotent (events may be delivered more than once)
+//  1. Business logic + outbox INSERT in same DB transaction
+//  2. Transaction commits atomically
+//  3. Relay goroutine polls for unpublished events
+//  4. Relay publishes to Kafka
+//  5. Relay marks events as published
+//  6. Consumers must be idempotent (events may be delivered more than once)
 package outbox
 
 import (
@@ -27,16 +27,16 @@ import (
 
 // Event represents an outbox event to be published to Kafka.
 type Event struct {
-	ID            string          `json:"id"`
-	Topic         string          `json:"topic"`
-	Key           string          `json:"key"`           // Kafka partition key
-	Payload       json.RawMessage `json:"payload"`
-	IdempotencyKey string         `json:"idempotency_key"`
-	CreatedAt     time.Time       `json:"created_at"`
-	PublishedAt   *time.Time      `json:"published_at,omitempty"`
-	RetryCount    int             `json:"retry_count"`
-	MaxRetries    int             `json:"max_retries"`
-	Status        string          `json:"status"` // "pending", "published", "failed", "dlq"
+	ID             string          `json:"id"`
+	Topic          string          `json:"topic"`
+	Key            string          `json:"key"` // Kafka partition key
+	Payload        json.RawMessage `json:"payload"`
+	IdempotencyKey string          `json:"idempotency_key"`
+	CreatedAt      time.Time       `json:"created_at"`
+	PublishedAt    *time.Time      `json:"published_at,omitempty"`
+	RetryCount     int             `json:"retry_count"`
+	MaxRetries     int             `json:"max_retries"`
+	Status         string          `json:"status"` // "pending", "published", "failed", "dlq"
 }
 
 // Publisher is the interface for publishing events (Kafka, etc.)

@@ -104,36 +104,57 @@ const feeTransactions: FeeTransaction[] = [
 export function getFeeSchedules() { return feeSchedules; }
 export function getFeeTransactions() { return feeTransactions; }
 
+// ── M-28: integer minor-unit money helpers ─────────────────────────────────
+// All fee/VAT/total computation is done in integer minor units (kobo) so no
+// raw float arithmetic is ever applied to money. Values are converted back to
+// major units only at the API boundary, preserving the response shape.
+function toKobo(major: number): number {
+  return Number.isFinite(major) ? Math.round(major * 100) : 0;
+}
+function fromKobo(kobo: number): number {
+  return Math.round(kobo) / 100;
+}
+/** percent is a percentage value (e.g. 0.5 means 0.5%); computed as basis points. */
+function percentageOf(amountKobo: number, percent: number): number {
+  const bps = Math.round(percent * 100);
+  return Math.round((amountKobo * bps) / 10_000);
+}
+
 export function calculateFee(scheduleId: string, amount: number): { feeAmount: number; vatAmount: number; totalCharge: number } {
   const schedule = feeSchedules.find((s) => s.id === scheduleId);
   if (!schedule) return { feeAmount: 0, vatAmount: 0, totalCharge: 0 };
 
-  let fee = 0;
-  if (schedule.feeType === "flat") fee = schedule.flatAmount || 0;
-  else if (schedule.feeType === "percentage") fee = amount * (schedule.percentage || 0) / 100;
-  else if (schedule.feeType === "capped") {
-    fee = Math.min(amount * (schedule.percentage || 0) / 100, schedule.cap || Infinity);
+  const amountKobo = toKobo(amount);
+  let feeKobo = 0;
+  if (schedule.feeType === "flat") {
+    feeKobo = toKobo(schedule.flatAmount || 0);
+  } else if (schedule.feeType === "percentage") {
+    feeKobo = percentageOf(amountKobo, schedule.percentage || 0);
+  } else if (schedule.feeType === "capped") {
+    const capKobo = schedule.cap ? toKobo(schedule.cap) : Number.POSITIVE_INFINITY;
+    feeKobo = Math.min(percentageOf(amountKobo, schedule.percentage || 0), capKobo);
   } else if (schedule.feeType === "tiered" && schedule.tiers) {
-    let remaining = amount;
+    let remainingKobo = amountKobo;
     for (const tier of schedule.tiers) {
-      const tierAmount = Math.min(remaining, tier.to - tier.from);
-      if (tierAmount <= 0) break;
-      fee += tierAmount * tier.rate / 100;
-      remaining -= tierAmount;
+      // tier.to may be Infinity (open-ended final tier) — treat as "all remaining".
+      const tierWidthKobo = Number.isFinite(tier.to) ? toKobo(tier.to - tier.from) : remainingKobo;
+      const tierAmountKobo = Math.min(remainingKobo, tierWidthKobo);
+      if (tierAmountKobo <= 0) break;
+      feeKobo += percentageOf(tierAmountKobo, tier.rate);
+      remainingKobo -= tierAmountKobo;
     }
   }
 
-  fee = Math.round(fee * 100) / 100;
-  const vat = schedule.vatApplicable ? Math.round(fee * 0.075 * 100) / 100 : 0;
-  return { feeAmount: fee, vatAmount: vat, totalCharge: Math.round((fee + vat) * 100) / 100 };
+  const vatKobo = schedule.vatApplicable ? percentageOf(feeKobo, 7.5) : 0;
+  return { feeAmount: fromKobo(feeKobo), vatAmount: fromKobo(vatKobo), totalCharge: fromKobo(feeKobo + vatKobo) };
 }
 
 export function getFeeSummary() {
-  const totalFees = feeTransactions.reduce((s, t) => s + t.feeAmount, 0);
-  const totalVAT = feeTransactions.reduce((s, t) => s + t.vatAmount, 0);
+  const totalFees = fromKobo(feeTransactions.reduce((s, t) => s + toKobo(t.feeAmount), 0));
+  const totalVAT = fromKobo(feeTransactions.reduce((s, t) => s + toKobo(t.vatAmount), 0));
   const byChannel: Record<string, number> = {};
   for (const t of feeTransactions) {
-    byChannel[t.channel] = (byChannel[t.channel] || 0) + t.totalCharge;
+    byChannel[t.channel] = fromKobo(toKobo(byChannel[t.channel] || 0) + toKobo(t.totalCharge));
   }
-  return { totalFees, totalVAT, totalRevenue: totalFees + totalVAT, transactions: feeTransactions.length, byChannel };
+  return { totalFees, totalVAT, totalRevenue: fromKobo(toKobo(totalFees) + toKobo(totalVAT)), transactions: feeTransactions.length, byChannel };
 }

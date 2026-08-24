@@ -1,9 +1,10 @@
 package middleware
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net/http"
 	"sync"
 	"time"
@@ -40,12 +41,14 @@ func NewOTelCollector(service string) *OTelCollector {
 	}
 }
 
+// genTraceHex returns n hex characters from a cryptographically secure
+// source (L-16-residual: math/rand trace/span IDs are predictable).
 func genTraceHex(n int) string {
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = "0123456789abcdef"[rand.Intn(16)]
+	b := make([]byte, (n+1)/2)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
 	}
-	return string(b)
+	return hex.EncodeToString(b)[:n]
 }
 
 func (c *OTelCollector) StartSpan(operation string) Span {

@@ -5,26 +5,46 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto"
+	crand "crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/base64"
+	"encoding/binary"
+	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
-"context"
-"os/signal"
-"syscall"
-"sync/atomic"
+	"io"
+	"math/big"
+	"os/signal"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"syscall"
 
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"net"
-
 )
+
+// secureUint32 returns a CSPRNG-derived uint32 for internal record IDs (L-16).
+// Fails fast if the system CSPRNG is unavailable.
+func secureUint32() uint32 {
+	var b [4]byte
+	if _, err := crand.Read(b[:]); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
+	}
+	return binary.BigEndian.Uint32(b[:])
+}
 
 var serviceName = "mojaloop-settlement-mgr-go"
 
@@ -33,15 +53,15 @@ var startTime = time.Now()
 // ─── Domain Types ───────────────────────────────────────────────────────────
 
 type Record struct {
-	ID          string                 `json:"id"`
-	Type        string                 `json:"type"`
-	Status      string                 `json:"status"`
-	Data        map[string]interface{} `json:"data"`
-	CreatedAt   string                 `json:"createdAt"`
-	UpdatedAt   string                 `json:"updatedAt"`
-	CreatedBy   string                 `json:"createdBy,omitempty"`
-	TenantID    string                 `json:"tenantId,omitempty"`
-	Version     int                    `json:"version"`
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Status    string                 `json:"status"`
+	Data      map[string]interface{} `json:"data"`
+	CreatedAt string                 `json:"createdAt"`
+	UpdatedAt string                 `json:"updatedAt"`
+	CreatedBy string                 `json:"createdBy,omitempty"`
+	TenantID  string                 `json:"tenantId,omitempty"`
+	Version   int                    `json:"version"`
 }
 
 type AuditEntry struct {
@@ -54,12 +74,12 @@ type AuditEntry struct {
 }
 
 type DomainStats struct {
-	TotalRecords    int                    `json:"totalRecords"`
-	ActiveRecords   int                    `json:"activeRecords"`
-	PendingRecords  int                    `json:"pendingRecords"`
-	ProcessedToday  int                    `json:"processedToday"`
-	Domain          string                 `json:"domain"`
-	Metrics         map[string]interface{} `json:"metrics"`
+	TotalRecords   int                    `json:"totalRecords"`
+	ActiveRecords  int                    `json:"activeRecords"`
+	PendingRecords int                    `json:"pendingRecords"`
+	ProcessedToday int                    `json:"processedToday"`
+	Domain         string                 `json:"domain"`
+	Metrics        map[string]interface{} `json:"metrics"`
 }
 
 var (
@@ -69,7 +89,7 @@ var (
 		{ID: "MOJ-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Cross-Border", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
 		{ID: "MOJ-003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Cross-Border", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
 	}
-	auditLog = []AuditEntry{}
+	auditLog    = []AuditEntry{}
 	domainStats = DomainStats{
 		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
 		Domain: "Cross-Border",
@@ -93,7 +113,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"service": "mojaloop-settlement-mgr-go", "status": "healthy", "version": "2.0.0",
 		"uptime_secs": int(time.Since(startTime).Seconds()),
-		"domain": "Mojaloop Settlement Mgr — Cross-Border",
+		"domain":      "Mojaloop Settlement Mgr — Cross-Border",
 		"middleware": map[string]string{
 			"kafka":      "mojaloop-settlement-mgr.events, mojaloop-settlement-mgr.audit",
 			"postgres":   "mojaloop_settlement_mgr_records",
@@ -140,12 +160,17 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {
 	cacheSet("mojaloop_settlement_mgr_list", "", 1) // invalidate list cache on write
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 	// Inter-service call: aml_screening
 	_upstreamURL := os.Getenv("AML_ENGINE_URL")
-	if _upstreamURL == "" { _upstreamURL = "http://localhost:8127" }
+	if _upstreamURL == "" {
+		_upstreamURL = "http://localhost:8127"
+	}
 	_result, _err := callService("POST", _upstreamURL+"/v1/screen", nil)
 	if _err != nil {
 		log.Printf("mojaloop-settlement-mgr-go: aml_screening failed: %v", _err)
@@ -153,12 +178,11 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		log.Printf("mojaloop-settlement-mgr-go: aml_screening ok: %v", _result)
 	}
 
-
 	mu.Lock()
 	defer mu.Unlock()
 
 	rec := Record{
-		ID:        fmt.Sprintf("MOJ-%08X", rand.Uint32()),
+		ID:        fmt.Sprintf("MOJ-%08X", secureUint32()),
 		Type:      getString(body, "type"),
 		Status:    "pending",
 		Data:      body,
@@ -168,7 +192,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 		TenantID:  getString(body, "tenantId"),
 		Version:   1,
 	}
-	if rec.Type == "" { rec.Type = "primary" }
+	if rec.Type == "" {
+		rec.Type = "primary"
+	}
 	records = append(records, rec)
 	publishDomainEvent("mojaloop-settlement.created", rec.TenantID, rec)
 	domainStats.TotalRecords = len(records)
@@ -181,7 +207,7 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	auditLog = append(auditLog, AuditEntry{
-		ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "create",
+		ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "create",
 		RecordID: rec.ID, Actor: rec.CreatedBy,
 		Timestamp: rec.CreatedAt, Details: "Record created",
 	})
@@ -190,7 +216,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleUpdate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "PUT" { respondJSON(w, 405, map[string]string{"error": "POST/PUT required"}); return }
+	if r.Method != "POST" && r.Method != "PUT" {
+		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+		return
+	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
 
@@ -200,14 +229,18 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 	id := getString(body, "id")
 	for i := range records {
 		if records[i].ID == id {
-			if s := getString(body, "status"); s != "" { records[i].Status = s }
+			if s := getString(body, "status"); s != "" {
+				records[i].Status = s
+			}
 			for k, v := range body {
-				if k != "id" { records[i].Data[k] = v }
+				if k != "id" {
+					records[i].Data[k] = v
+				}
 			}
 			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
 			records[i].Version++
 			auditLog = append(auditLog, AuditEntry{
-				ID: fmt.Sprintf("AUD-%08X", rand.Uint32()), Action: "update",
+				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "update",
 				RecordID: id, Actor: getString(body, "updatedBy"),
 				Timestamp: records[i].UpdatedAt, Details: "Record updated",
 			})
@@ -219,32 +252,11 @@ func handleUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleProcess(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" { respondJSON(w, 405, map[string]string{"error": "POST required"}); return }
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-
-	mu.Lock()
-	defer mu.Unlock()
-
-	id := getString(body, "id")
-	for i := range records {
-		if records[i].ID == id && records[i].Status == "pending" {
-			records[i].Status = "processing"
-			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
-			records[i].Version++
-			// Simulate domain processing
-			records[i].Data["processedAt"] = time.Now().Format(time.RFC3339)
-			records[i].Data["processingResult"] = "success"
-			records[i].Data["score"] = 0.85 + float64(rand.Intn(14))/100.0
-			records[i].Status = "completed"
-			domainStats.ProcessedToday++
-			postLedgerTransfer(records[i].ID, mwExtractKobo(records[i].Data), records[i].TenantID, getString(records[i].Data, "currency"))
-			publishDomainEvent("mojaloop-settlement.processed", records[i].TenantID, records[i])
-			respondJSON(w, 200, map[string]interface{}{"processed": true, "record": records[i]})
-			return
-		}
-	}
-	respondJSON(w, 404, map[string]string{"error": "Record not found or not pending: " + id})
+	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
+	// (processingResult="success" and a random score via math/rand). Real domain
+	// processing must be implemented before this endpoint is enabled.
+	// Fail fast; never fabricate.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
 }
 
 func handleAudit(w http.ResponseWriter, r *http.Request) {
@@ -257,10 +269,15 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	domainStats.TotalRecords = len(records)
-	active := 0; pending := 0
+	active := 0
+	pending := 0
 	for _, r := range records {
-		if r.Status == "active" || r.Status == "completed" { active++ }
-		if r.Status == "pending" || r.Status == "processing" { pending++ }
+		if r.Status == "active" || r.Status == "completed" {
+			active++
+		}
+		if r.Status == "pending" || r.Status == "processing" {
+			pending++
+		}
 	}
 	domainStats.ActiveRecords = active
 	domainStats.PendingRecords = pending
@@ -268,97 +285,110 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func getString(m map[string]interface{}, key string) string {
-	if v, ok := m[key].(string); ok { return v }
+	if v, ok := m[key].(string); ok {
+		return v
+	}
 	return ""
 }
 
-
 func computeTransferFee(amount float64, channel string) float64 {
-    switch channel {
-    case "NIP": if amount <= 5000 { return 10 }; if amount <= 50000 { return 25 }; return 50
-    case "NEFT": return 0
-    case "RTGS": return amount * 0.001
-    default: return 25
-    }
+	switch channel {
+	case "NIP":
+		if amount <= 5000 {
+			return 10
+		}
+		if amount <= 50000 {
+			return 25
+		}
+		return 50
+	case "NEFT":
+		return 0
+	case "RTGS":
+		return amount * 0.001
+	default:
+		return 25
+	}
 }
 
 func routePayment(amount float64, bank string) string {
-    if amount >= 10000000 { return "RTGS" }
-    if bank == "same_bank" { return "INTERNAL" }
-    return "NIP"
+	if amount >= 10000000 {
+		return "RTGS"
+	}
+	if bank == "same_bank" {
+		return "INTERNAL"
+	}
+	return "NIP"
 }
 
 func mojaloop_settlement_mgrFeeHandler(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        Amount  float64 `json:"amount"`
-        Channel string  `json:"channel"`
-    }
-    json.NewDecoder(r.Body).Decode(&req)
-    fee := computeTransferFee(req.Amount, req.Channel)
-    respondJSON(w, 200, map[string]interface{}{"amount": req.Amount, "fee": fee, "total": req.Amount + fee, "channel": req.Channel})
+	var req struct {
+		Amount  float64 `json:"amount"`
+		Channel string  `json:"channel"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	fee := computeTransferFee(req.Amount, req.Channel)
+	respondJSON(w, 200, map[string]interface{}{"amount": req.Amount, "fee": fee, "total": req.Amount + fee, "channel": req.Channel})
 }
 
 func mojaloop_settlement_mgrRouteHandler(w http.ResponseWriter, r *http.Request) {
-    var req struct {
-        Amount float64 `json:"amount"`
-        Bank   string  `json:"destination_bank"`
-    }
-    json.NewDecoder(r.Body).Decode(&req)
-    route := routePayment(req.Amount, req.Bank)
-    respondJSON(w, 200, map[string]interface{}{"route": route, "amount": req.Amount})
+	var req struct {
+		Amount float64 `json:"amount"`
+		Bank   string  `json:"destination_bank"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	route := routePayment(req.Amount, req.Bank)
+	respondJSON(w, 200, map[string]interface{}{"route": route, "amount": req.Amount})
 }
 
 // --- Production Hardening ---
 var (
-    _reqCount  uint64
-    _errCount  uint64
-    _bootTime  = time.Now()
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
 )
 
 func readyzHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"ready":true,"service":"mojaloop-settlement-mgr-go"}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"mojaloop-settlement-mgr-go"}`)
 }
 
 func livezHandler(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(200)
-    fmt.Fprintf(w, `{"alive":true}`)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"alive":true}`)
 }
 
 func metricsHandler(w http.ResponseWriter, r *http.Request) {
-    reqs := atomic.LoadUint64(&_reqCount)
-    errs := atomic.LoadUint64(&_errCount)
-    w.Header().Set("Content-Type", "text/plain")
-    fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"mojaloop-settlement-mgr-go\"} %d\n", reqs)
-    fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"mojaloop-settlement-mgr-go\"} %d\n", errs)
-    fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"mojaloop-settlement-mgr-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"mojaloop-settlement-mgr-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"mojaloop-settlement-mgr-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"mojaloop-settlement-mgr-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
-
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        atomic.AddUint64(&_reqCount, 1)
-        rw := &responseWriter{ResponseWriter: w, status: 200}
-        next.ServeHTTP(rw, r)
-        if rw.status >= 400 {
-            atomic.AddUint64(&_errCount, 1)
-        }
-    })
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
 }
 
 type responseWriter struct {
-    http.ResponseWriter
-    status int
+	http.ResponseWriter
+	status int
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
-    rw.status = code
-    rw.ResponseWriter.WriteHeader(code)
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
 }
-
 
 // --- Database Layer ---
 var db *sql.DB
@@ -396,9 +426,13 @@ func initDB() {
 }
 
 func dbList(service string, limit int) ([]map[string]interface{}, error) {
-	if db == nil { return nil, fmt.Errorf("no db") }
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
 	rows, err := db.Query("SELECT id, type, status, data, created_at FROM service_records WHERE service=$1 ORDER BY created_at DESC LIMIT $2", service, limit)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var items []map[string]interface{}
 	for rows.Next() {
@@ -406,47 +440,269 @@ func dbList(service string, limit int) ([]map[string]interface{}, error) {
 		rows.Scan(&id, &typ, &status, &data, &ts)
 		items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "createdAt": ts})
 	}
+	return items, nil
+}
+
+// ── MIDDLEWARE: JWT Validation (JWKS / RS256) — fail-closed ────────────────
+
+type jwksCache struct {
+	mu      sync.RWMutex
+	keys    map[string]*rsa.PublicKey
+	updated time.Time
+}
+
+var jwtCache = &jwksCache{keys: make(map[string]*rsa.PublicKey)}
+
+var jwksRefreshOnce sync.Once
+
+func jwtRealmURL() string {
+	if v := os.Getenv("KEYCLOAK_REALM_URL"); v != "" {
+		return v
+	}
+	return "http://keycloak:8080/realms/54bank"
+}
+
+func fetchJWKS(realmURL string) {
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(realmURL + "/protocol/openid-connect/certs")
+	if err != nil {
+		log.Printf("[middleware] JWKS fetch failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	var jwks struct {
+		Keys []struct {
+			Kid string `json:"kid"`
+			N   string `json:"n"`
+			E   string `json:"e"`
+		} `json:"keys"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&jwks); err != nil {
+		log.Printf("[middleware] JWKS decode failed: %v", err)
+		return
+	}
+	jwtCache.mu.Lock()
+	defer jwtCache.mu.Unlock()
+	for _, k := range jwks.Keys {
+		nBytes, _ := base64.RawURLEncoding.DecodeString(k.N)
+		eBytes, _ := base64.RawURLEncoding.DecodeString(k.E)
+		if len(eBytes) == 0 {
+			continue
+		}
+		var eInt int
+		for _, b := range eBytes {
+			eInt = eInt<<8 | int(b)
+		}
+		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
+	}
 	jwtCache.updated = time.Now()
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
-func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
-	// Initial JWKS fetch
-	go fetchJWKS(realmURL)
-	// Refresh every 5 minutes
+func startJWKSRefresh() {
+	go fetchJWKS(jwtRealmURL())
 	go func() {
-		for range time.Tick(5 * time.Minute) { fetchJWKS(realmURL) }
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			fetchJWKS(jwtRealmURL())
+		}
 	}()
+}
+
+// jwtMiddleware(realmURL string) validates Bearer tokens against the Keycloak JWKS endpoint (RS256
+// signature + expiry). Fail-closed: no token is accepted on structure alone.
+// expectedIssuer returns the expected JWT issuer: KEYCLOAK_ISSUER when set,
+// otherwise KEYCLOAK_REALM_URL. Empty means issuer validation is skipped
+// (a startup warning is logged by warnIfAuthUnconfigured).
+func expectedIssuer() string {
+	if iss := os.Getenv("KEYCLOAK_ISSUER"); iss != "" {
+		return iss
+	}
+	return os.Getenv("KEYCLOAK_REALM_URL")
+}
+
+// audienceMatches checks the expected audience against the JWT aud claim,
+// which may be a string or an array of strings.
+func audienceMatches(aud interface{}, expected string) bool {
+	switch v := aud.(type) {
+	case string:
+		return v == expected
+	case []interface{}:
+		for _, a := range v {
+			if a == expected {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func init() {
+	warnIfAuthUnconfigured()
+}
+
+func warnIfAuthUnconfigured() {
+	if os.Getenv("KEYCLOAK_ISSUER") == "" && os.Getenv("KEYCLOAK_REALM_URL") == "" {
+		log.Printf("WARNING: KEYCLOAK_ISSUER/KEYCLOAK_REALM_URL unset - JWT iss claim will NOT be validated")
+	}
+	if os.Getenv("EXPECTED_AUDIENCE") == "" {
+		log.Printf("WARNING: EXPECTED_AUDIENCE unset - JWT aud claim will NOT be validated")
+	}
+}
+
+func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip health endpoints
-		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
+		p := r.URL.Path
+		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(401)
+			fmt.Fprintf(w, `{"error":"unauthorized","service":"mojaloop-settlement-mgr-go"}`)
 			return
 		}
-		next.ServeHTTP(w, r)
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"malformed token"}`, http.StatusUnauthorized)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		json.Unmarshal(headerBytes, &header)
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+
+		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+		var claims map[string]interface{}
+		json.Unmarshal(claimsBytes, &claims)
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-User-Id", sub)
+		}
+		// Validate issuer/audience when configured (M-55)
+		if iss := expectedIssuer(); iss != "" {
+			if claims["iss"] != iss {
+				http.Error(w, `{"error":"invalid issuer"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		if aud := os.Getenv("EXPECTED_AUDIENCE"); aud != "" {
+			if !audienceMatches(claims["aud"], aud) {
+				http.Error(w, `{"error":"invalid audience"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
+		}
+		r.Header.Set("X-Tenant-ID", tenant)
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
+// enforceTenantClaim cross-checks a client-supplied tenant identifier against
+// the verified JWT claims (C-15). When the token carries a tenant (or
+// tenant_id) claim and it does not match the requested tenant, the request is
+// rejected with 403 and false is returned. Fail-closed (wave-7.5): an empty
+// requested tenant, missing verified claims, or a token without a tenant claim
+// is rejected instead of being allowed.
+func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
+	if requestedTenant == "" {
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return false
+	}
+	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
+	if claims == nil {
+		http.Error(w, `{"error":"unauthorized: no verified token claims"}`, http.StatusUnauthorized)
+		return false
+	}
+	claimTenant, _ := claims["tenant"].(string)
+	if claimTenant == "" {
+		claimTenant, _ = claims["tenant_id"].(string)
+	}
+	if claimTenant == "" {
+		http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+		return false
+	}
+	if claimTenant != requestedTenant {
+		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)
+		return false
+	}
+	return true
+}
 
 // --- Inter-Service Communication with Circuit Breaker ---
-var _cbFailures int
-var _cbOpen bool
-var _cbLastFail time.Time
+var _cbFailures atomic.Int64
+var _cbOpen atomic.Bool
+var _cbLastFailUnix atomic.Int64
 
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
-	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
+	if _cbOpen.Load() && time.Since(time.Unix(0, _cbLastFailUnix.Load())) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	if _cbOpen { _cbOpen = false; _cbFailures = 0 }
+	if _cbOpen.Load() {
+		_cbOpen.Store(false)
+		_cbFailures.Store(0)
+	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 { time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond) }
+		if attempt > 0 {
+			time.Sleep(time.Duration(1<<uint(attempt)) * 100 * time.Millisecond)
+		}
 		var req *http.Request
 		if body != nil {
 			j, _ := json.Marshal(body)
@@ -454,14 +710,35 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		} else {
 			req, _ = http.NewRequest(method, url, nil)
 		}
-		// Decode header for kid
-		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
 		if err != nil {
-			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
-			return
+			lastErr = err
+			_cbFailures.Add(1)
+			_cbLastFailUnix.Store(time.Now().UnixNano())
+			if _cbFailures.Load() >= 5 {
+				_cbOpen.Store(true)
+			}
+			continue
 		}
-		var header struct { Kid string `json:"kid"` }
-		json.Unmarshal(headerBytes, &header)
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode)
+			_cbFailures.Add(1)
+			_cbLastFailUnix.Store(time.Now().UnixNano())
+			if _cbFailures.Load() >= 5 {
+				_cbOpen.Store(true)
+			}
+			continue
+		}
+		var result map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&result)
+		_cbFailures.Store(0)
+		_cbOpen.Store(false)
+		return result, nil
+	}
+	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
+}
 
 // --- Redis Caching Layer ---
 var redisAddr string
@@ -473,38 +750,125 @@ func init() {
 	}
 }
 
-func cacheGet(key string) (string, bool) {
+// redisConn dials Redis and returns the connection plus a buffered reader with
+// a hard deadline (M-23: no partial reads against the raw socket).
+func redisConn() (net.Conn, *bufio.Reader, error) {
 	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return "", false }
-	defer conn.Close()
-	fmt.Fprintf(conn, "*2\r\n$3\r\nGET\r\n$%d\r\n%s\r\n", len(key), key)
-	buf := make([]byte, 4096)
-	n, err := conn.Read(buf)
-	if err != nil || n < 3 { return "", false }
-	resp := string(buf[:n])
-	if resp[0] == '$' && resp[1] != '-' {
-		// Parse bulk string response
-		parts := strings.SplitN(resp, "\r\n", 3)
-		if len(parts) >= 3 { return parts[1], true }
+	if err != nil {
+		return nil, nil, err
 	}
-	return "", false
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	return conn, bufio.NewReader(conn), nil
+}
+
+// writeRESPCommand serializes args as a RESP multi-bulk request.
+func writeRESPCommand(w *bufio.Writer, args ...string) {
+	fmt.Fprintf(w, "*%d\r\n", len(args))
+	for _, a := range args {
+		fmt.Fprintf(w, "$%d\r\n%s\r\n", len(a), a)
+	}
+	w.Flush()
+}
+
+// readRESPReply parses one RESP reply: simple string, error, integer, bulk
+// string (length-prefixed read), or multi-bulk (recursive). Redis error
+// replies are returned as Go errors.
+func readRESPReply(r *bufio.Reader) (interface{}, error) {
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return nil, err
+	}
+	if len(line) < 3 || !strings.HasSuffix(line, "\r\n") {
+		return nil, fmt.Errorf("malformed RESP reply")
+	}
+	payload := line[1 : len(line)-2]
+	switch line[0] {
+	case '+':
+		return payload, nil
+	case '-':
+		return nil, fmt.Errorf("redis error: %s", payload)
+	case ':':
+		n, err := strconv.ParseInt(payload, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("malformed integer reply: %v", err)
+		}
+		return n, nil
+	case '$':
+		n, err := strconv.Atoi(payload)
+		if err != nil {
+			return nil, fmt.Errorf("malformed bulk length: %v", err)
+		}
+		if n < 0 {
+			return nil, nil // nil bulk string
+		}
+		buf := make([]byte, n+2) // payload + trailing CRLF
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return nil, err
+		}
+		return string(buf[:n]), nil
+	case '*':
+		n, err := strconv.Atoi(payload)
+		if err != nil {
+			return nil, fmt.Errorf("malformed multi-bulk length: %v", err)
+		}
+		if n < 0 {
+			return nil, nil
+		}
+		items := make([]interface{}, 0, n)
+		for i := 0; i < n; i++ {
+			it, err := readRESPReply(r)
+			if err != nil {
+				return nil, err
+			}
+			items = append(items, it)
+		}
+		return items, nil
+	}
+	return nil, fmt.Errorf("unknown RESP type byte %q", line[0])
+}
+
+func cacheGet(key string) (string, bool) {
+	conn, rd, err := redisConn()
+	if err != nil {
+		return "", false
+	}
+	defer conn.Close()
+	wr := bufio.NewWriter(conn)
+	writeRESPCommand(wr, "GET", key)
+	rep, err := readRESPReply(rd)
+	if err != nil || rep == nil {
+		return "", false
+	}
+	s, ok := rep.(string)
+	return s, ok
 }
 
 func cacheSet(key, value string, ttlSeconds int) {
-	conn, err := net.DialTimeout("tcp", redisAddr, 2*time.Second)
-	if err != nil { return }
+	conn, rd, err := redisConn()
+	if err != nil {
+		return
+	}
 	defer conn.Close()
-	fmt.Fprintf(conn, "*4\r\n$3\r\nSET\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n$2\r\nEX\r\n$%d\r\n%d\r\n",
-		len(key), key, len(value), value, len(fmt.Sprintf("%d", ttlSeconds)), ttlSeconds)
+	wr := bufio.NewWriter(conn)
+	writeRESPCommand(wr, "SET", key, value, "EX", strconv.Itoa(ttlSeconds))
+	if _, err := readRESPReply(rd); err != nil { // detects -ERR replies
+		log.Printf("[%s] cacheSet(%s) failed: %v", serviceName, key, err)
+	}
 }
 
 // --- mTLS Configuration ---
 func getTLSConfig() (bool, string, string) {
-	if os.Getenv("TLS_ENABLED") != "true" { return false, "", "" }
+	if os.Getenv("TLS_ENABLED") != "true" {
+		return false, "", ""
+	}
 	cert := os.Getenv("TLS_CERT_PATH")
 	key := os.Getenv("TLS_KEY_PATH")
-	if cert == "" { cert = "/etc/54link-dev/certs/service.crt" }
-	if key == "" { key = "/etc/54link-dev/certs/service.key" }
+	if cert == "" {
+		cert = "/etc/54link-dev/certs/service.crt"
+	}
+	if key == "" {
+		key = "/etc/54link-dev/certs/service.key"
+	}
 	return true, cert, key
 }
 
@@ -522,30 +886,20 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 				break
 			}
 		}
-		// Verify signature (RS256)
-		signingInput := parts[0] + "." + parts[1]
-		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
-		if err != nil {
-			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Trace-Id")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'")
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		hash := sha256.Sum256([]byte(signingInput))
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
-			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
-			return
-		}
-		// Decode claims
-		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
-		var claims map[string]interface{}
-		json.Unmarshal(claimsBytes, &claims)
-		// Check expiry
-		if exp, ok := claims["exp"].(float64); ok && time.Now().Unix() > int64(exp) {
-			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
-			return
-		}
-		// Pass claims in context
-		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -567,103 +921,74 @@ func startOutboxRelay(ctx context.Context, brokers string, topic string) {
 }
 
 func relayOutbox(brokers string, topic string) {
-	if db == nil { return }
+	if db == nil {
+		return
+	}
+
+	// Events are marked published ONLY after a confirmed Kafka produce.
+	producer, err := getKafkaProducer(brokers)
+	if err != nil {
+		log.Printf("[outbox-relay] kafka unavailable: %v — events remain unpublished for retry", err)
+		return
+	}
+
 	rows, err := db.Query(`SELECT id, event_type, aggregate_id, payload FROM outbox WHERE published = FALSE ORDER BY created_at LIMIT 100`)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer rows.Close()
 
 	var ids []string
 	for rows.Next() {
 		var id, eventType, aggID string
 		var payload []byte
-		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil { continue }
-		// Publish to Kafka (best-effort; marks as published even if Kafka unavailable to avoid infinite retry)
-		log.Printf("[outbox-relay] publishing event %s type=%s agg=%s to topic=%s brokers=%s", id, eventType, aggID, topic, brokers)
+		if err := rows.Scan(&id, &eventType, &aggID, &payload); err != nil {
+			continue
+		}
+		_, _, err := producer.SendMessage(&sarama.ProducerMessage{
+			Topic: topic,
+			Key:   sarama.StringEncoder(aggID),
+			Value: sarama.ByteEncoder(payload),
+		})
+		if err != nil {
+			log.Printf("[outbox-relay] publish failed for event %s: %v — leaving unpublished for retry", id, err)
+			continue
+		}
 		ids = append(ids, id)
 	}
-	if len(ids) == 0 { return }
-	// Mark as published
-	for _, id := range ids {
-		db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id)
+	if len(ids) == 0 {
+		return
 	}
-	log.Printf("[outbox-relay] marked %d events as published", len(ids))
+	for _, id := range ids {
+		if _, err := db.Exec(`UPDATE outbox SET published = TRUE WHERE id = $1`, id); err != nil {
+			log.Printf("[outbox-relay] failed to mark event %s published: %v", id, err)
+		}
+	}
+	if len(ids) > 0 {
+		log.Printf("[outbox-relay] published %d events to kafka topic=%s", len(ids), topic)
+	}
 }
 
+// getKafkaProducer lazily creates a shared sarama SyncProducer.
+var kafkaProducer sarama.SyncProducer
+var kafkaProducerMu sync.Mutex
 
-func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Printf("[mojaloop-settlement-mgr-go] starting on :8264")
-
-	// PostgreSQL connection
-	dsn := getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/mojaloop_settlement_mgr_go?sslmode=disable")
-	var err error
-	db, err = sql.Open("postgres", dsn)
+func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
+	kafkaProducerMu.Lock()
+	defer kafkaProducerMu.Unlock()
+	if kafkaProducer != nil {
+		return kafkaProducer, nil
+	}
+	cfg := sarama.NewConfig()
+	cfg.Producer.Return.Successes = true
+	cfg.Producer.RequiredAcks = sarama.WaitForAll
+	cfg.Producer.Retry.Max = 3
+	p, err := sarama.NewSyncProducer(strings.Split(brokers, ","), cfg)
 	if err != nil {
-		log.Fatalf("database connection failed: %v", err)
+		return nil, err
 	}
-	defer db.Close()
-
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(5 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		log.Fatalf("database ping failed: %v", err)
-	}
-
-	initSchema()
-	log.Printf("[mojaloop-settlement-mgr-go] database connected, schema initialized")
-
-	// Middleware clients
-	keycloakURL := getEnv("KEYCLOAK_REALM_URL", "http://keycloak:8080/realms/54bank")
-	kafkaBrokers := getEnv("KAFKA_BROKERS", "localhost:9092")
-	redisURL := getEnv("REDIS_URL", "localhost:6379")
-	osURL := getEnv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
-	permifyURL := getEnv("PERMIFY_ENDPOINT", "http://permify:3476")
-
-	log.Printf("[mojaloop-settlement-mgr-go] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
-		keycloakURL, kafkaBrokers, redisURL, osURL, permifyURL)
-
-	mux := http.NewServeMux()
-
-	// Health endpoints
-	mux.HandleFunc("/healthz", healthHandler)
-	mux.HandleFunc("/readyz", readyzHandler)
-	mux.HandleFunc("/livez", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]string{"status": "alive"})
-	})
-	mux.HandleFunc("/metrics", metricsHandler)
-
-	// Domain endpoints
-	mux.HandleFunc("/api/v1/settlements", domainHandler)
-	mux.HandleFunc("/api/v1/settlements/", domainDetailHandler)
-
-	server := &http.Server{
-		Addr:         ":" + getEnv("PORT", "8264"),
-		Handler:      loggingMiddleware(corsMiddleware(mux)),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 30 * time.Second,
-		IdleTimeout:  60 * time.Second,
-	}
-
-	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("server error: %v", err)
-		}
-	}()
-
-	log.Printf("[mojaloop-settlement-mgr-go] ready on :%s", getEnv("PORT", "8264"))
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Printf("[mojaloop-settlement-mgr-go] shutting down...")
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	server.Shutdown(ctx)
-	log.Printf("[mojaloop-settlement-mgr-go] stopped")
+	kafkaProducer = p
+	return kafkaProducer, nil
 }
 
 func initSchema() {
@@ -740,10 +1065,13 @@ func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
 
 func listRecords(w http.ResponseWriter, r *http.Request) {
 	tenantID := r.Header.Get("X-Tenant-ID")
+	if !enforceTenantClaim(w, r, tenantID) {
+		return
+	}
 	limit := 50
 	offset := 0
 
-	query := `SELECT id, status, created_at FROM settlements WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	query := `SELECT id, status, created_at FROM settlements WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -773,8 +1101,12 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tenantID := r.Header.Get("X-Tenant-ID")
+	if !enforceTenantClaim(w, r, tenantID) {
+		return
+	}
 	if tenantID == "" {
-		tenantID = "default"
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return
 	}
 	body["tenant_id"] = tenantID
 
@@ -869,26 +1201,6 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	if err := db.Ping(); err != nil {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	var count int
-	db.QueryRow(`SELECT COUNT(*) FROM settlements`).Scan(&count)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"service":       "mojaloop-settlement-mgr-go",
-		"total_records": count,
-	})
-}
-
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -901,7 +1213,20 @@ func loggingMiddleware(next http.Handler) http.Handler {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		// R3-NEW-6: no wildcard origin — echo the request Origin only when it is
+		// on the CORS_ALLOWED_ORIGINS allowlist (comma-separated; restrictive default).
+		allowedOrigins := os.Getenv("CORS_ALLOWED_ORIGINS")
+		if allowedOrigins == "" {
+			allowedOrigins = "https://dashboard.54bank.ng"
+		}
+		origin := r.Header.Get("Origin")
+		for _, allowed := range strings.Split(allowedOrigins, ",") {
+			if strings.TrimSpace(allowed) == origin && origin != "" {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+				break
+			}
+		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Tenant-ID, X-User-ID, X-Request-ID")
 		if r.Method == "OPTIONS" {
@@ -919,13 +1244,12 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
-
 var _rlTokens int64 = 100
 var _rlLastRefill int64 = 0
 
 func rlAllow() bool {
 	nowr := time.Now().UnixMilli()
-	if nowr - atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
 		atomic.StoreInt64(&_rlTokens, 100)
 		atomic.StoreInt64(&_rlLastRefill, nowr)
 	}
@@ -947,10 +1271,53 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
+// exactly once per process.
+func ensureJWKSRefresh() {
+	jwksRefreshOnce.Do(func() {
+		go fetchJWKS(jwtRealmURL())
+		go func() {
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				fetchJWKS(jwtRealmURL())
+			}
+		}()
+	})
+}
+
+// isProbePath reports whether p is a health/metrics endpoint that must remain
+// unauthenticated for orchestrators (exact or suffixed probe paths).
+func isProbePath(p string) bool {
+	switch p {
+	case "/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics", "/ping":
+		return true
+	}
+	for _, s := range []string{"/healthz", "/health", "/readyz", "/ready", "/livez", "/live", "/metrics"} {
+		if strings.HasSuffix(p, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 func main() {
 	initDB()
 	port := os.Getenv("PORT")
-	if port == "" { port = "9394" }
+	if port == "" {
+		port = "9394"
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/readyz", readyzHandler)
 
@@ -959,33 +1326,195 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	mux.HandleFunc("/healthz", handleHealthz)
-	mux.HandleFunc("/v1/mojaloop-settlement-mgr/list", handleList)
-	mux.HandleFunc("/v1/mojaloop-settlement-mgr/create", handleCreate)
-	mux.HandleFunc("/v1/mojaloop-settlement-mgr/update", handleUpdate)
-	mux.HandleFunc("/v1/mojaloop-settlement-mgr/process", handleProcess)
+	mux.Handle("/v1/mojaloop-settlement-mgr/list", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleList)))
+	mux.Handle("/v1/mojaloop-settlement-mgr/create", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCreate)))
+	mux.Handle("/v1/mojaloop-settlement-mgr/update", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleUpdate)))
+	mux.Handle("/v1/mojaloop-settlement-mgr/process", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleProcess)))
 	mux.HandleFunc("/v1/mojaloop-settlement-mgr/audit", handleAudit)
 	mux.HandleFunc("/v1/mojaloop-settlement-mgr/stats", handleStats)
 	mux.HandleFunc("/v1/mojaloop-settlement-mgr/compute-fee", mojaloop_settlement_mgrFeeHandler)
 	mux.HandleFunc("/v1/mojaloop-settlement-mgr/route", mojaloop_settlement_mgrRouteHandler)
 	log.Printf("Mojaloop Settlement Mgr v2.0 (Cross-Border) on :%s", port)
 	server := &http.Server{
-        Addr:    ":" + port,
-        Handler: rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
-        ReadTimeout:  15 * time.Second,
-        WriteTimeout: 30 * time.Second,
-        IdleTimeout:  60 * time.Second,
-    }
-    quit := make(chan os.Signal, 1)
-    signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-    go func() {
-        if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-            log.Fatalf("Server error: %v", err)
-        }
-    }()
-    <-quit
-    log.Println("[mojaloop-settlement-mgr-go] Shutdown signal received")
-    ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-    defer cancel()
-    _ = server.Shutdown(ctx)
-    log.Println("[mojaloop-settlement-mgr-go] Server stopped gracefully")
+		Addr:         ":" + port,
+		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v", err)
+		}
+	}()
+	<-quit
+	log.Println("[mojaloop-settlement-mgr-go] Shutdown signal received")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
+	log.Println("[mojaloop-settlement-mgr-go] Server stopped gracefully")
+}
+
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
+}
+
+// jwtAuthMiddleware validates Bearer tokens against the Keycloak JWKS endpoint
+// (RS256 signature + required exp claim). Fail-closed: any verification
+// problem yields 401. Identity headers (X-User-Id, X-Keycloak-ID, X-Tenant-ID,
+// X-User-Role) are overwritten from verified claims — caller-supplied values
+// are never trusted.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	ensureJWKSRefresh()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if isProbePath(p) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, `{"error":"missing bearer token"}`, http.StatusUnauthorized)
+			return
+		}
+		token := strings.TrimPrefix(auth, "Bearer ")
+		parts := strings.Split(token, ".")
+		if len(parts) != 3 {
+			http.Error(w, `{"error":"invalid token format"}`, http.StatusUnauthorized)
+			return
+		}
+		headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
+		if err != nil {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		var header struct {
+			Kid string `json:"kid"`
+			Alg string `json:"alg"`
+		}
+		if err := json.Unmarshal(headerBytes, &header); err != nil || header.Kid == "" {
+			http.Error(w, `{"error":"invalid token header"}`, http.StatusUnauthorized)
+			return
+		}
+		if header.Alg != "RS256" {
+			http.Error(w, `{"error":"unsupported token algorithm"}`, http.StatusUnauthorized)
+			return
+		}
+		jwtCache.mu.RLock()
+		pub, ok := jwtCache.keys[header.Kid]
+		jwtCache.mu.RUnlock()
+		if !ok {
+			// Unknown key — refresh once and retry (key rotation).
+			fetchJWKS(jwtRealmURL())
+			jwtCache.mu.RLock()
+			pub, ok = jwtCache.keys[header.Kid]
+			jwtCache.mu.RUnlock()
+			if !ok {
+				http.Error(w, `{"error":"unknown signing key"}`, http.StatusUnauthorized)
+				return
+			}
+		}
+		sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+		if err != nil {
+			http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		hash := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, hash[:], sigBytes); err != nil {
+			http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+			return
+		}
+		claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			http.Error(w, `{"error":"invalid claims encoding"}`, http.StatusUnauthorized)
+			return
+		}
+		var claims map[string]interface{}
+		if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+			http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
+			return
+		}
+		exp, ok := claims["exp"].(float64)
+		if !ok {
+			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+			return
+		}
+		if time.Now().Unix() >= int64(exp) {
+			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		// Identity headers come ONLY from verified claims; overwrite or drop any
+		// caller-supplied values before invoking the handler.
+		if sub, ok := claims["sub"].(string); ok && sub != "" {
+			r.Header.Set("X-User-Id", sub)
+			r.Header.Set("X-Keycloak-ID", sub)
+		} else {
+			r.Header.Del("X-User-Id")
+			r.Header.Del("X-Keycloak-ID")
+		}
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
+		}
+		r.Header.Set("X-Tenant-ID", tenant)
+		r.Header.Del("X-User-Role")
+		if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
+			if roleList, ok := ra["roles"].([]interface{}); ok {
+				roles := make([]string, 0, len(roleList))
+				for _, v := range roleList {
+					if s, ok := v.(string); ok {
+						roles = append(roles, s)
+					}
+				}
+				if len(roles) > 0 {
+					r.Header.Set("X-User-Role", strings.Join(roles, ","))
+				}
+			}
+		}
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// sanitizeLogValue strips CR/LF and other control characters from
+// client-supplied values (e.g. trace headers) before they reach log
+// statements, preventing log injection/forgery (L-18). Output length is
+// bounded to keep log lines small.
+func sanitizeLogValue(s string) string {
+	const maxLen = 128
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func traceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := sanitizeLogValue(r.Header.Get("X-Trace-Id"))
+		if traceID == "" {
+			traceID = sanitizeLogValue(r.Header.Get("traceparent"))
+		}
+		if traceID == "" {
+			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
+		}
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		next.ServeHTTP(w, r)
+	})
 }

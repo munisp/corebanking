@@ -1,0 +1,36 @@
+# ── Generic multi-stage build for Rust services (services/*-rs) ─────────────
+# Referenced by docker-compose.yml with:
+#   build: { context: ., dockerfile: docker/Dockerfile.rust, args: { SERVICE: <dir> } }
+# Each target service is a self-contained Cargo crate (Cargo.toml + src/).
+
+# ── Build stage ──────────────────────────────────────────────────────────────
+FROM rust:1.88-slim AS builder
+ARG SERVICE
+RUN test -n "$SERVICE" || { echo "SERVICE build arg is required"; exit 1; }
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+# Prime the dependency cache with a stub main before copying real sources.
+COPY services/${SERVICE}/Cargo.toml services/${SERVICE}/Cargo.lock* ./
+RUN mkdir src && echo 'fn main(){}' > src/main.rs \
+ && (cargo build --release 2>/dev/null || true) && rm -rf src
+COPY services/${SERVICE}/ ./
+RUN cargo build --release \
+ && BIN="$(sed -n 's/^name *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)" \
+ && cp "target/release/${BIN}" /out/service
+
+# ── Runtime stage ────────────────────────────────────────────────────────────
+FROM rust:1.88-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates wget \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --uid 10001 appuser
+WORKDIR /app
+COPY --from=builder /out/service ./service
+USER appuser
+ENV PORT=8080
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${PORT}/healthz" >/dev/null || exit 1
+ENTRYPOINT ["./service"]

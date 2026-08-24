@@ -70,7 +70,9 @@ export const postInitializeVerification = asyncHandler(async (req: AuthRequest, 
     await AppDataSource.manager.save(entity);
     logger.info(`[initializeKyb] entity saved — id=${entity.id}`);
   } catch (dbErr: any) {
-    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, `DB save failed: ${dbErr.message}`, "KYB-500-01", "verification-service");
+    // M-54: generic client-facing error; DB details stay in logs.
+    logger.error(`[initializeKyb] DB save failed: ${dbErr.message}`);
+    throw new ApiError(httpStatus.INTERNAL_SERVER_ERROR, "Failed to save KYB verification record.", "KYB-500-01", "verification-service");
   }
 
   // Build URL — verification-ui reads kyb_verification_id to render KybFlow

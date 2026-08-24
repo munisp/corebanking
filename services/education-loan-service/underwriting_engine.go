@@ -10,16 +10,16 @@ import (
 // EducationLoanUnderwritingEngine handles loan underwriting decisions
 type EducationLoanUnderwritingEngine struct {
 	products map[EducationLoanType]*EducationLoanProductConfig
-	
+
 	// Underwriting limits
-	maxLoanAmount           float64
-	minGuarantorIncome      float64
-	minGuarantorCount       int
-	maxDTI                  float64 // Debt-to-Income ratio for guarantor
-	minStudentAge           int
-	maxStudentAge           int
-	minProgramDuration      int
-	maxProgramDuration      int
+	maxLoanAmount      float64
+	minGuarantorIncome float64
+	minGuarantorCount  int
+	maxDTI             float64 // Debt-to-Income ratio for guarantor
+	minStudentAge      int
+	maxStudentAge      int
+	minProgramDuration int
+	maxProgramDuration int
 }
 
 // EducationLoanProductConfig holds configuration for each loan product
@@ -42,42 +42,42 @@ type EducationLoanProductConfig struct {
 
 // UnderwritingDecision represents the result of underwriting
 type UnderwritingDecision struct {
-	Decision            string    `json:"decision"` // approved, declined, referred
-	ApprovedAmount      float64   `json:"approved_amount"`
-	InterestRate        float64   `json:"interest_rate"`
-	MoratoriumMonths    int       `json:"moratorium_months"`
-	RepaymentTenorMonths int      `json:"repayment_tenor_months"`
-	MonthlyPayment      float64   `json:"monthly_payment"`
-	RiskScore           float64   `json:"risk_score"`
-	RiskTier            string    `json:"risk_tier"`
-	DecisionReasons     []string  `json:"decision_reasons"`
-	Conditions          []string  `json:"conditions"`
-	DecisionDate        time.Time `json:"decision_date"`
-	ValidUntil          time.Time `json:"valid_until"`
+	Decision             string    `json:"decision"` // approved, declined, referred
+	ApprovedAmount       float64   `json:"approved_amount"`
+	InterestRate         float64   `json:"interest_rate"`
+	MoratoriumMonths     int       `json:"moratorium_months"`
+	RepaymentTenorMonths int       `json:"repayment_tenor_months"`
+	MonthlyPayment       float64   `json:"monthly_payment"`
+	RiskScore            float64   `json:"risk_score"`
+	RiskTier             string    `json:"risk_tier"`
+	DecisionReasons      []string  `json:"decision_reasons"`
+	Conditions           []string  `json:"conditions"`
+	DecisionDate         time.Time `json:"decision_date"`
+	ValidUntil           time.Time `json:"valid_until"`
 }
 
 // EligibilityResult represents eligibility check result
 type EligibilityResult struct {
-	Eligible          bool     `json:"eligible"`
-	MaxLoanAmount     float64  `json:"max_loan_amount"`
-	EstimatedRate     float64  `json:"estimated_rate"`
-	RequiredGuarantors int     `json:"required_guarantors"`
-	Reasons           []string `json:"reasons"`
-	Recommendations   []string `json:"recommendations"`
+	Eligible           bool     `json:"eligible"`
+	MaxLoanAmount      float64  `json:"max_loan_amount"`
+	EstimatedRate      float64  `json:"estimated_rate"`
+	RequiredGuarantors int      `json:"required_guarantors"`
+	Reasons            []string `json:"reasons"`
+	Recommendations    []string `json:"recommendations"`
 }
 
 // NewEducationLoanUnderwritingEngine creates a new underwriting engine
 func NewEducationLoanUnderwritingEngine() *EducationLoanUnderwritingEngine {
 	engine := &EducationLoanUnderwritingEngine{
-		products:            make(map[EducationLoanType]*EducationLoanProductConfig),
-		maxLoanAmount:       50000000, // 50 million NGN
-		minGuarantorIncome:  100000,   // 100k NGN monthly
-		minGuarantorCount:   1,
-		maxDTI:              0.40,     // 40% DTI
-		minStudentAge:       16,
-		maxStudentAge:       45,
-		minProgramDuration:  1,
-		maxProgramDuration:  7,
+		products:           make(map[EducationLoanType]*EducationLoanProductConfig),
+		maxLoanAmount:      50000000, // 50 million NGN
+		minGuarantorIncome: 100000,   // 100k NGN monthly
+		minGuarantorCount:  1,
+		maxDTI:             0.40, // 40% DTI
+		minStudentAge:      16,
+		maxStudentAge:      45,
+		minProgramDuration: 1,
+		maxProgramDuration: 7,
 	}
 
 	// Initialize products
@@ -516,7 +516,7 @@ func (e *EducationLoanUnderwritingEngine) getProgramRisk(duration, currentYear i
 // getAmountRisk returns risk based on loan amount
 func (e *EducationLoanUnderwritingEngine) getAmountRisk(requested, maxAllowed float64) float64 {
 	ratio := requested / maxAllowed
-	
+
 	if ratio > 0.8 {
 		return 0.5
 	} else if ratio > 0.6 {
