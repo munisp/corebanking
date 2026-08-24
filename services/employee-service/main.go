@@ -634,7 +634,9 @@ func (s *EmployeeService) onboardEmployeeHandler(w http.ResponseWriter, r *http.
 			"initiated_by": keycloakID,
 		},
 	}
-	employeeKafkaClient.PublishEvent("employee.onboarding.started", event)
+	if err := employeeKafkaClient.PublishEvent("employee.onboarding.started", event); err != nil {
+		log.Printf("Warning: Failed to publish employee.onboarding.started for %s: %v", employeeID, err)
+	}
 
 	// Record metrics
 	employeeOnboardingTotal.WithLabelValues("started", tenantID).Inc()
@@ -1054,10 +1056,12 @@ func (s *EmployeeService) updateEmployeeStatusHandler(w http.ResponseWriter, r *
 	json.NewEncoder(w).Encode(emp)
 }
 
-// handleEmployeeEvent handles employee events from Kafka
-func (s *EmployeeService) handleEmployeeEvent(ctx context.Context) (retry bool, err error) {
-	// TODO
-	return false, nil
+// eventString safely extracts a string field from an event payload map.
+func eventString(event map[string]interface{}, key string) string {
+	if v, ok := event[key].(string); ok {
+		return v
+	}
+	return ""
 }
 
 // sessionContextIDPattern allowlists identifiers that may be written into the
@@ -1170,8 +1174,26 @@ func (s *EmployeeService) createEmployeeRecord(ctx context.Context, employeeID s
 	return err
 }
 
-// publishEvent publishes an event to Kafka via Dapr
+// publishEvent publishes an employee lifecycle event to the employee-events
+// Kafka topic via the shared client (W7-C-12). Failures propagate to the
+// caller, which logs them — employee events are never silently dropped.
 func (s *EmployeeService) publishEvent(ctx context.Context, topic string, event map[string]interface{}) error {
-	// Deprecated: use employeeKafkaClient.PublishEvent instead
-	return nil
+	if employeeKafkaClient == nil {
+		return fmt.Errorf("employee kafka client not initialized")
+	}
+	eventType := eventString(event, "event_type")
+	if eventType == "" {
+		eventType = "employee.event"
+	}
+	empEvent := EmployeeEvent{
+		EntityID:  eventString(event, "employee_id"),
+		TenantID:  eventString(event, "bank_id"),
+		Status:    eventString(event, "new_status"),
+		Timestamp: time.Now().UTC(),
+		Metadata:  event,
+	}
+	if ts, ok := event["timestamp"].(time.Time); ok {
+		empEvent.Timestamp = ts
+	}
+	return employeeKafkaClient.PublishEvent(eventType, empEvent)
 }
