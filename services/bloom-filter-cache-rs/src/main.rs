@@ -327,7 +327,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
