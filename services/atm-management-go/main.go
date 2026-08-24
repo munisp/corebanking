@@ -911,24 +911,23 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 func initSchema() {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS cards (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    card_number_hash VARCHAR(128) NOT NULL,
-    card_number_last4 VARCHAR(4) NOT NULL,
-    card_type VARCHAR(16) NOT NULL,
-    card_brand VARCHAR(16) NOT NULL,
-    account_id UUID NOT NULL,
+    card_number_hash VARCHAR(64) NOT NULL,
+    masked_pan VARCHAR(19) NOT NULL,
     customer_id UUID NOT NULL,
-    status VARCHAR(20) NOT NULL DEFAULT 'inactive',
+    account_id UUID NOT NULL,
+    card_type VARCHAR(20) NOT NULL,
+    scheme VARCHAR(20) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active',
     expiry_month INT NOT NULL,
     expiry_year INT NOT NULL,
-    daily_limit_kobo BIGINT DEFAULT 50000000,
-    monthly_limit_kobo BIGINT DEFAULT 500000000,
-    is_contactless BOOLEAN DEFAULT TRUE,
-    is_virtual BOOLEAN DEFAULT FALSE,
-    issued_at TIMESTAMPTZ,
-    activated_at TIMESTAMPTZ,
+    daily_limit_kobo BIGINT NOT NULL DEFAULT 50000000,
+    monthly_limit_kobo BIGINT NOT NULL DEFAULT 500000000,
+    pin_retries INT DEFAULT 0,
+    last_used_at TIMESTAMPTZ,
+    blocked_reason VARCHAR(100),
     tenant_id UUID NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`)
 	if err != nil {
 		log.Fatalf("schema init failed: %v", err)
@@ -1191,31 +1190,30 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func assessATMCashDemand(atmID string, historicalWithdrawals []float64, dayOfWeek int) float64 {
-	if len(historicalWithdrawals) == 0 {
-		return 5000000 // default ₦50k
+func validateATMTransaction(amount float64, cardType string, dailyWithdrawn float64) (bool, string) {
+	maxWithdrawal := 200000.0 // CBN max ATM daily withdrawal
+	if cardType == "corporate" {
+		maxWithdrawal = 500000.0
 	}
-	sum := 0.0
-	for _, w := range historicalWithdrawals {
-		sum += w
+	if amount < 500 {
+		return false, "Minimum ATM withdrawal is ₦500"
 	}
-	avg := sum / float64(len(historicalWithdrawals))
-	weekendMultiplier := 1.0
-	if dayOfWeek >= 5 {
-		weekendMultiplier = 1.4
+	if amount > 40000 {
+		return false, "Maximum single ATM withdrawal is ₦40,000"
 	}
-	return avg * weekendMultiplier * 1.1 // 10% buffer
+	if dailyWithdrawn+amount > maxWithdrawal {
+		return false, fmt.Sprintf("Daily limit exceeded: withdrawn ₦%.0f + ₦%.0f > ₦%.0f", dailyWithdrawn, amount, maxWithdrawal)
+	}
+	if int(amount)%500 != 0 {
+		return false, "Amount must be in multiples of ₦500"
+	}
+	return true, "Transaction approved"
 }
-func validateATMTransaction(amount float64, dailyTotal float64, cardType string) (bool, string) {
-	dailyLimits := map[string]float64{"verve": 150000, "mastercard": 300000, "visa": 300000}
-	limit := dailyLimits[cardType]
-	if dailyTotal+amount > limit {
-		return false, fmt.Sprintf("Daily ATM limit of ₦%.0f exceeded for %s", limit, cardType)
+func computeATMFee(isOnUs bool, amount float64) float64 {
+	if isOnUs {
+		return 0
 	}
-	if amount > 100000 {
-		return false, "Single transaction limit is ₦100,000"
-	}
-	return true, "Transaction allowed"
+	return 65
 }
 
 // --- Circuit Breaker + Retry (Production) ---
@@ -1449,14 +1447,6 @@ func jwtRealmURL() string {
 	return "http://keycloak:8080/realms/54bank"
 }
 
-func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil {
-		return fmt.Errorf("no db")
-	}
-	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
-	return err
-}
-
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
 	if _cbOpen.Load() && time.Since(time.Unix(0, _cbLastFailUnix.Load())) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
@@ -1507,6 +1497,14 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
+}
+
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
 }
 
 var _cbOpen atomic.Bool
