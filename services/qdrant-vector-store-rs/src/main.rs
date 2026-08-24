@@ -227,6 +227,21 @@ fn rl_allow() -> bool { true }
 #[derive(Debug, Clone)]
 struct VerifiedClaims(serde_json::Value);
 
+/// Verified tenant id from JWT claims stored in request extensions (never from
+/// raw request headers or caller-supplied body fields).
+#[allow(dead_code)]
+fn claims_tenant(req: &actix_web::HttpRequest) -> Option<String> {
+    let ext = req.extensions();
+    let claims = ext.get::<VerifiedClaims>()?;
+    claims
+        .0
+        .get("tenant_id")
+        .or_else(|| claims.0.get("tenant"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+
 struct JwksCacheEntry {
     fetched_at: std::time::Instant,
     keys: jsonwebtoken::jwk::JwkSet,
@@ -395,6 +410,11 @@ async fn check_jwt(req: &actix_web::HttpRequest) -> Result<serde_json::Value, ac
         _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
     };
     let claims = verify_jwt_token(token).await?;
+    // Fail-closed (wave-7.5): tenant identity comes ONLY from verified claims;
+    // tokens without a tenant claim are rejected before any query runs.
+    if claims.get("tenant_id").or_else(|| claims.get("tenant")).and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+        return Err(actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})));
+    }
     req.extensions_mut().insert(VerifiedClaims(claims.clone()));
     Ok(claims)
 }
@@ -879,10 +899,12 @@ async fn init_schema(pool: &PgPool) {
 
 async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let tenant_id = req.headers().get("X-Tenant-ID")
-        .and_then(|v| v.to_str().ok()).unwrap_or("");
+    let tenant_id = match claims_tenant(&req) {
+        Some(t) if !t.is_empty() => t,
+        _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
+    };
 
-    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+    let rows = sqlx::query("SELECT id, status, created_at FROM service_configs WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT 50")
         .bind(tenant_id)
         .fetch_all(&data.db)
         .await;
@@ -905,9 +927,10 @@ async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) ->
 
 async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
-    let tenant_id = body.tenant_id.clone()
-        .or_else(|| req.headers().get("X-Tenant-ID").and_then(|v| v.to_str().ok()).map(String::from))
-        .unwrap_or_else(|| "default".to_string());
+    let tenant_id = match claims_tenant(&req) {
+        Some(t) if !t.is_empty() => t,
+        _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
+    };
 
     let status = body.status.clone().unwrap_or_else(|| "active".to_string());
 
