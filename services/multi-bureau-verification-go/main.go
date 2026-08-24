@@ -631,20 +631,17 @@ func traceMiddleware(next http.Handler) http.Handler {
 
 // --- JWT Auth Middleware ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
+	// Chain-level guard delegates to the canonical RS256/JWKS verifier
+	// (jwtMiddleware): every non-probe request gets real Keycloak signature
+	// verification with exp/iss/aud enforcement; probe/health paths stay exempt.
+	inner := jwtMiddleware(jwtRealmURL(), next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-			return
-		}
-		next.ServeHTTP(w, r)
+		inner.ServeHTTP(w, r)
 	})
 }
 
@@ -1175,39 +1172,33 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func aggregateBureauScores(scores map[string]int) (int, string) {
-	total := 0
-	count := 0
-	for _, s := range scores {
-		total += s
-		count++
+func validateBureauConfig(provider string, endpoint string, timeoutMs int) (bool, string) {
+	if provider == "" {
+		return false, "Provider required"
 	}
-	if count == 0 {
-		return 0, "No bureau data"
+	if endpoint == "" {
+		return false, "Endpoint required"
 	}
-	avg := total / count
-	grade := "E"
-	switch {
-	case avg >= 750:
-		grade = "A"
-	case avg >= 650:
-		grade = "B"
-	case avg >= 550:
-		grade = "C"
-	case avg >= 450:
-		grade = "D"
+	if timeoutMs > 30000 {
+		return false, "Bureau timeout cannot exceed 30 seconds"
 	}
-	return avg, grade
+	if timeoutMs < 1000 {
+		return false, "Bureau timeout must be at least 1 second"
+	}
+	return true, "Bureau config valid"
 }
-func validateBureauReport(bureauName string, reportAge int) (bool, string) {
-	if reportAge > 90 {
-		return false, "Bureau report older than 90 days — request fresh report"
+func computeVerificationConsensus(bvnMatch bool, ninMatch bool, dlMatch bool) float64 {
+	score := 0.0
+	if bvnMatch {
+		score += 0.4
 	}
-	validBureaus := map[string]bool{"CRC": true, "FirstCentral": true, "CreditRegistry": true}
-	if !validBureaus[bureauName] {
-		return false, "Unknown credit bureau: " + bureauName
+	if ninMatch {
+		score += 0.35
 	}
-	return true, "Bureau report valid"
+	if dlMatch {
+		score += 0.25
+	}
+	return score
 }
 
 // --- Circuit Breaker + Retry (Production) ---
@@ -1382,7 +1373,7 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "9088"
+		port = "9391"
 	}
 	initDB()
 	mux := http.NewServeMux()
@@ -1401,7 +1392,7 @@ func main() {
 	mux.Handle("/v1/multi-bureau/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 	mux.Handle("/v1/multi-bureau-verification/score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(multi_bureau_verificationScoreHandler)))
 	mux.Handle("/v1/multi-bureau-verification/validate", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(multi_bureau_verificationValidateRequestHandler)))
-	log.Printf("Multi-Bureau Verification v2.0 (Go) on :%s", port)
+	log.Printf("Multi-Bureau Verification v2.0 (Identity) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
 	_ = tlsKey
