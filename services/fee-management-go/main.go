@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -480,10 +481,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "fee-management-go"})
-	})
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
 
 	rulesHandler := handleRules(store)
 	mux.HandleFunc("/v1/fee-rules/", rulesHandler)
@@ -499,7 +499,84 @@ func main() {
 	})
 
 	log.Printf("[fee-management-go] listening on :%s", port)
-	if err := http.ListenAndServe(":"+port, jwtAuthMiddleware(mux)); err != nil {
+	if err := http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "service": "fee-management-go"})
+}
+
+// --- Request metrics (restored fleet-canonical block) ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"fee-management-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"fee-management-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"fee-management-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"fee-management-go"}`)
+}
+
+// --- Rate limiting (restored fleet-canonical token bucket: 100 rps) ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

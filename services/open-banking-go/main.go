@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -298,27 +299,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		respondJSON(w, 200, map[string]interface{}{
-			"status": "ok", "service": "open-banking",
-			"middleware": map[string]interface{}{
-				"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"ob.consent.created", "ob.consent.revoked", "ob.payment.initiated", "ob.account.accessed"}},
-				"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"ob:consents", "ob:tpp_certs", "ob:rate_limits", "ob:tokens"}},
-				"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"ob_consents", "ob_tpps", "ob_api_endpoints", "ob_access_logs"}},
-				"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"ob-access-logs", "ob-consent-audit", "ob-api-metrics"}},
-				"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank-openbanking", "client": "open-banking-service"},
-				"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"ob_consent", "ob_tpp", "ob_api_access"}},
-				"dapr":        map[string]interface{}{"url": envOr("DAPR_URL", "http://localhost:3500"), "app_id": "open-banking", "pubsub": "ob-events"},
-				"fluvio":      map[string]interface{}{"url": envOr("FLUVIO_URL", "localhost:9003"), "topics": []string{"ob-api-requests-stream", "ob-consent-events-stream"}},
-				"temporal":    map[string]interface{}{"url": envOr("TEMPORAL_URL", "localhost:7233"), "workflows": []string{"ConsentAuthorization", "PaymentInitiation", "TPPCertRenewal", "ConsentExpiry"}},
-				"mojaloop":    map[string]interface{}{"url": envOr("MOJALOOP_URL", "http://localhost:3002"), "usage": "open-banking-payment-routing"},
-				"tigerbeetle": map[string]interface{}{"url": envOr("TIGERBEETLE_URL", "localhost:3000"), "ledgers": []string{"ob_payment_initiation", "ob_funds_confirmation"}},
-				"lakehouse":   map[string]interface{}{"url": envOr("LAKEHOUSE_URL", "http://localhost:8181"), "tables": []string{"ob_api_usage_history", "ob_consent_history", "ob_tpp_analytics"}},
-				"apisix":      map[string]interface{}{"url": envOr("APISIX_URL", "http://localhost:9080"), "routes": []string{"/open-banking/*"}},
-				"openappsec":  map[string]interface{}{"url": envOr("OPENAPPSEC_URL", "http://localhost:4000"), "policy": "ob-waf-rules"},
-			},
-		})
-	})
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
 
 	mux.HandleFunc("/v1/open-banking/consents", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -421,5 +404,99 @@ func main() {
 	})
 
 	fmt.Println("Open Banking service on :8165")
-	http.ListenAndServe(":8165", jwtAuthMiddleware(mux))
+	http.ListenAndServe(":8165", rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))))
+}
+
+// healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, 200, map[string]interface{}{
+		"status": "ok", "service": "open-banking",
+		"middleware": map[string]interface{}{
+			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"ob.consent.created", "ob.consent.revoked", "ob.payment.initiated", "ob.account.accessed"}},
+			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"ob:consents", "ob:tpp_certs", "ob:rate_limits", "ob:tokens"}},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"ob_consents", "ob_tpps", "ob_api_endpoints", "ob_access_logs"}},
+			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"ob-access-logs", "ob-consent-audit", "ob-api-metrics"}},
+			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank-openbanking", "client": "open-banking-service"},
+			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"ob_consent", "ob_tpp", "ob_api_access"}},
+			"dapr":        map[string]interface{}{"url": envOr("DAPR_URL", "http://localhost:3500"), "app_id": "open-banking", "pubsub": "ob-events"},
+			"fluvio":      map[string]interface{}{"url": envOr("FLUVIO_URL", "localhost:9003"), "topics": []string{"ob-api-requests-stream", "ob-consent-events-stream"}},
+			"temporal":    map[string]interface{}{"url": envOr("TEMPORAL_URL", "localhost:7233"), "workflows": []string{"ConsentAuthorization", "PaymentInitiation", "TPPCertRenewal", "ConsentExpiry"}},
+			"mojaloop":    map[string]interface{}{"url": envOr("MOJALOOP_URL", "http://localhost:3002"), "usage": "open-banking-payment-routing"},
+			"tigerbeetle": map[string]interface{}{"url": envOr("TIGERBEETLE_URL", "localhost:3000"), "ledgers": []string{"ob_payment_initiation", "ob_funds_confirmation"}},
+			"lakehouse":   map[string]interface{}{"url": envOr("LAKEHOUSE_URL", "http://localhost:8181"), "tables": []string{"ob_api_usage_history", "ob_consent_history", "ob_tpp_analytics"}},
+			"apisix":      map[string]interface{}{"url": envOr("APISIX_URL", "http://localhost:9080"), "routes": []string{"/open-banking/*"}},
+			"openappsec":  map[string]interface{}{"url": envOr("OPENAPPSEC_URL", "http://localhost:4000"), "policy": "ob-waf-rules"},
+		},
+	})
+}
+
+// --- Request metrics (restored fleet-canonical block) ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"open-banking-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"open-banking-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"open-banking-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"open-banking-go"}`)
+}
+
+// --- Rate limiting (restored fleet-canonical token bucket: 100 rps) ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

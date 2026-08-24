@@ -6,36 +6,26 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
-	"encoding/json"
-	"fmt"
-	"log"
-	"net/http"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
-	"time"
-
-	"bytes"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
-	"os"
-	"strings"
-	"sync"
-	"time"
-
-	"crypto"
-	"crypto/rsa"
-	"crypto/sha256"
-	"encoding/base64"
 	"math/big"
 	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
 )
 
 // cryptoRandUint32 returns a cryptographically secure random uint32 for
@@ -382,7 +372,6 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 // --- Database Layer ---
 var db *sql.DB
-var daprClient dapr.Client
 var daprAvailable bool
 
 func initDB() {

@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -307,27 +308,9 @@ func main() {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		respondJSON(w, 200, map[string]interface{}{
-			"status": "ok", "service": "cash-pooling",
-			"middleware": map[string]interface{}{
-				"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"cp.sweep.executed", "cp.pool.created", "cp.balance.update"}},
-				"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"cp:pools", "cp:balances", "cp:sweep_schedules"}},
-				"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"cp_pools", "cp_child_accounts", "cp_sweep_transactions"}},
-				"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"cp-sweeps", "cp-audit"}},
-				"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "cash-pooling-service"},
-				"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"cash_pool", "sweep_transaction"}},
-				"dapr":        map[string]interface{}{"url": envOr("DAPR_URL", "http://localhost:3500"), "app_id": "cash-pooling", "pubsub": "cp-events"},
-				"fluvio":      map[string]interface{}{"url": envOr("FLUVIO_URL", "localhost:9003"), "topics": []string{"cp-balance-stream", "cp-sweep-stream"}},
-				"temporal":    map[string]interface{}{"url": envOr("TEMPORAL_URL", "localhost:7233"), "workflows": []string{"SweepExecutionWorkflow", "BalanceReconWorkflow", "NotionalPoolingWorkflow"}},
-				"mojaloop":    map[string]interface{}{"url": envOr("MOJALOOP_URL", "http://localhost:3002"), "usage": "interbank-sweep-settlement"},
-				"tigerbeetle": map[string]interface{}{"url": envOr("TIGERBEETLE_URL", "localhost:3000"), "ledgers": []string{"cp_header_accounts", "cp_child_accounts", "cp_sweep_entries"}},
-				"lakehouse":   map[string]interface{}{"url": envOr("LAKEHOUSE_URL", "http://localhost:8181"), "tables": []string{"cp_sweep_history", "cp_balance_snapshots"}},
-				"apisix":      map[string]interface{}{"url": envOr("APISIX_URL", "http://localhost:9080"), "routes": []string{"/api/cash-pooling/*"}},
-				"openappsec":  map[string]interface{}{"url": envOr("OPENAPPSEC_URL", "http://localhost:4000"), "policy": "cp-waf-rules"},
-			},
-		})
-	})
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
 
 	mux.HandleFunc("/v1/cash-pooling/pools", func(w http.ResponseWriter, _ *http.Request) {
 		mu.Lock()
@@ -439,5 +422,99 @@ func main() {
 
 	port := envOr("PORT", "8159")
 	fmt.Printf("Cash Pooling service on :%s\n", port)
-	http.ListenAndServe(":"+port, jwtAuthMiddleware(mux))
+	http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))))
+}
+
+// healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).
+func healthHandler(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, 200, map[string]interface{}{
+		"status": "ok", "service": "cash-pooling",
+		"middleware": map[string]interface{}{
+			"kafka":       map[string]interface{}{"broker": envOr("KAFKA_BROKER", "localhost:9092"), "topics": []string{"cp.sweep.executed", "cp.pool.created", "cp.balance.update"}},
+			"redis":       map[string]interface{}{"url": envOr("REDIS_URL", "redis://localhost:6379"), "cache_keys": []string{"cp:pools", "cp:balances", "cp:sweep_schedules"}},
+			"postgres":    map[string]interface{}{"url": os.Getenv("DATABASE_URL"), "tables": []string{"cp_pools", "cp_child_accounts", "cp_sweep_transactions"}},
+			"opensearch":  map[string]interface{}{"url": envOr("OPENSEARCH_URL", "http://localhost:9200"), "indices": []string{"cp-sweeps", "cp-audit"}},
+			"keycloak":    map[string]interface{}{"url": envOr("KEYCLOAK_URL", "http://localhost:8080"), "realm": "54bank", "client": "cash-pooling-service"},
+			"permify":     map[string]interface{}{"url": envOr("PERMIFY_URL", "http://localhost:3476"), "resources": []string{"cash_pool", "sweep_transaction"}},
+			"dapr":        map[string]interface{}{"url": envOr("DAPR_URL", "http://localhost:3500"), "app_id": "cash-pooling", "pubsub": "cp-events"},
+			"fluvio":      map[string]interface{}{"url": envOr("FLUVIO_URL", "localhost:9003"), "topics": []string{"cp-balance-stream", "cp-sweep-stream"}},
+			"temporal":    map[string]interface{}{"url": envOr("TEMPORAL_URL", "localhost:7233"), "workflows": []string{"SweepExecutionWorkflow", "BalanceReconWorkflow", "NotionalPoolingWorkflow"}},
+			"mojaloop":    map[string]interface{}{"url": envOr("MOJALOOP_URL", "http://localhost:3002"), "usage": "interbank-sweep-settlement"},
+			"tigerbeetle": map[string]interface{}{"url": envOr("TIGERBEETLE_URL", "localhost:3000"), "ledgers": []string{"cp_header_accounts", "cp_child_accounts", "cp_sweep_entries"}},
+			"lakehouse":   map[string]interface{}{"url": envOr("LAKEHOUSE_URL", "http://localhost:8181"), "tables": []string{"cp_sweep_history", "cp_balance_snapshots"}},
+			"apisix":      map[string]interface{}{"url": envOr("APISIX_URL", "http://localhost:9080"), "routes": []string{"/api/cash-pooling/*"}},
+			"openappsec":  map[string]interface{}{"url": envOr("OPENAPPSEC_URL", "http://localhost:4000"), "policy": "cp-waf-rules"},
+		},
+	})
+}
+
+// --- Request metrics (restored fleet-canonical block) ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"cash-pooling-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"cash-pooling-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"cash-pooling-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"cash-pooling-go"}`)
+}
+
+// --- Rate limiting (restored fleet-canonical token bucket: 100 rps) ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

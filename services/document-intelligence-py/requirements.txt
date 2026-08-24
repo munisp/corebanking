@@ -1,0 +1,8 @@
+# Generated from actual third-party imports in main.py (fleet-consistent pins).
+fastapi==0.115.12
+uvicorn==0.34.3
+pydantic==2.11.5
+psycopg2-binary==2.9.9
+opentelemetry-api==1.30.0
+opentelemetry-sdk==1.30.0
+opentelemetry-exporter-otlp-proto-grpc==1.30.0

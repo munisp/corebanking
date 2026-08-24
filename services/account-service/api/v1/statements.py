@@ -48,10 +48,19 @@ class GenerateRequest(BaseModel):
 
 
 @statements_router.post("/generate")
-def generate_statement(req: GenerateRequest):
-    acct = next((a for a in _ACCOUNTS if a["accountNumber"] == req.accountNumber), None)
-    if not acct:
+def generate_statement(
+    req: GenerateRequest,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+):
+    # Accounts live in the DB (see list_accounts above); look the account up by
+    # its 10-digit number within the caller's tenant.
+    repo = AccountRepository(db)
+    account = repo.get_by_account_number(req.accountNumber, tenant_id)
+    if not account:
         raise HTTPException(status_code=404, detail="account not found")
+    acct = account.to_dict()
+    acct["accountNumber"] = account.account_number
     txns = sorted(_filter_txns(req.accountNumber, req.startDate, req.endDate), key=lambda t: t["date"])
     total_debit = sum(t["debit"] for t in txns)
     total_credit = sum(t["credit"] for t in txns)
