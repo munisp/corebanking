@@ -333,7 +333,7 @@ func acgsf_guaranteeYieldHandler(w http.ResponseWriter, r *http.Request) {
 func acgsf_guaranteeRiskHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Hectares float64 `json:"hectares"`
-		Region   float64 `json:"region"`
+		Region   string  `json:"region"`
 		Season   string  `json:"season"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
