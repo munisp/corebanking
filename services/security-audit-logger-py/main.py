@@ -9,6 +9,7 @@ import uuid
 import logging
 import random
 import string
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extras
@@ -214,6 +215,36 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
+        # AUDIT-MUTABLE: the audit_events table the API targets was never
+        # created. Schema mirrors services/security-service/audit_trail.go:
+        # actor/tenant/correlation fields, before/after values, and a
+        # SHA-256 hash chain (previous_hash/entry_hash) for tamper evidence.
+        # The table is append-only — this service exposes no UPDATE/DELETE.
+        cur.execute("""CREATE TABLE IF NOT EXISTS audit_events (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            severity VARCHAR(20) NOT NULL DEFAULT 'info',
+            actor_id VARCHAR(128),
+            actor_type VARCHAR(20),
+            tenant_id VARCHAR(128),
+            resource_type VARCHAR(64),
+            resource_id VARCHAR(128),
+            action VARCHAR(100) NOT NULL,
+            description TEXT,
+            old_value JSONB,
+            new_value JSONB,
+            metadata JSONB,
+            ip_address VARCHAR(45),
+            user_agent TEXT,
+            correlation_id VARCHAR(128),
+            previous_hash VARCHAR(64),
+            entry_hash VARCHAR(64) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_event_type ON audit_events(event_type)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
@@ -303,15 +334,52 @@ app.add_middleware(
 )
 
 
-class CreateRequest(BaseModel):
-    status: Optional[str] = "active"
+class AuditEventRequest(BaseModel):
+    """Append-only audit event. Mirrors the audit_trail.go field set:
+    actor/tenant/correlation context plus before/after values."""
+    event_type: str
+    action: str
+    severity: Optional[str] = "info"
+    actor_id: Optional[str] = None
+    actor_type: Optional[str] = None
     tenant_id: Optional[str] = None
-    data: Optional[Dict[str, Any]] = None
+    resource_type: Optional[str] = None
+    resource_id: Optional[str] = None
+    description: Optional[str] = None
+    old_value: Optional[Dict[str, Any]] = None
+    new_value: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    correlation_id: Optional[str] = None
 
 
-class UpdateRequest(BaseModel):
-    status: Optional[str] = None
-    data: Optional[Dict[str, Any]] = None
+# --- Tamper-evident hash chain (AUDIT-MUTABLE) ---
+# Mirrors services/security-service/audit_trail.go: entry_hash =
+# sha256(id|event_type|severity|actor_id|tenant_id|action|resource_type|
+# resource_id|previous_hash|timestamp). The chain head is re-read from the DB
+# under a lock on every append, so a restart never forks the chain.
+_audit_chain_lock = threading.Lock()
+
+
+def _compute_entry_hash(entry_id, event_type, severity, actor_id, tenant_id,
+                        action, resource_type, resource_id, previous_hash,
+                        timestamp_iso):
+    import hashlib
+    data = "|".join([
+        str(entry_id), str(event_type), str(severity), str(actor_id),
+        str(tenant_id), str(action), str(resource_type), str(resource_id),
+        str(previous_hash), str(timestamp_iso),
+    ])
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _load_chain_head(cur):
+    cur.execute(
+        "SELECT entry_hash FROM audit_events ORDER BY created_at DESC, id DESC LIMIT 1"
+    )
+    row = cur.fetchone()
+    return row[0] if row else ""
 
 
 @app.get("/healthz")
@@ -349,25 +417,41 @@ def metrics():
 
 @app.get("/api/v1/audit_events")
 def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
+    """List audit events (read-only). Tenant header scopes the listing."""
     conn = get_db()
     if not conn:
         return {"items": [], "total": 0, "page": page, "limit": limit}
     try:
         cur = conn.cursor()
         offset = (page - 1) * limit
-        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    (limit, offset))
+        tenant = x_tenant_id or ""
+        cur.execute(
+            """SELECT id, event_type, severity, actor_id, tenant_id, action,
+                      resource_type, resource_id, entry_hash, created_at
+               FROM audit_events
+               WHERE %s = '' OR tenant_id = %s
+               ORDER BY created_at DESC LIMIT %s OFFSET %s""",
+            (tenant, tenant, limit, offset),
+        )
         rows = cur.fetchall()
         items = [
-            {"id": str(row[0]), "status": row[1], "tenant_id": str(row[2]) if row[2] else None, "created_at": str(row[3])}
+            {
+                "id": str(row[0]), "event_type": row[1], "severity": row[2],
+                "actor_id": row[3], "tenant_id": row[4], "action": row[5],
+                "resource_type": row[6], "resource_id": row[7],
+                "entry_hash": row[8], "created_at": str(row[9]),
+            }
             for row in rows
         ]
-        cur.execute("SELECT COUNT(*) FROM service_configs")
+        cur.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE %s = '' OR tenant_id = %s",
+            (tenant, tenant),
+        )
         total = cur.fetchone()[0]
         return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
     except Exception as e:
         logger.error(f"DB query failed: {e}")
-        raise HTTPException(status_code=503, detail="config_unavailable")
+        raise HTTPException(status_code=503, detail="audit_events_unavailable")
 # --- JWT Auth ---
 def validate_jwt(headers):
     """Validate Bearer JWT with real HS256 signature verification (stdlib).
@@ -608,67 +692,114 @@ audit_log: list = []
 domain_stats: dict = {"processed_today": 0}
 
 @app.post("/api/v1/audit_events", status_code=201)
-def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
-    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
-    status = body.status or "active"
+def create_record(body: AuditEventRequest, x_tenant_id: Optional[str] = Header(None)):
+    """Append a tamper-evident audit event. Append-only by design: this
+    service exposes no update or delete route for audit_events."""
+    tenant_id = body.tenant_id or x_tenant_id
     record_id = str(uuid.uuid4())
+    timestamp = datetime.now(timezone.utc).isoformat()
+    severity = body.severity or "info"
 
     conn = get_db()
-    with conn.cursor() as cur:
+    with _audit_chain_lock:
+        with conn.cursor() as cur:
+            previous_hash = _load_chain_head(cur)
+            entry_hash = _compute_entry_hash(
+                record_id, body.event_type, severity, body.actor_id or "",
+                tenant_id or "", body.action, body.resource_type or "",
+                body.resource_id or "", previous_hash, timestamp,
+            )
+            cur.execute(
+                """INSERT INTO audit_events (
+                       id, event_type, severity, actor_id, actor_type, tenant_id,
+                       resource_type, resource_id, action, description,
+                       old_value, new_value, metadata,
+                       ip_address, user_agent, correlation_id,
+                       previous_hash, entry_hash, created_at
+                   ) VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                             %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz)""",
+                (
+                    record_id, body.event_type, severity, body.actor_id,
+                    body.actor_type, tenant_id, body.resource_type,
+                    body.resource_id, body.action, body.description,
+                    json.dumps(body.old_value) if body.old_value is not None else None,
+                    json.dumps(body.new_value) if body.new_value is not None else None,
+                    json.dumps(body.metadata) if body.metadata is not None else None,
+                    body.ip_address, body.user_agent, body.correlation_id,
+                    previous_hash, entry_hash, timestamp,
+                ),
+            )
+            payload = json.dumps({
+                "id": record_id, "event_type": body.event_type,
+                "action": body.action, "tenant_id": tenant_id,
+                "entry_hash": entry_hash,
+            })
+            cur.execute(
+                "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+                ("audit_events.appended", record_id, payload),
+            )
+        conn.commit()
+    return {
+        "id": record_id, "status": "appended",
+        "entry_hash": entry_hash, "previous_hash": previous_hash,
+    }
+
+
+@app.get("/api/v1/audit_events/verify-chain")
+def verify_chain():
+    """Recompute the hash chain over the whole audit_events table. Any edited
+    or deleted historical row breaks every subsequent entry_hash and is
+    reported here (tamper evidence)."""
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
-            "INSERT INTO audit_events (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
-            (record_id, tenant_id, status)
+            """SELECT id, event_type, severity, actor_id, tenant_id, action,
+                      resource_type, resource_id, previous_hash, entry_hash, created_at
+               FROM audit_events ORDER BY created_at ASC, id ASC"""
         )
-        # Outbox event
-        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("audit_events.created", record_id, payload)
+        rows = cur.fetchall()
+
+    prev = ""
+    checked = 0
+    for row in rows:
+        expected = _compute_entry_hash(
+            str(row["id"]), row["event_type"], row["severity"] or "info",
+            row["actor_id"] or "", row["tenant_id"] or "", row["action"],
+            row["resource_type"] or "", row["resource_id"] or "",
+            row["previous_hash"] or "", row["created_at"].isoformat(),
         )
-    conn.commit()
-    return {"id": record_id, "status": "created"}
+        if (row["previous_hash"] or "") != prev or row["entry_hash"] != expected:
+            logger.error(
+                "AUDIT CHAIN VIOLATION at event %s (checked %d entries)", row["id"], checked
+            )
+            return {
+                "chain_valid": False,
+                "broken_at": str(row["id"]),
+                "entries_checked": checked,
+            }
+        prev = row["entry_hash"]
+        checked += 1
+    return {"chain_valid": True, "entries_checked": checked, "chain_head": prev or None}
 
 
 @app.get("/api/v1/audit_events/{record_id}")
 def get_record(record_id: str):
     conn = get_db()
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT id, status, created_at FROM audit_events WHERE id = %s::uuid", (record_id,))
+        cur.execute(
+            """SELECT id, event_type, severity, actor_id, actor_type, tenant_id,
+                      resource_type, resource_id, action, description,
+                      old_value, new_value, metadata, ip_address, user_agent,
+                      correlation_id, previous_hash, entry_hash, created_at
+               FROM audit_events WHERE id = %s::uuid""",
+            (record_id,),
+        )
         row = cur.fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="not found")
-    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
-
-
-@app.put("/api/v1/audit_events/{record_id}")
-def update_record(record_id: str, body: UpdateRequest):
-    status = body.status or "updated"
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE audit_events SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
-            (status, record_id)
-        )
-        payload = json.dumps({"id": record_id, "status": status})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("audit_events.updated", record_id, payload)
-        )
-    conn.commit()
-    return {"id": record_id, "status": status}
-
-
-@app.delete("/api/v1/audit_events/{record_id}", status_code=204)
-def delete_record(record_id: str):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("UPDATE audit_events SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
-        payload = json.dumps({"id": record_id})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("audit_events.deleted", record_id, payload)
-        )
-    conn.commit()
+    row["id"] = str(row["id"])
+    row["created_at"] = row["created_at"].isoformat()
+    return row
 
 # --- Graceful Shutdown ---
 server = None
