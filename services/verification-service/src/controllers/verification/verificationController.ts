@@ -26,6 +26,8 @@ import { process_default_verification_event_signal }  from "../../workflows";
 import { process_shield_verification_event_signal }   from "../../workflows";
 import { KycIdentityProviders }   from "../../utils/enums";
 import logger                     from "../../config/logger.config";
+import { readEnv }                from "../../config/readEnv.config";
+import { shieldApiClient }        from "../../lib/ShieldApiClient";
 import {
   createSession,
   getSession,

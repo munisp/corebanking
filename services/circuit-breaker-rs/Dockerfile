@@ -1,8 +1,8 @@
 FROM rust:1.77-slim AS builder
 WORKDIR /app
 COPY Cargo.toml ./
-COPY main.rs ./src/main.rs
-RUN mkdir -p src && cargo build --release
+COPY src/ ./src/
+RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
