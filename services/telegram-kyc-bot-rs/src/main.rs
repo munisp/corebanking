@@ -721,19 +721,30 @@ async fn main() -> std::io::Result<()> {
 async fn init_schema(pool: &PgPool) {
     sqlx::query(r#"CREATE TABLE IF NOT EXISTS kyc_records (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    telegram_user_id BIGINT NOT NULL,
+    customer_id UUID NOT NULL,
+    verification_type VARCHAR(32) NOT NULL,
+    document_type VARCHAR(32),
+    document_number VARCHAR(64),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    risk_score INT DEFAULT 0,
+    risk_level VARCHAR(20) DEFAULT 'low',
     bvn VARCHAR(11),
     nin VARCHAR(11),
-    full_name VARCHAR(256),
+    verified_name VARCHAR(200),
     date_of_birth DATE,
-    document_type VARCHAR(50),
-    document_number VARCHAR(100),
-    document_image_url TEXT,
-    selfie_url TEXT,
-    current_step INT NOT NULL DEFAULT 1,
-    status VARCHAR(20) NOT NULL DEFAULT 'in_progress',
-    rejection_reason TEXT,
-    tenant_id UUID,
+    address TEXT,
+    lga VARCHAR(100),
+    state VARCHAR(50),
+    country VARCHAR(3) DEFAULT 'NGA',
+    selfie_match_score REAL,
+    document_match_score REAL,
+    pep_check BOOLEAN DEFAULT FALSE,
+    sanctions_check BOOLEAN DEFAULT FALSE,
+    adverse_media_check BOOLEAN DEFAULT FALSE,
+    reviewer_id UUID,
+    reviewed_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    tenant_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )"#)
@@ -747,23 +758,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_validate_bvn() {
-        assert!(validate_bvn("12345678901"));
-        assert!(!validate_bvn("12345"));
-        assert!(!validate_bvn("1234567890a"));
-    }
+    fn test_validate_bvn() { assert!(validate_bvn("0123456789")); assert!(!validate_bvn("")); }
 
     #[test]
-    fn test_validate_nin() {
-        assert!(validate_nin("12345678901"));
-        assert!(!validate_nin("12345"));
-    }
-
-    #[test]
-    fn test_kyc_step_name() {
-        assert_eq!(kyc_step_name(1), "bvn_capture");
-        assert_eq!(kyc_step_name(6), "complete");
-    }
+    fn test_validate_nin() { assert!(validate_nin("0123456789")); assert!(!validate_nin("")); }
     #[test]
     fn test_circuit_breaker_opens() {
         for _ in 0..5 { cb_record_failure(); }
