@@ -309,17 +309,17 @@ func initAuditSchema() {
 		return
 	}
 	if _, err := db.Exec(`
-			CREATE TABLE IF NOT EXISTS payments_hub_audit_trail (
-				id            VARCHAR(50) PRIMARY KEY,
-				action        VARCHAR(100) NOT NULL,
-				record_id     VARCHAR(128),
-				actor         VARCHAR(128),
-				tenant_id     VARCHAR(128),
-				details       TEXT,
-				previous_hash VARCHAR(64),
-				entry_hash    VARCHAR(64) NOT NULL,
-				created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-			)`); err != nil {
+		CREATE TABLE IF NOT EXISTS payments_hub_audit_trail (
+			id            VARCHAR(50) PRIMARY KEY,
+			action        VARCHAR(100) NOT NULL,
+			record_id     VARCHAR(128),
+			actor         VARCHAR(128),
+			tenant_id     VARCHAR(128),
+			details       TEXT,
+			previous_hash VARCHAR(64),
+			entry_hash    VARCHAR(64) NOT NULL,
+			created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`); err != nil {
 		log.Printf("[audit] ERROR: failed to create payments_hub_audit_trail: %v", err)
 		return
 	}
@@ -600,8 +600,8 @@ func outboxAppend(topic, key string, payload interface{}, idempotencyKey string)
 	if db != nil {
 		payloadJSON, _ := json.Marshal(payload)
 		_, err := db.Exec(`INSERT INTO outbox (id, topic, key, payload, idempotency_key, created_at, status)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)
-				ON CONFLICT (idempotency_key) DO NOTHING`,
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (idempotency_key) DO NOTHING`,
 			entry.ID, topic, key, payloadJSON, idempotencyKey, entry.CreatedAt, entry.Status)
 		if err != nil {
 			log.Printf("[outbox] INSERT failed: %v", err)
@@ -876,8 +876,8 @@ func appendAudit(action, recordID, actor, tenantID, details string) error {
 
 	if _, err := db.Exec(
 		`INSERT INTO payments_hub_audit_trail
-				(id, action, record_id, actor, tenant_id, details, previous_hash, entry_hash, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			(id, action, record_id, actor, tenant_id, details, previous_hash, entry_hash, created_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		entry.ID, entry.Action, entry.RecordID, entry.Actor, entry.TenantID,
 		entry.Details, entry.PreviousHash, entry.EntryHash, entry.Timestamp,
 	); err != nil {
