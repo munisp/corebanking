@@ -1450,7 +1450,7 @@ func dbInsert(id, service, typ, status string, data []byte) error {
 }
 
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
-	if _cbOpen.Load() && time.Since(time.Unix(0, _cbLastFailUnix.Load()) < 30*time.Second {
+	if _cbOpen.Load() && time.Since(time.Unix(0, _cbLastFailUnix.Load())) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
 	if _cbOpen.Load() {
