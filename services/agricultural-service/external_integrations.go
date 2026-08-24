@@ -720,7 +720,14 @@ func (s *ExternalIntegrationsService) persistCRMSSubmission(sub CRMSSubmission) 
 }
 
 func (s *ExternalIntegrationsService) ListCRMSSubmissions(w http.ResponseWriter, r *http.Request) {
-	tenantID := r.URL.Query().Get("tenant_id")
+	// Tenant identity comes ONLY from verified JWT claims (stamped onto
+	// X-Tenant-ID by jwtAuthMiddleware); never from caller-supplied query
+	// parameters. Fail-closed: a missing tenant is rejected before any query.
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return
+	}
 	if err := s.ensureIntegrationTables(); err != nil {
 		upstreamUnavailable(w, "crms", err)
 		return
@@ -728,7 +735,7 @@ func (s *ExternalIntegrationsService) ListCRMSSubmissions(w http.ResponseWriter,
 	rows, err := s.db.QueryContext(r.Context(), `
 		SELECT submission_id, tenant_id, report_period, total_records, success_records,
 			failed_records, submission_status, submitted_at, acknowledged_at
-		FROM crms_submissions WHERE ($1 = '' OR tenant_id = $1) ORDER BY submitted_at DESC LIMIT 100`, tenantID)
+		FROM crms_submissions WHERE tenant_id = $1 ORDER BY submitted_at DESC LIMIT 100`, tenantID)
 	if err != nil {
 		upstreamUnavailable(w, "crms", err)
 		return
