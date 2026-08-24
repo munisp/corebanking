@@ -495,6 +495,14 @@ func (w *MortgageServicingWorkflow) updateArrearsStatus(ctx context.Context) err
 		}
 	}
 
+	// W7-C-11: persist the recalculated position to mortgage_arrears — the
+	// scheduled recalculation must not stop at status flips and events. Runs
+	// on every daily servicing pass, including when arrears have cleared
+	// (active records are resolved).
+	if err := updateArrearsStatus(w.MortgageID, w.TenantID); err != nil {
+		return fmt.Errorf("persist arrears status for mortgage %s: %w", w.MortgageID, err)
+	}
+
 	return nil
 }
 
