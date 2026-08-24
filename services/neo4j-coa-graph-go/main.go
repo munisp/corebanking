@@ -21,6 +21,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"regexp"
@@ -645,14 +646,27 @@ func sanitizeInput(s string) string {
 	return s
 }
 
+var (
+	checkJWTDelegate     http.Handler
+	checkJWTDelegateOnce sync.Once
+)
+
 func checkJWT(r *http.Request) error {
 	if strings.HasPrefix(r.URL.Path, "/healthz") || strings.HasPrefix(r.URL.Path, "/readyz") ||
 		strings.HasPrefix(r.URL.Path, "/livez") || strings.HasPrefix(r.URL.Path, "/metrics") {
 		return nil
 	}
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		return fmt.Errorf("missing bearer token")
+	// Real verification: delegate to the canonical RS256/JWKS chain verifier
+	// (jwtAuthMiddleware, backed by jwtMiddleware) instead of trusting token
+	// presence. The delegate is built once because jwtMiddleware spawns JWKS
+	// refresh goroutines at construction.
+	checkJWTDelegateOnce.Do(func() {
+		checkJWTDelegate = jwtAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	})
+	rec := httptest.NewRecorder()
+	checkJWTDelegate.ServeHTTP(rec, r)
+	if rec.Code == http.StatusUnauthorized {
+		return fmt.Errorf("unauthorized")
 	}
 	return nil
 }
@@ -857,33 +871,17 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 
 // --- JWT Validation (JWKS-aware) ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
+	// Chain-level guard delegates to the canonical RS256/JWKS verifier
+	// (jwtMiddleware): every non-probe request gets real Keycloak signature
+	// verification with exp/iss/aud enforcement; probe/health paths stay exempt.
+	inner := jwtMiddleware(jwtRealmURL(), next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" || p == "/v1/degradation" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-			return
-		}
-		token := strings.TrimPrefix(auth, "Bearer ")
-		// Validate JWT structure (header.payload.signature)
-		parts := strings.Split(token, ".")
-		if len(parts) != 3 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"malformed token","service":"%s"}`, serviceName)
-			return
-		}
-		// In production: validate against Keycloak JWKS endpoint
-		// keycloakURL := os.Getenv("KEYCLOAK_URL")
-		// Decode payload for claims
-		r.Header.Set("X-User-Id", "validated")
-		next.ServeHTTP(w, r)
+		inner.ServeHTTP(w, r)
 	})
 }
 

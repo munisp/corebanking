@@ -426,14 +426,6 @@ func rlAllow() bool {
 	return false
 }
 
-func checkJWT(r *http.Request) bool {
-	if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" || r.URL.Path == "/livez" || r.URL.Path == "/metrics" {
-		return true
-	}
-	auth := r.Header.Get("Authorization")
-	return strings.HasPrefix(auth, "Bearer ")
-}
-
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")

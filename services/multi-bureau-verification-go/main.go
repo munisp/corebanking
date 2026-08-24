@@ -631,20 +631,17 @@ func traceMiddleware(next http.Handler) http.Handler {
 
 // --- JWT Auth Middleware ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
+	// Chain-level guard delegates to the canonical RS256/JWKS verifier
+	// (jwtMiddleware): every non-probe request gets real Keycloak signature
+	// verification with exp/iss/aud enforcement; probe/health paths stay exempt.
+	inner := jwtMiddleware(jwtRealmURL(), next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-			return
-		}
-		next.ServeHTTP(w, r)
+		inner.ServeHTTP(w, r)
 	})
 }
 
