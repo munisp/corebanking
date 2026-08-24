@@ -280,11 +280,15 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 			r.Header.Del("X-User-Id")
 			r.Header.Del("X-Keycloak-ID")
 		}
-		if tenant := tenantFromClaims(claims); tenant != "" {
-			r.Header.Set("X-Tenant-ID", tenant)
-		} else {
-			r.Header.Del("X-Tenant-ID")
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
 		}
+		r.Header.Set("X-Tenant-ID", tenant)
 		r.Header.Del("X-User-Role")
 		if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
 			if roleList, ok := ra["roles"].([]interface{}); ok {
@@ -336,7 +340,7 @@ func handlePoliciesAll(w http.ResponseWriter, r *http.Request) {
 		SELECT policy_id, farmer_id, crop_type, coverage_usd, premium_usd,
 		       trigger_index, status, season_start, season_end, created_at
 		FROM etherisc_policies
-		WHERE ($1 = '' OR tenant_id = $1)
+		WHERE tenant_id = $1
 		ORDER BY created_at DESC
 	`, tenantID)
 	if err != nil {
@@ -423,7 +427,7 @@ func handleClaimsAll(w http.ResponseWriter, r *http.Request) {
 		SELECT c.claim_id, c.policy_id, c.trigger_value, c.payout_usd, c.status, c.paid_at, c.created_at
 		FROM etherisc_claims c
 		JOIN etherisc_policies p ON p.policy_id = c.policy_id
-		WHERE ($1 = '' OR c.tenant_id = $1)
+		WHERE c.tenant_id = $1
 		ORDER BY c.created_at DESC
 	`, tenantID)
 	if err != nil {
@@ -508,7 +512,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	db.QueryRowContext(r.Context(), `
 		SELECT COUNT(*), COALESCE(SUM(coverage_usd), 0)
 		FROM etherisc_policies
-		WHERE status = 'active' AND ($1 = '' OR tenant_id = $1)
+		WHERE status = 'active' AND tenant_id = $1
 	`, tenantID).Scan(&activePolicies, &totalCoverageUSD)
 
 	var claimsPaid int
@@ -516,7 +520,7 @@ func handleStats(w http.ResponseWriter, r *http.Request) {
 	db.QueryRowContext(r.Context(), `
 		SELECT COUNT(*), COALESCE(SUM(payout_usd), 0)
 		FROM etherisc_claims
-		WHERE status = 'paid' AND ($1 = '' OR tenant_id = $1)
+		WHERE status = 'paid' AND tenant_id = $1
 	`, tenantID).Scan(&claimsPaid, &claimPayoutUSD)
 
 	respondJSON(w, 200, map[string]interface{}{

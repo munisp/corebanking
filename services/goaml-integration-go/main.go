@@ -513,6 +513,17 @@ func warnIfAuthUnconfigured() {
 	}
 }
 
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	// Initial JWKS fetch
 	go fetchJWKS(realmURL)
@@ -606,6 +617,15 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			}
 		}
 		// Pass claims in context
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
+		}
+		r.Header.Set("X-Tenant-ID", tenant)
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -614,22 +634,26 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 // enforceTenantClaim cross-checks a client-supplied tenant identifier against
 // the verified JWT claims (C-15). When the token carries a tenant (or
 // tenant_id) claim and it does not match the requested tenant, the request is
-// rejected with 403 and false is returned. Tokens without a tenant claim
-// (e.g. service accounts) are allowed.
+// rejected with 403 and false is returned. Fail-closed (wave-7.5): an empty
+// requested tenant, missing verified claims, or a token without a tenant claim
+// is rejected instead of being allowed.
 func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
 	if requestedTenant == "" {
-		return true
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return false
 	}
 	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
 	if claims == nil {
-		return true
+		http.Error(w, `{"error":"unauthorized: no verified token claims"}`, http.StatusUnauthorized)
+		return false
 	}
 	claimTenant, _ := claims["tenant"].(string)
 	if claimTenant == "" {
 		claimTenant, _ = claims["tenant_id"].(string)
 	}
 	if claimTenant == "" {
-		return true
+		http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+		return false
 	}
 	if claimTenant != requestedTenant {
 		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)
@@ -1019,7 +1043,7 @@ func listRecords(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	offset := 0
 
-	query := `SELECT id, status, created_at FROM compliance_records WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	query := `SELECT id, status, created_at FROM compliance_records WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1053,7 +1077,8 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if tenantID == "" {
-		tenantID = "default"
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return
 	}
 	body["tenant_id"] = tenantID
 

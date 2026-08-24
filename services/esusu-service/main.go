@@ -678,13 +678,14 @@ func (s *EsusuService) JoinGroup(groupID string, req JoinGroupRequest, tenantID 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Fetch group from database (allow empty tenant_id for backward compatibility)
+	// Fetch group from database (fail-closed tenant scoping: the tenant comes
+	// from verified JWT claims; an empty tenant is rejected, never unscoped)
 	var dbGroup DBEsusuGroup
 	var err error
-	if tenantID != "" {
-		err = s.db.First(&dbGroup, "id = ? AND (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')", groupID, tenantID).Error
+	if tenantID == "" {
+		err = fmt.Errorf("tenant required")
 	} else {
-		err = s.db.First(&dbGroup, "id = ?", groupID).Error
+		err = s.db.First(&dbGroup, "id = ? AND tenant_id = ?", groupID, tenantID).Error
 	}
 	if err != nil {
 		return nil, fmt.Errorf("group not found")
@@ -986,13 +987,14 @@ func (s *EsusuService) GetGroup(groupID string, tenantID string) (*EsusuGroup, e
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// Fetch group from database (allow empty tenant_id for backward compatibility)
+	// Fetch group from database (fail-closed tenant scoping: the tenant comes
+	// from verified JWT claims; an empty tenant is rejected, never unscoped)
 	var dbGroup DBEsusuGroup
 	var err error
-	if tenantID != "" {
-		err = s.db.First(&dbGroup, "id = ? AND (tenant_id = ? OR tenant_id IS NULL OR tenant_id = '')", groupID, tenantID).Error
+	if tenantID == "" {
+		err = fmt.Errorf("tenant required")
 	} else {
-		err = s.db.First(&dbGroup, "id = ?", groupID).Error
+		err = s.db.First(&dbGroup, "id = ? AND tenant_id = ?", groupID, tenantID).Error
 	}
 	if err != nil {
 		return nil, fmt.Errorf("group not found")
@@ -1403,9 +1405,10 @@ func (h *EsusuHandler) ListGroups(w http.ResponseWriter, r *http.Request) {
 	keycloakID := r.Header.Get("x-keycloak-id")
 	tenantID := r.Header.Get("x-tenant-id")
 
-	// Tenant ID is optional for backward compatibility
+	// Tenant scoping is fail-closed: a verified tenant claim is required
 	if tenantID == "" {
-		log.Printf("[ListGroups] Warning: x-tenant-id header missing, querying all tenants")
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return
 	}
 
 	// Parse query parameters
@@ -1556,11 +1559,15 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 			r.Header.Del("X-User-Id")
 			r.Header.Del("X-Keycloak-ID")
 		}
-		if tenant := tenantFromClaims(claims); tenant != "" {
-			r.Header.Set("X-Tenant-ID", tenant)
-		} else {
-			r.Header.Del("X-Tenant-ID")
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
 		}
+		r.Header.Set("X-Tenant-ID", tenant)
 		r.Header.Del("X-User-Role")
 		if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
 			if roleList, ok := ra["roles"].([]interface{}); ok {
