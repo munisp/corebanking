@@ -27,10 +27,28 @@ struct CreateRequest {
 }
 
 struct AppState {
-    db: PgPool,
+    records: std::sync::Mutex<Vec<serde_json::Value>>,
+    db_url: Option<String>,
+    db_client: Option<std::sync::Arc<tokio_postgres::Client>>,
+    db: Option<PgPool>,
 }
 
-fn compute_chain_hash(prev_hash: &str, entry: &str) -> String { format!("{:x}", prev_hash.bytes().chain(entry.bytes()).fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(b as u64))) }
+/// AUDIT-TOY: real SHA-256 chain hash (previously a non-cryptographic
+/// wrapping-mul byte fold). Mirrors services/security-service/audit_trail.go:
+/// every entry's hash covers the previous entry's hash, so rewriting or
+/// deleting any historical row invalidates every subsequent entry_hash.
+fn compute_chain_hash(prev_hash: &str, entry: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(prev_hash.as_bytes());
+    hasher.update(b"|");
+    hasher.update(entry.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
 
 
 // --- Graceful Degradation ---
@@ -328,7 +346,7 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -586,10 +604,27 @@ async fn main() -> std::io::Result<()> {
             None => None,
         }
     } else { None };
+    // AUDIT-TOY: the sqlx pool backs the durable, hash-chained audit_events
+    // table (schema ensured by init_schema). Absent DATABASE_URL the service
+    // still starts, but audit appends fail closed with 503 — an immutable
+    // audit trail must never fall back to process memory.
+    let db_pool = if let Ok(url) = std::env::var("DATABASE_URL") {
+        match PgPoolOptions::new().max_connections(10).connect(&url).await {
+            Ok(pool) => {
+                init_schema(&pool).await;
+                Some(pool)
+            }
+            Err(e) => {
+                eprintln!("immutable-audit-rs: sqlx pool connect failed: {}", e);
+                None
+            }
+        }
+    } else { None };
     let state = web::Data::new(AppState {
-        records: Mutex::new(Vec::new()),
+        records: std::sync::Mutex::new(Vec::new()),
         db_url: std::env::var("DATABASE_URL").ok(),
         db_client,
+        db: db_pool,
     });
     println!("immutable-audit-rs on port {}", port);
     start_grpc_server("immutable-audit-rs", 10414);
@@ -632,12 +667,11 @@ async fn main() -> std::io::Result<()> {
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
-            .route("/metrics", web::get().to(metrics))
+            .route("/metrics", web::get().to(prom_metrics))
+            // Audit is append-only: no update/delete routes exist by design.
             .route("/api/v1/audit_events", web::get().to(list_records))
             .service(web::resource("/api/v1/audit_events").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::post().to(create_record)))
             .service(web::resource("/api/v1/audit_events/{id}").wrap(actix_web::middleware::from_fn(jwt_route_guard)).route(web::get().to(get_record)))
-            .route("/api/v1/audit_events/{id}", web::put().to(update_record))
-            .route("/api/v1/audit_events/{id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", port))?
     .shutdown_timeout(30)
@@ -660,11 +694,163 @@ async fn init_schema(pool: &PgPool) {
     changes JSONB DEFAULT '{}',
     metadata JSONB DEFAULT '{}',
     tenant_id UUID NOT NULL,
+    previous_hash VARCHAR(64),
+    entry_hash VARCHAR(64),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )"#)
     .execute(pool)
     .await
     .expect("Failed to create audit_events table");
+
+    // Existing deployments created before the hash chain: add the columns.
+    for stmt in [
+        "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS previous_hash VARCHAR(64)",
+        "ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS entry_hash VARCHAR(64)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)",
+        "CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at)",
+    ] {
+        sqlx::query(stmt)
+            .execute(pool)
+            .await
+            .expect("Failed to evolve audit_events schema");
+    }
+}
+
+/// AUDIT-TOY: append a tamper-evident audit entry. The entry_hash chains to
+/// the previous row's entry_hash (SHA-256 over
+/// id|event_type|outcome|actor_id|tenant_id|action|resource_type|resource_id|previous_hash|timestamp,
+/// mirroring services/security-service/audit_trail.go). Fails closed with 503
+/// when the durable store is unavailable.
+async fn create_record(data: web::Data<AppState>, body: web::Json<serde_json::Value>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let pool = match &data.db {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "audit store unavailable — audit events are never recorded in memory"
+        })),
+    };
+    let input = body.into_inner();
+    let get_str = |key: &str| input.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let event_type = get_str("event_type");
+    let action = get_str("action");
+    let resource_type = get_str("resource_type");
+    let resource_id = get_str("resource_id");
+    let actor_type = {
+        let t = get_str("actor_type");
+        if t.is_empty() { "user".to_string() } else { t }
+    };
+    let outcome = {
+        let o = get_str("outcome");
+        if o.is_empty() { "success".to_string() } else { o }
+    };
+    if event_type.is_empty() || action.is_empty() {
+        return HttpResponse::BadRequest().json(json!({"error": "event_type and action are required"}));
+    }
+    let actor_id = match Uuid::parse_str(&get_str("actor_id")) {
+        Ok(u) => u,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "actor_id must be a UUID"})),
+    };
+    let tenant_id = match Uuid::parse_str(&get_str("tenant_id")) {
+        Ok(u) => u,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "tenant_id must be a UUID"})),
+    };
+    let changes = input.get("changes").cloned().unwrap_or_else(|| json!({}));
+    let metadata = input.get("metadata").cloned().unwrap_or_else(|| json!({}));
+    let ip_address = get_str("ip_address");
+    let user_agent = get_str("user_agent");
+
+    // Chain head: the most recent entry's hash (genesis entries chain to "").
+    let prev_hash: String = match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT entry_hash FROM audit_events ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(v) => v.flatten().unwrap_or_default(),
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(json!({"error": format!("chain head lookup failed: {}", e)}));
+        }
+    };
+
+    let id = Uuid::new_v4();
+    let ts = Utc::now().to_rfc3339();
+    let canonical = format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        id, event_type, outcome, actor_id, tenant_id, action, resource_type, resource_id, prev_hash, ts
+    );
+    let entry_hash = compute_chain_hash(&prev_hash, &canonical);
+
+    let result = sqlx::query(
+        "INSERT INTO audit_events (id, event_type, actor_id, actor_type, resource_type, resource_id, action, outcome, ip_address, user_agent, changes, metadata, tenant_id, previous_hash, entry_hash, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::inet, $10, $11, $12, $13, $14, $15, $16::timestamptz)",
+    )
+    .bind(id)
+    .bind(&event_type)
+    .bind(actor_id)
+    .bind(&actor_type)
+    .bind(&resource_type)
+    .bind(&resource_id)
+    .bind(&action)
+    .bind(&outcome)
+    .bind(if ip_address.is_empty() { None } else { Some(&ip_address) })
+    .bind(if user_agent.is_empty() { None } else { Some(&user_agent) })
+    .bind(&changes)
+    .bind(&metadata)
+    .bind(tenant_id)
+    .bind(&prev_hash)
+    .bind(&entry_hash)
+    .bind(&ts)
+    .execute(pool)
+    .await;
+
+    match result {
+        Ok(_) => HttpResponse::Created().json(json!({
+            "id": id.to_string(),
+            "event_type": event_type,
+            "entry_hash": entry_hash,
+            "previous_hash": prev_hash,
+            "status": "appended",
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": format!("audit append failed: {}", e)})),
+    }
+}
+
+/// Read a single audit entry by id (read-only; no mutation routes exist).
+async fn get_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let pool = match &data.db {
+        Some(p) => p,
+        None => return HttpResponse::ServiceUnavailable().json(json!({"error": "audit store unavailable"})),
+    };
+    let id = match Uuid::parse_str(&path.into_inner()) {
+        Ok(u) => u,
+        Err(_) => return HttpResponse::BadRequest().json(json!({"error": "id must be a UUID"})),
+    };
+    let row = sqlx::query(
+        "SELECT id, event_type, actor_id, actor_type, resource_type, resource_id, action, outcome, tenant_id, previous_hash, entry_hash, created_at FROM audit_events WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await;
+
+    match row {
+        Ok(Some(r)) => HttpResponse::Ok().json(json!({
+            "id": r.get::<Uuid, _>("id").to_string(),
+            "event_type": r.get::<String, _>("event_type"),
+            "actor_id": r.get::<Uuid, _>("actor_id").to_string(),
+            "actor_type": r.get::<String, _>("actor_type"),
+            "resource_type": r.get::<String, _>("resource_type"),
+            "resource_id": r.get::<String, _>("resource_id"),
+            "action": r.get::<String, _>("action"),
+            "outcome": r.get::<String, _>("outcome"),
+            "tenant_id": r.get::<Uuid, _>("tenant_id").to_string(),
+            "previous_hash": r.get::<Option<String>, _>("previous_hash"),
+            "entry_hash": r.get::<Option<String>, _>("entry_hash"),
+            "created_at": r.get::<chrono::DateTime<Utc>, _>("created_at").to_rfc3339(),
+        })),
+        Ok(None) => HttpResponse::NotFound().json(json!({"error": "not found"})),
+        Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+    }
 }
 
 #[cfg(test)]
@@ -701,46 +887,6 @@ mod tests {
 
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE audit_events SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("audit_events.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req).await { return resp; }
-    let id = path.into_inner();
-    sqlx::query("UPDATE audit_events SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("audit_events.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
-}
+// Append-only by design: audit_events has no UPDATE/DELETE handlers. Any
+// mutation or removal of an entry would invalidate the SHA-256 entry_hash
+// chain written by create_record (AUDIT-TOY).
