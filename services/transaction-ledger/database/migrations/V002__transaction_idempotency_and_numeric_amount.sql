@@ -38,7 +38,7 @@ ALTER TABLE "transaction"
     ALTER COLUMN amount TYPE NUMERIC(20, 2)
     USING (
         CASE
-            WHEN amount IS NULL OR trim(amount) = '' THEN 0.00
+            WHEN amount IS NULL OR trim(amount::text) = '' THEN 0.00
             ELSE amount::NUMERIC(20, 2)
         END
     );
