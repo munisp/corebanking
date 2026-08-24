@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"time"
 
@@ -1206,19 +1207,147 @@ func saveForbearanceRequest(mortgageID, forbearanceID, forbearanceType string, d
 	return err
 }
 
+// amountToMinorUnits converts a major-unit (naira) amount to integer minor
+// units (kobo). All arrears arithmetic below is done in integer minor units
+// so float drift can never misclassify a mortgage.
+func amountToMinorUnits(amount float64) int64 {
+	return int64(math.Round(amount * 100))
+}
+
+func arrearsBucket(daysPastDue int) string {
+	switch {
+	case daysPastDue >= 90:
+		return "90+"
+	case daysPastDue >= 60:
+		return "61-90"
+	case daysPastDue >= 30:
+		return "31-60"
+	case daysPastDue > 0:
+		return "1-30"
+	default:
+		return "current"
+	}
+}
+
+// computeArrears recalculates the arrears position of a mortgage from its
+// repayment schedule: every pending schedule entry whose due date has passed
+// contributes its outstanding amount (scheduled total minus what has already
+// been paid against the entry). Fails closed when the database is
+// unavailable — a mortgage must never be reported "current" because the
+// schedule could not be read.
+func computeArrears(mortgageID string) (*ArrearsStatus, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+
+	schedule, err := fetchRepaymentSchedule(mortgageID)
+	if err != nil {
+		return nil, fmt.Errorf("fetch repayment schedule for arrears: %w", err)
+	}
+
+	today := time.Now()
+	var arrearsKobo int64
+	daysPastDue := 0
+	for _, entry := range schedule {
+		if entry.Status != "pending" || !entry.DueDate.Before(today) {
+			continue
+		}
+		outstandingKobo := amountToMinorUnits(entry.TotalAmount) - amountToMinorUnits(entry.PaidAmount)
+		if outstandingKobo <= 0 {
+			continue
+		}
+		arrearsKobo += outstandingKobo
+		if days := int(today.Sub(entry.DueDate).Hours() / 24); days > daysPastDue {
+			daysPastDue = days
+		}
+	}
+
+	var lastPaymentDate *time.Time
+	row := db.QueryRow(
+		"SELECT MAX(paid_date) FROM mortgage_payments WHERE mortgage_id = $1 AND status = 'paid'",
+		mortgageID,
+	)
+	if err := row.Scan(&lastPaymentDate); err != nil {
+		return nil, fmt.Errorf("fetch last payment date for arrears: %w", err)
+	}
+
+	return &ArrearsStatus{
+		MortgageID:      mortgageID,
+		InArrears:       arrearsKobo > 0,
+		DaysPastDue:     daysPastDue,
+		ArrearsAmount:   float64(arrearsKobo) / 100,
+		Bucket:          arrearsBucket(daysPastDue),
+		PenaltyAmount:   0, // no penalty policy is configured in this service
+		LastPaymentDate: lastPaymentDate,
+	}, nil
+}
+
+// updateArrearsStatus recalculates the arrears position and persists it to
+// mortgage_arrears. Called after every payment (main.go) and from the daily
+// servicing workflow (temporal_workflows.go). A cleared position resolves any
+// active arrears record; an overdue position upserts the active record.
 func updateArrearsStatus(mortgageID, tenantID string) error {
-	// Calculate arrears based on payment history
-	return nil
+	if db == nil {
+		return fmt.Errorf("database not available")
+	}
+
+	status, err := computeArrears(mortgageID)
+	if err != nil {
+		return err
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin arrears update: %w", err)
+	}
+	defer tx.Rollback()
+
+	if !status.InArrears {
+		// Arrears cleared — resolve any active record.
+		if _, err := tx.Exec(
+			"UPDATE mortgage_arrears SET status = 'resolved', updated_at = NOW() WHERE mortgage_id = $1 AND status = 'active'",
+			mortgageID,
+		); err != nil {
+			return fmt.Errorf("resolve cleared arrears for mortgage %s: %w", mortgageID, err)
+		}
+		return tx.Commit()
+	}
+
+	res, err := tx.Exec(
+		`UPDATE mortgage_arrears SET
+			arrears_amount = $2, days_past_due = $3, bucket = $4,
+			penalty_amount = $5, last_payment_date = $6, updated_at = NOW()
+		WHERE mortgage_id = $1 AND status = 'active'`,
+		mortgageID, status.ArrearsAmount, status.DaysPastDue, status.Bucket,
+		status.PenaltyAmount, status.LastPaymentDate,
+	)
+	if err != nil {
+		return fmt.Errorf("update arrears record for mortgage %s: %w", mortgageID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("arrears update result for mortgage %s: %w", mortgageID, err)
+	}
+	if affected == 0 {
+		if _, err := tx.Exec(
+			`INSERT INTO mortgage_arrears (
+				id, mortgage_id, arrears_amount, days_past_due, bucket,
+				penalty_amount, last_payment_date, status
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')`,
+			generateID("ARR"), mortgageID, status.ArrearsAmount, status.DaysPastDue,
+			status.Bucket, status.PenaltyAmount, status.LastPaymentDate,
+		); err != nil {
+			return fmt.Errorf("insert arrears record for mortgage %s: %w", mortgageID, err)
+		}
+	}
+
+	log.Printf("Arrears recalculated for mortgage %s (tenant %s): in_arrears=%v days_past_due=%d amount=%.2f bucket=%s",
+		mortgageID, tenantID, status.InArrears, status.DaysPastDue, status.ArrearsAmount, status.Bucket)
+	return tx.Commit()
 }
 
 func calculateArrearsStatus(mortgageID string) (*ArrearsStatus, error) {
-	return &ArrearsStatus{
-		MortgageID:    mortgageID,
-		InArrears:     false,
-		DaysPastDue:   0,
-		ArrearsAmount: 0,
-		Bucket:        "current",
-	}, nil
+	return computeArrears(mortgageID)
 }
 
 // ArrearsStatus represents arrears information
