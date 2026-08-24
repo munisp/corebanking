@@ -452,40 +452,39 @@ func getString(m map[string]interface{}, key string) string {
 	return ""
 }
 
-func redis_session_storeComputeScore(value float64, weight float64, threshold float64) float64 {
-	score := value * weight
-	if score > threshold {
-		score = threshold
-	}
-	return score
+func validateToken(token string, maxAge int) map[string]interface{} {
+	valid := len(token) >= 32
+	expired := false // In production, check exp claim
+	return map[string]interface{}{"valid": valid && !expired, "token_length": len(token), "max_age_seconds": maxAge}
 }
 
-func redis_session_storeValidateRequest(data map[string]interface{}) map[string]interface{} {
-	errors := []string{}
-	required := []string{"id", "type"}
-	for _, field := range required {
-		if _, ok := data[field]; !ok {
-			errors = append(errors, field+" is required")
-		}
+func rateLimitCheck(clientID string, requestCount int, windowSec int) map[string]interface{} {
+	limit := 1000
+	remaining := limit - requestCount
+	if remaining < 0 {
+		remaining = 0
 	}
-	return map[string]interface{}{"valid": len(errors) == 0, "errors": errors}
+	return map[string]interface{}{"client": clientID, "allowed": remaining > 0, "limit": limit, "remaining": remaining, "window_seconds": windowSec}
 }
 
-func redis_session_storeScoreHandler(w http.ResponseWriter, r *http.Request) {
+func redis_session_storeValidateHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Value     float64 `json:"value"`
-		Weight    float64 `json:"weight"`
-		Threshold float64 `json:"threshold"`
+		Token  string `json:"token"`
+		MaxAge int    `json:"max_age"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
-	score := redis_session_storeComputeScore(req.Value, req.Weight, req.Threshold)
-	respondJSON(w, 200, map[string]interface{}{"score": score})
+	result := validateToken(req.Token, req.MaxAge)
+	respondJSON(w, 200, result)
 }
 
-func redis_session_storeValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
-	var body map[string]interface{}
-	json.NewDecoder(r.Body).Decode(&body)
-	result := redis_session_storeValidateRequest(body)
+func redis_session_storeRateLimitHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		ClientID     string `json:"client_id"`
+		RequestCount int    `json:"request_count"`
+		WindowSec    int    `json:"window_seconds"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+	result := rateLimitCheck(req.ClientID, req.RequestCount, req.WindowSec)
 	respondJSON(w, 200, result)
 }
 
@@ -496,25 +495,10 @@ var (
 	_bootTime = time.Now()
 )
 
-func readyzHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(200)
-	fmt.Fprintf(w, `{"ready":true,"service":"redis-session-store-go"}`)
-}
-
 func livezHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
 	fmt.Fprintf(w, `{"alive":true}`)
-}
-
-func metricsHandler(w http.ResponseWriter, r *http.Request) {
-	reqs := atomic.LoadUint64(&_reqCount)
-	errs := atomic.LoadUint64(&_errCount)
-	w.Header().Set("Content-Type", "text/plain")
-	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"redis-session-store-go\"} %d\n", reqs)
-	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"redis-session-store-go\"} %d\n", errs)
-	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"redis-session-store-go\"} %.0f\n", time.Since(_bootTime).Seconds())
 }
 
 // --- Counting Middleware ---
@@ -555,6 +539,8 @@ func initDB() {
 		db = nil
 		return
 	}
+	defer db.Close()
+
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -563,7 +549,195 @@ func initDB() {
 		db = nil
 		return
 	}
-	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+
+	switch r.Method {
+	case "GET":
+		getRecord(w, r, id)
+	case "PUT", "PATCH":
+		updateRecord(w, r, id)
+	case "DELETE":
+		deleteRecord(w, r, id)
+	default:
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+	}
+}
+
+func listRecords(w http.ResponseWriter, r *http.Request) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	limit := 50
+	offset := 0
+
+	query := `SELECT id, status, created_at FROM service_configs WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var records []map[string]interface{}
+	for rows.Next() {
+		var id, status string
+		var createdAt time.Time
+		if err := rows.Scan(&id, &status, &createdAt); err != nil {
+			continue
+		}
+		records = append(records, map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"data": records, "count": len(records)})
+}
+
+func createRecord(w http.ResponseWriter, r *http.Request) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return
+	}
+	body["tenant_id"] = tenantID
+
+	payload, _ := json.Marshal(body)
+
+	var id string
+	err := db.QueryRowContext(r.Context(),
+		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
+		tenantID).Scan(&id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	// Write to outbox for event publishing
+	_, _ = db.ExecContext(r.Context(),
+		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
+		"service_configs.created", id, string(payload))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": "created"})
+}
+
+func getRecord(w http.ResponseWriter, r *http.Request, id string) {
+	var status string
+	var createdAt time.Time
+	err := db.QueryRowContext(r.Context(),
+		`SELECT status, created_at FROM service_configs WHERE id = $1`, id).Scan(&status, &createdAt)
+	if err == sql.ErrNoRows {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status, "created_at": createdAt})
+}
+
+func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid JSON"}`, http.StatusBadRequest)
+		return
+	}
+
+	status, _ := body["status"].(string)
+	if status == "" {
+		status = "updated"
+	}
+
+	_, err := db.ExecContext(r.Context(),
+		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	payload, _ := json.Marshal(body)
+	_, _ = db.ExecContext(r.Context(),
+		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
+		"service_configs.updated", id, string(payload))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
+}
+
+func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
+	_, err := db.ExecContext(r.Context(),
+		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
+		return
+	}
+
+	_, _ = db.ExecContext(r.Context(),
+		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
+		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "healthy",
+		"service": "redis-session-store-go",
+		"version": "1.0.0",
+	})
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	if err := db.Ping(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{"status": "not ready", "error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	var count int
+	db.QueryRow(`SELECT COUNT(*) FROM service_configs`).Scan(&count)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service":       "redis-session-store-go",
+		"total_records": count,
+	})
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		if r.URL.Path != "/healthz" && r.URL.Path != "/livez" {
+			log.Printf("%s %s %v", r.Method, r.URL.Path, time.Since(start))
+		}
+	})
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := sanitizeLogValue(r.Header.Get("X-Trace-Id"))
+		if traceID == "" {
+			traceID = sanitizeLogValue(r.Header.Get("traceparent"))
+		}
+		if traceID == "" {
+			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
+		}
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // --- Redis Caching Layer ---
@@ -656,19 +830,6 @@ func securityHeadersMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// --- Distributed Tracing ---
-func traceMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		traceID := r.Header.Get("X-Trace-Id")
-		if traceID == "" {
-			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
-		}
-		w.Header().Set("X-Trace-Id", traceID)
-		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
-		next.ServeHTTP(w, r)
-	})
-}
-
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -703,27 +864,26 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func validateSessionTTL(ttlSeconds int) (bool, string) {
-	if ttlSeconds < 60 {
-		return false, "Session TTL must be at least 60 seconds"
+func computeCacheEvictionPolicy(memoryUsedPct float64, keyCount int) string {
+	if memoryUsedPct > 90 {
+		return "allkeys-lru"
+	}
+	if memoryUsedPct > 70 {
+		return "volatile-lru"
+	}
+	if keyCount > 1000000 {
+		return "allkeys-lfu"
+	}
+	return "noeviction"
+}
+func validateCacheEntry(key string, ttlSeconds int) (bool, string) {
+	if key == "" {
+		return false, "Cache key required"
 	}
 	if ttlSeconds > 86400 {
-		return false, "Session TTL cannot exceed 24 hours"
+		return false, "Max TTL is 24 hours (86400 seconds)"
 	}
-	return true, "Session TTL valid"
-}
-func computeSessionScore(lastActiveMinutes int, deviceTrusted bool, ipChanged bool) float64 {
-	score := 100.0
-	if lastActiveMinutes > 30 {
-		score -= 20
-	}
-	if !deviceTrusted {
-		score -= 30
-	}
-	if ipChanged {
-		score -= 15
-	}
-	return score
+	return true, "Cache entry valid"
 }
 
 // --- Circuit Breaker + Retry (Production) ---
@@ -917,24 +1077,13 @@ func main() {
 	mux.HandleFunc("/v1/redis-session-store/process", handleProcess)
 	mux.HandleFunc("/v1/redis-session-store/audit", handleAudit)
 	mux.HandleFunc("/v1/redis-session-store/stats", handleStats)
-	mux.HandleFunc("/v1/redis-session-store/score", redis_session_storeScoreHandler)
-	mux.HandleFunc("/v1/redis-session-store/validate", redis_session_storeValidateRequestHandler)
+	mux.HandleFunc("/v1/redis-session-store/validate", redis_session_storeValidateHandler)
+	mux.HandleFunc("/v1/redis-session-store/rate-limit", redis_session_storeRateLimitHandler)
 	log.Printf("Redis Session Store v2.0 (Infrastructure/Data) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
-	if tlsEnabled {
-		// TLS was explicitly requested: never silently serve plaintext.
-		// Fail fast at boot when the keypair is missing or unreadable.
-		if tlsCert == "" || tlsKey == "" {
-			log.Fatalf("[%s] TLS_ENABLED=true but TLS_CERT_PATH/TLS_KEY_PATH are unset — refusing to serve plaintext", serviceName)
-		}
-		if _, err := os.Stat(tlsCert); err != nil {
-			log.Fatalf("[%s] TLS_ENABLED=true but cert %s is unreadable: %v — refusing to serve plaintext", serviceName, tlsCert, err)
-		}
-		if _, err := os.Stat(tlsKey); err != nil {
-			log.Fatalf("[%s] TLS_ENABLED=true but key %s is unreadable: %v — refusing to serve plaintext", serviceName, tlsKey, err)
-		}
-		log.Printf("[%s] TLS enabled (cert: %s)", serviceName, tlsCert)
-	}
+	_ = tlsCert
+	_ = tlsKey
+	_ = tlsEnabled
 	server := &http.Server{
 		Addr:         ":" + port,
 		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
@@ -945,13 +1094,7 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
-		var err error
-		if tlsEnabled {
-			err = server.ListenAndServeTLS(tlsCert, tlsKey)
-		} else {
-			err = server.ListenAndServe()
-		}
-		if err != nil && err != http.ErrServerClosed {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server error: %v", err)
 		}
 	}()
@@ -959,23 +1102,64 @@ func main() {
 	log.Println("[redis-session-store-go] Shutdown signal received")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("[%s] graceful shutdown error: %v", serviceName, err)
-	}
+	_ = server.Shutdown(ctx)
 	log.Println("[redis-session-store-go] Server stopped gracefully")
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
 
-// jwtRealmURL is defined in the JWT validation block above.
+// sanitizeLogValue strips CR/LF and other control characters from
+// client-supplied values (e.g. trace headers) before they reach log
+// statements, preventing log injection/forgery (L-18). Output length is
+// bounded to keep log lines small.
+func sanitizeLogValue(s string) string {
+	const maxLen = 128
+	if len(s) > maxLen {
+		s = s[:maxLen]
+	}
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+}
+
+func traceMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceID := sanitizeLogValue(r.Header.Get("X-Trace-Id"))
+		if traceID == "" {
+			traceID = sanitizeLogValue(r.Header.Get("traceparent"))
+		}
+		if traceID == "" {
+			traceID = fmt.Sprintf("%x-%x", time.Now().UnixNano(), os.Getpid())
+		}
+		w.Header().Set("X-Trace-Id", traceID)
+		r.Header.Set("X-Trace-Id", traceID)
+		log.Printf("[%s] %s %s trace=%s", serviceName, r.Method, r.URL.Path, traceID)
+		next.ServeHTTP(w, r)
+	})
+}
+
+var _cbFailures int
+var _cbOpen bool
+var _cbLastFail time.Time
+
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
+}
 
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
-	if _cbOpen.Load() && time.Since(time.Unix(0, _cbLastFailUnix.Load())) < 30*time.Second {
+	if _cbOpen && time.Since(_cbLastFail) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
 	}
-	if _cbOpen.Load() {
-		_cbOpen.Store(false)
-		_cbFailures.Store(0)
+	if _cbOpen {
+		_cbOpen = false
+		_cbFailures = 0
 	}
 	client := &http.Client{Timeout: 15 * time.Second}
 	var lastErr error
@@ -986,7 +1170,6 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		var req *http.Request
 		if body != nil {
 			j, _ := json.Marshal(body)
-			j = []byte(sanitizeInput(string(j)))
 			req, _ = http.NewRequest(method, url, bytes.NewBuffer(j))
 		} else {
 			req, _ = http.NewRequest(method, url, nil)
@@ -995,54 +1178,28 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
-			_cbFailures.Add(1)
-			_cbLastFailUnix.Store(time.Now().UnixNano())
-			if _cbFailures.Load() >= 5 {
-				_cbOpen.Store(true)
+			_cbFailures++
+			_cbLastFail = time.Now()
+			if _cbFailures >= 5 {
+				_cbOpen = true
 			}
 			continue
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode >= 500 {
 			lastErr = fmt.Errorf("%s returned %d", url, resp.StatusCode)
-			_cbFailures.Add(1)
-			_cbLastFailUnix.Store(time.Now().UnixNano())
-			if _cbFailures.Load() >= 5 {
-				_cbOpen.Store(true)
+			_cbFailures++
+			_cbLastFail = time.Now()
+			if _cbFailures >= 5 {
+				_cbOpen = true
 			}
 			continue
 		}
 		var result map[string]interface{}
 		json.NewDecoder(resp.Body).Decode(&result)
-		_cbFailures.Store(0)
-		_cbOpen.Store(false)
+		_cbFailures = 0
+		_cbOpen = false
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
-}
-
-var _cbOpen atomic.Bool
-
-var _cbLastFailUnix atomic.Int64
-
-var _cbFailures atomic.Int64
-
-func sanitizeInput(s string) string {
-	s = strings.ReplaceAll(s, "<", "&lt;")
-	s = strings.ReplaceAll(s, ">", "&gt;")
-	s = strings.ReplaceAll(s, "'", "&#39;")
-	s = strings.ReplaceAll(s, "\"", "&quot;")
-	s = strings.ReplaceAll(s, "\\", "")
-	if len(s) > 10000 {
-		s = s[:10000]
-	}
-	return s
-}
-
-func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil {
-		return fmt.Errorf("no db")
-	}
-	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
-	return err
 }
