@@ -997,5 +997,6 @@ async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> Ht
         .bind(&id)
         .bind(&payload)
         .execute(&data.db).await.ok();
+
     HttpResponse::NoContent().finish()
 }
