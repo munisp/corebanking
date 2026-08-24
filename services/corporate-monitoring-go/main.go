@@ -938,19 +938,21 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 }
 
 func initSchema() {
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS service_configs (
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS audit_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    config_key VARCHAR(128) NOT NULL,
-    config_value JSONB NOT NULL,
-    environment VARCHAR(20) NOT NULL DEFAULT 'production',
-    version INT NOT NULL DEFAULT 1,
-    description TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    updated_by UUID,
-    tenant_id UUID,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(config_key, environment, tenant_id)
+    event_type VARCHAR(64) NOT NULL,
+    actor_id UUID NOT NULL,
+    actor_type VARCHAR(20) NOT NULL,
+    resource_type VARCHAR(64) NOT NULL,
+    resource_id VARCHAR(128) NOT NULL,
+    action VARCHAR(32) NOT NULL,
+    outcome VARCHAR(20) NOT NULL DEFAULT 'success',
+    ip_address INET,
+    user_agent TEXT,
+    changes JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    tenant_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 	)`)
 	if err != nil {
 		log.Fatalf("schema init failed: %v", err)
@@ -969,9 +971,9 @@ func initSchema() {
 		log.Printf("outbox table creation (may already exist): %v", err)
 	}
 
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)`)
-	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_events_status ON audit_events(status)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at DESC)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
 }
 
@@ -987,7 +989,7 @@ func domainHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func domainDetailHandler(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/service_configs/"), "/")
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/v1/audit_events/"), "/")
 	id := parts[0]
 	if id == "" {
 		http.Error(w, `{"error":"id required"}`, http.StatusBadRequest)
@@ -1014,7 +1016,7 @@ func listRecords(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	offset := 0
 
-	query := `SELECT id, status, created_at FROM service_configs WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	query := `SELECT id, status, created_at FROM audit_events WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1057,7 +1059,7 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	var id string
 	err := db.QueryRowContext(r.Context(),
-		`INSERT INTO service_configs (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
+		`INSERT INTO audit_events (tenant_id, status) VALUES ($1, 'active') RETURNING id`,
 		tenantID).Scan(&id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -1067,7 +1069,7 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 	// Write to outbox for event publishing
 	_, _ = db.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.created", id, string(payload))
+		"audit_events.created", id, string(payload))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
@@ -1078,7 +1080,7 @@ func getRecord(w http.ResponseWriter, r *http.Request, id string) {
 	var status string
 	var createdAt time.Time
 	err := db.QueryRowContext(r.Context(),
-		`SELECT status, created_at FROM service_configs WHERE id = $1`, id).Scan(&status, &createdAt)
+		`SELECT status, created_at FROM audit_events WHERE id = $1`, id).Scan(&status, &createdAt)
 	if err == sql.ErrNoRows {
 		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		return
@@ -1105,7 +1107,7 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	}
 
 	_, err := db.ExecContext(r.Context(),
-		`UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
+		`UPDATE audit_events SET status = $1, updated_at = NOW() WHERE id = $2`, status, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -1114,7 +1116,7 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 	payload, _ := json.Marshal(body)
 	_, _ = db.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.updated", id, string(payload))
+		"audit_events.updated", id, string(payload))
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{"id": id, "status": status})
@@ -1122,7 +1124,7 @@ func updateRecord(w http.ResponseWriter, r *http.Request, id string) {
 
 func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
 	_, err := db.ExecContext(r.Context(),
-		`UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
+		`UPDATE audit_events SET status = 'deleted', updated_at = NOW() WHERE id = $1`, id)
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
@@ -1130,7 +1132,7 @@ func deleteRecord(w http.ResponseWriter, r *http.Request, id string) {
 
 	_, _ = db.ExecContext(r.Context(),
 		`INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)`,
-		"service_configs.deleted", id, `{"id":"`+id+`"}`)
+		"audit_events.deleted", id, `{"id":"`+id+`"}`)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -1214,25 +1216,27 @@ func rateLimitMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func validateCorporateExposure(totalExposure float64, paidUpCapital float64) (bool, string) {
-	maxSingle := paidUpCapital * 0.20
-	if totalExposure > maxSingle {
-		return false, fmt.Sprintf("Single obligor limit: max ₦%.0f (20%% of paid-up capital)", maxSingle)
+// ─── Domain Logic: Corporate Monitoring ────────────────────────────────────────────
+
+func validateRequest(requestType string, payload map[string]interface{}) (bool, string) {
+	if requestType == "" {
+		return false, "Request type required"
 	}
-	return true, "Within CBN single obligor limit"
+	if len(payload) == 0 {
+		return false, "Payload required"
+	}
+	return true, "Request valid"
 }
-func computeDebtServiceCoverage(netIncome float64, debtService float64) (float64, string) {
-	if debtService <= 0 {
-		return 0, "No debt service"
+
+func computeMetrics(items []map[string]interface{}) map[string]interface{} {
+	total := len(items)
+	active := 0
+	for _, item := range items {
+		if status, ok := item["status"].(string); ok && status == "active" {
+			active++
+		}
 	}
-	dscr := netIncome / debtService
-	rating := "strong"
-	if dscr < 1.0 {
-		rating = "impaired"
-	} else if dscr < 1.5 {
-		rating = "watch"
-	}
-	return dscr, rating
+	return map[string]interface{}{"total": total, "active": active, "inactive": total - active, "utilization": float64(active) / float64(total+1) * 100}
 }
 
 // --- Circuit Breaker + Retry (Production) ---
@@ -1407,7 +1411,7 @@ func degradationStatusHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "9320"
+		port = "9336"
 	}
 	initDB()
 	mux := http.NewServeMux()
@@ -1466,6 +1470,14 @@ func jwtRealmURL() string {
 	return "http://keycloak:8080/realms/54bank"
 }
 
+func dbInsert(id, service, typ, status string, data []byte) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
+	return err
+}
+
 func callService(method, url string, body interface{}) (map[string]interface{}, error) {
 	if _cbOpen.Load() && time.Since(time.Unix(0, _cbLastFailUnix.Load())) < 30*time.Second {
 		return nil, fmt.Errorf("circuit breaker open for %s", url)
@@ -1516,14 +1528,6 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 		return result, nil
 	}
 	return nil, fmt.Errorf("retries exhausted for %s: %w", url, lastErr)
-}
-
-func dbInsert(id, service, typ, status string, data []byte) error {
-	if db == nil {
-		return fmt.Errorf("no db")
-	}
-	_, err := db.Exec("INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5)", id, service, typ, status, string(data))
-	return err
 }
 
 var _cbOpen atomic.Bool
