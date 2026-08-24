@@ -48,7 +48,7 @@ async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_js
 
 async fn test_coverage(req: actix_web::HttpRequest, state: web::Data<AppState>) -> HttpResponse {
     let _ = sanitize_input("");
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     let upstream = std::env::var("SECURITY_URL").unwrap_or_else(|_| "http://security-gateway-go:8080".to_string());
     let _ = tokio::task::spawn_blocking(move || call_service_sync(&format!("{}/v1/notify", upstream), r#"{"source": "platform-hardening-rs", "action": "test_coverage"}"#)).await;
@@ -78,7 +78,7 @@ async fn test_coverage(req: actix_web::HttpRequest, state: web::Data<AppState>) 
 
 // Enhancement 22: Security Scanning
 async fn security_scanning(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "enhancementId": 22,
@@ -104,7 +104,7 @@ async fn security_scanning(req: actix_web::HttpRequest) -> HttpResponse {
 
 // Enhancement 23: Database Indexing
 async fn db_indexing(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "enhancementId": 23,
@@ -135,7 +135,7 @@ async fn db_indexing(req: actix_web::HttpRequest) -> HttpResponse {
 
 // Enhancement 24: API Versioning
 async fn api_versioning(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "enhancementId": 24,
@@ -166,7 +166,7 @@ async fn api_versioning(req: actix_web::HttpRequest) -> HttpResponse {
 
 // Enhancement 25: Feature Flags
 async fn feature_flags(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "enhancementId": 25,
@@ -196,7 +196,7 @@ async fn feature_flags(req: actix_web::HttpRequest) -> HttpResponse {
 
 // Enhancement 26: Secrets Management
 async fn secrets_management(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "enhancementId": 26,
@@ -223,7 +223,7 @@ async fn secrets_management(req: actix_web::HttpRequest) -> HttpResponse {
 
 // Enhancement 27: GraphQL
 async fn graphql_layer(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "enhancementId": 27,
@@ -258,7 +258,7 @@ async fn graphql_layer(req: actix_web::HttpRequest) -> HttpResponse {
 
 // Enhancement 28: Event Sourcing
 async fn event_sourcing(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "enhancementId": 28,
@@ -294,7 +294,7 @@ async fn event_sourcing(req: actix_web::HttpRequest) -> HttpResponse {
 
 // Quick Wins (5 items)
 async fn quick_wins(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "name": "Quick Wins (< 1 week each)",
@@ -360,7 +360,7 @@ fn degradation_mode() -> &'static str {
 }
 
 async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     HttpResponse::Ok().json(json!({
         "db_available": DB_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
         "cache_available": CACHE_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed),
@@ -369,7 +369,7 @@ async fn degradation_status(req: actix_web::HttpRequest) -> HttpResponse {
 }
 
 async fn healthz(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     if !rl_allow() { return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded", "retry_after": 1})); }
     HttpResponse::Ok().json(json!({
         "status": "healthy", "service": "platform-hardening-rs", "version": "1.0.0",
@@ -385,7 +385,7 @@ static _ERR_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // --- Alerting ---
 async fn alerts_endpoint(req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let reqs = _REQ_COUNT.load(AtomicOrdering::Relaxed);
     let errs = _ERR_COUNT.load(AtomicOrdering::Relaxed);
     let error_rate = if reqs > 0 { errs as f64 / reqs as f64 } else { 0.0 };
@@ -437,7 +437,172 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
 
 
 // --- JWT Auth Check ---
-fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
+// --- JWT Auth Check (fail-closed; R4-V4 remediation) ---
+// Canonical RS256/JWKS-primary verifier aligned with pin-block-engine-rs:
+// tokens are verified against the Keycloak JWKS (KEYCLOAK_JWKS_URL, or derived
+// from KEYCLOAK_REALM_URL) with a 300s cache and a 5s fetch timeout; HS256 via
+// JWT_SECRET remains as a fallback. 401 on missing/malformed/expired/
+// unknown-kid tokens; 503 when no verification backend is available. Verified
+// claims are stored in request extensions for downstream handlers.
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct VerifiedClaims(serde_json::Value);
+
+struct JwksCacheEntry {
+    fetched_at: std::time::Instant,
+    keys: jsonwebtoken::jwk::JwkSet,
+}
+
+static JWKS_CACHE: std::sync::OnceLock<std::sync::Mutex<Option<JwksCacheEntry>>> = std::sync::OnceLock::new();
+
+fn jwks_cache() -> &'static std::sync::Mutex<Option<JwksCacheEntry>> {
+    JWKS_CACHE.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn jwks_url() -> Option<String> {
+    if let Ok(u) = std::env::var("KEYCLOAK_JWKS_URL") {
+        if !u.is_empty() {
+            return Some(u);
+        }
+    }
+    match std::env::var("KEYCLOAK_REALM_URL") {
+        Ok(realm) if !realm.is_empty() => {
+            Some(format!("{}/protocol/openid-connect/certs", realm.trim_end_matches('/')))
+        }
+        _ => None,
+    }
+}
+
+async fn fetch_jwks() -> Result<jsonwebtoken::jwk::JwkSet, actix_web::HttpResponse> {
+    const JWKS_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+    let url = match jwks_url() {
+        Some(u) => u,
+        None => {
+            return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                "error": "jwt_validation_unavailable",
+                "detail": "no JWKS endpoint configured"
+            })))
+        }
+    };
+    {
+        let cache = jwks_cache().lock().unwrap();
+        if let Some(entry) = cache.as_ref() {
+            if entry.fetched_at.elapsed() < JWKS_TTL {
+                return Ok(entry.keys.clone());
+            }
+        }
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|_| actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "client init failed"
+        })))?;
+    let resp = client.get(&url).send().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwks_unavailable"}))
+    })?;
+    if !resp.status().is_success() {
+        return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "upstream returned error status"
+        })));
+    }
+    let keys = resp.json::<jsonwebtoken::jwk::JwkSet>().await.map_err(|_| {
+        actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+            "error": "jwks_unavailable",
+            "detail": "malformed JWKS payload"
+        }))
+    })?;
+    let mut cache = jwks_cache().lock().unwrap();
+    *cache = Some(JwksCacheEntry { fetched_at: std::time::Instant::now(), keys: keys.clone() });
+    Ok(keys)
+}
+
+fn apply_iss_aud(validation: &mut jsonwebtoken::Validation) {
+    if let Ok(iss) = std::env::var("JWT_EXPECTED_ISS") {
+        if !iss.is_empty() {
+            validation.set_issuer(&[iss]);
+        }
+    }
+    if let Ok(aud) = std::env::var("JWT_EXPECTED_AUD") {
+        if !aud.is_empty() {
+            validation.set_audience(&[aud]);
+        }
+    }
+}
+
+async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::HttpResponse> {
+    let header = jsonwebtoken::decode_header(token)
+        .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "malformed token header"})))?;
+    match header.alg {
+        jsonwebtoken::Algorithm::RS256 => {
+            let kid = match header.kid.clone() {
+                Some(k) if !k.is_empty() => k,
+                _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "missing kid"}))),
+            };
+            // JWKS outage => 503 (fail closed). Unknown kid => force one cache
+            // refresh (key rotation), then 401 if still unknown.
+            let jwks = fetch_jwks().await?;
+            let jwk = match jwks.find(&kid) {
+                Some(j) => j.clone(),
+                None => {
+                    {
+                        let mut cache = jwks_cache().lock().unwrap();
+                        *cache = None;
+                    }
+                    let refreshed = fetch_jwks().await?;
+                    match refreshed.find(&kid) {
+                        Some(j) => j.clone(),
+                        None => {
+                            return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "unknown kid"})))
+                        }
+                    }
+                }
+            };
+            let key = jsonwebtoken::DecodingKey::from_jwk(&jwk)
+                .map_err(|_| actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid jwk"})))?;
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::RS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        jsonwebtoken::Algorithm::HS256 => {
+            // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
+            let secret = match std::env::var("JWT_SECRET") {
+                Ok(s) if !s.is_empty() => s,
+                _ => {
+                    return Err(actix_web::HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                        "error": "jwt_validation_unavailable",
+                        "detail": "JWT_SECRET is not configured; refusing to validate"
+                    })))
+                }
+            };
+            let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+            validation.validate_exp = true;
+            validation.validate_nbf = true;
+            apply_iss_aud(&mut validation);
+            match jsonwebtoken::decode::<serde_json::Value>(
+                token,
+                &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+                &validation,
+            ) {
+                Ok(data) => Ok(data.claims),
+                Err(_) => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
+            }
+        }
+        other => Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({
+            "error": format!("unsupported alg {:?}", other)
+        }))),
+    }
+}
+
+async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -450,28 +615,16 @@ fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
         Some(t) if !t.is_empty() => t,
         _ => return Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
     };
-    // FAIL CLOSED: without JWT_SECRET there is no way to verify — 503, not accept-all.
-    let secret = match std::env::var("JWT_SECRET") {
-        Ok(s) if !s.is_empty() => s,
-        _ => return Err(HttpResponse::ServiceUnavailable().json(serde_json::json!({"error": "jwt_validation_unavailable"}))),
-    };
-    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
-    validation.validate_exp = true;
-    match jsonwebtoken::decode::<serde_json::Value>(
-        token,
-        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
-        &validation,
-    ) {
-        Ok(_) => Ok(()),
-        Err(_) => Err(HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid or expired token"}))),
-    }
+    let claims = verify_jwt_token(token).await?;
+    req.extensions_mut().insert(VerifiedClaims(claims));
+    Ok(())
 }
 // --- Route-layer JWT guard (R3-NEW-1): wraps routes whose handlers are registered but not defined in this file ---
 async fn jwt_route_guard(
     req: actix_web::dev::ServiceRequest,
     next: actix_web::middleware::Next<impl actix_web::body::MessageBody>,
 ) -> Result<actix_web::dev::ServiceResponse<actix_web::body::BoxBody>, actix_web::Error> {
-    if let Err(resp) = check_jwt(req.request()) {
+    if let Err(resp) = check_jwt(req.request()).await {
         return Ok(req.into_response(resp));
     }
     next.call(req).await.map(|res| res.map_into_boxed_body())
@@ -853,7 +1006,7 @@ mod tests {
 }
 
 async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
@@ -878,7 +1031,7 @@ async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body:
 }
 
 async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
-    if let Err(resp) = check_jwt(&req) { return resp; }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
     sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
         .bind(&id)
