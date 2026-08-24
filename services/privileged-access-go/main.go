@@ -993,22 +993,26 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 // enforceTenantClaim cross-checks a client-supplied tenant identifier against
 // the verified JWT claims (C-15). When the token carries a tenant (or
 // tenant_id) claim and it does not match the requested tenant, the request is
-// rejected with 403 and false is returned. Tokens without a tenant claim
-// (e.g. service accounts) are allowed.
+// rejected with 403 and false is returned. Fail-closed (wave-7.5): an empty
+// requested tenant, missing verified claims, or a token without a tenant claim
+// is rejected instead of being allowed.
 func enforceTenantClaim(w http.ResponseWriter, r *http.Request, requestedTenant string) bool {
 	if requestedTenant == "" {
-		return true
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return false
 	}
 	claims, _ := r.Context().Value("jwt_claims").(map[string]interface{})
 	if claims == nil {
-		return true
+		http.Error(w, `{"error":"unauthorized: no verified token claims"}`, http.StatusUnauthorized)
+		return false
 	}
 	claimTenant, _ := claims["tenant"].(string)
 	if claimTenant == "" {
 		claimTenant, _ = claims["tenant_id"].(string)
 	}
 	if claimTenant == "" {
-		return true
+		http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+		return false
 	}
 	if claimTenant != requestedTenant {
 		http.Error(w, `{"error":"tenant mismatch: token tenant does not match requested tenant"}`, http.StatusForbidden)

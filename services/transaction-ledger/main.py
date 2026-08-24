@@ -241,6 +241,10 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
             return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
         request.state.jwt_claims = claims
         tenant = claims.get("tenant_id") or claims.get("tenant")
+        if not tenant:
+            # Fail-closed (wave-7.5): tenant identity comes ONLY from verified
+            # claims; tokens without a tenant claim are rejected before any query.
+            return _JWTJSONResponse(status_code=403, content={"error": "forbidden", "detail": "token has no tenant claim"})
         _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
         _jwt_set_scope_header(request.scope, "x-tenant", tenant)
         subject = claims.get("sub") or claims.get("keycloak_id")

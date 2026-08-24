@@ -315,6 +315,10 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
             return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
         request.state.jwt_claims = claims
         tenant = claims.get("tenant_id") or claims.get("tenant")
+        if not tenant:
+            # Fail-closed (wave-7.5): tenant identity comes ONLY from verified
+            # claims; tokens without a tenant claim are rejected before any query.
+            return _JWTJSONResponse(status_code=403, content={"error": "forbidden", "detail": "token has no tenant claim"})
         _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
         _jwt_set_scope_header(request.scope, "x-tenant", tenant)
         subject = claims.get("sub") or claims.get("keycloak_id")
@@ -425,13 +429,15 @@ def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit
         cur = conn.cursor()
         offset = (page - 1) * limit
         tenant = x_tenant_id or ""
+        if not tenant:
+            raise HTTPException(status_code=403, detail="tenant required")
         cur.execute(
             """SELECT id, event_type, severity, actor_id, tenant_id, action,
                       resource_type, resource_id, entry_hash, created_at
                FROM audit_events
-               WHERE %s = '' OR tenant_id = %s
+               WHERE tenant_id = %s
                ORDER BY created_at DESC LIMIT %s OFFSET %s""",
-            (tenant, tenant, limit, offset),
+            (tenant, limit, offset),
         )
         rows = cur.fetchall()
         items = [
@@ -444,8 +450,8 @@ def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit
             for row in rows
         ]
         cur.execute(
-            "SELECT COUNT(*) FROM audit_events WHERE %s = '' OR tenant_id = %s",
-            (tenant, tenant),
+            "SELECT COUNT(*) FROM audit_events WHERE tenant_id = %s",
+            (tenant,),
         )
         total = cur.fetchone()[0]
         return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
@@ -695,7 +701,11 @@ domain_stats: dict = {"processed_today": 0}
 def create_record(body: AuditEventRequest, x_tenant_id: Optional[str] = Header(None)):
     """Append a tamper-evident audit event. Append-only by design: this
     service exposes no update or delete route for audit_events."""
-    tenant_id = body.tenant_id or x_tenant_id
+    # Tenant identity comes ONLY from verified JWT claims (header stamped by
+    # JWTAuthMiddleware); never from the caller-supplied body. Fail-closed.
+    tenant_id = x_tenant_id
+    if not tenant_id:
+        raise HTTPException(status_code=403, detail="tenant required")
     record_id = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
     severity = body.severity or "info"
