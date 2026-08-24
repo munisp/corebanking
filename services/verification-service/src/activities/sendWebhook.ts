@@ -1,7 +1,7 @@
 import axios from 'axios';
 import httpStatus from 'http-status';
 import * as https from 'node:https';
-import { KycWorkflowResult } from '../workflows/kyc.workflow';
+import type { KycWorkflowResult } from '../workflows/kyc.workflow';
 import logger from '../config/logger.config';
 
 // Webhook callbacks carry KYC PII (NIN, face-match results), so delivery is
@@ -32,7 +32,7 @@ function isAllowedCallbackUrl(rawUrl: string): boolean {
   );
 }
 
-export async function sendWebhook(url: string, result: KycWorkflowResult) {
+export async function sendWebhook(url: string, result: KycWorkflowResult): Promise<boolean> {
   if (!isAllowedCallbackUrl(url)) {
     logger.error(`[sendWebhook] rejected non-allowlisted callback URL (host not in WEBHOOK_ALLOWED_HOSTS or not https)`);
     throw new Error("Webhook callback URL is not allowed");
@@ -62,4 +62,5 @@ export async function sendWebhook(url: string, result: KycWorkflowResult) {
   }
 
   logger.info(`[sendWebhook] ✅ callback succeeded (${resp.status})`);
+  return true;
 }
