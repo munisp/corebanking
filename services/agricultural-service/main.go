@@ -2169,11 +2169,15 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 			r.Header.Del("X-User-Id")
 			r.Header.Del("X-Keycloak-ID")
 		}
-		if tenant := tenantFromClaims(claims); tenant != "" {
-			r.Header.Set("X-Tenant-ID", tenant)
-		} else {
-			r.Header.Del("X-Tenant-ID")
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
 		}
+		r.Header.Set("X-Tenant-ID", tenant)
 		r.Header.Del("X-User-Role")
 		if ra, ok := claims["realm_access"].(map[string]interface{}); ok {
 			if roleList, ok := ra["roles"].([]interface{}); ok {
