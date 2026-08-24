@@ -2,6 +2,7 @@ import { DataSource } from "typeorm";
 import { readEnv } from "../config/readEnv.config";
 import { Tenant } from "../models/Tenant";
 import { Transaction } from "../models/Transaction";
+import { SanctionsBlockedAlert } from "../models/SanctionsBlockedAlert";
 
 const DATABASE_URL = readEnv("DATABASE_URL", "") as string;
 const DB_SCHEMA: string = readEnv("DB_SCHEMA", "public") as string;
@@ -26,7 +27,7 @@ export const AppDataSource = new DataSource({
   schema: DB_SCHEMA,
   synchronize: false,
   logging: STAGE === "development",
-  entities: [Tenant, Transaction],
+  entities: [Tenant, Transaction, SanctionsBlockedAlert],
   migrations: [],
   subscribers: [],
   ssl: { rejectUnauthorized: !ALLOW_INSECURE_TLS },
