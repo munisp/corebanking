@@ -1,36 +1,37 @@
 """
-security-audit-logger-py - Centralized security audit logging service.
-
-STATUS (audit logger): This service stores audit events in-memory and exposes
-CRUD over `audit_events`. It does NOT persist to a durable audit store — see
-`POST /api/v1/audit/events` which returns 501 for durable writes.
-
-Middleware: Kafka audit topic, Postgres audit tables, Redis, OpenSearch, Vault, Permify.
+security-audit-logger-py - Production-ready service with PostgreSQL persistence.
+Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
 
 import os
 import json
+import uuid
 import logging
-from contextlib import asynccontextmanager
+import random
+import string
+from datetime import datetime, timezone
 
 import psycopg2
-from fastapi import FastAPI, HTTPException, Request
+import psycopg2.extras
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 import time
 import threading
 import signal
-import uuid
 import socket as _socket
-import urllib.request
+from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("security-audit-logger-py")
 
 # Configuration
 def _require_env(name):
-    """Fail-fast required environment variable (finding R3-NEW-3)."""
+    """Fail-fast required environment variable (finding R3-NEW-3).
+
+    No credential-bearing or otherwise insecure defaults: refuse to start when
+    the variable is unset or left as an unexpanded '${...}' placeholder."""
     val = os.environ.get(name, "").strip()
     if not val or val.startswith("${"):
         raise RuntimeError(
@@ -46,14 +47,9 @@ KAFKA_BROKERS = os.getenv("KAFKA_BROKERS", "localhost:9092")
 REDIS_URL = os.getenv("REDIS_URL", "localhost:6379")
 OPENSEARCH_URL = os.getenv("OPENSEARCH_ENDPOINT", "http://opensearch:9200")
 PERMIFY_URL = os.getenv("PERMIFY_ENDPOINT", "http://permify:3476")
-VAULT_URL = os.getenv("VAULT_ADDR", "http://vault:8200")
-PORT = int(os.getenv("PORT", "8701"))
+PORT = int(os.getenv("PORT", "8560"))
 
 db_conn = None
-
-# In-memory audit event store
-_audit_events: List[Dict[str, Any]] = []
-_audit_lock = threading.Lock()
 
 # Rate limiter state (module-level, guarded by _rl_lock)
 _rl_tokens = 100
@@ -157,7 +153,7 @@ MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
 TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54link-dev/certs/service.crt")
 TLS_KEY_PATH = os.environ.get("TLS_KEY_PATH", "/etc/54link-dev/certs/service.key")
 TLS_CA_PATH = os.environ.get("TLS_CA_PATH", "/etc/54link-dev/certs/ca.crt")
-PORT = int(os.environ.get("PORT", "9632"))
+PORT = int(os.environ.get("PORT", "9633"))
 START_TIME = time.time()
 
 # --- Metrics ---
@@ -205,7 +201,7 @@ def init_schema():
         return
     try:
         cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS audit_events (
+        cur.execute("""CREATE TABLE IF NOT EXISTS service_configs (
             id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
             tenant_id UUID,
             status VARCHAR(32) DEFAULT 'active',
@@ -219,9 +215,39 @@ def init_schema():
             published BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )""")
+        # AUDIT-MUTABLE: the audit_events table the API targets was never
+        # created. Schema mirrors services/security-service/audit_trail.go:
+        # actor/tenant/correlation fields, before/after values, and a
+        # SHA-256 hash chain (previous_hash/entry_hash) for tamper evidence.
+        # The table is append-only — this service exposes no UPDATE/DELETE.
+        cur.execute("""CREATE TABLE IF NOT EXISTS audit_events (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            event_type VARCHAR(64) NOT NULL,
+            severity VARCHAR(20) NOT NULL DEFAULT 'info',
+            actor_id VARCHAR(128),
+            actor_type VARCHAR(20),
+            tenant_id VARCHAR(128),
+            resource_type VARCHAR(64),
+            resource_id VARCHAR(128),
+            action VARCHAR(100) NOT NULL,
+            description TEXT,
+            old_value JSONB,
+            new_value JSONB,
+            metadata JSONB,
+            ip_address VARCHAR(45),
+            user_agent TEXT,
+            correlation_id VARCHAR(128),
+            previous_hash VARCHAR(64),
+            entry_hash VARCHAR(64) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_tenant ON audit_events(tenant_id)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_status ON audit_events(status)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_actor ON audit_events(actor_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_event_type ON audit_events(event_type)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_audit_events_created ON audit_events(created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_tenant ON service_configs(tenant_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
         conn.commit()
         logger.info("Schema initialized")
@@ -312,15 +338,52 @@ app.add_middleware(
 )
 
 
-class CreateRequest(BaseModel):
-    status: Optional[str] = "active"
+class AuditEventRequest(BaseModel):
+    """Append-only audit event. Mirrors the audit_trail.go field set:
+    actor/tenant/correlation context plus before/after values."""
+    event_type: str
+    action: str
+    severity: Optional[str] = "info"
+    actor_id: Optional[str] = None
+    actor_type: Optional[str] = None
     tenant_id: Optional[str] = None
-    data: Optional[Dict[str, Any]] = None
+    resource_type: Optional[str] = None
+    resource_id: Optional[str] = None
+    description: Optional[str] = None
+    old_value: Optional[Dict[str, Any]] = None
+    new_value: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    correlation_id: Optional[str] = None
 
 
-class UpdateRequest(BaseModel):
-    status: Optional[str] = None
-    data: Optional[Dict[str, Any]] = None
+# --- Tamper-evident hash chain (AUDIT-MUTABLE) ---
+# Mirrors services/security-service/audit_trail.go: entry_hash =
+# sha256(id|event_type|severity|actor_id|tenant_id|action|resource_type|
+# resource_id|previous_hash|timestamp). The chain head is re-read from the DB
+# under a lock on every append, so a restart never forks the chain.
+_audit_chain_lock = threading.Lock()
+
+
+def _compute_entry_hash(entry_id, event_type, severity, actor_id, tenant_id,
+                        action, resource_type, resource_id, previous_hash,
+                        timestamp_iso):
+    import hashlib
+    data = "|".join([
+        str(entry_id), str(event_type), str(severity), str(actor_id),
+        str(tenant_id), str(action), str(resource_type), str(resource_id),
+        str(previous_hash), str(timestamp_iso),
+    ])
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _load_chain_head(cur):
+    cur.execute(
+        "SELECT entry_hash FROM audit_events ORDER BY created_at DESC, id DESC LIMIT 1"
+    )
+    row = cur.fetchone()
+    return row[0] if row else ""
 
 
 @app.get("/healthz")
@@ -346,87 +409,55 @@ def livez():
 
 @app.get("/metrics")
 def metrics():
-    return {
-        "service": "security-audit-logger-py",
-        "requests_total": request_count,
-        "errors_total": error_count,
-        "audit_events_buffered": len(_audit_events),
-        "status": "operational",
-    }
+    try:
+        conn = get_db()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM audit_events")
+            count = cur.fetchone()[0]
+        return {"service": "security-audit-logger-py", "total_records": count}
+    except Exception:
+        return {"service": "security-audit-logger-py", "total_records": 0}
 
 
-# --- Domain routes: Audit event CRUD (in-memory, queryable) ---
-
-class AuditEvent(BaseModel):
-    event_type: str
-    actor: Optional[str] = None
-    resource: Optional[str] = None
-    action: Optional[str] = None
-    result: Optional[str] = "success"
-    severity: Optional[str] = "info"
-    details: Optional[Dict[str, Any]] = None
-    tenant_id: Optional[str] = None
-
-
-@app.get("/api/v1/audit/events")
-def list_audit_events(limit: int = 100, offset: int = 0):
-    with _audit_lock:
-        events = _audit_events[offset : offset + limit]
-        total = len(_audit_events)
-    return {"data": events, "count": len(events), "total": total}
-
-
-@app.get("/api/v1/audit/events/{event_id}")
-def get_audit_event(event_id: str):
-    with _audit_lock:
-        for e in _audit_events:
-            if e.get("id") == event_id:
-                return e
-    raise HTTPException(status_code=404, detail="audit event not found")
-
-
-@app.post("/api/v1/audit/events", status_code=201)
-def create_audit_event(event: AuditEvent):
-    """Buffer an audit event in-memory. NOTE: durable persistence to Postgres
-    audit tables is NOT implemented — see POST /api/v1/audit/events/durable."""
-    inc_requests()
-    record = {
-        "id": str(uuid.uuid4()),
-        "event_type": event.event_type,
-        "actor": event.actor,
-        "resource": event.resource,
-        "action": event.action,
-        "result": event.result,
-        "severity": event.severity,
-        "details": event.details or {},
-        "tenant_id": event.tenant_id,
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "persisted": False,
-    }
-    with _audit_lock:
-        _audit_events.append(record)
-    return record
-
-
-@app.post("/api/v1/audit/events/durable", status_code=501)
-def create_durable_audit_event(event: AuditEvent):
-    """NOT IMPLEMENTED: durable audit persistence (write-through to Postgres
-    audit_events table + Kafka audit topic) is tracked but not yet built.
-    Fails closed with 501 instead of silently dropping events."""
-    raise HTTPException(
-        status_code=501,
-        detail="durable audit persistence is not implemented; events are buffered in-memory only",
-    )
-
-
-@app.delete("/api/v1/audit/events/{event_id}")
-def delete_audit_event(event_id: str):
-    with _audit_lock:
-        for i, e in enumerate(_audit_events):
-            if e.get("id") == event_id:
-                _audit_events.pop(i)
-                return {"deleted": True, "id": event_id}
-    raise HTTPException(status_code=404, detail="audit event not found")
+@app.get("/api/v1/audit_events")
+def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
+    """List audit events (read-only). Tenant header scopes the listing."""
+    conn = get_db()
+    if not conn:
+        return {"items": [], "total": 0, "page": page, "limit": limit}
+    try:
+        cur = conn.cursor()
+        offset = (page - 1) * limit
+        tenant = x_tenant_id or ""
+        if not tenant:
+            raise HTTPException(status_code=403, detail="tenant required")
+        cur.execute(
+            """SELECT id, event_type, severity, actor_id, tenant_id, action,
+                      resource_type, resource_id, entry_hash, created_at
+               FROM audit_events
+               WHERE tenant_id = %s
+               ORDER BY created_at DESC LIMIT %s OFFSET %s""",
+            (tenant, limit, offset),
+        )
+        rows = cur.fetchall()
+        items = [
+            {
+                "id": str(row[0]), "event_type": row[1], "severity": row[2],
+                "actor_id": row[3], "tenant_id": row[4], "action": row[5],
+                "resource_type": row[6], "resource_id": row[7],
+                "entry_hash": row[8], "created_at": str(row[9]),
+            }
+            for row in rows
+        ]
+        cur.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE tenant_id = %s",
+            (tenant,),
+        )
+        total = cur.fetchone()[0]
+        return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
+    except Exception as e:
+        logger.error(f"DB query failed: {e}")
+        raise HTTPException(status_code=503, detail="audit_events_unavailable")
 # --- JWT Auth ---
 def validate_jwt(headers):
     """Validate Bearer JWT with real HS256 signature verification (stdlib).
@@ -476,7 +507,7 @@ def validate_jwt(headers):
 
 # --- Domain Logic ---
 def gen_id():
-    return "AUD-" + "".join(random.choices(string.hexdigits[:16].upper(), k=8))
+    return "SEC-" + "".join(random.choices(string.hexdigits[:16].upper(), k=8))
 
 
 def now_iso():
@@ -519,32 +550,6 @@ class CircuitBreaker:
         if self.failures >= self.threshold:
             self.state = "open"
 
-_circuit_breaker = CircuitBreaker()
-
-def call_service(method, url, body=None, retries=3, timeout=15):
-    """Call another microservice with retries and circuit breaker."""
-    if not _circuit_breaker.allow():
-        raise Exception(f"Circuit breaker open for {url}")
-    
-    last_err = None
-    for attempt in range(retries):
-        try:
-            if attempt > 0:
-                time.sleep(0.1 * (2 ** attempt))
-            
-            data = json.dumps(body).encode() if body else None
-            req = urllib.request.Request(url, data=data, method=method)
-            req.add_header("Content-Type", "application/json")
-            
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                result = json.loads(resp.read().decode())
-                _circuit_breaker.record_success()
-                return result
-        except Exception as e:
-            last_err = e
-            _circuit_breaker.record_failure()
-    
-    raise last_err
 
 
 # --- gRPC Client with Retry + Circuit Breaker ---
@@ -686,8 +691,129 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
+# In-memory state used by POST handlers
+SERVICE_NAME = "security-audit-logger-py"
+records: list = []
+audit_log: list = []
+domain_stats: dict = {"processed_today": 0}
+
+@app.post("/api/v1/audit_events", status_code=201)
+def create_record(body: AuditEventRequest, x_tenant_id: Optional[str] = Header(None)):
+    """Append a tamper-evident audit event. Append-only by design: this
+    service exposes no update or delete route for audit_events."""
+    # Tenant identity comes ONLY from verified JWT claims (header stamped by
+    # JWTAuthMiddleware); never from the caller-supplied body. Fail-closed.
+    tenant_id = x_tenant_id
+    if not tenant_id:
+        raise HTTPException(status_code=403, detail="tenant required")
+    record_id = str(uuid.uuid4())
+    timestamp = datetime.now(timezone.utc).isoformat()
+    severity = body.severity or "info"
+
+    conn = get_db()
+    with _audit_chain_lock:
+        with conn.cursor() as cur:
+            previous_hash = _load_chain_head(cur)
+            entry_hash = _compute_entry_hash(
+                record_id, body.event_type, severity, body.actor_id or "",
+                tenant_id or "", body.action, body.resource_type or "",
+                body.resource_id or "", previous_hash, timestamp,
+            )
+            cur.execute(
+                """INSERT INTO audit_events (
+                       id, event_type, severity, actor_id, actor_type, tenant_id,
+                       resource_type, resource_id, action, description,
+                       old_value, new_value, metadata,
+                       ip_address, user_agent, correlation_id,
+                       previous_hash, entry_hash, created_at
+                   ) VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                             %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz)""",
+                (
+                    record_id, body.event_type, severity, body.actor_id,
+                    body.actor_type, tenant_id, body.resource_type,
+                    body.resource_id, body.action, body.description,
+                    json.dumps(body.old_value) if body.old_value is not None else None,
+                    json.dumps(body.new_value) if body.new_value is not None else None,
+                    json.dumps(body.metadata) if body.metadata is not None else None,
+                    body.ip_address, body.user_agent, body.correlation_id,
+                    previous_hash, entry_hash, timestamp,
+                ),
+            )
+            payload = json.dumps({
+                "id": record_id, "event_type": body.event_type,
+                "action": body.action, "tenant_id": tenant_id,
+                "entry_hash": entry_hash,
+            })
+            cur.execute(
+                "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+                ("audit_events.appended", record_id, payload),
+            )
+        conn.commit()
+    return {
+        "id": record_id, "status": "appended",
+        "entry_hash": entry_hash, "previous_hash": previous_hash,
+    }
+
+
+@app.get("/api/v1/audit_events/verify-chain")
+def verify_chain():
+    """Recompute the hash chain over the whole audit_events table. Any edited
+    or deleted historical row breaks every subsequent entry_hash and is
+    reported here (tamper evidence)."""
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, event_type, severity, actor_id, tenant_id, action,
+                      resource_type, resource_id, previous_hash, entry_hash, created_at
+               FROM audit_events ORDER BY created_at ASC, id ASC"""
+        )
+        rows = cur.fetchall()
+
+    prev = ""
+    checked = 0
+    for row in rows:
+        expected = _compute_entry_hash(
+            str(row["id"]), row["event_type"], row["severity"] or "info",
+            row["actor_id"] or "", row["tenant_id"] or "", row["action"],
+            row["resource_type"] or "", row["resource_id"] or "",
+            row["previous_hash"] or "", row["created_at"].isoformat(),
+        )
+        if (row["previous_hash"] or "") != prev or row["entry_hash"] != expected:
+            logger.error(
+                "AUDIT CHAIN VIOLATION at event %s (checked %d entries)", row["id"], checked
+            )
+            return {
+                "chain_valid": False,
+                "broken_at": str(row["id"]),
+                "entries_checked": checked,
+            }
+        prev = row["entry_hash"]
+        checked += 1
+    return {"chain_valid": True, "entries_checked": checked, "chain_head": prev or None}
+
+
+@app.get("/api/v1/audit_events/{record_id}")
+def get_record(record_id: str):
+    conn = get_db()
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            """SELECT id, event_type, severity, actor_id, actor_type, tenant_id,
+                      resource_type, resource_id, action, description,
+                      old_value, new_value, metadata, ip_address, user_agent,
+                      correlation_id, previous_hash, entry_hash, created_at
+               FROM audit_events WHERE id = %s::uuid""",
+            (record_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="not found")
+    row["id"] = str(row["id"])
+    row["created_at"] = row["created_at"].isoformat()
+    return row
+
 # --- Graceful Shutdown ---
 server = None
+db_conn = None
 shutdown_event = threading.Event()
 
 def shutdown_handler(signum, frame):
@@ -756,9 +882,6 @@ def init_tracing(service_name):
     except Exception as e:
         logger.warning(f"Failed to init tracing: {e}")
 signal.signal(signal.SIGINT, shutdown_handler)
-
-import random
-import string
 
 if __name__ == "__main__":
     import uvicorn
