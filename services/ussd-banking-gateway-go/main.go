@@ -928,6 +928,7 @@ func getKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 
 func initSchema() {
 	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS channel_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id VARCHAR(64) NOT NULL UNIQUE,
     channel_type VARCHAR(32) NOT NULL,
     customer_id UUID,
