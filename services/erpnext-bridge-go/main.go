@@ -287,7 +287,7 @@ var creditNoteSyncs = []CreditNoteSync{
 		CreatedAt: "2026-05-06T15:00:00Z", SyncedAt: "2026-05-06T16:00:00Z",
 	},
 	{
-		ID: "CN-002", DisputeID: "DISP-2026-018", InvoiceID: "INV-2026-04-008", TenantID": "WL-MONIEPOINT",
+		ID: "CN-002", DisputeID: "DISP-2026-018", InvoiceID: "INV-2026-04-008", TenantID: "WL-MONIEPOINT",
 		Amount: 1200000, Reason: "Incorrect overage billing — QR transactions double-counted",
 		ERPCreditNote: "CN-2026-0048", ERPStatus: "confirmed",
 		GLEntries: []map[string]interface{}{
