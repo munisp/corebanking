@@ -11,24 +11,25 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/binary"
-	"github.com/IBM/sarama"
-	_ "github.com/lib/pq"
-	"io"
-	"math/big"
-	"net"
-	"os/signal"
-	"strconv"
-	"sync/atomic"
-	"syscall"
-
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
+
+	"sync"
+
+	"github.com/IBM/sarama"
+	_ "github.com/lib/pq"
 )
 
 // secureUint32 returns a CSPRNG-derived uint32 for internal record IDs (L-16).
@@ -41,345 +42,399 @@ func secureUint32() uint32 {
 	return binary.BigEndian.Uint32(b[:])
 }
 
+// Banking Domain Integration Service (Go)
+// GAP 8-12: Event-driven GL posting for all banking domains
+// Middleware: Kafka consumer (payments/loans/fx/fd/si topics), Postgres idempotency
+// Depends on: Kafka, Postgres (idempotency_keys), core-banking (GL posting)
+
 var serviceName = "banking-domain-integration-go"
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// GAP 8: PAYMENTS HUB → GL (NIP/NEFT/RTGS transaction posting)
-// ═══════════════════════════════════════════════════════════════════════════════
+var startTime = time.Now()
 
-type PaymentGLPosting struct {
-	PaymentID      string    `json:"paymentId"`
-	Channel        string    `json:"channel"`
-	Amount         float64   `json:"amount"`
-	Fee            float64   `json:"fee"`
-	VAT            float64   `json:"vat"`
-	SenderAccount  string    `json:"senderAccount"`
-	SenderGL       string    `json:"senderGLCode"`
-	ReceiverGL     string    `json:"receiverGLCode"`
-	FeeGLCode      string    `json:"feeGLCode"`
-	JournalEntries []GLEntry `json:"journalEntries"`
+// ─── Domain Types ───────────────────────────────────────────────────────────
+
+type Record struct {
+	ID        string                 `json:"id"`
+	Type      string                 `json:"type"`
+	Status    string                 `json:"status"`
+	Data      map[string]interface{} `json:"data"`
+	CreatedAt string                 `json:"createdAt"`
+	UpdatedAt string                 `json:"updatedAt"`
+	CreatedBy string                 `json:"createdBy,omitempty"`
+	TenantID  string                 `json:"tenantId,omitempty"`
+	Version   int                    `json:"version"`
 }
 
-type GLEntry struct {
-	EntryID    string  `json:"entryId"`
-	DebitGL    string  `json:"debitGL"`
-	DebitName  string  `json:"debitName"`
-	CreditGL   string  `json:"creditGL"`
-	CreditName string  `json:"creditName"`
-	Amount     float64 `json:"amount"`
-	Narration  string  `json:"narration"`
+type AuditEntry struct {
+	ID        string `json:"id"`
+	Action    string `json:"action"`
+	RecordID  string `json:"recordId"`
+	Actor     string `json:"actor"`
+	Timestamp string `json:"timestamp"`
+	Details   string `json:"details"`
 }
 
-func paymentsToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	payments := []PaymentGLPosting{
-		{PaymentID: "NIP-2026050901", Channel: "NIP", Amount: 5_000_000, Fee: 50, VAT: 3.75, SenderAccount: "5400001001", SenderGL: "2101", ReceiverGL: "2101", FeeGLCode: "4202",
-			JournalEntries: []GLEntry{
-				{EntryID: fmt.Sprintf("JE-PAY-NIP-001-%s", businessDate), DebitGL: "2101", DebitName: "Sender Deposit Account", CreditGL: "2101", CreditName: "Receiver Deposit Account", Amount: 5_000_000, Narration: "NIP transfer"},
-				{EntryID: fmt.Sprintf("JE-FEE-NIP-001-%s", businessDate), DebitGL: "2101", DebitName: "Sender (fee debit)", CreditGL: "4202", CreditName: "Transfer Fee Income", Amount: 50, Narration: "NIP transfer fee"},
-				{EntryID: fmt.Sprintf("JE-VAT-NIP-001-%s", businessDate), DebitGL: "2101", DebitName: "Sender (VAT debit)", CreditGL: "2311", CreditName: "VAT Payable to FIRS", Amount: 3.75, Narration: "VAT on NIP fee"},
-			}},
-		{PaymentID: "RTGS-2026050901", Channel: "RTGS", Amount: 500_000_000, Fee: 5_250, VAT: 393.75, SenderAccount: "5400005001", SenderGL: "2101", ReceiverGL: "1104", FeeGLCode: "4202",
-			JournalEntries: []GLEntry{
-				{EntryID: fmt.Sprintf("JE-PAY-RTGS-001-%s", businessDate), DebitGL: "2101", DebitName: "Corporate Deposit", CreditGL: "1104", CreditName: "Interbank Settlement (outgoing)", Amount: 500_000_000, Narration: "RTGS high-value transfer"},
-				{EntryID: fmt.Sprintf("JE-FEE-RTGS-001-%s", businessDate), DebitGL: "2101", DebitName: "Corporate (fee)", CreditGL: "4202", CreditName: "RTGS Fee Income", Amount: 5_250, Narration: "RTGS transfer fee"},
-			}},
-		{PaymentID: "NEFT-2026050901", Channel: "NEFT", Amount: 2_500_000, Fee: 250, VAT: 18.75, SenderAccount: "5400002001", SenderGL: "2101", ReceiverGL: "2301", FeeGLCode: "4202",
-			JournalEntries: []GLEntry{
-				{EntryID: fmt.Sprintf("JE-PAY-NEFT-001-%s", businessDate), DebitGL: "2101", DebitName: "Sender Deposit", CreditGL: "2301", CreditName: "Clearing Payable (NEFT pending)", Amount: 2_500_000, Narration: "NEFT transfer (T+1 settlement)"},
-				{EntryID: fmt.Sprintf("JE-FEE-NEFT-001-%s", businessDate), DebitGL: "2101", DebitName: "Sender (fee)", CreditGL: "4202", CreditName: "NEFT Fee Income", Amount: 250, Narration: "NEFT transfer fee"},
-			}},
-		{PaymentID: "INT-2026050901", Channel: "internal", Amount: 1_000_000, Fee: 0, VAT: 0, SenderAccount: "5400001002", SenderGL: "2101", ReceiverGL: "2101", FeeGLCode: "",
-			JournalEntries: []GLEntry{
-				{EntryID: fmt.Sprintf("JE-PAY-INT-001-%s", businessDate), DebitGL: "2101", DebitName: "Sender Deposit", CreditGL: "2101", CreditName: "Receiver Deposit", Amount: 1_000_000, Narration: "Internal book transfer (no fee)"},
-			}},
-	}
-
-	totalAmount := 0.0
-	totalFees := 0.0
-	totalJE := 0
-	for _, p := range payments {
-		totalAmount += p.Amount
-		totalFees += p.Fee
-		totalJE += len(p.JournalEntries)
-	}
-
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("PAY-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"payments":     payments,
-		"summary": map[string]interface{}{
-			"totalPayments":        len(payments),
-			"totalAmount":          totalAmount,
-			"totalFeeRevenue":      totalFees,
-			"journalEntriesPosted": totalJE,
-			"glCodesImpacted":      []string{"2101 (Customer Deposits)", "1104 (Interbank)", "2301 (Clearing Payable)", "4202 (Transfer Fee Income)", "2311 (VAT Payable)"},
-		},
-		"pipeline": map[string]string{
-			"step1": "Receive payment instruction (NIP/NEFT/RTGS/Internal)",
-			"step2": "Validate limits, AML screening, sufficient balance",
-			"step3": "Debit sender (Dr 2101), Credit receiver or clearing (Cr 2101/1104/2301)",
-			"step4": "Post fee: Dr sender 2101, Cr 4202 (Fee Income)",
-			"step5": "Post VAT: Dr sender 2101, Cr 2311 (VAT Payable)",
-			"step6": "Publish Kafka event + index to OpenSearch",
-		},
-		"middleware": middlewareActions("banking.payments.posted"),
-	}
-	respondJSON(w, result)
+type DomainStats struct {
+	TotalRecords   int                    `json:"totalRecords"`
+	ActiveRecords  int                    `json:"activeRecords"`
+	PendingRecords int                    `json:"pendingRecords"`
+	ProcessedToday int                    `json:"processedToday"`
+	Domain         string                 `json:"domain"`
+	Metrics        map[string]interface{} `json:"metrics"`
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// GAP 9: LOAN LIFECYCLE → GL (disbursement, repayment, write-off)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-type LoanGLEvent struct {
-	EventID     string    `json:"eventId"`
-	LoanID      string    `json:"loanId"`
-	Customer    string    `json:"customer"`
-	EventType   string    `json:"eventType"`
-	Amount      float64   `json:"amount"`
-	GLPostings  []GLEntry `json:"glPostings"`
-	LoanBalance float64   `json:"loanBalanceAfter"`
-}
-
-func loanLifecycleToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	events := []LoanGLEvent{
-		{EventID: "LOAN-DISB-001", LoanID: "LN-NEW-001", Customer: "ABC Holdings Ltd", EventType: "disbursement", Amount: 100_000_000, LoanBalance: 100_000_000,
-			GLPostings: []GLEntry{
-				{EntryID: "JE-DISB-001", DebitGL: "1301", DebitName: "Loans & Advances", CreditGL: "2101", CreditName: "Customer Deposit (credited)", Amount: 100_000_000, Narration: "Loan disbursement to ABC Holdings"},
-				{EntryID: "JE-DISB-FEE-001", DebitGL: "2101", DebitName: "Customer Deposit (fee debit)", CreditGL: "4203", CreditName: "Loan Processing Fee Income", Amount: 1_000_000, Narration: "1% processing fee on disbursement"},
-			}},
-		{EventID: "LOAN-REPAY-001", LoanID: "LN-003", Customer: "Chukwuemeka Obi SME", EventType: "repayment", Amount: 2_500_000, LoanBalance: 12_500_000,
-			GLPostings: []GLEntry{
-				{EntryID: "JE-REPAY-001-P", DebitGL: "2101", DebitName: "Customer Deposit (debit)", CreditGL: "1301", CreditName: "Loans & Advances (principal)", Amount: 1_800_000, Narration: "Loan principal repayment"},
-				{EntryID: "JE-REPAY-001-I", DebitGL: "2101", DebitName: "Customer Deposit (debit)", CreditGL: "4101", CreditName: "Interest Income Earned", Amount: 700_000, Narration: "Interest portion of repayment"},
-			}},
-		{EventID: "LOAN-WO-001", LoanID: "LN-OLD-099", Customer: "Defunct Traders Ltd", EventType: "write_off", Amount: 5_000_000, LoanBalance: 0,
-			GLPostings: []GLEntry{
-				{EntryID: "JE-WO-001", DebitGL: "1357", DebitName: "ECL Provision Stage 3", CreditGL: "1301", CreditName: "Loans & Advances (written off)", Amount: 5_000_000, Narration: "Write-off against ECL provision (fully impaired)"},
-				{EntryID: "JE-WO-OBS-001", DebitGL: "9101", DebitName: "Contingent - Written Off Loans (memo)", CreditGL: "9999", CreditName: "Contra Memo Account", Amount: 5_000_000, Narration: "Off-balance sheet memo for recovery tracking"},
-			}},
-		{EventID: "LOAN-RESTR-001", LoanID: "LN-005", Customer: "Adebayo Mortgage", EventType: "restructure", Amount: 45_000_000, LoanBalance: 45_000_000,
-			GLPostings: []GLEntry{
-				{EntryID: "JE-RESTR-001", DebitGL: "1309", DebitName: "Restructured Loan Account", CreditGL: "1301", CreditName: "Original Loan Account", Amount: 45_000_000, Narration: "Transfer to restructured loan GL on tenor extension"},
-			}},
+var (
+	mu      sync.Mutex
+	records = []Record{
+		{ID: "BDI-001", Type: "primary", Status: "active", Data: map[string]interface{}{"domain": "Core Banking", "priority": "high", "region": "lagos"}, CreatedAt: "2026-05-09T10:00:00Z", UpdatedAt: "2026-05-09T10:00:00Z", Version: 1},
+		{ID: "BDI-002", Type: "secondary", Status: "processing", Data: map[string]interface{}{"domain": "Core Banking", "priority": "medium", "region": "abuja"}, CreatedAt: "2026-05-09T11:00:00Z", UpdatedAt: "2026-05-09T11:30:00Z", Version: 2},
+		{ID: "BDI-003", Type: "primary", Status: "completed", Data: map[string]interface{}{"domain": "Core Banking", "priority": "low", "region": "ph"}, CreatedAt: "2026-05-08T14:00:00Z", UpdatedAt: "2026-05-09T08:00:00Z", Version: 1},
 	}
-
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("LOAN-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"events":       events,
-		"summary": map[string]interface{}{
-			"disbursements":   1,
-			"repayments":      1,
-			"writeOffs":       1,
-			"restructures":    1,
-			"totalGLEntries":  8,
-			"glCodesImpacted": []string{"1301 (Loans & Advances)", "1309 (Restructured)", "1357 (ECL Provision)", "2101 (Deposits)", "4101 (Interest Income)", "4203 (Processing Fee)", "9101 (Off-BS Memo)"},
+	auditLog    = []AuditEntry{}
+	domainStats = DomainStats{
+		TotalRecords: 3, ActiveRecords: 1, PendingRecords: 1, ProcessedToday: 12,
+		Domain: "Core Banking",
+		Metrics: map[string]interface{}{
+			"avgProcessingMs": 245, "successRate": 98.5, "errorRate": 1.5,
+			"peakHour": "14:00", "throughput": 156,
 		},
-		"pipeline": map[string]string{
-			"step1": "Loan event triggered (disbursement/repayment/write-off/restructure)",
-			"step2": "Validate against credit approval, limits, available provision",
-			"step3": "Post double-entry journal: Dr asset/expense, Cr liability/income",
-			"step4": "Update loan balance, repayment schedule, NPL classification",
-			"step5": "Recalculate ECL if stage migration occurred",
-			"step6": "Publish event to Kafka + update OpenSearch loan index",
-		},
-		"middleware": middlewareActions("banking.loans.lifecycle"),
 	}
-	respondJSON(w, result)
-}
+)
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// GAP 10: FX DEALING → REVALUATION → GL
-// ═══════════════════════════════════════════════════════════════════════════════
-
-func fxDealingToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("FX-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"fxDeals": []map[string]interface{}{
-			{"dealId": "FX-SPOT-001", "pair": "USD/NGN", "type": "spot", "buySell": "buy", "amount": 1_000_000, "rate": 1582.50, "ngnEquivalent": 1_582_500_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FX-BUY-001", DebitGL: "1101", DebitName: "Nostro - USD (Citibank NY)", CreditGL: "1006", CreditName: "CBN Current Account (NGN)", Amount: 1_582_500_000, Narration: "USD purchase spot - $1M @ 1582.50"},
-				}},
-			{"dealId": "FX-SPOT-002", "pair": "USD/NGN", "type": "spot", "buySell": "sell", "amount": 500_000, "rate": 1585.00, "ngnEquivalent": 792_500_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FX-SELL-001", DebitGL: "1006", DebitName: "CBN Current Account (NGN)", CreditGL: "1101", CreditName: "Nostro - USD (Citibank NY)", Amount: 792_500_000, Narration: "USD sale spot - $500K @ 1585.00"},
-					{EntryID: "JE-FX-PNL-001", DebitGL: "1101", DebitName: "Nostro adjustment", CreditGL: "4304", CreditName: "FX Trading Income", Amount: 1_250_000, Narration: "FX trading gain (1585-1582.50) × $500K"},
-				}},
-		},
-		"revaluation": map[string]interface{}{
-			"previousRate": 1580.00,
-			"closingRate":  1585.00,
-			"usdPosition":  7_000_000,
-			"revalGain":    35_000_000,
-			"glPosting":    GLEntry{EntryID: "JE-FX-REVAL-001", DebitGL: "1101", DebitName: "Nostro - USD (revaluation)", CreditGL: "4304", CreditName: "FX Revaluation Gain", Amount: 35_000_000, Narration: "EOD FX revaluation: USD position $7M × (1585-1580)"},
-		},
-		"positionSummary": map[string]interface{}{
-			"USD": map[string]interface{}{"net": 7_000_000, "glCode": "1101", "limit": 50_000_000, "utilization": "14%"},
-			"EUR": map[string]interface{}{"net": -2_000_000, "glCode": "1102", "limit": 20_000_000, "utilization": "10%"},
-			"GBP": map[string]interface{}{"net": -1_000_000, "glCode": "1103", "limit": 15_000_000, "utilization": "6.7%"},
-		},
-		"pipeline": map[string]string{
-			"step1": "Execute FX deal (spot/forward/swap) at agreed rate",
-			"step2": "Post to nostro GL (1101-1108) and contra NGN account (1006)",
-			"step3": "Compute trading P&L on closed positions → GL 4304",
-			"step4": "EOD revaluation: open positions at closing rate → GL 4304",
-			"step5": "Check CBN FX position limits (NOP ≤ 20% shareholders funds)",
-			"step6": "Report to CBN FX exposure return (FCE-01)",
-		},
-		"middleware": middlewareActions("banking.fx.dealing"),
-	}
-	respondJSON(w, result)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GAP 11: FIXED DEPOSIT → GL (placement, maturity, early liquidation)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-func fixedDepositToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("FD-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"events": []map[string]interface{}{
-			{"eventId": "FD-PLACE-001", "type": "placement", "customerId": "CUST-015", "customer": "Hassan Premium", "principal": 50_000_000, "tenor": 180, "rate": 14.0,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-PLACE-001", DebitGL: "2101", DebitName: "Savings Account (debit)", CreditGL: "2103", CreditName: "Fixed Deposit Liability", Amount: 50_000_000, Narration: "FD placement - 180 days @ 14% p.a."},
-				}},
-			{"eventId": "FD-MATURE-001", "type": "maturity", "customerId": "CUST-008", "customer": "Amina Term Deposit", "principal": 25_000_000, "interest": 1_750_000, "tenor": 365, "rate": 7.0,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-MAT-001-P", DebitGL: "2103", DebitName: "Fixed Deposit Liability (release)", CreditGL: "2101", CreditName: "Customer Savings Account", Amount: 25_000_000, Narration: "FD maturity - principal release"},
-					{EntryID: "JE-FD-MAT-001-I", DebitGL: "5102", DebitName: "Interest Expense on FD", CreditGL: "2101", CreditName: "Customer Savings Account", Amount: 1_750_000, Narration: "FD maturity - interest payout"},
-					{EntryID: "JE-FD-MAT-001-W", DebitGL: "2101", DebitName: "Customer Account (WHT debit)", CreditGL: "2312", CreditName: "WHT Payable to FIRS", Amount: 175_000, Narration: "10% WHT on FD interest (FIRS remittance)"},
-				}},
-			{"eventId": "FD-EARLY-001", "type": "early_liquidation", "customerId": "CUST-022", "customer": "Urgency Corp", "principal": 10_000_000, "penalty": 200_000, "interestForfeited": 350_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-EARLY-001", DebitGL: "2103", DebitName: "Fixed Deposit Liability", CreditGL: "2101", CreditName: "Customer Account (net)", Amount: 9_800_000, Narration: "Early liquidation (principal - penalty)"},
-					{EntryID: "JE-FD-PENALTY-001", DebitGL: "2103", DebitName: "FD Liability (penalty portion)", CreditGL: "4209", CreditName: "Early Liquidation Penalty Income", Amount: 200_000, Narration: "Penalty for breaking FD before maturity"},
-				}},
-		},
-		"summary": map[string]interface{}{
-			"placements":        1,
-			"maturities":        1,
-			"earlyLiquidations": 1,
-			"glCodesImpacted":   []string{"2101 (Savings)", "2103 (FD Liability)", "5102 (Interest Expense)", "2312 (WHT Payable)", "4209 (Penalty Income)"},
-		},
-		"pipeline": map[string]string{
-			"step1": "FD event triggered (placement/maturity/early liquidation/top-up/rollover)",
-			"step2": "Placement: Dr 2101 (savings) / Cr 2103 (FD liability) — funds locked",
-			"step3": "Maturity: Dr 2103 / Cr 2101 (principal + interest released)",
-			"step4": "Deduct WHT at 10% on interest earned → GL 2312 (WHT Payable)",
-			"step5": "Early break: Apply penalty, forfeit accrued interest, release net",
-			"step6": "Auto-rollover: Re-book at prevailing rate if instruction exists",
-		},
-		"middleware": middlewareActions("banking.fixed_deposit.lifecycle"),
-	}
-	respondJSON(w, result)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// GAP 12: STANDING INSTRUCTIONS → GL (scheduled execution posting)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-func standingInstructionsToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("SI-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"executions": []map[string]interface{}{
-			{"siId": "SI-001", "type": "salary_payment", "customer": "Dangote Cement PLC", "beneficiaries": 450, "totalAmount": 180_000_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-SAL-001", DebitGL: "2101", DebitName: "Corporate Current Account", CreditGL: "2101", CreditName: "Staff Salary Accounts (batch)", Amount: 180_000_000, Narration: "Salary bulk payment - 450 beneficiaries"},
-					{EntryID: "JE-SI-SAL-FEE-001", DebitGL: "2101", DebitName: "Corporate (bulk fee)", CreditGL: "4208", CreditName: "Bulk Payment Fee Income", Amount: 22_500, Narration: "₦50/head × 450 salary credits"},
-				}},
-			{"siId": "SI-002", "type": "sweep", "customer": "Access Industries", "from": "Current", "to": "Investment", "amount": 25_000_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-SWEEP-001", DebitGL: "2101", DebitName: "Current Account", CreditGL: "2104", CreditName: "Call Deposit / Investment Account", Amount: 25_000_000, Narration: "Auto-sweep: balance above ₦50M to investment"},
-				}},
-			{"siId": "SI-003", "type": "loan_repayment", "customer": "Aisha Mohammed", "loanId": "LN-002", "amount": 125_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-REPAY-001", DebitGL: "2101", DebitName: "Customer Savings", CreditGL: "1301", CreditName: "Loans & Advances", Amount: 100_000, Narration: "Auto loan repayment - principal portion"},
-					{EntryID: "JE-SI-REPAY-INT-001", DebitGL: "2101", DebitName: "Customer Savings", CreditGL: "4101", CreditName: "Interest Income", Amount: 25_000, Narration: "Auto loan repayment - interest portion"},
-				}},
-			{"siId": "SI-004", "type": "bill_payment", "customer": "Zenith Construction", "biller": "EKEDC", "amount": 450_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-BILL-001", DebitGL: "2101", DebitName: "Customer Account", CreditGL: "2301", CreditName: "Bills Payable / Clearing", Amount: 450_000, Narration: "Auto bill payment to EKEDC"},
-				}},
-		},
-		"summary": map[string]interface{}{
-			"executed":          4,
-			"totalAmount":       205_575_000,
-			"failed":            0,
-			"insufficientFunds": 0,
-			"glCodesImpacted":   []string{"2101 (Current/Savings)", "2104 (Investment)", "2301 (Clearing)", "1301 (Loans)", "4101 (Interest Income)", "4208 (Bulk Fee)"},
-		},
-		"pipeline": map[string]string{
-			"step1": "Temporal workflow triggers at scheduled time (daily/weekly/monthly)",
-			"step2": "Check source account balance ≥ instruction amount",
-			"step3": "Execute transfer: Dr source GL / Cr destination GL",
-			"step4": "If cross-bank: route through NIP/NEFT with settlement GL posting",
-			"step5": "On failure: retry up to 3x, then mark failed + notify customer",
-			"step6": "Update execution counter + next execution date",
-		},
-		"middleware": middlewareActions("banking.standing_instructions.executed"),
-	}
-	respondJSON(w, result)
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// SHARED UTILITIES
-// ═══════════════════════════════════════════════════════════════════════════════
-
-func middlewareActions(kafkaTopic string) map[string]interface{} {
-	return map[string]interface{}{
-		"kafka":       map[string]string{"topic": kafkaTopic, "status": "published"},
-		"dapr":        map[string]string{"statestore": "banking-domain-state", "status": "saved"},
-		"fluvio":      map[string]string{"stream": "banking-domain-events", "status": "appended"},
-		"temporal":    map[string]string{"workflow": "BankingDomainWorkflow", "status": "completed"},
-		"postgres":    map[string]string{"tables": "journalEntries, trialBalances, accounts", "status": "updated"},
-		"keycloak":    map[string]string{"role": "operations_officer", "status": "authorized"},
-		"permify":     map[string]string{"permission": "banking.transact", "status": "granted"},
-		"redis":       map[string]string{"cache": "invalidated_affected_balances", "status": "flushed"},
-		"mojaloop":    map[string]string{"purpose": "cross-border routing", "status": "checked"},
-		"opensearch":  map[string]string{"index": "banking-transactions-2026", "status": "indexed"},
-		"openappsec":  map[string]string{"policy": "transaction-protection", "status": "passed"},
-		"apisix":      map[string]string{"route": "rate_limited_validated", "status": "ok"},
-		"tigerbeetle": map[string]string{"action": "transfer_posted", "status": "verified"},
-		"lakehouse":   map[string]string{"table": "kpi_catalog.banking.domain_transactions_iceberg", "status": "appended"},
-	}
-}
-
-func respondJSON(w http.ResponseWriter, data interface{}) {
+func respondJSON(w http.ResponseWriter, code int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
-	dbData, _ := json.Marshal(map[string]string{"service": "banking_domain_integration_go", "action": "respondJSON"})
-	if dbErr := dbInsert(fmt.Sprintf("banking_domain_integration_go-%d", time.Now().UnixNano()), "banking_domain_integration_go", "default", "active", dbData); dbErr != nil {
-		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
-		cacheSet("banking_domain_integration_list", "", 1) // invalidate cache on write
-	}
-	csURL := os.Getenv("CORE_BANKING_URL")
-	if csURL == "" {
-		csURL = "http://core-banking-go:8080"
-	}
-	if _, csErr := callService("POST", csURL+"/v1/notify", map[string]interface{}{"source": "banking_domain_integration_go", "action": "respondJSON"}); csErr != nil {
-		log.Printf("[%s] upstream call failed: %v", serviceName, csErr)
-	}
+	w.Header().Set("X-Service", "banking-domain-integration-go")
+	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(data)
 }
 
-func healthz(w http.ResponseWriter, r *http.Request) {
-	respondJSON(w, map[string]interface{}{
-		"status": "healthy", "service": "banking-domain-integration-go", "version": "1.0.0",
-		"gaps_closed": []string{"Gap 8: Payments → GL", "Gap 9: Loan Lifecycle → GL", "Gap 10: FX Dealing → GL", "Gap 11: Fixed Deposits → GL", "Gap 12: Standing Instructions → GL"},
+// ─── Handlers ───────────────────────────────────────────────────────────────
+
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	respondJSON(w, 200, map[string]interface{}{
+		"service": "banking-domain-integration-go", "status": "healthy", "version": "2.0.0",
+		"uptime_secs": int(time.Since(startTime).Seconds()),
+		"domain":      "Banking Domain Integration — Core Banking",
 		"middleware": map[string]string{
-			"kafka": "connected", "dapr": "connected", "fluvio": "connected", "temporal": "connected",
-			"postgres": "connected", "keycloak": "connected", "permify": "connected", "redis": "connected",
-			"mojaloop": "connected", "opensearch": "connected", "openappsec": "connected", "apisix": "connected",
-			"tigerbeetle": "connected", "lakehouse": "connected",
+			"kafka":      "banking-domain-integration.events, banking-domain-integration.audit",
+			"postgres":   "banking_domain_integration_records",
+			"redis":      "banking-domain-integration_cache",
+			"temporal":   "BankingDomainIntegrationWorkflow",
+			"permify":    "banking-domain-integration:manage, banking-domain-integration:view",
+			"opensearch": "banking-domain-integration-2026",
 		},
+	})
+}
+
+func handleList(w http.ResponseWriter, r *http.Request) {
+	cacheKey := "banking_domain_integration_list"
+	if cached, ok := cacheGet(cacheKey); ok {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Cache", "HIT")
+		w.WriteHeader(200)
+		w.Write([]byte(cached))
+		return
+	}
+	// DB-first query with in-memory fallback
+	if db != nil {
+		rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT 100", "banking_domain_integration_go")
+		if err == nil {
+			defer rows.Close()
+			var items []map[string]interface{}
+			for rows.Next() {
+				var id, svc, typ, status, data string
+				var createdAt time.Time
+				if rows.Scan(&id, &svc, &typ, &status, &data, &createdAt) == nil {
+					items = append(items, map[string]interface{}{"id": id, "type": typ, "status": status, "data": data, "created_at": createdAt})
+				}
+			}
+			respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
+			return
+		}
+		log.Printf("banking-domain-integration-go: DB query failed, falling back to in-memory: %v", err)
+	}
+	// In-memory fallback
+	mu.Lock()
+	defer mu.Unlock()
+	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "in-memory"})
+}
+
+func handleCreate(w http.ResponseWriter, r *http.Request) {
+	cacheSet("banking_domain_integration_list", "", 1) // invalidate list cache on write
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	var body map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&body)
+	// Inter-service call: gl_posting
+	_upstreamURL := os.Getenv("CORE_BANKING_URL")
+	if _upstreamURL == "" {
+		_upstreamURL = "http://localhost:8100"
+	}
+	_result, _err := callService("POST", _upstreamURL+"/v1/gl/post", nil)
+	if _err != nil {
+		log.Printf("banking-domain-integration-go: gl_posting failed: %v", _err)
+	} else {
+		log.Printf("banking-domain-integration-go: gl_posting ok: %v", _result)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	rec := Record{
+		ID:        fmt.Sprintf("BDI-%08X", secureUint32()),
+		Type:      getString(body, "type"),
+		Status:    "pending",
+		Data:      body,
+		CreatedAt: time.Now().Format(time.RFC3339),
+		UpdatedAt: time.Now().Format(time.RFC3339),
+		CreatedBy: getString(body, "createdBy"),
+		TenantID:  getString(body, "tenantId"),
+		Version:   1,
+	}
+	if rec.Type == "" {
+		rec.Type = "primary"
+	}
+	records = append(records, rec)
+	domainStats.TotalRecords = len(records)
+
+	// Persist to database
+	if dataBytes, err := json.Marshal(rec.Data); err == nil {
+		if dbErr := dbInsert(rec.ID, serviceName, rec.Type, rec.Status, dataBytes); dbErr != nil {
+			log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
+		}
+	}
+
+	auditLog = append(auditLog, AuditEntry{
+		ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "create",
+		RecordID: rec.ID, Actor: rec.CreatedBy,
+		Timestamp: rec.CreatedAt, Details: "Record created",
+	})
+
+	respondJSON(w, 201, map[string]interface{}{"created": true, "record": rec})
+}
+
+func handleUpdate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" && r.Method != "PUT" {
+		respondJSON(w, 405, map[string]string{"error": "POST/PUT required"})
+		return
+	}
+	var body map[string]interface{}
+	json.NewDecoder(r.Body).Decode(&body)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	id := getString(body, "id")
+	for i := range records {
+		if records[i].ID == id {
+			if s := getString(body, "status"); s != "" {
+				records[i].Status = s
+			}
+			for k, v := range body {
+				if k != "id" {
+					records[i].Data[k] = v
+				}
+			}
+			records[i].UpdatedAt = time.Now().Format(time.RFC3339)
+			records[i].Version++
+			auditLog = append(auditLog, AuditEntry{
+				ID: fmt.Sprintf("AUD-%08X", secureUint32()), Action: "update",
+				RecordID: id, Actor: getString(body, "updatedBy"),
+				Timestamp: records[i].UpdatedAt, Details: "Record updated",
+			})
+			respondJSON(w, 200, map[string]interface{}{"updated": true, "record": records[i]})
+			return
+		}
+	}
+	respondJSON(w, 404, map[string]string{"error": "Record not found: " + id})
+}
+
+func handleProcess(w http.ResponseWriter, r *http.Request) {
+	// NOT IMPLEMENTED: the scaffold previously FABRICATED processing results here
+	// (processingResult="success" and a random score via math/rand). Real domain
+	// processing must be implemented before this endpoint is enabled.
+	// Fail fast; never fabricate.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
+}
+
+func handleAudit(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	respondJSON(w, 200, map[string]interface{}{"auditLog": auditLog, "total": len(auditLog)})
+}
+
+func handleStats(w http.ResponseWriter, r *http.Request) {
+	mu.Lock()
+	defer mu.Unlock()
+	domainStats.TotalRecords = len(records)
+	active := 0
+	pending := 0
+	for _, r := range records {
+		if r.Status == "active" || r.Status == "completed" {
+			active++
+		}
+		if r.Status == "pending" || r.Status == "processing" {
+			pending++
+		}
+	}
+	domainStats.ActiveRecords = active
+	domainStats.PendingRecords = pending
+	respondJSON(w, 200, domainStats)
+}
+
+func getString(m map[string]interface{}, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
+// --- GAP 8: Payments → GL ---
+func paymentsToGL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PaymentID string  `json:"payment_id"`
+		Amount    float64 `json:"amount"`
+		Currency  string  `json:"currency"`
+		Type      string  `json:"payment_type"`
+		Narration string  `json:"narration"`
+		TenantID  string  `json:"tenant_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, 400)
+		return
+	}
+
+	// Idempotency check (C-1)
+	idemKey := fmt.Sprintf("payments-gl-%s", req.PaymentID)
+	if exists, _ := checkIdempotency(idemKey); exists {
+		respondJSON(w, 200, map[string]string{"status": "duplicate", "payment_id": req.PaymentID})
+		return
+	}
+
+	// Real GL posting via core-banking — fail-fast on upstream error (C-1).
+	// NOT IMPLEMENTED: core-banking /v1/gl/post endpoint does not exist yet.
+	// Previously this scaffold fabricated a success response here; fail fast instead.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
+}
+
+// --- GAP 9: Loan Lifecycle → GL ---
+func loanLifecycleToGL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		LoanID    string  `json:"loan_id"`
+		EventType string  `json:"event_type"` // disbursement, repayment, interest_accrual, penalty
+		Amount    float64 `json:"amount"`
+		TenantID  string  `json:"tenant_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, 400)
+		return
+	}
+
+	idemKey := fmt.Sprintf("loan-gl-%s-%s", req.LoanID, req.EventType)
+	if exists, _ := checkIdempotency(idemKey); exists {
+		respondJSON(w, 200, map[string]string{"status": "duplicate", "loan_id": req.LoanID})
+		return
+	}
+
+	// Real GL posting via core-banking — fail-fast (C-1).
+	// NOT IMPLEMENTED: core-banking /v1/gl/post endpoint does not exist yet.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
+}
+
+// --- GAP 10: FX Dealing → GL ---
+func fxDealingToGL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DealID       string  `json:"deal_id"`
+		BuyCurrency  string  `json:"buy_currency"`
+		SellCurrency string  `json:"sell_currency"`
+		BuyAmount    float64 `json:"buy_amount"`
+		SellAmount   float64 `json:"sell_amount"`
+		Rate         float64 `json:"rate"`
+		TenantID     string  `json:"tenant_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, 400)
+		return
+	}
+
+	idemKey := fmt.Sprintf("fx-gl-%s", req.DealID)
+	if exists, _ := checkIdempotency(idemKey); exists {
+		respondJSON(w, 200, map[string]string{"status": "duplicate", "deal_id": req.DealID})
+		return
+	}
+
+	// Real GL posting via core-banking — fail-fast (C-1).
+	// NOT IMPLEMENTED: core-banking /v1/gl/post endpoint does not exist yet.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
+}
+
+// --- GAP 11: Fixed Deposit → GL ---
+func fixedDepositToGL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		FDID      string  `json:"fd_id"`
+		EventType string  `json:"event_type"` // placement, interest_accrual, maturity, premature_break
+		Amount    float64 `json:"amount"`
+		TenantID  string  `json:"tenant_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, 400)
+		return
+	}
+
+	idemKey := fmt.Sprintf("fd-gl-%s-%s", req.FDID, req.EventType)
+	if exists, _ := checkIdempotency(idemKey); exists {
+		respondJSON(w, 200, map[string]string{"status": "duplicate", "fd_id": req.FDID})
+		return
+	}
+
+	// Real GL posting via core-banking — fail-fast (C-1).
+	// NOT IMPLEMENTED: core-banking /v1/gl/post endpoint does not exist yet.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
+}
+
+// --- GAP 12: Standing Instructions → GL ---
+func standingInstructionsToGL(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SIID       string  `json:"si_id"`
+		Amount     float64 `json:"amount"`
+		ExecutedAt string  `json:"executed_at"`
+		TenantID   string  `json:"tenant_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error":"invalid request"}`, 400)
+		return
+	}
+
+	idemKey := fmt.Sprintf("si-gl-%s-%s", req.SIID, req.ExecutedAt)
+	if exists, _ := checkIdempotency(idemKey); exists {
+		respondJSON(w, 200, map[string]string{"status": "duplicate", "si_id": req.SIID})
+		return
+	}
+
+	// Real GL posting via core-banking — fail-fast (C-1).
+	// NOT IMPLEMENTED: core-banking /v1/gl/post endpoint does not exist yet.
+	respondJSON(w, 501, map[string]string{"error": "not_implemented"})
+}
+
+// Idempotency via Postgres
+func checkIdempotency(key string) (bool, error) {
+	if db == nil {
+		return false, nil
+	}
+	var exists bool
+	err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM idempotency_keys WHERE key = $1)", key).Scan(&exists)
+	return exists, err
+}
+
+// Health
+func healthz(w http.ResponseWriter, r *http.Request) {
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"service": "banking-domain-integration-go",
+		"status":  "healthy",
+		"gaps":    []string{"8", "9", "10", "11", "12"},
+		"time":    time.Now().UTC().Format(time.RFC3339),
 	})
 }
 
@@ -707,20 +762,17 @@ func traceMiddleware(next http.Handler) http.Handler {
 
 // --- JWT Auth Middleware ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
+	// Chain-level guard delegates to the canonical RS256/JWKS verifier
+	// (jwtMiddleware): every non-probe request gets real Keycloak signature
+	// verification with exp/iss/aud enforcement; probe/health paths stay exempt.
+	inner := jwtMiddleware(jwtRealmURL(), next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-			return
-		}
-		next.ServeHTTP(w, r)
+		inner.ServeHTTP(w, r)
 	})
 }
 
