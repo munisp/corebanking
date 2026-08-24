@@ -16,7 +16,13 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+var (
+	db  *pgxpool.Pool
+	ctx = context.Background()
 )
 
 var port = getEnv("PORT", "8222")
@@ -492,13 +498,13 @@ func main() {
 	startJWKSRefresh()
 
 	godotenv.Load()
-	ctx := context.Background()
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		log.Fatal("[cif-management-go] DATABASE_URL must be set; no default DSN is provided (credentials must come from the environment)")
 	}
-	db, err := pgxpool.New(ctx, dbURL)
+	var err error
+	db, err = pgxpool.New(ctx, dbURL)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}
@@ -511,17 +517,9 @@ func main() {
 	svc := &CIFService{db: db}
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		tid := tenantID(r)
-		var total int
-		if tid != "" {
-			db.QueryRow(ctx, `SELECT COUNT(*) FROM customers WHERE bank_id = $1`, tid).Scan(&total)
-		}
-		jsonResponse(w, 200, map[string]interface{}{
-			"status": "healthy", "service": "cif-management",
-			"cifs": map[string]int{"total": total}, "middleware": middlewareConfig,
-		})
-	})
+	mux.HandleFunc("/healthz", healthHandler)
+	mux.HandleFunc("/readyz", readyzHandler)
+	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/v1/customers", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			svc.createCustomer(w, r)
@@ -533,5 +531,89 @@ func main() {
 	mux.HandleFunc("/v1/stats", svc.getStats)
 
 	log.Printf("[cif-management] Listening on :%s\n", port)
-	log.Fatal(http.ListenAndServe(":"+port, jwtAuthMiddleware(mux)))
+	log.Fatal(http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux)))))
+}
+
+// healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	tid := tenantID(r)
+	var total int
+	if tid != "" {
+		db.QueryRow(ctx, `SELECT COUNT(*) FROM customers WHERE bank_id = $1`, tid).Scan(&total)
+	}
+	jsonResponse(w, 200, map[string]interface{}{
+		"status": "healthy", "service": "cif-management",
+		"cifs": map[string]int{"total": total}, "middleware": middlewareConfig,
+	})
+}
+
+// --- Request metrics (restored fleet-canonical block) ---
+var (
+	_reqCount uint64
+	_errCount uint64
+	_bootTime = time.Now()
+)
+
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.status = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func countingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddUint64(&_reqCount, 1)
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		if rw.status >= 400 {
+			atomic.AddUint64(&_errCount, 1)
+		}
+	})
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	reqs := atomic.LoadUint64(&_reqCount)
+	errs := atomic.LoadUint64(&_errCount)
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintf(w, "# TYPE requests_total counter\nrequests_total{service=\"cif-management-go\"} %d\n", reqs)
+	fmt.Fprintf(w, "# TYPE errors_total counter\nerrors_total{service=\"cif-management-go\"} %d\n", errs)
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\nuptime_seconds{service=\"cif-management-go\"} %.0f\n", time.Since(_bootTime).Seconds())
+}
+
+func readyzHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	fmt.Fprintf(w, `{"ready":true,"service":"cif-management-go"}`)
+}
+
+// --- Rate limiting (restored fleet-canonical token bucket: 100 rps) ---
+var _rlTokens int64 = 100
+var _rlLastRefill int64
+
+func rlAllow() bool {
+	nowr := time.Now().UnixMilli()
+	if nowr-atomic.LoadInt64(&_rlLastRefill) >= 1000 {
+		atomic.StoreInt64(&_rlTokens, 100)
+		atomic.StoreInt64(&_rlLastRefill, nowr)
+	}
+	if atomic.AddInt64(&_rlTokens, -1) < 0 {
+		atomic.AddInt64(&_rlTokens, 1)
+		return false
+	}
+	return true
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !rlAllow() {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":"rate_limit_exceeded"}`, 429)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
