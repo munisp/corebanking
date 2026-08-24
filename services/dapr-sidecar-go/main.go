@@ -359,6 +359,7 @@ func countingMiddleware(next http.Handler) http.Handler {
 		}
 	})
 }
+
 type responseWriter struct {
 	http.ResponseWriter
 	status int
