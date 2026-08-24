@@ -11,6 +11,7 @@
  */
 
 import { db } from "../db";
+import { and, eq } from "drizzle-orm";
 import { openappsecWafEvents, openappsecLearningData, wafRules } from "../../drizzle/schema";
 import { logger } from "./logger";
 import type { Request, Response, NextFunction } from "express";
@@ -93,10 +94,13 @@ export async function recordLearningData(
         .select()
         .from(openappsecLearningData)
         .where(
-          // Use raw SQL for multi-column condition
-          // @ts-ignore
-          (t: typeof openappsecLearningData) =>
-            `${t.endpoint} = '${endpoint}' AND ${t.method} = '${method}' AND ${t.paramName} = '${param.name}'`
+          // W7-C-15: fully parameterized drizzle conditions — no string
+          // interpolation of endpoint/method/param.name into SQL.
+          and(
+            eq(openappsecLearningData.endpoint, endpoint),
+            eq(openappsecLearningData.method, method),
+            eq(openappsecLearningData.paramName, param.name)
+          )
         )
         .limit(1);
 

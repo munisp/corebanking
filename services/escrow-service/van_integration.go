@@ -186,7 +186,22 @@ func NewEscrowFundingHandler(vanClient *EscrowVANClient) *EscrowFundingHandler {
 	return &EscrowFundingHandler{vanClient: vanClient}
 }
 
-// HandleVANPayment processes a VAN payment webhook for escrow funding
+// HandleVANPayment processes a VAN payment webhook for escrow funding.
+//
+// W7-C-03: this handler previously logged the payment and returned nil
+// (silent success) without ever crediting the escrow. That is unacceptable on
+// a real-money funding path, so it now FAILS CLOSED.
+//
+// MISSING BUSINESS RULE (must be supplied by the escrow product/ledger owners
+// before this handler may be enabled): the authoritative crediting semantics
+// for VAN funding — i.e. which ledger account is debited/credited, how
+// partial vs. exact vs. over-payment amounts map to FundedAmount, when the
+// escrow transitions to "funded", and which notification/workflow signal
+// fires on completion. Until that rule is implemented here, every call
+// returns an explicit error and the caller (the currently-unregistered
+// webhook endpoint, see the commented block below) must surface it as a 503.
+// The webhook route must remain UNREGISTERED until crediting is implemented
+// and webhook-signature verification is in place.
 func (h *EscrowFundingHandler) HandleVANPayment(ctx context.Context, payload *EscrowVANWebhookPayload) error {
 	if payload.ReferenceType != "escrow" {
 		return fmt.Errorf("invalid reference type: %s", payload.ReferenceType)
@@ -195,16 +210,10 @@ func (h *EscrowFundingHandler) HandleVANPayment(ctx context.Context, payload *Es
 	escrowID := payload.ReferenceID
 	amount := payload.Amount
 
-	log.Printf("Processing escrow funding: escrow=%s, amount=%.2f, from=%s", escrowID, amount, payload.SenderName)
+	log.Printf("VAN funding webhook received but NOT credited (crediting rule unimplemented): escrow=%s, amount=%.2f, payment=%s, txn=%s",
+		escrowID, amount, payload.PaymentID, payload.TransactionRef)
 
-	// TODO: Integrate with escrow service to:
-	// 1. Credit escrow account
-	// 2. Check if escrow is fully funded
-	// 3. Update escrow status to "funded" if complete
-	// 4. Notify seller that funds are in escrow
-	// 5. Trigger next step in escrow workflow
-
-	return nil
+	return fmt.Errorf("van_funding_not_configured: escrow %s VAN payment %.2f (%s) cannot be credited — authoritative escrow crediting rule is not implemented", escrowID, amount, payload.TransactionRef)
 }
 
 // EscrowDetails represents escrow information needed for VAN creation

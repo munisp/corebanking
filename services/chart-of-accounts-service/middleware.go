@@ -281,7 +281,25 @@ type AuditEvent struct {
 	UserAgent string `json:"user_agent"`
 }
 
+// logAuditEvent forwards the event to the service's real audit sink — the
+// audit-service POST /audits endpoint via sendAuditEvent (audit_middleware.go),
+// which persists the platform audit trail. W7-C-13: this function previously
+// had an empty body, so every CoA mutation audit event was silently dropped.
 func logAuditEvent(event AuditEvent) {
+	tenantID := event.TenantID
+	if tenantID == "" {
+		tenantID = "unknown"
+	}
+	actorID := event.UserID
+	if actorID == "" {
+		actorID = "unknown"
+	}
+	go sendAuditEvent(actorID, tenantID, event.Action, map[string]interface{}{
+		"resource":   event.Resource,
+		"user_role":  event.UserRole,
+		"ip_address": event.IPAddress,
+		"user_agent": event.UserAgent,
+	})
 }
 
 func writeError(w http.ResponseWriter, statusCode int, message string) {

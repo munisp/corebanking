@@ -645,15 +645,23 @@ func generateReferenceNumber(prefix string) string {
 	return fmt.Sprintf("%s-%d-%06d", prefix, year, sequence%1000000)
 }
 
-// Helper function to extract user ID from context/token
-func getUserID(c *gin.Context) string {
-	// TODO: Extract from JWT token
-	// For now, return from header or default
-	userID := c.GetHeader("x-keycloak-id")
-	if userID == "" {
-		userID = "user_default"
+// getUserID extracts the authenticated user identity EXCLUSIVELY from the
+// verified JWT claims that jwtAuthMiddleware stores in the gin context
+// (c.Set("jwt_claims", claims) after RS256/JWKS verification). Caller-supplied
+// identity headers are never consulted, and there is no "user_default"
+// fallback: when no verified subject claim is present the request is aborted
+// with 401 and ok=false is returned so the handler stops immediately.
+func getUserID(c *gin.Context) (userID string, ok bool) {
+	if v, exists := c.Get("jwt_claims"); exists {
+		if claims, isMap := v.(map[string]interface{}); isMap {
+			if sub, isStr := claims["sub"].(string); isStr && sub != "" {
+				return sub, true
+			}
+		}
 	}
-	return userID
+	SendError(c.Writer, "unauthorized", "Authenticated user identity required", http.StatusUnauthorized, nil)
+	c.Abort()
+	return "", false
 }
 
 // ============================================================
@@ -662,7 +670,10 @@ func getUserID(c *gin.Context) string {
 
 func getAllMurabaha(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	products, err := fetchAllMurabaha(tenantID, userID)
 	if err != nil {
@@ -676,7 +687,10 @@ func getAllMurabaha(c *gin.Context) {
 func getMurabahaByID(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	product, err := fetchMurabahaByID(id, tenantID, userID)
 	if err != nil {
@@ -689,7 +703,10 @@ func getMurabahaByID(c *gin.Context) {
 
 func applyForMurabaha(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		AssetName    string  `json:"asset_name" binding:"required"`
@@ -770,7 +787,10 @@ func applyForMurabaha(c *gin.Context) {
 func cancelMurabaha(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	if err := updateMurabahaStatusDB(id, tenantID, userID, StatusCancelled); err != nil {
 		SendError(c.Writer, "not_found", "Murabaha product not found", http.StatusNotFound, nil)
@@ -783,7 +803,10 @@ func cancelMurabaha(c *gin.Context) {
 func updateMurabahaStatus(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		Status string `json:"status" binding:"required"`
@@ -809,7 +832,10 @@ func updateMurabahaStatus(c *gin.Context) {
 
 func getAllMusharaka(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	products, err := fetchAllMusharaka(tenantID, userID)
 	if err != nil {
@@ -823,7 +849,10 @@ func getAllMusharaka(c *gin.Context) {
 func getMusharakaByID(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	product, err := fetchMusharakaByID(id, tenantID, userID)
 	if err != nil {
@@ -836,7 +865,10 @@ func getMusharakaByID(c *gin.Context) {
 
 func applyForMusharaka(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		BusinessName         string  `json:"business_name" binding:"required"`
@@ -893,7 +925,10 @@ func applyForMusharaka(c *gin.Context) {
 func cancelMusharaka(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	if err := updateMusharakaStatusDB(id, tenantID, userID, StatusCancelled); err != nil {
 		SendError(c.Writer, "not_found", "Musharaka product not found", http.StatusNotFound, nil)
@@ -906,7 +941,10 @@ func cancelMusharaka(c *gin.Context) {
 func updateMusharakaStatus(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		Status string `json:"status" binding:"required"`
@@ -932,7 +970,10 @@ func updateMusharakaStatus(c *gin.Context) {
 
 func getAllIjara(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	products, err := fetchAllIjara(tenantID, userID)
 	if err != nil {
@@ -946,7 +987,10 @@ func getAllIjara(c *gin.Context) {
 func getIjaraByID(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	product, err := fetchIjaraByID(id, tenantID, userID)
 	if err != nil {
@@ -959,7 +1003,10 @@ func getIjaraByID(c *gin.Context) {
 
 func applyForIjara(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		AssetName    string  `json:"asset_name" binding:"required"`
@@ -1005,7 +1052,10 @@ func applyForIjara(c *gin.Context) {
 func cancelIjara(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	if err := updateIjaraStatusDB(id, tenantID, userID, StatusCancelled); err != nil {
 		SendError(c.Writer, "not_found", "Ijara product not found", http.StatusNotFound, nil)
@@ -1018,7 +1068,10 @@ func cancelIjara(c *gin.Context) {
 func updateIjaraStatus(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		Status string `json:"status" binding:"required"`
@@ -1044,7 +1097,10 @@ func updateIjaraStatus(c *gin.Context) {
 
 func getAllTakaful(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	products, err := fetchAllTakaful(tenantID, userID)
 	if err != nil {
@@ -1058,7 +1114,10 @@ func getAllTakaful(c *gin.Context) {
 func getTakafulByID(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	product, err := fetchTakafulByID(id, tenantID, userID)
 	if err != nil {
@@ -1071,7 +1130,10 @@ func getTakafulByID(c *gin.Context) {
 
 func applyForTakaful(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		PolicyType     string  `json:"policy_type" binding:"required"`
@@ -1117,7 +1179,10 @@ func applyForTakaful(c *gin.Context) {
 func cancelTakaful(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	if err := updateTakafulStatusDB(id, tenantID, userID, StatusCancelled); err != nil {
 		SendError(c.Writer, "not_found", "Takaful product not found", http.StatusNotFound, nil)
@@ -1130,7 +1195,10 @@ func cancelTakaful(c *gin.Context) {
 func updateTakafulStatus(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		Status string `json:"status" binding:"required"`
@@ -1156,7 +1224,10 @@ func updateTakafulStatus(c *gin.Context) {
 
 func getAllSukuk(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	products, err := fetchAllSukuk(tenantID, userID)
 	if err != nil {
@@ -1170,7 +1241,10 @@ func getAllSukuk(c *gin.Context) {
 func getSukukByID(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	product, err := fetchSukukByID(id, tenantID, userID)
 	if err != nil {
@@ -1183,7 +1257,10 @@ func getSukukByID(c *gin.Context) {
 
 func investInSukuk(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		SukukType        string  `json:"sukuk_type" binding:"required"`
@@ -1229,7 +1306,10 @@ func investInSukuk(c *gin.Context) {
 func cancelSukuk(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	if err := updateSukukStatusDB(id, tenantID, userID, StatusCancelled); err != nil {
 		SendError(c.Writer, "not_found", "Sukuk product not found", http.StatusNotFound, nil)
@@ -1242,7 +1322,10 @@ func cancelSukuk(c *gin.Context) {
 func updateSukukStatus(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	var req struct {
 		Status string `json:"status" binding:"required"`
@@ -1268,7 +1351,10 @@ func updateSukukStatus(c *gin.Context) {
 
 func getAllProducts(c *gin.Context) {
 	tenantID := c.GetString("tenant_id")
-	userID := getUserID(c)
+	userID, idOK := getUserID(c)
+	if !idOK {
+		return
+	}
 
 	murabaha, _ := fetchAllMurabaha(tenantID, userID)
 	musharaka, _ := fetchAllMusharaka(tenantID, userID)
