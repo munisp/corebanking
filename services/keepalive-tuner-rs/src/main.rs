@@ -739,4 +739,3 @@ async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: 
 
     HttpResponse::NoContent().finish()
 }
-
