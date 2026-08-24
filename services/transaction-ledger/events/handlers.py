@@ -4,7 +4,8 @@ from database import get_session
 
 
 async def transaction_initiated_handler(payload: TransactionEventSchema):
-    session = next(get_session())
+    # RLS (migration V003): bind the event's tenant to the session context.
+    session = next(get_session(payload.tenant_id))
     try:
         transaction_repository = TransactionRepository(session)
         await transaction_repository.initiate_transaction(payload)
@@ -13,7 +14,7 @@ async def transaction_initiated_handler(payload: TransactionEventSchema):
 
 
 async def transaction_failed_handler(payload: TransactionEventSchema):
-    session = next(get_session())
+    session = next(get_session(payload.tenant_id))
     try:
         transaction_repository = TransactionRepository(session)
         await transaction_repository.mark_transaction_failed(payload)
@@ -22,7 +23,7 @@ async def transaction_failed_handler(payload: TransactionEventSchema):
 
 
 async def transaction_success_handler(payload: TransactionEventSchema):
-    session = next(get_session())
+    session = next(get_session(payload.tenant_id))
     try:
         transaction_repository = TransactionRepository(session)
         await transaction_repository.mark_transaction_success(payload)
