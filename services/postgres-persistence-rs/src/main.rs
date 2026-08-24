@@ -206,6 +206,11 @@ async fn check_jwt(req: &actix_web::HttpRequest) -> Result<serde_json::Value, ac
         _ => return Err(actix_web::HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid auth header"}))),
     };
     let claims = verify_jwt_token(token).await?;
+    // Fail-closed (wave-7.5): tenant identity comes ONLY from verified claims;
+    // tokens without a tenant claim are rejected before any query runs.
+    if claims.get("tenant_id").or_else(|| claims.get("tenant")).and_then(|v| v.as_str()).map(|s| s.is_empty()).unwrap_or(true) {
+        return Err(actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})));
+    }
     req.extensions_mut().insert(VerifiedClaims(claims.clone()));
     Ok(claims)
 }
@@ -347,9 +352,12 @@ async fn metrics(data: web::Data<AppState>) -> HttpResponse {
 async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     // Tenant identity comes from verified JWT claims (request extensions), never raw headers.
-    let tenant_id = claims_tenant(&req).unwrap_or_default();
+    let tenant_id = match claims_tenant(&req) {
+        Some(t) if !t.is_empty() => t,
+        _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
+    };
 
-    let rows = sqlx::query("SELECT id, status, created_at FROM cards WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT 50")
+    let rows = sqlx::query("SELECT id, status, created_at FROM cards WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT 50")
         .bind(tenant_id)
         .fetch_all(&data.db)
         .await;
@@ -373,7 +381,10 @@ async fn list_records(data: web::Data<AppState>, req: actix_web::HttpRequest) ->
 async fn create_record(data: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     // Tenant identity comes from verified JWT claims (request extensions), never raw headers/body.
-    let tenant_id = claims_tenant(&req).unwrap_or_else(|| "default".to_string());
+    let tenant_id = match claims_tenant(&req) {
+        Some(t) if !t.is_empty() => t,
+        _ => return actix_web::HttpResponse::Forbidden().json(serde_json::json!({"error": "tenant claim required"})),
+    };
 
     let status = body.status.clone().unwrap_or_else(|| "active".to_string());
 
