@@ -743,4 +743,3 @@ mod tests {
         DB_AVAILABLE.store(true, AtomicOrdering::Relaxed);
     }
 }
-
