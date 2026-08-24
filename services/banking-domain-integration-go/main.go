@@ -244,6 +244,7 @@ func fixedDepositToGL(w http.ResponseWriter, r *http.Request) {
 	businessDate := time.Now().Format("2006-01-02")
 	result := map[string]interface{}{
 		"batchId":      fmt.Sprintf("FD-GL-%s", businessDate),
+		"businessDate": businessDate,
 		"events": []map[string]interface{}{
 			{"eventId": "FD-PLACE-001", "type": "placement", "customerId": "CUST-015", "customer": "Hassan Premium", "principal": 50_000_000, "tenor": 180, "rate": 14.0,
 				"glPostings": []GLEntry{
