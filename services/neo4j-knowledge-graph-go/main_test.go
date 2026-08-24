@@ -23,7 +23,7 @@ func TestHealthEndpoint(t *testing.T) {
 func TestReadyzEndpoint(t *testing.T) {
 	req := httptest.NewRequest("GET", "/readyz", nil)
 	w := httptest.NewRecorder()
-	readyzHandler(w, req)
+	readyHandler(w, req)
 	if w.Code != 200 {
 		t.Errorf("readyz returned %d", w.Code)
 	}
@@ -44,7 +44,7 @@ func TestMetricsEndpoint(t *testing.T) {
 func TestJWTRequired(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/list", nil)
 	w := httptest.NewRecorder()
-	handler := jwtAuthMiddleware(http.HandlerFunc(listHandler))
+	handler := jwtAuthMiddleware(http.HandlerFunc(seedOntologyHandler))
 	handler.ServeHTTP(w, req)
 	if w.Code != 401 {
 		t.Errorf("expected 401 without JWT, got %d", w.Code)
@@ -69,7 +69,7 @@ func TestJWTForgedTokenRejected(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/list", nil)
 	req.Header.Set("Authorization", "Bearer "+header+"."+payload+"."+sig)
 	w := httptest.NewRecorder()
-	handler := jwtAuthMiddleware(http.HandlerFunc(listHandler))
+	handler := jwtAuthMiddleware(http.HandlerFunc(seedOntologyHandler))
 	handler.ServeHTTP(w, req)
 	if w.Code != 401 {
 		t.Errorf("expected 401 for forged JWT, got %d", w.Code)
