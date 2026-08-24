@@ -287,7 +287,7 @@ var creditNoteSyncs = []CreditNoteSync{
 		CreatedAt: "2026-05-06T15:00:00Z", SyncedAt: "2026-05-06T16:00:00Z",
 	},
 	{
-		ID: "CN-002", DisputeID: "DISP-2026-018", InvoiceID: "INV-2026-04-008", TenantID: "WL-MONIEPOINT",
+		ID: "CN-002", DisputeID: "DISP-2026-018", InvoiceID: "INV-2026-04-008", TenantID": "WL-MONIEPOINT",
 		Amount: 1200000, Reason: "Incorrect overage billing — QR transactions double-counted",
 		ERPCreditNote: "CN-2026-0048", ERPStatus: "confirmed",
 		GLEntries: []map[string]interface{}{
@@ -703,20 +703,17 @@ func dbInsert(id, service, typ, status string, data []byte) error {
 
 // --- JWT Auth Middleware ---
 func jwtAuthMiddleware(next http.Handler) http.Handler {
+	// Chain-level guard delegates to the canonical RS256/JWKS verifier
+	// (jwtMiddleware): every non-probe request gets real Keycloak signature
+	// verification with exp/iss/aud enforcement; probe/health paths stay exempt.
+	inner := jwtMiddleware(jwtRealmURL(), next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if p == "/healthz" || p == "/readyz" || p == "/livez" || p == "/metrics" || p == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
-		auth := r.Header.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(401)
-			fmt.Fprintf(w, `{"error":"unauthorized","service":"%s"}`, serviceName)
-			return
-		}
-		next.ServeHTTP(w, r)
+		inner.ServeHTTP(w, r)
 	})
 }
 
