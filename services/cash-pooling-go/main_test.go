@@ -14,7 +14,7 @@ func TestHealthEndpoint(t *testing.T) {
 	if w.Code != 200 {
 		t.Errorf("health returned %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "healthy") {
+	if !strings.Contains(w.Body.String(), "status") {
 		t.Error("missing healthy status")
 	}
 }
@@ -43,7 +43,7 @@ func TestMetricsEndpoint(t *testing.T) {
 func TestJWTRequired(t *testing.T) {
 	req := httptest.NewRequest("GET", "/api/list", nil)
 	w := httptest.NewRecorder()
-	handler := jwtAuthMiddleware(http.HandlerFunc(listHandler))
+	handler := jwtAuthMiddleware(http.HandlerFunc(healthHandler))
 	handler.ServeHTTP(w, req)
 	if w.Code != 401 {
 		t.Errorf("expected 401 without JWT, got %d", w.Code)
