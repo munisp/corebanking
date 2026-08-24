@@ -15,6 +15,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/signal"
 	"regexp"
@@ -51,8 +52,12 @@ func checkJWT(r *http.Request) error {
 	if strings.HasPrefix(r.URL.Path, "/healthz") || strings.HasPrefix(r.URL.Path, "/readyz") || strings.HasPrefix(r.URL.Path, "/livez") || strings.HasPrefix(r.URL.Path, "/metrics") {
 		return nil
 	}
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
+	// Real verification: delegate to the canonical RS256/JWKS chain verifier
+	// (jwtAuthMiddleware) instead of trusting token presence.
+	passed := false
+	rec := httptest.NewRecorder()
+	jwtAuthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { passed = true })).ServeHTTP(rec, r)
+	if !passed {
 		return fmt.Errorf("unauthorized")
 	}
 	return nil
