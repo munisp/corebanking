@@ -580,7 +580,7 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8247);
+    let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8180);
     let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
         match init_db(&url).await {
             Some(c) => { println!("satellite-crop-monitor-rs: connected to Postgres"); Some(std::sync::Arc::new(c)) }
@@ -593,7 +593,7 @@ async fn main() -> std::io::Result<()> {
         db_client,
     });
     println!("satellite-crop-monitor-rs on port {}", port);
-    start_grpc_server("satellite-crop-monitor-rs", 10458);
+    start_grpc_server("satellite-crop-monitor-rs", 10353);
     HttpServer::new(move || {
         App::new()
                 .wrap(
@@ -650,15 +650,16 @@ async fn init_schema(pool: &PgPool) {
     sqlx::query(r#"CREATE TABLE IF NOT EXISTS audit_events (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_type VARCHAR(64) NOT NULL,
-    entity_type VARCHAR(32) NOT NULL,
-    entity_id VARCHAR(64),
-    actor_id UUID,
-    actor_type VARCHAR(16) NOT NULL DEFAULT 'user',
+    actor_id UUID NOT NULL,
+    actor_type VARCHAR(20) NOT NULL,
+    resource_type VARCHAR(64) NOT NULL,
+    resource_id VARCHAR(128) NOT NULL,
     action VARCHAR(32) NOT NULL,
-    changes JSONB,
+    outcome VARCHAR(20) NOT NULL DEFAULT 'success',
     ip_address INET,
     user_agent TEXT,
-    session_id VARCHAR(64),
+    changes JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
     tenant_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )"#)
@@ -672,18 +673,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ndvi_health_exists() {
-        // Verify ndvi_health compiles and is callable
-        // Domain function: ndvi_health(ndvi: f64) -> &'static str
-        assert!(true, "ndvi_health should be defined");
-    }
+    fn test_rainfall_adequacy() { let r = rainfall_adequacy(10000.0); assert!(r >= 0.0); }
 
     #[test]
-    fn test_analyze_imagery_exists() {
-        // Verify analyze_imagery compiles and is callable
-        // Domain function: analyze_imagery(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse
-        assert!(true, "analyze_imagery should be defined");
-    }
+    fn test_yield_estimate() { let r = yield_estimate(10000.0); assert!(r >= 0.0); }
     #[test]
     fn test_circuit_breaker_opens() {
         for _ in 0..5 { cb_record_failure(); }
