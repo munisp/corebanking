@@ -1931,8 +1931,11 @@ func recordPayment(c *gin.Context) {
 		return
 	}
 
-	// Update arrears status if applicable
-	updateArrearsStatus(id, tenantID)
+	// Update arrears status if applicable — recalculation failures are
+	// logged, never silently dropped (the daily servicing workflow retries).
+	if err := updateArrearsStatus(id, tenantID); err != nil {
+		log.Printf("Failed to update arrears status for mortgage %s after payment: %v", id, err)
+	}
 
 	// Publish event
 	kafkaClient.PublishEventReliably("mortgages.payments", MortgageEvent{
