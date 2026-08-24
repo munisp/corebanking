@@ -548,7 +548,7 @@ func fetchJWKS(realmURL string) {
 		jwtCache.keys[k.Kid] = &rsa.PublicKey{N: new(big.Int).SetBytes(nBytes), E: eInt}
 	}
 	jwtCache.updated = time.Now()
-	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwks.Keys))
+	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
 // ensureJWKSRefresh starts the initial JWKS fetch and the 5-minute refresher
