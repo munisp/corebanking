@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends
 
 from database import Base, engine
+from database.migrate import run_migrations
 from api import health_router, transaction_router, investigation_router
 from utils import get_config
 from utils.coa_client import CoAClient
@@ -23,10 +24,29 @@ coa_client = CoAClient()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
+        # Dev bootstrap: create the model-owned tables if absent. The
+        # authoritative schema deltas (idempotency constraint, kobo
+        # projection, RLS, idempotency + audit tables) are the migrations
+        # below — create_all alone never applies them.
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables created/verified")
     except Exception as exc:
         logger.error("Failed to run create_all: %s", exc)
+
+    # W7-C-18: run the Flyway-style migrations (V002 idempotency/numeric,
+    # V003 kobo + RLS). They are idempotent (tracked in schema_migrations).
+    # In production a failed migration is startup-fatal: serving traffic
+    # against a schema missing the idempotency/RLS constraints is worse than
+    # not serving at all.
+    try:
+        run_migrations(config.DATABASE_URI)
+    except Exception:
+        from utils.config import config_name
+
+        if config_name == "production":
+            raise
+        logger.exception("Migration run failed (non-production; continuing)")
+
     yield
 
 

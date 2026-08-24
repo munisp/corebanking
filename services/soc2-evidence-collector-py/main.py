@@ -1,17 +1,26 @@
 """
-soc2-evidence-collector-py - Production-ready service with PostgreSQL persistence.
+soc2-evidence-collector-py - SOC 2 evidence collection service.
+
+STATUS (SOC2-HOLLOW remediation): this service previously exposed a generic
+`payments` CRUD scaffold that collected no SOC 2 evidence at all. Those
+routes now FAIL CLOSED with HTTP 501 (not_implemented): no route in this
+service fabricates or stores compliance "evidence". Real evidence collection
+(pulling from the platform audit trail, monitoring and access-control
+sources) is a tracked, unimplemented feature; until it lands, every domain
+route explicitly reports not_implemented instead of simulating collection.
+
+Operational routes (/healthz, /readyz, /livez, /metrics) remain live.
+
 Middleware: Keycloak JWT, Kafka events, OpenSearch indexing, Permify authorization.
 """
 
 import os
 import json
-import uuid
 import logging
 from contextlib import asynccontextmanager
 
 import psycopg2
-import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -338,37 +347,45 @@ def livez():
 
 @app.get("/metrics")
 def metrics():
-    try:
-        conn = get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM payments")
-            count = cur.fetchone()[0]
-        return {"service": "soc2-evidence-collector-py", "total_records": count}
-    except Exception:
-        return {"service": "soc2-evidence-collector-py", "total_records": 0}
+    return {
+        "service": "soc2-evidence-collector-py",
+        "requests_total": request_count,
+        "errors_total": error_count,
+        "evidence_collected": 0,
+        "status": "not_implemented",
+    }
+
+
+# --- Domain routes: FAIL CLOSED (SOC2-HOLLOW) ---
+# The previous `payments` CRUD scaffold collected no SOC 2 evidence; returning
+# fabricated record lists from a service named "soc2-evidence-collector" is
+# worse than refusing. Every domain route reports 501 until real evidence
+# collection (from the platform audit trail / monitoring / access-control
+# sources) is implemented.
+
+_NOT_IMPLEMENTED_DETAIL = (
+    "SOC 2 evidence collection is not implemented in this service; "
+    "no evidence is collected, fabricated, or returned. See module docstring."
+)
+
+
+def _not_implemented():
+    raise HTTPException(status_code=501, detail=_NOT_IMPLEMENTED_DETAIL)
 
 
 @app.get("/api/v1/payments")
-def list_records(x_tenant_id: Optional[str] = Header(None), page: int = 1, limit: int = 20):
-    conn = get_db()
-    if not conn:
-        return {"items": [], "total": 0, "page": page, "limit": limit}
-    try:
-        cur = conn.cursor()
-        offset = (page - 1) * limit
-        cur.execute("SELECT id, status, tenant_id, created_at FROM service_configs ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    (limit, offset))
-        rows = cur.fetchall()
-        items = [
-            {"id": str(row[0]), "status": row[1], "tenant_id": str(row[2]) if row[2] else None, "created_at": str(row[3])}
-            for row in rows
-        ]
-        cur.execute("SELECT COUNT(*) FROM service_configs")
-        total = cur.fetchone()[0]
-        return {"items": items, "total": total, "page": page, "limit": limit, "source": "database"}
-    except Exception as e:
-        logger.error(f"DB query failed: {e}")
-        raise HTTPException(status_code=503, detail="config_unavailable")
+def list_records():
+    _not_implemented()
+
+
+@app.get("/api/v1/evidence")
+def list_evidence():
+    _not_implemented()
+
+
+@app.post("/api/v1/evidence/collect", status_code=501)
+def collect_evidence():
+    _not_implemented()
 # --- JWT Auth ---
 def validate_jwt(headers):
     """Validate Bearer JWT with real HS256 signature verification (stdlib).
@@ -628,68 +645,26 @@ class _DegradationState:
 
 _degrade = _DegradationState()
 
-@app.post("/api/v1/payments", status_code=201)
-def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)):
-    tenant_id = body.tenant_id or x_tenant_id or "00000000-0000-0000-0000-000000000000"
-    status = body.status or "active"
-    record_id = str(uuid.uuid4())
-
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO payments (id, tenant_id, status) VALUES (%s::uuid, %s::uuid, %s)",
-            (record_id, tenant_id, status)
-        )
-        # Outbox event
-        payload = json.dumps({"id": record_id, "status": status, "tenant_id": tenant_id})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("payments.created", record_id, payload)
-        )
-    conn.commit()
-    return {"id": record_id, "status": "created"}
+# Legacy scaffold paths kept as explicit fail-closed 501s so callers receive
+# an honest not_implemented instead of a fabricated record or a bare 404.
+@app.post("/api/v1/payments", status_code=501)
+def create_record():
+    _not_implemented()
 
 
 @app.get("/api/v1/payments/{record_id}")
 def get_record(record_id: str):
-    conn = get_db()
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute("SELECT id, status, created_at FROM payments WHERE id = %s::uuid", (record_id,))
-        row = cur.fetchone()
-    if not row:
-        raise HTTPException(status_code=404, detail="not found")
-    return {"id": str(row["id"]), "status": row["status"], "created_at": row["created_at"].isoformat()}
+    _not_implemented()
 
 
 @app.put("/api/v1/payments/{record_id}")
-def update_record(record_id: str, body: UpdateRequest):
-    status = body.status or "updated"
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "UPDATE payments SET status = %s, updated_at = NOW() WHERE id = %s::uuid",
-            (status, record_id)
-        )
-        payload = json.dumps({"id": record_id, "status": status})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("payments.updated", record_id, payload)
-        )
-    conn.commit()
-    return {"id": record_id, "status": status}
+def update_record(record_id: str):
+    _not_implemented()
 
 
-@app.delete("/api/v1/payments/{record_id}", status_code=204)
+@app.delete("/api/v1/payments/{record_id}", status_code=501)
 def delete_record(record_id: str):
-    conn = get_db()
-    with conn.cursor() as cur:
-        cur.execute("UPDATE payments SET status = 'deleted', updated_at = NOW() WHERE id = %s::uuid", (record_id,))
-        payload = json.dumps({"id": record_id})
-        cur.execute(
-            "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
-            ("payments.deleted", record_id, payload)
-        )
-    conn.commit()
+    _not_implemented()
 
 # --- Graceful Shutdown ---
 server = None
