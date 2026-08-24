@@ -71,6 +71,17 @@ func fetchJWKS(realmURL string) {
 	log.Printf("[middleware] JWKS refreshed: %d keys", len(jwtCache.keys))
 }
 
+// tenantFromClaims derives the tenant ONLY from verified token claims — never
+// from caller-supplied headers or parameters.
+func tenantFromClaims(claims map[string]interface{}) string {
+	for _, k := range []string{"tenant_id", "tenantId", "tenant"} {
+		if s, ok := claims[k].(string); ok && s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
 func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 	// Initial JWKS fetch
 	go fetchJWKS(realmURL)
@@ -151,6 +162,15 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 			return
 		}
 		// Pass claims in context
+		// Tenant identity comes ONLY from verified JWT claims (fail-closed):
+		// overwrite any caller-supplied tenant header and reject tokens that
+		// carry no tenant claim before any query runs.
+		tenant := tenantFromClaims(claims)
+		if tenant == "" {
+			http.Error(w, `{"error":"forbidden: token has no tenant claim"}`, http.StatusForbidden)
+			return
+		}
+		r.Header.Set("X-Tenant-ID", tenant)
 		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -401,7 +421,7 @@ func listRecords(w http.ResponseWriter, r *http.Request) {
 	limit := 50
 	offset := 0
 
-	query := `SELECT id, status, created_at FROM accounts WHERE ($1 = '' OR tenant_id::text = $1) ORDER BY created_at DESC LIMIT $2 OFFSET $3`
+	query := `SELECT id, status, created_at FROM accounts WHERE tenant_id::text = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	rows, err := db.QueryContext(r.Context(), query, tenantID, limit, offset)
 	if err != nil {
 		internalError(w, "listRecords query", err)
@@ -432,7 +452,8 @@ func createRecord(w http.ResponseWriter, r *http.Request) {
 
 	tenantID := r.Header.Get("X-Tenant-ID")
 	if tenantID == "" {
-		tenantID = "default"
+		http.Error(w, `{"error":"forbidden: tenant required"}`, http.StatusForbidden)
+		return
 	}
 	body["tenant_id"] = tenantID
 
