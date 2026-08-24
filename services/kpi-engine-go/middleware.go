@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 )
@@ -48,13 +47,6 @@ func NewMiddlewareIntegration() *MiddlewareIntegration {
 			"lakehouse":   {Name: "Lakehouse (Iceberg+Sedona)", Endpoint: getEnv("LAKEHOUSE_ENDPOINT", "http://localhost:8181"), KPISource: "Materialized KPI views, geospatial analytics, trend data"},
 		},
 	}
-}
-
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }
 
 // ─── HEALTH CHECK PROBES ────────────────────────────────────────────────────
@@ -359,7 +351,7 @@ func middlewareStatusHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	jsonResp(w, 200, map[string]interface{}{
+	respondJSON(w, 200, map[string]interface{}{
 		"middleware":         statuses,
 		"total":              len(statuses),
 		"connected":          connected,
