@@ -302,7 +302,7 @@ var httpClient = &http.Client{
 // callBVNAPI calls the configured BVN verification API.
 // Expected provider response (Prembly-compatible):
 //
-//	{ "status": true, "detail": { "first_name": "...", "last_name": "...", ... } }
+//	{ "status": true, "detail": { "first_name": "...", "last_name": "..., ... } }
 //
 // Adapt the field mapping below to match your specific provider's schema.
 func callBVNAPI(bvn string) (*BVNVerification, []byte, error) {
