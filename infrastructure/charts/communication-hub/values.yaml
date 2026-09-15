@@ -44,6 +44,7 @@ dapr:
   cpu-limit: 150m
   memory-request: 128Mi
   memory-limit: 512Mi
+  config: daprsystem
 secrets:
   FLUVIO_URL: fluvio:9003
   TEMPORAL_HOST: temporal-frontend.temporal.svc:7233

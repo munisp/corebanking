@@ -39,6 +39,7 @@ dapr:
   cpu-limit: 150m
   memory-request: 64Mi
   memory-limit: 256Mi
+  config: daprsystem
 secrets:
   PORT: "8130"
   ACCOUNT_SVC_URL: "http://core-accounts.54link-dev.svc.cluster.local:9280"

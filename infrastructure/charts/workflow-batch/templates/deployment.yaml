@@ -25,6 +25,7 @@ spec:
         dapr.io/sidecar-cpu-limit:      '{{ index .Values.dapr "cpu-limit" }}'
         dapr.io/sidecar-memory-request: '{{ index .Values.dapr "memory-request" }}'
         dapr.io/sidecar-memory-limit:   '{{ index .Values.dapr "memory-limit" }}'
+        dapr.io/config: "{{ .Values.dapr.config }}"
       labels:
         {{- include "workflow-batch.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
