@@ -10,7 +10,14 @@ spec:
     - name: redisHost
       value: redis-master.redis.svc.cluster.local:6379
     - name: redisPassword
-      value: "3phHSv7qbAuZLb2pi9FWED2X"
+      # PREREQUISITE (not expressed here - secret values don't belong in git):
+      # a `redis-secret` Secret must exist in this namespace with a `password`
+      # key holding the real Redis password.
+      #   kubectl create secret generic redis-secret -n 54link-dev \
+      #     --from-literal=password=<real redis password>
+      secretKeyRef:
+        name: redis-secret
+        key: password
     - name: enableTLS
       value: "false"
     - name: dialTimeout
@@ -31,3 +38,5 @@ spec:
       value: "5m"
     - name: idleCheckFrequency
       value: "1m"
+  auth:
+    secretStore: kubernetes

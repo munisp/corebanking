@@ -1,1 +1,1 @@
-{"auths":{"registry.digitalocean.com":{"auth":"ZG9vX3YxX2IyNDFkYmJiZDgwZDAzOGE5NjczZjM4OWEzYzM4MDFjYTUxYTkxZGU4NmVmZmU0NjQzMGFhYjhhYmRiYjJmYWI6ZG9vX3YxX2IyNDFkYmJiZDgwZDAzOGE5NjczZjM4OWEzYzM4MDFjYTUxYTkxZGU4NmVmZmU0NjQzMGFhYjhhYmRiYjJmYWI="}}}
+{"auths":{"registry.digitalocean.com":{"auth":"CHANGE_ME_base64_of_token:token"}}}
