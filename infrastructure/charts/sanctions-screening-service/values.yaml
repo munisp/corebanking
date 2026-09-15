@@ -44,6 +44,7 @@ dapr:
   cpu-limit: 150m
   memory-request: 64Mi
   memory-limit: 256Mi
+  config: daprsystem
 secrets:
   PORT: "8283"
   MATCH_THRESHOLD: "0.85"

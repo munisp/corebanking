@@ -44,5 +44,6 @@ dapr:
   cpu-limit: 150m
   memory-request: 64Mi
   memory-limit: 256Mi
+  config: daprsystem
 secrets:
   PORT: "9096"

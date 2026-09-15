@@ -58,6 +58,7 @@ dapr:
   cpu-limit: 300m
   memory-request: 250Mi
   memory-limit: 1000Mi
+  config: daprsystem
 secrets:
   DB_DATABASE_TYPE: "postgres"
   DB_DATABASE: link_core_banking

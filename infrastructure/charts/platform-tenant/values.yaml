@@ -2,7 +2,7 @@ replicaCount: 1
 image:
   repository: registry.digitalocean.com/talentgraph-auth/54link-dev-platform-tenant
   pullPolicy: IfNotPresent
-  tag: "0.0.7"
+  tag: "0.0.8"
 nameOverride: ""
 fullnameOverride: ""
 serviceAccount:
@@ -58,6 +58,7 @@ dapr:
   cpu-limit: 300m
   memory-request: 250Mi
   memory-limit: 1000Mi
+  config: daprsystem
 secrets:
   DB_USERNAME: doadmin
   DB_DATABASE: link_core_banking
