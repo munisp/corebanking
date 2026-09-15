@@ -39,6 +39,7 @@ dapr:
   cpu-limit: 150m
   memory-request: 128Mi
   memory-limit: 512Mi
+  config: daprsystem
 secrets:
   APP_PORT: "8383"
   DB_DATABASE: link_core_banking

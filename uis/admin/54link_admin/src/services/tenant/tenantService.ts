@@ -38,12 +38,17 @@ export interface Tenant {
   updated_at: string;
   deleted_at: string | null;
   name: string;
+  type?: string;
   status: string;
   tenant_id: string;
   status_message: string | null;
   contact: TenantContact;
   branding: TenantBranding;
-  billing: TenantBilling;
+  // The tenant-management API returns `plan`/`billingPeriod` as flat fields on
+  // the tenant, not as a nested `billing` object.
+  plan?: string;
+  billingPeriod?: string;
+  billing?: TenantBilling;
   feature_flags: FeatureFlagConfig[];
   admin_feature_flags?: FeatureFlagConfig[];
   super_admin_feature_flags?: FeatureFlagConfig[];
@@ -80,6 +85,7 @@ const LINK54_DEFAULT_DATA: Tenant = {
   updated_at: "2025-01-01T00:00:00.000Z",
   deleted_at: null,
   name: "54Link",
+  type: "bank",
   status: "active",
   tenant_id: "bpmgd",
   status_message: null,
@@ -97,13 +103,8 @@ const LINK54_DEFAULT_DATA: Tenant = {
     secondary_color: "#16a34a", // Darker green
     domain: "54link.com",
   },
-  billing: {
-    id: 1,
-    created_at: "2025-01-01T00:00:00.000Z",
-    updated_at: "2025-01-01T00:00:00.000Z",
-    deleted_at: null,
-    plan: "enterprise",
-  },
+  plan: "enterprise",
+  billingPeriod: "monthly",
   // 54link default feature flags - all enabled (must match backend FeatureFlag enum)
   feature_flags: [
     { id: "f1",  name: "auth",                  is_enabled: true, config: {} },

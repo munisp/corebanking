@@ -44,6 +44,7 @@ dapr:
   cpu-limit: 150m
   memory-request: 128Mi
   memory-limit: 512Mi
+  config: daprsystem
 secrets:
   TRANSACTION_LEDGER_URL: "http://transaction-ledger.54link-dev.svc.cluster.local"
   PORT: "8019"

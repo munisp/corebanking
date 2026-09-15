@@ -147,7 +147,7 @@ export default function Dashboard() {
   // Tier distribution from tenants data
   const tierCounts: Record<string, number> = {};
   tenants.forEach((t) => {
-    const plan = t.billing?.plan || 'unknown';
+    const plan = t.plan || 'unknown';
     tierCounts[plan] = (tierCounts[plan] || 0) + 1;
   });
   const tierColors: Record<string, string> = {

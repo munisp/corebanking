@@ -59,6 +59,7 @@ dapr:
   cpu-limit: 300m
   memory-request: 250Mi
   memory-limit: 1000Mi
+  config: daprsystem
 secrets:
   DAPR_HOST: "localhost"
   APP_PORT: "9492"

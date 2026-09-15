@@ -45,6 +45,7 @@ dapr:
   cpu-limit: 300m
   memory-request: 250Mi
   memory-limit: 1000Mi
+  config: daprsystem
 secrets:
   CHAINLINK_URL: "https://oracle.etherisc.com"
   APP_PORT: "9162"

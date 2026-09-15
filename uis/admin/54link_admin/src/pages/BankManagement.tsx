@@ -155,7 +155,7 @@ export default function BankManagement() {
       tenant.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
       tenant.tenant_id.toLowerCase().includes(searchTerm.toLowerCase());
     const matchesTier =
-      filterTier === "all" || tenant.billing?.plan === filterTier;
+      filterTier === "all" || tenant.plan === filterTier;
     const matchesStatus =
       filterStatus === "all" || tenant.status === filterStatus;
     return matchesSearch && matchesTier && matchesStatus;
@@ -199,7 +199,7 @@ export default function BankManagement() {
     const data = filteredTenants.map((t) => ({
       "Tenant ID": t.tenant_id,
       Name: t.name,
-      Tier: t.billing?.plan || "N/A",
+      Tier: t.plan || "N/A",
       Status: t.status,
       Email: t.contact?.email || "",
       Phone: t.contact?.phone || "",
@@ -212,7 +212,7 @@ export default function BankManagement() {
     const data = filteredTenants.map((t) => [
       t.tenant_id,
       t.name,
-      t.billing?.plan || "N/A",
+      t.plan || "N/A",
       t.status,
       new Date(t.created_at).toLocaleDateString(),
     ]);
@@ -435,7 +435,7 @@ export default function BankManagement() {
     setSelectedTenant(tenant);
     setEditFormData({
       name: tenant.name || "",
-      type: "bank", // Default type since it's not in Tenant interface
+      type: tenant.type || "bank",
       status: tenant.status || "active",
       cacCertificateUrl: tenant.cac_certificate_url || "",
       cbnLicenseUrl: tenant.cbn_license_url || "",
@@ -447,7 +447,7 @@ export default function BankManagement() {
       contactName: tenant.contact?.name || "",
       contactEmail: tenant.contact?.email || "",
       contactPhone: tenant.contact?.phone || "",
-      billingPlan: tenant.billing?.plan || "premium",
+      billingPlan: tenant.plan || "premium",
     });
     // Pre-populate enabled feature flags from tenant
     const enabledFlagNames = new Set(
@@ -495,7 +495,7 @@ export default function BankManagement() {
       if (editFormData.cbnLicenseUrl !== (selectedTenant.cbn_license_url || "")) {
         updateData.cbnLicenseUrl = editFormData.cbnLicenseUrl;
       }
-      if (editFormData.billingPlan && editFormData.billingPlan !== (selectedTenant.billing?.plan || "")) {
+      if (editFormData.billingPlan && editFormData.billingPlan !== (selectedTenant.plan || "")) {
         updateData.plan = editFormData.billingPlan;
       }
 
@@ -644,7 +644,7 @@ export default function BankManagement() {
                   {isLoading
                     ? "..."
                     : getMetricValue(
-                        tenants.filter((t) => t.billing?.plan === "enterprise")
+                        tenants.filter((t) => t.plan === "enterprise")
                           .length,
                       )}
                 </div>
@@ -665,7 +665,7 @@ export default function BankManagement() {
                   {isLoading
                     ? "..."
                     : getMetricValue(
-                        tenants.filter((t) => t.billing?.plan === "premium")
+                        tenants.filter((t) => t.plan === "premium")
                           .length,
                       )}
                 </div>
@@ -686,7 +686,7 @@ export default function BankManagement() {
                   {isLoading
                     ? "..."
                     : getMetricValue(
-                        tenants.filter((t) => t.billing?.plan === "standard")
+                        tenants.filter((t) => t.plan === "standard")
                           .length,
                       )}
                 </div>
@@ -812,15 +812,15 @@ export default function BankManagement() {
                         </div>
                       </td>
                       <td className="px-6 py-4">
-                        <span className="text-sm text-slate-900 dark:text-white">
-                          Tenant
+                        <span className="text-sm text-slate-900 dark:text-white capitalize">
+                          {tenant.type || "N/A"}
                         </span>
                       </td>
                       <td className="px-6 py-4">
                         <span
-                          className={`px-3 py-1 rounded-full text-xs font-semibold ${getTierColor(tenant.billing?.plan || "basic")} capitalize`}
+                          className={`px-3 py-1 rounded-full text-xs font-semibold ${getTierColor(tenant.plan || "basic")} capitalize`}
                         >
-                          {tenant.billing?.plan || "N/A"}
+                          {tenant.plan || "N/A"}
                         </span>
                       </td>
                       <td className="px-6 py-4">
@@ -1106,9 +1106,9 @@ export default function BankManagement() {
                       Plan
                     </p>
                     <span
-                      className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${getTierColor(selectedTenant.billing?.plan || "basic")} capitalize`}
+                      className={`inline-block px-3 py-1 rounded-full text-xs font-semibold ${getTierColor(selectedTenant.plan || "basic")} capitalize`}
                     >
-                      {selectedTenant.billing?.plan || "N/A"}
+                      {selectedTenant.plan || "N/A"}
                     </span>
                   </div>
                 </div>

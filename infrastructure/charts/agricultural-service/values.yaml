@@ -45,6 +45,7 @@ dapr:
   cpu-limit: 300m
   memory-request: 250Mi
   memory-limit: 1000Mi
+  config: daprsystem
 secrets:
   SERVICE_PORT: "8015"
   PORT: "8015"
