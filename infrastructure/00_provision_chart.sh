@@ -86,12 +86,14 @@ dapr:
   memory-request: 250Mi
   memory-limit: 1000Mi
 secrets:
-  DB_HOST: db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com
+  # Fill these in after scaffolding - do not hardcode real credentials in this
+  # generator script, they'd be baked into every chart it produces.
+  DB_HOST: CHANGE_ME
   DB_PORT: 25060
-  DB_USER: doadmin
-  DB_PASSWORD: AVNS_MSy6CW3EGXnA8wJgkLv
-  DB_NAME: link_core_banking
-  DATABASE_URI: postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking
+  DB_USER: CHANGE_ME
+  DB_PASSWORD: CHANGE_ME
+  DB_NAME: CHANGE_ME
+  DATABASE_URI: CHANGE_ME
   DAPR_PUBSUB_NAME: pubsub
 EOL
 

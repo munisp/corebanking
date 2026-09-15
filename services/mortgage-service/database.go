@@ -52,10 +52,9 @@ func initRedis() *redis.Client {
 		redisAddr = "redis-master.redis.svc.cluster.local:6379"
 	}
 
+	// Real value must come from the environment - never hardcode Redis
+	// credentials in source.
 	redisPassword := os.Getenv("REDIS_PASSWORD")
-	if redisPassword == "" {
-		redisPassword = "3phHSv7qbAuZLb2pi9FWED2X"
-	}
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     redisAddr,

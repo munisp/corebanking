@@ -33,8 +33,14 @@ spec:
                   value: "https://54link-dev.upi.dev"
                 - name: PYTHONUNBUFFERED
                   value: "1"
+                # PREREQUISITE (not expressed here - secret values don't belong in git):
+                # a `smoke-test-db` Secret must exist in this namespace with a
+                # `database-url` key holding the real Postgres connection string.
+                #   kubectl create secret generic smoke-test-db -n <namespace> \
+                #     --from-literal=database-url=<real connection string>
                 - name: DATABASE_URL
-                  value: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking?sslmode=require"
+                  valueFrom:
+                    secretKeyRef: {name: smoke-test-db, key: database-url}
               resources:
                 requests:
                   cpu: "250m"

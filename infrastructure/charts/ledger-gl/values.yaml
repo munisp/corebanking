@@ -59,7 +59,9 @@ dapr:
   memory-limit: 1000Mi
   config: daprsystem
 secrets:
-  POSTGRES_URL: "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com:25060/link_core_banking?sslmode=require"
+  # Real value supplied at deploy time (helm upgrade --set-string secrets.POSTGRES_URL=...
+  # or a values override file that isn't committed) - never hardcode DB credentials here.
+  POSTGRES_URL: "CHANGE_ME"
   APP_PORT: "9465"
   PORT_BASE: "9465"
   SERVICE_GROUP: ledger-gl

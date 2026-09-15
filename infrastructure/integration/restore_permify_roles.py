@@ -32,11 +32,8 @@ import urllib.request
 import urllib.error
 
 # ── Config ────────────────────────────────────────────────────────────────────
-DB_URI = (
-    "postgresql://doadmin:AVNS_MSy6CW3EGXnA8wJgkLv"
-    "@db-postgresql-nyc1-18193-do-user-10555812-0.e.db.ondigitalocean.com"
-    ":25060/link_core_banking"
-)
+# Real value comes from the environment - never hardcode DB credentials here.
+DB_URI = os.environ["DATABASE_URI"]
 PERMIFY_URL = "http://localhost:3476"
 WRITE_ATTEMPTS = 3  # Postgres-backed Permify only needs 1, but retry for safety
 
