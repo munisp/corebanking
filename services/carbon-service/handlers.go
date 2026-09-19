@@ -91,22 +91,10 @@ func createProject(c *gin.Context) {
 		return
 	}
 
-	// Publish Kafka event for project creation
-	event := CarbonEvent{
-		Type:      "project.created",
-		EntityID:  projectID,
-		TenantID:  tenantID,
-		Timestamp: time.Now(),
-		Metadata: map[string]interface{}{
-			"project_name":  req.ProjectName,
-			"project_type":  req.ProjectType,
-			"location":      req.Location,
-			"registry":      req.Registry,
-			"registry_id":   req.RegistryID,
-			"total_credits": req.TotalCredits,
-		},
-	}
-	carbonKafkaClient.PublishEvent("carbon.project", event)
+	// OR-24: carbon.project Kafka publish removed — carbon is not a shipped
+	// feature and the topic had zero consumers (W10 orphan audit T7). The
+	// notifications row below remains the only record of project creation.
+	_ = carbonKafkaClient // client retained for future wired topics
 
 	c.JSON(201, gin.H{
 		"project_id":            projectID,
@@ -721,7 +709,7 @@ func settleTrade(c *gin.Context) {
 	}
 
 	query := `
-		SELECT trade_id, credit_id, seller_id, buyer_id, quantity,
+		SELECT trade_id, credit_id, seller_id, buyerID, quantity,
 			price_per_unit, total_amount, currency, status, trade_date
 		FROM carbon_trades
 		WHERE trade_id = $1 AND tenant_id = $2
