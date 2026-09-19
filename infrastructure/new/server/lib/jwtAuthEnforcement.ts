@@ -2,6 +2,12 @@
  * JWT Auth Enforcement — Keycloak JWT validation on every API route.
  * Implements token validation, role-based access, tenant extraction,
  * refresh token rotation, and session management.
+ *
+ * ST-05: LEGACY MONOLITH ROLE CATALOG. The role map in this file is a legacy
+ * monolith-local catalog and is NOT the canonical authorization model.
+ * Canonical catalog = Permify v2 schema at
+ * services/auth-service/schemas/permify/v2.perm. Do not add roles here; add
+ * them to the Permify schema. No behavior change in this wave — comment only.
  */
 import type { Express, Request, Response, NextFunction } from "express";
 import { decodeJWT, isTokenExpired, getJwksKeys, verifyTokenSignature } from "./jwtAuthMiddleware";
