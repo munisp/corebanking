@@ -5,7 +5,11 @@ import { VfdConnectorApiClient } from "../../../lib/VfdConnectorApiClient";
 import { billingApiClient } from "../../../lib/BillingApiClient";
 import { makerCheckerApiClient } from "../../../lib/MakerCheckerApiClient";
 import { nfiuApiClient } from "../../../lib/NfiuApiClient";
-import { sanctionsScreeningApiClient } from "../../../lib/SanctionsScreeningApiClient";
+import {
+  sanctionsScreeningApiClient,
+  SanctionsScreeningUnavailableError,
+  SanctionsScreeningResult,
+} from "../../../lib/SanctionsScreeningApiClient";
 import { asyncHandler } from "../../../middlewares/async";
 import { readEnv } from "../../../config/readEnv.config";
 import { daprClient } from "../../../services/daprClient";
@@ -127,14 +131,29 @@ export const initiate_transfer = asyncHandler(async (req, res) => {
     customerId: string,
     party: "payer" | "beneficiary",
   ) => {
-    const result = await sanctionsScreeningApiClient.screen({
-      name,
-      tenant_id: tenantId,
-      triggered_by: keycloakId,
-      transaction_id: (payload as any).reference,
-      customer_id: customerId,
-      screen_type: "transaction",
-    });
+    // CP-01/CP-03: on screening-service outage, fail closed using the
+    // error's fallback verdict (block) so the transfer is blocked
+    // AND the durable alert artifact is still persisted.
+    let result: SanctionsScreeningResult;
+    try {
+      result = await sanctionsScreeningApiClient.screen({
+        name,
+        tenant_id: tenantId,
+        triggered_by: keycloakId,
+        transaction_id: (payload as any).reference,
+        customer_id: customerId,
+        screen_type: "transaction",
+      });
+    } catch (screenErr) {
+      if (screenErr instanceof SanctionsScreeningUnavailableError) {
+        logger.error(
+          `Sanctions screening unavailable (fail-closed) party=${party} name=${name}: ${screenErr.message}`,
+        );
+        result = screenErr.fallbackResult;
+      } else {
+        throw screenErr;
+      }
+    }
 
     if (result.action === "block" || result.action === "hold_and_review") {
       const reason = result.matches
