@@ -238,43 +238,71 @@ spec:
     spec:
       template:
         spec:
-          resturityContext:
+          # PL-12 (F15-16): was `resturityContext:` — a typo that silently
+          # dropped the entire security context.
+          securityContext:
             runAsNonRoot: true
             runAsUser: 65534
           containers:
             - name: health-check
-              image: curlimages/curl:8.5.0
+              # PL-12: the script uses jq and bc; curlimages/curl has neither,
+              # so the replication-lag branch could never evaluate. alpine:3.20
+              # plus an initContainer install is used instead.
+              image: alpine:3.20
+              env:
+                # PL-12: real API hosts are deployment-specific — inject them,
+                # never bake in *.54bank.local placeholders.
+                - name: PRIMARY_K8S_API_HEALTHZ
+                  valueFrom:
+                    configMapKeyRef:
+                      name: dr-site-endpoints
+                      key: primary_healthz_url
+                      optional: false
+                - name: DR_K8S_API_HEALTHZ
+                  valueFrom:
+                    configMapKeyRef:
+                      name: dr-site-endpoints
+                      key: dr_healthz_url
+                      optional: false
+                - name: PROMETHEUS_URL
+                  value: "http://prometheus.monitoring.svc:9090"
+                - name: ALERTMANAGER_URL
+                  value: "http://alertmanager.monitoring.svc:9093"
               command:
                 - /bin/sh
                 - -c
                 - |
+                  # curlimages/curl lacked jq/bc — install them (cached layer in
+                  # practice; swap for a prebuilt internal image if egress is restricted).
+                  apk add --no-cache curl jq bc >/dev/null
+
                   # Check primary site
                   PRIMARY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-                    https://k8s-api.lagos.54bank.local:6443/healthz \
+                    "$PRIMARY_K8S_API_HEALTHZ" \
                     --max-time 5 || echo "000")
 
                   # Check DR site
                   DR_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-                    https://k8s-api.abuja.54bank.local:6443/healthz \
+                    "$DR_K8S_API_HEALTHZ" \
                     --max-time 5 || echo "000")
 
                   # Check replication lag
                   REPL_LAG=$(curl -s \
-                    http://prometheus.monitoring.svc:9090/api/v1/query?query=pg_replication_lag \
+                    "$PROMETHEUS_URL/api/v1/query?query=pg_replication_lag" \
                     --max-time 5 | jq -r '.data.result[0].value[1] // "unknown"')
 
                   echo "Primary: $PRIMARY_STATUS | DR: $DR_STATUS | Repl Lag: ${REPL_LAG}s"
 
                   # Alert if primary is down
                   if [ "$PRIMARY_STATUS" != "200" ]; then
-                    curl -s -X POST http://alertmanager.monitoring.svc:9093/api/v2/alerts \
+                    curl -s -X POST "$ALERTMANAGER_URL/api/v2/alerts" \
                       -H "Content-Type: application/json" \
-                      -d '[{"labels":{"alertname":"PrimarySiteDown","severity":"critical"},"annotations":{"summary":"Lagos primary site unreachable"}}]'
+                      -d '[{"labels":{"alertname":"PrimarySiteDown","severity":"critical"},"annotations":{"summary":"Primary site unreachable"}}]'
                   fi
 
                   # Alert if replication lag > 60s
                   if [ "$REPL_LAG" != "unknown" ] && [ "$(echo "$REPL_LAG > 60" | bc -l)" = "1" ]; then
-                    curl -s -X POST http://alertmanager.monitoring.svc:9093/api/v2/alerts \
+                    curl -s -X POST "$ALERTMANAGER_URL/api/v2/alerts" \
                       -H "Content-Type: application/json" \
                       -d '[{"labels":{"alertname":"HighReplicationLag","severity":"warning"},"annotations":{"summary":"DB replication lag exceeds 60s"}}]'
                   fi
@@ -286,3 +314,15 @@ spec:
                   cpu: 100m
                   memory: 64Mi
           restartPolicy: OnFailure
+---
+# PL-12: endpoints consumed by the dr-health-check CronJob above.
+# Set these to the REAL API-server healthz URLs of the primary and DR clusters
+# for each environment (previously hardcoded *.54bank.local placeholders).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: dr-site-endpoints
+  namespace: dr-management
+data:
+  primary_healthz_url: "https://SET-ME-primary-k8s-api:6443/healthz"
+  dr_healthz_url: "https://SET-ME-dr-k8s-api:6443/healthz"
