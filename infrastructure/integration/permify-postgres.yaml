@@ -142,8 +142,10 @@ spec:
     spec:
       containers:
         - name: permify
-          # Keep your existing image here
-          image: ghcr.io/permify/permify:latest
+          # PL-07: pinned to a real stable tag (published as
+          # ghcr.io/permify/permify:v1.6.8 — see Permify releases). `:latest`
+          # made authz upgrades uncontrolled.
+          image: ghcr.io/permify/permify:v1.6.8
           env:
             # ---- existing env vars (keep as-is) ----
             - name: PERMIFY_RATE_LIMIT
@@ -154,8 +156,9 @@ spec:
               value: "true"
             - name: PERMIFY_HTTP_PORT
               value: "3476"
+            # PL-07: profiler disabled in production (was true).
             - name: PERMIFY_PROFILER_ENABLED
-              value: "true"
+              value: "false"
             - name: PERMIFY_PROFILER_PORT
               value: "6060"
             - name: PERMIFY_LOG_LEVEL
@@ -170,8 +173,15 @@ spec:
               value: "10000"
             - name: PERMIFY_SERVICE_PERMISSION_CACHE_MAX_COST
               value: "16MiB"
-            - name: PERMIFY_DISTRIBUTED_ADDRESS
-              value: "demo:///grpc.demo.consistent_hash_balancer"
+            # PL-07: the literal demo:/// balancer address pointed at Permify's
+            # public demo infrastructure — removed. Distributed (gossip) mode is
+            # not enabled; replicas coordinate through the shared Postgres
+            # backend below, which makes authz data durable across restarts.
+            # NOTE: once this manifest (postgres engine) is deployed, the
+            # 15×-write hack in services/auth-service/adapters/permify.py
+            # ("Permify uses in-memory storage with 3 replicas") MUST be
+            # deleted — writes must go to a single logical Permify. Cross-ref:
+            # PL-07, coordinated via the W10 lead (R1B owns that file).
             - name: PERMIFY_DISTRIBUTED_PORT
               value: "5053"
 
