@@ -122,6 +122,39 @@ spec:
                   name: 54bank-secrets
                   key: jwt-secret
                   optional: true
+            # CP-01: goAML egress configuration. Without these, CTRs/STRs park
+            # at status 'generated' and never reach the NFIU. Keys live in the
+            # service SealedSecret (nfiu-ctr-str-filing-py-secrets).
+            - name: GOAML_API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nfiu-ctr-str-filing-py-secrets
+                  key: goaml-api-url
+                  optional: true
+            - name: GOAML_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nfiu-ctr-str-filing-py-secrets
+                  key: goaml-api-key
+                  optional: true
+            - name: GOAML_BANK_CODE
+              valueFrom:
+                secretKeyRef:
+                  name: nfiu-ctr-str-filing-py-secrets
+                  key: goaml-bank-code
+                  optional: true
+            - name: GOAML_REPORTER_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: nfiu-ctr-str-filing-py-secrets
+                  key: goaml-reporter-name
+                  optional: true
+            - name: NFIU_INTAKE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: nfiu-ctr-str-filing-py-secrets
+                  key: intake-token
+                  optional: true
           resources:
             requests:
               cpu: 100m
