@@ -240,9 +240,54 @@ class TransactionRepository:
         ledger_id: Optional[str],
         tag: Optional[str],
         currency_value: str,
+        fee_amount_kobo: Optional[int] = None,
+        fee_account: Optional[str] = None,
     ) -> dict:
         payer_code = _gl_account_code(str(payer))
         payee_code = _gl_account_code(str(payee))
+        lines = [
+            {
+                "account_id": payer_code,
+                "description": (
+                    f"Debit payer "
+                    f"{payer_meta.get('account', {}).get('account_number', payer)}"
+                ),
+                "debit_amount": amount_kobo,
+                "credit_amount": 0,
+            },
+            {
+                "account_id": payee_code,
+                "description": (
+                    f"Credit payee "
+                    f"{payee_meta.get('account', {}).get('account_number', payee)}"
+                ),
+                "debit_amount": 0,
+                "credit_amount": amount_kobo,
+            },
+        ]
+        # MN-10: multi-leg journal — the commission/fee leg charged to the
+        # payer and credited to the fee-income GL account (balanced).
+        if fee_amount_kobo and int(fee_amount_kobo) > 0:
+            fee_code = _gl_account_code(str(fee_account or "4201"))
+            lines.append(
+                {
+                    "account_id": payer_code,
+                    "description": (
+                        f"Debit payer fee "
+                        f"{payer_meta.get('account', {}).get('account_number', payer)}"
+                    ),
+                    "debit_amount": int(fee_amount_kobo),
+                    "credit_amount": 0,
+                }
+            )
+            lines.append(
+                {
+                    "account_id": fee_code,
+                    "description": "Credit fee/commission income",
+                    "debit_amount": 0,
+                    "credit_amount": int(fee_amount_kobo),
+                }
+            )
         return dict(
             user_id="system",
             user_role="system",
@@ -252,26 +297,7 @@ class TransactionRepository:
                 f"{payer_meta.get('account', {}).get('account_number', payer)} → "
                 f"{payee_meta.get('account', {}).get('account_number', payee)}"
             ),
-            lines=[
-                {
-                    "account_id": payer_code,
-                    "description": (
-                        f"Debit payer "
-                        f"{payer_meta.get('account', {}).get('account_number', payer)}"
-                    ),
-                    "debit_amount": amount_kobo,
-                    "credit_amount": 0,
-                },
-                {
-                    "account_id": payee_code,
-                    "description": (
-                        f"Credit payee "
-                        f"{payee_meta.get('account', {}).get('account_number', payee)}"
-                    ),
-                    "debit_amount": 0,
-                    "credit_amount": amount_kobo,
-                },
-            ],
+            lines=lines,
             reference=transaction_id,
             metadata={
                 "ledger_id": ledger_id,
@@ -300,6 +326,8 @@ class TransactionRepository:
             ledger_id=payload.ledger_id,
             tag=payload.tag,
             currency_value=payload.currency.value if payload.currency else "NGN",
+            fee_amount_kobo=getattr(payload, "fee_amount_kobo", None),
+            fee_account=getattr(payload, "fee_account", None),
         )
         await self._coa.create_journal_entry(tenant_id=transaction.tenant_id, **args)
 
@@ -324,6 +352,8 @@ class TransactionRepository:
             ledger_id=payload.ledger_id,
             tag=payload.tag,
             currency_value=payload.currency.value if payload.currency else "NGN",
+            fee_amount_kobo=getattr(payload, "fee_amount_kobo", None),
+            fee_account=getattr(payload, "fee_account", None),
         )
         transaction.status = TransactionStatus.GL_FAILED
         self._db.add(
