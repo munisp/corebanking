@@ -5,6 +5,7 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/lib/pq"
 )
 
 func envOr(key, fallback string) string {
@@ -75,11 +78,54 @@ type ConsentRequest struct {
 }
 
 var (
-	consents  []Consent
 	tpps      []TPP
 	endpoints []APIEndpoint
 	mu        sync.Mutex
+	// CP-09: Postgres consent store (durable, shared across replicas).
+	consentDB *sql.DB
 )
+
+// CP-09: initConsentStore creates the durable consent table. Called at boot;
+// failure is logged and consent endpoints fail closed with 503.
+func initConsentStore() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[open-banking-go] DATABASE_URL not set — consent store unavailable (endpoints will 503)")
+		return
+	}
+	var err error
+	consentDB, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[open-banking-go] consent DB open failed: %v", err)
+		consentDB = nil
+		return
+	}
+	consentDB.SetMaxOpenConns(10)
+	if _, err := consentDB.Exec(`CREATE TABLE IF NOT EXISTS ob_consents (
+		id TEXT PRIMARY KEY,
+		customer_id TEXT NOT NULL,
+		customer_name TEXT,
+		tpp_id TEXT NOT NULL,
+		tpp_name TEXT,
+		consent_type TEXT NOT NULL CHECK (consent_type IN ('ais','pis','cbpii')),
+		permissions JSONB NOT NULL DEFAULT '[]',
+		accounts JSONB NOT NULL DEFAULT '[]',
+		status TEXT NOT NULL DEFAULT 'awaiting_authorization'
+			CHECK (status IN ('awaiting_authorization','authorized','rejected','revoked','expired')),
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		expires_at TIMESTAMPTZ NOT NULL,
+		last_accessed_at TIMESTAMPTZ,
+		access_count INT NOT NULL DEFAULT 0,
+		revoked_at TIMESTAMPTZ
+	)`); err != nil {
+		log.Printf("[open-banking-go] ob_consents schema init failed: %v", err)
+	}
+	_, _ = consentDB.Exec(`CREATE INDEX IF NOT EXISTS idx_ob_consents_customer ON ob_consents(customer_id)`)
+	_, _ = consentDB.Exec(`CREATE INDEX IF NOT EXISTS idx_ob_consents_tpp ON ob_consents(tpp_id, status)`)
+	// Lazily expire consents past their expiry on boot.
+	_, _ = consentDB.Exec(`UPDATE ob_consents SET status='expired' WHERE status='authorized' AND expires_at < NOW()`)
+	log.Printf("[open-banking-go] consent store ready")
+}
 
 func init() {
 	tpps = []TPP{
@@ -91,15 +137,11 @@ func init() {
 		{"TPP-006", "Carbon (Paylater)", "CBN/TPP/2025/006", "pisp", "suspended", "CBN Certificate Authority", "2026-06-30", []string{"https://carbon.ng/callback"}, "api@carbon.ng", []string{"v3.1"}, 450},
 	}
 
-	consents = []Consent{
-		{"CNS-001", "CUST-001", "Dangote Industries", "TPP-001", "Paystack (Stripe)", "pis", []string{"ReadAccountsBasic", "ReadBalances", "CreatePayment"}, "authorized", "2026-04-01T10:00:00Z", "2026-10-01T10:00:00Z", "2026-05-09T14:30:00Z", 250, []string{"0012345678", "0012345679"}},
-		{"CNS-002", "CUST-002", "MTN Nigeria", "TPP-003", "Mono (YC)", "ais", []string{"ReadAccountsDetail", "ReadBalances", "ReadTransactionsDetail", "ReadStatementsBasic"}, "authorized", "2026-03-15T09:00:00Z", "2026-09-15T09:00:00Z", "2026-05-09T16:00:00Z", 1200, []string{"0098765432"}},
-		{"CNS-003", "CUST-003", "Access Corp", "TPP-002", "Flutterwave", "pis", []string{"ReadAccountsBasic", "CreatePayment"}, "authorized", "2026-05-01T12:00:00Z", "2026-11-01T12:00:00Z", "2026-05-09T11:00:00Z", 50, []string{"0033344455"}},
-		{"CNS-004", "CUST-004", "BUA Cement", "TPP-005", "Stitch", "cbpii", []string{"ReadAccountsBasic", "ReadBalances", "ConfirmFunds"}, "authorized", "2026-04-20T08:00:00Z", "2026-07-20T08:00:00Z", "2026-05-08T09:00:00Z", 80, []string{"0044455566"}},
-		{"CNS-005", "CUST-005", "Retail Customer", "TPP-004", "Okra", "ais", []string{"ReadAccountsBasic", "ReadBalances"}, "revoked", "2026-01-10T10:00:00Z", "2026-07-10T10:00:00Z", "2026-03-15T14:00:00Z", 30, []string{"0055566677"}},
-		{"CNS-006", "CUST-006", "Shell Nigeria", "TPP-006", "Carbon (Paylater)", "pis", []string{"CreatePayment"}, "rejected", "2026-05-09T10:00:00Z", "2026-11-09T10:00:00Z", "", 0, []string{"0066677788"}},
-	}
-
+	// CP-09: the six seeded in-memory consents (Dangote/MTN/Access Corp/BUA/
+	// Retail/Shell) were fabricated and lived only in process memory — deleted.
+	// Consents now live in Postgres (ob_consents) and are enforced on data
+	// endpoints. The TPP registry seed above is retained as the static
+	// accreditation list used for consent-creation validation.
 	endpoints = []APIEndpoint{
 		{"API-001", "/open-banking/v3.1/accounts", "GET", "accounts", "v3.1", "Get list of accounts", 1000, "oauth2_ais"},
 		{"API-002", "/open-banking/v3.1/accounts/{accountId}", "GET", "accounts", "v3.1", "Get account details", 1000, "oauth2_ais"},
@@ -296,6 +338,7 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 
 func main() {
 	startJWKSRefresh()
+	initConsentStore() // CP-09
 
 	mux := http.NewServeMux()
 
@@ -303,65 +346,18 @@ func main() {
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
 
-	mux.HandleFunc("/v1/open-banking/consents", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet {
-			mu.Lock()
-			respondJSON(w, 200, map[string]interface{}{"items": consents, "total": len(consents)})
-			mu.Unlock()
-			return
-		}
-		if r.Method == http.MethodPost {
-			var req ConsentRequest
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				respondJSON(w, 400, map[string]string{"error": "invalid JSON"})
-				return
-			}
-			if req.ConsentType != "ais" && req.ConsentType != "pis" && req.ConsentType != "cbpii" {
-				respondJSON(w, 400, map[string]string{"error": "consentType must be ais, pis, or cbpii"})
-				return
-			}
-			if len(req.Permissions) == 0 {
-				respondJSON(w, 400, map[string]string{"error": "at least one permission required"})
-				return
-			}
-			if req.CustomerID == "" || req.TPPID == "" {
-				respondJSON(w, 400, map[string]string{"error": "customerId and tppId required"})
-				return
-			}
-			// Verify TPP is active
-			tppActive := false
-			tppName := ""
-			for _, t := range tpps {
-				if t.ID == req.TPPID && t.Status == "active" {
-					tppActive = true
-					tppName = t.Name
-					break
-				}
-			}
-			if !tppActive {
-				respondJSON(w, 403, map[string]string{"error": "TPP is not active or not found"})
-				return
-			}
-			mu.Lock()
-			consent := Consent{
-				ID:          fmt.Sprintf("CNS-%03d", len(consents)+1),
-				CustomerID:  req.CustomerID,
-				TPPID:       req.TPPID,
-				TPPName:     tppName,
-				ConsentType: req.ConsentType,
-				Permissions: req.Permissions,
-				Status:      "awaiting_authorization",
-				CreatedAt:   time.Now().UTC().Format(time.RFC3339),
-				ExpiresAt:   time.Now().UTC().Add(180 * 24 * time.Hour).Format(time.RFC3339),
-				Accounts:    req.Accounts,
-			}
-			consents = append(consents, consent)
-			mu.Unlock()
-			respondJSON(w, 201, consent)
-			return
-		}
-		respondJSON(w, 405, map[string]string{"error": "method not allowed"})
-	})
+	mux.HandleFunc("/v1/open-banking/consents", handleConsents)
+	// CP-09: consent lifecycle sub-actions (authorize / revoke).
+	mux.HandleFunc("/v1/open-banking/consents/", handleConsentAction)
+
+	// CP-09: AIS/PIS data endpoints behind real consent enforcement. The
+	// account/payment DATA source is not implemented in this service, so
+	// these honestly return 501 AFTER the consent check — an unauthenticated
+	// or out-of-scope request is rejected (403), never served.
+	mux.HandleFunc("/open-banking/v3.1/accounts", consentEnforcement("ais", "ReadAccountsBasic", notImplementedData))
+	mux.HandleFunc("/open-banking/v3.1/accounts/", consentEnforcement("ais", "ReadAccountsDetail", notImplementedData))
+	mux.HandleFunc("/open-banking/v3.1/payments/domestic-payments", consentEnforcement("pis", "CreatePayment", notImplementedData))
+	mux.HandleFunc("/open-banking/v3.1/funds-confirmation", consentEnforcement("cbpii", "ConfirmFunds", notImplementedData))
 
 	mux.HandleFunc("/v1/open-banking/tpps", func(w http.ResponseWriter, _ *http.Request) {
 		respondJSON(w, 200, map[string]interface{}{"items": tpps, "total": len(tpps)})
@@ -371,43 +367,274 @@ func main() {
 		respondJSON(w, 200, map[string]interface{}{"items": endpoints, "total": len(endpoints)})
 	})
 
-	mux.HandleFunc("/v1/open-banking/stats", func(w http.ResponseWriter, _ *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		active := 0
-		totalAccess := 0
-		for _, c := range consents {
-			if c.Status == "authorized" {
-				active++
-			}
-			totalAccess += c.AccessCount
-		}
-		activeTPPs := 0
-		for _, t := range tpps {
-			if t.Status == "active" {
-				activeTPPs++
-			}
-		}
-		respondJSON(w, 200, map[string]interface{}{
-			"totalConsents":    len(consents),
-			"activeConsents":   active,
-			"totalTPPs":        len(tpps),
-			"activeTPPs":       activeTPPs,
-			"totalAPIAccesses": totalAccess,
-			"apiEndpoints":     len(endpoints),
-			"byConsentType": map[string]int{
-				"ais":   3,
-				"pis":   4,
-				"cbpii": 1,
-			},
-		})
-	})
+	mux.HandleFunc("/v1/open-banking/stats", handleConsentStats)
 
 	fmt.Println("Open Banking service on :8165")
 	http.ListenAndServe(":8165", rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(mux))))
 }
 
 // healthHandler serves /healthz (extracted from the inline closure in main; behavior unchanged).
+
+// ── CP-09: DB-backed consent lifecycle + enforcement ────────────────────────
+
+func consentDBOr503(w http.ResponseWriter) bool {
+	if consentDB == nil {
+		respondJSON(w, 503, map[string]string{"error": "consent store unavailable"})
+		return false
+	}
+	return true
+}
+
+func handleConsents(w http.ResponseWriter, r *http.Request) {
+	if !consentDBOr503(w) {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		// Expire lazily on read so expired consents are never served as active.
+		_, _ = consentDB.Exec(`UPDATE ob_consents SET status='expired' WHERE status='authorized' AND expires_at < NOW()`)
+		rows, err := consentDB.Query(`SELECT id, customer_id, customer_name, tpp_id, tpp_name, consent_type,
+			permissions, accounts, status, created_at, expires_at, access_count
+			FROM ob_consents ORDER BY created_at DESC LIMIT 500`)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "query failed"})
+			return
+		}
+		defer rows.Close()
+		items := []Consent{}
+		for rows.Next() {
+			var c Consent
+			var perms, accounts string
+			var customerName, tppName *string
+			var createdAt, expiresAt time.Time
+			if err := rows.Scan(&c.ID, &c.CustomerID, &customerName, &c.TPPID, &tppName, &c.ConsentType,
+				&perms, &accounts, &c.Status, &createdAt, &expiresAt, &c.AccessCount); err != nil {
+				continue
+			}
+			if customerName != nil {
+				c.CustomerName = *customerName
+			}
+			if tppName != nil {
+				c.TPPName = *tppName
+			}
+			_ = json.Unmarshal([]byte(perms), &c.Permissions)
+			_ = json.Unmarshal([]byte(accounts), &c.Accounts)
+			c.CreatedAt = createdAt.UTC().Format(time.RFC3339)
+			c.ExpiresAt = expiresAt.UTC().Format(time.RFC3339)
+			items = append(items, c)
+		}
+		respondJSON(w, 200, map[string]interface{}{"items": items, "total": len(items)})
+	case http.MethodPost:
+		var req ConsentRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			respondJSON(w, 400, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		if req.ConsentType != "ais" && req.ConsentType != "pis" && req.ConsentType != "cbpii" {
+			respondJSON(w, 400, map[string]string{"error": "consentType must be ais, pis, or cbpii"})
+			return
+		}
+		if len(req.Permissions) == 0 {
+			respondJSON(w, 400, map[string]string{"error": "at least one permission required"})
+			return
+		}
+		if req.CustomerID == "" || req.TPPID == "" {
+			respondJSON(w, 400, map[string]string{"error": "customerId and tppId required"})
+			return
+		}
+		tppActive := false
+		tppName := ""
+		for _, t := range tpps {
+			if t.ID == req.TPPID && t.Status == "active" {
+				tppActive = true
+				tppName = t.Name
+				break
+			}
+		}
+		if !tppActive {
+			respondJSON(w, 403, map[string]string{"error": "TPP is not active or not found"})
+			return
+		}
+		id := fmt.Sprintf("CNS-%x", sha256.Sum256([]byte(fmt.Sprintf("%s-%s-%d", req.CustomerID, req.TPPID, time.Now().UnixNano()))))[:18]
+		perms, _ := json.Marshal(req.Permissions)
+		accounts, _ := json.Marshal(req.Accounts)
+		expires := time.Now().UTC().Add(180 * 24 * time.Hour)
+		_, err := consentDB.Exec(`INSERT INTO ob_consents
+			(id, customer_id, tpp_id, tpp_name, consent_type, permissions, accounts, status, expires_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,'awaiting_authorization',$8)`,
+			id, req.CustomerID, req.TPPID, tppName, req.ConsentType, string(perms), string(accounts), expires)
+		if err != nil {
+			log.Printf("[open-banking-go] consent insert failed: %v", err)
+			respondJSON(w, 500, map[string]string{"error": "consent creation failed"})
+			return
+		}
+		respondJSON(w, 201, map[string]interface{}{
+			"id": id, "status": "awaiting_authorization", "expiresAt": expires.Format(time.RFC3339),
+			"message": "consent created — customer authorization required before use",
+		})
+	default:
+		respondJSON(w, 405, map[string]string{"error": "method not allowed"})
+	}
+}
+
+// handleConsentAction handles /v1/open-banking/consents/{id}/authorize and
+// /{id}/revoke. Revocation sets status='revoked' AND expires_at=NOW() so the
+// consent is dead on both axes immediately (CP-09).
+func handleConsentAction(w http.ResponseWriter, r *http.Request) {
+	if !consentDBOr503(w) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/open-banking/consents/")
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 {
+		respondJSON(w, 404, map[string]string{"error": "expected /consents/{id}/authorize|revoke"})
+		return
+	}
+	id, action := parts[0], parts[1]
+	switch action {
+	case "authorize":
+		res, err := consentDB.Exec(`UPDATE ob_consents SET status='authorized'
+			WHERE id=$1 AND status='awaiting_authorization' AND expires_at > NOW()`, id)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "authorize failed"})
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			respondJSON(w, 409, map[string]string{"error": "consent not found, already decided, or expired"})
+			return
+		}
+		respondJSON(w, 200, map[string]string{"id": id, "status": "authorized"})
+	case "revoke":
+		res, err := consentDB.Exec(`UPDATE ob_consents SET status='revoked', revoked_at=NOW(), expires_at=NOW()
+			WHERE id=$1 AND status IN ('awaiting_authorization','authorized')`, id)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "revocation failed"})
+			return
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			respondJSON(w, 409, map[string]string{"error": "consent not found or already terminated"})
+			return
+		}
+		log.Printf("[open-banking-go] consent %s revoked", id)
+		respondJSON(w, 200, map[string]string{"id": id, "status": "revoked"})
+	default:
+		respondJSON(w, 404, map[string]string{"error": "unknown consent action"})
+	}
+}
+
+// consentEnforcement is the CP-09 enforcement middleware for AIS/PIS data
+// endpoints: the caller must present x-consent-id referencing a consent that
+// is (a) authorized, (b) not expired, (c) of the right type, and (d) carrying
+// the required permission scope. Failures are 403 with a precise reason;
+// store outage is 503 (fail closed).
+func consentEnforcement(consentType, permission string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !consentDBOr503(w) {
+			return
+		}
+		consentID := r.Header.Get("x-consent-id")
+		if consentID == "" {
+			respondJSON(w, 403, map[string]string{"error": "x-consent-id header required (CBN OB Guidelines / NDPR consent enforcement)"})
+			return
+		}
+		var status, cType, perms string
+		var expiresAt time.Time
+		err := consentDB.QueryRow(`SELECT status, consent_type, permissions, expires_at FROM ob_consents WHERE id=$1`, consentID).
+			Scan(&status, &cType, &perms, &expiresAt)
+		if err != nil {
+			respondJSON(w, 403, map[string]string{"error": "consent not found"})
+			return
+		}
+		if status != "authorized" {
+			respondJSON(w, 403, map[string]string{"error": "consent not authorized", "status": status})
+			return
+		}
+		if time.Now().After(expiresAt) {
+			_, _ = consentDB.Exec(`UPDATE ob_consents SET status='expired' WHERE id=$1 AND status='authorized'`, consentID)
+			respondJSON(w, 403, map[string]string{"error": "consent expired"})
+			return
+		}
+		if cType != consentType {
+			respondJSON(w, 403, map[string]string{"error": fmt.Sprintf("consent type %s does not permit %s access", cType, consentType)})
+			return
+		}
+		var scopes []string
+		_ = json.Unmarshal([]byte(perms), &scopes)
+		ok := false
+		for _, s := range scopes {
+			if s == permission {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			respondJSON(w, 403, map[string]string{"error": "consent lacks required permission scope", "required": permission})
+			return
+		}
+		_, _ = consentDB.Exec(`UPDATE ob_consents SET last_accessed_at=NOW(), access_count=access_count+1 WHERE id=$1`, consentID)
+		next(w, r)
+	}
+}
+
+// notImplementedData: consent is enforced, but the AIS/PIS data source is not
+// implemented in this service — honest 501 instead of fabricated data.
+func notImplementedData(w http.ResponseWriter, _ *http.Request) {
+	respondJSON(w, 501, map[string]string{
+		"error":  "not_implemented",
+		"detail": "Consent verified. This data endpoint has no upstream account/payment data source wired in this service.",
+	})
+}
+
+func handleConsentStats(w http.ResponseWriter, _ *http.Request) {
+	if !consentDBOr503(w) {
+		return
+	}
+	_, _ = consentDB.Exec(`UPDATE ob_consents SET status='expired' WHERE status='authorized' AND expires_at < NOW()`)
+	stats := map[string]interface{}{"byStatus": map[string]int{}, "byConsentType": map[string]int{}}
+	rows, err := consentDB.Query(`SELECT status, consent_type, COUNT(*), COALESCE(SUM(access_count),0) FROM ob_consents GROUP BY status, consent_type`)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "query failed"})
+		return
+	}
+	defer rows.Close()
+	total, active, totalAccess := 0, 0, 0
+	byStatus := map[string]int{}
+	byType := map[string]int{}
+	for rows.Next() {
+		var st, ct string
+		var n, ac int
+		if rows.Scan(&st, &ct, &n, &ac) != nil {
+			continue
+		}
+		byStatus[st] += n
+		byType[ct] += n
+		total += n
+		totalAccess += ac
+		if st == "authorized" {
+			active += n
+		}
+	}
+	activeTPPs := 0
+	for _, t := range tpps {
+		if t.Status == "active" {
+			activeTPPs++
+		}
+	}
+	stats["byStatus"] = byStatus
+	stats["byConsentType"] = byType
+	stats["totalConsents"] = total
+	stats["activeConsents"] = active
+	stats["totalTPPs"] = len(tpps)
+	stats["activeTPPs"] = activeTPPs
+	stats["totalAPIAccesses"] = totalAccess
+	stats["apiEndpoints"] = len(endpoints)
+	respondJSON(w, 200, stats)
+}
+
 func healthHandler(w http.ResponseWriter, _ *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"status": "ok", "service": "open-banking",
