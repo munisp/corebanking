@@ -92,9 +92,90 @@ def init_schema():
     logger.info("Schema initialized")
 
 
+# ---------------------------------------------------------------------------
+# MN-01 (S15): nightly dormancy sweep. Reads REAL accounts from the
+# account-service Postgres (ACCOUNT_DB_URL) and transitions inactivity-expired
+# ACTIVE accounts to DORMANT via the authenticated account-service endpoint.
+# ---------------------------------------------------------------------------
+import threading
+import urllib.request
+
+ACCOUNT_DB_URL = os.getenv("ACCOUNT_DB_URL", "")  # account-service Postgres DSN
+ACCOUNT_SERVICE_URL = os.getenv("ACCOUNT_SERVICE_URL", "http://account-service:80")
+ACCOUNT_SERVICE_TOKEN = os.getenv("ACCOUNT_SERVICE_TOKEN", os.getenv("INTERNAL_SERVICE_TOKEN", ""))
+DORMANCY_DAYS = int(os.getenv("DORMANCY_DAYS", "365"))
+SWEEP_INTERVAL_SECONDS = int(os.getenv("SWEEP_INTERVAL_SECONDS", "86400"))
+SWEEP_ENABLED = os.getenv("SWEEP_ENABLED", "true").lower() == "true"
+
+_sweep_stop = threading.Event()
+
+
+def _mark_dormant(tenant_id: str, account_id: str) -> bool:
+    if not ACCOUNT_SERVICE_TOKEN:
+        logger.error("ACCOUNT_SERVICE_TOKEN unset; cannot transition accounts (fail-closed)")
+        return False
+    req = urllib.request.Request(
+        f"{ACCOUNT_SERVICE_URL}/account/{account_id}/mark-dormant",
+        method="POST",
+        headers={
+            "x-tenant-id": str(tenant_id),
+            "x-service-token": ACCOUNT_SERVICE_TOKEN,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status == 200
+    except Exception as exc:
+        logger.error("mark-dormant failed account=%s error=%s", account_id, exc)
+        return False
+
+
+def _sweep_once() -> None:
+    if not ACCOUNT_DB_URL:
+        logger.error("ACCOUNT_DB_URL unset; dormancy sweep skipped (fail-closed)")
+        return
+    conn = psycopg2.connect(ACCOUNT_DB_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT id, tenant_id FROM account
+                   WHERE status = 'active'
+                     AND COALESCE(last_activity_at, updated_at, created_at)
+                         < NOW() - make_interval(days => %s)""",
+                (DORMANCY_DAYS,),
+            )
+            candidates = cur.fetchall()
+    finally:
+        conn.close()
+    transitioned = 0
+    for row in candidates:
+        if _mark_dormant(str(row["tenant_id"]), str(row["id"])):
+            transitioned += 1
+    logger.info(
+        "Dormancy sweep complete: %d candidate(s), %d transitioned to DORMANT",
+        len(candidates), transitioned,
+    )
+
+
+def _sweep_loop() -> None:
+    # Run shortly after startup, then nightly.
+    _sweep_stop.wait(60)
+    while not _sweep_stop.is_set():
+        try:
+            _sweep_once()
+        except Exception as exc:
+            logger.error("Dormancy sweep error: %s", exc)
+        _sweep_stop.wait(SWEEP_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_schema()
+    if SWEEP_ENABLED:
+        thread = threading.Thread(target=_sweep_loop, name="dormancy-sweeper", daemon=True)
+        thread.start()
+        logger.info("Dormancy sweeper started (interval=%ds, dormancy_days=%d)",
+                    SWEEP_INTERVAL_SECONDS, DORMANCY_DAYS)
     logger.info(f"[dormant-account-monitor-py] ready on :%d", PORT)
     logger.info(f"[dormant-account-monitor-py] middleware: keycloak=%s kafka=%s redis=%s opensearch=%s permify=%s",
                 KEYCLOAK_URL, KAFKA_BROKERS, REDIS_URL, OPENSEARCH_URL, PERMIFY_URL)
