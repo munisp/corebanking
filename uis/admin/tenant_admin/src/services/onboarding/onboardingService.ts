@@ -18,7 +18,12 @@ export type TenantRole =
   | "treasury_manager" // Treasury & billing
   | "loan_officer" // Loan applications
   | "compliance_officer" // KYC & sanctions
-  | "support_agent"; // Customer support
+  | "support_agent" // Customer support
+  // ST-01: teller and fraud_analyst exist in v2.perm and VALID_TENANT_ROLES
+  // (auth-service utils/permissions.py) — they were missing here and thus
+  // unassignable from the UI.
+  | "teller" // Branch teller operations
+  | "fraud_analyst"; // Fraud case management
 
 export const TENANT_ROLE_LABELS: Record<TenantRole, string> = {
   super_admin: "Super Admin",
@@ -34,6 +39,8 @@ export const TENANT_ROLE_LABELS: Record<TenantRole, string> = {
   loan_officer: "Loan Officer",
   compliance_officer: "Compliance Officer",
   support_agent: "Support Agent",
+  teller: "Teller",
+  fraud_analyst: "Fraud Analyst",
 };
 
 export const TENANT_ROLES = Object.keys(TENANT_ROLE_LABELS) as TenantRole[];
