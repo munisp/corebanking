@@ -5,7 +5,6 @@
  * │ UI Route                         │ APISIX Prefix            │ Backend Service              │ Port  │
  * ├──────────────────────────────────┼──────────────────────────┼──────────────────────────────┼───────┤
  * │ /dispute                         │ /dispute                 │ dispute-service              │ 80    │
- * │ /dispute-management              │ /dispute-management      │ dispute-management-py        │ 9255  │
  * │ /audit-logs                      │ /audit                   │ audit-service                │ 80    │
  * │ /audit-trail                     │ /audit                   │ audit-service                │ 80    │
  * │ /admin/temporal-access           │ /temporal-access         │ temporal-access-service      │ 80    │
