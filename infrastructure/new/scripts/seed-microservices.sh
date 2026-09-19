@@ -152,39 +152,6 @@ post "http://localhost:8092/v1/islamic/ijara" \
   "Ijara contract (office lease)"
 echo ""
 
-# ── Dispute Management :8094 ──
-echo "▸ Dispute Management (:8094)"
-post "http://localhost:8094/v1/disputes/cases" \
-  '{"customerId":"CUST-001","transactionId":"TXN-20260115-001","amount":125000,"currency":"NGN","category":"unauthorized_transaction","channel":"card","merchantName":"Unknown POS Lagos","description":"I did not authorize this POS transaction at an unknown location","cardLast4":"4567"}' \
-  "Dispute case (unauthorized POS ₦125K)"
-post "http://localhost:8094/v1/disputes/cases" \
-  '{"customerId":"CUST-002","transactionId":"TXN-20260118-042","amount":2500000,"currency":"NGN","category":"service_not_rendered","channel":"transfer","merchantName":"ABC Supplies Ltd","description":"Paid for goods but vendor has not delivered after 30 days"}' \
-  "Dispute case (service not rendered ₦2.5M)"
-post "http://localhost:8094/v1/disputes/cases" \
-  '{"customerId":"CUST-003","transactionId":"TXN-20260120-007","amount":45000,"currency":"NGN","category":"duplicate_charge","channel":"web","merchantName":"Jumia Nigeria","description":"Charged twice for the same order #JUM-987654"}' \
-  "Dispute case (duplicate charge ₦45K)"
-echo ""
-
-# ── Education Loans :8095 ──
-echo "▸ Education Loans (:8095)"
-post "http://localhost:8095/v1/education-loans/loans" \
-  '{"studentId":"STU-001","studentName":"Ngozi Uche","institution":"University of Lagos","program":"MSc Computer Science","amount":3500000,"currency":"NGN","tenorMonths":48,"interestRate":9.0,"guarantorName":"Olumide Ajayi","guarantorBVN":"22003334444","disbursementAccount":"0012345678"}' \
-  "Education loan (UNILAG MSc, ₦3.5M)"
-post "http://localhost:8095/v1/education-loans/loans" \
-  '{"studentId":"STU-002","studentName":"Patience Osagie","institution":"Covenant University","program":"BSc Accounting","amount":1800000,"currency":"NGN","tenorMonths":36,"interestRate":7.5,"guarantorName":"Rasheed Olanrewaju","guarantorBVN":"22005556666","disbursementAccount":"2098765432"}' \
-  "Education loan (Covenant BSc, ₦1.8M)"
-echo ""
-
-# ── ERPNext Sync :8096 ──
-echo "▸ ERPNext Sync (:8096)"
-post "http://localhost:8096/v1/erpnext/sync-jobs" \
-  '{"type":"journal_entry","direction":"push","status":"completed","entries":[{"account":"Cash - 54Bank","debit":5000000,"credit":0},{"account":"Customer Deposits","debit":0,"credit":5000000}],"reference":"JV-2026-0042"}' \
-  "Journal entry sync (₦5M cash deposit)"
-post "http://localhost:8096/v1/erpnext/sync-jobs" \
-  '{"type":"invoice","direction":"pull","status":"pending","entries":[{"account":"Service Revenue","debit":0,"credit":250000},{"account":"Accounts Receivable","debit":250000,"credit":0}],"reference":"INV-2026-0108"}' \
-  "Invoice sync (₦250K service revenue)"
-echo ""
-
 # ── Esusu Groups :8097 ──
 echo "▸ Esusu Groups (:8097)"
 post "http://localhost:8097/v1/esusu/groups" \
