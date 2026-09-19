@@ -276,6 +276,9 @@ async def startup():
                 resolution TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             CREATE INDEX IF NOT EXISTS idx_disputes_customer ON disputes(customer_id);
+            -- MN-06: expand-only — track provisional credit lifecycle.
+            ALTER TABLE disputes ADD COLUMN IF NOT EXISTS provisional_credit BOOLEAN NOT NULL DEFAULT FALSE;
+            ALTER TABLE disputes ADD COLUMN IF NOT EXISTS provisional_reversed BOOLEAN NOT NULL DEFAULT FALSE;
         """)
 
 @app.on_event("shutdown")
@@ -322,6 +325,21 @@ async def create_dispute(
             INSERT INTO disputes (dispute_id, customer_id, transaction_id, dispute_type, amount, description, tenant_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
         """, dispute_id, keycloak_id, payload.transaction_id, payload.dispute_type, Decimal(amount), payload.description, tenant_id)
+
+        # MN-06: provisional credit on filing for ATM/POS failure types
+        # (CBN 72h rule). Posted before the response; marked on the dispute.
+        if payload.dispute_type.strip().lower() in PROVISIONAL_CREDIT_TYPES:
+            customer_account = _customer_account_id(transaction)
+            _post_provisional_credit(
+                dispute_id=dispute_id,
+                tenant_id=tenant_id,
+                customer_account=customer_account,
+                amount_kobo=_amount_kobo(amount),
+            )
+            await conn.execute(
+                "UPDATE disputes SET provisional_credit=TRUE WHERE dispute_id=$1",
+                dispute_id,
+            )
 
     # Publish Kafka event for dispute creation
     kafka_client.publish_dispute_event(
@@ -397,15 +415,194 @@ async def get_dispute(
         
         return { **dict(dispute), "transaction": transaction }
 
+# ---------------------------------------------------------------------------
+# MN-06 (S6): dispute money movement. Resolution posts a REAL balanced journal
+# via journal-posting-go (Dr chargeback-suspense / Cr customer) with
+# deterministic transactionRef dispute:{id}:refund; provisional credit is
+# posted at filing for ATM/POS failure types and auto-reversed when the
+# dispute resolves against the customer.
+# ---------------------------------------------------------------------------
+
+from utils import ExternalAPIClient as _ExternalAPIClient
+
+JOURNAL_POSTING_URL = os.getenv("JOURNAL_POSTING_URL", "http://journal-posting-go:8080")
+CHARGEBACK_SUSPENSE_ACCOUNT_ID = os.getenv("CHARGEBACK_SUSPENSE_ACCOUNT_ID", "")
+INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
+
+PROVISIONAL_CREDIT_TYPES = {
+    "atm_failure", "atm_cash_not_dispensed", "pos_failure", "pos_debit_no_value",
+    "atm", "pos",
+}
+REFUND_RESOLUTIONS = {"refund", "partial_credit", "customer_upheld", "upheld"}
+AGAINST_CUSTOMER_RESOLUTIONS = {"rejected", "denied", "customer_liable", "merchant_upheld"}
+
+
+def _journal_headers(tenant_id: str) -> dict:
+    headers = {"Content-Type": "application/json", "x-tenant-id": tenant_id}
+    if INTERNAL_SERVICE_TOKEN:
+        headers["Authorization"] = f"Bearer {INTERNAL_SERVICE_TOKEN}"
+    return headers
+
+
+def _post_balanced_journal(
+    *,
+    tenant_id: str,
+    transaction_ref: str,
+    narration: str,
+    debit_account: int,
+    credit_account: int,
+    amount_kobo: int,
+) -> None:
+    """Post a balanced double-entry journal to TigerBeetle via
+    journal-posting-go. Fail-closed: raises on any error so the dispute status
+    is NOT flipped without the money moving. Deterministic transactionRef makes
+    retries idempotent."""
+    if not CHARGEBACK_SUSPENSE_ACCOUNT_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="CHARGEBACK_SUSPENSE_ACCOUNT_ID not configured; dispute money movement disabled (fail-closed)",
+        )
+    client = _ExternalAPIClient(base_url=JOURNAL_POSTING_URL, headers=_journal_headers(tenant_id))
+    client._post(
+        "/v1/journals",
+        data={
+            "tenantId": tenant_id,
+            "transactionRef": transaction_ref,
+            "narration": narration,
+            "currency": "NGN",
+            "legs": [
+                {"accountId": int(debit_account), "type": "debit", "amount": int(amount_kobo)},
+                {"accountId": int(credit_account), "type": "credit", "amount": int(amount_kobo)},
+            ],
+        },
+    )
+
+
+def _customer_account_id(transaction: dict) -> int:
+    """The customer's TB account in the disputed transaction: the non-mint party."""
+    payer = str(transaction.get("payer") or "")
+    payee = str(transaction.get("payee") or "")
+    candidate = payee if payer.upper() == "MINT_ACCOUNT" else payer
+    if not candidate.isdigit():
+        raise HTTPException(
+            status_code=422,
+            detail="Cannot resolve customer ledger account from disputed transaction",
+        )
+    return int(candidate)
+
+
+def _amount_kobo(amount) -> int:
+    from decimal import ROUND_HALF_UP
+
+    return int((Decimal(str(amount)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _post_provisional_credit(
+    *, dispute_id: str, tenant_id: str, customer_account: int, amount_kobo: int
+) -> None:
+    _post_balanced_journal(
+        tenant_id=tenant_id,
+        transaction_ref=f"dispute:{dispute_id}:provisional",
+        narration=f"Provisional credit for dispute {dispute_id} (CBN 72h rule)",
+        debit_account=int(CHARGEBACK_SUSPENSE_ACCOUNT_ID),
+        credit_account=customer_account,
+        amount_kobo=amount_kobo,
+    )
+
+
 @app.put("/api/v1/administration/disputes/{dispute_id}/resolve")
 async def resolve_dispute(
-    dispute_id: str, 
-    resolution: str, 
+    dispute_id: str,
+    resolution: str,
     db=Depends(lambda: db_pool),
     tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_id: str = Header(..., alias="x-keycloak-id"),
+    ledger_id: str = Header("1", alias="x-ledger-id"),
 ):
+    resolution_norm = (resolution or "").strip().lower()
+    context = Context(tenant_id=tenant_id, keycloak_id=keycloak_id, ledger_id=ledger_id)
+
     async with db.acquire() as conn:
-        await conn.execute("UPDATE disputes SET status = 'resolved', resolution = $1 WHERE dispute_id = $2 AND tenant_id = $3", resolution, dispute_id, tenant_id)
+        dispute = await conn.fetchrow(
+            "SELECT * FROM disputes WHERE dispute_id = $1 AND tenant_id = $2",
+            dispute_id, tenant_id,
+        )
+        if not dispute:
+            raise HTTPException(status_code=404, detail="Dispute not found")
+        if dispute["status"] == "resolved":
+            # Idempotent replay.
+            return {"status": "resolved", "dispute_id": dispute_id, "idempotent_replay": True}
+
+        amount_kobo = _amount_kobo(dispute["amount"])
+
+        # Fetch the disputed transaction to resolve the customer's ledger account.
+        transaction = {}
+        if resolution_norm in REFUND_RESOLUTIONS | AGAINST_CUSTOMER_RESOLUTIONS or dispute["provisional_credit"]:
+            txn_resp = TransactionLedgerAdapter().get_transaction_by_id(
+                dispute["transaction_id"], context
+            )
+            transaction = (txn_resp or {}).get("transaction") or {}
+
+        if resolution_norm in REFUND_RESOLUTIONS:
+            customer_account = _customer_account_id(transaction)
+            if dispute["provisional_credit"] and not dispute["provisional_reversed"]:
+                # Provisional credit already moved funds to the customer; the
+                # final refund only needs to settle the suspense account — the
+                # refund journal below is posted with the SAME suspense/customer
+                # direction only when no provisional credit exists, otherwise we
+                # mark the provisional credit as final (no double credit).
+                await conn.execute(
+                    "UPDATE disputes SET status='resolved', resolution=$1 WHERE dispute_id=$2 AND tenant_id=$3",
+                    resolution, dispute_id, tenant_id,
+                )
+            else:
+                # MN-06: real refund — Dr chargeback-suspense / Cr customer.
+                _post_balanced_journal(
+                    tenant_id=tenant_id,
+                    transaction_ref=f"dispute:{dispute_id}:refund",
+                    narration=f"Refund for dispute {dispute_id} ({resolution_norm})",
+                    debit_account=int(CHARGEBACK_SUSPENSE_ACCOUNT_ID),
+                    credit_account=customer_account,
+                    amount_kobo=amount_kobo,
+                )
+                await conn.execute(
+                    "UPDATE disputes SET status='resolved', resolution=$1 WHERE dispute_id=$2 AND tenant_id=$3",
+                    resolution, dispute_id, tenant_id,
+                )
+        elif resolution_norm in AGAINST_CUSTOMER_RESOLUTIONS:
+            # Auto-reversal of any provisional credit: Dr customer / Cr suspense.
+            if dispute["provisional_credit"] and not dispute["provisional_reversed"]:
+                customer_account = _customer_account_id(transaction)
+                _post_balanced_journal(
+                    tenant_id=tenant_id,
+                    transaction_ref=f"dispute:{dispute_id}:provisional-reversal",
+                    narration=f"Provisional credit reversal for dispute {dispute_id}",
+                    debit_account=customer_account,
+                    credit_account=int(CHARGEBACK_SUSPENSE_ACCOUNT_ID),
+                    amount_kobo=amount_kobo,
+                )
+                await conn.execute(
+                    "UPDATE disputes SET provisional_reversed=TRUE WHERE dispute_id=$1 AND tenant_id=$2",
+                    dispute_id, tenant_id,
+                )
+            await conn.execute(
+                "UPDATE disputes SET status='resolved', resolution=$1 WHERE dispute_id=$2 AND tenant_id=$3",
+                resolution, dispute_id, tenant_id,
+            )
+        else:
+            await conn.execute(
+                "UPDATE disputes SET status='resolved', resolution=$1 WHERE dispute_id=$2 AND tenant_id=$3",
+                resolution, dispute_id, tenant_id,
+            )
+
+    # Keep publishing disputes.resolved (consumers: notification, suspense recon).
+    kafka_client.publish_dispute_event(
+        event_type=DisputeEventTypes.DISPUTE_RESOLVED,
+        dispute_id=dispute_id,
+        tenant_id=tenant_id,
+        status="resolved",
+        metadata={"resolution": resolution_norm},
+    )
     return {"status": "resolved", "dispute_id": dispute_id}
 
 if __name__ == "__main__":
