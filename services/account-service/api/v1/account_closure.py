@@ -112,9 +112,113 @@ def approve_closure(
     return {"message": "success", "data": req.to_dict()}
 
 
+# ---------------------------------------------------------------------------
+# MN-02 (S2): real closure — balance check, residual sweep, lien/dispute
+# refusal, terminal CLOSED status. Previously a pure status flip that left
+# residual funds stranded and the account spendable.
+# ---------------------------------------------------------------------------
+
+from repositories import AccountRepository
+from utils import create_logger, get_config
+from utils.enums import AccountStatus
+from utils.external_api_client import ExternalAPIClient
+
+logger = create_logger(__name__)
+config = get_config()
+
+
+class CompleteClosurePayload(BaseModel):
+    destinationAccount: Optional[str] = None  # TB account id receiving residual
+
+
+def _service_headers(tenant_id: str, keycloak_id: str) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "x-tenant-id": tenant_id,
+        "x-keycloak-id": keycloak_id,
+    }
+    token = str(getattr(config, "INTERNAL_SERVICE_TOKEN", "") or "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _refuse_if_active_liens(account_id: int, tenant_id: str, keycloak_id: str) -> None:
+    lien_url = str(getattr(config, "LIEN_SVC_URL", "") or "")
+    client = ExternalAPIClient(base_url=lien_url, headers=_service_headers(tenant_id, keycloak_id))
+    try:
+        resp = client._get(f"/api/v1/lien/account?account_id={account_id}")
+    except Exception as exc:
+        # Fail-closed: cannot prove no court-ordered freeze exists.
+        raise HTTPException(
+            status_code=503, detail="Lien service unavailable; closure refused"
+        ) from exc
+    if int((resp or {}).get("total_active_kobo", 0)) > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Account has active liens/holds; closure refused",
+        )
+
+
+def _refuse_if_open_disputes(account, tenant_id: str, keycloak_id: str) -> None:
+    dispute_url = str(getattr(config, "DISPUTE_SVC_URL", "") or "").strip()
+    if not dispute_url:
+        logger.warning("DISPUTE_SVC_URL not configured; skipping dispute check for closure")
+        return
+    client = ExternalAPIClient(base_url=dispute_url, headers=_service_headers(tenant_id, keycloak_id))
+    try:
+        disputes = client._get("/api/v1/disputes") or []
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Dispute service unavailable; closure refused"
+        ) from exc
+    open_disputes = [
+        d for d in disputes
+        if str(d.get("status") or "").lower() not in ("resolved", "closed", "rejected")
+    ]
+    if open_disputes:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Customer has {len(open_disputes)} open dispute(s); closure refused",
+        )
+
+
+def _sweep_residual(
+    *, account_id: int, destination: str, balance_kobo: int, closure_ref: str,
+    tenant_id: str, keycloak_id: str,
+) -> None:
+    """Sweep the residual balance via journal-posting-go (balanced Dr source /
+    Cr destination, posted to TigerBeetle). Idempotent via transactionRef
+    closure:{request_id}. Failure -> 503, closure NOT completed (saga: the
+    status flip only happens after the sweep is confirmed)."""
+    journal_url = str(getattr(config, "JOURNAL_POSTING_URL", "") or "")
+    client = ExternalAPIClient(base_url=journal_url, headers=_service_headers(tenant_id, keycloak_id))
+    payload = {
+        "tenantId": tenant_id,
+        "transactionRef": f"closure:{closure_ref}",
+        "narration": f"Account closure residual sweep {closure_ref}",
+        "currency": "NGN",
+        "legs": [
+            {"accountId": int(account_id), "type": "debit", "amount": int(balance_kobo)},
+            {"accountId": int(destination), "type": "credit", "amount": int(balance_kobo)},
+        ],
+    }
+    try:
+        client._post("/v1/journals", data=payload)
+    except Exception as exc:
+        logger.error("Closure residual sweep failed ref=%s error=%s", closure_ref, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Residual sweep failed; closure NOT completed (safe to retry)",
+        ) from exc
+
+
 @closure_router.patch("/{closure_id}/complete")
 def complete_closure(
     closure_id: str,
+    payload: Optional[CompleteClosurePayload] = None,
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
     keycloak_id: str = Header(..., alias="x-keycloak-id"),
@@ -126,8 +230,63 @@ def complete_closure(
     ).first()
     if not req:
         raise HTTPException(status_code=404, detail="Closure request not found")
+    if req.status == "completed":
+        return {"message": "already completed", "data": req.to_dict()}
     if req.status != "approved":
         raise HTTPException(status_code=400, detail="Request must be approved before completing")
+
+    repo = AccountRepository(db)
+    account = repo.get_by_account_id(str(req.account_id), tenant_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    if account.status == AccountStatus.CLOSED:
+        req.status = "completed"
+        req.closed_at = req.closed_at or datetime.datetime.utcnow()
+        db.commit()
+        return {"message": "already completed", "data": req.to_dict()}
+
+    # Refuse with active liens or open disputes (fail-closed).
+    _refuse_if_active_liens(int(account.id), tenant_id, keycloak_id)
+    _refuse_if_open_disputes(account, tenant_id, str(account.keycloak_id))
+
+    # TB balance check + residual sweep BEFORE the status flip.
+    from adapters import TigerBeetleAdapter
+
+    try:
+        tb_account = TigerBeetleAdapter().get_account(int(account.id))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503, detail="Balance source unavailable; closure refused"
+        ) from exc
+    balance_kobo = 0
+    if tb_account is not None:
+        balance_kobo = int(tb_account.credits_posted) - int(tb_account.debits_posted)
+
+    if balance_kobo < 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Account has a negative balance; settle before closure",
+        )
+    if balance_kobo > 0:
+        destination = (payload.destinationAccount if payload else None) or getattr(
+            req, "destination_account", None
+        )
+        if not destination:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Account has residual balance of {balance_kobo} kobo; provide destinationAccount",
+            )
+        _sweep_residual(
+            account_id=int(account.id),
+            destination=str(destination),
+            balance_kobo=balance_kobo,
+            closure_ref=str(req.id),
+            tenant_id=tenant_id,
+            keycloak_id=keycloak_id,
+        )
+
+    # Terminal status: check_account blocks all post-closure debits.
+    account.status = AccountStatus.CLOSED
     req.status = "completed"
     req.closed_at = datetime.datetime.utcnow()
     db.commit()
