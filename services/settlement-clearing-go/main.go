@@ -20,6 +20,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"shared/otel/go/otelkit"
 )
 
 var serviceName = "settlement-clearing-go"
@@ -71,7 +72,7 @@ func initDB() {
 		dsn = "postgres://localhost:5432/corebanking?sslmode=disable"
 	}
 	var err error
-	app.db, err = sql.Open("postgres", dsn)
+	app.db, err = otelkit.OpenSQLDB("postgres", dsn)
 	if err != nil {
 		log.Printf("[%s] DB connection failed: %v", serviceName, err)
 		return
@@ -97,6 +98,7 @@ func initDB() {
 		amount_kobo BIGINT NOT NULL,
 		session_id TEXT NOT NULL DEFAULT '',
 		payment_ref TEXT NOT NULL DEFAULT '',
+		idempotency_key TEXT NOT NULL DEFAULT '',
 		narration_code TEXT NOT NULL DEFAULT '',
 		status TEXT NOT NULL DEFAULT 'pending',
 		settlement_type TEXT NOT NULL DEFAULT 'RTGS',
@@ -104,6 +106,9 @@ func initDB() {
 	);
 	CREATE INDEX IF NOT EXISTS idx_nip_status ON nip_transfers(status);
 	CREATE INDEX IF NOT EXISTS idx_nip_source ON nip_transfers(source_bank);
+	-- MN-15: expand-only idempotency key for transfer replays.
+	ALTER TABLE nip_transfers ADD COLUMN IF NOT EXISTS idempotency_key TEXT NOT NULL DEFAULT '';
+	CREATE UNIQUE INDEX IF NOT EXISTS uq_nip_idempotency ON nip_transfers(idempotency_key) WHERE idempotency_key <> '';
 
 	CREATE TABLE IF NOT EXISTS settlement_batches (
 		batch_id TEXT PRIMARY KEY,
@@ -151,12 +156,13 @@ func seedNostroPositions() {
 
 func processTransfer(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SourceBank    string `json:"source_bank"`
-		DestBank      string `json:"dest_bank"`
-		AmountKobo    int64  `json:"amount_kobo"`
-		SessionID     string `json:"session_id"`
-		PaymentRef    string `json:"payment_ref"`
-		NarrationCode string `json:"narration_code"`
+		SourceBank     string `json:"source_bank"`
+		DestBank       string `json:"dest_bank"`
+		AmountKobo     int64  `json:"amount_kobo"`
+		SessionID      string `json:"session_id"`
+		PaymentRef     string `json:"payment_ref"`
+		NarrationCode  string `json:"narration_code"`
+		IdempotencyKey string `json:"idempotency_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondJSON(w, 400, map[string]string{"error": "invalid request"})
@@ -171,19 +177,22 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check source bank nostro position
-	var sourceBalance int64
-	err := app.db.QueryRow(`SELECT balance_kobo FROM nostro_positions WHERE bank_code = $1`, req.SourceBank).Scan(&sourceBalance)
-	if err == sql.ErrNoRows {
-		respondJSON(w, 404, map[string]string{"error": "source bank not found"})
-		return
-	}
-	if sourceBalance < req.AmountKobo {
-		respondJSON(w, 422, map[string]interface{}{
-			"error":          "insufficient nostro position",
-			"available_kobo": sourceBalance, "required_kobo": req.AmountKobo,
-		})
-		return
+	// MN-15: idempotent replay — return the original transfer, do NOT move
+	// funds a second time.
+	if req.IdempotencyKey != "" {
+		var existingID, existingStatus string
+		err := app.db.QueryRow(`SELECT transfer_id, status FROM nip_transfers WHERE idempotency_key = $1`, req.IdempotencyKey).Scan(&existingID, &existingStatus)
+		if err == nil {
+			respondJSON(w, 200, map[string]interface{}{
+				"transfer_id": existingID, "status": existingStatus,
+				"idempotent_replay": true, "amount_kobo": req.AmountKobo,
+			})
+			return
+		}
+		if err != sql.ErrNoRows {
+			respondJSON(w, 500, map[string]string{"error": "idempotency check failed"})
+			return
+		}
 	}
 
 	settlementType := "RTGS"
@@ -199,10 +208,27 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = tx.Exec(`UPDATE nostro_positions SET balance_kobo = balance_kobo - $1, last_updated = NOW() WHERE bank_code = $2`, req.AmountKobo, req.SourceBank)
+	// MN-15: atomic conditional debit INSIDE the tx — eliminates the
+	// check-then-debit TOCTOU race that could overdraw the nostro position
+	// under concurrent transfers.
+	result, err := tx.Exec(`UPDATE nostro_positions SET balance_kobo = balance_kobo - $1, last_updated = NOW() WHERE bank_code = $2 AND balance_kobo >= $1`, req.AmountKobo, req.SourceBank)
 	if err != nil {
 		tx.Rollback()
 		respondJSON(w, 500, map[string]string{"error": "debit failed"})
+		return
+	}
+	rows, _ := result.RowsAffected()
+	if rows == 0 {
+		tx.Rollback()
+		var sourceBalance int64
+		if berr := app.db.QueryRow(`SELECT balance_kobo FROM nostro_positions WHERE bank_code = $1`, req.SourceBank).Scan(&sourceBalance); berr == sql.ErrNoRows {
+			respondJSON(w, 404, map[string]string{"error": "source bank not found"})
+			return
+		}
+		respondJSON(w, 422, map[string]interface{}{
+			"error":          "insufficient nostro position",
+			"available_kobo": sourceBalance, "required_kobo": req.AmountKobo,
+		})
 		return
 	}
 	_, err = tx.Exec(`UPDATE nostro_positions SET balance_kobo = balance_kobo + $1, last_updated = NOW() WHERE bank_code = $2`, req.AmountKobo, req.DestBank)
@@ -211,9 +237,10 @@ func processTransfer(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 500, map[string]string{"error": "credit failed"})
 		return
 	}
-	_, err = tx.Exec(`INSERT INTO nip_transfers (transfer_id, source_bank, dest_bank, amount_kobo, session_id, payment_ref, narration_code, status, settlement_type)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, 'settled', $8)`,
-		transferID, req.SourceBank, req.DestBank, req.AmountKobo, req.SessionID, req.PaymentRef, req.NarrationCode, settlementType)
+	_, err = tx.Exec(`INSERT INTO nip_transfers (transfer_id, source_bank, dest_bank, amount_kobo, session_id, payment_ref, narration_code, status, settlement_type, idempotency_key)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, 'settled', $8, $9)
+		ON CONFLICT (transfer_id) DO NOTHING`,
+		transferID, req.SourceBank, req.DestBank, req.AmountKobo, req.SessionID, req.PaymentRef, req.NarrationCode, settlementType, req.IdempotencyKey)
 	if err != nil {
 		tx.Rollback()
 		respondJSON(w, 500, map[string]string{"error": "transfer record failed"})
@@ -463,6 +490,17 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), serviceName)
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startJWKSRefresh()
 
 	initDB()
@@ -474,7 +512,7 @@ func main() {
 	mux.HandleFunc("/healthz", healthz)
 	mux.HandleFunc("/api/v1/settlement/transfer", processTransfer)
 	mux.HandleFunc("/api/v1/settlement/positions", getPositions)
-	srv := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(mux)}
+	srv := &http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(mux))}
 	go func() {
 		log.Printf("[%s] Starting on :%s", serviceName, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
