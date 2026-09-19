@@ -59,7 +59,7 @@ groups:
     for: 10m
     annotations:
       summary: 5xx ratio on {{ $labels.service_name }} (tenant {{ $labels.tenant_id }}) above 5% for 10 minutes.
-      runbook_hint: "Pivot to Tempo/Loki for the service; cross-check HighErrorRate with the audit findings — fraud-service\
+      runbook_hint: "Pivot to Tempo/Loki for the service; cross-check HighErrorRate with the audit findings \x5Cu2014 fraud-service\
         \ /api/v1/fraud/check 500s on every call by construction (F15-14). If only fraud/check fails, follow the fraud runbook\
         \ instead of rolling back."
     labels:
@@ -118,7 +118,7 @@ groups:
     execErrState: Error
     for: 1m
     annotations:
-      summary: "Audit ship failures on {{ $labels.service_name }} — mutating requests are producing NO audit records."
+      summary: "Audit ship failures on {{ $labels.service_name }} \x5Cu2014 mutating requests are producing NO audit records."
       runbook_hint: 'Audit F15-1/F15-2: 22 services ship audit events with no credential to a fail-closed, unreachable audit-service
         (401/NXDOMAIN, errors swallowed). This wave surfaces the failures as a metric; fix requires wiring sender auth + a
         real audit-service deployment. Treat every firing minute as a regulatory audit-trail gap.'
@@ -179,7 +179,7 @@ groups:
     execErrState: Error
     for: 0m
     annotations:
-      summary: "Sanctions screening errors on {{ $labels.service_name }} — screens returning proceed-on-error mean unscreened\
+      summary: "Sanctions screening errors on {{ $labels.service_name }} \x5Cu2014 screens returning proceed-on-error mean unscreened\
         \ money movement."
       runbook_hint: 'Audit F12-01: sanctions screen errors return ''proceed''. Identify the transactions screened during the
         error window, re-screen them manually, and fix the upstream screen endpoint before the next batch.'
@@ -241,7 +241,7 @@ groups:
     execErrState: Error
     for: 0m
     annotations:
-      summary: "Fraud precheck failures on {{ $labels.service_name }} — payments are executing with ZERO fraud screening\
+      summary: "Fraud precheck failures on {{ $labels.service_name }} \x5Cu2014 payments are executing with ZERO fraud screening\
         \ (fail-open)."
       runbook_hint: 'Audit F15-15: payment-processing-service prechecks http://fraud-engine.54agent.svc.cluster.local, a service
         that does not exist, and proceeds on error. Point FRAUD_ENGINE_SVC_URL at fraud-service /api/v1/fraud/check (mind
@@ -308,7 +308,7 @@ groups:
     annotations:
       summary: Tenant {{ $labels.tenant_id }} request rate is >3 sigma above its 24h baseline.
       runbook_hint: "Compare with deployment/marketing events; if unexplained, check for credential stuffing or a misconfigured\
-        \ client loop. Per SPEC §2.3 the tenant.id label exists ONLY on money-path services — non-money services cannot\
+        \ client loop. Per SPEC \x5CxA72.3 the tenant.id label exists ONLY on money-path services \x5Cu2014 non-money services cannot\
         \ produce this alert (cardinality guard)."
     labels:
       severity: warning
