@@ -179,8 +179,10 @@ class TokenService:
             )
         pem_key = self.jwk_to_pem(key_data)
 
-        decode_options = {"verify_exp": True, "verify_signature": True}
-        decode_kwargs = {}
+        decode_options = {"verify_exp": True, "verify_signature": True, "verify_nbf": True}
+        # PL-06: clock-skew tolerance for exp/nbf (previously zero — any
+        # pod/IdP clock drift caused spurious 401s fleet-wide).
+        decode_kwargs = {"leeway": float(os.getenv("JWT_LEEWAY_SECONDS", "30"))}
         # iss is always validated against the configured/derived realm issuer.
         decode_kwargs["issuer"] = self._expected_issuer(context)
         decode_options["verify_iss"] = True
