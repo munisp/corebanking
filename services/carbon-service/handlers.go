@@ -709,7 +709,7 @@ func settleTrade(c *gin.Context) {
 	}
 
 	query := `
-		SELECT trade_id, credit_id, seller_id, buyerID, quantity,
+		SELECT trade_id, credit_id, seller_id, buyer_id, quantity,
 			price_per_unit, total_amount, currency, status, trade_date
 		FROM carbon_trades
 		WHERE trade_id = $1 AND tenant_id = $2
