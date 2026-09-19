@@ -258,7 +258,6 @@ export function registerERPNextBridgeRoutes(app: Express) {
       ],
       services: [
         { service: "erpnext-bridge-go", port: 8110, role: "CoA discovery, webhook processing, credit note sync", language: "Go" },
-        { service: "erpnext-sync-py", port: 8103, role: "Existing: batch sync, journal entries, CoA mappings (now enhanced)", language: "Python" },
       ],
       middleware: {
         kafka: ["erpnext.je.outbound", "erpnext.invoice.outbound", "erpnext.payment.inbound", "erpnext.creditnote.inbound", "erpnext.dispute.outbound"],
