@@ -39,38 +39,16 @@ struct AppState {
     valuations: Mutex<Vec<Valuation>>,
 }
 
-fn seed_valuations() -> Vec<Valuation> {
-    vec![
-        Valuation { id: "VAL-001".into(), collateral_id: "COL-001".into(), collateral_type: "property".into(), description: "4-bed detached house, Lekki Phase 1, Lagos".into(), owner: "Pinnacle Holdings Ltd".into(), market_value: 450_000_000.0, forced_sale_value: 315_000_000.0, haircut_pct: 30.0, net_realizable_value: 315_000_000.0, currency: "NGN".into(), valuer: "Knight Frank Nigeria".into(), valuation_date: "2026-03-15".into(), expiry_date: "2027-03-15".into(), insurance_value: 400_000_000.0, insurance_expiry: "2027-01-15".into(), lien_status: "perfected".into(), status: "current".into() },
-        Valuation { id: "VAL-002".into(), collateral_id: "COL-002".into(), collateral_type: "property".into(), description: "Commercial office complex, Victoria Island, Lagos — 5 floors".into(), owner: "Zenith Construction Ltd".into(), market_value: 1_800_000_000.0, forced_sale_value: 1_260_000_000.0, haircut_pct: 30.0, net_realizable_value: 1_260_000_000.0, currency: "NGN".into(), valuer: "CBRE Nigeria".into(), valuation_date: "2026-01-10".into(), expiry_date: "2027-01-10".into(), insurance_value: 1_500_000_000.0, insurance_expiry: "2026-12-31".into(), lien_status: "perfected".into(), status: "current".into() },
-        Valuation { id: "VAL-003".into(), collateral_id: "COL-003".into(), collateral_type: "vehicle".into(), description: "Fleet of 20 Toyota Hilux trucks (2024 model)".into(), owner: "Farmgate Commodities Ltd".into(), market_value: 600_000_000.0, forced_sale_value: 360_000_000.0, haircut_pct: 40.0, net_realizable_value: 360_000_000.0, currency: "NGN".into(), valuer: "Internal Valuation".into(), valuation_date: "2026-04-01".into(), expiry_date: "2026-10-01".into(), insurance_value: 550_000_000.0, insurance_expiry: "2026-12-31".into(), lien_status: "perfected".into(), status: "current".into() },
-        Valuation { id: "VAL-004".into(), collateral_id: "COL-004".into(), collateral_type: "securities".into(), description: "FGN Bonds 2030 — ₦500M face value".into(), owner: "Ibrahim Musa".into(), market_value: 480_000_000.0, forced_sale_value: 456_000_000.0, haircut_pct: 5.0, net_realizable_value: 456_000_000.0, currency: "NGN".into(), valuer: "FMDQ".into(), valuation_date: "2026-05-09".into(), expiry_date: "2026-06-09".into(), insurance_value: 0.0, insurance_expiry: "N/A".into(), lien_status: "perfected".into(), status: "current".into() },
-        Valuation { id: "VAL-005".into(), collateral_id: "COL-005".into(), collateral_type: "equipment".into(), description: "Caterpillar excavators (3 units) + cranes (2 units)".into(), owner: "Niger Delta Dredging Ltd".into(), market_value: 850_000_000.0, forced_sale_value: 425_000_000.0, haircut_pct: 50.0, net_realizable_value: 425_000_000.0, currency: "NGN".into(), valuer: "PPH Associates".into(), valuation_date: "2025-12-01".into(), expiry_date: "2026-06-01".into(), insurance_value: 700_000_000.0, insurance_expiry: "2026-06-30".into(), lien_status: "perfected".into(), status: "expiring_soon".into() },
-        Valuation { id: "VAL-006".into(), collateral_id: "COL-006".into(), collateral_type: "cash_deposit".into(), description: "Lien on fixed deposit — 12-month tenor".into(), owner: "Dangote Cement PLC".into(), market_value: 2_000_000_000.0, forced_sale_value: 2_000_000_000.0, haircut_pct: 0.0, net_realizable_value: 2_000_000_000.0, currency: "NGN".into(), valuer: "54link-dev Internal".into(), valuation_date: "2026-05-01".into(), expiry_date: "2027-05-01".into(), insurance_value: 0.0, insurance_expiry: "N/A".into(), lien_status: "perfected".into(), status: "current".into() },
-    ]
-}
 
 async fn healthz() -> HttpResponse {
     info!("Health check requested");
+    // LN-14: fabricated middleware connectivity block removed. This service is a
+    // self-contained FSV calculator with in-memory state; it has no kafka, dapr,
+    // temporal, postgres, keycloak, permify, redis, mojaloop, opensearch, apisix,
+    // tigerbeetle, or lakehouse connections, and healthz no longer claims otherwise.
     HttpResponse::Ok().json(serde_json::json!({
         "status": "ok",
         "service": "collateral-valuation",
-            "middleware": serde_json::json!({
-                "kafka": { "status": "connected", "topics": ["collateral_valuation.events", "collateral_valuation.audit"] },
-                "dapr": { "status": "connected", "appId": "collateral_valuation-sidecar" },
-                "fluvio": { "status": "connected", "topic": "collateral_valuation-stream" },
-                "temporal": { "status": "connected", "namespace": "collateral_valuation" },
-                "postgres": { "status": "connected", "database": "ndsep_db", "schema": "collateral_valuation" },
-                "keycloak": { "status": "connected", "realm": "54link-dev" },
-                "permify": { "status": "connected", "schema": "collateral_valuation_authz" },
-                "redis": { "status": "connected", "prefix": "collateral_valuation:" },
-                "mojaloop": { "status": "connected", "participant": "collateral_valuation" },
-                "opensearch": { "status": "connected", "index": "collateral_valuation-*" },
-                "openappsec": { "status": "connected", "policy": "collateral_valuation-protection" },
-                "apisix": { "status": "connected", "upstream": "collateral_valuation" },
-                "tigerbeetle": { "status": "connected", "cluster": "54link-dev-ledger" },
-                "lakehouse": { "status": "connected", "table": "collateral_valuation_iceberg" }
-            }),
         "types": ["property", "vehicle", "equipment", "securities", "cash_deposit", "guarantee"],
     }))
 }
@@ -150,7 +128,7 @@ async fn valuation_summary(req: actix_web::HttpRequest, data: web::Data<AppState
         "totalValuations": vals.len(),
         "totalMarketValue": total_market,
         "totalFSV": total_fsv,
-        "avgHaircut": ((1.0 - total_fsv / total_market) * 10000.0).round() / 100.0,
+        "avgHaircut": if total_market > 0.0 { ((1.0 - total_fsv / total_market) * 10000.0).round() / 100.0 } else { 0.0 },
         "marketValueByType": by_type,
         "byStatus": by_status
     }))
@@ -371,9 +349,9 @@ async fn main() -> std::io::Result<()> {
         "0.0.0.0:8154".to_string()
     });
 
-    info!("Loading valuations seed data");
-    let valuations = seed_valuations();
-    info!("Loaded {} valuations", valuations.len());
+    // LN-14: no seed data. Valuations are produced on demand by the real FSV
+    // calculator (POST /v1/valuations/compute-fsv).
+    let valuations: Vec<Valuation> = Vec::new();
 
     let state = web::Data::new(AppState {
         valuations: Mutex::new(valuations),
@@ -399,44 +377,3 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>) -> HttpResponse {
-    let id = path.into_inner();
-    let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
-
-    let result = sqlx::query("UPDATE service_configs SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("service_configs.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
-        }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
-    }
-}
-
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>) -> HttpResponse {
-    let id = path.into_inner();
-    sqlx::query("UPDATE service_configs SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("service_configs.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
-}
