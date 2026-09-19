@@ -1,11 +1,10 @@
 from fastapi import FastAPI, Depends
 
 from database import Base, engine
+from database.migrations import run_migrations
 from api import health_router, audit_router
 from utils import get_config
 from middlewares import swagger_keycloak_id_auth, get_request_auth_headers
-from dapr.ext.fastapi import DaprApp  # type: ignore
-from events import subscribe
 
 # Setup config
 config = get_config()
@@ -15,6 +14,30 @@ app = FastAPI(
     description="54Link Audit Service.",
     version="0.0.0"
 )
+# --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
+# OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
+# tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware
+# (tenant.id span attr from x-tenant-id). Honors OTEL_SDK_DISABLED; never raises.
+try:
+    import os as _otel_os
+    import sys as _otel_sys
+
+    _otel_sys.path.insert(
+        0,
+        _otel_os.path.normpath(
+            _otel_os.path.join(
+                _otel_os.path.dirname(__file__), "..", "..", "shared", "otel", "python"
+            )
+        ),
+    )
+    from otelkit import init_telemetry
+
+    init_telemetry("audit-service", app)
+except Exception as _otel_exc:
+    import logging as _otel_logging
+
+    _otel_logging.getLogger("otel").warning("otelkit init skipped: %s", _otel_exc)
+
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
@@ -161,6 +184,27 @@ from starlette.responses import JSONResponse as _JWTJSONResponse
 # Probe endpoints are exempt; everything else requires a verifiable Bearer JWT.
 _JWT_EXEMPT_PATHS = frozenset({"/health", "/healthz", "/ready", "/readyz", "/livez", "/metrics"})
 
+# AU-01 (F15-1): service-to-service audit ingestion credential. Senders present
+# the shared secret as the X-Audit-Ingest-Token header; the value is injected
+# from the shared `audit-ingest-credentials` k8s secret. Fail-closed: when
+# AUDIT_INGEST_TOKEN is unset the header path is disabled and only a Bearer JWT
+# whose claims carry role service/audit-writer can ingest.
+_AUDIT_INGEST_TOKEN = _jwt_os.environ.get("AUDIT_INGEST_TOKEN", "")
+_AUDIT_WRITER_ROLES = frozenset({"service", "audit-writer"})
+
+
+def _jwt_claim_roles(claims):
+    roles = set()
+    role = claims.get("role")
+    if isinstance(role, str):
+        roles.add(role)
+    for item in claims.get("roles") or []:
+        roles.add(item)
+    realm = claims.get("realm_access") or {}
+    for item in realm.get("roles") or []:
+        roles.add(item)
+    return roles
+
 
 def _jwt_set_scope_header(scope, name, value):
     """Overwrite (or remove, when value is None) a request header in the ASGI scope so
@@ -188,6 +232,27 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         if request.method == "OPTIONS" or request.url.path in _JWT_EXEMPT_PATHS:
             return await call_next(request)
+        is_ingest = (
+            request.method == "POST"
+            and request.url.path.rstrip("/") == "/audits"
+        )
+        # AU-01: shared-secret ingestion path for the 22 audit-shipping services.
+        if is_ingest:
+            ingest_token = request.headers.get("x-audit-ingest-token", "")
+            if ingest_token:
+                if not _AUDIT_INGEST_TOKEN or not _jwt_hmac.compare_digest(
+                    ingest_token.encode(), _AUDIT_INGEST_TOKEN.encode()
+                ):
+                    return _JWTJSONResponse(
+                        status_code=401,
+                        content={"error": "unauthorized", "detail": "Invalid audit ingest token"},
+                    )
+                request.state.jwt_claims = {
+                    "sub": "audit-ingest",
+                    "role": "audit-writer",
+                    "tenant_id": request.headers.get("x-tenant-id", ""),
+                }
+                return await call_next(request)
         try:
             if _jwt_inspect.iscoroutinefunction(validate_jwt):
                 claims, err = await validate_jwt(request.headers)
@@ -198,6 +263,12 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
         if not claims:
             status = 503 if err == "jwks_unavailable" else 401
             return _JWTJSONResponse(status_code=status, content={"error": "unauthorized", "detail": err})
+        # AU-01: ingestion via Bearer JWT requires an explicit writer role.
+        if is_ingest and not (_jwt_claim_roles(claims) & _AUDIT_WRITER_ROLES):
+            return _JWTJSONResponse(
+                status_code=403,
+                content={"error": "forbidden", "detail": "audit-writer or service role required"},
+            )
         request.state.jwt_claims = claims
         tenant = claims.get("tenant_id") or claims.get("tenant")
         _jwt_set_scope_header(request.scope, "x-tenant-id", tenant)
@@ -211,13 +282,17 @@ class JWTAuthMiddleware(_JWTBaseHTTPMiddleware):
 app.add_middleware(JWTAuthMiddleware)
 
 
-dapr_app = DaprApp(app)
-
 app.middleware("http")(get_request_auth_headers)
 
 Base.metadata.create_all(bind=engine)
+# AU-03/PL-10: apply expand-only migrations (hash chain, retention bucket,
+# archive certificate table) and backfill. Idempotent.
+run_migrations()
 
 app.include_router(health_router, prefix="", tags=["health"])
 app.include_router(audit_router, prefix="/audits", tags=["audit"])
 
-subscribe(dapr_app)
+# OR-14 (T36): the Dapr `new_audit_log` subscription had zero producers
+# fleet-wide (audit arrives via authenticated HTTP POST /audits per F15-2), so
+# the orphan subscription and its handler were deleted. HTTP intake is the real
+# ingestion path.
