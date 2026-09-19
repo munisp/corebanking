@@ -12,6 +12,19 @@ from middlewares import swagger_keycloak_id_auth, get_request_auth_headers
 from dapr.ext.fastapi import DaprApp  # type: ignore
 from events import subscribe
 
+# --- OpenTelemetry (SPEC w9 §2.5): make the shared otelkit importable ---
+import os as _otel_os
+import sys as _otel_sys
+
+_otel_sys.path.insert(
+    0,
+    _otel_os.path.normpath(
+        _otel_os.path.join(
+            _otel_os.path.dirname(__file__), "..", "..", "shared", "otel", "python"
+        )
+    ),
+)
+
 logger = logging.getLogger(__name__)
 
 # Setup config
@@ -56,6 +69,16 @@ app = FastAPI(
     version="0.0.0",
     lifespan=lifespan,
 )
+
+# --- OpenTelemetry init (SPEC w9 §2.5): OTLP gRPC traces+metrics, W3C ---
+# propagation, FastAPI server spans, TenantMiddleware (tenant.id span attr).
+# Honors OTEL_SDK_DISABLED; never raises.
+try:
+    from otelkit import init_telemetry
+
+    init_telemetry("transaction-ledger", app)
+except Exception as _otel_exc:
+    logger.warning("otelkit init skipped: %s", _otel_exc)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
