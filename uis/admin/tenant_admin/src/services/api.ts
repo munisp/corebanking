@@ -61,7 +61,8 @@ apiClient.interceptors.request.use(
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
 
-      // Try to extract x-keycloak-id from JWT token if not in tenant headers
+      // Extract identity from the authenticated user's JWT (the session store
+      // for this UI is localStorage.auth_token — ST-02).
       try {
         const parts = token.split(".");
         if (parts.length === 3) {
@@ -78,7 +79,6 @@ apiClient.interceptors.request.use(
             if (keycloakId) {
               config.headers["x-keycloak-id"] = String(keycloakId);
               config.headers["x-user-id"] = String(keycloakId);
-              config.headers["x-user-role"] = "super_admin"; // Assuming only admins can perform API actions; adjust as needed
               if (import.meta.env.DEV) {
                 console.log(
                   "getTenantHeadersFromStorage: extracted x-keycloak-id from JWT token:",
@@ -86,6 +86,19 @@ apiClient.interceptors.request.use(
                 );
               }
             }
+          }
+          // ST-02: x-user-role is derived from the authenticated user's token
+          // claims (realm_access.roles) — NEVER hardcoded. When the token
+          // carries no realm roles, no x-user-role header is sent and the
+          // gateway/server-side JWT claims govern authorization.
+          const realmRoles: unknown =
+            payload.realm_access && payload.realm_access.roles;
+          if (Array.isArray(realmRoles) && realmRoles.length > 0) {
+            config.headers["x-user-role"] = realmRoles
+              .map((r) => String(r))
+              .join(",");
+          } else {
+            delete config.headers["x-user-role"];
           }
         }
       } catch (e) {
