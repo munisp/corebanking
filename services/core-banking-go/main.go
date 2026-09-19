@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/munisp/corebanking/pkg/tbclient"
+	"shared/otel/go/otelkit"
 )
 
 var serviceName = "core-banking-go"
@@ -582,7 +583,7 @@ func initDB() {
 		log.Printf("[%s] DATABASE_URL not set — running without Postgres", serviceName)
 		return
 	}
-	conn, err := sql.Open("postgres", dsn)
+	conn, err := otelkit.OpenSQLDB("postgres", dsn)
 	if err != nil {
 		log.Printf("[%s] db open error: %v", serviceName, err)
 		return
@@ -614,6 +615,17 @@ func main() {
 	if port == "" {
 		port = "8080"
 	}
+	shutdown, oerr := otelkit.Init(context.Background(), serviceName)
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	initDB()
 	initLedger()
 	go startOutboxRelay(2 * time.Second)
@@ -635,7 +647,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux))))),
+		Handler:      otelkit.HTTPMiddleware(rateLimitMiddleware(securityHeadersMiddleware(jwtAuthMiddleware(traceMiddleware(countingMiddleware(mux)))))),
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
