@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 import logging
 from pathlib import Path
@@ -20,11 +21,16 @@ def load_schema():
         # Load schema to tenant from environment variable or default to 'bpmgd'
         tenant_id = os.getenv("PERMIFY_DEFAULT_TENANT", "bpmgd")
 
-        # Write schema multiple times to ensure all Permify pods receive it
-        # Permify uses in-memory storage with 3 replicas
-        write_attempts = int(os.getenv("PERMIFY_WRITE_ATTEMPTS", "15"))
-        successful_writes = 0
+        # PL-07: Permify is now postgres-backed (image pinned v1.6.8, ESO-wired
+        # credentials): a single durable schema write is visible to all pods via
+        # the shared store. The previous 15x scatter-write loop targeted the old
+        # in-memory multi-replica topology and masked real failures behind
+        # partial-success counting. Bounded retry (default 3 attempts, linear
+        # backoff) now covers transient network/LB errors only; total failure is
+        # logged at error level and NOT silently tolerated.
+        write_attempts = int(os.getenv("PERMIFY_WRITE_ATTEMPTS", "3"))
         schema_version = "unknown"
+        wrote = False
 
         for attempt in range(write_attempts):
             try:
@@ -35,19 +41,23 @@ def load_schema():
                 )
 
                 if response.status_code == 200:
-                    successful_writes += 1
                     result = response.json()
                     schema_version = result.get("schema_version", schema_version)
+                    wrote = True
+                    break
+                logger.debug(
+                    f"Schema write attempt {attempt + 1} returned HTTP {response.status_code}"
+                )
             except Exception as attempt_error:
                 logger.debug(
                     f"Schema write attempt {attempt + 1} failed: {str(attempt_error)}"
                 )
-                continue
+            if attempt + 1 < write_attempts:
+                time.sleep(0.25 * (attempt + 1))
 
-        if successful_writes > 0:
+        if wrote:
             logger.info(
-                f"Permify schema loaded successfully (version: {schema_version}, "
-                f"{successful_writes}/{write_attempts} writes succeeded)"
+                f"Permify schema loaded successfully (version: {schema_version})"
             )
         else:
             logger.error(
@@ -117,11 +127,10 @@ def assign_role(
             ],
         }
 
-        # Write relationship multiple times to ensure all Permify pods receive it
-        # Permify uses in-memory storage with 3 replicas, so we need to write
-        # multiple times through the load balancer to hit all pods
-        write_attempts = int(os.getenv("PERMIFY_WRITE_ATTEMPTS", "15"))
-        successful_writes = 0
+        # PL-07: postgres-backed Permify — one durable write suffices; bounded
+        # retry covers transient errors only. First success returns
+        # immediately; partial-success scatter-writing removed.
+        write_attempts = int(os.getenv("PERMIFY_WRITE_ATTEMPTS", "3"))
 
         for attempt in range(write_attempts):
             try:
@@ -132,24 +141,24 @@ def assign_role(
                 )
 
                 if response.status_code in [200, 201]:
-                    successful_writes += 1
+                    logger.info(
+                        f"Successfully assigned role '{role}' to user {user_id} on {entity_type}:{entity_id}"
+                    )
+                    return True
+                logger.debug(
+                    f"Write attempt {attempt + 1} returned HTTP {response.status_code}"
+                )
             except Exception as attempt_error:
                 logger.debug(
                     f"Write attempt {attempt + 1} failed: {str(attempt_error)}"
                 )
-                continue
+            if attempt + 1 < write_attempts:
+                time.sleep(0.25 * (attempt + 1))
 
-        if successful_writes > 0:
-            logger.info(
-                f"Successfully assigned role '{role}' to user {user_id} on {entity_type}:{entity_id} "
-                f"({successful_writes}/{write_attempts} writes succeeded)"
-            )
-            return True
-        else:
-            logger.error(
-                f"Failed to assign role: all {write_attempts} write attempts failed"
-            )
-            return False
+        logger.error(
+            f"Failed to assign role: all {write_attempts} write attempts failed"
+        )
+        return False
     except Exception as e:
         logger.error(f"Error assigning role: {str(e)}")
         return False
@@ -168,9 +177,9 @@ def remove_role(
             }
         }
 
-        # Delete relationship multiple times to ensure all Permify pods process it
-        delete_attempts = int(os.getenv("PERMIFY_WRITE_ATTEMPTS", "15"))
-        successful_deletes = 0
+        # PL-07: postgres-backed Permify — one durable delete suffices; bounded
+        # retry covers transient errors only. Scatter-delete loop removed.
+        delete_attempts = int(os.getenv("PERMIFY_WRITE_ATTEMPTS", "3"))
 
         for attempt in range(delete_attempts):
             try:
@@ -181,24 +190,24 @@ def remove_role(
                 )
 
                 if response.status_code in [200, 204]:
-                    successful_deletes += 1
+                    logger.info(
+                        f"Successfully removed role '{role}' from user {user_id} on {entity_type}:{entity_id}"
+                    )
+                    return True
+                logger.debug(
+                    f"Delete attempt {attempt + 1} returned HTTP {response.status_code}"
+                )
             except Exception as attempt_error:
                 logger.debug(
                     f"Delete attempt {attempt + 1} failed: {str(attempt_error)}"
                 )
-                continue
+            if attempt + 1 < delete_attempts:
+                time.sleep(0.25 * (attempt + 1))
 
-        if successful_deletes > 0:
-            logger.info(
-                f"Successfully removed role '{role}' from user {user_id} on {entity_type}:{entity_id} "
-                f"({successful_deletes}/{delete_attempts} deletes succeeded)"
-            )
-            return True
-        else:
-            logger.error(
-                f"Failed to remove role: all {delete_attempts} delete attempts failed"
-            )
-            return False
+        logger.error(
+            f"Failed to remove role: all {delete_attempts} delete attempts failed"
+        )
+        return False
     except Exception as e:
         logger.error(f"Error removing role: {str(e)}")
         return False
