@@ -1,0 +1,170 @@
+# PL-11: Scheduled Postgres backups (previously db-backup.sh had zero schedulers —
+# its own header comment was the entire scheduling story — and backups were
+# local-only with no offsite copy).
+#
+# This CronJob runs infrastructure/new/scripts/db-backup.sh nightly at 02:00 with
+# S3 upload (SSE-AES256) and local retention. A failed backup exits non-zero, which
+# surfaces as a failed Job and, via the alert rule below, pages the on-call.
+#
+# ─── RUNBOOK (operator reference) ────────────────────────────────────────────
+#
+# 1. Postgres (this CronJob)
+#    - Logical dump: pg_dump --format=custom --compress=9, uploaded to
+#      s3://$S3_BUCKET/postgres/ with SSE-AES256.
+#    - Physical basebackup + WAL: set ENABLE_WAL_ARCHIVE=true for pg_basebackup
+#      archives (point-in-time recovery).
+#    - Restore drill: monthly — restore latest dump into a scratch namespace
+#      with db-restore.sh, verify row counts, record the drill.
+#
+# 2. TigerBeetle (ledger of record) — NOT covered by pg_dump. Snapshot procedure:
+#    - TigerBeetle is replicated (see infrastructure.yaml statefulset, replicas>1);
+#      a backup is a consistent copy of the replica's data file.
+#    - Procedure per TB docs: quiesce writes against the target replica (or pick a
+#      replica not serving the primary role), copy the `<cluster>.tb` data file
+#      while the replica is stopped or via block-level snapshot (VolumeSnapshot),
+#      then upload the file to s3://$S3_BUCKET/tigerbeetle/<timestamp>.tb.
+#    - NEVER copy the data file of a running replica with plain `cp` — the file
+#      is only crash-consistent at rest; use a stopped replica or a CSI snapshot.
+#    - Automation of this snapshot is a follow-up (needs a TB-sidecar Job);
+#      until then it is a documented manual monthly step.
+#
+# 3. Keycloak — included in the Postgres dump (its DB lives on the same cluster);
+#    additionally export realm configs: `kc.sh export --dir ...` monthly, manual.
+#
+# 4. Permify — authz schema/relationships live in Postgres (permify-postgres.yaml,
+#    PERMIFY_DATABASE_ENGINE=postgres) → covered by the Postgres dump of the
+#    permify database. Re-seed from infrastructure/integration/permify-seed.sh on
+#    rebuild.
+#
+# 5. Redis — cache-only; no backup required (documented decision). If durable
+#    usage appears, enable AOF and snapshot RDB to S3.
+#
+# 6. Kafka — topics are reproducible event streams sourced from service outboxes;
+#    no backup (documented decision). If a topic becomes a system of record, add
+#    MirrorMaker2 replication or tiered storage.
+#
+# 7. Alerting (wire into Alertmanager/PrometheusRule):
+#    - metric: time() - kube_job_status_completion_time{job_name=~"db-backup.*"}
+#      > 26h  →  severity=critical "no successful Postgres backup in 26h".
+#    - kube_job_status_failed{job_name=~"db-backup.*"} > 0 → severity=warning.
+# ──────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Secret
+metadata:
+  name: backup-credentials
+  namespace: infrastructure
+type: Opaque
+stringData:
+  # Populate from the external secret manager in real deployments
+  # (see k8s/external-secrets/external-secrets-operator.yaml). These keys are
+  # placeholders so the manifest is self-describing; do NOT commit real values.
+  DB_PASSWORD: "CHANGEME-via-external-secrets"
+  AWS_ACCESS_KEY_ID: "CHANGEME-via-external-secrets"
+  AWS_SECRET_ACCESS_KEY: "CHANGEME-via-external-secrets"
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: db-backup
+  namespace: infrastructure
+  labels:
+    app: db-backup
+    register-ref: PL-11
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 7
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 3600
+      template:
+        metadata:
+          labels:
+            app: db-backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: backup
+              # Image must contain: postgresql-client (pg_dump/pg_basebackup),
+              # aws-cli v2, bash, findutils. Build from scripts/Dockerfile.backup
+              # or use an internal image; the tag below is illustrative.
+              image: registry.54bank.internal/platform/db-backup:1.0.0
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "/opt/54bank/scripts/db-backup.sh"]
+              env:
+                - name: DB_HOST
+                  value: "postgres-primary.infrastructure.svc.cluster.local"
+                - name: DB_PORT
+                  value: "5432"
+                - name: DB_NAME
+                  value: "bank54_db"
+                - name: DB_USER
+                  value: "bank54_user"
+                - name: RETENTION_DAYS
+                  value: "30"
+                - name: ENABLE_WAL_ARCHIVE
+                  value: "true"
+                - name: S3_BUCKET
+                  value: "54bank-backups"
+                - name: S3_PREFIX
+                  value: "postgres"
+                - name: AWS_DEFAULT_REGION
+                  value: "af-south-1"
+                - name: DB_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: backup-credentials
+                      key: DB_PASSWORD
+                      optional: false
+                - name: AWS_ACCESS_KEY_ID
+                  valueFrom:
+                    secretKeyRef:
+                      name: backup-credentials
+                      key: AWS_ACCESS_KEY_ID
+                      optional: false
+                - name: AWS_SECRET_ACCESS_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: backup-credentials
+                      key: AWS_SECRET_ACCESS_KEY
+                      optional: false
+              volumeMounts:
+                - name: scripts
+                  mountPath: /opt/54bank/scripts
+                - name: backup-data
+                  mountPath: /var/backups/54bank
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+          volumes:
+            - name: scripts
+              configMap:
+                name: db-backup-script
+                defaultMode: 0755
+            - name: backup-data
+              emptyDir: {}
+---
+# The backup script is mounted from this ConfigMap so the CronJob always runs
+# the in-repo version of db-backup.sh (single source of truth).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-backup-script
+  namespace: infrastructure
+  annotations:
+    # Keep in sync with infrastructure/new/scripts/db-backup.sh — regenerate:
+    #   kubectl create configmap db-backup-script --from-file=db-backup.sh=../../scripts/db-backup.sh --dry-run=client -o yaml
+    source: "infrastructure/new/scripts/db-backup.sh"
+data:
+  db-backup.sh: |
+    # PLACEHOLDER — replaced at deploy time from infrastructure/new/scripts/db-backup.sh
+    # (see the `source` annotation above). Deploy pipelines must regenerate this
+    # ConfigMap from the repo file; do not edit the copy here by hand.
+    echo "db-backup.sh must be injected from the repo — see annotation" >&2
+    exit 1
