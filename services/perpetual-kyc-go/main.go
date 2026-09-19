@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
@@ -9,11 +10,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -253,6 +256,14 @@ func evaluateTrigger(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[%s] UPDATE profile failed: %v", serviceName, err)
 	}
 
+	// CP-06: advisory actions are no longer strings nobody executes — a
+	// confirmed sanctions hit executes FREEZE_ACCOUNT by placing a
+	// regulatory_freeze lien via account-lien-go.
+	freezeResult := ""
+	if req.Trigger == TriggerSanctionsHit {
+		freezeResult = freezeAccountForSanctions(req.CustomerID, eventID)
+	}
+
 	respondJSON(w, 200, map[string]interface{}{
 		"event_id":       eventID,
 		"requires_rekyc": requiresReKYC,
@@ -261,7 +272,113 @@ func evaluateTrigger(w http.ResponseWriter, r *http.Request) {
 		"risk_score":     profile.RiskScore,
 		"due_date":       dueDate.Format(time.RFC3339),
 		"actions":        getRequiredActions(req.Trigger, profile),
+		"freeze_result":  freezeResult,
 	})
+}
+
+// CP-06: execute the FREEZE_ACCOUNT action for a sanctions hit by placing a
+// regulatory_freeze lien on the customer's account(s) via account-lien-go.
+// account_id is the customer_id here (account resolution lives upstream); the
+// lien amount is the full-balance sentinel since a sanctions freeze is total.
+// A failure is CRITICAL-logged — a sanctions freeze that silently fails is a
+// reportable compliance incident.
+func freezeAccountForSanctions(customerID, eventID string) string {
+	lienURL := getEnv("ACCOUNT_LIEN_URL", "http://account-lien-go:8080")
+	payload := map[string]interface{}{
+		"account_id":  customerID,
+		"amount_kobo": int64(1) << 62, // total freeze sentinel (exceeds any balance)
+		"type":        "regulatory_freeze",
+		"reason":      "SANCTIONS_LIST_HIT — regulatory freeze per CBN AML/CFT 2022 (rekyc event " + eventID + ")",
+		"reference":   eventID,
+		"placed_by":   serviceName,
+	}
+	body, _ := json.Marshal(payload)
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(lienURL+"/api/v1/lien/place", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[%s] CRITICAL: sanctions freeze lien FAILED for customer=%s event=%s: %v — manual freeze required", serviceName, customerID, eventID, err)
+		return "freeze_failed: " + err.Error()
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		log.Printf("[%s] CRITICAL: sanctions freeze lien rejected status=%d customer=%s event=%s: %s", serviceName, resp.StatusCode, customerID, eventID, string(b))
+		return fmt.Sprintf("freeze_rejected: status %d", resp.StatusCode)
+	}
+	log.Printf("[%s] sanctions freeze lien placed customer=%s event=%s", serviceName, customerID, eventID)
+	return "frozen"
+}
+
+// CP-06: nightly sweeper — the evaluate endpoint was a pull API with no
+// callers, so due periodic reviews never materialized. The sweeper selects
+// customer_risk_profiles whose next_review_date is past due and creates real
+// rekyc_events (idempotent: skipped when an open scheduled-review event
+// already exists for the customer).
+func startReKYCSweeper() {
+	intervalHours := 24
+	if v := os.Getenv("REKYC_SWEEP_INTERVAL_HOURS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			intervalHours = n
+		}
+	}
+	go func() {
+		time.Sleep(2 * time.Minute) // let the DB warm up after boot
+		for {
+			sweepDueProfiles()
+			time.Sleep(time.Duration(intervalHours) * time.Hour)
+		}
+	}()
+	log.Printf("[%s] rekyc sweeper started (interval=%dh)", serviceName, intervalHours)
+}
+
+func sweepDueProfiles() {
+	if app.db == nil {
+		return
+	}
+	rows, err := app.db.Query(`SELECT p.customer_id, p.risk_level FROM customer_risk_profiles p
+		WHERE p.next_review_date < NOW()
+		  AND NOT EXISTS (SELECT 1 FROM rekyc_events e
+		                  WHERE e.customer_id = p.customer_id
+		                    AND e.trigger = 'SCHEDULED_REVIEW'
+		                    AND e.status != 'completed')`)
+	if err != nil {
+		log.Printf("[%s] rekyc sweep query failed: %v", serviceName, err)
+		return
+	}
+	type dueProfile struct{ customerID, riskLevel string }
+	var due []dueProfile
+	for rows.Next() {
+		var d dueProfile
+		if err := rows.Scan(&d.customerID, &d.riskLevel); err == nil {
+			due = append(due, d)
+		}
+	}
+	rows.Close()
+	for _, d := range due {
+		dueDate := time.Now().Add(7 * 24 * time.Hour)
+		if d.riskLevel == "high" {
+			dueDate = time.Now().Add(24 * time.Hour)
+		} else if d.riskLevel == "medium" {
+			dueDate = time.Now().Add(3 * 24 * time.Hour)
+		}
+		eventID := fmt.Sprintf("REKYC-%x", sha256.Sum256([]byte(d.customerID+"-SCHEDULED_REVIEW-sweep-"+time.Now().Format(time.RFC3339Nano))))
+		if len(eventID) > 40 {
+			eventID = eventID[:40]
+		}
+		_, err := app.db.Exec(`INSERT INTO rekyc_events (event_id, customer_id, trigger, risk_level, details, created_at, status, due_date)
+			VALUES ($1,$2,'SCHEDULED_REVIEW',$3,$4,NOW(),'requires_review',$5)`,
+			eventID, d.customerID, d.riskLevel, `{"source":"nightly_sweeper","reason":"periodic review past due"}`, dueDate)
+		if err != nil {
+			log.Printf("[%s] rekyc sweep insert failed customer=%s: %v", serviceName, d.customerID, err)
+			continue
+		}
+		// Defer the next sweep eligibility until this review is due.
+		_, _ = app.db.Exec(`UPDATE customer_risk_profiles SET next_review_date = $2 WHERE customer_id = $1`, d.customerID, dueDate)
+		log.Printf("[%s] rekyc sweep created event=%s customer=%s risk=%s due=%s", serviceName, eventID, d.customerID, d.riskLevel, dueDate.Format(time.RFC3339))
+	}
+	if len(due) > 0 {
+		log.Printf("[%s] rekyc sweep created %d due review events", serviceName, len(due))
+	}
 }
 
 func getRequiredActions(trigger ReKYCTrigger, profile *CustomerRiskProfile) []string {
@@ -541,6 +658,7 @@ func main() {
 	startJWKSRefresh()
 
 	initDB()
+	startReKYCSweeper() // CP-06
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9041"
