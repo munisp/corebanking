@@ -15,6 +15,9 @@ import { PartyIdTypeEnum, PubSubTopics, TransactionDirectionEnum } from "../../u
 import { ITransactionCompletedEvent } from "../../types/events";
 import { lowerDenominatorMultiplier } from "../../utils/constants";
 import { IFineractWithdrawResponse } from "../../types/api.response";
+import { sanctionsScreeningApiClient } from "../../lib/SanctionsScreeningApiClient";
+import { AppDataSource } from "../../database/dataSource";
+import { SanctionsBlockedAlert } from "../../models/SanctionsBlockedAlert";
 
 const logger = createLogger(extract_name_form_path(__filename));
 const tenant = readEnv("TENANT_NAME", "ucard") as string;
@@ -86,6 +89,73 @@ export const receive_transfer = asyncHandler(async (req, res) => {
 
     logger.info(`Deposit amount: ${deposit_amount}`);
 
+    // MN-13 (S13): screen the beneficiary BEFORE the deposit. Fail-closed:
+    // screening unavailable => no credit. On block/hold, funds are routed to
+    // the sanctions-suspense account (never silently to the beneficiary and
+    // never vanished), an alert is persisted, and an STR-filing event fires.
+    const screening = await sanctionsScreeningApiClient.screen({
+      name: id_value,
+      tenant_id: tenant,
+      triggered_by: "mojaloop-connector:receive_transfer",
+      transaction_id: transaction_data.transactionId,
+      screen_type: "transaction",
+    });
+
+    let creditPartyIdValue = id_value;
+    if (screening.action !== "proceed") {
+      const suspenseAccountId = readEnv("SANCTIONS_SUSPENSE_ACCOUNT_ID", "") as string;
+      if (!suspenseAccountId) {
+        // Fail-fast: there is nowhere safe to park blocked funds.
+        throw new Error(
+          "Sanctions block but SANCTIONS_SUSPENSE_ACCOUNT_ID is not configured",
+        );
+      }
+      creditPartyIdValue = suspenseAccountId;
+
+      const alert = new SanctionsBlockedAlert();
+      alert.transfer_id = payload.transferId;
+      alert.beneficiary = id_value;
+      alert.payer_fsp = source;
+      alert.amount = data.amount;
+      alert.currency = transaction_data.currency;
+      alert.screening_id = screening.id;
+      alert.risk_level = screening.risk_level;
+      alert.action = screening.action;
+      alert.suspense_account_id = suspenseAccountId;
+      alert.status = "open";
+      alert.str_filed = false;
+      alert.note = `Inbound transfer ${payload.transferId} blocked by sanctions screening; funds parked in suspense`;
+      try {
+        await AppDataSource.manager.save(alert);
+      } catch (dbErr: any) {
+        // Persist-or-die: a blocked transfer without an audit row must not proceed.
+        logger.error(`SanctionsBlockedAlert persistence failed: ${dbErr?.message}`);
+        throw new Error("Failed to persist sanctions-blocked alert; transfer aborted");
+      }
+
+      try {
+        await daprClient.publishTxnNotification("sanctions.blocked", {
+          transfer_id: payload.transferId,
+          beneficiary: id_value,
+          payer_fsp: source,
+          amount: data.amount,
+          currency: transaction_data.currency,
+          screening_id: screening.id,
+          risk_level: screening.risk_level,
+          action: screening.action,
+          alert_id: alert.id,
+          suspense_account_id: suspenseAccountId,
+          tenant,
+        });
+      } catch (pubErr: any) {
+        logger.error(`sanctions.blocked publish failed (STR filing at risk): ${pubErr?.message}`);
+      }
+
+      logger.error(
+        `ALERT sanctions.blocked transfer=${payload.transferId} beneficiary=${id_value} action=${screening.action} suspense=${suspenseAccountId}`,
+      );
+    }
+
     logger.info(`Attempt to credit the customer`);
 
     const result = (await daprClient.invoke(
@@ -93,7 +163,7 @@ export const receive_transfer = asyncHandler(async (req, res) => {
       "transfers/deposit",
       HttpMethod.POST,
       {
-        payee: { partyIdType: id_type, partyIdentifier: id_value },
+        payee: { partyIdType: id_type, partyIdentifier: creditPartyIdValue },
         amount: {
           amount: deposit_amount.toString(),
           currency: transaction_data.currency,
@@ -102,6 +172,18 @@ export const receive_transfer = asyncHandler(async (req, res) => {
         transaction_id: transaction_data.transactionId,
       }
     )) as IFineractWithdrawResponse;
+
+    if (screening.action !== "proceed") {
+      // Funds are safe in suspense; reject the transfer at the switch so the
+      // payer FSP sees the failure and no fulfilment is committed downstream.
+      await MojaloopApiClient.getInstance().send_transfer_error(
+        payload.transferId,
+        "Beneficiary blocked by sanctions screening; funds routed to suspense",
+        destination,
+        source,
+      );
+      return;
+    }
 
     logger.info(`credit is successfull`);
 
