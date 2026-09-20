@@ -14,7 +14,7 @@ import sys as _otel_sys
 _otel_sys.path.insert(
     0,
     os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "..", "..", "shared", "otel", "python")
+        os.path.join(os.path.dirname(__file__), "..", "..", "shared", "otel", "python")
     ),
 )
 try:
