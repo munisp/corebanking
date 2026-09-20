@@ -29,6 +29,10 @@ class TransactionEventSchema(BaseModel):
     tag: Optional[str]
     tenant_id: str
     ledger_id: str
+    # MN-10: optional fee leg — when present, transaction-ledger posts a
+    # multi-leg journal (Dr payer fee / Cr fee-income) alongside the main leg.
+    fee_amount_kobo: Optional[int] = None
+    fee_account: Optional[str] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -67,10 +71,32 @@ class InitiateSystemPayoutSchema(BaseModel):
         return _validate_kobo(v)
 
 
+def _promote_major_amount(cls, data):
+    """Back-compat: legacy callers send `amount` in MAJOR units (naira).
+    Promote to integer kobo with ROUND_HALF_UP (MN-10/F13-1, MN-16/F13-8)."""
+    if isinstance(data, dict) and "amount_kobo" not in data and "amount" in data:
+        from decimal import Decimal, ROUND_HALF_UP
+
+        data = dict(data)
+        major = data.pop("amount")
+        data["amount_kobo"] = int(
+            (Decimal(str(major)) * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        )
+    return data
+
+
 class InitiateDepositSchema(BaseModel):
     recipient: int
     amount_kobo: int
     note: str
+    # MN-07/MN-14: optional caller reference -> deterministic TB transfer id
+    # (e.g. reversal:{transaction_id}) making replays ledger no-ops.
+    reference: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _promote_amount(cls, data):
+        return _promote_major_amount(cls, data)
 
     @validator("amount_kobo")
     def validate_amount_kobo(cls, v):
@@ -81,6 +107,12 @@ class InitiateDepositWithAccountNumberSchema(BaseModel):
     recipient_account_number: str
     amount_kobo: int
     note: str
+    reference: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _promote_amount(cls, data):
+        return _promote_major_amount(cls, data)
 
     @validator("amount_kobo")
     def validate_amount_kobo(cls, v):
