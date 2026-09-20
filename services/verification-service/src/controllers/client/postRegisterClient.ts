@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import httpStatus from "http-status";
 import logger from "../../config/logger.config";
+import { readEnv } from "../../config/readEnv.config";
 import { AppDataSource } from "../../database/dataSource";
 import { ClientEntity } from "../../entity/ClientEntity";
 import { ballerineApiClient } from "../../lib/BallerineApiClient";
@@ -10,10 +11,67 @@ import { CustomerStatuses } from "../../utils/enums";
 import { validateRequest } from "../../validations";
 import { PostRegisterClientValidationSchema } from "../../validations/schemas";
 
+// OB-15: caller-supplied callback URLs must be HTTPS and their host must be on
+// the CALLBACK_HOST_ALLOWLIST (comma-separated). Fail-closed: when the
+// allowlist is not configured, no callback URL is accepted.
+function assertCallbackUrlAllowed(callBackUrl?: string): void {
+  if (!callBackUrl) return;
+
+  const allowlist = (readEnv("CALLBACK_HOST_ALLOWLIST") as string | undefined)
+    ?.split(",")
+    .map((h) => h.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (!allowlist || allowlist.length === 0) {
+    throw new ApiError(
+      httpStatus.INTERNAL_SERVER_ERROR,
+      "CALLBACK_HOST_ALLOWLIST is not configured; refusing caller-supplied callback URL.",
+      "VER-500-CB",
+      "verification-service",
+    );
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(callBackUrl);
+  } catch {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "callBackUrl is not a valid URL.",
+      "VER-400-CB",
+      "verification-service",
+    );
+  }
+
+  if (parsed.protocol !== "https:") {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "callBackUrl must use https.",
+      "VER-400-CB",
+      "verification-service",
+    );
+  }
+
+  const host = parsed.hostname.toLowerCase();
+  const allowed = allowlist.some(
+    (allowedHost) => host === allowedHost || host.endsWith(`.${allowedHost}`),
+  );
+  if (!allowed) {
+    throw new ApiError(
+      httpStatus.BAD_REQUEST,
+      "callBackUrl host is not on the allowlist.",
+      "VER-400-CB",
+      "verification-service",
+    );
+  }
+}
+
 export const postRegisterClient = asyncHandler(async (req, res) => {
   try {
     const { clientName, redirectUrls, contact, logo, callBackUrl } =
       validateRequest(PostRegisterClientValidationSchema, req.body);
+
+    assertCallbackUrlAllowed(callBackUrl);
 
     const existingClient = await AppDataSource.manager.findOne(ClientEntity, {
       where: {
