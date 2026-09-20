@@ -108,6 +108,10 @@ class PermissionManager:
         "loan_officer",
         "compliance_officer",
         "support_agent",
+        # ST-01: teller and fraud_analyst exist in v2.perm and in
+        # PermifyTenantRole but were missing here, making them unassignable.
+        "teller",
+        "fraud_analyst",
     ]
 
     @staticmethod
