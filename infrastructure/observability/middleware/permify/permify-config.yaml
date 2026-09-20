@@ -1,0 +1,43 @@
+# =============================================================================
+# Permify server config — OTLP traces + Prometheus metrics
+#
+# Target (verified-static): ghcr.io/permify/permify:v1.1.4 deployed as
+# Deployment/permify ns `54bank` (infrastructure/new/k8s/infrastructure.yaml)
+# and ns `permify` (infrastructure/integration/permify-postgres.yaml).
+#
+# Two delivery options — pick ONE:
+#   (a) This file mounted as Permify's config (`serve --config /etc/permify/config.yaml`), or
+#   (b) permify-otel-env-patch.yaml (matches the repo's env-driven style; preferred).
+#
+# Contracts (SPEC §3/§2.1): OTLP gRPC -> otel-collector:4317; metrics job
+# `permify` -> :2112. Database block intentionally omitted: the existing
+# deployments configure Postgres via PERMIFY_DATABASE_* env / Secret
+# (verified-static) — do not duplicate credentials here. No secrets.
+# =============================================================================
+
+server:
+  http:
+    address: :3476          # existing deployment contract (verified-static)
+  grpc:
+    address: :3478
+
+log:
+  level: info
+
+tracer:
+  enabled: true
+  exporter: otlp            # Permify v1.x OTLP gRPC exporter
+  endpoint: otel-collector.observability.svc.cluster.local:4317
+  insecure: true            # plaintext OTLP inside the cluster
+  urlpath: ""
+
+meter:
+  enabled: true
+  exporter: prometheus
+  address: 0.0.0.0:2112     # SPEC §3 contract: permify :2112
+
+profiler:
+  enabled: false            # pprof was on :6060 in one manifest; disable in prod
+
+# resource attributes: Permify sets service.name=permify itself; namespace/env
+# attributes are attached by the Collector resource processor (B1 owns it).
