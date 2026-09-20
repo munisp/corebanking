@@ -2,6 +2,10 @@ module journal-posting
 
 go 1.22.0
 
+require shared/otel/go v0.0.0
+
+replace shared/otel/go => ../../shared/otel/go
+
 require (
 	github.com/IBM/sarama v1.43.3
 	github.com/lib/pq v1.10.9

@@ -2,6 +2,10 @@ module github.com/54link-dev/core-banking-go
 
 go 1.22
 
+require shared/otel/go v0.0.0
+
+replace shared/otel/go => ../../shared/otel/go
+
 require (
 	github.com/IBM/sarama v1.45.1
 	github.com/munisp/corebanking/pkg/tbclient v0.0.0
