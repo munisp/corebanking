@@ -6,4 +6,5 @@ export * from "./createBusinessWorkflow";
 export * from "./createCustomerWorkflow";
 export * from "./createEmployeeWorkflow";
 export * from "./createTenantWorkflow";
+export * from "./decommissionTenantWorkflow";
 
