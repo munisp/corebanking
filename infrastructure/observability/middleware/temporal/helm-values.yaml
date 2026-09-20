@@ -1,0 +1,47 @@
+# =============================================================================
+# Temporal server — Prometheus metrics on :8000
+#
+# Collector scrape job contract (SPEC §3): `temporal` -> :8000.
+#
+# verified-static: the repo has NO Temporal *server* deployment manifest —
+# only SDK workers/clients (infrastructure/new/**/temporal-*.yaml). The server
+# is therefore assumed to be deployed via the `temporalio/temporal` Helm chart
+# (or externally); these values apply to that chart. Requires deployment.
+#
+# Two files in one document:
+#   1) Helm values fragment for temporalio/temporal chart
+#   2) dynamicconfig (development-defaults) — NOT needed for metrics; kept as
+#      the place to pin server tuning. Metrics come from STATIC config below.
+# =============================================================================
+
+# --- 1) Helm values fragment -------------------------------------------------
+# Merge into your `helm upgrade temporal temporalio/temporal -f <values>`.
+server:
+  config:
+    global:
+      metrics:
+        prometheus:
+          timerType: histogram
+          listenAddress: "0.0.0.0:8000"   # SPEC §3 contract: temporal :8000
+        tags:
+          service: temporal
+          namespace: corebanking
+  # Expose the metrics port on the server pods so the collector can scrape it.
+  service:
+    extraPorts:
+      - name: metrics
+        port: 8000
+        targetPort: 8000
+# Keep chart-bundled prometheus OFF — platform Prometheus/Collector owns scrape.
+prometheus:
+  enabled: false
+grafana:
+  enabled: false
+
+# --- 2) dynamicconfig (optional, server-side feature toggles) ----------------
+# dynamicconfig is for runtime-tunable knobs, NOT for enabling the metrics
+# listener (that is static config above). Left intentionally minimal.
+# Save as dynamicconfig/development.yaml when using docker-compose deploys.
+# dynamicconfig:
+#   system.forceSearchAttributesCacheRefreshOnRead:
+#     - value: true
