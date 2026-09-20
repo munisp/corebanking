@@ -60,6 +60,10 @@ dapr:
   memory-request: 250Mi
   memory-limit: 1000Mi
 secrets:
+  # PL-12: Dapr pubsub component name for the Python Dapr services in this
+  # group (config.py default is "", which makes publish/subscribe calls fail).
+  # Matches the platform component infrastructure/manifests/dapr/pubsub.yaml.
+  DAPR_PUBSUB_NAME: "pubsub"
   DAPR_HOST: "localhost"
   APP_PORT: "9492"
   PORT_BASE: "9492"
@@ -80,10 +84,27 @@ secrets:
   # secret manager. The chart fails to render if this is empty.
   VERIFICATION_SVC_CLIENT_SECRET: ""
   BILLING_SVC_URL: "http://platform-tenant.54link-dev.svc.cluster.local:9523"
-  BUSINESS_SVC_URL: "http://workflow-operations.54link-dev.svc.cluster.local:9677"
+  # OB-05: was mis-wired to workflow-operations:9677 (no business-service there).
+  # business-service chart: fullnameOverride "business-service", port 8086.
+  BUSINESS_SVC_URL: "http://business-service.54link-dev.svc.cluster.local:8086"
   BVN_NIN_SVC_URL: "http://compliance-kyc-aml.54link-dev.svc.cluster.local:9219"
-  SANCTIONS_SCREENING_URL: "http://compliance-kyc-aml.54link-dev.svc.cluster.local:9236"
+  # OB-07: compliance-kyc-aml has no /api/screen route; the real implementation
+  # is sanctions-screening-service (Rust, src/main.rs:1248), chart port 8283.
+  SANCTIONS_SCREENING_URL: "http://sanctions-screening-service.54link-dev.svc.cluster.local:8283"
   TEMPORAL_TASK_QUEUE: "orchestrator-service"
   DAPR_PUBSUB_TOPIC_PREFIX: ""
   TENANT_SERVICE_APP_ID: "platform-tenant"
+  # PL-01: default ledger for newly created tenants.
+  DEFAULT_LEDGER_ID: "1"
+  # OB-01: shared service token for service-to-service calls into the
+  # orchestrator. NEVER committed — inject at deploy time (helm --set
+  # secrets.ORCHESTRATOR_SERVICE_TOKEN=... or an external secret manager).
+  # The orchestrator refuses to boot when this is empty (EnvSchema min 32).
+  ORCHESTRATOR_SERVICE_TOKEN: ""
+  # OB-01: HMAC-SHA256 key for KYC/KYB callback signatures
+  # (x-callback-signature). Inject at deploy time; boot fails when empty.
+  CALLBACK_HMAC_SECRET: ""
+  # OB-03: HS256 secret for orchestrator→identity-service JWTs. Must match the
+  # JWT_SECRET of the Python identity services. Inject at deploy time.
+  JWT_SECRET: ""
   SERVICES: "admin-service,api-key-enforcer-go,api-key-vault-go,api-marketplace-go,api-metering,api-versioning-go,apisix-plugin-optimizer-go,bundle-splitter-py,cors-gateway-go,dapr-sidecar-go,graphql-gateway-go,plugin-marketplace-py,security-gateway-go,webhook-engine-go,orchestrator-service"
