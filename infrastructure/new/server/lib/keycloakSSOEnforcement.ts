@@ -1,5 +1,10 @@
 // D1: Keycloak SSO Enforcement — JWT validation middleware for all 540+ routes
 // Enforces authentication on all /api/* routes with configurable exceptions
+//
+// ST-05: LEGACY MONOLITH ROLE CATALOG. Roles/permissions referenced here are a
+// legacy monolith-local catalog, NOT the canonical authorization model.
+// Canonical catalog = Permify v2 schema at
+// services/auth-service/schemas/permify/v2.perm. Comment-only change.
 import type { Express, Request, Response, NextFunction } from "express";
 
 interface DecodedToken {
