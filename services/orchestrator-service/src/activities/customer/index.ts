@@ -1,4 +1,5 @@
 export * from "./createAuthProfile";
+export * from "./deleteAuthProfile";
 export * from "./createUserProfile";
 export * from "./createAccountProfile";
 export * from "./initializeKyc";
