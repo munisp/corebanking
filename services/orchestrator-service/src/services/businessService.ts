@@ -2,6 +2,7 @@ import axios, { AxiosInstance } from "axios";
 import { createSecureHttpsAgent } from "../lib/secureHttpsAgent";
 import { readEnv } from "../config/readEnv.config";
 import logger from "../config/logger.config";
+import { serviceAuthClient } from "../lib/serviceAuthClient";
 
 class BusinessService {
   private _axiosInstance: AxiosInstance;
@@ -45,6 +46,8 @@ class BusinessService {
             "x-tenant-id":       payload.tenant_id,
             "x-keycloak-id":     payload.keycloak_id,
             "x-keycloak-realm":  `54link_${payload.tenant_id}`,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization":     serviceAuthClient.getAuthHeader(payload.tenant_id),
           },
         },
       );
@@ -69,6 +72,8 @@ class BusinessService {
           headers: {
             "x-tenant-id":    tenant_id,
             "x-keycloak-id":  keycloak_id,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization":  serviceAuthClient.getAuthHeader(tenant_id),
           },
         },
       );
@@ -78,7 +83,9 @@ class BusinessService {
         ? `HTTP ${error.response.status}: ${JSON.stringify(error.response.data)}`
         : error.message;
       logger.error(`[businessService] markKybComplete failed — ${detail}`);
-      // Fail gracefully — don't throw; callback should still return 200
+      // OB-05: do NOT swallow — KYB completion must persist or the caller must
+      // see the failure. Throw so the callback returns an error and retries.
+      throw new Error(`Mark KYB complete failed: ${detail}`);
     }
   }
 }
