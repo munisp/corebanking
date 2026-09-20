@@ -16,12 +16,12 @@ export async function createTenant(payload: ICreateTenantPayload) {
     });
     return result;
   } catch (error: any) {
+    // PL-15: log status + message only — never full upstream response bodies
+    // (they can contain tenant PII/secrets) or stacks in activity logs.
     logger.error(`[createTenant activity] Failed to create tenant`, {
       tenantId: payload.tenantId,
       error: error?.message,
-      status: error?.status,
-      response: error?.response?.data,
-      stack: error?.stack,
+      status: error?.status ?? error?.response?.status,
     });
     throw error;
   }
