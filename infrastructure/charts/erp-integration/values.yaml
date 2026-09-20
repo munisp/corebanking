@@ -52,4 +52,4 @@ secrets:
   PORT_BASE: "9750"
   PORT: "9751"
   SERVICE_GROUP: erp-integration
-  SERVICES: "erpnext-bridge-go,erpnext-integration-service,erpnext-sync-py"
+  SERVICES: "erpnext-bridge-go,erpnext-integration-service"
