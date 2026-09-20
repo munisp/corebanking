@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -610,6 +613,93 @@ func fetchDisbursementSchedule(applicationID string) []DisbursementEntry {
 	return schedule
 }
 
+// LN-12 (L13): atomic disbursement claim. Exactly one concurrent request can
+// transition a disbursement entry from a claimable state to 'disbursing';
+// the double-disbursement race is closed at the DB before any money moves.
+// Returns (nil, nil) when the entry is not claimable (already disbursing,
+// disbursed, cancelled, or not found).
+func claimDisbursementForProcessing(disbursementID, applicationID string) (*DisbursementEntry, error) {
+	if db == nil {
+		return nil, fmt.Errorf("database unavailable: cannot claim disbursement %s", disbursementID)
+	}
+
+	query := `UPDATE education_loan_disbursements
+		SET status = 'disbursing'
+		WHERE id = $1 AND application_id = $2 AND status IN ('scheduled', 'pending_verification', 'disbursement_pending')
+		RETURNING id, application_id, semester, academic_year, scheduled_date, disbursed_date,
+			tuition_amount, accommodation_amount, other_amount, total_amount, status,
+			institution_account_id, student_account_id, transaction_reference, ledger_transaction_id`
+
+	d := &DisbursementEntry{}
+	err := db.QueryRow(query, disbursementID, applicationID).Scan(
+		&d.ID, &d.ApplicationID, &d.Semester, &d.AcademicYear, &d.ScheduledDate, &d.DisbursedDate,
+		&d.TuitionAmount, &d.AccommodationAmount, &d.OtherAmount, &d.TotalAmount, &d.Status,
+		&d.InstitutionAccountID, &d.StudentAccountID, &d.TransactionReference, &d.LedgerTransactionID,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// releaseDisbursementClaim rolls a claimed entry back to its pre-claim state
+// after a failure whose side effects were fully compensated.
+func releaseDisbursementClaim(disbursementID string) error {
+	if db == nil {
+		return fmt.Errorf("database unavailable")
+	}
+	_, err := db.Exec(`UPDATE education_loan_disbursements SET status = 'scheduled' WHERE id = $1 AND status = 'disbursing'`, disbursementID)
+	return err
+}
+
+// markDisbursementCompensationFailed marks an entry whose compensation
+// itself failed — manual reconciliation required; never silent.
+func markDisbursementCompensationFailed(disbursementID string) error {
+	if db == nil {
+		return fmt.Errorf("database unavailable")
+	}
+	_, err := db.Exec(`UPDATE education_loan_disbursements SET status = 'compensation_failed' WHERE id = $1`, disbursementID)
+	return err
+}
+
+// updatePaymentLedgerStatus persists the outcome of a payment attempt.
+func updatePaymentLedgerStatus(paymentID, status, ledgerTxID string) error {
+	if db == nil {
+		return fmt.Errorf("database unavailable")
+	}
+	_, err := db.Exec(`UPDATE education_loan_payments SET status = $1, ledger_transaction_id = $2 WHERE id = $3`, status, ledgerTxID, paymentID)
+	return err
+}
+
+// fetchOutstandingBalance reads the persisted outstanding balance for a loan.
+func fetchOutstandingBalance(loanID, tenantID string) (float64, error) {
+	if db == nil {
+		return 0, fmt.Errorf("database unavailable")
+	}
+	var balance float64
+	err := db.QueryRow(`SELECT outstanding_balance FROM education_loan_applications WHERE id = $1 AND tenant_id = $2`, loanID, tenantID).Scan(&balance)
+	return balance, err
+}
+
+// updateOutstandingBalanceAndStatus persists the post-payment balance and,
+// when fully repaid, the settled status.
+func updateOutstandingBalanceAndStatus(loanID, tenantID string, newBalance float64, settled bool) error {
+	if db == nil {
+		return fmt.Errorf("database unavailable")
+	}
+	if settled {
+		_, err := db.Exec(`UPDATE education_loan_applications SET outstanding_balance = $1, status = $2, updated_at = $3 WHERE id = $4 AND tenant_id = $5`,
+			newBalance, string(StatusSettled), time.Now(), loanID, tenantID)
+		return err
+	}
+	_, err := db.Exec(`UPDATE education_loan_applications SET outstanding_balance = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4`,
+		newBalance, time.Now(), loanID, tenantID)
+	return err
+}
+
 func saveDisbursementDetails(app *EducationLoanApplication, disbursement *DisbursementEntry) error {
 	if db == nil {
 		return nil
@@ -963,12 +1053,59 @@ func verifyAdmissionWithInstitution(institutionID, admissionNumber string) *Veri
 	}
 }
 
+// LN-15 (L16): real guarantor identity verification against
+// bvn-nin-verification-go (BVN_NIN_URL). FAIL-CLOSED: any provider error or
+// unreachable service yields Verified=false — the unconditional
+// Verified:true simulation is removed.
 func verifyGuarantorDetails(guarantor *Guarantor) *VerificationResult {
-	// Simulated guarantor verification
-	return &VerificationResult{
-		Verified: true,
-		Message:  "Guarantor verified",
+	base := os.Getenv("BVN_NIN_URL")
+	if base == "" {
+		base = "http://bvn-nin-verification-go:8080"
 	}
+
+	verify := func(path, idKey, idValue string) (bool, string) {
+		if idValue == "" {
+			return false, "no " + idKey + " supplied"
+		}
+		payload, _ := json.Marshal(map[string]string{idKey: idValue, "customerId": guarantor.ID})
+		client := &http.Client{Timeout: 8 * time.Second}
+		req, err := http.NewRequest("POST", base+path, bytes.NewReader(payload))
+		if err != nil {
+			return false, err.Error()
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			return false, "verification provider unreachable: " + err.Error()
+		}
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusOK {
+			return false, fmt.Sprintf("verification provider error: status %d", resp.StatusCode)
+		}
+		var result struct {
+			Verified bool `json:"verified"`
+		}
+		if err := json.Unmarshal(body, &result); err != nil {
+			return false, "verification provider returned undecodable response"
+		}
+		if !result.Verified {
+			return false, idKey + " not verified"
+		}
+		return true, ""
+	}
+
+	bvnOK, bvnMsg := verify("/api/bvn/verify", "bvn", guarantor.BVN)
+	if !bvnOK {
+		return &VerificationResult{Verified: false, Message: "guarantor BVN verification failed: " + bvnMsg}
+	}
+	if guarantor.NIN != "" {
+		ninOK, ninMsg := verify("/api/nin/verify", "nin", guarantor.NIN)
+		if !ninOK {
+			return &VerificationResult{Verified: false, Message: "guarantor NIN verification failed: " + ninMsg}
+		}
+	}
+	return &VerificationResult{Verified: true, Message: "Guarantor verified"}
 }
 
 func validateApplicationForSubmission(app *EducationLoanApplication) error {
@@ -1085,4 +1222,62 @@ func generateEducationLoanOffer(app *EducationLoanApplication) map[string]interf
 		"valid_until":  time.Now().AddDate(0, 0, 30),
 		"generated_at": time.Now(),
 	}
+}
+
+// LN-09 (L10): education book -> ifrs9_exposures feed (table read by
+// ifrs9-ecl-engine-rs src/main.rs:114-125). dpd derives from the repayment
+// start date and the outstanding balance; stage 90+ -> 3, 30+ -> 2, else 1.
+func writeEducationIFRS9Exposures(now time.Time) {
+	if db == nil {
+		return
+	}
+	rows, err := db.Query(`
+		SELECT id, tenant_id, student_name, loan_type, approved_amount, outstanding_balance, repayment_start_date
+		FROM education_loan_applications
+		WHERE status IN ('fully_disbursed', 'partially_disbursed', 'repayment_active', 'in_arrears', 'default', 'written_off')`)
+	if err != nil {
+		log.Printf("WARN: education ifrs9 query failed: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id, tenantID, name, loanType string
+		var approved, outstanding float64
+		var repayStart *time.Time
+		if err := rows.Scan(&id, &tenantID, &name, &loanType, &approved, &outstanding, &repayStart); err != nil {
+			continue
+		}
+		dpd := 0
+		if repayStart != nil && outstanding > 0 && now.After(*repayStart) {
+			dpd = int(now.Sub(*repayStart).Hours() / 24)
+		}
+		stage := 1
+		if dpd > 90 {
+			stage = 3
+		} else if dpd > 30 {
+			stage = 2
+		}
+		if _, err := db.Exec(`
+			INSERT INTO ifrs9_exposures (id, customer_name, product_type, outstanding_balance_kobo, original_amount_kobo,
+				days_past_due, stage, pd_12m, lgd, collateral_value_kobo, ecl_12m_kobo, ecl_lifetime_kobo, ecl_kobo)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 0, 0, 0, 0, 0)
+			ON CONFLICT (id) DO UPDATE SET outstanding_balance_kobo = EXCLUDED.outstanding_balance_kobo,
+				days_past_due = EXCLUDED.days_past_due, stage = EXCLUDED.stage`,
+			"education:"+id, name, loanType, int64(outstanding*100), int64(approved*100), dpd, stage); err != nil {
+			log.Printf("WARN: education ifrs9 upsert failed for loan %s: %v", id, err)
+		}
+	}
+}
+
+// startEducationIFRS9Sweeper runs the exposure feed nightly (LN-09).
+func startEducationIFRS9Sweeper() {
+	go func() {
+		writeEducationIFRS9Exposures(time.Now())
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		for t := range ticker.C {
+			writeEducationIFRS9Exposures(t)
+		}
+	}()
 }

@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"shared/otel/go/otelkit"
 )
 
 type POSTerminal struct {
@@ -287,6 +289,17 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), "pos-terminal-go")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startJWKSRefresh()
 
 	mux := http.NewServeMux()
@@ -420,7 +433,7 @@ func main() {
 	// Wrap mux with CORS middleware
 	handler := corsMiddleware(mux)
 
-	if err := http.ListenAndServe(addr, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(handler)))); err != nil {
+	if err := http.ListenAndServe(addr, otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(handler))))); err != nil {
 		fmt.Fprintf(os.Stderr, "server error: %v\n", err)
 		os.Exit(1)
 	}

@@ -1,19 +1,24 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
+	"io"
 	"log"
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -112,6 +117,14 @@ func initDatabase(ctx context.Context, db *pgxpool.Pool) error {
 		CREATE INDEX IF NOT EXISTS idx_salary_instructions_bank_id ON salary_instructions(bank_id);
 		CREATE INDEX IF NOT EXISTS idx_salary_instructions_batch ON salary_instructions(batch_id, bank_id);
 	`)
+	if err != nil {
+		return err
+	}
+	// MN-19: expand-migrate — leg_index maps an instruction to its leg inside
+	// the bulk-payments-rs batch (idempotency key sha256(batch_id|index)).
+	_, err = db.Exec(ctx, `
+		ALTER TABLE salary_instructions ADD COLUMN IF NOT EXISTS leg_index INTEGER;
+	`)
 	return err
 }
 
@@ -121,24 +134,24 @@ func respondJSON(w http.ResponseWriter, status int, data interface{}) {
 	json.NewEncoder(w).Encode(data)
 }
 
-func (s *SalaryService) healthz(w http.ResponseWriter, _ *http.Request) {
-	respondJSON(w, http.StatusOK, map[string]interface{}{
-		"status": "ok", "service": "salary-processing",
-		"middleware": map[string]interface{}{
-			"kafka":       map[string]interface{}{"status": "connected", "topics": []string{"salary_processing.events", "salary_processing.audit", "salary_processing.notifications"}},
-			"dapr":        map[string]interface{}{"status": "connected", "appId": "salary_processing-sidecar"},
-			"fluvio":      map[string]interface{}{"status": "connected", "topic": "salary_processing-stream"},
-			"temporal":    map[string]interface{}{"status": "connected", "namespace": "salary_processing"},
-			"postgres":    map[string]interface{}{"status": "connected", "database": "ndsep_db", "schema": "salary_processing"},
-			"keycloak":    map[string]interface{}{"status": "connected", "realm": "54bank"},
-			"permify":     map[string]interface{}{"status": "connected", "schema": "salary_processing_authz"},
-			"redis":       map[string]interface{}{"status": "connected", "prefix": "salary_processing:"},
-			"mojaloop":    map[string]interface{}{"status": "connected", "participant": "salary_processing"},
-			"opensearch":  map[string]interface{}{"status": "connected", "index": "salary_processing-*"},
-			"openappsec":  map[string]interface{}{"status": "connected", "policy": "salary_processing-protection"},
-			"apisix":      map[string]interface{}{"status": "connected", "upstream": "salary_processing"},
-			"tigerbeetle": map[string]interface{}{"status": "connected", "cluster": "54bank-ledger"},
-			"lakehouse":   map[string]interface{}{"status": "connected", "table": "salary_processing_iceberg"},
+// healthz (MN-19): reports ONLY real dependency checks. The previous version
+// fabricated "connected" claims for kafka/dapr/fluvio/temporal/permify/redis/
+// mojaloop/opensearch/openappsec/apisix/tigerbeetle/lakehouse — no clients for
+// any of those exist in this service. Deleted.
+func (s *SalaryService) healthz(w http.ResponseWriter, r *http.Request) {
+	pgErr := s.db.Ping(r.Context())
+	pg := "connected"
+	status := "ok"
+	code := http.StatusOK
+	if pgErr != nil {
+		pg = "unreachable: " + pgErr.Error()
+		status = "degraded"
+		code = http.StatusServiceUnavailable
+	}
+	respondJSON(w, code, map[string]interface{}{
+		"status": status, "service": "salary-processing",
+		"checks": map[string]interface{}{
+			"postgres": pg,
 		},
 	})
 }
@@ -278,6 +291,360 @@ func (s *SalaryService) instructionsHandler(w http.ResponseWriter, r *http.Reque
 		filtered = append(filtered, i)
 	}
 	respondJSON(w, http.StatusOK, map[string]interface{}{"items": filtered, "total": len(filtered)})
+}
+
+// ─── Batch execution through bulk-payments-rs (MN-19) ──────────────────────
+//
+// Previously this service had NO executor: batches/instructions were CRUD-only
+// and the status/fail_reason columns were never written. Now
+// POST /v1/salary/batches/{id}/execute runs the batch as a bulk-payments-rs
+// batch (the de-facto executor) with deterministic per-leg idempotency keys
+// sha256(batch_id|index), and POST /v1/salary/batches/{id}/retry re-runs ONLY
+// failed legs via bulk-payments-rs /retry-failed. Instruction status
+// transitions are durable: pending → sent → paid|failed (fail_reason set from
+// the rail's error).
+
+func bulkPaymentsURL() string {
+	if v := strings.TrimSpace(os.Getenv("BULK_PAYMENTS_URL")); v != "" {
+		return strings.TrimRight(v, "/")
+	}
+	return "http://bulk-payments-rs:8080"
+}
+
+// legIdempotencyKey must match bulk-payments-rs leg_idempotency_key():
+// sha256(batch_id|index) hex (MN-18/MN-19).
+func legIdempotencyKey(bulkBatchID string, index int) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%d", bulkBatchID, index)))
+	return hex.EncodeToString(sum[:])
+}
+
+func (s *SalaryService) batchActionHandler(w http.ResponseWriter, r *http.Request) {
+	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/salary/batches/"), "/")
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 || parts[0] == "" {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "unknown batch action; use /v1/salary/batches/{id}/execute|retry"})
+		return
+	}
+	switch parts[1] {
+	case "execute":
+		s.executeBatch(w, r, parts[0])
+	case "retry":
+		s.retryBatch(w, r, parts[0])
+	default:
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "unknown batch action; use execute|retry"})
+	}
+}
+
+// bulkRequest issues an authenticated request to bulk-payments-rs, passing
+// the caller's JWT and tenant/maker-checker headers through.
+func bulkRequest(r *http.Request, method, url string, body interface{}) (int, []byte, error) {
+	var rdr io.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		rdr = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), method, url, rdr)
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// Pass through the caller's credentials — bulk-payments-rs verifies JWT
+	// fail-closed and forwards auth/tenant headers to the payment hub.
+	if v := r.Header.Get("Authorization"); v != "" {
+		req.Header.Set("Authorization", v)
+	}
+	for _, h := range []string{"x-tenant-id", "x-keycloak-id", "x-ledger-id", "x-mint-account-id", "x-switch-name", "x-ams-name", "x-maker-checker-approval-id"} {
+		if v := r.Header.Get(h); v != "" {
+			req.Header.Set(h, v)
+		}
+	}
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	return resp.StatusCode, b, nil
+}
+
+func (s *SalaryService) executeBatch(w http.ResponseWriter, r *http.Request, batchID string) {
+	if r.Method != http.MethodPost {
+		respondJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	tid := tenantID(r)
+	if tid == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "x-tenant-id header required"})
+		return
+	}
+	ctx := r.Context()
+
+	var status, companyID, payrollMonth string
+	err := s.db.QueryRow(ctx,
+		`SELECT status, company_id, payroll_month FROM salary_batches WHERE id=$1 AND bank_id=$2`,
+		batchID, tid).Scan(&status, &companyID, &payrollMonth)
+	if err == pgx.ErrNoRows {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "batch not found"})
+		return
+	}
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if status == "processing" {
+		respondJSON(w, http.StatusConflict, map[string]string{"error": "batch execution already in flight"})
+		return
+	}
+	if status == "completed" {
+		respondJSON(w, http.StatusConflict, map[string]string{"error": "batch already fully executed; use retry for failed instructions"})
+		return
+	}
+
+	// Load pending instructions in deterministic order — the row position IS
+	// the leg index used in the bulk idempotency key.
+	type instr struct {
+		id, employeeName, accountNo, bankCode string
+		netPay                                float64
+	}
+	rows, err := s.db.Query(ctx, `
+		SELECT id, employee_name, account_no, bank_code, net_pay
+		FROM salary_instructions WHERE batch_id=$1 AND bank_id=$2 AND status='pending'
+		ORDER BY id`, batchID, tid)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	var instructions []instr
+	for rows.Next() {
+		var i instr
+		if err := rows.Scan(&i.id, &i.employeeName, &i.accountNo, &i.bankCode, &i.netPay); err == nil {
+			instructions = append(instructions, i)
+		}
+	}
+	rows.Close()
+	if len(instructions) == 0 {
+		respondJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "no pending instructions in this batch; use /retry to re-run failed instructions"})
+		return
+	}
+
+	// Assign durable leg indexes (execute runs only on pending instructions,
+	// so this is the first and only assignment).
+	for i, ins := range instructions {
+		if _, err := s.db.Exec(ctx,
+			`UPDATE salary_instructions SET leg_index=$3 WHERE id=$1 AND bank_id=$2`,
+			ins.id, tid, i); err != nil {
+			respondJSON(w, http.StatusInternalServerError, map[string]string{"error": "leg index assignment failed: " + err.Error()})
+			return
+		}
+	}
+
+	// bulk-payments-rs batch id is namespaced by tenant+batch because salary
+	// batch ids (SAL-001, …) are only unique per bank.
+	bulkBatchID := fmt.Sprintf("salary-%s-%s", tid, batchID)
+
+	// Durable transition pending→sent + batch→processing, one tx.
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`UPDATE salary_instructions SET status='sent' WHERE batch_id=$1 AND bank_id=$2 AND status='pending'`,
+		batchID, tid); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE salary_batches SET status='processing' WHERE id=$1 AND bank_id=$2`,
+		batchID, tid); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Build the bulk transfer legs. The source account is the employer's
+	// settlement account (env SALARY_SOURCE_ACCOUNT_ID, falling back to the
+	// batch company id); the rail validates/executes the actual movement.
+	sourceAccount := strings.TrimSpace(os.Getenv("SALARY_SOURCE_ACCOUNT_ID"))
+	if sourceAccount == "" {
+		sourceAccount = companyID
+	}
+	transfers := make([]map[string]interface{}, 0, len(instructions))
+	for _, ins := range instructions {
+		transfers = append(transfers, map[string]interface{}{
+			"switch_name":   "vfd",
+			"fromAccountId": sourceAccount,
+			"toAccount": map[string]string{
+				"number": ins.accountNo,
+				"id":     ins.accountNo,
+				"name":   ins.employeeName,
+				"status": "active",
+			},
+			"toBank": ins.bankCode,
+			"amount": strconv.FormatFloat(ins.netPay, 'f', 2, 64),
+			"remark": fmt.Sprintf("Salary %s — %s", payrollMonth, ins.employeeName),
+		})
+	}
+
+	code, body, err := bulkRequest(r, http.MethodPost, bulkPaymentsURL()+"/v1/bulk-payments",
+		map[string]interface{}{"batch_id": bulkBatchID, "transfers": transfers})
+	if err != nil {
+		// Execution state at the rail is UNKNOWN — do not guess paid/failed.
+		// Batch stays 'processing'; /retry reconciles from persisted leg state.
+		respondJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"error": "bulk_rail_unreachable", "detail": err.Error(),
+			"note": "batch left in 'processing'; POST /v1/salary/batches/" + batchID + "/retry reconciles from persisted leg state",
+		})
+		return
+	}
+	if code == http.StatusForbidden {
+		// bulk-payments-rs maker-checker gate (MN-18): revert to pre-execution
+		// state so the batch can be executed again once an approval id exists.
+		s.db.Exec(ctx, `UPDATE salary_instructions SET status='pending' WHERE batch_id=$1 AND bank_id=$2 AND status='sent'`, batchID, tid)
+		s.db.Exec(ctx, `UPDATE salary_batches SET status='pending_approval' WHERE id=$1 AND bank_id=$2`, batchID, tid)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write(body)
+		return
+	}
+	if code != http.StatusOK {
+		respondJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"error": "bulk_rail_error", "httpStatus": code, "body": string(body),
+			"note": "batch left in 'processing'; POST /v1/salary/batches/" + batchID + "/retry reconciles from persisted leg state",
+		})
+		return
+	}
+
+	// Reconcile instruction/batch state from the PERSISTED bulk batch (not
+	// the ephemeral response) — the durable legs are the source of truth.
+	rec, recErr := s.reconcileFromBulk(r, tid, batchID, bulkBatchID)
+	if recErr != nil {
+		respondJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"error": "reconcile_failed", "detail": recErr.Error(),
+			"note": "legs executed at rail; retry /v1/salary/batches/" + batchID + "/retry to reconcile",
+		})
+		return
+	}
+	respondJSON(w, http.StatusOK, rec)
+}
+
+// retryBatch re-runs ONLY failed instructions: bulk-payments-rs
+// /retry-failed re-executes legs persisted as failed (never succeeded ones),
+// then instruction/batch state is reconciled from the persisted legs.
+func (s *SalaryService) retryBatch(w http.ResponseWriter, r *http.Request, batchID string) {
+	if r.Method != http.MethodPost {
+		respondJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	tid := tenantID(r)
+	if tid == "" {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "x-tenant-id header required"})
+		return
+	}
+	var status string
+	err := s.db.QueryRow(r.Context(),
+		`SELECT status FROM salary_batches WHERE id=$1 AND bank_id=$2`, batchID, tid).Scan(&status)
+	if err == pgx.ErrNoRows {
+		respondJSON(w, http.StatusNotFound, map[string]string{"error": "batch not found"})
+		return
+	}
+	if err != nil {
+		respondJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+
+	bulkBatchID := fmt.Sprintf("salary-%s-%s", tid, batchID)
+	code, body, err := bulkRequest(r, http.MethodPost,
+		fmt.Sprintf("%s/v1/bulk-payments/%s/retry-failed", bulkPaymentsURL(), bulkBatchID),
+		map[string]interface{}{})
+	if err != nil {
+		respondJSON(w, http.StatusBadGateway, map[string]string{"error": "bulk_rail_unreachable", "detail": err.Error()})
+		return
+	}
+	if code == http.StatusNotFound {
+		respondJSON(w, http.StatusBadRequest, map[string]string{"error": "batch has no rail execution to retry; use /execute first"})
+		return
+	}
+	if code != http.StatusOK {
+		respondJSON(w, http.StatusBadGateway, map[string]interface{}{
+			"error": "bulk_rail_error", "httpStatus": code, "body": string(body)})
+		return
+	}
+
+	rec, recErr := s.reconcileFromBulk(r, tid, batchID, bulkBatchID)
+	if recErr != nil {
+		respondJSON(w, http.StatusBadGateway, map[string]string{"error": "reconcile_failed", "detail": recErr.Error()})
+		return
+	}
+	respondJSON(w, http.StatusOK, rec)
+}
+
+// reconcileFromBulk reads the persisted bulk batch (legs included) and writes
+// durable instruction transitions sent→paid|failed plus the batch summary.
+func (s *SalaryService) reconcileFromBulk(r *http.Request, tid, batchID, bulkBatchID string) (map[string]interface{}, error) {
+	code, body, err := bulkRequest(r, http.MethodGet,
+		fmt.Sprintf("%s/v1/bulk-payments/%s", bulkPaymentsURL(), bulkBatchID), nil)
+	if err != nil {
+		return nil, fmt.Errorf("bulk batch read failed: %w", err)
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("bulk batch read HTTP %d: %s", code, string(body))
+	}
+	var batch struct {
+		Status    string `json:"status"`
+		Succeeded int    `json:"succeeded"`
+		Failed    int    `json:"failed"`
+		Legs      []struct {
+			Index  int    `json:"index"`
+			Status string `json:"status"`
+			Error  string `json:"error"`
+		} `json:"legs"`
+	}
+	if err := json.Unmarshal(body, &batch); err != nil {
+		return nil, fmt.Errorf("bulk batch response unparseable: %w", err)
+	}
+
+	ctx := r.Context()
+	for _, leg := range batch.Legs {
+		newStatus := ""
+		failReason := ""
+		switch leg.Status {
+		case "success":
+			newStatus = "paid"
+		case "failed":
+			newStatus = "failed"
+			failReason = leg.Error
+		default:
+			continue // still pending at the rail — leave as 'sent'
+		}
+		if _, err := s.db.Exec(ctx,
+			`UPDATE salary_instructions SET status=$1, fail_reason=$2
+			 WHERE batch_id=$3 AND bank_id=$4 AND leg_index=$5`,
+			newStatus, failReason, batchID, tid, leg.Index); err != nil {
+			return nil, fmt.Errorf("instruction status update failed: %w", err)
+		}
+	}
+
+	if _, err := s.db.Exec(ctx, `
+		UPDATE salary_batches SET status=$1, success_count=$2, failed_count=$3, processed_at=NOW()
+		WHERE id=$4 AND bank_id=$5`,
+		batch.Status, batch.Succeeded, batch.Failed, batchID, tid); err != nil {
+		return nil, fmt.Errorf("batch summary update failed: %w", err)
+	}
+
+	return map[string]interface{}{
+		"batchId":     batchID,
+		"status":      batch.Status,
+		"succeeded":   batch.Succeeded,
+		"failed":      batch.Failed,
+		"bulkBatchId": bulkBatchID,
+	}, nil
 }
 
 func (s *SalaryService) statsHandler(w http.ResponseWriter, r *http.Request) {
@@ -527,6 +894,7 @@ func main() {
 	mux.HandleFunc("/readyz", readyzHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/v1/salary/batches", svc.batchesHandler)
+	mux.HandleFunc("/v1/salary/batches/", svc.batchActionHandler) // MN-19: {id}/execute, {id}/retry
 	mux.HandleFunc("/v1/salary/instructions", svc.instructionsHandler)
 	mux.HandleFunc("/v1/salary/stats", svc.statsHandler)
 

@@ -1,0 +1,141 @@
+# =============================================================================
+# open-appsec → Loki forwarding via Vector
+#
+# HONEST SCOPE: open-appsec (Check Point nano agent) has NO OpenTelemetry
+# trace/metrics support (verified-static as of this wave: no OTel exporter in
+# the agent's logging model; re-check against the deployed agent version).
+# Integration is therefore LOG/ALERT forwarding only:
+#
+#   open-appsec agent ──(security events: syslog/CEF or JSON over TCP/UDP)──►
+#   Vector (this ConfigMap) ──► Loki (labelled stream) ──► Grafana alert rules
+#
+# The agent side is configured in its own policy/local management to log to
+# syslog target vector-openappsec.observability.svc.cluster.local:5514.
+# No secrets.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-openappsec
+  namespace: observability
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+    observability.corebanking/component: openappsec-forwarder
+data:
+  vector.yaml: |
+    data_dir: /var/lib/vector
+    api:
+      enabled: false
+
+    sources:
+      # open-appsec nano agent security-event log stream (CEF/JSON over syslog)
+      openappsec_syslog_tcp:
+        type: syslog
+        address: 0.0.0.0:5514
+        mode: tcp
+        max_length: 102400
+      openappsec_syslog_udp:
+        type: syslog
+        address: 0.0.0.0:5514
+        mode: udp
+        max_length: 102400
+
+    transforms:
+      normalize:
+        type: remap
+        inputs: [openappsec_syslog_tcp, openappsec_syslog_udp]
+        source: |
+          # Tag the stream; keep the raw message for Loki. If the agent emits
+          # JSON, parse it so severity/action become Loki labels.
+          .service = "openappsec"
+          .service_namespace = "corebanking"
+          parsed, err = parse_json(.message)
+          if err == null {
+            . = merge(., parsed)
+          }
+          # Normalize severity for Grafana alert queries
+          .severity = downcase(to_string(.severity) ?? to_string(.log_level) ?? "info")
+          # Tenant attribution if the agent event carries it (best effort —
+          # open-appsec events usually have no tenant field; SPEC §2.3 applies
+          # to kits, this is log-only)
+          if exists(.tenant_id) { .tenant_id = to_string(.tenant_id) }
+
+    sinks:
+      loki:
+        type: loki
+        inputs: [normalize]
+        endpoint: http://loki.observability.svc.cluster.local:3100
+        encoding:
+          codec: json
+        labels:
+          service: openappsec
+          namespace: corebanking
+          severity: "{{ severity }}"
+          tenant_id: "{{ tenant_id }}"
+        out_of_order_action: accept
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vector-openappsec
+  namespace: observability
+  labels:
+    app: vector-openappsec
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vector-openappsec
+  template:
+    metadata:
+      labels:
+        app: vector-openappsec
+    spec:
+      containers:
+        - name: vector
+          image: timberio/vector:0.37.0-debian   # pin per policy before deploy
+          ports:
+            - containerPort: 5514
+              name: syslog-tcp
+              protocol: TCP
+            - containerPort: 5514
+              name: syslog-udp
+              protocol: UDP
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector/vector.yaml
+              subPath: vector.yaml
+            - name: data
+              mountPath: /var/lib/vector
+          readinessProbe:
+            exec:
+              command: ["vector", "healthcheck"]
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+      volumes:
+        - name: config
+          configMap:
+            name: vector-openappsec
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vector-openappsec
+  namespace: observability
+  labels:
+    observability.corebanking/component: openappsec-forwarder
+spec:
+  selector:
+    app: vector-openappsec
+  ports:
+    - name: syslog-tcp
+      port: 5514
+      protocol: TCP
+    - name: syslog-udp
+      port: 5514
+      protocol: UDP

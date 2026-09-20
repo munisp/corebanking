@@ -76,7 +76,7 @@ spec:
               memory: 32Mi
       containers:
         - name: virtual-accounts-go
-          image: ghcr.io/54bank/virtual-accounts-go:latest
+          image: ghcr.io/54bank/virtual-accounts-go:v1.0.0  # PL-16: :latest banned — pinned release tag; replace with the signed image digest at deploy time. (~460 remaining manifests still on :latest — fleet-wide pin is follow-up)
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080

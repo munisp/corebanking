@@ -27,6 +27,8 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"shared/otel/go/otelkit"
 )
 
 // ─── shared helpers ─────────────────────────────────────────────────────────────
@@ -815,11 +817,24 @@ func tenantFromClaims(claims map[string]interface{}) string {
 
 func main() {
 	port := getEnv("PORT", "9141")
+
+	shutdown, oerr := otelkit.Init(context.Background(), "omini-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
+
 	srv := newServer()
 
 	httpSrv := &http.Server{
 		Addr:         ":" + port,
-		Handler:      jwtAuthMiddleware(srv.router),
+		Handler:      otelkit.HTTPMiddleware(jwtAuthMiddleware(srv.router)),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 	}

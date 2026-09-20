@@ -73,6 +73,11 @@ spec:
                 name: 54link-shared-infrastructure-svc-secret
             - secretRef:
                 name: 54link-shared-app-svc-secret
+            # AU-01 (F15-1): shared audit ingest credential (AUDIT_INGEST_TOKEN)
+            # and CP-07 export key (AUDIT_EXPORT_SECRET) for audit shipping/verification.
+            - secretRef:
+                name: audit-ingest-credentials
+                optional: true
             - secretRef:
                 name: {{ include "workflow-reporting.fullname" . }}-secrets
           {{- with .Values.resources }}

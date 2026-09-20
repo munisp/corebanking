@@ -9,7 +9,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"os"
@@ -23,6 +25,9 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
+
+	"go.opentelemetry.io/otel/attribute"
+	"shared/otel/go/otelkit"
 )
 
 var (
@@ -259,10 +264,31 @@ func main() {
 	log.Println("WARNING: loan-service is DEPRECATED — migrate to loan-origination-go")
 	godotenv.Load()
 
+	shutdown, oerr := otelkit.Init(context.Background(), "loan-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	if err := initDatabase(); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	defer db.Close()
+
+	// LN-03 (L3): PAYMENT_URL is required at boot — fail fast rather than
+	// 500 on every disbursement (w8:F1-14).
+	if err := InitPaymentConfig(); err != nil {
+		log.Fatalf("%v", err)
+	}
+
+	// LN-03 (L3): COA journal outbox retry worker (persist + retry, not
+	// fire-and-forget PostAsync).
+	startCoAOutboxWorker()
 
 	engine = NewCreditDecisionEngine()
 	coaClient = NewCoAClient()
@@ -277,6 +303,7 @@ func main() {
 	}
 
 	router := gin.Default()
+	router.Use(otelkit.GinMiddleware())
 	router.Use(jwtAuthMiddleware())
 	router.Use(corsMiddleware())
 	router.Use(loggingMiddleware())
@@ -362,6 +389,67 @@ func createTables() error {
 
 		-- Index for transaction lookups
 		CREATE INDEX IF NOT EXISTS idx_payment_transaction ON loan_payments (transaction_id);
+
+		-- LN-02 (L2): stored credit evaluations — approval requires a stored
+		-- passing evaluation, not an advisory recomputation.
+		CREATE TABLE IF NOT EXISTS loan_evaluations (
+			id SERIAL PRIMARY KEY,
+			loan_application_id VARCHAR(50) NOT NULL REFERENCES loan_applications(loan_application_id) ON DELETE CASCADE,
+			tenant_id VARCHAR(50) NOT NULL,
+			decision VARCHAR(20) NOT NULL,
+			risk_score NUMERIC(6, 4),
+			approved_amount NUMERIC(15, 2),
+			approved_term INT,
+			interest_rate NUMERIC(15, 2),
+			decline_reasons TEXT,
+			evaluated_by VARCHAR(100),
+			evaluated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+
+		-- LN-04 (L4): persisted amortized repayment schedule. Collections and
+		-- completion are driven from these installment rows — not from a
+		-- divergent flat-interest formula.
+		CREATE TABLE IF NOT EXISTS loan_schedule (
+			id SERIAL PRIMARY KEY,
+			loan_application_id VARCHAR(50) NOT NULL REFERENCES loan_applications(loan_application_id) ON DELETE CASCADE,
+			tenant_id VARCHAR(50) NOT NULL,
+			installment_number INT NOT NULL,
+			due_date TIMESTAMP NOT NULL,
+			principal_amount NUMERIC(15, 2) NOT NULL,
+			interest_amount NUMERIC(15, 2) NOT NULL,
+			total_amount NUMERIC(15, 2) NOT NULL,
+			remaining_balance NUMERIC(15, 2) NOT NULL,
+			status VARCHAR(20) NOT NULL DEFAULT 'pending',
+			paid_amount NUMERIC(15, 2) NOT NULL DEFAULT 0,
+			paid_at TIMESTAMP,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE (loan_application_id, installment_number)
+		);
+
+		-- LN-03 (L3): COA journal outbox — entries are persisted before the
+		-- money path completes and retried by a background worker.
+		CREATE TABLE IF NOT EXISTS coa_outbox (
+			id SERIAL PRIMARY KEY,
+			tenant_id VARCHAR(50) NOT NULL,
+			user_id VARCHAR(100),
+			user_role VARCHAR(100),
+			entry_json JSONB NOT NULL,
+			status VARCHAR(20) NOT NULL DEFAULT 'pending',
+			attempts INT NOT NULL DEFAULT 0,
+			last_error TEXT,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			posted_at TIMESTAMP
+		);
+
+		-- LN-02 (L2): approver identity + maker-checker reference columns.
+		ALTER TABLE loan_applications ADD COLUMN IF NOT EXISTS approved_by VARCHAR(100);
+		ALTER TABLE loan_applications ADD COLUMN IF NOT EXISTS approved_at TIMESTAMP;
+		ALTER TABLE loan_applications ADD COLUMN IF NOT EXISTS declined_by VARCHAR(100);
+		ALTER TABLE loan_applications ADD COLUMN IF NOT EXISTS maker_checker_approval_id VARCHAR(100);
+
+		-- LN-09 (L10): delinquency aging columns maintained by the sweeper.
+		ALTER TABLE loan_applications ADD COLUMN IF NOT EXISTS days_past_due INT NOT NULL DEFAULT 0;
+		ALTER TABLE loan_applications ADD COLUMN IF NOT EXISTS aging_bucket VARCHAR(10) NOT NULL DEFAULT 'current';
 	`
 
 	_, err := db.Exec(schema)
@@ -384,7 +472,7 @@ func initDatabase() error {
 	}
 
 	var err error
-	db, err = sql.Open("postgres", connStr)
+	db, err = otelkit.OpenSQLDB("postgres", connStr)
 	if err != nil {
 		log.Fatal("Failed to connect to database:", err)
 	}
@@ -552,8 +640,37 @@ func healthCheck(c *gin.Context) {
 }
 
 func createLoanApplication(c *gin.Context) {
+	// LN-01 (L1): credit_score, bvn_verified and nin_verified are
+	// SERVER-SOURCED attributes. A client that supplies them is rejected
+	// outright; they are fetched from bvn-nin-verification-go and
+	// credit-service by applicant id. If the verification providers are
+	// unreachable the request fails closed (503).
+	rawBody, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		SendErrorGin(c, "validation_failed", "failed to read request body", 400)
+		return
+	}
+
+	var probe struct {
+		CreditScore *int   `json:"credit_score"`
+		BVNVerified *bool  `json:"bvn_verified"`
+		NINVerified *bool  `json:"nin_verified"`
+		BVN         string `json:"bvn"`
+		NIN         string `json:"nin"`
+	}
+	if err := json.Unmarshal(rawBody, &probe); err != nil {
+		SendErrorGin(c, "validation_failed", err.Error(), 400)
+		return
+	}
+	if probe.CreditScore != nil || probe.BVNVerified != nil || probe.NINVerified != nil {
+		SendErrorGin(c, "validation_failed",
+			"credit_score, bvn_verified and nin_verified are server-sourced and must not be supplied by the client",
+			400)
+		return
+	}
+
 	var application LoanApplication
-	if err := c.ShouldBindJSON(&application); err != nil {
+	if err := json.Unmarshal(rawBody, &application); err != nil {
 		SendErrorGin(c, "validation_failed", err.Error(), 400)
 		return
 	}
@@ -567,6 +684,25 @@ func createLoanApplication(c *gin.Context) {
 		application.LoanType = "general"
 	}
 
+	// Server-side identity verification (fail-closed).
+	bvnVerified, ninVerified, err := fetchApplicantVerification(application.TenantID, application.ApplicantID, probe.BVN, probe.NIN)
+	if err != nil {
+		log.Printf("ERROR: identity verification unavailable for applicant %s: %v", application.ApplicantID, err)
+		SendErrorGin(c, "service_unavailable", "identity verification service unavailable — application not accepted", 503)
+		return
+	}
+	application.BVNVerified = bvnVerified
+	application.NINVerified = ninVerified
+
+	// Server-side credit score (fail-closed).
+	creditScore, err := fetchApplicantCreditScore(application.TenantID, &application)
+	if err != nil {
+		log.Printf("ERROR: credit scoring unavailable for applicant %s: %v", application.ApplicantID, err)
+		SendErrorGin(c, "service_unavailable", "credit scoring service unavailable — application not accepted", 503)
+		return
+	}
+	application.CreditScore = creditScore
+
 	query := `
 		INSERT INTO loan_applications (loan_application_id, tenant_id, applicant_id, loan_amount, loan_purpose, loan_type,
 			requested_term, monthly_income, existing_debt, collateral_value, credit_score,
@@ -575,7 +711,7 @@ func createLoanApplication(c *gin.Context) {
 		RETURNING id
 	`
 
-	err := db.QueryRow(query, application.LoanApplicationID, application.TenantID, application.ApplicantID, application.LoanAmount, application.LoanPurpose, application.LoanType,
+	err = db.QueryRow(query, application.LoanApplicationID, application.TenantID, application.ApplicantID, application.LoanAmount, application.LoanPurpose, application.LoanType,
 		application.RequestedTerm, application.MonthlyIncome, application.ExistingDebt, application.CollateralValue, application.CreditScore,
 		application.EmploymentStatus, application.EmploymentDuration, application.BankStatementScore, application.BVNVerified, application.NINVerified, application.LoanInterestRatePercent).Scan(&application.ID)
 
@@ -850,39 +986,158 @@ func evaluateLoanApplication(c *gin.Context) {
 
 	decision := engine.EvaluateLoanApplication(&app)
 
+	// LN-02 (L2): persist the evaluation so approval can require a stored
+	// passing evaluation instead of re-running an advisory computation.
+	reasons := strings.Join(decision.DeclineReasons, "; ")
+	if _, err := db.Exec(`
+		INSERT INTO loan_evaluations (loan_application_id, tenant_id, decision, risk_score, approved_amount, approved_term, interest_rate, decline_reasons, evaluated_by)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+		app.LoanApplicationID, tenantID, decision.Decision, decision.RiskScore,
+		decision.ApprovedAmount, decision.ApprovedTerm, decision.InterestRate, reasons,
+		c.GetHeader("X-Keycloak-ID")); err != nil {
+		log.Println("Failed to persist evaluation:", err)
+		SendErrorGin(c, "internal_error", "Failed to store evaluation", 500)
+		return
+	}
+
+	// A terminal evaluation moves the application to a decision-driven state;
+	// approval is only possible from 'evaluated' with a stored APPROVED row.
+	switch decision.Decision {
+	case "APPROVED", "REFER":
+		if _, err := db.Exec(`UPDATE loan_applications SET status = 'evaluated', updated_at = $1 WHERE loan_application_id = $2 AND tenant_id = $3 AND status IN ('pending', 'under_review')`,
+			time.Now(), app.LoanApplicationID, tenantID); err != nil {
+			log.Println("Failed to update application status after evaluation:", err)
+		}
+	case "DECLINED":
+		if _, err := db.Exec(`UPDATE loan_applications SET status = 'declined', updated_at = $1 WHERE loan_application_id = $2 AND tenant_id = $3 AND status IN ('pending', 'under_review')`,
+			time.Now(), app.LoanApplicationID, tenantID); err != nil {
+			log.Println("Failed to update application status after evaluation:", err)
+		}
+	}
+
 	c.JSON(200, decision)
 }
 
+// LN-02 (L2): controlled approval. Preconditions: the application is in
+// 'evaluated' state with a STORED passing evaluation; the approver identity
+// comes from verified JWT claims (X-Keycloak-ID set by jwtAuthMiddleware),
+// never from the request body; amounts above LOAN_APPROVAL_THRESHOLD_KOBO
+// require a maker-checker approval id (x-maker-checker-approval-id header).
+// Terminal-state re-approval is rejected.
 func approveLoanApplication(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetHeader("X-Tenant-ID")
 
-	query := `UPDATE loan_applications SET status = 'approved' WHERE loan_application_id = $1 AND tenant_id = $2`
-	_, err := db.Exec(query, id, tenantID)
+	approverID := c.GetHeader("X-Keycloak-ID")
+	if approverID == "" {
+		SendErrorGin(c, "unauthenticated", "authenticated approver identity required", 401)
+		return
+	}
 
+	// Stored passing evaluation precondition.
+	var evalDecision string
+	err := db.QueryRow(`
+		SELECT decision FROM loan_evaluations
+		WHERE loan_application_id = $1 AND tenant_id = $2
+		ORDER BY evaluated_at DESC LIMIT 1`, id, tenantID).Scan(&evalDecision)
+	if err == sql.ErrNoRows {
+		SendErrorGin(c, "precondition_failed", "application has no stored evaluation — evaluate first", 412)
+		return
+	}
+	if err != nil {
+		SendErrorGin(c, "internal_error", "Failed to read evaluation", 500)
+		return
+	}
+	if evalDecision != "APPROVED" && evalDecision != "REFER" {
+		SendErrorGin(c, "precondition_failed", "latest stored evaluation did not pass — cannot approve", 412)
+		return
+	}
+
+	// Maker-checker for amounts above the configured threshold (kobo).
+	thresholdStr := GetEnv("LOAN_APPROVAL_THRESHOLD_KOBO", "")
+	if thresholdStr != "" {
+		threshold, terr := strconv.ParseInt(thresholdStr, 10, 64)
+		if terr != nil {
+			log.Printf("ERROR: LOAN_APPROVAL_THRESHOLD_KOBO=%q is not an integer", thresholdStr)
+			SendErrorGin(c, "internal_error", "approval threshold misconfigured", 500)
+			return
+		}
+		var amount float64
+		if err := db.QueryRow(`SELECT loan_amount FROM loan_applications WHERE loan_application_id = $1 AND tenant_id = $2`, id, tenantID).Scan(&amount); err != nil {
+			SendErrorGin(c, "not_found", "Application not found", 404)
+			return
+		}
+		if int64(amount*100) > threshold {
+			mcID := c.GetHeader("x-maker-checker-approval-id")
+			if mcID == "" {
+				SendErrorGin(c, "precondition_failed",
+					"amount exceeds LOAN_APPROVAL_THRESHOLD_KOBO — a maker-checker approval id (x-maker-checker-approval-id header) is required", 412)
+				return
+			}
+			if _, err := db.Exec(`UPDATE loan_applications SET maker_checker_approval_id = $1 WHERE loan_application_id = $2 AND tenant_id = $3`, mcID, id, tenantID); err != nil {
+				log.Println("Failed to persist maker-checker approval id:", err)
+			}
+		}
+	}
+
+	// Atomic state guard: only 'evaluated' can be approved (terminal states
+	// declined/disbursed/completed/written_off are rejected by no-row).
+	res, err := db.Exec(`
+		UPDATE loan_applications SET status = 'approved', approved_by = $1, approved_at = $2, updated_at = $2
+		WHERE loan_application_id = $3 AND tenant_id = $4 AND status = 'evaluated'`,
+		approverID, time.Now(), id, tenantID)
 	if err != nil {
 		SendErrorGin(c, "internal_error", "Failed to approve application", 500)
 		return
 	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		SendErrorGin(c, "conflict", "application is not in 'evaluated' state (already decided or terminal)", 409)
+		return
+	}
 
-	c.JSON(200, gin.H{"status": "approved"})
+	c.JSON(200, gin.H{"status": "approved", "approved_by": approverID})
 }
 
+// LN-02 (L2): decline is likewise guarded — only non-terminal states can be
+// declined, and the declining officer's identity is persisted from JWT claims.
 func declineLoanApplication(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetHeader("X-Tenant-ID")
 
-	query := `UPDATE loan_applications SET status = 'declined' WHERE loan_application_id = $1 AND tenant_id = $2`
-	_, err := db.Exec(query, id, tenantID)
+	declinedBy := c.GetHeader("X-Keycloak-ID")
+	if declinedBy == "" {
+		SendErrorGin(c, "unauthenticated", "authenticated officer identity required", 401)
+		return
+	}
 
+	res, err := db.Exec(`
+		UPDATE loan_applications SET status = 'declined', declined_by = $1, updated_at = $2
+		WHERE loan_application_id = $3 AND tenant_id = $4 AND status IN ('pending', 'under_review', 'evaluated')`,
+		declinedBy, time.Now(), id, tenantID)
 	if err != nil {
 		SendErrorGin(c, "internal_error", "Failed to decline application", 500)
 		return
 	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		SendErrorGin(c, "conflict", "application not found or already in a terminal state", 409)
+		return
+	}
 
-	c.JSON(200, gin.H{"status": "declined"})
+	c.JSON(200, gin.H{"status": "declined", "declined_by": declinedBy})
 }
 
+// LN-03 (L3): disbursement saga with an atomic claim.
+//  1. CLAIM (atomic): UPDATE ... SET status='disbursing' WHERE
+//     status='approved' RETURNING — the double-disbursement window
+//     (check-then-act on a non-locked read) is closed at the DB.
+//  2. The amount comes from the claimed record, never the request.
+//  3. The COA journal entry is ENQUEUED to the outbox before money moves
+//     (persist + retry, not fire-and-forget).
+//  4. FORWARD: real payment via the payment service.
+//  5. COMMIT: status='disbursed' + persisted amortized schedule (LN-04).
+//  6. Failure handling: pre-payment failures release the claim; post-payment
+//     persistence failure marks compensation_failed with an ALERT (the
+//     payment-service exposes no reversal API — manual reconciliation).
 func disburseLoan(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetHeader("X-Tenant-ID")
@@ -891,76 +1146,178 @@ func disburseLoan(c *gin.Context) {
 	mintAccountID := c.GetHeader("X-Mint-Account-ID")
 
 	var app LoanApplication
-	query := `
-		SELECT id, tenant_id, applicant_id, loan_application_id, loan_amount, loan_purpose, requested_term,
+	// Step 1 — atomic claim. err checked BEFORE any use of the row (the
+	// previous ordering bug checked err after the status guards).
+	claimQuery := `
+		UPDATE loan_applications SET status = 'disbursing', updated_at = $3
+		WHERE loan_application_id = $1 AND tenant_id = $2 AND status = 'approved'
+		RETURNING id, tenant_id, applicant_id, loan_application_id, loan_amount, loan_purpose, requested_term,
 			monthly_income, COALESCE(existing_debt, 0), COALESCE(collateral_value, 0), COALESCE(credit_score, 0),
 			COALESCE(employment_status, ''), COALESCE(employment_duration, 0), COALESCE(bank_statement_score, 0),
-			bvn_verified, nin_verified, status
-		FROM loan_applications
-		WHERE loan_application_id = $1 AND tenant_id = $2
+			bvn_verified, nin_verified, status, interest_rate_percent
 	`
-
-	err := db.QueryRow(query, id, tenantID).Scan(
+	err := db.QueryRow(claimQuery, id, tenantID, time.Now()).Scan(
 		&app.ID, &app.TenantID, &app.ApplicantID, &app.LoanApplicationID, &app.LoanAmount, &app.LoanPurpose,
 		&app.RequestedTerm, &app.MonthlyIncome, &app.ExistingDebt, &app.CollateralValue,
 		&app.CreditScore, &app.EmploymentStatus, &app.EmploymentDuration,
-		&app.BankStatementScore, &app.BVNVerified, &app.NINVerified, &app.Status,
+		&app.BankStatementScore, &app.BVNVerified, &app.NINVerified, &app.Status, &app.LoanInterestRatePercent,
 	)
-
-	if app.Status == "disbursed" {
-		SendErrorGin(c, "already_exists", "Loan already disbursed", 400)
+	if err == sql.ErrNoRows {
+		SendErrorGin(c, "conflict", "Loan not found, not approved, or disbursement already in progress", 409)
 		return
 	}
-
-	if app.Status != "approved" {
-		SendErrorGin(c, "bad_request", "Loan must be approved first", 400)
-		return
-	}
-
 	if err != nil {
-		SendErrorGin(c, "not_found", "Invalid Loan Application", 404)
+		log.Printf("ERROR: disbursement claim failed for loan %s: %v", id, err)
+		SendErrorGin(c, "internal_error", "Failed to initiate disbursement", 500)
 		return
 	}
 
-	var AmountString = strconv.FormatFloat(app.LoanAmount, 'f', 2, 64)
+	releaseClaim := func() {
+		if _, rerr := db.Exec(`UPDATE loan_applications SET status = 'approved', updated_at = $1 WHERE loan_application_id = $2 AND tenant_id = $3 AND status = 'disbursing'`,
+			time.Now(), id, tenantID); rerr != nil {
+			log.Printf("ALERT: failed to release disbursement claim for loan %s: %v", id, rerr)
+		}
+	}
 
-	// Deposit loan value into user account
+	// Step 2 — amount from the claimed record.
+	var amountString = strconv.FormatFloat(app.LoanAmount, 'f', 2, 64)
+	amountInKobo := int64(app.LoanAmount * 100)
+
+	// Step 3 — persist the COA journal entry in the outbox BEFORE money moves.
+	if err := coaClient.RecordLoanDisbursement(tenantID, keycloakID, "finance_admin", id, app.LoanType, amountInKobo); err != nil {
+		log.Printf("ERROR: COA outbox enqueue failed for loan %s disbursement: %v", id, err)
+		releaseClaim()
+		SendErrorGin(c, "internal_error", "Failed to persist disbursement journal — disbursement aborted", 500)
+		return
+	}
+
+	// Step 4 — forward: move the funds (mint -> applicant).
 	_, err = Payment(&PaymentStruct{
 		Recipient:     app.ApplicantID,
-		Amount:        AmountString,
-		Note:          "LOAN_DISBURSEMENT/" + AmountString,
+		Amount:        amountString,
+		Note:          "LOAN_DISBURSEMENT/" + amountString,
 		TenantID:      tenantID,
 		KeycloakID:    keycloakID,
 		LedgerID:      ledgerID,
 		MintAccountID: mintAccountID,
 	})
-
 	if err != nil {
-		SendErrorGin(c, "internal_error", "Payment processing failed", 500)
+		log.Printf("Payment failed for loan %s disbursement: %v", id, err)
+		releaseClaim()
+		SendErrorGin(c, "bad_gateway", "Payment processing failed — no disbursement recorded", 502)
 		return
 	}
 
-	updateQuery := `
+	// Step 5 — commit + persist the amortized repayment schedule (LN-04).
+	now := time.Now()
+	res, err := db.Exec(`
 		UPDATE loan_applications
-		SET status = 'disbursed', loan_started_at = $1
-		WHERE loan_application_id = $2 AND tenant_id = $3
-	`
-	_, err = db.Exec(updateQuery, time.Now(), id, tenantID)
-
+		SET status = 'disbursed', loan_started_at = $1, updated_at = $1
+		WHERE loan_application_id = $2 AND tenant_id = $3 AND status = 'disbursing'
+	`, now, id, tenantID)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n == 0 {
+			err = fmt.Errorf("commit updated no rows")
+		}
+	}
 	if err != nil {
-		SendErrorGin(c, "internal_error", "Failed to disburse loan", 500)
+		log.Printf("ALERT: loan %s paid via payment service but commit failed: %v — marking compensation_failed, manual reconciliation required", id, err)
+		if _, merr := db.Exec(`UPDATE loan_applications SET status = 'compensation_failed', updated_at = $1 WHERE loan_application_id = $2 AND tenant_id = $3`, time.Now(), id, tenantID); merr != nil {
+			log.Printf("ALERT: could not mark loan %s compensation_failed: %v", id, merr)
+		}
+		SendErrorGin(c, "internal_error", "Disbursement paid but persistence failed — manual reconciliation required", 500)
 		return
 	}
 
-	amountInKobo := int64(app.LoanAmount * 100)
-	coaClient.RecordLoanDisbursement(tenantID, c.GetHeader("X-Keycloak-ID"), "finance_admin", id, app.LoanType, amountInKobo)
+	if err := persistRepaymentSchedule(id, tenantID, app.LoanAmount, app.LoanInterestRatePercent, app.RequestedTerm, now); err != nil {
+		// Money moved; schedule persistence failure is loud but the loan
+		// stays disbursed — the schedule can be regenerated deterministically.
+		log.Printf("ALERT: loan %s disbursed but schedule persistence failed: %v — regenerate before collections", id, err)
+	}
+
+	// Telemetry: loan_disbursement_events_total{service,tenant_id,loan_id}
+	// (Wave-9 SPEC addendum; feeds the DoubleDisburseGuard alert rule).
+	otelkit.IncCounter(c.Request.Context(), "loan_disbursement_events_total",
+		attribute.String("service", "loan-service"),
+		attribute.String("tenant_id", tenantID),
+		attribute.String("loan_id", id))
 
 	c.JSON(200, gin.H{"status": "disbursed"})
+}
+
+// persistRepaymentSchedule (LN-04) writes the amortized schedule rows that
+// collections and completion are driven from.
+func persistRepaymentSchedule(loanApplicationID, tenantID string, loanAmount, interestRatePercent float64, termMonths int, startDate time.Time) error {
+	if termMonths < 1 {
+		return fmt.Errorf("invalid term %d", termMonths)
+	}
+	if interestRatePercent <= 0 {
+		// Zero-rate loan: equal principal installments (EMI formula is
+		// undefined at r=0).
+		per := loanAmount / float64(termMonths)
+		balance := loanAmount
+		for i := 1; i <= termMonths; i++ {
+			principal := per
+			if i == termMonths {
+				principal = balance
+			}
+			balance -= principal
+			_, err := db.Exec(`
+				INSERT INTO loan_schedule (loan_application_id, tenant_id, installment_number, due_date, principal_amount, interest_amount, total_amount, remaining_balance, status)
+				VALUES ($1, $2, $3, $4, $5, 0, $5, $6, 'pending')
+				ON CONFLICT (loan_application_id, installment_number) DO NOTHING`,
+				loanApplicationID, tenantID, i, startDate.AddDate(0, i, 0), principal, math.Max(balance, 0))
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	schedule := GenerateRepaymentSchedule(loanAmount, interestRatePercent, termMonths, startDate)
+	for _, inst := range schedule.Schedule {
+		_, err := db.Exec(`
+			INSERT INTO loan_schedule (loan_application_id, tenant_id, installment_number, due_date, principal_amount, interest_amount, total_amount, remaining_balance, status)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+			ON CONFLICT (loan_application_id, installment_number) DO NOTHING`,
+			loanApplicationID, tenantID, inst.InstallmentNumber, inst.DueDate,
+			inst.PrincipalPayment, inst.InterestPayment, inst.TotalPayment, inst.RemainingBalance)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func getRepaymentSchedule(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetHeader("X-Tenant-ID")
+
+	// LN-04 (L4): serve the PERSISTED amortized schedule written at
+	// disbursement. Legacy loans without persisted rows fall back to the
+	// deterministic recomputation.
+	var persisted []RepaymentInstallment
+	rows, err := db.Query(`
+		SELECT installment_number, due_date, principal_amount, interest_amount, total_amount, remaining_balance
+		FROM loan_schedule WHERE loan_application_id = $1 AND tenant_id = $2
+		ORDER BY installment_number`, id, tenantID)
+	if err != nil {
+		SendErrorGin(c, "internal_error", "Failed to read repayment schedule", 500)
+		return
+	}
+	for rows.Next() {
+		var inst RepaymentInstallment
+		if err := rows.Scan(&inst.InstallmentNumber, &inst.DueDate, &inst.PrincipalPayment, &inst.InterestPayment, &inst.TotalPayment, &inst.RemainingBalance); err != nil {
+			log.Println("Error scanning schedule row:", err)
+			continue
+		}
+		persisted = append(persisted, inst)
+	}
+	rows.Close()
+
+	if len(persisted) > 0 {
+		c.JSON(200, gin.H{"schedule": persisted, "basis": "amortized", "persisted": true})
+		return
+	}
 
 	var app LoanApplication
 	query := `
@@ -972,7 +1329,7 @@ func getRepaymentSchedule(c *gin.Context) {
 		WHERE loan_application_id = $1 AND tenant_id = $2
 	`
 
-	err := db.QueryRow(query, id, tenantID).Scan(
+	err = db.QueryRow(query, id, tenantID).Scan(
 		&app.ID, &app.TenantID, &app.ApplicantID, &app.LoanApplicationID, &app.LoanAmount, &app.LoanPurpose,
 		&app.RequestedTerm, &app.MonthlyIncome, &app.ExistingDebt, &app.CollateralValue,
 		&app.CreditScore, &app.EmploymentStatus, &app.EmploymentDuration,
@@ -984,12 +1341,25 @@ func getRepaymentSchedule(c *gin.Context) {
 		SendErrorGin(c, "not_found", "Loan Application not found", 404)
 		return
 	}
+	if app.LoanStartedAt == nil {
+		SendErrorGin(c, "conflict", "loan not disbursed — no repayment schedule", 409)
+		return
+	}
 
 	schedule := GenerateRepaymentSchedule(app.LoanAmount, app.LoanInterestRatePercent, app.RequestedTerm, *app.LoanStartedAt)
 
 	c.JSON(200, schedule)
 }
 
+// is rejected — never silently clipped.
+// LN-05 (L5): repayment is ledger-first. A real transfer via the payment
+// service (customer -> settlement account) must execute BEFORE any row is
+// recorded; the stored transaction id is the SERVER-FETCHED reference from
+// the payment service — client-supplied transaction ids are rejected.
+// Precondition: status='disbursed'. Overpayment beyond the schedule total
+// is rejected (issue a credit note out of band), never silently clipped.
+// LN-04 (L4): totals come from the persisted amortized schedule, not the
+// flat-interest formula.
 func recordPayment(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetHeader("X-Tenant-ID")
@@ -999,6 +1369,14 @@ func recordPayment(c *gin.Context) {
 		SendErrorGin(c, "validation_failed", err.Error(), 400)
 		return
 	}
+	if payment.TransactionID != "" {
+		SendErrorGin(c, "validation_failed", "transaction_id is server-issued by the payment service and must not be supplied", 400)
+		return
+	}
+	if payment.Amount <= 0 {
+		SendErrorGin(c, "validation_failed", "amount must be positive", 400)
+		return
+	}
 
 	var app LoanApplication
 	query := `
@@ -1017,77 +1395,119 @@ func recordPayment(c *gin.Context) {
 		&app.BankStatementScore, &app.BVNVerified, &app.NINVerified, &app.Status, &app.LoanInterestRatePercent,
 		&app.LoanStartedAt,
 	)
-
 	if err != nil {
 		SendErrorGin(c, "not_found", "Loan Application not found", 404)
 		return
 	}
 
+	// Only a disbursed loan can accept repayment.
 	if app.Status == "completed" {
 		SendErrorGin(c, "bad_request", "Loan payment already completed", 400)
+		return
+	}
+	if app.Status != "disbursed" {
+		SendErrorGin(c, "conflict", "loan must be disbursed before payments are accepted", 409)
+		return
+	}
+
+	// Amortized total from the persisted schedule (LN-04).
+	var totalRequiredPaymentAmount float64
+	err = db.QueryRow(`SELECT COALESCE(SUM(total_amount), 0) FROM loan_schedule WHERE loan_application_id = $1 AND tenant_id = $2`,
+		app.LoanApplicationID, tenantID).Scan(&totalRequiredPaymentAmount)
+	if err != nil {
+		SendErrorGin(c, "internal_error", "Failed to read repayment schedule", 500)
+		return
+	}
+	if totalRequiredPaymentAmount <= 0 {
+		// No persisted schedule — refuse rather than fall back to the
+		// divergent flat-interest formula.
+		SendErrorGin(c, "conflict", "loan has no persisted repayment schedule — disbursement incomplete", 409)
 		return
 	}
 
 	var totalPaid float64
 	err = db.QueryRow(`
-		SELECT COALESCE(SUM(amount), 0) 
-		FROM loan_payments 
+		SELECT COALESCE(SUM(amount), 0)
+		FROM loan_payments
 		WHERE loan_application_id = $1 AND tenant_id = $2
 	`, app.LoanApplicationID, tenantID).Scan(&totalPaid)
-
 	if err != nil {
 		log.Println("Failed to fetch total payments:", err)
 		SendErrorGin(c, "internal_error", "Failed to fetch payment total", 500)
 		return
 	}
 
-	log.Printf("Total Amount Paid: %f", totalPaid)
-
-	var recordedPaymentAmount = payment.Amount
-
-	var totalRequiredPaymentAmount = app.LoanAmount + (app.LoanAmount * app.LoanInterestRatePercent / 100)
-
-	var totalUnpaid = totalRequiredPaymentAmount - totalPaid
-
-	// Ensure no over-payment.
-	if recordedPaymentAmount > totalUnpaid {
-		recordedPaymentAmount = totalUnpaid
+	totalUnpaid := totalRequiredPaymentAmount - totalPaid
+	if payment.Amount > totalUnpaid {
+		SendErrorGin(c, "bad_request",
+			fmt.Sprintf("payment %.2f exceeds outstanding balance %.2f — overpayment is rejected; request a credit note", payment.Amount, totalUnpaid),
+			400)
+		return
 	}
 
+	// Step 1 — move the money FIRST via the payment service.
+	settlementAccount := GetEnv("LOAN_REPAYMENT_RECIPIENT", "")
+	if settlementAccount == "" {
+		SendErrorGin(c, "service_unavailable", "LOAN_REPAYMENT_RECIPIENT not configured — repayment unavailable", 503)
+		return
+	}
+	amountString := strconv.FormatFloat(payment.Amount, 'f', 2, 64)
+	keycloakID := c.GetHeader("X-Keycloak-ID")
+	payResult, err := Payment(&PaymentStruct{
+		Recipient:     settlementAccount,
+		Amount:        amountString,
+		Note:          "LOAN_REPAYMENT/" + app.LoanApplicationID + "/" + amountString,
+		TenantID:      tenantID,
+		KeycloakID:    keycloakID,
+		LedgerID:      c.GetHeader("X-Ledger-ID"),
+		MintAccountID: c.GetHeader("X-Mint-Account-ID"),
+	})
+	if err != nil {
+		log.Printf("Repayment transfer failed for loan %s: %v", app.LoanApplicationID, err)
+		SendErrorGin(c, "bad_gateway", "Payment processing failed — no payment recorded", 502)
+		return
+	}
+	if payResult.TransactionID == "" {
+		log.Printf("ERROR: payment service returned no transaction reference for loan %s repayment", app.LoanApplicationID)
+		SendErrorGin(c, "bad_gateway", "payment service returned no transaction reference — payment not recorded", 502)
+		return
+	}
+
+	// Step 2 — record the payment with the server-fetched reference.
+	recordedPaymentAmount := payment.Amount
 	loanPaymentQuery := `
-		INSERT INTO loan_payments 
+		INSERT INTO loan_payments
 			(loan_payment_id, loan_application_id, tenant_id, transaction_id, amount, payment_date, payment_method)
-		VALUES 
+		VALUES
 			($1, $2, $3, $4, $5, $6, $7)
 		RETURNING id
 	`
-
 	err = db.QueryRow(
 		loanPaymentQuery,
 		generateID("LOAN_PAYMENT"),
 		app.LoanApplicationID,
 		tenantID,
-		payment.TransactionID,
+		payResult.TransactionID,
 		recordedPaymentAmount,
-		payment.PaymentDate,
+		time.Now(),
 		payment.PaymentMethod,
 	).Scan(&payment.ID)
-
 	if err != nil {
-		log.Println("Insert error:", err)
-		SendErrorGin(c, "internal_error", "Failed to record payment", 500)
+		// Money moved but the record failed — loud, never silent.
+		log.Printf("ALERT: repayment of %.2f for loan %s executed (ref %s) but recording failed: %v — manual reconciliation required",
+			recordedPaymentAmount, app.LoanApplicationID, payResult.TransactionID, err)
+		SendErrorGin(c, "internal_error", "Payment executed but recording failed — manual reconciliation required", 500)
 		return
 	}
 
-	// Record journal entry for loan repayment
-	keycloakID := c.GetHeader("X-Keycloak-ID")
-	totalInterest := app.LoanAmount * app.LoanInterestRatePercent / 100
-	// remainingPrincipal := app.LoanAmount - totalPaid
-
-	// Calculate interest and principal portions of this payment
+	// Interest-first waterfall from the persisted schedule totals (LN-04).
+	var totalInterest float64
+	if err := db.QueryRow(`SELECT COALESCE(SUM(interest_amount), 0) FROM loan_schedule WHERE loan_application_id = $1 AND tenant_id = $2`,
+		app.LoanApplicationID, tenantID).Scan(&totalInterest); err != nil {
+		totalInterest = 0
+	}
 	var principalPortion, interestPortion float64
 	if totalPaid < totalInterest {
-		// Still paying off interest first
 		if recordedPaymentAmount <= (totalInterest - totalPaid) {
 			interestPortion = recordedPaymentAmount
 			principalPortion = 0
@@ -1096,27 +1516,77 @@ func recordPayment(c *gin.Context) {
 			principalPortion = recordedPaymentAmount - interestPortion
 		}
 	} else {
-		// Interest fully paid, all goes to principal
 		principalPortion = recordedPaymentAmount
 		interestPortion = 0
 	}
 
-	// Convert to kobo (smallest currency unit)
+	// Mark schedule installments covered by this payment (oldest first).
+	applyPaymentToSchedule(app.LoanApplicationID, tenantID, recordedPaymentAmount)
+
+	// Record journal entry for loan repayment (outbox — persist + retry).
 	principalKobo := int64(principalPortion * 100)
 	interestKobo := int64(interestPortion * 100)
-
-	coaClient.RecordLoanRepayment(tenantID, keycloakID, "finance_admin", app.LoanApplicationID, app.LoanType, principalKobo, interestKobo)
+	if err := coaClient.RecordLoanRepayment(tenantID, keycloakID, "finance_admin", app.LoanApplicationID, app.LoanType, principalKobo, interestKobo); err != nil {
+		log.Printf("ALERT: COA outbox enqueue failed for loan %s repayment (ref %s): %v", app.LoanApplicationID, payResult.TransactionID, err)
+	}
 
 	if totalPaid+recordedPaymentAmount >= totalRequiredPaymentAmount {
 		_, err := db.Exec(`
 			UPDATE loan_applications
-			SET status = 'completed'
-			WHERE loan_application_id = $1 AND tenant_id = $2
-		`, app.LoanApplicationID, app.TenantID)
+			SET status = 'completed', updated_at = $1
+			WHERE loan_application_id = $2 AND tenant_id = $3
+		`, time.Now(), app.LoanApplicationID, app.TenantID)
 		if err != nil {
 			log.Println("Failed to update loan status:", err)
 		}
 	}
 
-	c.JSON(200, gin.H{"status": "success", "amount": recordedPaymentAmount})
+	c.JSON(200, gin.H{"status": "success", "amount": recordedPaymentAmount, "transaction_id": payResult.TransactionID})
+}
+
+// applyPaymentToSchedule (LN-04) marks pending installments as covered by a
+// payment, oldest due first.
+func applyPaymentToSchedule(loanApplicationID, tenantID string, amount float64) {
+	rows, err := db.Query(`
+		SELECT id, total_amount, paid_amount FROM loan_schedule
+		WHERE loan_application_id = $1 AND tenant_id = $2 AND status != 'paid'
+		ORDER BY installment_number`, loanApplicationID, tenantID)
+	if err != nil {
+		log.Printf("ALERT: schedule lookup failed for loan %s: %v", loanApplicationID, err)
+		return
+	}
+	defer rows.Close()
+
+	type instRow struct {
+		id          int
+		total, paid float64
+	}
+	var installments []instRow
+	for rows.Next() {
+		var r instRow
+		if err := rows.Scan(&r.id, &r.total, &r.paid); err == nil {
+			installments = append(installments, r)
+		}
+	}
+
+	remaining := amount
+	for _, inst := range installments {
+		if remaining <= 0 {
+			break
+		}
+		due := inst.total - inst.paid
+		apply := math.Min(remaining, due)
+		newPaid := inst.paid + apply
+		status := "pending"
+		var paidAt interface{}
+		if newPaid >= inst.total {
+			status = "paid"
+			paidAt = time.Now()
+		}
+		if _, err := db.Exec(`UPDATE loan_schedule SET paid_amount = $1, status = $2, paid_at = $3 WHERE id = $4`,
+			newPaid, status, paidAt, inst.id); err != nil {
+			log.Printf("ALERT: installment update failed (schedule id %d): %v", inst.id, err)
+		}
+		remaining -= apply
+	}
 }

@@ -226,6 +226,17 @@ export class KeycloakAdminApiClient {
     await this.axios_client.delete(`/admin/realms/${realm_name}`, await this.get_config());
   }
 
+  // PL-02: revoke all active SSO sessions in a realm (Keycloak Admin API
+  // POST /admin/realms/{realm}/logout-all). Used by tenant decommissioning so
+  // suspended/offboarded tenants' already-issued tokens stop working.
+  public async logout_all(realm_name: string) {
+    await this.axios_client.post(
+      `/admin/realms/${realm_name}/logout-all`,
+      {},
+      await this.get_config(),
+    );
+  }
+
   private async get_basic_client_scope_id(realm: string): Promise<string> {
     const { data } = await this.axios_client.get(
       `/admin/realms/${realm}/client-scopes`,

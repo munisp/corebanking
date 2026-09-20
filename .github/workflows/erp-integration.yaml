@@ -8,7 +8,6 @@ on:
     paths:
       - 'services/erpnext-bridge-go/**'
       - 'services/erpnext-integration-service/**'
-      - 'services/erpnext-sync-py/**'
       - 'docker/Dockerfile.consolidated'
       - 'docker/entrypoint.sh'
       - 'docker/build-services.sh'
@@ -42,7 +41,7 @@ jobs:
           file: ./docker/Dockerfile.consolidated
           push: true
           build-args: |
-            SERVICES=erpnext-bridge-go,erpnext-integration-service,erpnext-sync-py
+            SERVICES=erpnext-bridge-go,erpnext-integration-service
             PRIMARY_LANG=go
             PORT_BASE=9750
           tags: registry.digitalocean.com/talentgraph-auth/54link-dev-erp-integration:${{ env.TAG }}

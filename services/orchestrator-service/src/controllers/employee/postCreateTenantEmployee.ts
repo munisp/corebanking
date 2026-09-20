@@ -1,7 +1,6 @@
-import { uuid4 } from "@temporalio/workflow";
 import httpStatus from "http-status";
 import { asyncHandler } from "../../middlewares/async";
-import { ApiError } from "../../middlewares/error";
+import { resolveTenantId } from "../../middlewares/auth";
 import { tenantService } from "../../services/tenantService";
 import { workflowRunner } from "../../utils/workflowRunner";
 import { validateRequest } from "../../validations";
@@ -11,8 +10,8 @@ import { createEmployeeWorkflow } from "../../workflows/createEmployeeWorkflow";
 export const postCreateTenantEmployee = asyncHandler(async (req, res) => {
   const payload = validateRequest(CreateEmployeeSchema, req.body);
 
-  const tenantId = req.headers["x-tenant-id"] as string;
-  if (!tenantId) throw new ApiError(httpStatus.BAD_REQUEST, "Tenant ID is required.");
+  // OB-01: tenant derived from verified token claims (see resolveTenantId).
+  const tenantId = resolveTenantId(req, res);
 
   const keycloakRealm = "54link_" + tenantId;
   const [keycloakPublicKey, ledgerId] = await Promise.all([
@@ -22,7 +21,8 @@ export const postCreateTenantEmployee = asyncHandler(async (req, res) => {
 
   const verification = await workflowRunner(createEmployeeWorkflow, {
     args: { ...payload, tenantId, keycloakRealm, keycloakPublicKey, ledgerId },
-    workflowId: `54link_create_tenant_employee_${tenantId}_${uuid4()}`,
+    // OB-08: deterministic workflow id for Temporal-side dedup.
+    workflowId: `54link_create_tenant_employee_${tenantId}_${payload.email}`,
     defaultErrorMessage: "Employee creation failed.",
     withTimeOut: 40000,
     timeOutFn: () => {

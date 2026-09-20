@@ -20,6 +20,8 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"shared/otel/go/otelkit"
 )
 
 var serviceName = "account-lien-go"
@@ -51,7 +53,7 @@ func initDB() {
 		dsn = "postgres://localhost:5432/corebanking?sslmode=disable"
 	}
 	var err error
-	app.db, err = sql.Open("postgres", dsn)
+	app.db, err = otelkit.OpenSQLDB("postgres", dsn)
 	if err != nil {
 		log.Printf("[%s] DB connection failed (will retry): %v", serviceName, err)
 		return
@@ -78,6 +80,20 @@ func initDB() {
 	CREATE INDEX IF NOT EXISTS idx_liens_status ON liens(status);`
 	if _, err := app.db.Exec(schema); err != nil {
 		log.Printf("[%s] Schema init failed: %v", serviceName, err)
+	}
+
+	// MN-11 (F14-11): dedupe any historical duplicates, then enforce
+	// UNIQUE(account_id, reference) so lien placement retries are idempotent.
+	dedupe := `DELETE FROM liens a USING liens b
+		WHERE a.reference <> '' AND a.account_id = b.account_id AND a.reference = b.reference
+		AND a.placed_at > b.placed_at;`
+	if _, err := app.db.Exec(dedupe); err != nil {
+		log.Printf("[%s] lien dedupe migration failed: %v", serviceName, err)
+	}
+	uniq := `CREATE UNIQUE INDEX IF NOT EXISTS uq_liens_account_reference
+		ON liens(account_id, reference) WHERE reference <> '';`
+	if _, err := app.db.Exec(uniq); err != nil {
+		log.Printf("[%s] lien unique index migration failed: %v", serviceName, err)
 	}
 	log.Printf("[%s] PostgreSQL connected, schema ready", serviceName)
 }
@@ -120,12 +136,28 @@ func placeLien(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if app.db != nil {
-		_, err := app.db.Exec(`INSERT INTO liens (lien_id, account_id, amount_kobo, type, reason, reference, status, placed_by, placed_at, expires_at)
-			VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9)`,
+		// MN-11: idempotent placement — a retry with the same
+		// (account_id, reference) returns the existing lien instead of
+		// stacking a duplicate hold.
+		result, err := app.db.Exec(`INSERT INTO liens (lien_id, account_id, amount_kobo, type, reason, reference, status, placed_by, placed_at, expires_at)
+			VALUES ($1, $2, $3, $4, $5, $6, 'active', $7, $8, $9)
+			ON CONFLICT (account_id, reference) WHERE reference <> '' DO NOTHING`,
 			lienID, req.AccountID, req.AmountKobo, req.Type, req.Reason, req.Reference, req.PlacedBy, now, expiresAt)
 		if err != nil {
 			log.Printf("[%s] INSERT lien failed: %v", serviceName, err)
 			respondJSON(w, 500, map[string]string{"error": "failed to persist lien"})
+			return
+		}
+		if rows, _ := result.RowsAffected(); rows == 0 && req.Reference != "" {
+			var existingID, existingStatus string
+			var existingAmount int64
+			app.db.QueryRow(`SELECT lien_id, status, amount_kobo FROM liens WHERE account_id = $1 AND reference = $2`,
+				req.AccountID, req.Reference).Scan(&existingID, &existingStatus, &existingAmount)
+			respondJSON(w, 200, map[string]interface{}{
+				"lien_id": existingID, "status": existingStatus,
+				"amount_kobo": existingAmount, "idempotent_replay": true,
+				"total_liens_on_account_kobo": totalLienKobo,
+			})
 			return
 		}
 	}
@@ -388,10 +420,49 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// MN-11: expiry sweeper — liens with expires_at in the past must not stay
+// 'active' forever. Runs on a ticker; also sweeps once at startup.
+func startLienExpirySweeper() {
+	sweep := func() {
+		if app.db == nil {
+			return
+		}
+		result, err := app.db.Exec(`UPDATE liens SET status = 'expired', released_at = NOW()
+			WHERE expires_at IS NOT NULL AND expires_at < NOW() AND status = 'active'`)
+		if err != nil {
+			log.Printf("[%s] lien expiry sweep failed: %v", serviceName, err)
+			return
+		}
+		if rows, _ := result.RowsAffected(); rows > 0 {
+			log.Printf("[%s] lien expiry sweep expired %d lien(s)", serviceName, rows)
+		}
+	}
+	sweep()
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			sweep()
+		}
+	}()
+}
+
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), serviceName)
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startJWKSRefresh()
 
 	initDB()
+	startLienExpirySweeper()
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "9046"
@@ -401,7 +472,7 @@ func main() {
 	mux.HandleFunc("/api/v1/lien/place", placeLien)
 	mux.HandleFunc("/api/v1/lien/release", releaseLien)
 	mux.HandleFunc("/api/v1/lien/account", getAccountLiens)
-	srv := &http.Server{Addr: ":" + port, Handler: jwtAuthMiddleware(mux)}
+	srv := &http.Server{Addr: ":" + port, Handler: otelkit.HTTPMiddleware(jwtAuthMiddleware(mux))}
 	go func() {
 		log.Printf("[%s] Starting on :%s", serviceName, port)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

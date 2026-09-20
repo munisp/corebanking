@@ -372,8 +372,9 @@ func setupRoutes(router *mux.Router) {
 	router.HandleFunc("/dapr/subscribe", subscribeHandler).Methods("GET")
 	router.HandleFunc("/events/transaction", handleTransactionEvent).Methods("POST")
 	router.HandleFunc("/events/loan", handleLoanEvent).Methods("POST")
-	router.HandleFunc("/events/account", handleAccountEvent).Methods("POST")
-	router.HandleFunc("/events/payment", handlePaymentEvent).Methods("POST")
+	// OR-11: /events/account and /events/payment routes deleted with their
+	// handlers — the account.* / payment.processing.* topics have no producer
+	// anywhere in the fleet, so these endpoints could never fire.
 	router.HandleFunc("/events/savings", handleSavingsEvent).Methods("POST")
 	router.HandleFunc("/events/mortgage", handleMortgageEvent).Methods("POST")
 	router.HandleFunc("/events/lpo", handleLpoEvent).Methods("POST")

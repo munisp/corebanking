@@ -29,12 +29,6 @@ const SEED: Record<string, unknown[]> = {
     { id: "SAR-2026-003", name: "Dormant Account Reactivation — Suspicious", category: "Dormant-Active", amount: "₦82M", filedTo: "NFIU", cbnRef: "CBN-SAR-2026-0168", filingDate: "2026-05-14", analyst: "Compliance Officer A", status: "draft" },
     { id: "SAR-2026-004", name: "Trade-Based ML — Inflated Invoices", category: "TBML", amount: "₦340M", filedTo: "NFIU", cbnRef: "CBN-SAR-2026-0171", filingDate: "2026-05-14", analyst: "Compliance Officer C", status: "pending" },
   ],
-  "ctr-auto-filer": [
-    { id: "CTR-2026-0891", name: "Cash Deposit — First Bank Ikeja", category: "Cash Deposit", amount: "₦8.5M", accountHolder: "Chief Okonkwo Enterprises", branch: "Ikeja GRA", filedTo: "NFIU", status: "filed" },
-    { id: "CTR-2026-0892", name: "Cash Withdrawal — GTBank VI", category: "Cash Withdrawal", amount: "₦12M", accountHolder: "Alhaji Danladi Holdings", branch: "Victoria Island", filedTo: "NFIU", status: "filed" },
-    { id: "CTR-2026-0893", name: "Cash Deposit — Zenith Kano", category: "Cash Deposit", amount: "₦6.2M", accountHolder: "Musa Trading Ltd", branch: "Kano Main", filedTo: "NFIU", status: "filed" },
-    { id: "CTR-2026-0894", name: "Cash Withdrawal — Access Abuja", category: "Cash Withdrawal", amount: "₦15M", accountHolder: "Federal Contractors Ltd", branch: "Abuja Central", filedTo: "NFIU", status: "pending" },
-  ],
   "aml-case-manager": [
     { id: "CASE-001", name: "Structuring Investigation — Garba Account", category: "Structuring", priority: "high", assignedTo: "AML Analyst A", openDate: "2026-04-28", evidence: "12 sub-₦5M deposits in 3 days", linkedSar: "SAR-2026-001", status: "investigating" },
     { id: "CASE-002", name: "Shell Company Network — Emeka Industries", category: "Layering", priority: "critical", assignedTo: "AML Analyst B", openDate: "2026-04-15", evidence: "5 linked companies, circular transfers", linkedSar: "SAR-2026-002", status: "investigating" },
@@ -108,7 +102,6 @@ export function registerAMLEnhancementRoutes(app: Express) {
   const services = [
     { key: "aml-risk-scoring", url: process.env.AML_RISK_SCORING_URL || "http://localhost:8574" },
     { key: "sar-filing", url: process.env.SAR_FILING_URL || "http://localhost:8575" },
-    { key: "ctr-auto-filer", url: process.env.CTR_AUTO_FILER_URL || "http://localhost:8576" },
     { key: "aml-case-manager", url: process.env.AML_CASE_MANAGER_URL || "http://localhost:8577" },
     { key: "watchlist-manager", url: process.env.WATCHLIST_MANAGER_URL || "http://localhost:8578" },
     { key: "adverse-media-scanner", url: process.env.ADVERSE_MEDIA_SCANNER_URL || "http://localhost:8579" },

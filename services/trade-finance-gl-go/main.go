@@ -199,50 +199,18 @@ func murabahaGL(w http.ResponseWriter, r *http.Request) {
 // Provisional credit, investigation, reversal or permanent credit
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// MN-06: The previous implementation served a fully fabricated batch of dispute
+// GL postings (hardcoded DSP-001..004 journals stamped "posted" via the
+// middlewareActions fiction). No dispute/chargeback GL integration exists —
+// dispute-management-py (the only dispute producer) was unbootable and is
+// deleted (OR-06). Fail honestly until a real integration is built.
 func disputeChargebackGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("DISPUTE-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"disputes": []map[string]interface{}{
-			{"disputeId": "DSP-001", "type": "card_chargeback", "customer": "Adebayo Emmanuel", "amount": 150_000, "merchant": "Unknown POS Terminal", "stage": "provisional_credit_issued",
-				"glPostings": []GLEntry{
-					{EntryID: "JE-DSP-PROV-001", DebitGL: "1408", DebitName: "Chargeback Suspense (Pending)", CreditGL: "2101", CreditName: "Customer Account (provisional credit)", Amount: 150_000, Narration: "Provisional credit pending dispute investigation (CBN 72hr rule)"},
-				}},
-			{"disputeId": "DSP-002", "type": "card_chargeback", "customer": "Fatimah Ibrahim", "amount": 85_000, "merchant": "Online Store XYZ", "stage": "resolved_in_customer_favor",
-				"glPostings": []GLEntry{
-					{EntryID: "JE-DSP-RESOLVE-001", DebitGL: "1104", DebitName: "Card Network Settlement (recoverable)", CreditGL: "1408", CreditName: "Chargeback Suspense (cleared)", Amount: 85_000, Narration: "Chargeback won — recover from acquirer/merchant"},
-				}},
-			{"disputeId": "DSP-003", "type": "unauthorized_transfer", "customer": "Ibrahim Mohammed", "amount": 500_000, "channel": "mobile_banking", "stage": "resolved_against_customer",
-				"glPostings": []GLEntry{
-					{EntryID: "JE-DSP-REVERSE-001", DebitGL: "2101", DebitName: "Customer Account (provisional reversed)", CreditGL: "1408", CreditName: "Chargeback Suspense (cleared)", Amount: 500_000, Narration: "Dispute resolved against customer — reverse provisional credit"},
-				}},
-			{"disputeId": "DSP-004", "type": "atm_failed_dispense", "customer": "Chukwuemeka Obi", "amount": 200_000, "channel": "ATM-VI-003", "stage": "bank_liability",
-				"glPostings": []GLEntry{
-					{EntryID: "JE-DSP-BANK-001", DebitGL: "5301", DebitName: "ATM Discrepancy Expense", CreditGL: "1408", CreditName: "Chargeback Suspense (absorbed)", Amount: 200_000, Narration: "ATM failed dispense — bank bears loss (journal imbalance confirmed)"},
-				}},
-		},
-		"summary": map[string]interface{}{
-			"provisionalCredits": 1, "resolvedForCustomer": 1, "resolvedAgainst": 1, "bankLiability": 1,
-			"totalSuspenseBalance": 150_000, "totalRecovered": 85_000, "totalLoss": 200_000,
-			"glCodesImpacted": []string{"1408 (Chargeback Suspense)", "2101 (Customer Deposits)", "1104 (Card Settlement)", "5301 (ATM Discrepancy Expense)"},
-			"cbnCompliance": map[string]string{
-				"acknowledgment": "Within 72 hours (CBN circular)",
-				"resolution":     "Within 15 business days (card disputes)",
-				"provisional":    "Credit issued immediately for ATM/POS failures",
-			},
-		},
-		"pipeline": map[string]string{
-			"step1": "Dispute received → provisional credit: Dr 1408 (Suspense) / Cr 2101 (Customer)",
-			"step2": "Investigation period (15 business days for card, 72hrs ack for all)",
-			"step3": "If customer wins: Dr 1104 (recover from network) / Cr 1408 (clear suspense)",
-			"step4": "If customer loses: Dr 2101 (reverse credit) / Cr 1408 (clear suspense)",
-			"step5": "If bank error: Dr 5301 (expense) / Cr 1408 (bank absorbs loss)",
-			"step6": "Report to CBN Fraud & Forgery Return (FFR) if fraud confirmed",
-		},
-		"middleware": middlewareActions("banking.disputes.chargeback"),
-	}
-	respondJSON(w, result)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error":  "not_implemented",
+		"detail": "dispute/chargeback GL posting is not implemented: no live dispute event source or journal pipeline exists (MN-06). This endpoint previously returned fabricated journals; it now fails closed.",
+	})
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -29,6 +29,8 @@ import (
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
+
+	"shared/otel/go/otelkit"
 )
 
 var (
@@ -36,6 +38,9 @@ var (
 	db           *sql.DB
 	requestCount uint64
 	errorCount   uint64
+	// CP-12/T33: malformed/undecodable compliance.screening verdicts and
+	// verdict persistence failures. Exposed as sanctions_screen_errors_total.
+	sanctionsScreenErrors uint64
 )
 
 func respondJSON(w http.ResponseWriter, args ...interface{}) {
@@ -84,6 +89,9 @@ func metricsHandler(w http.ResponseWriter, _ *http.Request) {
 	e := atomic.LoadUint64(&errorCount)
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprintf(w, "requests_total{service=\"%s\"} %d\nerrors_total{service=\"%s\"} %d\n", serviceName, r, serviceName, e)
+	// CP-12/T33: compliance.screening verdict processing errors (exact metric
+	// name per SPEC alerting addendum).
+	fmt.Fprintf(w, "sanctions_screen_errors_total{service=\"%s\"} %d\n", serviceName, atomic.LoadUint64(&sanctionsScreenErrors))
 }
 
 func rateLimitMiddleware(next http.Handler) http.Handler {
@@ -289,7 +297,7 @@ func initDB() {
 		return
 	}
 	var err error
-	db, err = sql.Open("postgres", dsn)
+	db, err = otelkit.OpenSQLDB("postgres", dsn)
 	if err != nil {
 		log.Printf("DB error: %v", err)
 		return
@@ -1307,6 +1315,17 @@ func watchdogHealthy() bool {
 
 func main() {
 	initTracing()
+	shutdown, oerr := otelkit.Init(context.Background(), serviceName)
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startWatchdog(10 * time.Second)
 	watchdogPing()
 	port := os.Getenv("PORT")
@@ -1315,6 +1334,9 @@ func main() {
 	}
 	initDB()
 	initRedis()
+	if redisClient != nil {
+		redisClient.AddHook(otelkit.RedisHook())
+	}
 	startJWKSRefresh()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", healthHandler)
@@ -1322,9 +1344,18 @@ func main() {
 	mux.HandleFunc("/livez", livezHandler)
 	mux.HandleFunc("/metrics", metricsHandler)
 	registerRoutes(mux)
+
+	// CP-12/T33: START the compliance screening verdict consumer. Previously
+	// eventConsumer was constructed but never started, so the
+	// compliance.screening feedback loop was void on both ends and screening
+	// verdicts could never influence payment execution. When Kafka is not
+	// configured Start() logs and returns without pretending to subscribe.
+	eventConsumer.OnMessage(handleComplianceEvent)
+	eventConsumer.Start()
+
 	handler := idempotencyMiddleware(rateLimitMiddleware(authMiddleware(mux)))
 	// Slowloris hardening: full server timeouts (ReadHeader/Read/Write/Idle).
-	server := newSecureServer(":"+port, corsMiddleware(gzipMiddleware(handler)))
+	server := newSecureServer(":"+port, otelkit.HTTPMiddleware(corsMiddleware(gzipMiddleware(handler))))
 	go func() {
 		log.Printf("[payments-hub-go] Starting on :%s", port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -1519,3 +1550,107 @@ func (ec *EventConsumer) Start() {
 }
 
 var eventConsumer = newEventConsumer([]string{"banking.lending", "compliance.screening"}, serviceName)
+
+// ── CP-12/T33: compliance.screening verdict consumption ─────────────────────
+
+// screeningVerdict mirrors the ScreeningResponse published by
+// sanctions-screening-service on topic compliance.screening (via the
+// Kafka-backed Dapr "pubsub" component, possibly CloudEvent-enveloped).
+type screeningVerdict struct {
+	ID            string  `json:"id"`
+	ScreenedName  string  `json:"screened_name"`
+	TenantID      string  `json:"tenant_id"`
+	TransactionID *string `json:"transaction_id"`
+	CustomerID    *string `json:"customer_id"`
+	RiskLevel     string  `json:"risk_level"`
+	Action        string  `json:"action"`
+	HighestScore  float64 `json:"highest_score"`
+	MatchCount    int     `json:"match_count"`
+	ScreenedAt    string  `json:"screened_at"`
+}
+
+func handleComplianceEvent(topic string, _ string, value []byte) {
+	switch topic {
+	case "compliance.screening":
+		handleScreeningVerdict(value)
+	case "banking.lending":
+		// T32: banking.lending has no live producer (only dead pkg/fundsaga) —
+		// log honestly rather than pretend to process.
+		log.Printf("[EventConsumer] banking.lending message (%d bytes) — no handler wired (T32)", len(value))
+	default:
+		log.Printf("[EventConsumer] unhandled topic %s (%d bytes)", topic, len(value))
+	}
+}
+
+func handleScreeningVerdict(value []byte) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(value, &raw); err != nil {
+		atomic.AddUint64(&sanctionsScreenErrors, 1)
+		log.Printf("[compliance.screening] malformed verdict message: %v", err)
+		return
+	}
+	// Dapr pubsub wraps payloads in a CloudEvent envelope; accept both the raw
+	// verdict and the enveloped {"data": <verdict>} form.
+	payload := value
+	if data, ok := raw["data"]; ok && len(data) > 0 && string(data) != "null" {
+		payload = data
+	}
+	var v screeningVerdict
+	if err := json.Unmarshal(payload, &v); err != nil || v.ID == "" {
+		atomic.AddUint64(&sanctionsScreenErrors, 1)
+		log.Printf("[compliance.screening] undecodable verdict payload: %v", err)
+		return
+	}
+	if err := persistScreeningVerdict(&v, payload); err != nil {
+		atomic.AddUint64(&sanctionsScreenErrors, 1)
+		log.Printf("[compliance.screening] CRITICAL: verdict id=%s NOT persisted: %v", v.ID, err)
+		return
+	}
+	// Block/unblock decision record: the persisted verdict row is the durable
+	// system of record for whether a screened transaction may proceed.
+	log.Printf("[compliance.screening] verdict id=%s tenant=%s name=%q action=%s risk=%s transaction_id=%v persisted",
+		v.ID, v.TenantID, v.ScreenedName, v.Action, v.RiskLevel, v.TransactionID)
+}
+
+var verdictTableOnce sync.Once
+var verdictTableErr error
+
+func ensureVerdictTable() error {
+	verdictTableOnce.Do(func() {
+		if db == nil {
+			verdictTableErr = fmt.Errorf("database not configured")
+			return
+		}
+		_, verdictTableErr = db.Exec(`
+			CREATE TABLE IF NOT EXISTS compliance_screening_verdicts (
+				id            TEXT PRIMARY KEY,
+				tenant_id     TEXT,
+				screened_name TEXT,
+				transaction_id TEXT,
+				customer_id   TEXT,
+				risk_level    TEXT,
+				action        TEXT,
+				highest_score DOUBLE PRECISION,
+				match_count   INT,
+				payload       JSONB,
+				received_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)`)
+	})
+	return verdictTableErr
+}
+
+// persistScreeningVerdict durably stores every verdict (idempotent on the
+// screening id) so block/unblock decisions survive restarts and are auditable.
+func persistScreeningVerdict(v *screeningVerdict, raw json.RawMessage) error {
+	if err := ensureVerdictTable(); err != nil {
+		return err
+	}
+	_, err := db.Exec(`
+		INSERT INTO compliance_screening_verdicts
+			(id, tenant_id, screened_name, transaction_id, customer_id, risk_level, action, highest_score, match_count, payload)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+		ON CONFLICT (id) DO NOTHING`,
+		v.ID, v.TenantID, v.ScreenedName, v.TransactionID, v.CustomerID,
+		v.RiskLevel, v.Action, v.HighestScore, v.MatchCount, string(raw))
+	return err
+}

@@ -317,10 +317,22 @@ def call_document_verify(doc_type, image_data):
         "doc_type": doc_type, "image": image_data,
     })
 
-def call_sanctions_check(name, dob, nationality):
-    """Call sanctions-screening-rs for PEP/sanctions."""
-    return call_service("POST", f"{SANCTIONS_URL}/v1/screen", {
-        "entity_name": name, "dob": dob, "nationality": nationality,
+def call_sanctions_check(name, tenant_id, triggered_by, dob=None, nationality=None):
+    """Call sanctions-screening-service for PEP/sanctions screening.
+
+    CP-03: previously posted to `{SANCTIONS_URL}/v1/screen` — a path no
+    screening service exposes (the real route is POST /api/screen on
+    sanctions-screening-service) — with a payload shape the service does not
+    accept. Fixed to the real route + contract. NOTE: this function currently
+    has no caller in the repo; it is kept (corrected) as the wired-in hook for
+    onboarding-time screening. dob/nationality are accepted for caller
+    compatibility but the screening service matches on name only.
+    """
+    return call_service("POST", f"{SANCTIONS_URL}/api/screen", {
+        "name": name,
+        "tenant_id": tenant_id,
+        "triggered_by": triggered_by,
+        "screen_type": "onboarding",
     })
 
 # ── gRPC Server (high-performance inter-service communication) ──

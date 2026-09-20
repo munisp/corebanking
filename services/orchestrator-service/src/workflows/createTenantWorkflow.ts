@@ -21,12 +21,15 @@ export async function createTenantWorkflow(
     createTenant,
     createMintAccount,
     createAuthProfile,
+    deleteAuthProfile,
     createUserProfile,
     getTenant,
     setupPassword,
     initializeKyc,
     createAdminProfile,
     saveAdminKycState,
+    deleteTenantRealm,
+    suspendTenantRecord,
   } = proxyActivities<typeof activities>({
     retry: {
       initialInterval: "1s",
@@ -37,6 +40,11 @@ export async function createTenantWorkflow(
     },
     startToCloseTimeout: "1m",
   });
+
+  // OB-08/PL-01: saga state — track side effects needing compensation.
+  let provisionedRealm: string | null = null;
+  let tenantRecordCreated = false;
+  let createdAuthProfile: { keycloak_id: string } | null = null;
 
   try {
     // 00. Check if tenant already exists and has completed onboarding and exit gracefully.
@@ -60,6 +68,7 @@ export async function createTenantWorkflow(
     const keycloakConfig = await provisionKeycloakRealm(
       `54link_${args.tenantId}`,
     );
+    provisionedRealm = keycloakConfig.realm;
     const authFeature = features.find(
       (feature) => feature.flag === TenantFeatureFlag.AUTH,
     );
@@ -95,6 +104,7 @@ export async function createTenantWorkflow(
       },
       features,
     });
+    tenantRecordCreated = true;
 
     // 06a. Create Contact Auth Profile
     const auth = await createAuthProfile({
@@ -105,6 +115,7 @@ export async function createTenantWorkflow(
       keycloak_realm: keycloakConfig.realm,
       keycloak_pub_key: keycloakConfig.public_rsa_key,
     });
+    createdAuthProfile = { keycloak_id: auth.auth.keycloak_id };
 
     // 06b. Setup Password
     await setupPassword({
@@ -179,6 +190,28 @@ export async function createTenantWorkflow(
 
     return { ...tenant, kyc_url: kyc.url };
   } catch (e: any) {
+    // OB-08/PL-01: saga compensation, reverse order of side effects.
+    // Best-effort: compensations never mask the original failure.
+    try {
+      if (createdAuthProfile) {
+        await deleteAuthProfile({
+          tenant_id: args.tenantId,
+          keycloak_id: createdAuthProfile.keycloak_id,
+          keycloak_realm: provisionedRealm ?? `54link_${args.tenantId}`,
+        });
+      }
+      if (tenantRecordCreated) {
+        // tenant-management has no delete; suspend is its terminal state.
+        await suspendTenantRecord(args.tenantId);
+      }
+      if (provisionedRealm) {
+        // Real Admin API call — removes the orphaned realm (and its users).
+        await deleteTenantRealm(provisionedRealm);
+      }
+    } catch {
+      // Compensation failure is surfaced via activity retry/alerting; the
+      // original workflow error below is the authoritative failure.
+    }
     throw new ApplicationFailure(`Tenant creation workflow failed: ${e.message}`);
   }
 }

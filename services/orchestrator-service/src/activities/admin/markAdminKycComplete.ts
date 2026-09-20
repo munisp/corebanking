@@ -1,10 +1,9 @@
-import { AppDataSource } from "../../database/dataSource";
+import { adminService } from "../../services/adminService";
 
+// OB-06: previously this ran raw SQL against the orchestrator's own DB
+// (`UPDATE admin ...`), but the orchestrator schema has no admin table — the
+// admin record lives in admin-service. Call the real API
+// (POST /admin/kyc/complete, admin-service api/v1/admin.py:270).
 export async function markAdminKycComplete(tenant_id: string, keycloak_id: string) {
-  await AppDataSource.query(
-    `UPDATE admin
-     SET is_verified = TRUE, updated_at = NOW()
-     WHERE keycloak_id = $1 AND tenant_id = $2`,
-    [keycloak_id, tenant_id],
-  );
+  return adminService.markKycComplete(tenant_id, keycloak_id);
 }

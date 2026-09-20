@@ -1,0 +1,96 @@
+# =============================================================================
+# Option B: Spark JMX exporter on :8090 (matches SPEC §3 `spark-jmx` contract)
+#
+# ConfigMap with jmx_prometheus_javaagent rules for Spark driver/executor
+# metrics, plus a Deployment-patch fragment showing the javaagent attach.
+# Adjust the target Deployment name/labels to the actual Spark driver.
+# No Spark/Sedona Deployment exists in-tree (verified-static) — see README.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spark-jmx-exporter
+  namespace: 54bank
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+    observability.corebanking/component: spark-jmx
+data:
+  config.yaml: |
+    lowercaseOutputName: true
+    lowercaseOutputLabelNames: true
+    rules:
+      # Spark driver metrics (namespace from spark.metrics.namespace)
+      - pattern: metrics<name=(.+)\.driver\.(.+)\.(.+)><>Value
+        name: spark_driver_$2
+        labels:
+          app_id: "$1"
+      - pattern: metrics<name=(.+)\.driver\.(.+)\.(.+)><>Count
+        name: spark_driver_$2_count
+        labels:
+          app_id: "$1"
+      # Executor metrics
+      - pattern: metrics<name=(.+)\.(\d+)\.executor\.(.+)><>Value
+        name: spark_executor_$3
+        labels:
+          app_id: "$1"
+          executor_id: "$2"
+      # DAGScheduler / BlockManager gauges
+      - pattern: metrics<name=(.+)\.DAGScheduler\.(.+)><>Value
+        name: spark_dagscheduler_$2
+        labels:
+          app_id: "$1"
+      - pattern: metrics<name=(.+)\.BlockManager\.(.+)><>Value
+        name: spark_blockmanager_$2
+        labels:
+          app_id: "$1"
+      # JVM fallback
+      - pattern: java.lang<type=Memory><HeapMemoryUsage>(\w+)
+        name: jvm_memory_heap_$1
+---
+# Deployment-patch fragment (strategic merge) — attach the javaagent to the
+# Spark driver on :8090. ADJUST metadata.name to the actual driver deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-driver          # ADJUST
+  namespace: 54bank
+spec:
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: spark         # ADJUST to actual container name
+          env:
+            - name: SPARK_DAEMON_JAVA_OPTS
+              value: >-
+                -javaagent:/opt/jmx/jmx_prometheus_javaagent.jar=8090:/opt/jmx/config.yaml
+          ports:
+            - containerPort: 8090
+              name: jmx-metrics
+          volumeMounts:
+            - name: jmx-exporter-config
+              mountPath: /opt/jmx/config.yaml
+              subPath: config.yaml
+      volumes:
+        - name: jmx-exporter-config
+          configMap:
+            name: spark-jmx-exporter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spark-jmx
+  namespace: 54bank
+  labels:
+    observability.corebanking/scrape: "true"
+spec:
+  selector:
+    app: spark                  # ADJUST to driver pod label
+  ports:
+    - name: metrics
+      port: 8090                # SPEC §3 contract
+      targetPort: 8090

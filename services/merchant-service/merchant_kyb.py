@@ -8,7 +8,7 @@ completed, sanctions_check/pep_check are None, no final risk tier is computed,
 and the assessment is persisted with status "pending_screening".
 """
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime
@@ -79,7 +79,10 @@ class KYBSubmission(BaseModel):
 class KYBVerificationDecision(BaseModel):
     merchant_id: str
     decision: VerificationStatus
-    verified_by: str
+    # OB-12: deprecated — the reviewer identity is ALWAYS taken from the
+    # verified JWT claims, never from the request body. Field kept Optional for
+    # backward-compatible payload parsing; any supplied value is ignored.
+    verified_by: Optional[str] = None
     verification_notes: Optional[str] = None
     rejection_reason: Optional[str] = None
     required_documents: Optional[List[str]] = None
@@ -222,18 +225,48 @@ async def get_kyb_status(merchant_id: str, db: asyncpg.Pool = Depends(get_db_poo
             "updated_at": kyb['updated_at']
         }
 
+def _caller_identity(request: Request):
+    """OB-12: extract the reviewer identity + realm roles from the JWT claims
+    verified by JWTAuthMiddleware (request.state.jwt_claims)."""
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    subject = claims.get("sub") or claims.get("keycloak_id")
+    roles = (claims.get("realm_access") or {}).get("roles") or []
+    if not isinstance(roles, list):
+        roles = []
+    return subject, set(roles)
+
+
 @router.post("/{merchant_id}/kyb/verify")
 async def verify_kyb(
     merchant_id: str,
     decision: KYBVerificationDecision,
+    request: Request,
     db: asyncpg.Pool = Depends(get_db_pool)
 ):
-    """Make KYB verification decision (admin only)"""
+    """Make KYB verification decision (compliance_officer / tenant_admin only).
+
+    OB-12: verified_by is derived from the authenticated caller's JWT claims —
+    a body-supplied reviewer identity is ignored (self-approval closed).
+    """
+    caller, roles = _caller_identity(request)
+    if not caller:
+        raise HTTPException(status_code=401, detail="Authenticated identity required")
+    if not ({"compliance_officer", "tenant_admin"} & roles):
+        raise HTTPException(
+            status_code=403,
+            detail="KYB verification requires compliance_officer or tenant_admin role",
+        )
+    verified_by = caller
+    claims = getattr(request.state, "jwt_claims", None) or {}
+    claims_tenant = claims.get("tenant_id") or claims.get("tenant")
     async with db.acquire() as conn:
-        # Check if KYB submission exists
+        # Check if KYB submission exists (tenant-scoped when the token carries a
+        # tenant claim — OB-12: no cross-tenant KYB decisions)
         kyb = await conn.fetchrow(
-            "SELECT * FROM merchant_kyb_verification WHERE merchant_id = $1",
-            merchant_id
+            """SELECT k.* FROM merchant_kyb_verification k
+               JOIN merchants m ON m.merchant_id = k.merchant_id
+               WHERE k.merchant_id = $1 AND ($2::text IS NULL OR m.tenant_id = $2)""",
+            merchant_id, claims_tenant
         )
         if not kyb:
             raise HTTPException(status_code=404, detail="KYB submission not found")
@@ -245,7 +278,7 @@ async def verify_kyb(
                 rejection_reason = $4, verified_at = CURRENT_TIMESTAMP,
                 updated_at = CURRENT_TIMESTAMP
             WHERE merchant_id = $5
-        """, decision.decision.value, decision.verified_by, decision.verification_notes,
+        """, decision.decision.value, verified_by, decision.verification_notes,
             decision.rejection_reason, merchant_id)
         
         # Update merchant status based on decision
@@ -262,15 +295,15 @@ async def verify_kyb(
         await conn.execute("""
             UPDATE merchants
             SET status = $1, kyb_status = $2, updated_at = CURRENT_TIMESTAMP
-            WHERE merchant_id = $3
-        """, new_status, kyb_status, merchant_id)
+            WHERE merchant_id = $3 AND ($4::text IS NULL OR tenant_id = $4)
+        """, new_status, kyb_status, merchant_id, claims_tenant)
         
         return {
             "status": "decision_recorded",
             "merchant_id": merchant_id,
             "decision": decision.decision.value,
             "merchant_status": new_status,
-            "verified_by": decision.verified_by,
+            "verified_by": verified_by,
             "verified_at": datetime.now()
         }
 

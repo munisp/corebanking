@@ -23,6 +23,7 @@ auth_router = APIRouter()
 
 @auth_router.post("")
 def create_auth(
+    request: Request,
     payload: CreateAuth,
     db: Session = Depends(get_session),
     tenant_id: str = Header(..., alias="x-tenant-id"),
@@ -31,15 +32,27 @@ def create_auth(
 ):
     """Create auth route handler (self-registration).
 
-    Fail-closed on privilege: body-supplied privileged roles are ignored.
-    Self-registered identities always get the lowest default role; privileged
-    roles are only assignable via admin-authenticated endpoints.
+    Fail-closed on privilege (OB-13): body-supplied privileged roles
+    (platform_role / tenant_role / non-default user_role) are honored ONLY when
+    the caller is (a) an authenticated service account — JWTAuthMiddleware sets
+    request.state.is_service_caller for HS256 service JWTs carrying
+    role='service' — or (b) an existing super_admin (Keycloak realm role present
+    in the verified JWT claims). Anonymous or ordinary self-registration always
+    gets the lowest default role; privileged roles are otherwise assignable only
+    via admin-authenticated endpoints.
     """
 
     try:
-        payload.user_role = UserRole.USER
-        payload.platform_role = None
-        payload.tenant_role = None
+        claims = getattr(request.state, "jwt_claims", None) or {}
+        is_service_caller = bool(getattr(request.state, "is_service_caller", False))
+        realm_roles = (claims.get("realm_access") or {}).get("roles") or []
+        is_super_admin = "super_admin" in realm_roles
+        if not (is_service_caller or is_super_admin):
+            payload.user_role = UserRole.USER
+            payload.platform_role = None
+            payload.tenant_role = None
+        elif payload.user_role is None:
+            payload.user_role = UserRole.USER
 
         auth_service = AuthService(db)
 
@@ -70,6 +83,47 @@ def create_auth(
             status_code=500,
             message="Create auth failed.",
             code="AUTH-AUTH-INT-5000",
+        )
+
+
+@auth_router.delete("/{keycloak_id}")
+def delete_auth(
+    keycloak_id: str,
+    request: Request,
+    db: Session = Depends(get_session),
+    tenant_id: str = Header(..., alias="x-tenant-id"),
+    keycloak_realm: str = Header(..., alias="x-keycloak-realm"),
+    keycloak_pub_key: str = Header(..., alias="x-keycloak-pub-key"),
+):
+    """Delete an auth profile + its Keycloak identities (R1A saga-compensation
+    contract, invoked by orchestrator workflow compensation).
+
+    Service-token callers ONLY: JWTAuthMiddleware sets
+    request.state.is_service_caller exclusively for HS256 service JWTs carrying
+    role='service' (sub='orchestrator-service'); every other caller gets 403.
+    Best-effort compensation — 404 when the profile is already absent is a
+    valid terminal outcome for the compensating saga.
+    """
+    if not getattr(request.state, "is_service_caller", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Service token required (role='service').",
+        )
+
+    try:
+        auth_service = AuthService(db)
+        deleted = auth_service.delete_auth(keycloak_id, tenant_id, keycloak_realm)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Auth profile not found.")
+        return responses.JSONResponse(content={"message": "success"}, status_code=200)
+    except HTTPException as e:
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error during delete_auth: {str(e)}")
+        raise_http_exception_handler(
+            status_code=500,
+            message="Delete auth failed.",
+            code="AUTH-AUTH-INT-5002",
         )
 
 

@@ -6,10 +6,11 @@
 //
 // Pipeline steps (in execution order):
 //   STEP-001  EOTI Mark          — lock business date in DB
-//   STEP-002  Interest Accrual   — POST interest-computation-rs /api/interest/accrue
-//   STEP-003  Reconciliation     — POST reconciliation-engine-rs /api/recon/trigger
-//   STEP-004  Settlement Finalize— close + settle open window (mojaloop-settlement-mgr-go)
-//   STEP-005  GL Balance Check   — verify trial balance (gl-engine-rs)
+//   STEP-002  Interest Accrual   — POST interest-accrual-engine-go /v1/interest/accrue
+//   STEP-003  Reconciliation     — POST reconciliation-engine-rs /v1/settlement-recon/run
+//   STEP-004  Settlement Finalize— SKIPPED explicitly: no real settlement executor
+//                                  exists (mojaloop-settlement-mgr-go is a 501 scaffold)
+//   STEP-005  GL Balance Check   — GET gl-engine-go /v1/gl/trial-balance
 //   STEP-006  CTR Filing         — trigger NFIU CTR extract for the day
 //   STEP-007  Audit Finalization — publish eod.completed event
 //   STEP-008  EOFI Mark          — unlock for next business date
@@ -21,11 +22,13 @@
 //
 // Required environment variables:
 //   DATABASE_URL                  — PostgreSQL DSN
-//   INTEREST_COMPUTATION_URL      — interest-computation-rs base URL
-//   RECONCILIATION_ENGINE_URL     — reconciliation-engine-rs base URL
-//   SETTLEMENT_MGR_URL            — mojaloop-settlement-mgr-go base URL
-//   GL_ENGINE_URL                 — gl-engine-rs base URL
+//   INTEREST_ACCRUAL_URL          — interest-accrual-engine-go base URL (MN-24)
+//   RECON_URL                     — reconciliation-engine-rs base URL (MN-24)
+//   GL_ENGINE_URL                 — gl-engine-go base URL (MN-24)
 //   NFIU_CTR_STR_URL              — nfiu-ctr-str-filing-py base URL
+//   EOD_SERVICE_TOKEN             — service Bearer token for downstream calls
+//                                   (interest-accrual-engine-go, reconciliation-engine-rs
+//                                   and gl-engine-go all enforce JWT, fail-closed) (MN-24)
 //   DAPR_URL                      — Dapr sidecar
 //   DAPR_PUBSUB                   — Dapr pub/sub component name
 //   ALLOWED_ORIGINS               — CORS allowed origins
@@ -53,6 +56,9 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+
+	"go.opentelemetry.io/otel/attribute"
+	"shared/otel/go/otelkit"
 )
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -82,7 +88,7 @@ func initDB() {
 		log.Fatal("DATABASE_URL is required")
 	}
 	var err error
-	db, err = sql.Open("postgres", dsn)
+	db, err = otelkit.OpenSQLDB("postgres", dsn)
 	if err != nil {
 		log.Fatalf("DB open: %v", err)
 	}
@@ -193,6 +199,13 @@ func callService(method, url string, tenantID string, body interface{}) (int, []
 	req.Header.Set("x-tenant-id", tenantID)
 	req.Header.Set("x-keycloak-id", "eod-processor")
 	req.Header.Set("x-user-role", "system")
+	// MN-24: downstream targets (interest-accrual-engine-go,
+	// reconciliation-engine-rs, gl-engine-go) all enforce JWT fail-closed, so
+	// EOD attaches its service token. When unset, calls will 401 and the step
+	// fails loudly — that is the intended fail-closed behaviour.
+	if tok := strings.TrimSpace(os.Getenv("EOD_SERVICE_TOKEN")); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 
 	client := &http.Client{Timeout: 300 * time.Second} // 5min per step
 	resp, err := client.Do(req)
@@ -270,11 +283,23 @@ func stepDone(id int, recordsProcessed int, result interface{}) {
 		SELECT run_id FROM eod_step_records WHERE id=$1)`, id)
 }
 
-func stepFailed(id int, errMsg string) {
+func stepFailed(id int, stepID, errMsg string) {
 	db.Exec(`UPDATE eod_step_records SET status='failed', completed_at=now(),
 		error_message=$1 WHERE id=$2`, errMsg, id)
 	db.Exec(`UPDATE eod_runs SET failed_steps=failed_steps+1 WHERE id IN (
 		SELECT run_id FROM eod_step_records WHERE id=$1)`, id)
+	// MN-24: EVERY failed step increments eod_run_failures_total (Wave-9 counter;
+	// feeds the EODRunFailed alert rule), not only hard-aborting ones.
+	otelkit.IncCounter(context.Background(), "eod_run_failures_total",
+		attribute.String("service", "eod-processor-go"),
+		attribute.String("step", stepID))
+}
+
+// stepSkipped records a step as explicitly skipped with an operator-visible
+// reason (e.g. MN-24: no real settlement executor exists to call).
+func stepSkipped(id int, note string) {
+	db.Exec(`UPDATE eod_step_records SET status='skipped', completed_at=now(),
+		result_json=$1 WHERE id=$2`, fmt.Sprintf(`{"note":%q}`, note), id)
 }
 
 // ── EOD Step Executors ────────────────────────────────────────────────────────
@@ -291,156 +316,164 @@ func executeEOTI(runID int, tid, businessDate string) (int, error) {
 	return 1, nil
 }
 
-// STEP-002: Trigger interest accrual for businessDate
+// STEP-002: Trigger interest accrual for businessDate.
+// MN-24/F2-01: previously pointed at interest-computation-rs:8336
+// /api/interest/accrue — a route that does not exist on that service (it only
+// serves /api/v1/service_configs* on :8103), so EOD hard-aborted here every
+// run. The real accrual engine is interest-accrual-engine-go
+// (POST /v1/interest/accrue, container port 8080 in-cluster), which posts
+// balanced GL journals with a per-(tenant,account,date) idempotency fence.
 func executeInterestAccrual(runID int, tid, businessDate string) (int, error) {
 	recID := stepStarted(runID, "STEP-002", "Interest Accrual")
-	url := getEnv("INTEREST_COMPUTATION_URL", "http://interest-computation-rs:8336") + "/api/interest/accrue"
+	url := getEnv("INTEREST_ACCRUAL_URL", "http://interest-accrual-engine-go:8080") + "/v1/interest/accrue"
 
 	code, body, err := callService("POST", url, tid, map[string]interface{}{
-		"accrualDate": businessDate,
+		"businessDate": businessDate,
 	})
 	if err != nil {
-		stepFailed(recID, err.Error())
+		stepFailed(recID, "STEP-002", err.Error())
 		return 0, fmt.Errorf("interest accrual call failed: %w", err)
 	}
 	if code != 202 && code != 200 {
 		msg := fmt.Sprintf("interest accrual HTTP %d: %s", code, string(body))
-		stepFailed(recID, msg)
+		stepFailed(recID, "STEP-002", msg)
 		return 0, fmt.Errorf("%s", msg)
 	}
 
 	var result map[string]interface{}
 	json.Unmarshal(body, &result)
 	stepDone(recID, 1, result)
-	log.Printf("EOD run=%d STEP-002 interest accrual triggered runId=%v", runID, result["runId"])
+	log.Printf("EOD run=%d STEP-002 interest accrual triggered batchId=%v status=%v", runID, result["batchId"], result["status"])
 	return 1, nil
 }
 
-// STEP-003: Trigger reconciliation run
+// STEP-003: Trigger reconciliation run.
+// MN-24/F2-01: previously called reconciliation-engine-rs:8290
+// /api/recon/trigger — neither the port (real: 8234, 8080 in-cluster) nor the
+// route exists. The real route is POST /v1/settlement-recon/run, which reads
+// nostro_positions, compares integer kobo balances and persists recon_breaks /
+// suspense items on discrepancy (MN-17). It fails closed with 503
+// source_unavailable when its data source is missing — treated as a step
+// failure here (hard-abort), which is the correct behaviour for EOD.
 func executeReconciliation(runID int, tid, businessDate string) (int, error) {
 	recID := stepStarted(runID, "STEP-003", "Reconciliation")
-	url := getEnv("RECONCILIATION_ENGINE_URL", "http://reconciliation-engine-rs:8290") + "/api/recon/trigger"
+	url := getEnv("RECON_URL", "http://reconciliation-engine-rs:8080") + "/v1/settlement-recon/run"
 
 	code, body, err := callService("POST", url, tid, map[string]interface{}{
-		"triggeredBy":  "eod-processor",
-		"businessDate": businessDate,
+		"recon_type":    "nostro",
+		"business_date": businessDate,
 	})
 	if err != nil {
-		stepFailed(recID, err.Error())
+		stepFailed(recID, "STEP-003", err.Error())
 		return 0, fmt.Errorf("reconciliation call failed: %w", err)
 	}
 	if code != 202 && code != 200 {
 		msg := fmt.Sprintf("reconciliation HTTP %d: %s", code, string(body))
-		stepFailed(recID, msg)
+		stepFailed(recID, "STEP-003", msg)
 		return 0, fmt.Errorf("%s", msg)
 	}
 
-	var result map[string]interface{}
+	var result struct {
+		Recon struct {
+			ReconID          string `json:"recon_id"`
+			Status           string `json:"status"`
+			ItemsOutstanding int    `json:"items_outstanding"`
+		} `json:"recon"`
+	}
 	json.Unmarshal(body, &result)
-	stepDone(recID, 1, result)
-	log.Printf("EOD run=%d STEP-003 reconciliation triggered runId=%v", runID, result["runId"])
+	stepDone(recID, result.Recon.ItemsOutstanding, map[string]interface{}{
+		"reconId": result.Recon.ReconID, "reconStatus": result.Recon.Status,
+		"itemsOutstanding": result.Recon.ItemsOutstanding,
+	})
+	log.Printf("EOD run=%d STEP-003 reconciliation done reconId=%s status=%s outstanding=%d",
+		runID, result.Recon.ReconID, result.Recon.Status, result.Recon.ItemsOutstanding)
 	return 1, nil
 }
 
-// STEP-004: Close open settlement window and execute settlement
+// STEP-004: Settlement Finalize.
+// MN-24/F2-01: the previous implementation called mojaloop-settlement-mgr-go
+// /v1/settlement/windows* — routes that DO NOT EXIST on that service; its only
+// processing endpoint is an explicit 501 (services/mojaloop-settlement-mgr-go
+// handleProcess). There is no real settlement executor in the fleet today.
+// Rather than calling fiction (or failing EOD forever on a 501 scaffold), the
+// step is recorded as explicitly SKIPPED with an operator-visible reason, and
+// the run continues. Re-enable a real call here only when a settlement
+// executor with real window close/settle routes is deployed.
 func executeSettlement(runID int, tid, businessDate string) (int, error) {
 	recID := stepStarted(runID, "STEP-004", "Settlement Finalize")
-	settlementURL := getEnv("SETTLEMENT_MGR_URL", "http://mojaloop-settlement-mgr-go:8268")
-
-	// Find the open window
-	code, body, err := callService("GET", settlementURL+"/v1/settlement/windows?status=open", tid, nil)
-	if err != nil {
-		stepFailed(recID, err.Error())
-		return 0, fmt.Errorf("get settlement windows: %w", err)
-	}
-
-	var windowsResp struct {
-		Items []struct {
-			ID     string `json:"id"`
-			Status string `json:"status"`
-		} `json:"items"`
-		Total int `json:"total"`
-	}
-	if code == 200 {
-		json.Unmarshal(body, &windowsResp)
-	}
-
-	if len(windowsResp.Items) == 0 {
-		// No open window — not an error for EOD; settlement may have already closed
-		stepDone(recID, 0, map[string]string{"note": "no open settlement window"})
-		log.Printf("EOD run=%d STEP-004 no open settlement window, skipping", runID)
-		return 0, nil
-	}
-
-	windowID := windowsResp.Items[0].ID
-
-	// Close the window
-	closeCode, closeBody, err := callService("POST",
-		fmt.Sprintf("%s/v1/settlement/windows/%s/close", settlementURL, windowID),
-		tid, nil)
-	if err != nil {
-		stepFailed(recID, err.Error())
-		return 0, fmt.Errorf("close settlement window: %w", err)
-	}
-	if closeCode != 200 {
-		msg := fmt.Sprintf("close window HTTP %d: %s", closeCode, string(closeBody))
-		stepFailed(recID, msg)
-		return 0, fmt.Errorf("%s", msg)
-	}
-
-	// Execute settlement
-	settleCode, settleBody, err := callService("POST",
-		fmt.Sprintf("%s/v1/settlement/windows/%s/settle", settlementURL, windowID),
-		tid, nil)
-	if err != nil {
-		stepFailed(recID, err.Error())
-		return 0, fmt.Errorf("settle window: %w", err)
-	}
-	if settleCode != 200 {
-		msg := fmt.Sprintf("settle HTTP %d: %s", settleCode, string(settleBody))
-		stepFailed(recID, msg)
-		return 0, fmt.Errorf("%s", msg)
-	}
-
-	var settleResult map[string]interface{}
-	json.Unmarshal(settleBody, &settleResult)
-	stepDone(recID, 1, settleResult)
-	log.Printf("EOD run=%d STEP-004 settlement completed window=%s", runID, windowID)
-	return 1, nil
+	note := "skipped: no settlement executor deployed — mojaloop-settlement-mgr-go is a 501 scaffold with no /v1/settlement/windows routes; refusing to call fiction"
+	stepSkipped(recID, note)
+	log.Printf("EOD run=%d STEP-004 %s (date=%s tenant=%s)", runID, note, businessDate, tid)
+	return 0, nil
 }
 
-// STEP-005: Verify GL trial balance debits == credits
+// STEP-005: Verify GL trial balance debits == credits.
+// MN-24/F2-01: previously called gl-engine-rs:8251 GET /v1/gl/trial-balance —
+// wrong service AND wrong method (gl-engine-rs :8101 serves that route
+// POST-only). The real read endpoint is gl-engine-go GET
+// /v1/gl/trial-balance?tenantId=..., which returns persisted trial-balance
+// rows {items: [{total_debits_kobo, total_credits_kobo, ...}]}. EOD sums the
+// integer kobo columns and requires exact debit == credit equality.
 func executeGLBalanceCheck(runID int, tid, businessDate string) (int, error) {
 	recID := stepStarted(runID, "STEP-005", "GL Balance Check")
-	glURL := getEnv("GL_ENGINE_URL", "http://gl-engine-rs:8251")
+	glURL := getEnv("GL_ENGINE_URL", "http://gl-engine-go:8080")
 
-	code, body, err := callService("GET", glURL+"/v1/gl/trial-balance", tid, nil)
+	code, body, err := callService("GET",
+		fmt.Sprintf("%s/v1/gl/trial-balance?tenantId=%s", glURL, tid), tid, nil)
 	if err != nil {
-		stepFailed(recID, err.Error())
+		stepFailed(recID, "STEP-005", err.Error())
 		return 0, fmt.Errorf("GL trial balance call: %w", err)
 	}
 	if code != 200 {
 		msg := fmt.Sprintf("GL trial balance HTTP %d: %s", code, string(body))
-		stepFailed(recID, msg)
+		stepFailed(recID, "STEP-005", msg)
 		return 0, fmt.Errorf("%s", msg)
 	}
 
-	var tbResult map[string]interface{}
-	json.Unmarshal(body, &tbResult)
+	var tbResult struct {
+		Items []struct {
+			GLAccountCode      string `json:"glAccountCode"`
+			TotalDebitsKobo    int64  `json:"total_debits_kobo"`
+			TotalCreditsKobo   int64  `json:"total_credits_kobo"`
+			ClosingBalanceKobo int64  `json:"closing_balance_kobo"`
+		} `json:"items"`
+		Total int `json:"total"`
+	}
+	if err := json.Unmarshal(body, &tbResult); err != nil {
+		msg := fmt.Sprintf("GL trial balance unparseable response: %v", err)
+		stepFailed(recID, "STEP-005", msg)
+		return 0, fmt.Errorf("%s", msg)
+	}
+	if len(tbResult.Items) == 0 {
+		// Fail-closed: with no trial-balance rows the balance check cannot be
+		// verified, so the step must NOT pass silently.
+		msg := "GL trial balance returned zero rows — balance cannot be verified (fail-closed)"
+		stepFailed(recID, "STEP-005", msg)
+		return 0, fmt.Errorf("%s", msg)
+	}
 
-	// Enforce balance: totalDebitKobo == totalCreditKobo
-	totalDebit, _ := tbResult["totalDebitKobo"].(float64)
-	totalCredit, _ := tbResult["totalCreditKobo"].(float64)
+	// Integer kobo comparison — no float money.
+	var totalDebit, totalCredit int64
+	for _, it := range tbResult.Items {
+		totalDebit += it.TotalDebitsKobo
+		totalCredit += it.TotalCreditsKobo
+	}
 	if totalDebit != totalCredit {
-		msg := fmt.Sprintf("GL OUT OF BALANCE: debit=%v credit=%v diff=%v",
+		msg := fmt.Sprintf("GL OUT OF BALANCE: debitKobo=%d creditKobo=%d diffKobo=%d",
 			totalDebit, totalCredit, totalDebit-totalCredit)
-		stepFailed(recID, msg)
+		stepFailed(recID, "STEP-005", msg)
 		return 0, fmt.Errorf("%s", msg)
 	}
 
-	stepDone(recID, int(totalDebit), tbResult)
-	log.Printf("EOD run=%d STEP-005 GL balanced debit=%.0f credit=%.0f", runID, totalDebit, totalCredit)
-	return int(totalDebit), nil
+	stepDone(recID, len(tbResult.Items), map[string]interface{}{
+		"accountsChecked":  len(tbResult.Items),
+		"totalDebitsKobo":  totalDebit,
+		"totalCreditsKobo": totalCredit,
+		"businessDate":     businessDate,
+	})
+	log.Printf("EOD run=%d STEP-005 GL balanced accounts=%d debitKobo=%d creditKobo=%d",
+		runID, len(tbResult.Items), totalDebit, totalCredit)
+	return len(tbResult.Items), nil
 }
 
 // STEP-006: Request NFIU CTR extract for business date
@@ -529,6 +562,9 @@ func runEOD(runID int, tid, businessDate string) {
 			// Steps 001–005 are hard-required; failures abort the run
 			// Steps 006–008 are best-effort
 			if i < 5 {
+				// MN-24: eod_run_failures_total is incremented by stepFailed for
+				// every failed step (hard or soft); here we only mark the run
+				// failed and hard-abort (fail-closed semantics unchanged).
 				db.Exec(`UPDATE eod_runs SET status='failed', completed_at=now(),
 					error_summary=$1 WHERE id=$2`, err.Error(), runID)
 				return
@@ -983,6 +1019,17 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), "eod-processor-go")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startJWKSRefresh()
 
 	initDB()
@@ -1005,7 +1052,7 @@ func main() {
 
 	port := getEnv("PORT", "8207")
 	log.Printf("eod-processor-go listening on :%s — %d pipeline steps", port, len(pipeline))
-	log.Fatal(http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(corsMiddleware(mux))))))
+	log.Fatal(http.ListenAndServe(":"+port, otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(corsMiddleware(mux)))))))
 }
 
 // --- Request metrics (restored fleet-canonical block) ---

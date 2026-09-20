@@ -1,0 +1,45 @@
+# Prometheus — corebanking observability (wave-9, builder B1)
+# Federation model: the OTel Collector re-exports everything (OTLP SDK metrics
+# + scraped middleware exporters + postgresql/redis receivers) on :8889;
+# Prometheus scrapes that one endpoint plus the stack's own self-metrics.
+# External label cluster=54bank per mission contract.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    cluster: 54bank
+    monitor: corebanking-observability
+
+scrape_configs:
+  # Primary federation point: everything the collector exports.
+  # honor_labels preserves the exporter's own job/service labels so
+  # middleware job names (kafka-jmx, postgres-exporter, ...) survive.
+  - job_name: otel-collector-federation
+    honor_labels: true
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  # Collector internal telemetry (queue sizes, refused spans, memory).
+  # Powers the CollectorQueueBackpressure alert family (SPEC §4).
+  - job_name: otel-collector-internal
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  # Stack self-monitoring.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: tempo
+    static_configs:
+      - targets: ["tempo:3200"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: grafana
+    static_configs:
+      - targets: ["grafana:3000"]

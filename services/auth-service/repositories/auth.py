@@ -37,3 +37,12 @@ class AuthRepository:
         )
         self.__db.add(auth)
         return auth
+
+    def delete_auth_by_keycloak_id(self, keycloak_id: str, tenant_id: str) -> bool:
+        """Delete an auth profile by keycloak id (R1A saga-compensation
+        contract). Returns True when a row was removed, False when absent."""
+        auth = self.get_auth_by_keycloak_id(keycloak_id, tenant_id)
+        if auth is None:
+            return False
+        self.__db.delete(auth)
+        return True

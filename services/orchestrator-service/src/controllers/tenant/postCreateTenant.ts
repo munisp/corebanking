@@ -1,4 +1,3 @@
-import { uuid4 } from "@temporalio/workflow";
 import { asyncHandler } from "../../middlewares/async";
 import { workflowRunner } from "../../utils/workflowRunner";
 import { validateRequest } from "../../validations";
@@ -6,6 +5,7 @@ import { createTenantWorkflow } from "../../workflows/createTenantWorkflow";
 import httpStatus from "http-status";
 import { generateSlug } from "../../utils";
 import { CreateTenantSchema } from "../../validations/schemas";
+import { readEnv } from "../../config/readEnv.config";
 import logger from "../../config/logger.config";
 
 export const postCreateTenant = asyncHandler(async (req, res) => {
@@ -22,8 +22,11 @@ export const postCreateTenant = asyncHandler(async (req, res) => {
   });
 
   const tenantId = generateSlug(payload.name);
-  const ledgerId = "1"; // Default ledger ID for new tenants
-  const workflowId = `54link_create_tenant_${tenantId}_${uuid4()}`;
+  // PL-01: ledger for a brand-new tenant comes from env until per-tenant
+  // ledger provisioning exists (DEFAULT_LEDGER_ID, default "1").
+  const ledgerId = readEnv("DEFAULT_LEDGER_ID", "1") as string;
+  // OB-08: deterministic workflow id — retries of the same tenant slug dedup.
+  const workflowId = `54link_create_tenant_${tenantId}`;
 
   logger.info(`[postCreateTenant] Starting tenant creation workflow`, {
     tenantId,

@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
@@ -392,6 +392,43 @@ def affordability_check(monthly_income, monthly_expenses, proposed_emi):
     disposable = monthly_income - monthly_expenses
     affordable = proposed_emi <= disposable * 0.5
     return {"disposable_income": round(disposable, 2), "proposed_emi": proposed_emi, "affordable": affordable, "max_emi": round(disposable * 0.5, 2)}
+
+
+# LN-16: advisory scoring routes. These expose the domain logic above over HTTP
+# for loan-origination (see services/loan-origination/main.go:51-55, R9-05).
+# Advisory only: results are NOT persisted and carry advisory=True so callers
+# cannot mistake them for binding credit decisions. The global JWTAuthMiddleware
+# (fail-closed; probes exempt) already guards these paths.
+def _require_numeric(payload: Dict[str, Any], fields) -> Dict[str, float]:
+    values = {}
+    for f in fields:
+        v = payload.get(f)
+        if v is None:
+            raise HTTPException(status_code=400, detail=f"missing required field: {f}")
+        try:
+            values[f] = float(v)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail=f"field {f} must be numeric")
+    return values
+
+
+@app.post("/api/v1/score/advisory")
+def score_advisory(payload: Dict[str, Any] = Body(...)):
+    v = _require_numeric(payload, ["income", "debt", "employment_years", "loan_history_count", "defaults", "age"])
+    result = compute_credit_score(
+        v["income"], v["debt"], v["employment_years"],
+        v["loan_history_count"], v["defaults"], v["age"],
+    )
+    result["advisory"] = True
+    return result
+
+
+@app.post("/api/v1/affordability/advisory")
+def affordability_advisory(payload: Dict[str, Any] = Body(...)):
+    v = _require_numeric(payload, ["monthly_income", "monthly_expenses", "proposed_emi"])
+    result = affordability_check(v["monthly_income"], v["monthly_expenses"], v["proposed_emi"])
+    result["advisory"] = True
+    return result
 
 
 # --- HTTP Handler ---

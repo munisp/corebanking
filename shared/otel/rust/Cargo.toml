@@ -1,0 +1,31 @@
+[package]
+name = "otelkit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Shared OpenTelemetry kit for corebanking Rust services (Wave-9 SPEC §2.5)"
+license = "Proprietary"
+publish = false
+
+# Framework integrations are optional so non-HTTP services (batch jobs, raw
+# socket daemons) do not pay for axum/actix/tower-http in their dep tree.
+[features]
+default = []
+axum = ["dep:axum", "dep:tower-http"]
+actix-web = ["dep:actix-web", "dep:futures-util"]
+
+[dependencies]
+# Version pinning rationale: see README.md.
+# opentelemetry* 0.27.x and tracing-opentelemetry 0.28.x are the mutually
+# compatible release line; bumping one without the other breaks compilation.
+opentelemetry = { version = "0.27", features = ["trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["trace", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.28"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
+
+axum = { version = "0.7", optional = true }
+tower-http = { version = "0.5", features = ["trace"], optional = true }
+actix-web = { version = "4.9", optional = true }
+futures-util = { version = "0.3", optional = true }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
@@ -10,17 +11,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/IBM/sarama"
+	"io"
 	"log"
+	"math"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
 
 var serviceName = "trade-finance-go"
+
+// Package-level DB pool. W10 build repair: this declaration was missing upstream
+// (module never compiled at HEAD); initDB() assigns it, handlers nil-guard it.
+var db *sql.DB
+
+// nowISO was lost with the OR-01 deletion of enhancements.go; createHandler uses it.
+func nowISO() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // Inter-service URLs
 var sanctionsURL = func() string {
@@ -192,8 +205,9 @@ func initDB() {
 		db = nil
 		return
 	}
-	defer db.Close()
-
+	// W10 build repair: the upstream `defer db.Close()` here closed the pool the
+	// moment initDB returned, breaking every subsequent query. The pool lives
+	// for the process lifetime; it is intentionally not closed here.
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(5 * time.Minute)
@@ -222,6 +236,10 @@ func initSchema() {
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(config_key, environment, tenant_id)
 	)`)
+	if err != nil {
+		// W10 build repair: err was declared and never checked upstream.
+		log.Printf("[%s] service_configs schema init failed: %v", serviceName, err)
+	}
 	db.Exec(`CREATE TABLE IF NOT EXISTS service_records (id TEXT PRIMARY KEY, service TEXT NOT NULL, type TEXT DEFAULT 'default', status TEXT DEFAULT 'active', data JSONB DEFAULT '{}', created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
 	db.Exec(`CREATE TABLE IF NOT EXISTS trade_transactions (id SERIAL PRIMARY KEY, trade_id TEXT, lc_number TEXT, applicant TEXT, beneficiary TEXT, amount NUMERIC(15,2), currency TEXT, status TEXT, incoterm TEXT, created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW())`)
@@ -257,13 +275,19 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 	if upstreamURL == "" {
 		upstreamURL = "http://localhost:8120"
 	}
+	// W10 build repair: was `log.Fatalf("schema init failed", err)` — killed the
+	// process on any AML upstream error, with a copy-pasted wrong message, and
+	// discarded the screening verdict. Now fail-closed with an honest 502; the
+	// persisted record id is returned so the trade is not lost for audit.
 	result, err := callService("POST", upstreamURL+"/v1/screen", body)
 	if err != nil {
-		log.Fatalf("schema init failed: %v", err)
+		log.Printf("[%s] AML screening upstream failed: %v", serviceName, err)
+		jsonResp(w, 502, map[string]interface{}{"created": true, "id": id, "aml_screening": "unavailable", "error": "aml_upstream_unavailable"})
+		return
 	}
 
 	cacheSet(tenantID+":"+"trade_finance_list", "", 1) // invalidate list cache
-	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "data": body, "source": dbSourceTag()})
+	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "data": body, "aml_screening": result, "source": dbSourceTag()})
 }
 func lcFee(amount float64, tenor int) float64 {
 	rate := 0.0015
@@ -272,15 +296,48 @@ func lcFee(amount float64, tenor int) float64 {
 	}
 	return math.Round(amount*rate*float64(tenor)/365.0*100) / 100
 }
-func domainHandler(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case "GET":
-		listRecords(w, r)
-	case "POST":
-		createRecord(w, r)
-	default:
-		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+
+// W10 build repair: the unrouted domainHandler (referencing listRecords /
+// createRecord, which were never defined anywhere upstream) is deleted as
+// orphan code. Its intended functionality is already served by the mounted
+// routes /api/list (listHandler) and /api/create (createHandler).
+
+// requiredDocuments returns the LC presentation document checklist for the
+// given Incoterm. Used by the mounted issueLCHandler. Base set follows UCP 600
+// art. 18-28; insurance document only when the Incoterm obliges the seller to
+// insure (CIF/CIP); transport document type follows carriage mode implied by
+// the term (any-mode vs sea/inland-waterway-only).
+func requiredDocuments(incoterm string) []string {
+	docs := []string{"commercial_invoice", "packing_list", "certificate_of_origin"}
+	seaOnly := map[string]bool{"FAS": true, "FOB": true, "CFR": true, "CIF": true}
+	if seaOnly[strings.ToUpper(incoterm)] {
+		docs = append(docs, "bill_of_lading")
+	} else {
+		docs = append(docs, "transport_document")
 	}
+	switch strings.ToUpper(incoterm) {
+	case "CIF", "CIP":
+		docs = append(docs, "insurance_certificate")
+	}
+	return docs
+}
+
+// validatePresentation checks a document presentation against the required
+// checklist (UCP 600 art. 14 documentary compliance). Returns compliant=true
+// only when every required document type was presented. W10 build repair:
+// referenced by the mounted presentDocHandler but never defined upstream.
+func validatePresentation(presented, required []string) (bool, []string) {
+	set := make(map[string]bool, len(presented))
+	for _, d := range presented {
+		set[strings.ToLower(strings.TrimSpace(d))] = true
+	}
+	missing := []string{}
+	for _, req := range required {
+		if !set[strings.ToLower(req)] {
+			missing = append(missing, req)
+		}
+	}
+	return len(missing) == 0, missing
 }
 
 func lcStatus(issued bool, expired bool, utilized bool) string {

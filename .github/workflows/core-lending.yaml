@@ -14,7 +14,6 @@ on:
       - 'services/credit-service/**'
       - 'services/debt-collection-go/**'
       - 'services/education-loan-service/**'
-      - 'services/education-loans-py/**'
       - 'services/group-lending-go/**'
       - 'services/interbank-lending-rs/**'
       - 'services/loan-calculator-go/**'
@@ -57,7 +56,7 @@ jobs:
           file: ./docker/Dockerfile.consolidated
           push: true
           build-args: |
-            SERVICES=agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,education-loans-py,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go
+            SERVICES=agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go
             PRIMARY_LANG=go
             PORT_BASE=9310
           tags: registry.digitalocean.com/talentgraph-auth/54link-dev-core-lending:${{ env.TAG }}

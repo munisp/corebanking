@@ -474,6 +474,7 @@ fn sanitize_input(s: &str) -> String {
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
         let id = format!("{}_{}_{}", "ussd_transaction_engine_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let _span = otelkit::pg_span("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)").entered();
         let svc_name = String::from("ussd-transaction-engine-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
@@ -706,6 +707,15 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     log::info!("[ussd-transaction-engine-rs] starting");
 
+    // Wave-9 otelkit (SPEC §2.5): OTLP gRPC tracing; dropping the guard flushes spans.
+    let _otel_guard = match otelkit::init("ussd-transaction-engine-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[ussd-transaction-engine-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
+
 HttpServer::new(move || {
         App::new()
                 .wrap(
@@ -741,6 +751,7 @@ HttpServer::new(move || {
                 .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
                 .add(("Content-Security-Policy", "default-src 'self'"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .wrap(otelkit::actix::TenantMiddleware)
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))

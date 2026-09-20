@@ -1,3 +1,4 @@
+import os
 import time
 from utils import ExternalAPIClient, get_config, create_logger
 from schemas import Context, AuditEventSchema
@@ -29,6 +30,10 @@ class AuditServiceAdapter(ExternalAPIClient):
             "x-tenant-id": context.tenant_id if context else "system",
             "x-keycloak-id": "system",
         }
+        # AU-01 (F15-1): service-to-service ingest credential (fail-closed receiver).
+        _ingest_token = os.getenv("AUDIT_INGEST_TOKEN", "")
+        if _ingest_token:
+            headers["X-Audit-Ingest-Token"] = _ingest_token
         event_data = payload.model_dump()
 
         last_exc = None
@@ -51,3 +56,14 @@ class AuditServiceAdapter(ExternalAPIClient):
             event_data,
             str(last_exc),
         )
+        # Alerting contract (w9 addendum): count exhausted audit ship failures.
+        try:
+            import sys as _s
+            _s.path.insert(0, os.path.normpath(os.path.join(
+                os.path.dirname(__file__), "..", "..", "..", "shared", "otel", "python")))
+            from otelkit import inc_counter
+            inc_counter("audit_ship_failures_total",
+                        {"service": "payment-processing-service",
+                         "tenant_id": context.tenant_id if context else "unknown"})
+        except Exception:
+            pass

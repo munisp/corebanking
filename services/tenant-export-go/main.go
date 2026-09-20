@@ -130,7 +130,8 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(cached))
 		return
 	}
-	// DB-first query with in-memory fallback
+	// PL-07: DB-only read path — the in-memory fallback served stale, per-pod
+	// records while claiming to be tenant export data. DB outage => honest 503.
 	if db != nil {
 		rows, err := db.Query("SELECT id, service, type, status, data, created_at FROM service_records WHERE service = $1 ORDER BY created_at DESC LIMIT 100", "tenant_export_go")
 		if err == nil {
@@ -146,12 +147,9 @@ func handleList(w http.ResponseWriter, r *http.Request) {
 			respondJSON(w, 200, map[string]interface{}{"records": items, "total": len(items), "source": "database"})
 			return
 		}
-		log.Printf("tenant-export-go: DB query failed, falling back to in-memory: %v", err)
+		log.Printf("tenant-export-go: DB query failed: %v", err)
 	}
-	// In-memory fallback
-	mu.Lock()
-	defer mu.Unlock()
-	respondJSON(w, 200, map[string]interface{}{"records": records, "total": len(records), "source": "in-memory"})
+	respondJSON(w, 503, map[string]interface{}{"error": "record store unavailable", "message": "Postgres is not reachable; no in-memory fallback is served."})
 }
 
 func handleCreate(w http.ResponseWriter, r *http.Request) {

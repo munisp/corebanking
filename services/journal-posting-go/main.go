@@ -23,6 +23,7 @@ import (
 	"github.com/IBM/sarama"
 	_ "github.com/lib/pq"
 	"github.com/munisp/corebanking/pkg/tbclient"
+	"shared/otel/go/otelkit"
 )
 
 var db *sql.DB
@@ -719,6 +720,17 @@ func main() {
 		port = "8080"
 	}
 
+	shutdown, oerr := otelkit.Init(context.Background(), serviceName)
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startWatchdog(10 * time.Second)
 
 	// Postgres (journal records + outbox)
@@ -728,7 +740,7 @@ func main() {
 		log.Fatalf("[journal-posting-go] DATABASE_URL env var is required; refusing to start with default database credentials")
 	}
 	var err error
-	db, err = sql.Open("postgres", dsn)
+	db, err = otelkit.OpenSQLDB("postgres", dsn)
 	if err != nil {
 		log.Fatalf("database connection failed: %v", err)
 	}
@@ -760,7 +772,7 @@ func main() {
 	mux.Handle("/v1/journals", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handlePostJournal)))
 	mux.Handle("/v1/journals/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleGetJournal)))
 
-	handler := panicRecoveryMiddleware(securityMiddleware(mux))
+	handler := otelkit.HTTPMiddleware(panicRecoveryMiddleware(securityMiddleware(mux)))
 
 	srv := &http.Server{
 		Addr:         ":" + port,

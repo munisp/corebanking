@@ -230,21 +230,18 @@ func handlePublish(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- Predefined Event Types ---
+// OR-24: pruned 12 catalog entries naming event types nobody produces
+// (verified by fleet-wide fixed-string grep; remaining refs were struct
+// fields like `transaction.completed_at` or healthz descriptor strings):
+// transaction.{completed,failed,reversed}, approval.approved,
+// alert.{fraud,aml,system}, kyc.status_changed, loan.disbursed,
+// loan.repayment_due, card.transaction, balance.threshold.
+// Kept entries have verified live producers in maker-checker-go
+// (main.go:440,704,792). approval.completed added — also produced (:704).
 var eventTypes = map[string]string{
-	"transaction.completed": "transactions",
-	"transaction.failed":    "transactions",
-	"transaction.reversed":  "transactions",
-	"approval.requested":    "approvals",
-	"approval.approved":     "approvals",
-	"approval.rejected":     "approvals",
-	"alert.fraud":           "alerts",
-	"alert.aml":             "alerts",
-	"alert.system":          "system",
-	"kyc.status_changed":    "alerts",
-	"loan.disbursed":        "transactions",
-	"loan.repayment_due":    "alerts",
-	"card.transaction":      "transactions",
-	"balance.threshold":     "alerts",
+	"approval.requested": "approvals",
+	"approval.completed": "approvals",
+	"approval.rejected":  "approvals",
 }
 
 func handleEventTypes(w http.ResponseWriter, r *http.Request) {

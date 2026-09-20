@@ -1,0 +1,164 @@
+# docker-compose.observability.yml — corebanking observability stack (wave-9 B1)
+# Bring-up:  docker compose -f docker-compose.observability.yml up -d
+# Requires: GRAFANA_ADMIN_PASSWORD set in the environment (no default, by design).
+# All middleware/metrics endpoints are env-driven with in-cluster defaults.
+# Nothing here has been executed — see README.md "verified vs requires-deploy".
+
+name: corebanking-observability
+
+networks:
+  observability:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.114.0
+    container_name: otel-collector
+    restart: unless-stopped
+    user: "10001:10001"   # numeric non-root; image is distroless (no shell)
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-dev}
+      # Middleware exporter endpoints (defaults = sibling stack/hostnames)
+      KAFKA_JMX_HOST: ${KAFKA_JMX_HOST:-kafka}
+      POSTGRES_EXPORTER_HOST: ${POSTGRES_EXPORTER_HOST:-postgres-exporter}
+      REDIS_EXPORTER_HOST: ${REDIS_EXPORTER_HOST:-redis-exporter}
+      KEYCLOAK_HOST: ${KEYCLOAK_HOST:-keycloak}
+      PERMIFY_HOST: ${PERMIFY_HOST:-permify}
+      OPENSEARCH_HOST: ${OPENSEARCH_HOST:-opensearch}
+      APISIX_HOST: ${APISIX_HOST:-apisix}
+      TEMPORAL_HOST: ${TEMPORAL_HOST:-temporal-server}
+      FLUVIO_HOST: ${FLUVIO_HOST:-fluvio}
+      TIGERBEETLE_SIDECAR_HOST: ${TIGERBEETLE_SIDECAR_HOST:-tigerbeetle-sidecar}
+      SPARK_JMX_HOST: ${SPARK_JMX_HOST:-spark}
+      # Direct receiver endpoints + credentials (env-only, never defaulted)
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_METRICS_USERNAME: ${POSTGRES_METRICS_USERNAME:-}
+      POSTGRES_METRICS_PASSWORD: ${POSTGRES_METRICS_PASSWORD:-}
+      REDIS_HOST: ${REDIS_HOST:-redis}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    ports:
+      - "4317:4317"     # OTLP gRPC ingest
+      - "4318:4318"     # OTLP HTTP ingest
+      - "8889:8889"     # prometheus exporter (federation point)
+      - "8888:8888"     # collector internal metrics
+      - "13133:13133"   # health_check extension
+    networks: [observability]
+    healthcheck:
+      # The collector image is distroless: no shell, no wget/curl, so an HTTP
+      # probe from inside the container is impossible. `validate` re-parses the
+      # running config and exits non-zero if the binary/filesystem is broken —
+      # a real exec check, but NOT a liveness probe of the running process.
+      # The k8s manifests use a proper kubelet HTTP probe on :13133 instead.
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otelcol-contrib/config.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: prometheus
+    restart: unless-stopped
+    user: "65534:65534"   # nobody (image default)
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks: [observability]
+    depends_on:
+      - otel-collector
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    container_name: tempo
+    restart: unless-stopped
+    user: "10001:10001"
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"     # query API + /ready + /metrics
+      - "4317"          # OTLP gRPC (internal to the network)
+      - "4318"          # OTLP HTTP (internal)
+    networks: [observability]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3200/ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  loki:
+    image: grafana/loki:3.2.1
+    container_name: loki
+    restart: unless-stopped
+    user: "10001:10001"
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"     # push/query API + /ready + /metrics + /otlp
+    networks: [observability]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3100/ready || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: grafana
+    restart: unless-stopped
+    user: "472:472"       # grafana user (image default)
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      # No default: compose refuses to start without it.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set in the environment}
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      GF_PATHS_DATA: /var/lib/grafana
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks: [observability]
+    depends_on:
+      prometheus:
+        condition: service_started
+      tempo:
+        condition: service_started
+      loki:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

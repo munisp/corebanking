@@ -44,7 +44,9 @@ export const resolve_pending_transactions = asyncHandler(async (_, res) => {
       const reserve_funds_response = await CoreBankingApiClient.getInstance().reserve_funds(
         transaction.payer.idValue,
         transaction.amount,
-        "Failed Retriable Transaction"
+        "Failed Retriable Transaction",
+        `${transaction.transaction_id}:${transaction.hold_id || "initial"}`,
+        transaction.tenant
       );
 
       transaction.hold_id = reserve_funds_response?.resourceId || transaction.hold_id;
@@ -70,7 +72,9 @@ export const resolve_pending_transactions = asyncHandler(async (_, res) => {
         const reserve_funds_response = await CoreBankingApiClient.getInstance().reserve_funds(
           parentTransaction.payer.idValue,
           parentTransaction.amount,
-          "Failed Retriable Transaction"
+          "Failed Retriable Transaction",
+          `${parentTransaction.transaction_id}:${parentTransaction.hold_id || "initial"}`,
+          parentTransaction.tenant
         );
 
         parentTransaction.hold_id = reserve_funds_response?.resourceId || parentTransaction.hold_id;

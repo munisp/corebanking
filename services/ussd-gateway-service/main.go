@@ -24,6 +24,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"shared/otel/go/otelkit"
 )
 
 var startTime = time.Now()
@@ -364,6 +366,17 @@ func tenantFromClaims(claims map[string]interface{}) string {
 func main() {
 	port := getEnv("PORT", "9172")
 
+	shutdown, oerr := otelkit.Init(context.Background(), "ussd-gateway-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", healthz)
@@ -375,7 +388,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           loggingMiddleware(jwtAuthMiddleware(mux)),
+		Handler:           otelkit.HTTPMiddleware(loggingMiddleware(jwtAuthMiddleware(mux))),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

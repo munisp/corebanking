@@ -2,12 +2,18 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"shared/otel/go/otelkit"
 )
 
 // CoAClient is a client for interacting with the Chart of Accounts service
@@ -190,15 +196,37 @@ func (c *CoAClient) GetMapping(tenantID, mappingKey string) string {
 	return m.AccountID
 }
 
-// PostAsync fires a journal entry in a background goroutine.
-// COA failures never block the caller — same pattern as audit.
-func (c *CoAClient) PostAsync(tenantID, userID, userRole string, entry CreateJournalEntryRequest) {
-	go func() {
-		if _, err := c.CreateJournalEntry(tenantID, userID, userRole, entry); err != nil {
-			// swallow — COA is non-blocking
-			_ = err
+// PostJournalEntrySync posts a journal entry synchronously with bounded
+// retry (F2-06, Wave-10). The previous PostAsync fire-and-forget goroutine
+// silently swallowed every failure, so escrow releases appeared in
+// TigerBeetle but never in the general ledger — an unbalanced books defect.
+// Terminal failure increments audit_ship_failures_total (the Wave-9 telemetry
+// convention feeding the AuditShipFailureRate alert) and returns the error so
+// the caller can log/alert for reconciliation. The journal is never silently
+// lost.
+func (c *CoAClient) PostJournalEntrySync(ctx context.Context, tenantID, userID, userRole string, entry CreateJournalEntryRequest) (*JournalEntryResponse, error) {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := c.CreateJournalEntry(tenantID, userID, userRole, entry)
+		if err == nil {
+			return resp, nil
 		}
-	}()
+		lastErr = err
+		log.Printf("ERROR: COA journal post attempt %d/%d failed (ref=%s): %v", attempt, maxAttempts, entry.Reference, err)
+		if attempt < maxAttempts {
+			select {
+			case <-ctx.Done():
+				lastErr = fmt.Errorf("context cancelled during COA journal retry: %w", ctx.Err())
+				attempt = maxAttempts
+			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+			}
+		}
+	}
+	otelkit.IncCounter(ctx, "audit_ship_failures_total",
+		attribute.String("service", "escrow-service"),
+		attribute.String("sink", "chart-of-accounts"))
+	return nil, fmt.Errorf("COA journal entry (ref=%s) failed after %d attempts: %w", entry.Reference, maxAttempts, lastErr)
 }
 
 // GetAccounts retrieves all accounts for a tenant

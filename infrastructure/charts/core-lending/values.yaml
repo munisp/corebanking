@@ -63,7 +63,18 @@ dapr:
   memory-request: 250Mi
   memory-limit: 1000Mi
 secrets:
+  # LN-03/LN-01/LN-13 (R9): lending service dependencies. Non-secret service
+  # discovery URLs (no credentials). loan-service fails fast at boot without
+  # PAYMENT_URL; education/agricultural ledger operations fail closed without
+  # TB_ADDRESS; loan-service KYC/credit fetches fail closed (503) without
+  # BVN_NIN_URL / CREDIT_SERVICE_URL reachability.
+  PAYMENT_URL: "http://payment-processing-service:8080/api/v1/payments"
+  LOAN_REPAYMENT_RECIPIENT: "loan-repayment-settlement"
+  TB_ADDRESS: "tigerbeetle.tigerbeetle.svc.cluster.local:3000"
+  BVN_NIN_URL: "http://bvn-nin-verification-go:8080"
+  CREDIT_SERVICE_URL: "http://credit-service:8080"
+  AGRI_DISBURSEMENT_ACCOUNT_ID: "bank-funds:agricultural"
   APP_PORT: "9310"
   PORT_BASE: "9310"
   SERVICE_GROUP: core-lending
-  SERVICES: "agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,education-loans-py,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go"
+  SERVICES: "agent-loan-origination-py,bnpl-service,collateral-valuation-rs,cooperative-credit-scoring-py,credit-scoring-py,credit-service,debt-collection-go,education-loan-service,group-lending-go,interbank-lending-rs,loan-calculator-go,loan-origination-go,loan-service,microfinance-engine-go,microfinance-py,mortgage-service,syndicated-loans-go"

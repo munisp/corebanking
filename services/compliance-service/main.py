@@ -15,6 +15,8 @@ import uvicorn
 import asyncpg
 import os
 import json
+import asyncio
+import requests
 from dotenv import load_dotenv
 from utils import to_utc
 from utils.kafka_instance import KafkaClientInstance
@@ -22,11 +24,44 @@ from utils.kafka_client import ComplianceEventTypes
 
 load_dotenv()
 
+# CP-02: SARs are filed through the real NFIU goAML filer service
+# (nfiu-ctr-str-filing-py). When unset, SAR submission fails closed with 503.
+NFIU_FILING_URL = os.getenv("NFIU_FILING_URL", "").rstrip("/")
+NFIU_SERVICE_TOKEN = os.getenv("NFIU_SERVICE_TOKEN", "")
+SAR_FILING_RETRY_SECONDS = int(os.getenv("SAR_FILING_RETRY_SECONDS", "300"))
+SAR_ACK_POLL_SECONDS = int(os.getenv("SAR_ACK_POLL_SECONDS", "300"))
+SAR_MAX_FILING_ATTEMPTS = int(os.getenv("SAR_MAX_FILING_ATTEMPTS", "10"))
+
 app = FastAPI(
     title="54Link Compliance Service",
     description="Complete compliance and regulatory reporting service",
     version="1.0.0"
 )
+# --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
+# OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
+# tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware
+# (tenant.id span attr from x-tenant-id). Honors OTEL_SDK_DISABLED; never raises.
+try:
+    import os as _otel_os
+    import sys as _otel_sys
+
+    _otel_sys.path.insert(
+        0,
+        _otel_os.path.normpath(
+            _otel_os.path.join(
+                _otel_os.path.dirname(__file__), "..", "..", "shared", "otel", "python"
+            )
+        ),
+    )
+    from otelkit import init_telemetry, instrument_kafka
+
+    init_telemetry("compliance-service", app)
+    instrument_kafka()
+except Exception as _otel_exc:
+    import logging as _otel_logging
+
+    _otel_logging.getLogger("otel").warning("otelkit init skipped: %s", _otel_exc)
+
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
@@ -251,6 +286,10 @@ class ReportStatus(str, Enum):
     GENERATING = "generating"
     COMPLETED = "completed"
     FAILED = "failed"
+    # CP-11: no real transmission integration exists, so a report can never be
+    # silently flipped to 'submitted'. The honest terminal state is
+    # 'prepared_for_manual_filing'.
+    PREPARED_FOR_MANUAL_FILING = "prepared_for_manual_filing"
     SUBMITTED = "submitted"
 
 class AlertSeverity(str, Enum):
@@ -263,6 +302,7 @@ class SARStatus(str, Enum):
     DRAFT = "draft"
     UNDER_REVIEW = "under_review"
     APPROVED = "approved"
+    SUBMITTED = "submitted"  # CP-02: accepted by NFIU filer, awaiting goAML ack
     FILED = "filed"
     REJECTED = "rejected"
 
@@ -345,12 +385,16 @@ class FileSar(BaseModel):
     supporting_documents: Optional[List[str]] = None
 
 class SubmitSar(BaseModel):
+    # CP-02: the caller-supplied filing_reference was removed — a typed-in
+    # reference is not proof of filing. The filing reference is now fetched
+    # from the NFIU filer's goAML acknowledgement.
     reviewed_by: str
-    filing_reference: str
 
 # Database functions
 async def get_db():
     return db_pool
+
+_sar_workers: List[asyncio.Task] = []
 
 @app.on_event("startup")
 async def startup():
@@ -499,13 +543,40 @@ async def startup():
             
             CREATE INDEX IF NOT EXISTS idx_aml_risk_entity ON aml_risk_assessments(entity_id);
             CREATE INDEX IF NOT EXISTS idx_aml_risk_level ON aml_risk_assessments(risk_level);
+
+            -- CP-02: columns linking a SAR to the real NFIU STR filing.
+            ALTER TABLE sar_filings ADD COLUMN IF NOT EXISTS nfiu_str_id VARCHAR(100);
+            ALTER TABLE sar_filings ADD COLUMN IF NOT EXISTS goaml_ref VARCHAR(100);
+
+            -- CP-02: durable retry queue for SAR filings that could not reach
+            -- the NFIU filer — a submission failure is never silently dropped.
+            CREATE TABLE IF NOT EXISTS sar_filing_queue (
+                sar_id VARCHAR(50) PRIMARY KEY REFERENCES sar_filings(sar_id),
+                tenant_id VARCHAR(50) NOT NULL,
+                reviewed_by VARCHAR(255),
+                attempts INT NOT NULL DEFAULT 0,
+                max_attempts INT NOT NULL DEFAULT 10,
+                last_error TEXT,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
         """)
-    
+
+    # CP-02: background workers — retry queued SAR filings and poll the NFIU
+    # filer for goAML acknowledgements so status 'filed' reflects a real ack.
+    global _sar_workers
+    _sar_workers = [
+        asyncio.create_task(_sar_filing_retry_loop()),
+        asyncio.create_task(_sar_ack_poll_loop()),
+    ]
+
     print("Compliance service started successfully")
 
 @app.on_event("shutdown")
 async def shutdown():
     global db_pool
+    for t in _sar_workers:
+        t.cancel()
     if db_pool:
         await db_pool.close()
 
@@ -544,31 +615,84 @@ async def generate_regulatory_report(
     }
 
 async def generate_report_data(report_id: str, report: RegulatoryReport):
-    """Background task to generate report data"""
-    async with db_pool.acquire() as conn:
-        # Simulate report generation
-        report_data = {
-            "report_id": report_id,
-            "report_type": report.report_type.value,
-            "period": {
-                "start": report.period_start.isoformat(),
-                "end": report.period_end.isoformat()
-            },
-            "summary": {
-                "total_transactions": 15420,
-                "total_volume": 2450000000.00,
-                "total_customers": 3250,
-                "new_customers": 125,
-                "flagged_transactions": 23
-            },
-            "generated_at": datetime.now().isoformat()
-        }
-        
-        await conn.execute("""
-            UPDATE regulatory_reports
-            SET report_data = $1, status = 'completed', generated_at = CURRENT_TIMESTAMP
-            WHERE report_id = $2
-        """, json.dumps(report_data), report_id)
+    """Background task to generate report data.
+
+    CP-11: the hardcoded totals ("total_transactions": 15420, "total_volume":
+    2450000000.00, "flagged_transactions": 23) were fabrication — deleted.
+    Data is now generated from real queries against this service's own schema.
+    Transaction count/volume are NOT available in the compliance schema (the
+    OLTP ledger lives elsewhere); they are reported as null with an explicit
+    note rather than invented. On DB failure the report is marked 'failed'.
+    """
+    if db_pool is None:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            start = to_utc(report.period_start)
+            end = to_utc(report.period_end)
+            tenant = report.tenant_id
+
+            alerts_total = await conn.fetchval(
+                "SELECT COUNT(*) FROM compliance_alerts WHERE tenant_id=$1 AND created_at BETWEEN $2 AND $3",
+                tenant, start, end)
+            alerts_open = await conn.fetchval(
+                "SELECT COUNT(*) FROM compliance_alerts WHERE tenant_id=$1 AND status='open' AND created_at BETWEEN $2 AND $3",
+                tenant, start, end)
+            alerts_critical = await conn.fetchval(
+                "SELECT COUNT(*) FROM compliance_alerts WHERE tenant_id=$1 AND severity='critical' AND created_at BETWEEN $2 AND $3",
+                tenant, start, end)
+            sars_created = await conn.fetchval(
+                "SELECT COUNT(*) FROM sar_filings WHERE tenant_id=$1 AND created_at BETWEEN $2 AND $3",
+                tenant, start, end)
+            sars_filed = await conn.fetchval(
+                "SELECT COUNT(*) FROM sar_filings WHERE tenant_id=$1 AND status='filed' AND created_at BETWEEN $2 AND $3",
+                tenant, start, end)
+            screenings = await conn.fetchval(
+                "SELECT COUNT(*) FROM sanctions_screening WHERE tenant_id=$1 AND screened_at BETWEEN $2 AND $3",
+                tenant, start, end)
+            screening_hits = await conn.fetchval(
+                "SELECT COUNT(*) FROM sanctions_screening WHERE tenant_id=$1 AND screening_result <> 'clear' AND screened_at BETWEEN $2 AND $3",
+                tenant, start, end)
+
+            report_data = {
+                "report_id": report_id,
+                "report_type": report.report_type.value,
+                "period": {
+                    "start": report.period_start.isoformat(),
+                    "end": report.period_end.isoformat()
+                },
+                "summary": {
+                    # Real counts from the compliance schema only.
+                    "compliance_alerts_total": alerts_total,
+                    "compliance_alerts_open": alerts_open,
+                    "compliance_alerts_critical": alerts_critical,
+                    "sars_created": sars_created,
+                    "sars_filed": sars_filed,
+                    "sanctions_screenings": screenings,
+                    "sanctions_screening_hits": screening_hits,
+                    # CP-11: not fabricatable from this schema — explicitly null.
+                    "total_transactions": None,
+                    "total_volume": None,
+                },
+                "data_notes": [
+                    "total_transactions/total_volume are not available in the compliance schema; "
+                    "use efass-generator-rs (GL-derived) for financial aggregates. Nulls are "
+                    "honest absences, not zeroes.",
+                ],
+                "generated_at": datetime.now().isoformat()
+            }
+
+            await conn.execute("""
+                UPDATE regulatory_reports
+                SET report_data = $1, status = 'completed', generated_at = CURRENT_TIMESTAMP
+                WHERE report_id = $2
+            """, json.dumps(report_data), report_id)
+    except Exception as exc:
+        print(f"[compliance-service] report generation failed for {report_id}: {exc}", flush=True)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE regulatory_reports SET status = 'failed' WHERE report_id = $1
+            """, report_id)
 
 @app.get("/api/v1/compliance/reports/{report_id}")
 async def get_regulatory_report(report_id: str, db=Depends(get_db)):
@@ -624,30 +748,36 @@ async def list_regulatory_reports(
 @app.post("/api/v1/compliance/reports/{report_id}/submit")
 async def submit_regulatory_report(
     report_id: str,
-    submission_reference: str,
     db=Depends(get_db)
 ):
-    """Submit regulatory report to authorities"""
+    """Prepare a regulatory report for filing.
+
+    CP-11: no real transmission integration (eFASS upload / goAML for returns)
+    exists, so this endpoint NEVER flips a report to 'submitted' with a
+    caller-typed reference. The honest terminal state is
+    'prepared_for_manual_filing': an officer must file the generated report
+    through the regulator's portal and record the acknowledgement out of band.
+    """
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
             UPDATE regulatory_reports
-            SET status = 'submitted', submitted_at = CURRENT_TIMESTAMP,
-                submission_reference = $1
-            WHERE report_id = $2 AND status = 'completed'
+            SET status = 'prepared_for_manual_filing'
+            WHERE report_id = $1 AND status = 'completed'
             RETURNING report_id
-        """, submission_reference, report_id)
-        
+        """, report_id)
+
         if not row:
             raise HTTPException(
                 status_code=400,
-                detail="Report not found or not ready for submission"
+                detail="Report not found or not ready (must be status 'completed')"
             )
-        
+
         return {
-            "status": "submitted",
+            "status": "prepared_for_manual_filing",
             "report_id": report_id,
-            "submission_reference": submission_reference,
-            "submitted_at": datetime.now()
+            "message": "No automated transmission integration exists. File manually via the "
+                       "regulator portal (eFASS/goAML); the platform does not self-certify "
+                       "submission.",
         }
 
 # Compliance Alerts Endpoints
@@ -843,34 +973,196 @@ async def list_sars(
             "total": len(rows)
         }
 
+# ── CP-02: real SAR filing through nfiu-ctr-str-filing-py ────────────────────
+
+def _sar_to_str_payload(sar: dict) -> dict:
+    """Map a compliance-service SAR row to the NFIU filer's STR contract.
+    Money is converted to integer minor units (kobo)."""
+    total_kobo = int((sar["total_amount"] or Decimal("0")) * 100)
+    txn_ids = sar["transaction_ids"] or []
+    if isinstance(txn_ids, str):
+        txn_ids = json.loads(txn_ids)
+    today = datetime.now().date()
+    return {
+        "customer_id": sar["subject_id"],
+        "customer_name": sar["subject_name"],
+        "customer_type": "individual" if sar["subject_type"] == "individual" else "corporate",
+        "reason": f"{sar['suspicious_activity_type']}: {sar['filing_reason']}",
+        "category": sar["suspicious_activity_type"],
+        "total_amount_kobo": total_kobo,
+        "transaction_count": len(txn_ids) or 1,
+        "period_start": today.isoformat(),
+        "period_end": today.isoformat(),
+        "detection_method": "compliance_service_sar",
+        "risk_score": 80,
+        "risk_level": "high",
+        "transaction_ids": txn_ids,
+    }
+
+
+def _post_str_to_filer(tenant_id: str, str_payload: dict) -> dict:
+    """Blocking HTTP call (run via asyncio.to_thread). Raises on failure."""
+    headers = {"x-tenant-id": tenant_id, "Content-Type": "application/json"}
+    if NFIU_SERVICE_TOKEN:
+        headers["Authorization"] = f"Bearer {NFIU_SERVICE_TOKEN}"
+    resp = requests.post(
+        f"{NFIU_FILING_URL}/api/strs", json=str_payload, headers=headers, timeout=20
+    )
+    if resp.status_code >= 300:
+        raise RuntimeError(f"nfiu filer returned {resp.status_code}: {resp.text[:200]}")
+    return resp.json()
+
+
+async def _enqueue_sar_filing(conn, sar_id: str, tenant_id: str, reviewed_by: str, error: str):
+    await conn.execute("""
+        INSERT INTO sar_filing_queue (sar_id, tenant_id, reviewed_by, last_error)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (sar_id) DO UPDATE
+          SET last_error = EXCLUDED.last_error, updated_at = CURRENT_TIMESTAMP
+    """, sar_id, tenant_id, reviewed_by, error)
+
+
+async def _attempt_sar_filing(conn, sar: dict, reviewed_by: str) -> dict:
+    """File one SAR with the NFIU filer. Returns the filer response.
+    Raises on failure (caller decides queue/503)."""
+    str_payload = _sar_to_str_payload(sar)
+    result = await asyncio.to_thread(_post_str_to_filer, sar["tenant_id"], str_payload)
+    nfiu_str_id = result.get("strId") or result.get("str_id")
+    fiu_ref = result.get("fiuRef") or result.get("fiu_ref")
+    # Status becomes 'submitted' — NEVER 'filed'. 'filed' is set only by the
+    # ack poller when the filer reports a real goAML acknowledgement.
+    await conn.execute("""
+        UPDATE sar_filings
+        SET status = 'submitted', nfiu_str_id = $1, filing_reference = $2,
+            reviewed_by = $3, updated_at = CURRENT_TIMESTAMP
+        WHERE sar_id = $4
+    """, nfiu_str_id, fiu_ref, reviewed_by, sar["sar_id"])
+    await conn.execute("DELETE FROM sar_filing_queue WHERE sar_id = $1", sar["sar_id"])
+    return result
+
+
+async def _sar_filing_retry_loop():
+    """CP-02: retry SAR filings that failed to reach the NFIU filer."""
+    while True:
+        try:
+            if db_pool is not None and NFIU_FILING_URL:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch("""
+                        SELECT q.sar_id, q.reviewed_by, q.attempts, q.max_attempts, s.*
+                        FROM sar_filing_queue q
+                        JOIN sar_filings s ON s.sar_id = q.sar_id
+                        WHERE s.status IN ('draft', 'under_review', 'approved')
+                        ORDER BY q.updated_at LIMIT 25
+                    """)
+                    for row in rows:
+                        sar = dict(row)
+                        try:
+                            await _attempt_sar_filing(conn, sar, row["reviewed_by"] or "retry-worker")
+                            print(f"[compliance-service] CP-02 retry: SAR {sar['sar_id']} filed via nfiu filer", flush=True)
+                        except Exception as exc:
+                            attempts = row["attempts"] + 1
+                            exhausted = attempts >= row["max_attempts"]
+                            await conn.execute("""
+                                UPDATE sar_filing_queue
+                                SET attempts = $2, last_error = $3, updated_at = CURRENT_TIMESTAMP
+                                WHERE sar_id = $1
+                            """, sar["sar_id"], attempts, str(exc)[:500])
+                            if exhausted:
+                                print(
+                                    f"[compliance-service] CRITICAL: SAR {sar['sar_id']} filing exhausted "
+                                    f"{row['max_attempts']} attempts: {exc}. MANUAL FILING REQUIRED.",
+                                    flush=True,
+                                )
+        except Exception as exc:
+            print(f"[compliance-service] SAR filing retry loop error: {exc}", flush=True)
+        await asyncio.sleep(SAR_FILING_RETRY_SECONDS)
+
+
+async def _sar_ack_poll_loop():
+    """CP-02: poll the NFIU filer for goAML acks; only a real ack flips a SAR
+    to 'filed' and sets the goaml_ref."""
+    while True:
+        try:
+            if db_pool is not None and NFIU_FILING_URL:
+                async with db_pool.acquire() as conn:
+                    rows = await conn.fetch("""
+                        SELECT sar_id, tenant_id, nfiu_str_id FROM sar_filings
+                        WHERE status = 'submitted' AND nfiu_str_id IS NOT NULL
+                        LIMIT 50
+                    """)
+                for row in rows:
+                    try:
+                        def _get():
+                            headers = {"x-tenant-id": row["tenant_id"]}
+                            if NFIU_SERVICE_TOKEN:
+                                headers["Authorization"] = f"Bearer {NFIU_SERVICE_TOKEN}"
+                            return requests.get(
+                                f"{NFIU_FILING_URL}/api/strs/{row['nfiu_str_id']}",
+                                headers=headers, timeout=15,
+                            )
+                        resp = await asyncio.to_thread(_get)
+                        if resp.status_code != 200:
+                            continue
+                        data = resp.json()
+                        if data.get("status") == "filed" and data.get("goamlRef"):
+                            async with db_pool.acquire() as conn:
+                                await conn.execute("""
+                                    UPDATE sar_filings
+                                    SET status = 'filed', filed_at = CURRENT_TIMESTAMP,
+                                        goaml_ref = $2, updated_at = CURRENT_TIMESTAMP
+                                    WHERE sar_id = $1
+                                """, row["sar_id"], str(data["goamlRef"]))
+                    except Exception as exc:
+                        print(f"[compliance-service] SAR ack poll error sar={row['sar_id']}: {exc}", flush=True)
+        except Exception as exc:
+            print(f"[compliance-service] SAR ack poll loop error: {exc}", flush=True)
+        await asyncio.sleep(SAR_ACK_POLL_SECONDS)
+
+
 @app.post("/api/v1/compliance/sar/{sar_id}/submit")
 async def submit_sar(
     sar_id: str,
     payload: SubmitSar,
     db = Depends(get_db)
 ):
-    """Submit SAR to regulatory authorities"""
+    """Submit SAR to the NFIU via the real goAML filing service.
+
+    CP-02: previously this flipped status to 'filed' with a caller-supplied
+    filing_reference — no XML, no transmission, no ack. Now the SAR is routed
+    through nfiu-ctr-str-filing-py; the filing reference comes from the
+    filer's goAML acknowledgement, fetched by the ack poller. On filer outage
+    the request is queued durably (sar_filing_queue) and 503 is returned.
+    """
+    if not NFIU_FILING_URL:
+        raise HTTPException(
+            status_code=503,
+            detail="NFIU filing service not configured (NFIU_FILING_URL) — SAR cannot be filed",
+        )
     async with db.acquire() as conn:
-        row = await conn.fetchrow("""
-            UPDATE sar_filings
-            SET status = 'filed', filed_at = CURRENT_TIMESTAMP,
-                filing_reference = $1, reviewed_by = $2,
-                updated_at = CURRENT_TIMESTAMP
-            WHERE sar_id = $3 AND status IN ('draft', 'approved')
-            RETURNING sar_id
-        """, payload.filing_reference, payload.reviewed_by, sar_id)
-        
-        if not row:
+        sar = await conn.fetchrow(
+            "SELECT * FROM sar_filings WHERE sar_id = $1", sar_id
+        )
+        if not sar:
+            raise HTTPException(status_code=404, detail="SAR not found")
+        if sar["status"] not in ("draft", "under_review", "approved"):
             raise HTTPException(
                 status_code=400,
-                detail="SAR not found or not ready for filing"
+                detail=f"SAR not ready for filing (status={sar['status']})",
             )
-        
+        try:
+            result = await _attempt_sar_filing(conn, dict(sar), payload.reviewed_by)
+        except Exception as exc:
+            await _enqueue_sar_filing(conn, sar_id, sar["tenant_id"], payload.reviewed_by, str(exc)[:500])
+            raise HTTPException(
+                status_code=503,
+                detail=f"NFIU filing service unavailable — SAR queued for automatic retry ({exc})",
+            )
         return {
-            "status": "filed",
+            "status": "submitted",
             "sar_id": sar_id,
-            "filing_reference": payload.filing_reference,
-            "filed_at": datetime.now()
+            "nfiu_str_id": result.get("strId") or result.get("str_id"),
+            "fiu_ref": result.get("fiuRef") or result.get("fiu_ref"),
+            "message": "SAR accepted by NFIU filing service; status becomes 'filed' only on goAML acknowledgement",
         }
 
 # Transaction Monitoring Endpoints

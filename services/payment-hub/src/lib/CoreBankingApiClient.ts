@@ -293,13 +293,17 @@ export class CoreBankingApiClient {
           "/payment/deposit",
           {
             recipient: Number(payeeAccount.id),
-            amount: Number(payload.amount.amount),
+            // MN-10/MN-16: integer kobo, ROUND_HALF_UP at this single point.
+            amount_kobo: Math.round(Number(payload.amount.amount) * 100),
             note: payload.note || payload.transaction_id,
+            // MN-07/MN-14: deterministic reference -> idempotent TB transfer.
+            reference: payload.transaction_id,
           },
           {
             headers: {
               ...this.buildCoreHeaders(tenantName),
               "x-mint-account-id": mintAccountId,
+              "x-idempotency-key": payload.transaction_id,
             },
           },
         )
@@ -322,13 +326,16 @@ export class CoreBankingApiClient {
         "/payment/deposit",
         {
           recipient: Number(payload.accountId),
-          amount: Number(payload.amount.amount),
+          // MN-10/MN-16: integer kobo, ROUND_HALF_UP at this single point.
+          amount_kobo: Math.round(Number(payload.amount.amount) * 100),
           note: payload.note || payload.reference,
+          reference: payload.reference,
         },
         {
           headers: {
             ...this.buildCoreHeaders(tenantName),
             "x-mint-account-id": mintAccountId,
+            "x-idempotency-key": payload.reference,
           },
         },
       );
@@ -362,27 +369,58 @@ export class CoreBankingApiClient {
     );
   }
 
+  /**
+   * MN-07: real fund reservation — creates a TigerBeetle PENDING transfer via
+   * the payment-processing internal API. The hold id is deterministic
+   * (`reserve:{transaction_id}`) on the server, so retries are no-ops.
+   * Replaces the former log-only stub.
+   */
   public async reserve_funds(
     account_id: string,
     amount: string,
     reason: string,
+    transaction_id?: string,
+    tenantName = defaultTenantName,
   ) {
-    const resourceId = randomUUID();
-
-    logger.warn(
-      `Soft-reserving funds for account ${account_id}, amount ${amount}. Reason: ${reason}. Token: ${resourceId}`,
-    );
-
-    return { resourceId };
+    const txnId = transaction_id || randomUUID();
+    try {
+      const response = await this.paymentAxios.post(
+        "/internal/funds/reserve",
+        {
+          account_id: Number(account_id),
+          amount_minor: Number(amount),
+          transaction_id: txnId,
+          reason,
+        },
+        { headers: this.buildCoreHeaders(tenantName) },
+      );
+      return { resourceId: response.data?.hold_id as string };
+    } catch (error) {
+      throw new Error(
+        this.resolveErrorMessage(error) || "Failed to reserve funds",
+      );
+    }
   }
 
+  /**
+   * MN-07: release = void the pending transfer. Idempotent server-side.
+   */
   public async release_reserved_funds(
     account_id: string,
     transaction_id: string,
+    tenantName = defaultTenantName,
   ) {
-    logger.warn(
-      `Soft-releasing funds for account ${account_id}, token ${transaction_id}`,
-    );
-    return { success: true };
+    try {
+      await this.paymentAxios.post(
+        "/internal/funds/release",
+        { account_id: Number(account_id), transaction_id },
+        { headers: this.buildCoreHeaders(tenantName) },
+      );
+      return { success: true };
+    } catch (error) {
+      throw new Error(
+        this.resolveErrorMessage(error) || "Failed to release reserved funds",
+      );
+    }
   }
 }

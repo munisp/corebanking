@@ -15,3 +15,7 @@ uuid = { version = "1.17.0", features = ["v4"] }
 chrono = { version = "0.4.41", features = ["serde"] }
 tokio = { version = "1.43.1", features = ["full"] }
 reqwest = { version = "0.12.22", features = ["json"] }
+otelkit = { path = "../../shared/otel/rust", features = ["actix-web"] }
+# MN-18: deterministic per-leg idempotency keys (sha256(batch_id|index))
+sha2 = "0.10.8"
+hex = "0.4.3"

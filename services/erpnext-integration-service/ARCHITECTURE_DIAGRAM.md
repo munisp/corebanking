@@ -68,8 +68,8 @@
 │  │                         Event Handlers                                  │   │
 │  ├─────────────────────────────────────────────────────────────────────────┤   │
 │  │                                                                         │   │
-│  │  POST /events/payment    ──▶  handlePaymentEvent()                     │   │
-│  │       └──▶ processPaymentEvent() ──▶ syncPaymentToERP()               │   │
+│  │  (OR-11: /events/payment and /events/account removed — topics have    │   │
+│  │   no producer anywhere in the fleet; handlers deleted)                 │   │
 │  │                                                                         │   │
 │  │  POST /events/loan       ──▶  handleLoanEvent()                        │   │
 │  │       └──▶ processLoanEvent() ──▶ syncLoanToERP()                     │   │
@@ -84,7 +84,6 @@
 │  │       └──▶ processLpoEvent() ──▶ syncLpoToERP()                       │   │
 │  │                                                                         │   │
 │  │  POST /events/transaction ──▶ handleTransactionEvent()                 │   │
-│  │  POST /events/account     ──▶ handleAccountEvent()                     │   │
 │  │                                                                         │   │
 │  └─────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                 │

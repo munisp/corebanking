@@ -28,6 +28,8 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"shared/otel/go/otelkit"
 )
 
 // Prometheus metrics
@@ -341,34 +343,32 @@ var (
 )
 
 type Config struct {
-	Port              string
-	DatabaseURL       string
-	TigerBeetleAddr   string
-	TemporalAddr      string
-	TemporalNamespace string
-	TemporalTaskQueue string
-	KYCServiceURL     string
-	FraudServiceURL   string
-	NotificationURL   string
-	AuditServiceURL   string
-	SMSProviderURL    string
-	SMSProviderKey    string
+	Port            string
+	DatabaseURL     string
+	TigerBeetleAddr string
+	// OR-18/W1 (Wave-10): Temporal configuration removed. temporal_workflows.go
+	// (the claimed origination/servicing/collections automation) had zero call
+	// sites and no Temporal SDK import — it was deleted rather than left as
+	// phantom automation. These fields were never dialed.
+	KYCServiceURL   string
+	FraudServiceURL string
+	NotificationURL string
+	AuditServiceURL string
+	SMSProviderURL  string
+	SMSProviderKey  string
 }
 
 func loadConfig() *Config {
 	return &Config{
-		Port:              getEnv("PORT", "8080"),
-		DatabaseURL:       getEnv("DATABASE_URL", "postgres://localhost:5432/escrow"),
-		TigerBeetleAddr:   getEnv("TB_ADDRESS", "192.168.152.250:3000,192.168.14.240:3000,192.168.96.166:3000"),
-		TemporalAddr:      getEnv("TEMPORAL_ADDRESS", "temporal-frontend.temporal.svc:7233"),
-		TemporalNamespace: getEnv("TEMPORAL_NAMESPACE", "54link"),
-		TemporalTaskQueue: getEnv("TEMPORAL_TASK_QUEUE", "core_banking_mortgage"),
-		KYCServiceURL:     getEnv("KYC_SERVICE_URL", "http://verification-service"),
-		FraudServiceURL:   getEnv("FRAUD_SERVICE_URL", "http://fraud-service:8080"),
-		NotificationURL:   getEnv("NOTIFICATION_URL", "http://notification-service:8080"),
-		AuditServiceURL:   getEnv("AUDIT_SERVICE_URL", "http://audit-service:8080"),
-		SMSProviderURL:    getEnv("SMS_PROVIDER_URL", ""),
-		SMSProviderKey:    getEnv("SMS_PROVIDER_KEY", ""),
+		Port:            getEnv("PORT", "8080"),
+		DatabaseURL:     getEnv("DATABASE_URL", "postgres://localhost:5432/escrow"),
+		TigerBeetleAddr: getEnv("TB_ADDRESS", "192.168.152.250:3000,192.168.14.240:3000,192.168.96.166:3000"),
+		KYCServiceURL:   getEnv("KYC_SERVICE_URL", "http://verification-service"),
+		FraudServiceURL: getEnv("FRAUD_SERVICE_URL", "http://fraud-service:8080"),
+		NotificationURL: getEnv("NOTIFICATION_URL", "http://notification-service:8080"),
+		AuditServiceURL: getEnv("AUDIT_SERVICE_URL", "http://audit-service:8080"),
+		SMSProviderURL:  getEnv("SMS_PROVIDER_URL", ""),
+		SMSProviderKey:  getEnv("SMS_PROVIDER_KEY", ""),
 	}
 }
 
@@ -592,11 +592,37 @@ func tenantFromClaims(claims map[string]interface{}) string {
 	return ""
 }
 
+// hasAnyRole reports whether the comma-separated X-User-Role header (populated
+// ONLY from verified JWT realm_access roles by jwtAuthMiddleware) contains any
+// of the required roles. LN-07.
+func hasAnyRole(header string, required ...string) bool {
+	for _, r := range strings.Split(header, ",") {
+		r = strings.TrimSpace(r)
+		for _, req := range required {
+			if r == req {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func main() {
 	godotenv.Load()
 
 	cfg := loadConfig()
 
+	shutdown, oerr := otelkit.Init(context.Background(), "mortgage-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	// Initialize connections
 	if err := initDatabase(); err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
@@ -614,6 +640,7 @@ func main() {
 
 	// Initialize Gin router
 	router := gin.Default()
+	router.Use(otelkit.GinMiddleware())
 	router.Use(jwtAuthMiddleware())
 	router.Use(corsMiddleware())
 	router.Use(loggingMiddleware())
@@ -902,7 +929,7 @@ func createMortgageApplication(c *gin.Context) {
 	}
 
 	// Publish event to Kafka
-	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.created",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1038,7 +1065,7 @@ func submitMortgageApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1110,7 +1137,7 @@ func underwriteApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.underwriting", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.underwriting", MortgageEvent{
 		Type:       "mortgage.underwriting.completed",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1154,8 +1181,10 @@ func submitToCreditCommittee(c *gin.Context) {
 	// Update status
 	updateMortgageStatus(id, tenantID, StatusCreditCommittee)
 
-	// Publish event for workflow
-	kafkaClient.PublishEventReliably("mortgages.credit-committee", MortgageEvent{
+	// Publish lifecycle event (OR-18: no Temporal workflow consumes this in
+	// this service — the phantom servicing workflows were deleted; downstream
+	// consumers are external subscribers)
+	PublishEventOrAlert(kafkaClient, "mortgages.credit-committee", MortgageEvent{
 		Type:       "mortgage.credit_committee.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1216,7 +1245,7 @@ func approveApplication(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.approvals", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.approvals", MortgageEvent{
 		Type:       "mortgage.application.approved",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1260,7 +1289,7 @@ func declineApplication(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusDeclined)
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.applications", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.applications", MortgageEvent{
 		Type:       "mortgage.application.declined",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1300,7 +1329,7 @@ func issueOffer(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusOfferIssued)
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.offers", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.offers", MortgageEvent{
 		Type:       "mortgage.offer.issued",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1341,7 +1370,7 @@ func acceptOffer(c *gin.Context) {
 	updateMortgageStatus(id, tenantID, StatusOfferAccepted)
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.offers", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.offers", MortgageEvent{
 		Type:       "mortgage.offer.accepted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1549,7 +1578,7 @@ func addPropertyDetails(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.properties", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.properties", MortgageEvent{
 		Type:       "mortgage.property.added",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1623,7 +1652,7 @@ func submitValuation(c *gin.Context) {
 	ltv := app.RequestedAmount / req.MarketValue * 100
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.valuations", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.valuations", MortgageEvent{
 		Type:       "mortgage.valuation.submitted",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1677,7 +1706,7 @@ func verifyTitle(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.title-verification", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.title-verification", MortgageEvent{
 		Type:       "mortgage.title.verified",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1728,7 +1757,7 @@ func verifyNHFContribution(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.nhf", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.nhf", MortgageEvent{
 		Type:       "mortgage.nhf.verified",
 		MortgageID: app.ID,
 		TenantID:   tenantID,
@@ -1932,13 +1961,16 @@ func recordPayment(c *gin.Context) {
 	}
 
 	// Update arrears status if applicable — recalculation failures are
-	// logged, never silently dropped (the daily servicing workflow retries).
+	// logged, never silently dropped. OR-18: there is NO servicing workflow
+	// that retries this (the phantom temporal_workflows.go was deleted);
+	// arrears are recomputed here on each payment and a failure requires
+	// operational follow-up on the logged error.
 	if err := updateArrearsStatus(id, tenantID); err != nil {
-		log.Printf("Failed to update arrears status for mortgage %s after payment: %v", id, err)
+		log.Printf("ERROR: failed to update arrears status for mortgage %s after payment: %v — manual recalculation required", id, err)
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.payments", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.payments", MortgageEvent{
 		Type:       "mortgage.payment.received",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -2057,7 +2089,7 @@ func processPrepayment(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.prepayments", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.prepayments", MortgageEvent{
 		Type:       "mortgage.prepayment.processed",
 		MortgageID: id,
 		TenantID:   tenantID,
@@ -2122,7 +2154,7 @@ func initiateRefinancing(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.refinancing", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.refinancing", MortgageEvent{
 		Type:       "mortgage.refinancing.initiated",
 		MortgageID: newApp.ID,
 		TenantID:   tenantID,
@@ -2164,18 +2196,46 @@ func restructureMortgage(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
 
+	// LN-07 (Wave-10): the approver is derived from VERIFIED JWT claims
+	// (jwtAuthMiddleware overwrites X-Keycloak-ID / X-User-Role from token
+	// claims; caller-supplied values are dropped). The previous code trusted
+	// the self-asserted `approved_by` body field — anyone could approve their
+	// own restructuring.
+	approverID := c.GetHeader("X-Keycloak-ID")
+	if approverID == "" {
+		c.JSON(401, gin.H{"error": "authenticated approver identity required"})
+		return
+	}
+	if !hasAnyRole(c.GetHeader("X-User-Role"), "loan_officer", "credit_admin", "tenant_admin") {
+		c.JSON(403, gin.H{"error": "restructuring requires role loan_officer, credit_admin or tenant_admin"})
+		return
+	}
+
 	var req struct {
 		RestructureType string  `json:"restructure_type" binding:"required"` // term_extension, rate_reduction, payment_holiday
 		NewTenorMonths  int     `json:"new_tenor_months"`
 		NewInterestRate float64 `json:"new_interest_rate"`
 		HolidayMonths   int     `json:"holiday_months"`
 		Reason          string  `json:"reason" binding:"required"`
-		ApprovedBy      string  `json:"approved_by" binding:"required"`
+		// ApprovedBy is no longer read from the request body (LN-07): the
+		// approver is the authenticated principal. Any client-supplied value
+		// is ignored.
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
+	}
+
+	// LN-07: money-term changes (term extension / rate reduction) require a
+	// maker-checker approval reference — the four-eyes control evidence.
+	makerCheckerID := ""
+	if req.RestructureType == "term_extension" || req.RestructureType == "rate_reduction" {
+		makerCheckerID = strings.TrimSpace(c.GetHeader("X-Maker-Checker-Approval-ID"))
+		if makerCheckerID == "" {
+			c.JSON(428, gin.H{"error": "X-Maker-Checker-Approval-ID header required for term_extension/rate_reduction restructuring"})
+			return
+		}
 	}
 
 	app, err := fetchMortgageApplication(id, tenantID)
@@ -2202,8 +2262,8 @@ func restructureMortgage(c *gin.Context) {
 	balance, _ := tbClient.GetAccountBalance(app.PrincipalAccountID)
 	app.MonthlyPayment = calculateMonthlyPayment(balance, app.InterestRate, app.ApprovedTenorMonths)
 
-	// Save restructuring
-	if err := saveRestructuringDetails(app, req.RestructureType, req.Reason, req.ApprovedBy); err != nil {
+	// Save restructuring — approver is the verified principal (LN-07)
+	if err := saveRestructuringDetails(app, req.RestructureType, req.Reason, approverID); err != nil {
 		c.JSON(500, gin.H{"error": "failed to save restructuring"})
 		return
 	}
@@ -2213,15 +2273,16 @@ func restructureMortgage(c *gin.Context) {
 	saveRepaymentSchedule(id, newSchedule)
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.restructuring", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.restructuring", MortgageEvent{
 		Type:       "mortgage.restructured",
 		MortgageID: id,
 		TenantID:   tenantID,
 		Timestamp:  time.Now(),
 		Metadata: map[string]interface{}{
-			"restructure_type": req.RestructureType,
-			"reason":           req.Reason,
-			"approved_by":      req.ApprovedBy,
+			"restructure_type":          req.RestructureType,
+			"reason":                    req.Reason,
+			"approved_by":               approverID,
+			"maker_checker_approval_id": makerCheckerID,
 		},
 	})
 
@@ -2266,7 +2327,7 @@ func requestForbearance(c *gin.Context) {
 	}
 
 	// Publish event
-	kafkaClient.PublishEventReliably("mortgages.forbearance", MortgageEvent{
+	PublishEventOrAlert(kafkaClient, "mortgages.forbearance", MortgageEvent{
 		Type:       "mortgage.forbearance.requested",
 		MortgageID: id,
 		TenantID:   tenantID,

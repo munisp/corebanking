@@ -76,6 +76,7 @@ the same account simultaneously, potentially overdrawing.
 locking. Features: deadlock prevention (sorted key acquisition), auto-expiry
 (max 5 min TTL), fencing tokens (prevents stale lock holders from writing),
 all-or-nothing multi-key acquisition with rollback.
+  **[RETRACTED — OR-05/Wave-10: this package had zero importers fleet-wide and has been DELETED. The claimed protection never ran in any service.]**
 
 ### GAP 7: No TigerBeetle Two-Phase Commit
 **Severity**: HIGH — transfers committed instantly with no hold/reserve step
@@ -84,6 +85,7 @@ no service actually uses pending→commit flow.
 **Fix**: Created `pkg/tb2pc` package implementing full two-phase commit
 lifecycle: CreatePending → PostPending/VoidPending. Supports linked
 (all-or-nothing) pending transfers and automatic timeout-based expiry.
+  **[RETRACTED — OR-05/Wave-10: this package had zero importers fleet-wide and has been DELETED. The claimed protection never ran in any service.]**
 
 ### GAP 8: No Transactional Outbox for Kafka Events
 **Severity**: MEDIUM — Kafka events emitted outside DB transaction can be lost
@@ -94,6 +96,7 @@ never learn about the transaction.
 Events INSERT into outbox table within same DB transaction. Relay goroutine
 polls and publishes. At-least-once delivery guaranteed. Includes DLQ for
 events that exceed max retries.
+  **[RETRACTED — OR-05/Wave-10: this package had zero importers fleet-wide and has been DELETED. The claimed protection never ran in any service.]**
 
 ### GAP 9: No Double-Entry Validation in Saga Framework
 **Severity**: MEDIUM — saga could execute unbalanced transfers
@@ -102,6 +105,7 @@ fund movement types.
 **Fix**: Created `pkg/fundsaga` package with `StepValidateBalances()` that
 verifies total debits == total credits for every saga. 20 pre-built saga
 pipelines (P2P, salary, loan, remittance, fee, etc.) all enforce this.
+  **[RETRACTED — OR-05/Wave-10: this package had zero importers fleet-wide and has been DELETED. The claimed protection never ran in any service.]**
 
 ### GAP 10: Temporal Activity Stubs Have No Heartbeats
 **Severity**: LOW — activities that hang won't be detected by Temporal
@@ -116,6 +120,7 @@ can detect hung activities and retry them.
 **Fix**: Card holds use TigerBeetle pending transfers. The `tb2pc` manager
 automatically expires pending transfers after the configured timeout (7 days
 for card holds). Voided holds release the reserved funds.
+  **[RETRACTED — OR-05/Wave-10: this package had zero importers fleet-wide and has been DELETED. The claimed protection never ran in any service.]**
 
 ---
 
@@ -150,12 +155,18 @@ for card holds). Voided holds release the reserved funds.
 
 ### Infrastructure Packages (4 packages, 65 tests)
 
+**[RETRACTED — OR-05/Wave-10: all four packages below had zero importers
+fleet-wide (no service imported or required them) and have been DELETED.
+The "ALL PASS" results covered code that never ran in any service. Real saga
+orchestration lives in orchestrator Temporal workflows and service-level
+outboxes.]**
+
 | Package | Tests | Status |
 |---------|-------|--------|
-| `pkg/fundsaga` (saga orchestration) | 32 | ALL PASS |
-| `pkg/tb2pc` (two-phase commit) | 10 | ALL PASS |
-| `pkg/distlock` (distributed locking) | 10 | ALL PASS |
-| `pkg/outbox` (transactional outbox) | 6 | ALL PASS |
+| ~~`pkg/fundsaga` (saga orchestration)~~ DELETED (0 importers) | 32 | ALL PASS (of dead code) |
+| ~~`pkg/tb2pc` (two-phase commit)~~ DELETED (0 importers) | 10 | ALL PASS (of dead code) |
+| ~~`pkg/distlock` (distributed locking)~~ DELETED (0 importers) | 10 | ALL PASS (of dead code) |
+| ~~`pkg/outbox` (transactional outbox)~~ DELETED (0 importers) | 6 | ALL PASS (of dead code) |
 
 ### Double-Entry Validation (15 saga types)
 Every saga type verified: total debits == total credits (integer arithmetic).

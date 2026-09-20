@@ -6,9 +6,11 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -19,11 +21,15 @@ import (
 	"sync"
 	"time"
 
+	_ "github.com/lib/pq"
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"shared/otel/go/otelkit"
 )
 
 // Prometheus metrics
@@ -131,6 +137,42 @@ type VirtualAccountService struct {
 	nibssClient    *NIBSSClient
 	webhookClient  *http.Client
 	lakehouse      *LakehousePublisher
+	db             *sql.DB // MN-14: durable webhook dedup store
+}
+
+// ErrDuplicateInboundPayment marks a replayed webhook (MN-14).
+var ErrDuplicateInboundPayment = errors.New("duplicate inbound payment")
+
+// initDedupStore opens Postgres for durable inbound-payment dedup
+// (MN-14/S14). Returns nil (with a warning) when DATABASE_URL is unset —
+// the webhook route fails closed in that case.
+func initDedupStore() *sql.DB {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		log.Printf("[virtual-account-service] DATABASE_URL unset — inbound webhook dedup will be UNAVAILABLE (fail-closed on /payments/inbound)")
+		return nil
+	}
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[virtual-account-service] DATABASE_URL invalid: %v", err)
+		return nil
+	}
+	if err := db.Ping(); err != nil {
+		log.Printf("[virtual-account-service] Postgres unreachable: %v", err)
+		return nil
+	}
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS processed_inbound_payments (
+		id BIGSERIAL PRIMARY KEY,
+		provider TEXT NOT NULL,
+		external_id TEXT NOT NULL,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		CONSTRAINT uq_processed_inbound UNIQUE (provider, external_id)
+	)`)
+	if err != nil {
+		log.Printf("[virtual-account-service] dedup table init failed: %v", err)
+		return nil
+	}
+	return db
 }
 
 // NewVirtualAccountService creates a new service instance
@@ -155,6 +197,7 @@ func NewVirtualAccountService() *VirtualAccountService {
 			Timeout: 30 * time.Second,
 		},
 		lakehouse: NewLakehousePublisher(),
+		db:        initDedupStore(),
 	}
 }
 
@@ -367,12 +410,39 @@ func (s *VirtualAccountService) ProcessInboundPayment(ctx context.Context, payme
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	for _, existing := range s.payments {
-		if payment.SessionID != "" && existing.SessionID == payment.SessionID {
-			return fmt.Errorf("duplicate inbound payment session: %s", payment.SessionID)
+	// MN-14 (S14): durable dedup in Postgres — in-memory dedup was lost on
+	// restart and duplicates returned 400, amplifying upstream retry storms.
+	// Claim (provider, external_id) atomically; a replay is reported via
+	// ErrDuplicateInboundPayment and the route returns 200 (prior outcome).
+	if s.db != nil {
+		externalID := payment.SessionID
+		if externalID == "" {
+			externalID = payment.TransactionRef
 		}
-		if payment.TransactionRef != "" && existing.TransactionRef == payment.TransactionRef {
-			return fmt.Errorf("duplicate inbound payment reference: %s", payment.TransactionRef)
+		if externalID != "" {
+			var claimID int64
+			err := s.db.QueryRowContext(ctx,
+				`INSERT INTO processed_inbound_payments (provider, external_id)
+				 VALUES ('nibss', $1)
+				 ON CONFLICT (provider, external_id) DO NOTHING
+				 RETURNING id`, externalID).Scan(&claimID)
+			if err == sql.ErrNoRows {
+				return ErrDuplicateInboundPayment
+			}
+			if err != nil {
+				// Fail-closed: cannot prove this payment was not processed.
+				return fmt.Errorf("dedup store unavailable: %w", err)
+			}
+		}
+	} else {
+		log.Printf("[virtual-account-service] WARNING: in-memory dedup fallback (DATABASE_URL unset)")
+		for _, existing := range s.payments {
+			if payment.SessionID != "" && existing.SessionID == payment.SessionID {
+				return ErrDuplicateInboundPayment
+			}
+			if payment.TransactionRef != "" && existing.TransactionRef == payment.TransactionRef {
+				return ErrDuplicateInboundPayment
+			}
 		}
 	}
 
@@ -906,9 +976,21 @@ func tenantFromClaims(claims map[string]interface{}) string {
 }
 
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), "virtual-account-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	service := NewVirtualAccountService()
 
 	router := gin.Default()
+	router.Use(otelkit.GinMiddleware())
 	router.Use(jwtAuthMiddleware())
 	router.Use(auditMiddleware())
 
@@ -1027,19 +1109,47 @@ func main() {
 		})
 
 		// Receive inbound payment (NIBSS webhook)
+		// MN-14 (S14): routed THROUGH the HMAC signature check in
+		// NIBSSWebhookHandler.HandleInboundPayment (previously bypassed), with
+		// durable Postgres dedup (fail-closed when the dedup store is absent).
+		webhookHandler := NewNIBSSWebhookHandler(service.nibssClient, service)
 		api.POST("/payments/inbound", func(c *gin.Context) {
-			var payment VANPayment
-			if err := c.ShouldBindJSON(&payment); err != nil {
+			if service.db == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "webhook dedup store unavailable (DATABASE_URL not configured)"})
+				return
+			}
+
+			var nibssPayment NIBSSInboundPayment
+			if err := c.ShouldBindJSON(&nibssPayment); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
 
-			if err := service.ProcessInboundPayment(c.Request.Context(), &payment); err != nil {
+			signature := c.GetHeader("x-nibss-signature")
+			if signature == "" {
+				signature = c.GetHeader("x-signature")
+			}
+			if signature == "" {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "missing webhook signature"})
+				return
+			}
+
+			err := webhookHandler.HandleInboundPayment(c.Request.Context(), &nibssPayment, signature)
+			if err != nil {
+				if errors.Is(err, ErrDuplicateInboundPayment) {
+					// MN-14: replays get 200 (prior outcome), not a 400 storm.
+					c.JSON(http.StatusOK, gin.H{"message": "payment already processed", "idempotent_replay": true})
+					return
+				}
+				if err.Error() == "invalid signature" {
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid signature"})
+					return
+				}
 				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 				return
 			}
 
-			c.JSON(http.StatusOK, gin.H{"message": "payment processed", "payment_id": payment.ID})
+			c.JSON(http.StatusOK, gin.H{"message": "payment processed"})
 		})
 	}
 

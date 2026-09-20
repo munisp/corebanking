@@ -15,7 +15,6 @@ on:
       - 'services/cbn-compliance-checker-py/**'
       - 'services/cbn-returns-py/**'
       - 'services/cbn-service/**'
-      - 'services/ctr-auto-filer-go/**'
       - 'services/efass-generator-rs/**'
       - 'services/fatca-crs-rs/**'
       - 'services/gl-regulatory-pipeline-py/**'
@@ -62,7 +61,7 @@ jobs:
           file: ./docker/Dockerfile.consolidated
           push: true
           build-args: |
-            SERVICES=agent-regulatory-returns-py,audit-service,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,cbn-service,ctr-auto-filer-go,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,internal-auditor-service,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py
+            SERVICES=agent-regulatory-returns-py,audit-service,basel-engine-rs,cbn-agri-returns-py,cbn-agsmeis-go,cbn-anchor-borrowers-go,cbn-compliance-checker-py,cbn-returns-py,cbn-service,efass-generator-rs,fatca-crs-rs,gl-regulatory-pipeline-py,ifrs9-ecl-engine-rs,ifrs9-engine-rs,internal-auditor-service,lcr-nsfr-rs,nfiu-ctr-str-filing-py,regulatory-automation-py,regulatory-reporting-go,regulatory-sandbox-go,sar-filing-engine-go,soc2-evidence-collector-py
             PRIMARY_LANG=go
             PORT_BASE=9244
           tags: registry.digitalocean.com/talentgraph-auth/54link-dev-compliance-regulatory:${{ env.TAG }}

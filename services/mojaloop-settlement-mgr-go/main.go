@@ -166,17 +166,10 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	// Inter-service call: aml_screening
-	_upstreamURL := os.Getenv("AML_ENGINE_URL")
-	if _upstreamURL == "" {
-		_upstreamURL = "http://localhost:8127"
-	}
-	_result, _err := callService("POST", _upstreamURL+"/v1/screen", nil)
-	if _err != nil {
-		log.Printf("mojaloop-settlement-mgr-go: aml_screening failed: %v", _err)
-	} else {
-		log.Printf("mojaloop-settlement-mgr-go: aml_screening ok: %v", _result)
-	}
+	// CP-03: removed decorative "aml_screening" inter-service call — it posted a nil
+	// body to /v1/screen, a path no AML/sanctions service exposes, and discarded the
+	// result. Dead scaffold deleted; real screening happens in payment-hub's
+	// sanctionsScreeningApiClient against sanctions-screening-service /api/screen.
 
 	mu.Lock()
 	defer mu.Unlock()

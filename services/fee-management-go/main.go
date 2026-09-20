@@ -28,14 +28,23 @@ type FeeRule struct {
 	ID            string   `json:"id"`
 	Name          string   `json:"name"`
 	FeeType       string   `json:"fee_type"`
-	Amount        *float64 `json:"amount,omitempty"`
-	Rate          *float64 `json:"rate,omitempty"`
+	Amount        *float64 `json:"amount,omitempty"` // legacy fixed fee (NGN float) — prefer AmountKobo
+	Rate          *float64 `json:"rate,omitempty"`   // legacy percent — prefer RateBps
 	ProductCode   *string  `json:"product_code,omitempty"`
 	Service       *string  `json:"service,omitempty"`
 	Currency      string   `json:"currency"`
 	Status        string   `json:"status"`
 	EffectiveFrom *string  `json:"effective_from,omitempty"`
 	CreatedAt     string   `json:"created_at"`
+	// MN-10 evaluation fields (expand-migrated columns):
+	TenantID        *string `json:"tenant_id,omitempty"`        // nil/empty = global rule
+	TransactionType *string `json:"transaction_type,omitempty"` // nil/empty = any
+	Channel         *string `json:"channel,omitempty"`          // nil/empty = any
+	FeeAccountID    *string `json:"fee_account_id,omitempty"`   // GL/TB fee-income account for postings
+	AmountKobo      *int64  `json:"amount_kobo,omitempty"`      // fixed fee, integer minor units
+	RateBps         *int64  `json:"rate_bps,omitempty"`         // percent-of-amount fee in basis points
+	MinFeeKobo      *int64  `json:"min_fee_kobo,omitempty"`
+	MaxFeeKobo      *int64  `json:"max_fee_kobo,omitempty"`
 }
 
 // ── Storage ───────────────────────────────────────────────────────────────────
@@ -112,19 +121,43 @@ func newPGStore(dsn string) (*pgStore, error) {
 	if err != nil {
 		return nil, err
 	}
+	// MN-10 expand-migrate: evaluation + posting columns.
+	for _, stmt := range []string{
+		`ALTER TABLE fee_rules ADD COLUMN IF NOT EXISTS tenant_id TEXT`,
+		`ALTER TABLE fee_rules ADD COLUMN IF NOT EXISTS transaction_type TEXT`,
+		`ALTER TABLE fee_rules ADD COLUMN IF NOT EXISTS channel TEXT`,
+		`ALTER TABLE fee_rules ADD COLUMN IF NOT EXISTS fee_account_id TEXT`,
+		`ALTER TABLE fee_rules ADD COLUMN IF NOT EXISTS amount_kobo BIGINT`,
+		`ALTER TABLE fee_rules ADD COLUMN IF NOT EXISTS rate_bps BIGINT`,
+		`ALTER TABLE fee_rules ADD COLUMN IF NOT EXISTS min_fee_kobo BIGINT`,
+		`ALTER TABLE fee_rules ADD COLUMN IF NOT EXISTS max_fee_kobo BIGINT`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			return nil, err
+		}
+	}
 	return &pgStore{db: db}, nil
 }
 
+const feeRuleCols = `id,name,fee_type,amount,rate,product_code,service,currency,status,effective_from,created_at,tenant_id,transaction_type,channel,fee_account_id,amount_kobo,rate_bps,min_fee_kobo,max_fee_kobo`
+
+func scanFeeRule(scan func(dest ...any) error) (FeeRule, error) {
+	var r FeeRule
+	err := scan(&r.ID, &r.Name, &r.FeeType, &r.Amount, &r.Rate, &r.ProductCode, &r.Service, &r.Currency, &r.Status, &r.EffectiveFrom, &r.CreatedAt,
+		&r.TenantID, &r.TransactionType, &r.Channel, &r.FeeAccountID, &r.AmountKobo, &r.RateBps, &r.MinFeeKobo, &r.MaxFeeKobo)
+	return r, err
+}
+
 func (s *pgStore) List() ([]FeeRule, error) {
-	rows, err := s.db.Query(`SELECT id,name,fee_type,amount,rate,product_code,service,currency,status,effective_from,created_at FROM fee_rules ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT ` + feeRuleCols + ` FROM fee_rules ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []FeeRule
 	for rows.Next() {
-		var r FeeRule
-		if err := rows.Scan(&r.ID, &r.Name, &r.FeeType, &r.Amount, &r.Rate, &r.ProductCode, &r.Service, &r.Currency, &r.Status, &r.EffectiveFrom, &r.CreatedAt); err != nil {
+		r, err := scanFeeRule(rows.Scan)
+		if err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -136,8 +169,9 @@ func (s *pgStore) List() ([]FeeRule, error) {
 }
 
 func (s *pgStore) Create(r *FeeRule) error {
-	_, err := s.db.Exec(`INSERT INTO fee_rules(id,name,fee_type,amount,rate,product_code,service,currency,status,effective_from,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-		r.ID, r.Name, r.FeeType, r.Amount, r.Rate, r.ProductCode, r.Service, r.Currency, r.Status, r.EffectiveFrom, r.CreatedAt)
+	_, err := s.db.Exec(`INSERT INTO fee_rules(`+feeRuleCols+`) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`,
+		r.ID, r.Name, r.FeeType, r.Amount, r.Rate, r.ProductCode, r.Service, r.Currency, r.Status, r.EffectiveFrom, r.CreatedAt,
+		r.TenantID, r.TransactionType, r.Channel, r.FeeAccountID, r.AmountKobo, r.RateBps, r.MinFeeKobo, r.MaxFeeKobo)
 	return err
 }
 
@@ -152,8 +186,10 @@ func (s *pgStore) Update(id string, patch *FeeRule) (*FeeRule, error) {
 	}
 	patch.ID = id
 	patch.CreatedAt = createdAt
-	_, err = s.db.Exec(`UPDATE fee_rules SET name=$2,fee_type=$3,amount=$4,rate=$5,product_code=$6,service=$7,currency=$8,status=$9,effective_from=$10 WHERE id=$1`,
-		id, patch.Name, patch.FeeType, patch.Amount, patch.Rate, patch.ProductCode, patch.Service, patch.Currency, patch.Status, patch.EffectiveFrom)
+	_, err = s.db.Exec(`UPDATE fee_rules SET name=$2,fee_type=$3,amount=$4,rate=$5,product_code=$6,service=$7,currency=$8,status=$9,effective_from=$10,
+		tenant_id=$11,transaction_type=$12,channel=$13,fee_account_id=$14,amount_kobo=$15,rate_bps=$16,min_fee_kobo=$17,max_fee_kobo=$18 WHERE id=$1`,
+		id, patch.Name, patch.FeeType, patch.Amount, patch.Rate, patch.ProductCode, patch.Service, patch.Currency, patch.Status, patch.EffectiveFrom,
+		patch.TenantID, patch.TransactionType, patch.Channel, patch.FeeAccountID, patch.AmountKobo, patch.RateBps, patch.MinFeeKobo, patch.MaxFeeKobo)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +316,167 @@ func handleRules(store Store) http.HandlerFunc {
 	}
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Fee evaluation (MN-10) ──────────────────────────────────────────────────
+//
+// POST /v1/fee-rules/evaluate — deterministic, pure function of the persisted
+// rule set. Consumed (or to be consumed) by payment paths; R2's
+// payment-processing-service currently computes commission via its own
+// adapter — convergence on this endpoint is noted as future work, not claimed.
+//
+// Request:  {transaction_type, amount_kobo, tenant_id, channel, currency}
+// Response: {fee_kobo, fee_account_id, rule_id, currency, matched}
+//
+// Fee = fixed (amount_kobo | legacy amount×100) + proportional
+// (ROUND_HALF_UP(amount_kobo × rate_bps / 10000) | legacy rate %), clamped to
+// [min_fee_kobo, max_fee_kobo]. Matching: status='active', effective_from ≤
+// now, and each of tenant_id / transaction_type / channel either unset on the
+// rule or equal to the request. The most specific matching rule wins
+// (tenant+type+channel specificity), latest created_at breaks ties.
+
+type EvaluateRequest struct {
+	TransactionType string `json:"transaction_type"`
+	AmountKobo      int64  `json:"amount_kobo"`
+	TenantID        string `json:"tenant_id"`
+	Channel         string `json:"channel"`
+	Currency        string `json:"currency"`
+}
+
+type EvaluateResponse struct {
+	FeeKobo      int64  `json:"fee_kobo"`
+	FeeAccountID string `json:"fee_account_id"`
+	RuleID       string `json:"rule_id"`
+	Currency     string `json:"currency"`
+	Matched      bool   `json:"matched"`
+}
+
+// roundHalfUpFloat converts a legacy float NGN/percent quantity to integer
+// kobo via big.Rat ROUND_HALF_UP (deprecation path only).
+func roundHalfUpKobo(v float64) int64 {
+	r := new(big.Rat).SetFloat64(v)
+	num, den := r.Num(), r.Denom()
+	q, rem := new(big.Int).QuoRem(num, den, new(big.Int))
+	if q.Sign() >= 0 && new(big.Int).Mul(rem, big.NewInt(2)).Cmp(den) >= 0 {
+		q.Add(q, big.NewInt(1))
+	}
+	return q.Int64()
+}
+
+// evaluateFee computes the fee in integer kobo for one matched rule.
+func evaluateFee(rule *FeeRule, amountKobo int64) int64 {
+	fee := int64(0)
+	if rule.AmountKobo != nil {
+		fee += *rule.AmountKobo
+	} else if rule.Amount != nil {
+		fee += roundHalfUpKobo(*rule.Amount * 100)
+	}
+	if rule.RateBps != nil {
+		// ROUND_HALF_UP(amount × bps / 10000), big-int to avoid overflow.
+		num := new(big.Int).Mul(big.NewInt(amountKobo), big.NewInt(*rule.RateBps))
+		num.Add(num, big.NewInt(5000))
+		fee += new(big.Int).Quo(num, big.NewInt(10000)).Int64()
+	} else if rule.Rate != nil {
+		fee += roundHalfUpKobo(float64(amountKobo) * *rule.Rate / 100)
+	}
+	if rule.MinFeeKobo != nil && fee < *rule.MinFeeKobo {
+		fee = *rule.MinFeeKobo
+	}
+	if rule.MaxFeeKobo != nil && fee > *rule.MaxFeeKobo {
+		fee = *rule.MaxFeeKobo
+	}
+	return fee
+}
+
+func matchStr(ruleVal *string, reqVal string) bool {
+	if ruleVal == nil || *ruleVal == "" {
+		return true
+	}
+	return *ruleVal == reqVal
+}
+
+func ruleEffective(rule *FeeRule, now time.Time) bool {
+	if rule.EffectiveFrom == nil || *rule.EffectiveFrom == "" {
+		return true
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02"} {
+		if t, err := time.Parse(layout, *rule.EffectiveFrom); err == nil {
+			return !t.After(now)
+		}
+	}
+	return true // unparsable effective_from does not block (legacy rows)
+}
+
+func handleEvaluate(store Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		var req EvaluateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		if req.AmountKobo <= 0 {
+			writeErr(w, http.StatusBadRequest, "amount_kobo must be positive")
+			return
+		}
+		if req.Currency == "" {
+			req.Currency = "NGN"
+		}
+		rules, err := store.List()
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		now := time.Now().UTC()
+		best := -1
+		bestScore := -1
+		for i := range rules {
+			rule := &rules[i]
+			if rule.Status != "active" || !ruleEffective(rule, now) {
+				continue
+			}
+			if rule.Currency != "" && rule.Currency != req.Currency {
+				continue
+			}
+			if !matchStr(rule.TenantID, req.TenantID) ||
+				!matchStr(rule.TransactionType, req.TransactionType) ||
+				!matchStr(rule.Channel, req.Channel) {
+				continue
+			}
+			score := 0
+			if rule.TenantID != nil && *rule.TenantID != "" {
+				score++
+			}
+			if rule.TransactionType != nil && *rule.TransactionType != "" {
+				score++
+			}
+			if rule.Channel != nil && *rule.Channel != "" {
+				score++
+			}
+			// Higher specificity wins; RFC3339 created_at breaks ties (latest).
+			if score > bestScore || (score == bestScore && best >= 0 && rule.CreatedAt > rules[best].CreatedAt) {
+				best, bestScore = i, score
+			}
+		}
+		if best < 0 {
+			writeJSON(w, http.StatusOK, EvaluateResponse{FeeKobo: 0, Currency: req.Currency, Matched: false})
+			return
+		}
+		rule := &rules[best]
+		resp := EvaluateResponse{
+			FeeKobo:  evaluateFee(rule, req.AmountKobo),
+			RuleID:   rule.ID,
+			Currency: req.Currency,
+			Matched:  true,
+		}
+		if rule.FeeAccountID != nil {
+			resp.FeeAccountID = *rule.FeeAccountID
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
 
 // ── MIDDLEWARE: JWT Validation (JWKS / RS256, fail-closed) ──────────────────
 
@@ -486,6 +682,7 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 
 	rulesHandler := handleRules(store)
+	mux.HandleFunc("/v1/fee-rules/evaluate", handleEvaluate(store)) // MN-10 — registered before the /v1/fee-rules/ subtree; ServeMux picks the longest pattern
 	mux.HandleFunc("/v1/fee-rules/", rulesHandler)
 	mux.HandleFunc("/v1/fee-rules", rulesHandler)
 

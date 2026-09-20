@@ -22,3 +22,24 @@ def subscribe(dapr_app):
             )
         finally:
             session.close()
+
+    # OR-15: consume core-banking.events (event core.posting.posted) so every
+    # core posting event is persisted for analytics/recon instead of going
+    # unread. Producer publishes raw Kafka (not CloudEvent-wrapped) via
+    # sarama; the kafka-backed Dapr pubsub component delivers the same topic.
+    @dapr_app.subscribe(
+        pubsub=config.DAPR_PUBSUB_NAME,
+        topic=PubsubTopics.CORE_BANKING_EVENTS.value,
+    )
+    def core_banking_events(event: dict = Body(...)):
+        session = next(get_session())
+        logger.info("Received CORE_BANKING_EVENTS event: %s", event)
+        try:
+            event_repo = EventRepository(session)
+            event_repo.create_event(
+                topic=PubsubTopics.CORE_BANKING_EVENTS.value,
+                raw=event,
+                tenant_id=str(event.get("tenantID", "")) if isinstance(event, dict) else "",
+            )
+        finally:
+            session.close()

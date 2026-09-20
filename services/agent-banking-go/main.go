@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/hmac"
 	"crypto/rsa"
 	"crypto/sha256"
 	"database/sql"
@@ -160,6 +161,162 @@ func createHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[%s] dbInsert failed: %v", serviceName, dbErr)
 	}
 	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "source": "in-memory"})
+}
+
+// --- OB-04: agent profile endpoints (orchestrator agentService client contract) ---
+// The orchestrator client (services/orchestrator-service/src/services/agentService.ts)
+// calls, against base AGENT_SVC_URL:
+//   POST /agent                 body: IAgentProfilePayload   headers: x-tenant-id, x-keycloak-id
+//   POST /agent/kyc/save        body: {kyc_url}              headers: x-tenant-id, x-keycloak-id
+//   POST /agent/kyc/complete    body: {}                     headers: x-tenant-id, x-keycloak-id
+//   POST /agent/kyc/fail        body: {}                     headers: x-tenant-id, x-keycloak-id
+// Both the client's literal paths and the canonical /v1/agent-banking/agents
+// prefix are mounted (see route registration below). All require a verified
+// JWT (jwtMiddleware): RS256 Keycloak user tokens or HS256 service tokens.
+
+type agentProfilePayload struct {
+	FirstName       string `json:"first_name"`
+	LastName        string `json:"last_name"`
+	Email           string `json:"email"`
+	Phone           string `json:"phone"`
+	UIN             string `json:"uin"`
+	KeycloakID      string `json:"keycloak_id"`
+	TenantID        string `json:"tenant_id"`
+	AgentRole       string `json:"agent_role"`
+	BusinessName    string `json:"business_name"`
+	BusinessAddress string `json:"business_address"`
+	City            string `json:"city"`
+	State           string `json:"state"`
+	PostalCode      string `json:"postal_code"`
+	LGA             string `json:"lga"`
+}
+
+// agentIdentity resolves (tenantID, keycloakID) for agent profile calls:
+// headers first (claim-derived for user tokens; caller-supplied for verified
+// service tokens), body values as fallback. A body/header tenant mismatch is
+// rejected with 403.
+func agentIdentity(w http.ResponseWriter, r *http.Request, bodyTenant, bodyKeycloakID string) (string, string, bool) {
+	tenantID := r.Header.Get("X-Tenant-ID")
+	if tenantID == "" {
+		tenantID = bodyTenant
+	} else if bodyTenant != "" && bodyTenant != tenantID {
+		jsonResp(w, 403, map[string]interface{}{"error": "tenant_mismatch", "message": "tenant_id in body does not match the request tenant"})
+		return "", "", false
+	}
+	keycloakID := r.Header.Get("X-Keycloak-ID")
+	if keycloakID == "" {
+		keycloakID = bodyKeycloakID
+	}
+	if tenantID == "" || keycloakID == "" {
+		jsonResp(w, 400, map[string]interface{}{"error": "missing_identity", "message": "x-tenant-id and x-keycloak-id (or body equivalents) are required"})
+		return "", "", false
+	}
+	return tenantID, keycloakID, true
+}
+
+func createAgentProfileHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		jsonResp(w, 405, map[string]interface{}{"error": "method_not_allowed", "message": "POST required"})
+		return
+	}
+	if db == nil {
+		// OB-04: durable persistence is mandatory — fail closed rather than
+		// acknowledge a profile that was never stored.
+		jsonResp(w, 503, map[string]interface{}{"error": "storage_unavailable", "message": "agent profile store unavailable (DATABASE_URL not configured)"})
+		return
+	}
+	var body agentProfilePayload
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonResp(w, 400, map[string]interface{}{"error": "invalid_body", "message": err.Error()})
+		return
+	}
+	tenantID, keycloakID, ok := agentIdentity(w, r, body.TenantID, body.KeycloakID)
+	if !ok {
+		return
+	}
+	var id int64
+	err := db.QueryRow(`INSERT INTO agent_profiles
+		(tenant_id, keycloak_id, first_name, last_name, email, phone, uin, agent_role,
+		 business_name, business_address, city, state, postal_code, lga)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		ON CONFLICT (tenant_id, keycloak_id) DO NOTHING
+		RETURNING id`,
+		tenantID, keycloakID, body.FirstName, body.LastName, body.Email, body.Phone,
+		body.UIN, body.AgentRole, body.BusinessName, body.BusinessAddress,
+		body.City, body.State, body.PostalCode, body.LGA).Scan(&id)
+	if err == sql.ErrNoRows {
+		// Idempotent replay: profile already exists — return it with 200.
+		var existingID int64
+		var kycStatus string
+		if qerr := db.QueryRow(`SELECT id, kyc_status FROM agent_profiles WHERE tenant_id=$1 AND keycloak_id=$2`,
+			tenantID, keycloakID).Scan(&existingID, &kycStatus); qerr != nil {
+			jsonResp(w, 500, map[string]interface{}{"error": "db_query_failed", "message": qerr.Error()})
+			return
+		}
+		jsonResp(w, 200, map[string]interface{}{"created": false, "id": existingID, "tenant_id": tenantID, "keycloak_id": keycloakID, "kyc_status": kycStatus, "idempotent": true})
+		return
+	}
+	if err != nil {
+		jsonResp(w, 500, map[string]interface{}{"error": "db_insert_failed", "message": err.Error()})
+		return
+	}
+	jsonResp(w, 201, map[string]interface{}{"created": true, "id": id, "tenant_id": tenantID, "keycloak_id": keycloakID, "kyc_status": "pending"})
+}
+
+// agentKycTransitionHandler handles kyc/save, kyc/complete and kyc/fail.
+func agentKycTransitionHandler(transition string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonResp(w, 405, map[string]interface{}{"error": "method_not_allowed", "message": "POST required"})
+			return
+		}
+		if db == nil {
+			jsonResp(w, 503, map[string]interface{}{"error": "storage_unavailable", "message": "agent profile store unavailable (DATABASE_URL not configured)"})
+			return
+		}
+		var body struct {
+			KycURL     string `json:"kyc_url"`
+			TenantID   string `json:"tenant_id"`
+			KeycloakID string `json:"keycloak_id"`
+		}
+		// body may be empty for complete/fail
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		tenantID, keycloakID, ok := agentIdentity(w, r, body.TenantID, body.KeycloakID)
+		if !ok {
+			return
+		}
+		var query string
+		var args []interface{}
+		switch transition {
+		case "save":
+			if body.KycURL == "" {
+				jsonResp(w, 400, map[string]interface{}{"error": "missing_kyc_url", "message": "kyc_url is required"})
+				return
+			}
+			query = `UPDATE agent_profiles SET kyc_url=$1, kyc_status='in_progress', updated_at=now() WHERE tenant_id=$2 AND keycloak_id=$3`
+			args = []interface{}{body.KycURL, tenantID, keycloakID}
+		case "complete":
+			query = `UPDATE agent_profiles SET kyc_status='verified', updated_at=now() WHERE tenant_id=$1 AND keycloak_id=$2`
+			args = []interface{}{tenantID, keycloakID}
+		case "fail":
+			query = `UPDATE agent_profiles SET kyc_status='failed', updated_at=now() WHERE tenant_id=$1 AND keycloak_id=$2`
+			args = []interface{}{tenantID, keycloakID}
+		default:
+			jsonResp(w, 500, map[string]interface{}{"error": "unknown_transition", "message": transition})
+			return
+		}
+		res, err := db.Exec(query, args...)
+		if err != nil {
+			jsonResp(w, 500, map[string]interface{}{"error": "db_update_failed", "message": err.Error()})
+			return
+		}
+		affected, _ := res.RowsAffected()
+		if affected == 0 {
+			jsonResp(w, 404, map[string]interface{}{"error": "agent_not_found", "message": "no agent profile for tenant_id+keycloak_id"})
+			return
+		}
+		jsonResp(w, 200, map[string]interface{}{"updated": true, "tenant_id": tenantID, "keycloak_id": keycloakID, "transition": transition})
+	}
 }
 
 func computeCommission(amount float64, rate float64) float64 {
@@ -334,11 +491,8 @@ func callAgentKYC(agentID string) (map[string]interface{}, error) {
 	})
 }
 
-func callAgentFloatTopup(agentID string, amount float64) (map[string]interface{}, error) {
-	return callService("POST", walletURL+"/v1/transfers", map[string]interface{}{
-		"to_account": agentID, "amount": amount, "type": "float_topup",
-	})
-}
+// MN-23: callAgentFloatTopup deleted — it had zero call sites and targeted a
+// wallet /v1/transfers domain that does not exist in the fleet (ROADMAP).
 
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
@@ -387,6 +541,32 @@ func initDB() {
 		return
 	}
 	log.Printf("[%s] Postgres connected (pool: 25/5)", serviceName)
+
+	// OB-04: durable agent profile store (expand-only; CREATE IF NOT EXISTS).
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS agent_profiles (
+		id BIGSERIAL PRIMARY KEY,
+		tenant_id TEXT NOT NULL,
+		keycloak_id TEXT NOT NULL,
+		first_name TEXT NOT NULL DEFAULT '',
+		last_name TEXT NOT NULL DEFAULT '',
+		email TEXT NOT NULL DEFAULT '',
+		phone TEXT NOT NULL DEFAULT '',
+		uin TEXT NOT NULL DEFAULT '',
+		agent_role TEXT NOT NULL DEFAULT '',
+		business_name TEXT NOT NULL DEFAULT '',
+		business_address TEXT NOT NULL DEFAULT '',
+		city TEXT NOT NULL DEFAULT '',
+		state TEXT NOT NULL DEFAULT '',
+		postal_code TEXT NOT NULL DEFAULT '',
+		lga TEXT NOT NULL DEFAULT '',
+		kyc_status TEXT NOT NULL DEFAULT 'pending',
+		kyc_url TEXT,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+		UNIQUE (tenant_id, keycloak_id)
+	)`); err != nil {
+		log.Printf("[%s] agent_profiles table init failed: %v", serviceName, err)
+	}
 }
 
 // ── MIDDLEWARE: JWT Validation ───────────────────────────────────────────────
@@ -522,8 +702,57 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		}
 		var header struct {
 			Kid string `json:"kid"`
+			Alg string `json:"alg"`
 		}
 		json.Unmarshal(headerBytes, &header)
+
+		// OB-03/OB-04: accept orchestrator service-to-service tokens — HS256
+		// signed with the shared JWT_SECRET and carrying role='service'
+		// (sub='orchestrator-service'). Signature and exp are fully verified;
+		// fail-closed when JWT_SECRET is unset. Service tokens carry no tenant
+		// claim, so the caller-supplied X-Tenant-ID header is kept (for user
+		// tokens it is overwritten from claims below).
+		if header.Alg == "HS256" {
+			secret := os.Getenv("JWT_SECRET")
+			if secret == "" || strings.HasPrefix(secret, "${") {
+				http.Error(w, `{"error":"auth_not_configured"}`, http.StatusUnauthorized)
+				return
+			}
+			sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
+			if err != nil {
+				http.Error(w, `{"error":"invalid signature encoding"}`, http.StatusUnauthorized)
+				return
+			}
+			mac := hmac.New(sha256.New, []byte(secret))
+			mac.Write([]byte(parts[0] + "." + parts[1]))
+			if !hmac.Equal(mac.Sum(nil), sigBytes) {
+				http.Error(w, `{"error":"invalid signature"}`, http.StatusUnauthorized)
+				return
+			}
+			claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
+			var claims map[string]interface{}
+			if err := json.Unmarshal(claimsBytes, &claims); err != nil {
+				http.Error(w, `{"error":"invalid claims"}`, http.StatusUnauthorized)
+				return
+			}
+			exp, ok := claims["exp"].(float64)
+			if !ok {
+				http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
+				return
+			}
+			if time.Now().Unix() >= int64(exp) {
+				http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+				return
+			}
+			if claims["role"] != "service" {
+				http.Error(w, `{"error":"forbidden: service role required"}`, http.StatusForbidden)
+				return
+			}
+			r.Header.Set("X-User-Role", "service")
+			ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+			next.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
 
 		jwtCache.mu.RLock()
 		pub, ok := jwtCache.keys[header.Kid]
@@ -1366,6 +1595,18 @@ func main() {
 	mux.Handle("/v1/agent/commission", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(commissionCalcHandler)))
 	mux.Handle("/v1/agent/float-check", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(floatCheckHandler)))
 	mux.Handle("/v1/agent/tier-assess", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(tierAssessHandler)))
+
+	// OB-04: real agent profile endpoints. Canonical prefixed paths AND the
+	// orchestrator agentService client's literal paths (client base is
+	// AGENT_SVC_URL, so it hits /agent, /agent/kyc/save, ...).
+	mux.Handle("/v1/agent-banking/agents", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(createAgentProfileHandler)))
+	mux.Handle("/v1/agent-banking/agents/kyc/save", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("save")))
+	mux.Handle("/v1/agent-banking/agents/kyc/complete", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("complete")))
+	mux.Handle("/v1/agent-banking/agents/kyc/fail", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("fail")))
+	mux.Handle("/agent", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(createAgentProfileHandler)))
+	mux.Handle("/agent/kyc/save", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("save")))
+	mux.Handle("/agent/kyc/complete", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("complete")))
+	mux.Handle("/agent/kyc/fail", jwtMiddleware(jwtRealmURL(), agentKycTransitionHandler("fail")))
 
 	log.Printf("agent-banking-go listening on port %s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()

@@ -7,7 +7,7 @@ All 520 services validated end-to-end. Every service exists, has EventBus integr
 ## Scenario 1: Customer Onboarding
 **Stakeholder:** Retail Customer (via mobile app)
 **SLA:** Account activation within 5 minutes (Tier 1), 24 hours (Tier 3)
-**Services (20):** account-opening-go → kyc-engine-py → bvn-nin-verification-go → biometric-auth-rs → face-match-rs → cbn-tiered-kyc-rs → notification-service-go + address-verification-py, liveness-detection-rs, liveness-inference-py, liveness-orchestrator-go, identity-verification-go, identity-channels-go, multi-bureau-verification-go, kyc-workflow-orchestration-py, kyc-self-service-py, kyc-data-quality-py, kyc-event-consumer-py, video-kyc-py, kyc-analytics-dashboard-py, account-closure-go
+**Services (19):** account-opening-go → kyc-engine-py → bvn-nin-verification-go → biometric-auth-rs → face-match-rs → cbn-tiered-kyc-rs → notification-service-go + address-verification-py, liveness-detection-rs, liveness-inference-py, liveness-orchestrator-go, identity-verification-go, identity-channels-go, multi-bureau-verification-go, kyc-workflow-orchestration-py, kyc-self-service-py, kyc-data-quality-py, kyc-event-consumer-py, video-kyc-py, kyc-analytics-dashboard-py
 
 ```
 [Flutter: onboarding_screen] → account-opening-go ──emit→ banking.accounts
@@ -36,7 +36,7 @@ payments-hub-go ──emit→ banking.payments
 ## Scenario 3: Loan Origination & Disbursement
 **Stakeholder:** Loan Officer + Customer
 **SLA:** Decision within 2 hours, disbursement same-day
-**Services (16):** loan-origination-go, credit-bureau-rs, credit-scoring-py, collateral-valuation-rs, loan-calculator-go, payments-hub-go, gl-engine-rs, ifrs9-ecl-engine-rs, ifrs9-engine-rs, credit-facility-go, education-loans-py, syndicated-loans-go, nirsal-credit-guarantee-go, mortgage-servicing-rs, debt-collection-go, group-lending-go
+**Services (15):** loan-origination-go, credit-bureau-rs, credit-scoring-py, collateral-valuation-rs, loan-calculator-go, payments-hub-go, gl-engine-rs, ifrs9-ecl-engine-rs, ifrs9-engine-rs, credit-facility-go, syndicated-loans-go, nirsal-credit-guarantee-go, mortgage-servicing-rs, debt-collection-go, group-lending-go
 
 ```
 loan-origination-go ──emit→ banking.lending
@@ -51,7 +51,7 @@ loan-origination-go ──emit→ banking.lending
 ## Scenario 4: Fraud Detection & Response
 **Stakeholder:** Compliance Officer + Automated Systems
 **SLA:** Real-time detection <500ms, case opened <1min
-**Services (25):** fraud-detection-rs, ai-fraud-scoring-rs, fraudfusion-ensemble-rs, gnn-fraud-detection-py, aml-engine-rs, aml-case-manager-go, sanctions-screening-rs, notification-service-go, incident-management-go, aml-risk-scoring-rs, aml-training-tracker-go, sanctions-engine-rs, sanctions-batch-rescreener-rs, goaml-integration-go, nfiu-ctr-str-filing-py, ctr-auto-filer-go, sar-filing-engine-go, watchlist-manager-rs, txn-monitoring-rules-rs, txn-pattern-analyzer-py, adverse-media-screening-py, pep-enhanced-dd-py, beneficial-ownership-go, ubo-ownership-graph-rs, typology-detector-rs, kyb-engine-go, kyb-engine-py
+**Services (24):** fraud-detection-rs, ai-fraud-scoring-rs, fraudfusion-ensemble-rs, gnn-fraud-detection-py, aml-engine-rs, aml-case-manager-go, sanctions-screening-rs, notification-service-go, incident-management-go, aml-risk-scoring-rs, aml-training-tracker-go, sanctions-engine-rs, sanctions-batch-rescreener-rs, goaml-integration-go, nfiu-ctr-str-filing-py, sar-filing-engine-go, watchlist-manager-rs, txn-monitoring-rules-rs, txn-pattern-analyzer-py, adverse-media-screening-py, pep-enhanced-dd-py, beneficial-ownership-go, ubo-ownership-graph-rs, typology-detector-rs, kyb-engine-go, kyb-engine-py
 
 ```
 [Any transaction] → banking.payments
@@ -278,7 +278,7 @@ document-management-py → document-intelligence-py (OCR)
 ## Scenario 21: Database & Cache Layer
 **Stakeholder:** DBA + Backend Engineer
 **SLA:** Query <50ms (p99), cache hit >95%, replication lag <100ms
-**Services (25):** bloom-filter-cache-rs, cache-invalidation-rs, cdn-edge-cache-go, connection-pooler-rs, hot-data-cache-rs, prepared-stmt-cache-go, query-cache-engine-rs, redis-cache-middleware-rs, redis-cache-rs, redis-session-store-go, postgres-adapter-go, postgres-persistence-rs, postgres-query-cache-rs, postgres-query-optimizer-go, postgres-vacuum-py, pgbouncer-manager-go, read-replica-router-rs, table-partitioner-rs, tigerbeetle-adapter-rs, tigerbeetle-batch-engine-rs, tigerbeetle-ledger-rs, tigerbeetle-multicurrency-rs, tigerbeetle-protocol-rs, tigerbeetle-sync-go, sw-api-cache-go
+**Services (24):** bloom-filter-cache-rs, cache-invalidation-rs, cdn-edge-cache-go, connection-pooler-rs, hot-data-cache-rs, prepared-stmt-cache-go, query-cache-engine-rs, redis-cache-middleware-rs, redis-cache-rs, redis-session-store-go, postgres-adapter-go, postgres-persistence-rs, postgres-query-cache-rs, postgres-query-optimizer-go, postgres-vacuum-py, pgbouncer-manager-go, read-replica-router-rs, table-partitioner-rs, tigerbeetle-adapter-rs, tigerbeetle-batch-engine-rs, tigerbeetle-ledger-rs, tigerbeetle-multicurrency-rs, tigerbeetle-protocol-rs, tigerbeetle-sync-go, sw-api-cache-go
 
 ```
 [Request] → bloom-filter-cache-rs (negative cache)
@@ -293,7 +293,7 @@ document-management-py → document-intelligence-py (OCR)
 ## Scenario 22: API Gateway & Integration
 **Stakeholder:** API Product Manager + Partners
 **SLA:** API response <200ms, rate limit 1000 req/s per client
-**Services (32):** api-key-enforcer-go, api-key-vault-go, api-marketplace-go, api-versioning-go, apisix-gateway-go, apisix-plugin-optimizer-go, graphql-federation-go, graphql-gateway-go, grpc-gateway-rs, grpc-hot-path-go, webhook-engine-go, banking-domain-integration-go, cac-realtime-api-go, cors-gateway-go, body-limit-enforcer-go, csp-nonce-engine-go, output-encoder-rs, path-validator-rs, sql-parameterizer-rs, request-validator-py, route-schema-enforcer-go, route-trie-optimizer-rs, erpnext-bridge-go, erpnext-sync-py, developer-portal-go, realtime-gateway-go, http2-multiplexer-rs, request-coalescer-go, response-compressor-rs, fast-json-serializer-rs, stream-response-go, keepalive-tuner-rs
+**Services (31):** api-key-enforcer-go, api-key-vault-go, api-marketplace-go, api-versioning-go, apisix-gateway-go, apisix-plugin-optimizer-go, graphql-federation-go, graphql-gateway-go, grpc-gateway-rs, grpc-hot-path-go, webhook-engine-go, banking-domain-integration-go, cac-realtime-api-go, cors-gateway-go, body-limit-enforcer-go, csp-nonce-engine-go, output-encoder-rs, path-validator-rs, sql-parameterizer-rs, request-validator-py, route-schema-enforcer-go, route-trie-optimizer-rs, erpnext-bridge-go, developer-portal-go, realtime-gateway-go, http2-multiplexer-rs, request-coalescer-go, response-compressor-rs, fast-json-serializer-rs, stream-response-go, keepalive-tuner-rs
 
 ```
 [Client] → apisix-gateway-go → api-key-enforcer-go
@@ -334,7 +334,7 @@ unit-test-runner-py → contract-test-rs → e2e-orchestrator-go
 ## Scenario 25: Platform Admin & Config
 **Stakeholder:** Platform Admin + DevOps
 **SLA:** Feature flag toggle <1s, tenant provisioning <5min
-**Services (67):** feature-flag-engine-rs, feature-flags-go, feature-entitlement-go, graduated-rollout-rs, tenant-provisioning-go, tenant-provisioning-py, tenant-management-py, tenant-billing-go, tenant-export-go, tenant-isolation-go, tenant-metering-go, tenant-ratelimit-rs, billing-analytics-py, billing-enforcement-rs, billing-event-processor-py, billing-ingestor-go, billing-orchestrator-go, billing-rating-rs, billing-rbac-rs, db-migration-manager-go, db-migrations, helm-validator-go, i18n-service-go, custom-domain-go, white-label-engine-go, plugin-marketplace-py, product-factory-rs, relationship-pricing-rs, rate-cascade-rs, fee-management-go, accounting-rules-rs, middleware-go, middleware-py, middleware-rs, dapr-sidecar-go, hpa-autoscaler-go, idempotency-go, express-rate-limiter-rs, adaptive-rate-limiter-rs, backup-manager-py, docker-hardener-py, distroless-builder-py, network-policy-manager-py, skeleton-loading-rs, sri-validator-rs, component-memoizer-py, optimistic-ui-engine-go, virtual-scroll-engine-rs, bundle-splitter-py, temporal-memoizer-go, aggregation-center-go, banking-operations-pipeline-py, platform-operations-engine-py, workflow-engine-py, saga-coordinator-py, temporal-orchestrator-py, temporal-sagas-go, temporal-worker-go, inventory-py, exam-management-py, dispute-management-py, growth-features-go, ledger-reconciliation-rs, journal-posting-go, carbon-esg-tracker-py, kyc-aml-screening-py, risk-based-approach-py
+**Services (64):** feature-flag-engine-rs, feature-flags-go, feature-entitlement-go, graduated-rollout-rs, tenant-provisioning-go, tenant-provisioning-py, tenant-management-py, tenant-billing-go, tenant-export-go, tenant-isolation-go, tenant-metering-go, tenant-ratelimit-rs, billing-analytics-py, billing-enforcement-rs, billing-event-processor-py, billing-ingestor-go, billing-orchestrator-go, billing-rating-rs, billing-rbac-rs, db-migration-manager-go, db-migrations, helm-validator-go, i18n-service-go, custom-domain-go, white-label-engine-go, plugin-marketplace-py, product-factory-rs, relationship-pricing-rs, rate-cascade-rs, fee-management-go, accounting-rules-rs, middleware-rs, dapr-sidecar-go, hpa-autoscaler-go, idempotency-go, express-rate-limiter-rs, adaptive-rate-limiter-rs, backup-manager-py, docker-hardener-py, distroless-builder-py, network-policy-manager-py, skeleton-loading-rs, sri-validator-rs, component-memoizer-py, optimistic-ui-engine-go, virtual-scroll-engine-rs, bundle-splitter-py, temporal-memoizer-go, aggregation-center-go, banking-operations-pipeline-py, platform-operations-engine-py, workflow-engine-py, saga-coordinator-py, temporal-orchestrator-py, temporal-sagas-go, temporal-worker-go, inventory-py, exam-management-py, growth-features-go, ledger-reconciliation-rs, journal-posting-go, carbon-esg-tracker-py, kyc-aml-screening-py, risk-based-approach-py
 
 ```
 feature-flag-engine-rs → graduated-rollout-rs

@@ -2,9 +2,15 @@
 // Computes daily interest accrual for savings, loans, FDs, overdrafts.
 //
 // Data integrity doctrine:
-//   - Accrual-eligible accounts are read from Postgres (accrual_eligible_accounts).
+//   - Accrual-eligible accounts are read from Postgres (accrual_eligible_accounts),
+//     populated by POST /v1/interest/sync-eligible-accounts which pulls the real
+//     savings account set from account-service (MN-09).
 //   - Every accrual posts a REAL balanced double-entry journal into the GL
 //     store ("journalEntries" + "glAccounts" balance update) in one tx.
+//   - For customer-credit products (savings, fixed_deposit) the accrued amount
+//     is ALSO moved in TigerBeetle from the interest mint account to the
+//     customer's TB account (MN-09), with a deterministic idempotency key
+//     accrue:{account}:{date}. A TB failure fails the accrual (fail-closed).
 //   - If Postgres is unavailable the batch FAILS with an error and nothing is
 //     marked posted. No hardcoded accounts, no fabricated "posted" statuses,
 //     no middleware action claims.
@@ -23,12 +29,14 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	_ "github.com/lib/pq"
+	"github.com/munisp/corebanking/pkg/tbclient"
 )
 
 var db *sql.DB
@@ -71,6 +79,11 @@ type AccrualResult struct {
 	GLCreditCode string `json:"glCreditCode"`
 	JournalEntry string `json:"journalEntryId"`
 	Status       string `json:"status"` // posted | failed
+	// MN-09: TigerBeetle mint→customer credit leg outcome.
+	// posted | posted_idempotent | failed | not_applicable (receivable products)
+	TBTransferStatus string `json:"tbTransferStatus,omitempty"`
+	TBTransferRef    string `json:"tbTransferRef,omitempty"`
+	FailReason       string `json:"failReason,omitempty"`
 }
 
 type AccrualBatchResult struct {
@@ -80,6 +93,8 @@ type AccrualBatchResult struct {
 	TotalAccruedKobo int64           `json:"total_accrued_kobo"`
 	Posted           int             `json:"journalEntriesPosted"`
 	Failed           int             `json:"journalEntriesFailed"`
+	TBCredited       int             `json:"tbCredited"` // MN-09
+	TBFailed         int             `json:"tbFailed"`   // MN-09
 	Results          []AccrualResult `json:"results"`
 	Status           string          `json:"status"` // completed | failed | no_eligible_accounts
 }
@@ -99,6 +114,100 @@ func productFor(t string) (AccrualProduct, bool) {
 		}
 	}
 	return AccrualProduct{}, false
+}
+
+// ── TigerBeetle credit leg (MN-09) ──────────────────────────────────────────
+//
+// The internal GL accrual journal records the interest expense/liability; the
+// actual money movement is a TigerBeetle transfer from the bank's interest
+// mint account to the customer's TB account. A customer's TB account id IS
+// the integer account-service account id (account-service creates TB accounts
+// with that id — services/account-service/adapters/tigerbeetle.py). The
+// transfer id is deterministic — sha256("54bank/interest-accrual/" +
+// "accrue:{account}:{date}") — so a replayed batch yields TransferExists
+// instead of double-crediting the customer.
+//
+// Fail-closed: when TB_ADDRESS / INTEREST_MINT_ACCOUNT_ID are unset, or the
+// transfer is rejected, the accrual result is marked failed and the batch
+// reports tbFailed>0 (HTTP 500) — interest is never "accrued" only on paper.
+
+var tbLedger *tbclient.Client // nil until initTBLedger succeeds
+
+func initTBLedger() {
+	if strings.TrimSpace(os.Getenv("TB_ADDRESS")) == "" ||
+		strings.TrimSpace(os.Getenv("INTEREST_MINT_ACCOUNT_ID")) == "" {
+		log.Printf("[%s] WARN: TB_ADDRESS / INTEREST_MINT_ACCOUNT_ID unset — customer TB credit legs will FAIL (fail-closed) until configured", serviceName)
+		return
+	}
+	c, err := tbclient.NewClient(tbclient.Config{})
+	if err != nil {
+		log.Printf("[%s] WARN: TigerBeetle client init failed: %v — TB credit legs will fail (fail-closed)", serviceName, err)
+		return
+	}
+	tbLedger = c
+	log.Printf("[%s] TigerBeetle credit leg enabled", serviceName)
+}
+
+// customerCreditProduct reports whether accrued interest for a product is paid
+// OUT to the customer (bank expense → customer deposit). Loan/OD/mortgage
+// accruals are receivables FROM the customer, collected via repayment — no
+// mint→customer transfer at accrual time.
+func customerCreditProduct(productType string) bool {
+	return productType == "savings" || productType == "fixed_deposit"
+}
+
+func tbUint128FromNumericID(s, what string) (tbclient.Uint128, error) {
+	n, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return tbclient.Uint128{}, fmt.Errorf("%s %q is not a numeric TigerBeetle account id: %w", what, s, err)
+	}
+	return tbclient.Uint128FromU64(n, 0), nil
+}
+
+// creditCustomerTB moves accruedKobo (integer minor units) from the interest
+// mint account to the customer's TigerBeetle account.
+// Returns (status, ref, err): status ∈ posted | posted_idempotent | failed.
+func creditCustomerTB(accountID string, accruedKobo int64, accrualDate string) (string, string, error) {
+	// Deterministic idempotency key mandated by MN-09: accrue:{account}:{date}
+	ref := fmt.Sprintf("accrue:%s:%s", accountID, accrualDate)
+	if tbLedger == nil {
+		return "failed", ref, fmt.Errorf("tigerbeetle ledger not configured (TB_ADDRESS / INTEREST_MINT_ACCOUNT_ID)")
+	}
+	mintID, err := tbUint128FromNumericID(os.Getenv("INTEREST_MINT_ACCOUNT_ID"), "INTEREST_MINT_ACCOUNT_ID")
+	if err != nil {
+		return "failed", ref, err
+	}
+	custID, err := tbUint128FromNumericID(accountID, "account id")
+	if err != nil {
+		return "failed", ref, err
+	}
+	sum := sha256.Sum256([]byte("54bank/interest-accrual/" + ref))
+	var b [16]byte
+	copy(b[:], sum[:16])
+	transferID := tbclient.BytesToUint128(b)
+
+	results, err := tbLedger.CreateTransfers(context.Background(), []tbclient.Transfer{{
+		ID:              transferID,
+		DebitAccountID:  mintID,
+		CreditAccountID: custID,
+		Amount:          tbclient.ToUint128(uint64(accruedKobo)),
+		Ledger:          1,
+		Code:            700, // interest payment
+	}})
+	if err != nil {
+		return "failed", ref, fmt.Errorf("tigerbeetle create transfer: %w", err)
+	}
+	for _, r := range results {
+		switch r.Status {
+		case tbclient.TransferCreated:
+			return "posted", ref, nil
+		case tbclient.TransferExists:
+			return "posted_idempotent", ref, nil
+		default:
+			return "failed", ref, fmt.Errorf("tigerbeetle transfer rejected: %v", r.Status)
+		}
+	}
+	return "posted", ref, nil // empty result set = all transfers accepted
 }
 
 // loadEligibleAccounts reads the real accrual-eligible account set from Postgres.
@@ -334,10 +443,31 @@ func runAccrualBatch(w http.ResponseWriter, r *http.Request) {
 			batch.Posted++
 			batch.TotalAccruedKobo += daily
 		}
+
+		// MN-09: move the accrued interest to the customer in TigerBeetle.
+		// Runs for BOTH fresh posts and idempotent replays — the deterministic
+		// transfer id makes a replay a no-op (TransferExists) and self-heals a
+		// batch whose GL journal committed but whose TB leg previously failed.
+		if res.Status != "failed" {
+			if customerCreditProduct(acc.ProductType) {
+				tbStatus, tbRef, tbErr := creditCustomerTB(acc.ID, res.AccruedKobo, businessDate)
+				res.TBTransferStatus = tbStatus
+				res.TBTransferRef = tbRef
+				if tbErr != nil {
+					log.Printf("[%s] TB credit leg FAILED for %s: %v", serviceName, acc.ID, tbErr)
+					res.FailReason = tbErr.Error()
+					batch.TBFailed++
+				} else {
+					batch.TBCredited++
+				}
+			} else {
+				res.TBTransferStatus = "not_applicable" // receivable products: no mint→customer leg
+			}
+		}
 		batch.Results = append(batch.Results, res)
 	}
 	batch.TotalAccounts = len(accounts)
-	if batch.Failed > 0 {
+	if batch.Failed > 0 || batch.TBFailed > 0 {
 		batch.Status = "failed"
 	}
 
@@ -357,6 +487,143 @@ func runAccrualBatch(w http.ResponseWriter, r *http.Request) {
 		code = 500
 	}
 	writeJSON(w, code, batch)
+}
+
+// syncEligibleAccountsHandler implements POST /v1/interest/sync-eligible-accounts
+// (MN-09): pulls the REAL savings account set from account-service
+// (GET {ACCOUNT_SVC_URL}/account/all, paginated) and upserts
+// accrual_eligible_accounts, so the nightly batch accrues against live account
+// data instead of a hand-maintained table. Per-account rates/day-basis already
+// configured are preserved on conflict; new rows get the tenant default
+// INTEREST_DEFAULT_SAVINGS_RATE_BP. Fail-closed: any account-service error
+// aborts the sync with 502 and changes nothing beyond the pages already
+// upserted (each upsert is idempotent).
+func syncEligibleAccountsHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, 405, map[string]string{"error": "method_not_allowed"})
+		return
+	}
+	if db == nil {
+		writeJSON(w, 503, map[string]string{"error": "accrual_store_unavailable"})
+		return
+	}
+	claims := jwtClaims(r)
+	if claims == nil {
+		writeJSON(w, 401, map[string]string{"error": "unauthorized"})
+		return
+	}
+	if !claimsHaveServiceRole(claims) {
+		writeJSON(w, 403, map[string]string{"error": "forbidden", "detail": "sync requires a service or admin role"})
+		return
+	}
+	tenantID := tenantFromClaims(claims)
+	if tenantID == "" {
+		writeJSON(w, 403, map[string]string{"error": "forbidden", "detail": "token carries no tenant claim"})
+		return
+	}
+
+	base := strings.TrimRight(strings.TrimSpace(os.Getenv("ACCOUNT_SVC_URL")), "/")
+	if base == "" {
+		writeJSON(w, 503, map[string]string{"error": "account_service_unconfigured", "detail": "ACCOUNT_SVC_URL not set; refusing to sync from nothing"})
+		return
+	}
+	rateBP := int64(250) // 2.5% p.a. default (matches savings-product default)
+	if v := strings.TrimSpace(os.Getenv("INTEREST_DEFAULT_SAVINGS_RATE_BP")); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			rateBP = n
+		}
+	}
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	synced := 0
+	skipped := 0
+	for page := 1; ; page++ {
+		url := fmt.Sprintf("%s/account/all?page=%d&limit=100", base, page)
+		req, err := http.NewRequestWithContext(r.Context(), "GET", url, nil)
+		if err != nil {
+			writeJSON(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		req.Header.Set("x-tenant-id", tenantID)
+		req.Header.Set("x-keycloak-id", serviceName)
+		req.Header.Set("x-ledger-id", "1")
+		if tok := strings.TrimSpace(os.Getenv("ACCOUNT_SVC_TOKEN")); tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			writeJSON(w, 502, map[string]interface{}{"error": "account_service_unreachable", "detail": err.Error(), "syncedSoFar": synced})
+			return
+		}
+		var page_resp struct {
+			Items []map[string]interface{} `json:"items"`
+			Total int                      `json:"total"`
+		}
+		dec := json.NewDecoder(resp.Body)
+		dec.UseNumber() // TB account ids can exceed float53-safe range
+		decodeErr := dec.Decode(&page_resp)
+		code := resp.StatusCode
+		resp.Body.Close()
+		if code != 200 {
+			writeJSON(w, 502, map[string]interface{}{"error": "account_service_error", "httpStatus": code, "syncedSoFar": synced})
+			return
+		}
+		if decodeErr != nil {
+			writeJSON(w, 502, map[string]string{"error": "account_service_unparseable", "detail": decodeErr.Error()})
+			return
+		}
+		if len(page_resp.Items) == 0 {
+			break
+		}
+
+		for _, item := range page_resp.Items {
+			// account_type / status arrive as enum values (e.g. "savings",
+			// "active"); compare case-insensitively for safety.
+			acctType := strings.ToLower(fmt.Sprintf("%v", item["account_type"]))
+			status := strings.ToLower(fmt.Sprintf("%v", item["status"]))
+			if acctType != "savings" || status != "active" {
+				skipped++
+				continue
+			}
+			idStr := fmt.Sprintf("%v", item["id"])
+			if _, err := strconv.ParseUint(idStr, 10, 64); err != nil {
+				skipped++
+				continue
+			}
+			name, _ := item["name"].(string)
+			// Principal: prefer the TigerBeetle-enriched "balance" (kobo);
+			// fall back to the stored balance_kobo column.
+			var principal int64
+			if v, ok := item["balance"].(json.Number); ok {
+				principal, _ = v.Int64()
+			} else if v, ok := item["balance_kobo"].(json.Number); ok {
+				principal, _ = v.Int64()
+			}
+			if _, err := db.ExecContext(r.Context(),
+				`INSERT INTO accrual_eligible_accounts
+					(account_id, account_name, product_type, principal_kobo, annual_rate_bp, day_basis, status)
+				 VALUES ($1,$2,'savings',$3,$4,365,'active')
+				 ON CONFLICT (account_id) DO UPDATE SET
+					account_name   = EXCLUDED.account_name,
+					principal_kobo = EXCLUDED.principal_kobo,
+					status         = 'active'`,
+				idStr, name, principal, rateBP); err != nil {
+				writeJSON(w, 500, map[string]interface{}{"error": "eligible_account_upsert_failed", "detail": err.Error(), "accountId": idStr})
+				return
+			}
+			synced++
+		}
+		if page*100 >= page_resp.Total {
+			break
+		}
+	}
+
+	log.Printf("[%s] eligible-account sync tenant=%s synced=%d skipped=%d", serviceName, tenantID, synced, skipped)
+	writeJSON(w, 200, map[string]interface{}{
+		"synced": synced, "skipped": skipped, "tenantId": tenantID,
+		"defaultSavingsRateBP": rateBP,
+	})
 }
 
 func healthz(w http.ResponseWriter, r *http.Request) {
@@ -687,6 +954,7 @@ func main() {
 		log.Fatalf("database ping failed: %v", err)
 	}
 	initSchema()
+	initTBLedger() // MN-09: TigerBeetle mint→customer credit leg
 
 	startJWKSRefresh()
 
@@ -702,6 +970,7 @@ func main() {
 	mux.HandleFunc("/metrics", metricsHandler)
 	mux.HandleFunc("/v1/interest/accrue", runAccrualBatch)
 	mux.HandleFunc("/v1/interest/batches", listHandler)
+	mux.HandleFunc("/v1/interest/sync-eligible-accounts", syncEligibleAccountsHandler) // MN-09
 
 	server := &http.Server{
 		Addr:         ":" + port,

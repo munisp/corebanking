@@ -2,6 +2,10 @@ module github.com/afrong/54link-omini-service
 
 go 1.23.0
 
+require shared/otel/go v0.0.0
+
+replace shared/otel/go => ../../shared/otel/go
+
 require (
 	github.com/gorilla/mux v1.8.1
 	github.com/prometheus/client_golang v1.23.2

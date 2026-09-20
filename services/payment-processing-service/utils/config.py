@@ -34,8 +34,27 @@ class Config:
     INSURANCE_SVC_URL = os.getenv("INSURANCE_SVC_URL", "")
     SUPPLY_CHAIN_SVC_URL = os.getenv("SUPPLY_CHAIN_SVC_URL", "")
     EXCHANGE_RATE_SVC_URL = os.getenv("EXCHANGE_RATE_SVC_URL", "")
+    # PL-07 (F15-15): point at the real fraud-service chart name/port
+    # (infrastructure/charts/core-payments/values.yaml:70, fraud-service /api/v1/fraud/check).
     FRAUD_ENGINE_SVC_URL = os.getenv(
-        "FRAUD_ENGINE_SVC_URL", "http://fraud-engine.54agent.svc.cluster.local"
+        "FRAUD_ENGINE_SVC_URL",
+        "http://fraud-service.54link-dev.svc.cluster.local:9200",
+    )
+    # PL-07: fail-closed fraud precheck. The ONLY override is an explicit
+    # emergency break-glass flag; every use is logged CRITICAL.
+    FRAUD_PRECHECK_EMERGENCY_ALLOW = (
+        os.getenv("FRAUD_PRECHECK_EMERGENCY_ALLOW", "false").lower() == "true"
+    )
+    # F2-04: when the commission service is unreachable, zero commission is
+    # only permitted with an explicit config flag; otherwise fail closed.
+    ALLOW_ZERO_COMMISSION = (
+        os.getenv("ALLOW_ZERO_COMMISSION", "false").lower() == "true"
+    )
+    # MN-10: TigerBeetle fee-income account receiving the commission leg.
+    FEE_INCOME_ACCOUNT_ID = os.getenv("FEE_INCOME_ACCOUNT_ID", "")
+    # MN-11: lien service consulted on debit paths (fail-closed).
+    LIEN_SVC_URL = os.getenv(
+        "LIEN_SVC_URL", "http://account-lien-go:9046"
     )
     COMPLIANCE_SVC_URL = os.getenv(
         "COMPLIANCE_SVC_URL", "http://cbn-compliance-comprehensive.54agent.svc.cluster.local"
@@ -61,6 +80,9 @@ class Config:
         "PAYMENT_RAILS_CONNECTORS_DAPR_ID", "payment-rails-connectors"
     )
     STATE_STORE_NAME = os.getenv("STATE_STORE_NAME", "statestore")
+    # MN-11/MN-13: optional service-to-service bearer for JWT-protected
+    # internal services (account-lien-go etc.).
+    INTERNAL_SERVICE_TOKEN = os.getenv("INTERNAL_SERVICE_TOKEN", "")
     SYSTEM_AGENT_ID = os.getenv("SYSTEM_AGENT_ID", "00000000-0000-0000-0000-000000000000")
 
 

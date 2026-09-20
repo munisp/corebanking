@@ -468,5 +468,7 @@ func isEscrowExpired(expiryDate time.Time) bool {
 }
 
 func generateEscrowReference() string {
-	return fmt.Sprintf("ESC-%s", time.Now().Format("20060102150405"))
+	// Second-resolution timestamps collide within a second (the uniqueness
+	// assertion below failed on every same-second pair); use nanoseconds.
+	return fmt.Sprintf("ESC-%d", time.Now().UnixNano())
 }

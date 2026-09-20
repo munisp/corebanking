@@ -55,29 +55,6 @@ type TransactionEvent struct {
 	LedgerID      string    `json:"ledger_id"`
 }
 
-type AccountEvent struct {
-	Type        string                 `json:"type"`
-	AccountID   string                 `json:"account_id"`
-	TenantID    string                 `json:"tenant_id"`
-	CustomerID  string                 `json:"customer_id"`
-	AccountType string                 `json:"account_type"`
-	Balance     float64                `json:"balance"`
-	Timestamp   time.Time              `json:"timestamp"`
-	Metadata    map[string]interface{} `json:"metadata,omitempty"`
-}
-
-type PaymentEvent struct {
-	Type          string    `json:"type"`
-	PaymentID     string    `json:"payment_id"`
-	TenantID      string    `json:"tenant_id"`
-	CustomerID    string    `json:"customer_id"`
-	Amount        float64   `json:"amount"`
-	Currency      string    `json:"currency"`
-	Status        string    `json:"status"`
-	PaymentMethod string    `json:"payment_method"`
-	Timestamp     time.Time `json:"timestamp"`
-}
-
 type SavingsEvent struct {
 	Type       string                 `json:"type"`
 	GoalID     string                 `json:"goal_id,omitempty"`
@@ -116,82 +93,48 @@ type LpoEvent struct {
 // Dapr subscription handler
 func subscribeHandler(w http.ResponseWriter, r *http.Request) {
 	subscriptions := []DaprSubscription{
-		// Transaction events
+		// OR-11: subscription topics aligned to topics with REAL, verified live
+		// producers (W10 orphan audit). Pruned 12 entries whose topics have no
+		// producer anywhere in the fleet: transaction.initiated (dot-variant;
+		// payment-processing publishes 'transaction_initiated'),
+		// loan.disbursed, loan.payment.recorded, account.created, account.updated,
+		// payment.processing.{transaction,payout,loan,lpo,deposit,transfer},
+		// savings.transaction, lpo.lifecycle, and
+		// mortgages.{workflows,arrears,collections} (their only producer was the
+		// now-deleted mortgage-service/temporal_workflows.go).
+		//
+		// CAVEAT (kept from audit): producers are mixed-transport. Some publish
+		// via Dapr pubsub (payment-processing-service), others write to raw Kafka
+		// (loan-service, lpo-service, savings-service, mortgage-service,
+		// escrow-service). Delivery through this Dapr subscription therefore
+		// depends on the kafka-backed 'pubsub' component
+		// (infrastructure/new/dapr/components/pubsub.yaml) consuming the same
+		// Kafka topics; payloads arriving from raw-Kafka producers are not
+		// CloudEvent-wrapped at the broker.
+		//
+		// Transaction events — payment-processing-service publishes
+		// 'transaction_initiated' (underscore) via PubsubTopics.TRANSACTION_INITIATED
+		// (utils/enums.py:40, services/payment.py).
 		{
 			PubsubName: "pubsub",
-			Topic:      "transaction.initiated",
+			Topic:      "transaction_initiated",
 			Route:      "/events/transaction",
 		},
-		// Loan events
+		// Loan events — loan-service/main.go:622 publishes 'loan.application.created'.
 		{
 			PubsubName: "pubsub",
 			Topic:      "loan.application.created",
 			Route:      "/events/loan",
 		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "loan.disbursed",
-			Route:      "/events/loan",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "loan.payment.recorded",
-			Route:      "/events/loan",
-		},
-		// Account events
-		{
-			PubsubName: "pubsub",
-			Topic:      "account.created",
-			Route:      "/events/account",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "account.updated",
-			Route:      "/events/account",
-		},
-		// Payment processing events
-		{
-			PubsubName: "pubsub",
-			Topic:      "payment.processing.transaction",
-			Route:      "/events/payment",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "payment.processing.payout",
-			Route:      "/events/payment",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "payment.processing.loan",
-			Route:      "/events/payment",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "payment.processing.lpo",
-			Route:      "/events/payment",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "payment.processing.deposit",
-			Route:      "/events/payment",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "payment.processing.transfer",
-			Route:      "/events/payment",
-		},
-		// Savings events
+		// Savings events — savings-service/main.py:344 publishes 'savings.goal'
+		// (SavingsTopics.GOAL).
 		{
 			PubsubName: "pubsub",
 			Topic:      "savings.goal",
 			Route:      "/events/savings",
 		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "savings.transaction",
-			Route:      "/events/savings",
-		},
-		// Mortgage events
+		// Mortgage events — mortgage-service/main.go publishes these three topics
+		// via PublishEventReliably (:919, :1499, :1955).
 		{
 			PubsubName: "pubsub",
 			Topic:      "mortgages.applications",
@@ -207,27 +150,8 @@ func subscribeHandler(w http.ResponseWriter, r *http.Request) {
 			Topic:      "mortgages.payments",
 			Route:      "/events/mortgage",
 		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "mortgages.workflows",
-			Route:      "/events/mortgage",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "mortgages.arrears",
-			Route:      "/events/mortgage",
-		},
-		{
-			PubsubName: "pubsub",
-			Topic:      "mortgages.collections",
-			Route:      "/events/mortgage",
-		},
-		// LPO events
-		{
-			PubsubName: "pubsub",
-			Topic:      "lpo.lifecycle",
-			Route:      "/events/lpo",
-		},
+		// LPO events — lpo-service/main.py:577 publishes 'lpo.application'
+		// (LpoKafkaTopics.LPO_APPLICATION).
 		{
 			PubsubName: "pubsub",
 			Topic:      "lpo.application",
@@ -290,62 +214,6 @@ func handleLoanEvent(w http.ResponseWriter, r *http.Request) {
 
 	// Process loan event
 	go processLoanEvent(loanEvent)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
-}
-
-// Account event handler
-func handleAccountEvent(w http.ResponseWriter, r *http.Request) {
-	var cloudEvent CloudEvent
-	if err := json.NewDecoder(r.Body).Decode(&cloudEvent); err != nil {
-		log.Printf("Error decoding account event: %v", err)
-		http.Error(w, "Invalid event", http.StatusBadRequest)
-		return
-	}
-
-	// Extract account data
-	eventData, _ := json.Marshal(cloudEvent.Data)
-	var acctEvent AccountEvent
-	if err := json.Unmarshal(eventData, &acctEvent); err != nil {
-		log.Printf("Error parsing account event data: %v", err)
-		http.Error(w, "Invalid event data", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("Received account event: %s (type: %s) for tenant %s", acctEvent.AccountID, acctEvent.Type, acctEvent.TenantID)
-
-	// Process account event
-	go processAccountEvent(acctEvent)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
-}
-
-// Payment event handler
-func handlePaymentEvent(w http.ResponseWriter, r *http.Request) {
-	var cloudEvent CloudEvent
-	if err := json.NewDecoder(r.Body).Decode(&cloudEvent); err != nil {
-		log.Printf("Error decoding payment event: %v", err)
-		http.Error(w, "Invalid event", http.StatusBadRequest)
-		return
-	}
-
-	// Extract payment data
-	eventData, _ := json.Marshal(cloudEvent.Data)
-	var paymentEvent PaymentEvent
-	if err := json.Unmarshal(eventData, &paymentEvent); err != nil {
-		log.Printf("Error parsing payment event data: %v", err)
-		http.Error(w, "Invalid event data", http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("Received payment event: %s (type: %s) for tenant %s", paymentEvent.PaymentID, paymentEvent.Type, paymentEvent.TenantID)
-
-	// Process payment event
-	go processPaymentEvent(paymentEvent)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -511,31 +379,6 @@ func processLoanEvent(event LoanEvent) {
 	}
 }
 
-func processAccountEvent(event AccountEvent) {
-	ctx := context.Background()
-
-	// Find active connections for this tenant
-	connections, err := integrationService.ListConnections(ctx, event.TenantID, event.CustomerID)
-	if err != nil {
-		log.Printf("Error fetching connections for tenant %s: %v", event.TenantID, err)
-		return
-	}
-
-	for _, conn := range connections {
-		if conn.Status != ConnectionStatusActive {
-			continue
-		}
-
-		if event.Type == "account.created" || event.Type == "account.updated" {
-			if err := syncAccountToERP(ctx, conn, event); err != nil {
-				log.Printf("Error syncing account to ERP: %v", err)
-			} else {
-				log.Printf("Successfully synced account %s to ERPNext", event.AccountID)
-			}
-		}
-	}
-}
-
 // Helper functions
 func parseAmount(amountStr string) float64 {
 	var amount float64
@@ -645,89 +488,6 @@ func syncLoanPaymentToERP(ctx context.Context, conn *ERPConnection, event LoanEv
 		`, event.TransactionID, conn.ID, event.TenantID, event.CustomerID, "loan_payment",
 			"completed", event.Amount, "NGN", event.CustomerID, "MINT_ACCOUNT",
 			event.CustomerID, event.TransactionID, "Payment Entry", event.TransactionID)
-	}
-
-	return nil
-}
-
-func syncAccountToERP(ctx context.Context, conn *ERPConnection, event AccountEvent) error {
-	client := NewERPNextClient(conn.BaseURL, conn.APIKey, conn.APISecret, conn.OAuthToken)
-
-	// Create or update Account in ERPNext
-	account := ERPNextAccount{
-		AccountName: event.AccountID,
-		AccountType: "Bank",
-		IsGroup:     0,
-		Company:     "Default Company",
-	}
-
-	// Use doRequest directly since there's no CreateAccount method
-	_, err := client.doRequest(ctx, "POST", "/api/resource/Account", account)
-	return err
-}
-
-// Payment event processor
-func processPaymentEvent(event PaymentEvent) {
-	ctx := context.Background()
-
-	// Find active connections for this tenant
-	connections, err := integrationService.ListConnections(ctx, event.TenantID, event.CustomerID)
-	if err != nil {
-		log.Printf("Error fetching connections for tenant %s: %v", event.TenantID, err)
-		return
-	}
-
-	for _, conn := range connections {
-		if conn.Status != ConnectionStatusActive {
-			continue
-		}
-
-		if err := syncPaymentToERP(ctx, conn, event); err != nil {
-			log.Printf("Error syncing payment to ERP: %v", err)
-		} else {
-			log.Printf("Successfully synced payment %s to ERPNext", event.PaymentID)
-		}
-	}
-}
-
-func syncPaymentToERP(ctx context.Context, conn *ERPConnection, event PaymentEvent) error {
-	client := NewERPNextClient(conn.BaseURL, conn.APIKey, conn.APISecret, conn.OAuthToken)
-
-	// Determine payment type based on event type
-	paymentType := "Receive"
-	if event.Type == "payment.processing.payout" || event.Type == "payment.processing.transfer" {
-		paymentType = "Pay"
-	}
-
-	// Create Payment Entry in ERPNext
-	paymentEntry := ERPNextPaymentEntry{
-		PaymentType:    paymentType,
-		PostingDate:    event.Timestamp.Format("2006-01-02"),
-		Company:        "Default Company",
-		PartyType:      "Customer",
-		Party:          event.CustomerID,
-		PaidAmount:     event.Amount,
-		ReceivedAmount: event.Amount,
-		ReferenceNo:    event.PaymentID,
-		ReferenceDate:  event.Timestamp.Format("2006-01-02"),
-	}
-
-	_, err := client.CreatePaymentEntry(ctx, paymentEntry)
-	if err != nil {
-		return fmt.Errorf("failed to create payment entry: %w", err)
-	}
-
-	// Record payment in local database
-	if integrationService.db != nil {
-		integrationService.db.ExecContext(ctx, `
-			INSERT INTO payments 
-			(id, connection_id, tenant_id, customer_id, payment_type, status, amount, currency,
-			 payment_method, reference, erp_doc_type, erp_doc_id, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
-			ON CONFLICT (id) DO NOTHING
-		`, event.PaymentID, conn.ID, event.TenantID, event.CustomerID, paymentType,
-			event.Status, event.Amount, event.Currency, event.PaymentMethod,
-			event.PaymentID, "Payment Entry", event.PaymentID)
 	}
 
 	return nil

@@ -1,32 +1,70 @@
-from utils import ExternalAPIClient, get_config, create_logger
-from schemas import Context
+"""CP-01 cross-mission wiring (R3 contract): repoint high-value transaction
+reporting from the phantom `cbn-compliance-comprehensive` host to the REAL CTR
+intake — the nfiu-ctr-str-filing-py filer, which subscribes to the Dapr pubsub
+topic `transactions.high-value` (component `pubsub`) at
+/api/intake/transaction-event.
+
+Payload contract (R3-report.md §CP-01):
+{tenantId, amountKobo, reference|transactionId, customerId, customerName?,
+ customerType?, currency?}
+CBN thresholds (₦5M individual / ₦10M corporate) are enforced at the filer;
+we publish every event with amount >= ₦5M.
+
+Failures are NO LONGER silently swallowed: every publish failure logs ERROR and
+increments `nfiu_ctr_publish_errors_total` (fraud_precheck-style alerting
+contract).
+"""
+
+from dapr.clients import DaprClient
+import json
+
+from utils import get_config, create_logger
 
 logger = create_logger(__name__)
 config = get_config()
 
+try:
+    from otelkit import inc_counter
+except Exception:  # pragma: no cover - otelkit absent in isolated tests
+    def inc_counter(name, attrs=None):
+        return None
+
 CTR_THRESHOLD_NGN = 5_000_000.0
 
+HIGH_VALUE_TOPIC = "transactions.high-value"
 
-class ComplianceServiceAdapter(ExternalAPIClient):
-    """
-    Adapter for cbn-compliance-comprehensive service.
-    Used to report large transactions (CTR) and per-transaction stats
-    so Monthly Activity Reports and CTR reports reflect live data.
-    Failures are swallowed — compliance reporting must never block payments.
-    """
 
-    def __init__(self):
-        ExternalAPIClient.__init__(
-            self,
-            base_url=config.COMPLIANCE_SVC_URL,
-            headers={"Content-Type": "application/json"},
-        )
+class ComplianceServiceAdapter:
+    """Publishes high-value transaction events to the NFIU CTR/STR filer."""
 
-    def _safe_post(self, endpoint: str, data: dict) -> None:
+    def _publish_high_value_event(self, payload: dict) -> None:
         try:
-            self._post(endpoint=endpoint, data=data, get_response=False)
+            with DaprClient() as d:
+                d.publish_event(
+                    pubsub_name=config.DAPR_PUBSUB_NAME or "pubsub",
+                    topic_name=HIGH_VALUE_TOPIC,
+                    data=json.dumps(payload),
+                    data_content_type="application/json",
+                )
+            logger.info(
+                "High-value CTR event published reference=%s amountKobo=%s",
+                payload.get("reference"),
+                payload.get("amountKobo"),
+            )
         except Exception as exc:
-            logger.warning("Compliance ingest call failed endpoint=%s error=%s", endpoint, exc)
+            # CP-01: no silent swallow — ERROR log + metric.
+            inc_counter(
+                "nfiu_ctr_publish_errors_total",
+                {
+                    "service": "payment-processing-service",
+                    "tenant_id": str(payload.get("tenantId") or "unknown"),
+                },
+            )
+            logger.error(
+                "Failed to publish high-value CTR event reference=%s error=%s",
+                payload.get("reference"),
+                exc,
+            )
 
     def notify_transaction(
         self,
@@ -40,39 +78,29 @@ class ComplianceServiceAdapter(ExternalAPIClient):
         customer_bvn: str | None = None,
         customer_account: str = "",
         transaction_date: str,
+        tenant_id: str = "",
+        customer_type: str | None = None,
     ) -> None:
         """
-        Called after every successful transaction.
-        Always records stats for Monthly Activity Reports.
-        Also files a CTR record if amount >= NGN 5M.
+        Called after every successful transaction. Publishes a
+        transactions.high-value event for the NFIU filer when the amount
+        crosses the CBN individual CTR floor (₦5M); corporate ₦10M threshold
+        is applied at the filer.
         """
-        self._safe_post(
-            "/api/v1/agent-stats/record",
-            {
-                "transaction_type": transaction_type,
-                "amount_ngn": amount_ngn,
-                "period": transaction_date[:7],  # YYYY-MM
-            },
-        )
-
         if amount_ngn >= CTR_THRESHOLD_NGN and currency.upper() == "NGN":
-            self._safe_post(
-                "/api/v1/ctr-ingest",
+            self._publish_high_value_event(
                 {
-                    "transaction_id": transaction_id,
-                    "transaction_type": transaction_type,
-                    "amount": amount_ngn,
-                    "currency": currency,
-                    "agent_id": agent_id,
-                    "customer_name": customer_name,
-                    "customer_bvn": customer_bvn,
-                    "customer_account": customer_account,
-                    "transaction_date": transaction_date,
-                },
-            )
-            logger.info(
-                "CTR ingest triggered transaction_id=%s amount=%.2f",
-                transaction_id, amount_ngn,
+                    "tenantId": tenant_id or "unknown",
+                    "amountKobo": int(round(amount_ngn * 100)),
+                    "reference": transaction_id,
+                    "transactionId": transaction_id,
+                    "customerId": customer_account or agent_id,
+                    "customerName": customer_name or None,
+                    "customerType": customer_type,
+                    "currency": currency.upper(),
+                    "transactionType": transaction_type,
+                    "transactionDate": transaction_date,
+                }
             )
 
     def notify_fraud(
@@ -85,16 +113,20 @@ class ComplianceServiceAdapter(ExternalAPIClient):
         victim_account: str = "",
         perpetrator_info: str = "",
     ) -> None:
-        """Called by fraud pre-check when a transaction is blocked."""
-        self._safe_post(
-            "/api/v1/fraud-ingest",
-            {
-                "fraud_type": fraud_type,
-                "amount_attempted": amount_attempted,
-                "amount_lost": 0,
-                "channel": channel,
-                "incident_date": incident_date,
-                "victim_account": victim_account,
-                "perpetrator_info": perpetrator_info,
-            },
+        """Called by fraud pre-check when a transaction is blocked. The
+        cbn-compliance fraud-ingest endpoint is phantom; fraud blocks are
+        surfaced via logs/metrics instead of a dead HTTP call."""
+        logger.error(
+            "FRAUD BLOCK fraud_type=%s amount_attempted=%.2f channel=%s "
+            "incident_date=%s victim=%s perpetrator=%s",
+            fraud_type,
+            amount_attempted,
+            channel,
+            incident_date,
+            victim_account,
+            perpetrator_info,
+        )
+        inc_counter(
+            "fraud_blocks_total",
+            {"service": "payment-processing-service", "fraud_type": fraud_type},
         )

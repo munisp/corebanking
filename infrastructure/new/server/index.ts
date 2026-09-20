@@ -5197,7 +5197,7 @@ async function startServer() {
     }
 
     const searchDomains: { name: string; url: string }[] = [];
-    if (!domain || domain === "disputes") searchDomains.push({ name: "disputes", url: `${DISPUTE_SERVICE_URL}/v1/disputes/cases` });
+    if (!domain || domain === "disputes") searchDomains.push({ name: "disputes", url: `${DISPUTE_SERVICE_URL}/api/v1/disputes` });
     if (!domain || domain === "customers") searchDomains.push({ name: "customers", url: "" });
 
     const results: Array<{ domain: string; id: string; match: string; score: number }> = [];
@@ -5236,11 +5236,11 @@ async function startServer() {
   const VIRTUAL_ACCOUNTS_SERVICE_URL = process.env.VIRTUAL_ACCOUNTS_SERVICE_URL || "http://localhost:8096";
   const AGENT_BANKING_SERVICE_URL = process.env.AGENT_BANKING_SERVICE_URL || "http://localhost:8097";
   const GROUP_LENDING_SERVICE_URL = process.env.GROUP_LENDING_SERVICE_URL || "http://localhost:8098";
-  const EDUCATION_LOANS_SERVICE_URL = process.env.EDUCATION_LOANS_SERVICE_URL || "http://localhost:8099";
   const LEDGER_RECON_SERVICE_URL = process.env.LEDGER_RECON_SERVICE_URL || "http://localhost:8100";
   const IDENTITY_CHANNELS_SERVICE_URL = process.env.IDENTITY_CHANNELS_SERVICE_URL || "http://localhost:8101";
-  const DISPUTE_SERVICE_URL = process.env.DISPUTE_SERVICE_URL || "http://localhost:8102";
-  const ERPNEXT_SYNC_SERVICE_URL = process.env.ERPNEXT_SYNC_SERVICE_URL || "http://localhost:8103";
+  // OR-06 closure: repointed from deleted dispute-management-py (:8102) to the real
+  // dispute-service (uvicorn PORT default 8019, services/dispute-service/main.py:609).
+  const DISPUTE_SERVICE_URL = process.env.DISPUTE_SERVICE_URL || "http://localhost:8019";
   const REGULATORY_SERVICE_URL = process.env.REGULATORY_SERVICE_URL || "http://localhost:8104";
   const SECURITY_GATEWAY_URL = process.env.SECURITY_GATEWAY_URL || "http://localhost:8105";
   const RESILIENCE_SERVICE_URL = process.env.RESILIENCE_SERVICE_URL || "http://localhost:8106";
@@ -5280,11 +5280,9 @@ async function startServer() {
     "virtual-accounts": VIRTUAL_ACCOUNTS_SERVICE_URL,
     "agent-banking": AGENT_BANKING_SERVICE_URL,
     "group-lending": GROUP_LENDING_SERVICE_URL,
-    "education-loans": EDUCATION_LOANS_SERVICE_URL,
     "ledger-recon": LEDGER_RECON_SERVICE_URL,
     "identity-channels": IDENTITY_CHANNELS_SERVICE_URL,
     "disputes": DISPUTE_SERVICE_URL,
-    "erpnext-sync": ERPNEXT_SYNC_SERVICE_URL,
     "regulatory": REGULATORY_SERVICE_URL,
     "security-gateway": SECURITY_GATEWAY_URL,
     "resilience": RESILIENCE_SERVICE_URL,
@@ -5867,35 +5865,6 @@ async function startServer() {
     void proxyToService(GROUP_LENDING_SERVICE_URL, `/v1/group-lending/groups/${req.params.id}/repay`, req, res);
   });
 
-  // Education Loans proxy routes (Python :8099)
-  app.all("/api/platform/education-loans/loans", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education-loans/loans", req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/approve", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/approve`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/disburse", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/disburse`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/repay", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/repay`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/defer", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/defer`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/schedule", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/schedule`, req, res);
-  });
-  app.all("/api/platform/education-loans/loans/:id/disbursements", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, `/v1/education-loans/loans/${req.params.id}/disbursements`, req, res);
-  });
-  app.all("/api/platform/education-loans/repayments", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education-loans/repayments", req, res);
-  });
-
   // Ledger Reconciliation proxy routes (Rust :8100)
   app.all("/api/platform/reconciliation/runs", (req, res) => {
     void proxyToService(LEDGER_RECON_SERVICE_URL, "/v1/reconciliation/runs", req, res);
@@ -5943,55 +5912,6 @@ async function startServer() {
   });
   app.all("/api/platform/identity/sessions", (req, res) => {
     void proxyToService(IDENTITY_CHANNELS_SERVICE_URL, "/v1/identity/sessions", req, res);
-  });
-
-  // Dispute Management proxy routes (Python :8102)
-  app.all("/api/platform/disputes/cases", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/cases", req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/evidence", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/evidence`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/investigate", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/investigate`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/resolve", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/resolve`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/escalate", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/escalate`, req, res);
-  });
-  app.all("/api/platform/disputes/cases/:id/chargeback", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, `/v1/disputes/cases/${req.params.id}/chargeback`, req, res);
-  });
-  app.all("/api/platform/disputes/categories", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/categories", req, res);
-  });
-
-  // ERPNext Sync proxy routes (Python :8103)
-  app.all("/api/platform/erpnext/sync-jobs", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, "/v1/erpnext/sync-jobs", req, res);
-  });
-  app.all("/api/platform/erpnext/sync-jobs/:id", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, `/v1/erpnext/sync-jobs/${req.params.id}`, req, res);
-  });
-  app.all("/api/platform/erpnext/sync-jobs/:id/execute", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, `/v1/erpnext/sync-jobs/${req.params.id}/execute`, req, res);
-  });
-  app.all("/api/platform/erpnext/sync-jobs/:id/retry", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, `/v1/erpnext/sync-jobs/${req.params.id}/retry`, req, res);
-  });
-  app.all("/api/platform/erpnext/journal-entries", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, "/v1/erpnext/journal-entries", req, res);
-  });
-  app.all("/api/platform/erpnext/coa-mappings", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, "/v1/erpnext/coa-mappings", req, res);
-  });
-  app.all("/api/platform/erpnext/coa-mappings/:id", (req, res) => {
-    void proxyToService(ERPNEXT_SYNC_SERVICE_URL, `/v1/erpnext/coa-mappings/${req.params.id}`, req, res);
   });
 
   // Regulatory Reporting proxy routes (Python :8104)
@@ -6274,34 +6194,6 @@ async function startServer() {
   });
   app.all("/api/platform/esusu/analytics", (req, res) => {
     void proxyToService(ESUSU_SERVICE_URL, "/v1/esusu/analytics", req, res);
-  });
-
-  // B8: Education Loans enhanced routes
-  app.all("/api/platform/education/institutions", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education/institutions", req, res);
-  });
-  app.all("/api/platform/education/grace-periods", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education/grace-periods", req, res);
-  });
-  app.all("/api/platform/education/scholarships", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education/scholarships", req, res);
-  });
-  app.all("/api/platform/education/income-repayment", (req, res) => {
-    void proxyToService(EDUCATION_LOANS_SERVICE_URL, "/v1/education/income-repayment", req, res);
-  });
-
-  // B9: Disputes enhanced routes
-  app.all("/api/platform/disputes/chargebacks", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/chargebacks", req, res);
-  });
-  app.all("/api/platform/disputes/arbitration", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/arbitration", req, res);
-  });
-  app.all("/api/platform/disputes/sla", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/sla", req, res);
-  });
-  app.all("/api/platform/disputes/evidence", (req, res) => {
-    void proxyToService(DISPUTE_SERVICE_URL, "/v1/disputes/evidence", req, res);
   });
 
   // B10: Regulatory enhanced routes

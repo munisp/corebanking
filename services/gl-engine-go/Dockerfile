@@ -1,4 +1,6 @@
-FROM golang:1.21-alpine AS builder
+# PL-04: builder bumped 1.21 → 1.22 — go.mod requires go 1.22.7 (shared/otel/go
+# baseline); the 1.21 builder could never have compiled this module.
+FROM golang:1.22-alpine AS builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

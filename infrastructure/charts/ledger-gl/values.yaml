@@ -58,6 +58,10 @@ dapr:
   memory-request: 250Mi
   memory-limit: 1000Mi
 secrets:
+  # PL-12: Dapr pubsub component name for the Python Dapr services in this
+  # group (config.py default is "", which makes publish/subscribe calls fail).
+  # Matches the platform component infrastructure/manifests/dapr/pubsub.yaml.
+  DAPR_PUBSUB_NAME: "pubsub"
   # Postgres connection URL (contains credentials) — NEVER committed. Inject
   # at deploy time, e.g. helm --set secrets.POSTGRES_URL=... or via an
   # external secret manager. The chart fails to render if this is empty.

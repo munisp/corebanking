@@ -110,6 +110,31 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="treasury-liquidity-py", version="1.0.0", lifespan=lifespan)
+# --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
+# OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
+# tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware
+# (tenant.id span attr from x-tenant-id). Honors OTEL_SDK_DISABLED; never raises.
+try:
+    import os as _otel_os
+    import sys as _otel_sys
+
+    _otel_sys.path.insert(
+        0,
+        _otel_os.path.normpath(
+            _otel_os.path.join(
+                _otel_os.path.dirname(__file__), "..", "..", "shared", "otel", "python"
+            )
+        ),
+    )
+    from otelkit import init_telemetry, instrument_psycopg2
+
+    init_telemetry("treasury-liquidity-py", app)
+    instrument_psycopg2()
+except Exception as _otel_exc:
+    import logging as _otel_logging
+
+    _otel_logging.getLogger("otel").warning("otelkit init skipped: %s", _otel_exc)
+
 
 # --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
 import inspect as _jwt_inspect

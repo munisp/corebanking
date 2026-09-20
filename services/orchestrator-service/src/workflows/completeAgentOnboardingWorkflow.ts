@@ -5,7 +5,7 @@ import { ICompleteAgentOnboardingWorkflow } from "../types/workflows";
 export async function completeAgentOnboardingWorkflow(
   args: ICompleteAgentOnboardingWorkflow,
 ): Promise<null> {
-  const { createAgentAccountProfile, markAgentKycComplete } = proxyActivities<
+  const { createAgentAccountProfile, markAgentKycComplete, markAgentKycFailed } = proxyActivities<
     typeof activities
   >({
     retry: {
@@ -38,6 +38,16 @@ export async function completeAgentOnboardingWorkflow(
 
     return null;
   } catch (e: any) {
+    // OR-22: failure path wiring — mark the agent KYC as failed so the agent
+    // record does not stay PENDING forever after a failed completion run.
+    try {
+      await markAgentKycFailed(
+        args.metadata.tenant_id,
+        args.metadata.keycloak_id,
+      );
+    } catch {
+      // Never mask the original failure with a failure-path update error.
+    }
     throw new ApplicationFailure(e.message);
   }
 }

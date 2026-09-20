@@ -165,11 +165,13 @@ type EmployeeOnboardingRequest struct {
 
 // EmployeeOnboardingResponse represents the response
 type EmployeeOnboardingResponse struct {
-	EmployeeID          string    `json:"employee_id"`
-	Status              string    `json:"status"`
-	KeycloakUserID      string    `json:"keycloak_user_id,omitempty"`
-	Message             string    `json:"message"`
-	EstimatedCompletion time.Time `json:"estimated_completion"`
+	EmployeeID     string `json:"employee_id"`
+	Status         string `json:"status"`
+	KeycloakUserID string `json:"keycloak_user_id,omitempty"`
+	Message        string `json:"message"`
+	// OB-09: omitted — no automated workflow exists, so no honest completion
+	// estimate can be given.
+	EstimatedCompletion *time.Time `json:"estimated_completion,omitempty"`
 }
 
 // Employee represents an employee record
@@ -541,6 +543,43 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
 }
 
+// OB-09: role-grant authorization helpers. X-User-Role is populated ONLY from
+// verified JWT realm_access.roles by jwtAuthMiddleware (comma-separated list).
+var employeeManagerRoles = map[string]bool{
+	"tenant_admin":       true,
+	"super_admin":        true,
+	"operations_manager": true,
+}
+
+// privilegedEmployeeRoles additionally require a maker-checker approval
+// reference (x-maker-checker-approval-id header) so no single caller can
+// self-onboard a back-office administrator.
+var privilegedEmployeeRoles = map[string]bool{
+	"bank_admin":     true,
+	"compliance":     true,
+	"auditor":        true,
+	"branch_manager": true,
+}
+
+func callerRoles(r *http.Request) map[string]bool {
+	roles := map[string]bool{}
+	for _, role := range strings.Split(r.Header.Get("X-User-Role"), ",") {
+		if role = strings.TrimSpace(role); role != "" {
+			roles[role] = true
+		}
+	}
+	return roles
+}
+
+func hasAnyRole(caller map[string]bool, allowed map[string]bool) bool {
+	for role := range allowed {
+		if caller[role] {
+			return true
+		}
+	}
+	return false
+}
+
 // onboardEmployeeHandler handles employee onboarding requests
 func (s *EmployeeService) onboardEmployeeHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -550,6 +589,21 @@ func (s *EmployeeService) onboardEmployeeHandler(w http.ResponseWriter, r *http.
 	var req EmployeeOnboardingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	// OB-09: authorization — employee creation requires a staff-admin role from
+	// the verified JWT claims (previously any authenticated tenant user could
+	// create employees, including bank_admin).
+	if !hasAnyRole(callerRoles(r), employeeManagerRoles) {
+		http.Error(w, "Forbidden: employee creation requires tenant_admin, super_admin or operations_manager role", http.StatusForbidden)
+		return
+	}
+	// OB-09 maker-checker contract: granting a privileged employee role requires
+	// the x-maker-checker-approval-id header referencing a completed approval in
+	// maker-checker-go. Without it the request is rejected.
+	if privilegedEmployeeRoles[req.Role] && strings.TrimSpace(r.Header.Get("x-maker-checker-approval-id")) == "" {
+		http.Error(w, "Forbidden: privileged role '"+req.Role+"' requires x-maker-checker-approval-id header (maker-checker approval)", http.StatusForbidden)
 		return
 	}
 
@@ -611,13 +665,13 @@ func (s *EmployeeService) onboardEmployeeHandler(w http.ResponseWriter, r *http.
 	// Increment active onboardings gauge
 	activeOnboardings.Inc()
 
-	// Start Temporal workflow
-	workflowID := fmt.Sprintf("employee-onboarding-workflow-%s", employeeID)
-
-	// Store initial employee record with pending status
+	// OB-09: the fabricated Temporal workflow start is deleted — this service has
+	// no Temporal client, so claiming "workflow started" was a lie. The employee
+	// record is created synchronously with status "pending"; activation happens
+	// only via an authorized PATCH /employees/{id}/status.
 	if err := s.createEmployeeRecord(ctx, employeeID, &req, "pending"); err != nil {
 		log.Printf("Warning: Failed to create employee record: %v", err)
-		// Continue anyway as workflow will create it
+		// Continue anyway — record creation is retried by the caller
 	}
 
 	// Publish event to Kafka (strongly-typed)
@@ -630,7 +684,6 @@ func (s *EmployeeService) onboardEmployeeHandler(w http.ResponseWriter, r *http.
 		Metadata: map[string]interface{}{
 			"bank_id":      tenantID,
 			"branch_id":    branchID,
-			"workflow_id":  workflowID,
 			"initiated_by": keycloakID,
 		},
 	}
@@ -642,12 +695,11 @@ func (s *EmployeeService) onboardEmployeeHandler(w http.ResponseWriter, r *http.
 	employeeOnboardingTotal.WithLabelValues("started", tenantID).Inc()
 	employeeOnboardingDuration.WithLabelValues("started").Observe(time.Since(startTime).Seconds())
 
-	// Return response
+	// Return response — honest: no workflow is running; record awaits approval.
 	response := EmployeeOnboardingResponse{
-		EmployeeID:          employeeID,
-		Status:              "in_progress",
-		Message:             "Employee onboarding workflow started",
-		EstimatedCompletion: time.Now().Add(30 * time.Minute),
+		EmployeeID: employeeID,
+		Status:     "pending",
+		Message:    "Employee record created with status 'pending'; activation requires an authorized status update (no automated onboarding workflow is running)",
 	}
 
 	// Store idempotency record if key was provided
@@ -967,6 +1019,14 @@ func (s *EmployeeService) updateEmployeeStatusHandler(w http.ResponseWriter, r *
 	ctx := r.Context()
 	vars := mux.Vars(r)
 	employeeID := vars["employee_id"]
+
+	// OB-09: authorization — employee status changes (incl. activation) require a
+	// staff-admin role from the verified JWT claims. Previously any authenticated
+	// tenant user could activate a self-created bank_admin employee.
+	if !hasAnyRole(callerRoles(r), employeeManagerRoles) {
+		http.Error(w, "Forbidden: employee status updates require tenant_admin, super_admin or operations_manager role", http.StatusForbidden)
+		return
+	}
 
 	// Extract tenant context from headers
 	tenantID := r.Header.Get("x-tenant-id")

@@ -1,0 +1,321 @@
+# =============================================================================
+# OpenTelemetry Collector — corebanking observability spine
+# SPEC: work/w9/SPEC.md §1-§2. Wave-9 builder B1.
+#
+# Interface contracts honored here:
+#   - OTLP gRPC on :4317, OTLP HTTP on :4318 (SPEC §2.1).
+#   - Every pipeline upserts resource attr service.namespace="corebanking" (§2.2).
+#   - tenant.id and k8s.* attributes are NEVER dropped by this config (§2.3).
+#     The Collector does not mint tenant ids; it only keeps/drops attributes.
+#   - The prometheus exporter (:8889) is the federation point for Prometheus.
+#     The exporter maps datapoint attribute "tenant.id" -> metric label
+#     "tenant_id" (dots are not valid in PromQL label names), which is exactly
+#     the label Grafana per-tenant notification policies match on (§2.3).
+#
+# All upstream/middleware endpoints are env-driven (SPEC §2.5 / §5):
+#   ${env:NAME:-default}  -> override via container env; defaults match the
+#   docker-compose.observability.yml service names. No credentials anywhere.
+# =============================================================================
+
+extensions:
+  # Liveness/readiness endpoint. Used by the compose healthcheck and the
+  # k8s probes. No shell exists in the collector image, so compose can only
+  # re-validate the config (see docker-compose.observability.yml comments).
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  # --- Telemetry emitted by instrumented services (SDKs push here) ---------
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # --- Middleware metric exporters scraped by the collector ----------------
+  # Job names are part of the interface contract: dashboards and alert rules
+  # (B2) key on them. Do not rename without updating both.
+  # Cross-builder contract (verified against B2 alert rules):
+  #   - job "tigerbeetle-sidecar" matches B2's regex `tigerbeetle.*`   OK
+  #   - job "redis-exporter"       matches B2's regex `.*(idempotency|redis).*`
+  #     (idempotency alerting uses service-side /metrics scraped via the
+  #     redis-exporter/idempotency targets, not this file's receiver block).
+  # NOTE: metrics produced by the `redis` receiver below carry service_name
+  # labels but NO `job` label (the prometheus exporter does not synthesize
+  # job); alert rules keyed on job=~".*redis.*" see the redis-exporter job.
+  prometheus:
+    config:
+      scrape_configs:
+        # Kafka brokers via Prometheus JMX exporter.
+        # PRIMARY: 9404 — the in-tree Kafka is a Strimzi CR; B7 ships the
+        # Strimzi ConfigMap that publishes the JMX exporter on :9404.
+        # FALLBACK: 5556 — standalone JMX exporter agent (B7 also documents
+        # this path); if the Strimzi wiring is not in place, set
+        # KAFKA_JMX_PORT=5556 via env.
+        - job_name: kafka-jmx
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:KAFKA_JMX_HOST:-kafka}:${env:KAFKA_JMX_PORT:-9404}"]
+
+        # PostgreSQL via postgres_exporter (per-db or cluster-wide instance).
+        # Complements the `postgresql` receiver below: the exporter gives
+        # pg_stat_* series, the receiver gives curated database metrics.
+        - job_name: postgres-exporter
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:POSTGRES_EXPORTER_HOST:-postgres-exporter}:${env:POSTGRES_EXPORTER_PORT:-9187}"]
+
+        # Redis via oliver006/redis_exporter.
+        - job_name: redis-exporter
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:REDIS_EXPORTER_HOST:-redis-exporter}:${env:REDIS_EXPORTER_PORT:-9121}"]
+
+        # Keycloak built-in metrics on the management port :9000.
+        # PREREQUISITE (B7 keycloak README): the in-tree image is
+        # keycloak:24.0; metrics/OTel tracing on :9000 require the v25+ image
+        # bump B7 documents (v25 moves health/metrics to the management
+        # interface). On 24.0 this job will be DOWN — a deployment
+        # prerequisite, not a config bug.
+        - job_name: keycloak
+          scrape_interval: 15s
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["${env:KEYCLOAK_HOST:-keycloak}:${env:KEYCLOAK_METRICS_PORT:-9000}"]
+
+        # Permify authorization service (prometheus endpoint, B7 wiring).
+        - job_name: permify
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:PERMIFY_HOST:-permify}:${env:PERMIFY_METRICS_PORT:-2112}"]
+
+        # OpenSearch via the Aiven prometheus-exporter plugin served on the
+        # main HTTP port :9200 at /_prometheus/metrics.
+        # NOTE: :9600 is the Performance Analyzer endpoint (non-Prometheus) —
+        # do not scrape it here. PREREQUISITE (B7): the plugin must be
+        # installed version-locked to the OpenSearch release (in-tree
+        # OpenSearch 2.12.0 => prometheus-exporter 2.12.0.x); without it this
+        # job is DOWN, which is exactly what `up{job="opensearch"}` surfaces.
+        - job_name: opensearch
+          scrape_interval: 30s
+          metrics_path: /_prometheus/metrics
+          static_configs:
+            - targets: ["${env:OPENSEARCH_HOST:-opensearch}:${env:OPENSEARCH_METRICS_PORT:-9200}"]
+
+        # Apache APISIX gateway (prometheus plugin, B7 global rule).
+        - job_name: apisix
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:APISIX_HOST:-apisix}:${env:APISIX_METRICS_PORT:-9091}"]
+
+        # Temporal server (prometheus listen address, B7 wiring).
+        - job_name: temporal
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:TEMPORAL_HOST:-temporal}:${env:TEMPORAL_METRICS_PORT:-8000}"]
+
+        # Fluvio SPU/SC prometheus endpoint.
+        - job_name: fluvio
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:FLUVIO_HOST:-fluvio}:${env:FLUVIO_METRICS_PORT:-9110}"]
+
+        # TigerBeetle has no native metrics endpoint in-tree; B7 documents a
+        # sidecar exporter. Target is the sidecar, not the TB process itself.
+        - job_name: tigerbeetle-sidecar
+          scrape_interval: 15s
+          static_configs:
+            - targets: ["${env:TIGERBEETLE_SIDECAR_HOST:-tigerbeetle-sidecar}:${env:TIGERBEETLE_SIDECAR_PORT:-9090}"]
+
+        # Apache Sedona / Spark JMX exporter (Spark master/driver metrics).
+        - job_name: spark-sedona-jmx
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["${env:SPARK_JMX_HOST:-spark}:${env:SPARK_JMX_PORT:-8090}"]
+
+        # REQUIRES-DEPLOYMENT STUB — upstream Mojaloop stack (SPEC §3: B7
+        # owns the upstream scrape). ADJUST before enabling: the upstream
+        # Mojaloop deployment's metrics endpoints (central-ledger and
+        # companions) are deployment-specific — host, port, and path below
+        # are placeholders from common upstream defaults, NOT verified
+        # against this repo's Mojaloop manifests. Uncomment after B7's
+        # mojaloop scrape config lands, and point MOJALOOP_METRICS_* at the
+        # real endpoints.
+        # - job_name: mojaloop
+        #   scrape_interval: 30s
+        #   metrics_path: /metrics   # ADJUST: verify per upstream component
+        #   static_configs:
+        #     - targets: ["${env:MOJALOOP_METRICS_HOST:-mojaloop-central-ledger}:${env:MOJALOOP_METRICS_PORT:-4004}"]  # ADJUST
+
+  # --- Direct database/cache receivers (SPEC §3 assigns these to B1) -------
+  # Credentials come from the environment ONLY. There is no default password.
+  # If POSTGRES_METRICS_USERNAME/PASSWORD are unset the receiver fails and the
+  # collector logs it — that is intentional (fail visible, never silent).
+  postgresql:
+    endpoint: "${env:POSTGRES_HOST:-postgres}:${env:POSTGRES_PORT:-5432}"
+    transport: tcp
+    username: "${env:POSTGRES_METRICS_USERNAME:-}"
+    password: "${env:POSTGRES_METRICS_PASSWORD:-}"
+    collection_interval: 15s
+    tls:
+      # Internal cluster traffic. Set CA/cert via env-driven deployment config
+      # if the postgres endpoint enforces TLS.
+      insecure: true
+
+  redis:
+    endpoint: "${env:REDIS_HOST:-redis}:${env:REDIS_PORT:-6379}"
+    # Empty password = no AUTH (go-redis semantics). Only set if Redis runs
+    # with requirepass.
+    password: "${env:REDIS_PASSWORD:-}"
+    collection_interval: 15s
+
+processors:
+  # First in every pipeline: shed load before the process OOMs.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # SPEC §2.2: every span/metric/log carries service.namespace="corebanking".
+  resource/namespace:
+    attributes:
+      - key: service.namespace
+        value: corebanking
+        action: upsert
+      # SPEC §2.2: deployment.environment from DEPLOY_ENV, default "dev".
+      - key: deployment.environment
+        value: "${env:DEPLOY_ENV:-dev}"
+        action: upsert
+
+  # SPEC §2.3 attribute contract.
+  #
+  # KEEP list (explicitly NOT deleted here — removal is a spec violation):
+  #   tenant.id   - set by kit ingress middleware (x-tenant-id header -> JWT
+  #                 tenant_id claim). Required for per-tenant dashboards,
+  #                 100% money-route sampling below, and the tenant_id metric
+  #                 label consumed by Grafana per-tenant alerting.
+  #   k8s.*       - pod/namespace/node attribution from the k8s attributes
+  #                 processor in the SDKs/kits or an upstream collector.
+  #
+  # This processor only strips known high-cardinality junk that has no
+  # observability value at platform level. Additions to the delete list must
+  # never include tenant.id or k8s.* keys.
+  attributes/retain-tenant-and-k8s:
+    actions:
+      - key: http.request.header.user_agent
+        action: delete
+      - key: http.request.header.cookie
+        action: delete
+      - key: http.request.header.authorization
+        action: delete   # defense-in-depth: auth material must never be telemetry
+
+  # Trace sampling. Decision order is OR across policies: a trace is kept if
+  # ANY policy keeps it.
+  #
+  #   1. errors-always:           100% of traces containing an ERROR span.
+  #   2. money-path-tenant-100pct:100% of spans that carry tenant.id AND whose
+  #                               http.route matches the money-path regex
+  #                               (payments, payouts, disbursements, transfers,
+  #                               settlement, ledger, transactions). Combined
+  #                               with SDK-side OTEL_TRACES_SAMPLER_ARG=1.0 on
+  #                               money services (SPEC §2.1), money-path
+  #                               telemetry is effectively never dropped.
+  #   3. baseline-10pct:          10% probabilistic for everything else.
+  #
+  # TRADEOFFS (deliberate):
+  #   * decision_wait buffers whole traces in memory for up to 15s before the
+  #     sampling decision; this is the dominant collector RAM cost. Bounded by
+  #     num_traces=50000 — past that the collector makes early (non-tail)
+  #     decisions, so under extreme load the 100% guarantee degrades to
+  #     probabilistic. Monitor otelcol_processor_tail_sampling_* metrics.
+  #   * The money-path policy depends on kits actually attaching tenant.id at
+  #     ingress (SPEC §2.3). If a service misses middleware, its traffic falls
+  #     back to the 10% baseline — silently. Grafana money-path dashboard
+  #     panels keyed on tenant_id make that gap visible.
+  #   * The http.route regex must be maintained as money routes evolve; an
+  #     unmatched money route is still caught by policy 3 at 10%.
+  tail_sampling:
+    decision_wait: 15s
+    num_traces: 50000
+    expected_new_traces_per_sec: 500
+    policies:
+      - name: errors-always
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: money-path-tenant-100pct
+        type: ottl_condition
+        ottl_condition:
+          error_mode: ignore
+          spans:
+            - 'attributes["tenant.id"] != nil'
+            - 'IsMatch(attributes["http.route"] ?? "", "(?i).*(payment|payout|disburse|transfer|settlement|ledger|transaction).*")'
+      - name: baseline-10pct
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: 10
+
+  # Last in every pipeline: amortize exporter calls.
+  batch:
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+    timeout: 5s
+
+exporters:
+  # Traces -> Tempo (OTLP gRPC).
+  otlp/tempo:
+    endpoint: "${env:TEMPO_HOST:-tempo}:4317"
+    tls:
+      insecure: true
+
+  # Metrics -> Prometheus via pull/federation. Prometheus scrapes this
+  # endpoint (job otel-collector-federation in prometheus.yml).
+  # Label-name contract (verified against B2/Grafana, SPEC §2.3):
+  #   the exporter sanitizes attribute keys to valid PromQL label names by
+  #   replacing '.' with '_' — so datapoint/resource attributes export as:
+  #     tenant.id          -> label tenant_id    (per-tenant alerting key)
+  #     service.name       -> label service_name
+  #     service.namespace  -> label service_namespace
+  #     deployment.environment -> label deployment_environment
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    enable_open_metrics: true
+    resource_to_telemetry_conversion:
+      # Promote service.name / service.namespace / deployment.environment
+      # onto every exported metric so federation queries don't lose origin.
+      enabled: true
+
+  # Logs -> Loki's native OTLP endpoint (Loki >= 2.9).
+  # NOTE: the contrib `loki` exporter is deprecated upstream; OTLP-to-Loki is
+  # the supported path. Loki 3.x maps OTLP resource attributes (service.name,
+  # service.namespace) to structured metadata / labels by default.
+  otlphttp/loki:
+    endpoint: "http://${env:LOKI_HOST:-loki}:3100/otlp"
+    tls:
+      insecure: true
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/namespace, attributes/retain-tenant-and-k8s, tail_sampling, batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp, prometheus, postgresql, redis]
+      processors: [memory_limiter, resource/namespace, attributes/retain-tenant-and-k8s, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/namespace, attributes/retain-tenant-and-k8s, batch]
+      exporters: [otlphttp/loki]
+  telemetry:
+    logs:
+      level: info
+    # Collector's own metrics on :8888 (scraped by Prometheus job
+    # otel-collector-internal — this is what powers queue/backpressure alerts).
+    # `address` is the legacy-but-stable form (valid in 0.114.x); the newer
+    # `readers:` block can replace it once the image is bumped past 0.115.
+    metrics:
+      address: 0.0.0.0:8888
