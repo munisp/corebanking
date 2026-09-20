@@ -34,7 +34,5 @@ export const postCreateTenantEmployee = asyncHandler(async (req, res) => {
     },
   });
 
-  console.log("workflow response", verification);
-
   return res.status(httpStatus.CREATED).json({ message: "success", verification });
 });
