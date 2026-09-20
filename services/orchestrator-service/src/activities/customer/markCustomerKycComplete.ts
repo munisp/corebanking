@@ -1,10 +1,9 @@
-import { AppDataSource } from "../../database/dataSource";
+import { userService } from "../../services/userService";
 
+// OB-06: previously this ran raw SQL against the orchestrator's own DB
+// (`UPDATE "user" ...`), but the orchestrator schema has no "user" table — the
+// user record lives in user-service. Call the real API (POST /user/kyc/complete,
+// user-service api/user.py:183), which also publishes the KYC_COMPLETED event.
 export async function markCustomerKycComplete(tenant_id: string, keycloak_id: string) {
-  await AppDataSource.query(
-    `UPDATE "user"
-     SET kyc_verification_status = 'VERIFIED', status = 'ACTIVE', updated_at = NOW()
-     WHERE keycloak_id = $1 AND tenant_id = $2`,
-    [keycloak_id, tenant_id],
-  );
+  return userService.markKycComplete(tenant_id, keycloak_id);
 }
