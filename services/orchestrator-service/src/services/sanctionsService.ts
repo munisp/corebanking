@@ -43,18 +43,16 @@ class SanctionsService {
       });
       return resp.data;
     } catch (error: any) {
-      // Fail-open on service unavailability: a screening outage must not halt all onboarding.
-      // Log loudly so ops can detect the gap and trigger manual review.
+      // OB-07: FAIL-CLOSED. A screening outage must stop onboarding, not wave
+      // it through. Throw so the Temporal activity retries (and the workflow
+      // ultimately fails) instead of silently proceeding. Callers treat a
+      // thrown error exactly like action="block": onboarding halts.
       console.error(
-        `[SANCTIONS] Screening service unreachable for "${args.name}" tenant=${args.tenantId}: ${error.message}`
+        `[SANCTIONS] Screening service unreachable for "${args.name}" tenant=${args.tenantId}: ${error.message} — failing closed (block)`
       );
-      return {
-        id: "service-error",
-        screened_name: args.name,
-        action: "proceed",
-        risk_level: "unknown",
-        matches: [],
-      };
+      throw new Error(
+        `Sanctions screening failed for "${args.name}" (tenant=${args.tenantId}): screening outage is treated as BLOCK — ${error.message}`
+      );
     }
   }
 }
