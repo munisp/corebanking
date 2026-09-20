@@ -1,0 +1,51 @@
+# =============================================================================
+# Permify — env-var strategic-merge patch (preferred; matches repo style where
+# Deployment/permify in ns 54bank is configured purely via PERMIFY_* env vars)
+# Apply: kubectl -n 54bank patch deployment permify --patch-file <this file>
+# (repeat with namespace `permify` for the integration copy if it is live)
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: permify
+  namespace: 54bank
+spec:
+  template:
+    spec:
+      containers:
+        - name: permify
+          env:
+            - name: PERMIFY_TRACER_ENABLED
+              value: "true"
+            - name: PERMIFY_TRACER_EXPORTER
+              value: "otlp"
+            - name: PERMIFY_TRACER_ENDPOINT
+              value: "otel-collector.observability.svc.cluster.local:4317"
+            - name: PERMIFY_TRACER_INSECURE
+              value: "true"
+            - name: PERMIFY_METER_ENABLED
+              value: "true"
+            - name: PERMIFY_METER_EXPORTER
+              value: "prometheus"
+            - name: PERMIFY_METER_ADDRESS
+              value: "0.0.0.0:2112"       # SPEC §3 contract: permify :2112
+            - name: PERMIFY_PROFILER_ENABLED
+              value: "false"              # was "true" in integration/permify-postgres.yaml
+          ports:
+            - containerPort: 2112
+              name: metrics
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: permify-metrics
+  namespace: 54bank
+  labels:
+    observability.corebanking/scrape: "true"
+spec:
+  selector:
+    app: permify
+  ports:
+    - name: metrics
+      port: 2112
+      targetPort: 2112
