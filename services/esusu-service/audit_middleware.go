@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,14 +10,17 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"shared/otel/go/otelkit"
 )
 
 var (
-	auditSvcURL  = os.Getenv("AUDIT_SVC_URL")
-	skipPrefixes = []string{"/health", "/metrics", "/dapr", "/docs", "/ready"}
-	skipMethods  = map[string]bool{"GET": true, "HEAD": true, "OPTIONS": true}
-	auditUUIDRE  = regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-	auditIntRE   = regexp.MustCompile(`/[0-9]+`)
+	auditSvcURL      = os.Getenv("AUDIT_SVC_URL")
+	auditIngestToken = os.Getenv("AUDIT_INGEST_TOKEN") // AU-01
+	skipPrefixes     = []string{"/health", "/metrics", "/dapr", "/docs", "/ready"}
+	skipMethods      = map[string]bool{"GET": true, "HEAD": true, "OPTIONS": true}
+	auditUUIDRE      = regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	auditIntRE       = regexp.MustCompile(`/[0-9]+`)
 )
 
 func init() {
@@ -59,12 +63,21 @@ func sendAuditEvent(actorID, tenantID, eventType string, eventData map[string]in
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-tenant-id", tenantID)
 	req.Header.Set("x-keycloak-id", "system")
+	if auditIngestToken != "" {
+		// AU-01 (F15-1): shared ingest credential; audit-service fails closed without it.
+		req.Header.Set("X-Audit-Ingest-Token", auditIngestToken)
+	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		// w9 alerting contract: audit_ship_failures_total.
+		otelkit.IncCounter(context.Background(), "audit_ship_failures_total", otelkit.TenantIDAttributeKV(tenantID))
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		otelkit.IncCounter(context.Background(), "audit_ship_failures_total", otelkit.TenantIDAttributeKV(tenantID))
+	}
 }
 
 func auditMiddleware(next http.Handler) http.Handler {
