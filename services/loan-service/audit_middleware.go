@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,13 +12,16 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"shared/otel/go/otelkit"
 )
 
 var (
-	ginAuditSvcURL  = os.Getenv("AUDIT_SVC_URL")
-	ginSkipPrefixes = []string{"/health", "/metrics", "/dapr", "/docs", "/ready"}
-	ginAuditUUIDRE  = regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
-	ginAuditIntRE   = regexp.MustCompile(`/[0-9]+`)
+	ginAuditSvcURL      = os.Getenv("AUDIT_SVC_URL")
+	ginAuditIngestToken = os.Getenv("AUDIT_INGEST_TOKEN") // AU-01
+	ginSkipPrefixes     = []string{"/health", "/metrics", "/dapr", "/docs", "/ready"}
+	ginAuditUUIDRE      = regexp.MustCompile(`/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}`)
+	ginAuditIntRE       = regexp.MustCompile(`/[0-9]+`)
 )
 
 func init() {
@@ -50,12 +54,21 @@ func ginSendAuditEvent(actorID, tenantID, eventType string, eventData map[string
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-tenant-id", tenantID)
 	req.Header.Set("x-keycloak-id", "system")
+	if ginAuditIngestToken != "" {
+		// AU-01 (F15-1): shared ingest credential; audit-service fails closed without it.
+		req.Header.Set("X-Audit-Ingest-Token", ginAuditIngestToken)
+	}
 	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		// w9 alerting contract: audit_ship_failures_total.
+		otelkit.IncCounter(context.Background(), "audit_ship_failures_total", otelkit.TenantIDAttributeKV(tenantID))
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		otelkit.IncCounter(context.Background(), "audit_ship_failures_total", otelkit.TenantIDAttributeKV(tenantID))
+	}
 }
 
 func auditMiddleware() gin.HandlerFunc {
