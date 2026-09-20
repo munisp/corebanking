@@ -1,0 +1,10 @@
+# corebanking observability stack (wave-9, builder B1)
+# Pinned images, non-root, no committed secrets (secretKeyRef targets
+# 'grafana-admin' and 'otel-metrics-credentials' are created out-of-band).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+    pod-security.kubernetes.io/enforce: restricted
