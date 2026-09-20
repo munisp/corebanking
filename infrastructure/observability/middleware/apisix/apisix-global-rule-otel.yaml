@@ -1,0 +1,53 @@
+# =============================================================================
+# APISIX — global OpenTelemetry tracing + Prometheus metrics
+#
+# ApisixGlobalRule applies the plugins to EVERY ApisixRoute in the namespace
+# (the repo's ~600 routes live in ns `54link-dev` with ingressClassName apisix
+# — verified-static, e.g. infrastructure/apisix-resources/routes/*.yaml).
+#
+# Contracts (SPEC §3/§2.1):
+#   - opentelemetry plugin exports OTLP/HTTP to
+#     http://otel-collector:4318/v1/traces (plugin appends /v1/traces itself —
+#     configure the base address only)
+#   - prometheus plugin export endpoint on :9091 (job `apisix`)
+#
+# Requires: apisix-ingress-controller watching ns 54link-dev with
+# ingressClassName apisix (requires-deployment — only the standalone APISIX
+# Deployment in ns 54bank is present in-tree).
+# =============================================================================
+apiVersion: apisix.apache.org/v2
+kind: ApisixGlobalRule
+metadata:
+  name: corebanking-otel-prometheus
+  namespace: 54link-dev
+  labels:
+    app.kubernetes.io/part-of: corebanking-observability
+spec:
+  ingressClassName: apisix
+  plugins:
+    # --- Distributed tracing ------------------------------------------------
+    - name: opentelemetry
+      enable: true
+      config:
+        sampler:
+          name: always_on        # SPEC §2.1: money path always sampled (1.0)
+        collector:
+          address: "otel-collector.observability.svc.cluster.local:4318"
+          request_timeout: 3
+        resource:
+          service.name: apisix-gateway
+          service.namespace: corebanking     # SPEC §2.2
+        additional_attributes:
+          - "deployment.environment=dev"     # keep in sync with DEPLOY_ENV
+        batch_span_processor:
+          drop_on_queue_full: false
+          max_queue_size: 2048
+          batch_timeout: 2
+          inactive_timeout: 1
+          max_export_batch_size: 64
+        set_ngx_var: true          # exposes trace_id as nginx var for log correlation
+    # --- Metrics ------------------------------------------------------------
+    - name: prometheus
+      enable: true
+      config:
+        prefer_name: true          # route/service names instead of ids (bounded cardinality)
