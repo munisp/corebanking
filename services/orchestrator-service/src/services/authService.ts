@@ -6,6 +6,7 @@ import {
   IAuthProfileResponse,
   ISetupPassword,
 } from "../types/auth";
+import { serviceAuthClient } from "../lib/serviceAuthClient";
 
 class AuthService {
   private _axiosInstance: AxiosInstance;
@@ -37,6 +38,8 @@ class AuthService {
             "x-tenant-id": payload.tenant_id,
             "x-keycloak-realm": payload.keycloak_realm,
             "x-keycloak-pub-key": payload.keycloak_pub_key,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(payload.tenant_id),
           },
         },
       );
@@ -78,6 +81,8 @@ class AuthService {
             "x-tenant-id": payload.tenant_id,
             "x-keycloak-realm": payload.keycloak_realm,
             "x-keycloak-pub-key": payload.keycloak_pub_key,
+            // OB-03: service-to-service bearer (role="service")
+            "Authorization": serviceAuthClient.getAuthHeader(payload.tenant_id),
           },
         },
       );
@@ -100,6 +105,42 @@ class AuthService {
       }
       console.error("Network error setting up password:", error.message);
       throw new Error("Network error — authentication service unreachable");
+    }
+  }
+  /**
+   * OB-08 (saga compensation): best-effort delete of a previously created auth
+   * profile. NOTE: auth-service @ 1c9134e2 exposes no DELETE endpoint (only
+   * POST /auth, /login, /setup-password, /forgot-password, /reset-password,
+   * /change-password) — this calls DELETE /auth/{keycloak_id} which R1B must
+   * add. Until then a 404/405 is logged as CRITICAL for manual cleanup and
+   * not rethrown (compensation must never mask the original failure).
+   */
+  public async deleteAuthProfile(
+    tenant_id: string,
+    keycloak_id: string,
+    keycloak_realm: string,
+  ): Promise<void> {
+    try {
+      await this._axiosInstance.delete(`/auth/${keycloak_id}`, {
+        headers: {
+          "x-tenant-id": tenant_id,
+          "x-keycloak-realm": keycloak_realm,
+          // OB-03: service-to-service bearer (role="service")
+          "Authorization": serviceAuthClient.getAuthHeader(tenant_id),
+        },
+      });
+    } catch (error: any) {
+      const status = error.response?.status;
+      if (status === 404 || status === 405) {
+        console.error(
+          `[authService.deleteAuthProfile] CRITICAL: auth-service has no delete endpoint yet (HTTP ${status}); orphaned auth profile keycloak_id=${keycloak_id} tenant=${tenant_id} requires manual cleanup`,
+        );
+        return;
+      }
+      console.error(
+        `[authService.deleteAuthProfile] compensation failed keycloak_id=${keycloak_id}: ${error.message}`,
+      );
+      // Best-effort: never throw from a compensation.
     }
   }
 }
