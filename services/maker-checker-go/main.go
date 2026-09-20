@@ -51,6 +51,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq"
+	"shared/otel/go/otelkit"
 )
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -80,7 +81,7 @@ func initDB() {
 		log.Fatal("DATABASE_URL is required")
 	}
 	var err error
-	db, err = sql.Open("postgres", dsn)
+	db, err = otelkit.OpenSQLDB("postgres", dsn)
 	if err != nil {
 		log.Fatalf("DB open: %v", err)
 	}
@@ -1155,6 +1156,17 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 }
 
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), "maker-checker-go")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	startJWKSRefresh()
 
 	initDB()
@@ -1218,7 +1230,7 @@ func main() {
 
 	port := getEnv("PORT", "8210")
 	log.Printf("maker-checker-go listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(corsMiddleware(mux))))))
+	log.Fatal(http.ListenAndServe(":"+port, otelkit.HTTPMiddleware(rateLimitMiddleware(jwtAuthMiddleware(countingMiddleware(corsMiddleware(mux)))))))
 }
 
 // --- Request metrics (restored fleet-canonical block) ---

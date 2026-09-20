@@ -28,6 +28,31 @@ load_dotenv()
 coa_client = CoAClient()
 
 app = FastAPI(title="54Link Insurance Service", version="1.0.0")
+# --- OpenTelemetry (SPEC w9 §2.5 TEMPLATE): otelkit init + tenant middleware.
+# OTLP gRPC traces+metrics (default http://otel-collector:4317), W3C
+# tracecontext+baggage propagation, FastAPI server spans, TenantMiddleware
+# (tenant.id span attr from x-tenant-id). Honors OTEL_SDK_DISABLED; never raises.
+try:
+    import os as _otel_os
+    import sys as _otel_sys
+
+    _otel_sys.path.insert(
+        0,
+        _otel_os.path.normpath(
+            _otel_os.path.join(
+                _otel_os.path.dirname(__file__), "..", "..", "shared", "otel", "python"
+            )
+        ),
+    )
+    from otelkit import init_telemetry, instrument_kafka
+
+    init_telemetry("insurance-service", app)
+    instrument_kafka()
+except Exception as _otel_exc:
+    import logging as _otel_logging
+
+    _otel_logging.getLogger("otel").warning("otelkit init skipped: %s", _otel_exc)
+
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL

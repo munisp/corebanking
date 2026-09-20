@@ -1283,9 +1283,12 @@ func computeArrears(mortgageID string) (*ArrearsStatus, error) {
 }
 
 // updateArrearsStatus recalculates the arrears position and persists it to
-// mortgage_arrears. Called after every payment (main.go) and from the daily
-// servicing workflow (temporal_workflows.go). A cleared position resolves any
-// active arrears record; an overdue position upserts the active record.
+// mortgage_arrears. Called after every payment (main.go). OR-18 (Wave-10):
+// the "daily servicing workflow" (temporal_workflows.go) referenced here was
+// phantom code with zero call sites and was deleted — this recalculation runs
+// on payment only; failures are logged for manual follow-up.
+// A cleared position resolves any active arrears record; an overdue position
+// upserts the active record.
 func updateArrearsStatus(mortgageID, tenantID string) error {
 	if db == nil {
 		return fmt.Errorf("database not available")

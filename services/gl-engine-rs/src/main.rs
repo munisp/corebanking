@@ -290,6 +290,7 @@ async fn post_journal(body: web::Json<Vec<JournalEntry>>, state: web::Data<AppSt
             return db_unavailable();
         }
     };
+    let _span = otelkit::pg_span("INSERT INTO gl_journals; INSERT INTO gl_journal_lines (post_journal transaction)").entered();
     let narration = entries.first().map(|e| e.narration.clone()).unwrap_or_default();
     let posted_by = entries.first().and_then(|e| e.posted_by.clone());
     if let Err(e) = sqlx::query(
@@ -700,6 +701,7 @@ fn sanitize_input(s: &str) -> String {
 // Best-effort audit persistence via the GL pool. Never fails a request.
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     let id = format!("{}_{}_{}", "gl_engine_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let _span = otelkit::pg_span("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5::jsonb)").entered();
     let svc_name = String::from("gl-engine-rs");
     let status = String::from("active");
     let data_str = serde_json::to_string(data).unwrap_or_default();
@@ -980,6 +982,14 @@ async fn init_schema(pool: &PgPool) {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
+    // Wave-9 otelkit (SPEC §2.5): OTLP gRPC tracing; dropping the guard flushes spans.
+    let _otel_guard = match otelkit::init("gl-engine-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[gl-engine-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8101);
     // FAIL FAST: the GL must never run on in-memory state or default credentials.
     let db_url = env::var("DATABASE_URL")
@@ -1021,6 +1031,7 @@ async fn main() -> std::io::Result<()> {
                 }
             })
             .app_data(state.clone())
+            .wrap(otelkit::actix::TenantMiddleware)
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))

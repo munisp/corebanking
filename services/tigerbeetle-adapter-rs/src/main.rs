@@ -51,6 +51,7 @@ async fn tb_operation(req: actix_web::HttpRequest, state: web::Data<AppState>, b
     let input = body.into_inner();
     let debit = input.get("debit").and_then(|v| v.as_bool()).unwrap_or(false);
     let credit = input.get("credit").and_then(|v| v.as_bool()).unwrap_or(false);
+    let _span = otelkit::tigerbeetle_span("account_flags").entered();
     let result = account_flags(debit, credit);
     let _result_data = json!({"endpoint": "tb_operation"});
     db_persist(&state, "tb_operation", &_result_data).await;
@@ -380,6 +381,7 @@ fn sanitize_input(s: &str) -> String {
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
         let id = format!("{}_{}_{}", "tigerbeetle_adapter_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let _span = otelkit::pg_span("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)").entered();
         let svc_name = String::from("tigerbeetle-adapter-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
@@ -565,6 +567,14 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Wave-9 otelkit (SPEC §2.5): OTLP gRPC tracing; dropping the guard flushes spans.
+    let _otel_guard = match otelkit::init("tigerbeetle-adapter-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[tigerbeetle-adapter-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8256);
     let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
         match init_db(&url).await {
@@ -614,6 +624,7 @@ async fn main() -> std::io::Result<()> {
                 .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
                 .add(("Content-Security-Policy", "default-src 'self'"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .wrap(otelkit::actix::TenantMiddleware)
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/v1/tb_operation", web::post().to(tb_operation))

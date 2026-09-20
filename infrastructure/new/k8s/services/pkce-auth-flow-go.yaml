@@ -32,6 +32,7 @@ spec:
         language: go
         tier: microservice
       annotations:
+        reloader.stakater.com/auto: \"true\"  # PL-14: roll pods when ExternalSecret targets refresh
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
@@ -76,7 +77,7 @@ spec:
               memory: 32Mi
       containers:
         - name: pkce-auth-flow-go
-          image: ghcr.io/54bank/pkce-auth-flow-go:latest
+          image: ghcr.io/54bank/pkce-auth-flow-go:v1.0.0  # PL-16: :latest banned — pinned release tag; replace with the signed image digest at deploy time. (~460 remaining manifests still on :latest — fleet-wide pin is follow-up)
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -95,9 +96,9 @@ spec:
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
-                  name: pkce-auth-flow-go-secrets
-                  key: database-url
-                  optional: true
+                  name: database-credentials  # PL-14: ExternalSecret target (ESO-managed, refreshInterval 1h)
+                  key: DATABASE_URL
+                  optional: false
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
@@ -119,9 +120,9 @@ spec:
             - name: JWT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: 54bank-secrets
-                  key: jwt-secret
-                  optional: true
+                  name: jwt-signing-keys  # PL-14: ExternalSecret target (ESO-managed, refreshInterval 24h)
+                  key: JWT_SECRET
+                  optional: false
           resources:
             requests:
               cpu: 100m

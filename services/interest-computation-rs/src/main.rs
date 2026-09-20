@@ -426,6 +426,7 @@ fn sanitize_input(s: &str) -> String {
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
         let id = format!("{}_{}_{}", "interest_computation_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let _span = otelkit::pg_span("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)").entered();
         let svc_name = String::from("interest-computation-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
@@ -611,6 +612,14 @@ fn mtls_config() -> (bool, String, String, String) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Wave-9 otelkit (SPEC §2.5): OTLP gRPC tracing; dropping the guard flushes spans.
+    let _otel_guard = match otelkit::init("interest-computation-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[interest-computation-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8103);
     let state = web::Data::new(AppState {
             db_url: std::env::var("DATABASE_URL").ok(),
@@ -658,6 +667,7 @@ async fn main() -> std::io::Result<()> {
                 .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
                 .add(("Content-Security-Policy", "default-src 'self'"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .wrap(otelkit::actix::TenantMiddleware)
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(health))
             .route("/readyz", web::get().to(readyz))

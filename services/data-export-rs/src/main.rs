@@ -85,12 +85,22 @@ async fn export_data(req: actix_web::HttpRequest, state: web::Data<AppState>, bo
 
 async fn list_records(req: actix_web::HttpRequest, state: web::Data<AppState>, query: web::Query<std::collections::HashMap<String, String>>) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
+    // PL-07: fail closed when the store is down — previously this handler
+    // served per-pod in-memory records while labeling them source:"database".
+    if state.db_url.is_none() {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "record store unavailable",
+            "message": "Postgres is not configured; no in-memory fallback is served."
+        }));
+    }
     let records = state.records.lock().unwrap();
     let page: usize = query.get("page").and_then(|p| p.parse().ok()).unwrap_or(1);
     let limit: usize = query.get("limit").and_then(|l| l.parse().ok()).unwrap_or(20);
     let total = records.len();
     let items: Vec<&serde_json::Value> = records.iter().skip((page-1)*limit).take(limit).collect();
-    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": if state.db_url.is_some() { "database" } else { "in-memory" }}))
+    // These are this pod's in-memory records (write-through cache); labeled
+    // honestly. TODO: serve from a real SELECT against service_records.
+    HttpResponse::Ok().json(json!({"items": items, "total": total, "page": page, "source": "in-memory", "note": "in-pod cache; DB-backed listing not yet implemented"}))
 }
 
 async fn stats(state: web::Data<AppState>) -> HttpResponse {

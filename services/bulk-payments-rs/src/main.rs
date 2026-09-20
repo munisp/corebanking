@@ -1,12 +1,19 @@
 #![allow(unused)]
+// MN-18: this crate previously DID NOT COMPILE — it referenced undefined
+// handlers (create_record/get_record/metrics), missing imports (Mutex, json!,
+// AtomicU64/AtomicOrdering) and a sqlx dependency absent from Cargo.toml.
+// Repaired below; all money paths now use the tokio_postgres client.
 use tokio_postgres;
 use actix_web::dev::Service;
 use actix_web::{web, App, HttpServer, HttpResponse, middleware};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
+use serde_json::json;
 use std::env;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicOrdering};
 use uuid::Uuid;
 use chrono::{Utc, DateTime};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Record {
@@ -49,19 +56,46 @@ async fn health() -> HttpResponse {
     }))
 }
 
+/// MN-18: deterministic per-leg idempotency key — sha256(batch_id|index),
+/// hex-encoded. A batch retry re-derives the SAME keys, so already-succeeded
+/// legs are skipped locally and the hub can dedup on x-idempotency-key.
+fn leg_idempotency_key(batch_id: &str, index: usize) -> String {
+    let mut h = Sha256::new();
+    h.update(format!("{}|{}", batch_id, index).as_bytes());
+    hex::encode(h.finalize())
+}
+
+/// Extract a transfer amount as integer kobo from a hub-shaped transfer
+/// payload ("amount" may be a JSON string or number, in naira major units).
+/// Integer minor units only after this point — no float money comparisons.
+fn transfer_amount_kobo(transfer: &serde_json::Value) -> i64 {
+    let naira = transfer
+        .get("amount")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| v.as_f64())
+        })
+        .unwrap_or(0.0);
+    (naira * 100.0).round() as i64
+}
+
 /// Forwards a single transfer payload to the payment hub /v1/transfers/initiate.
-/// Passes through the caller's auth and tenant headers unchanged.
+/// Passes through the caller's auth and tenant headers unchanged, plus the
+/// per-leg idempotency key (MN-18) as x-idempotency-key.
 async fn forward_transfer_to_hub(
     http_client: &reqwest::Client,
     hub_url: &str,
     transfer: serde_json::Value,
     auth: &str,
     forwarded_headers: &std::collections::HashMap<String, String>,
+    idempotency_key: &str,
 ) -> Result<serde_json::Value, String> {
     let url = format!("{}/v1/transfers/initiate", hub_url);
     let mut req = http_client
         .post(&url)
         .header("Authorization", auth)
+        .header("x-idempotency-key", idempotency_key)
         .header("Content-Type", "application/json");
 
     for (k, v) in forwarded_headers {
@@ -162,8 +196,57 @@ async fn process_batch(
         return HttpResponse::BadRequest().json(json!({"error": "transfers array must not be empty"}));
     }
 
+    // MN-18: durable per-leg persistence is MANDATORY for money movement —
+    // refuse to process a batch without Postgres (fail-closed; previously the
+    // batch would execute with only an in-memory summary).
+    let db = match &state.db_client {
+        Some(c) => c.clone(),
+        None => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "batch_store_unavailable",
+                "detail": "postgres not connected; refusing to execute a money batch without durable per-leg persistence"
+            }));
+        }
+    };
+
+    // MN-18: batch-level maker-checker gate (F7-08 structuring bypass: a
+    // ₦50M batch of ₦900k legs never triggered maker-checker). Batches whose
+    // total exceeds BULK_APPROVAL_THRESHOLD_KOBO require an approval id.
+    let total_kobo: i64 = transfers.iter().map(transfer_amount_kobo).sum();
+    let threshold_kobo: i64 = std::env::var("BULK_APPROVAL_THRESHOLD_KOBO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5_000_000_000); // default ₦50,000,000.00
+    let approval_id = req
+        .headers()
+        .get("x-maker-checker-approval-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if total_kobo > threshold_kobo && approval_id.is_empty() {
+        return HttpResponse::Forbidden().json(json!({
+            "error": "maker_checker_approval_required",
+            "detail": "batch total exceeds BULK_APPROVAL_THRESHOLD_KOBO; supply x-maker-checker-approval-id",
+            "batchTotalKobo": total_kobo,
+            "thresholdKobo": threshold_kobo,
+        }));
+    }
+
     let hub_url = std::env::var("PAYMENT_HUB_URL")
         .unwrap_or_else(|_| "http://payment-hub".to_string());
+
+    // MN-18: register the batch durably BEFORE executing any leg.
+    let tenant_hdr = forwarded_headers.get("x-tenant-id").cloned().unwrap_or_default();
+    if let Err(e) = db.execute(
+        "INSERT INTO batches (batch_id, tenant_id, total, total_amount_kobo, status, approval_id)
+         VALUES ($1,$2,$3,$4,'processing',NULLIF($5,''))
+         ON CONFLICT (batch_id) DO NOTHING",
+        &[&batch_id, &tenant_hdr, &(transfers.len() as i32), &total_kobo, &approval_id],
+    ).await {
+        return HttpResponse::ServiceUnavailable().json(json!({
+            "error": "batch_store_write_failed", "detail": e.to_string()
+        }));
+    }
 
     let mut results = Vec::with_capacity(transfers.len());
     let mut succeeded: u32 = 0;
@@ -179,29 +262,83 @@ async fn process_batch(
                 }
             }
         }
+        let idem_key = leg_idempotency_key(&batch_id, idx);
+
+        // MN-18: replay guard — a leg that already succeeded is NEVER
+        // re-executed, so a batch retry cannot double-pay.
+        match db.query_opt(
+            "SELECT status FROM batch_legs WHERE idempotency_key = $1",
+            &[&idem_key],
+        ).await {
+            Ok(Some(row)) if row.get::<_, String>(0) == "success" => {
+                succeeded += 1;
+                results.push(json!({
+                    "index": idx,
+                    "status": "already_succeeded",
+                    "idempotencyKey": idem_key,
+                }));
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "batch_store_read_failed", "detail": e.to_string()
+                }));
+            }
+        }
+
+        // Record the leg as pending before hitting the rail.
+        if let Err(e) = db.execute(
+            "INSERT INTO batch_legs (idempotency_key, batch_id, leg_index, status, transfer)
+             VALUES ($1,$2,$3,'pending',$4::jsonb)
+             ON CONFLICT (idempotency_key) DO UPDATE SET status='pending', updated_at=NOW()",
+            &[&idem_key, &batch_id, &(idx as i32), &transfer.to_string()],
+        ).await {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "batch_store_write_failed", "detail": e.to_string()
+            }));
+        }
+
         let outcome = forward_transfer_to_hub(
             &state.http_client,
             &hub_url,
             transfer,
             &auth,
             &forwarded_headers,
+            &idem_key,
         )
         .await;
 
         match outcome {
             Ok(resp_body) => {
                 succeeded += 1;
+                // MN-18: durable per-leg status transition pending→success.
+                if let Err(e) = db.execute(
+                    "UPDATE batch_legs SET status='success', error=NULL, response=$2::jsonb, updated_at=NOW() WHERE idempotency_key=$1",
+                    &[&idem_key, &resp_body.to_string()],
+                ).await {
+                    eprintln!("[bulk-payments-rs] leg {} success persist failed: {}", idem_key, e);
+                }
                 results.push(json!({
                     "index": idx,
                     "status": "success",
+                    "idempotencyKey": idem_key,
                     "response": resp_body,
                 }));
             }
             Err(err_msg) => {
                 failed += 1;
+                // MN-18: durable per-leg status transition pending→failed.
+                if let Err(e) = db.execute(
+                    "UPDATE batch_legs SET status='failed', error=$2, updated_at=NOW() WHERE idempotency_key=$1",
+                    &[&idem_key, &err_msg],
+                ).await {
+                    eprintln!("[bulk-payments-rs] leg {} failure persist failed: {}", idem_key, e);
+                }
                 results.push(json!({
                     "index": idx,
                     "status": "failed",
+                    "idempotencyKey": idem_key,
                     "error": err_msg,
                 }));
             }
@@ -210,12 +347,29 @@ async fn process_batch(
 
     let total = transfers.len() as u32;
     let success_rate = batch_success_rate(total, succeeded);
+    // MN-18: durable batch summary.
+    let final_status = if failed == 0 {
+        "completed"
+    } else if succeeded == 0 {
+        "failed"
+    } else {
+        "completed_with_failures"
+    };
+    if let Err(e) = db.execute(
+        "UPDATE batches SET succeeded=$2, failed=$3, status=$4, updated_at=NOW() WHERE batch_id=$1",
+        &[&batch_id, &(succeeded as i32), &(failed as i32), &final_status],
+    ).await {
+        eprintln!("[bulk-payments-rs] batch {} summary persist failed: {}", batch_id, e);
+    }
+
     let summary = json!({
         "batch_id": batch_id,
         "total": total,
         "succeeded": succeeded,
         "failed": failed,
         "success_rate_pct": success_rate,
+        "status": final_status,
+        "totalAmountKobo": total_kobo,
         "results": results,
     });
 
@@ -224,23 +378,258 @@ async fn process_batch(
     HttpResponse::Ok().json(summary)
 }
 
+/// POST /v1/bulk-payments/{batch_id}/retry-failed (MN-18)
+///
+/// Re-executes ONLY legs persisted as failed; succeeded legs are never
+/// re-sent (the per-leg replay guard + deterministic idempotency keys make a
+/// double payout impossible).
+async fn retry_failed(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if !rl_allow() {
+        return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
+    }
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let batch_id = path.into_inner();
+    let db = match &state.db_client {
+        Some(c) => c.clone(),
+        None => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "batch_store_unavailable",
+                "detail": "postgres not connected"
+            }));
+        }
+    };
+
+    // The batch must exist — 404 otherwise (no hash-fiction fallback).
+    match db.query_opt("SELECT batch_id FROM batches WHERE batch_id = $1", &[&batch_id]).await {
+        Ok(None) => {
+            return HttpResponse::NotFound().json(json!({
+                "error": "batch_not_found", "batchId": batch_id
+            }));
+        }
+        Err(e) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "batch_store_read_failed", "detail": e.to_string()
+            }));
+        }
+        Ok(Some(_)) => {}
+    }
+
+    let auth = req
+        .headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let forward_header_names = [
+        "x-tenant-id", "x-tenent-id", "x-keycloak-id", "x-ledger-id",
+        "x-mint-account-id", "x-switch-name", "x-ams-name", "x-payer-pin", "x-pin",
+    ];
+    let mut forwarded_headers = std::collections::HashMap::new();
+    for name in &forward_header_names {
+        if let Some(val) = req.headers().get(*name).and_then(|v| v.to_str().ok()) {
+            forwarded_headers.insert(name.to_string(), val.to_string());
+        }
+    }
+
+    let rows = match db.query(
+        "SELECT leg_index, transfer::text FROM batch_legs WHERE batch_id = $1 AND status = 'failed' ORDER BY leg_index",
+        &[&batch_id],
+    ).await {
+        Ok(r) => r,
+        Err(e) => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "batch_store_read_failed", "detail": e.to_string()
+            }));
+        }
+    };
+
+    let hub_url = std::env::var("PAYMENT_HUB_URL")
+        .unwrap_or_else(|_| "http://payment-hub".to_string());
+
+    let mut results = Vec::with_capacity(rows.len());
+    let mut succeeded: u32 = 0;
+    let mut failed: u32 = 0;
+    for row in &rows {
+        let idx: i32 = row.get(0);
+        let transfer_txt: String = row.get(1);
+        let transfer: serde_json::Value =
+            serde_json::from_str(&transfer_txt).unwrap_or_else(|_| json!({}));
+        let idem_key = leg_idempotency_key(&batch_id, idx as usize);
+        match forward_transfer_to_hub(
+            &state.http_client,
+            &hub_url,
+            transfer,
+            &auth,
+            &forwarded_headers,
+            &idem_key,
+        )
+        .await
+        {
+            Ok(resp_body) => {
+                succeeded += 1;
+                let _ = db.execute(
+                    "UPDATE batch_legs SET status='success', error=NULL, response=$2::jsonb, updated_at=NOW() WHERE idempotency_key=$1",
+                    &[&idem_key, &resp_body.to_string()],
+                ).await;
+                results.push(json!({"index": idx, "status": "success", "idempotencyKey": idem_key, "response": resp_body}));
+            }
+            Err(err_msg) => {
+                failed += 1;
+                let _ = db.execute(
+                    "UPDATE batch_legs SET status='failed', error=$2, updated_at=NOW() WHERE idempotency_key=$1",
+                    &[&idem_key, &err_msg],
+                ).await;
+                results.push(json!({"index": idx, "status": "failed", "idempotencyKey": idem_key, "error": err_msg}));
+            }
+        }
+    }
+
+    // Refresh the persisted batch summary from leg reality.
+    if let Ok(row) = db.query_one(
+        "SELECT COUNT(*) FILTER (WHERE status = 'success'), COUNT(*) FILTER (WHERE status = 'failed') FROM batch_legs WHERE batch_id = $1",
+        &[&batch_id],
+    ).await {
+        let s: i64 = row.get(0);
+        let f: i64 = row.get(1);
+        let st = if f == 0 { "completed" } else if s == 0 { "failed" } else { "completed_with_failures" };
+        let _ = db.execute(
+            "UPDATE batches SET succeeded=$2, failed=$3, status=$4, updated_at=NOW() WHERE batch_id=$1",
+            &[&batch_id, &(s as i32), &(f as i32), &st],
+        ).await;
+    }
+
+    HttpResponse::Ok().json(json!({
+        "batch_id": batch_id,
+        "retried": rows.len(),
+        "succeeded": succeeded,
+        "failed": failed,
+        "results": results,
+    }))
+}
+
+/// GET /v1/bulk-payments/{batch_id} (MN-18)
+///
+/// Reads the PERSISTED batch (and its legs) or returns 404. This replaces the
+/// previous hash-fiction: batch_status ignored batch state entirely and
+/// returned compute_batch_hash() of caller-supplied amounts.
+async fn get_batch(
+    req: actix_web::HttpRequest,
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    let batch_id = path.into_inner();
+    let db = match &state.db_client {
+        Some(c) => c.clone(),
+        None => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "batch_store_unavailable", "detail": "postgres not connected"
+            }));
+        }
+    };
+    match db.query_opt(
+        "SELECT batch_id, tenant_id, total, succeeded, failed, total_amount_kobo, status, COALESCE(approval_id,''), created_at::text, updated_at::text FROM batches WHERE batch_id = $1",
+        &[&batch_id],
+    ).await {
+        Ok(Some(row)) => {
+            let legs = db.query(
+                "SELECT leg_index, status, COALESCE(error,''), idempotency_key FROM batch_legs WHERE batch_id = $1 ORDER BY leg_index",
+                &[&batch_id],
+            ).await.unwrap_or_default();
+            let leg_items: Vec<serde_json::Value> = legs.iter().map(|l| json!({
+                "index": l.get::<_, i32>(0),
+                "status": l.get::<_, String>(1),
+                "error": l.get::<_, String>(2),
+                "idempotencyKey": l.get::<_, String>(3),
+            })).collect();
+            HttpResponse::Ok().json(json!({
+                "batchId": row.get::<_, String>(0),
+                "tenantId": row.get::<_, String>(1),
+                "total": row.get::<_, i32>(2),
+                "succeeded": row.get::<_, i32>(3),
+                "failed": row.get::<_, i32>(4),
+                "totalAmountKobo": row.get::<_, i64>(5),
+                "status": row.get::<_, String>(6),
+                "approvalId": row.get::<_, String>(7),
+                "createdAt": row.get::<_, String>(8),
+                "updatedAt": row.get::<_, String>(9),
+                "legs": leg_items,
+                "source": "postgres",
+            }))
+        }
+        Ok(None) => HttpResponse::NotFound().json(json!({
+            "error": "batch_not_found", "batchId": batch_id
+        })),
+        Err(e) => HttpResponse::ServiceUnavailable().json(json!({
+            "error": "batch_store_read_failed", "detail": e.to_string()
+        })),
+    }
+}
+
+/// MN-18: the approve/cancel UI aliases previously resolved to the batch_status
+/// hash calculator — pure fiction. Honest 501 until a real approval workflow
+/// exists; batch-level maker-checker is enforced at processing time via the
+/// x-maker-checker-approval-id header.
+async fn not_implemented(req: actix_web::HttpRequest) -> HttpResponse {
+    if let Err(resp) = check_jwt(&req).await { return resp; }
+    HttpResponse::NotImplemented().json(json!({
+        "error": "not_implemented",
+        "detail": "batch approve/cancel workflow is not implemented; batch maker-checker is enforced in POST /v1/bulk-payments via x-maker-checker-approval-id"
+    }))
+}
+
+/// POST /v1/status (MN-18)
+///
+/// Reads the PERSISTED batch identified by {"batch_id": "..."} in the body,
+/// or 404. The previous implementation ignored batch state and returned
+/// compute_batch_hash() of caller-supplied amounts — deleted as fiction.
 async fn batch_status(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
     if !rl_allow() {
         return HttpResponse::TooManyRequests().json(json!({"error": "rate_limit_exceeded"}));
     }
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let input = body.into_inner();
-    let amounts_v: Vec<f64> = input.get("amounts").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_f64()).collect()).unwrap_or_default();
-    let amounts = amounts_v.as_slice();
-    let result = compute_batch_hash(amounts);
-    let _result_data = json!({"endpoint": "batch_status"});
-    db_persist(&state, "batch_status", &_result_data).await;
-
-    HttpResponse::Ok().json(json!({
-        "service": "bulk-payments-rs",
-        "endpoint": "batch_status",
-        "result": json!({"value": result}),
-    }))
+    let batch_id = match input.get("batch_id").and_then(|v| v.as_str()) {
+        Some(b) if !b.is_empty() => b.to_string(),
+        _ => {
+            return HttpResponse::BadRequest().json(json!({
+                "error": "batch_id is required"
+            }));
+        }
+    };
+    let db = match &state.db_client {
+        Some(c) => c.clone(),
+        None => {
+            return HttpResponse::ServiceUnavailable().json(json!({
+                "error": "batch_store_unavailable", "detail": "postgres not connected"
+            }));
+        }
+    };
+    match db.query_opt(
+        "SELECT batch_id, total, succeeded, failed, total_amount_kobo, status, updated_at::text FROM batches WHERE batch_id = $1",
+        &[&batch_id],
+    ).await {
+        Ok(Some(row)) => HttpResponse::Ok().json(json!({
+            "batchId": row.get::<_, String>(0),
+            "total": row.get::<_, i32>(1),
+            "succeeded": row.get::<_, i32>(2),
+            "failed": row.get::<_, i32>(3),
+            "totalAmountKobo": row.get::<_, i64>(4),
+            "status": row.get::<_, String>(5),
+            "updatedAt": row.get::<_, String>(6),
+            "source": "postgres",
+        })),
+        Ok(None) => HttpResponse::NotFound().json(json!({
+            "error": "batch_not_found", "batchId": batch_id
+        })),
+        Err(e) => HttpResponse::ServiceUnavailable().json(json!({
+            "error": "batch_store_read_failed", "detail": e.to_string()
+        })),
+    }
 }
 
 async fn generate_return_file(req: actix_web::HttpRequest, state: web::Data<AppState>, body: web::Json<serde_json::Value>) -> HttpResponse {
@@ -344,6 +733,36 @@ async fn init_db(db_url: &str) -> Option<tokio_postgres::Client> {
                     created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW()
                 )", &[]).await;
             let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)", &[]).await;
+            // MN-18: durable batch + per-leg stores. batch_legs.idempotency_key
+            // is sha256(batch_id|index) — a batch retry re-derives the same
+            // keys, so succeeded legs are never re-executed.
+            let _ = client.execute(
+                "CREATE TABLE IF NOT EXISTS batches (
+                    batch_id TEXT PRIMARY KEY,
+                    tenant_id TEXT,
+                    total INTEGER NOT NULL DEFAULT 0,
+                    succeeded INTEGER NOT NULL DEFAULT 0,
+                    failed INTEGER NOT NULL DEFAULT 0,
+                    total_amount_kobo BIGINT NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'processing',
+                    approval_id TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                )", &[]).await;
+            let _ = client.execute(
+                "CREATE TABLE IF NOT EXISTS batch_legs (
+                    idempotency_key TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL REFERENCES batches(batch_id),
+                    leg_index INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    error TEXT,
+                    transfer JSONB NOT NULL,
+                    response JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE (batch_id, leg_index)
+                )", &[]).await;
+            let _ = client.execute("CREATE INDEX IF NOT EXISTS idx_batch_legs_batch ON batch_legs(batch_id, status)", &[]).await;
             Some(client)
         }
         Err(e) => { eprintln!("DB connect failed: {} — in-memory fallback", e); None }
@@ -517,7 +936,9 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+// MN-18 compile repair: parameter type was `&actix_web` (a crate name, not a
+// type) — the crate could not compile. Corrected to &actix_web::HttpRequest.
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -550,6 +971,7 @@ async fn jwt_route_guard(
 async fn db_persist(state: &web::Data<AppState>, endpoint: &str, data: &serde_json::Value) {
     if let Some(ref client) = state.db_client {
         let id = format!("{}_{}_{}", "bulk_payments_rs", endpoint, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+        let _span = otelkit::pg_span("INSERT INTO service_records (id, service, type, status, data) VALUES ($1, $2, $3, $4, $5)").entered();
         let svc_name = String::from("bulk-payments-rs");
         let status = String::from("active");
         let data_str = serde_json::to_string(data).unwrap_or_default();
@@ -585,6 +1007,14 @@ fn rl_allow() -> bool {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Wave-9 otelkit (SPEC §2.5): OTLP gRPC tracing; dropping the guard flushes spans.
+    let _otel_guard = match otelkit::init("bulk-payments-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[bulk-payments-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
     let port: u16 = env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(8130);
     let db_client = if let Ok(url) = std::env::var("DATABASE_URL") {
         match tokio::time::timeout(std::time::Duration::from_secs(5), init_db(&url)).await {
@@ -630,6 +1060,7 @@ async fn main() -> std::io::Result<()> {
                 .add(("Strict-Transport-Security", "max-age=31536000; includeSubDomains"))
                 .add(("Content-Security-Policy", "default-src 'self'"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
+            .wrap(otelkit::actix::TenantMiddleware)
             .route("/healthz", web::get().to(health))
             // canonical internal routes
             .route("/v1/process", web::post().to(process_batch))
@@ -641,10 +1072,14 @@ async fn main() -> std::io::Result<()> {
             .route("/v1/bulk-payments", web::get().to(list_records))
             .route("/v1/bulk-payments", web::post().to(process_batch))
             .route("/v1/bulk-payments/stats", web::get().to(stats))
-            .route("/v1/bulk-payments/{id}", web::get().to(list_records))
-            .route("/v1/bulk-payments/{id}/items", web::get().to(list_records))
-            .route("/v1/bulk-payments/{id}/approve", web::post().to(batch_status))
-            .route("/v1/bulk-payments/{id}/cancel", web::post().to(batch_status))
+            // MN-18: real persisted batch read (404 when unknown), retry of
+            // failed legs only, and honest 501 for approve/cancel (was the
+            // batch_status hash calculator — fiction).
+            .route("/v1/bulk-payments/{id}", web::get().to(get_batch))
+            .route("/v1/bulk-payments/{id}/items", web::get().to(get_batch))
+            .route("/v1/bulk-payments/{id}/retry-failed", web::post().to(retry_failed))
+            .route("/v1/bulk-payments/{id}/approve", web::post().to(not_implemented))
+            .route("/v1/bulk-payments/{id}/cancel", web::post().to(not_implemented))
             .route("/readyz", web::get().to(readyz))
             .route("/livez", web::get().to(|| async { HttpResponse::Ok().json(serde_json::json!({"status": "alive"})) }))
             .route("/metrics", web::get().to(metrics))
@@ -660,30 +1095,60 @@ async fn main() -> std::io::Result<()> {
     .await
 }
 
-async fn init_schema(pool: &PgPool) {
-    sqlx::query(r#"CREATE TABLE IF NOT EXISTS payments (
-    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    reference VARCHAR(64) NOT NULL UNIQUE,
-    payment_type VARCHAR(32) NOT NULL,
-    source_account VARCHAR(20) NOT NULL,
-    destination_account VARCHAR(20) NOT NULL,
-    destination_bank VARCHAR(10),
-    amount_kobo BIGINT NOT NULL CHECK (amount_kobo > 0),
-    fee_kobo BIGINT NOT NULL DEFAULT 0,
-    currency VARCHAR(3) NOT NULL DEFAULT 'NGN',
-    status VARCHAR(20) NOT NULL DEFAULT 'initiated',
-    channel VARCHAR(32) NOT NULL,
-    session_id VARCHAR(64),
-    narration TEXT,
-    beneficiary_name VARCHAR(100),
-    tenant_id UUID NOT NULL,
-    initiated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    completed_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )"#)
-    .execute(pool)
-    .await
-    .expect("Failed to create payments table");
+// MN-18: the sqlx-based init_schema / payments-table CRUD below referenced a
+// sqlx dependency that was never declared in Cargo.toml and an AppState.db
+// field that does not exist — the crate could not compile. Repaired to use
+// the tokio_postgres client against service_records (fail-closed 503 without
+// Postgres).
+
+/// create_record — POST /api/v1/payments (generic record intake).
+async fn create_record(state: web::Data<AppState>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+    let id = uuid::Uuid::new_v4().to_string();
+    let status = body.status.clone().unwrap_or_else(|| "active".to_string());
+    let tenant = body.tenant_id.clone().unwrap_or_default();
+    let data_str = serde_json::to_string(&body.extra).unwrap_or_else(|_| "{}".to_string());
+    match &state.db_client {
+        Some(client) => {
+            match client.execute(
+                "INSERT INTO service_records (id, service, type, status, data) VALUES ($1,$2,$3,$4,$5::jsonb)",
+                &[&id, &"bulk_payments_rs", &"payment", &status, &data_str],
+            ).await {
+                Ok(_) => HttpResponse::Created().json(json!({"id": id, "status": status, "tenantId": tenant})),
+                Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+            }
+        }
+        None => HttpResponse::ServiceUnavailable().json(json!({"error": "store_unavailable", "detail": "postgres not connected"})),
+    }
+}
+
+/// get_record — GET /api/v1/payments/{id}.
+async fn get_record(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+    let id = path.into_inner();
+    match &state.db_client {
+        Some(client) => {
+            match client.query_opt(
+                "SELECT id, type, status, data::text, created_at::text FROM service_records WHERE id = $1 AND service = $2",
+                &[&id, &"bulk_payments_rs"],
+            ).await {
+                Ok(Some(row)) => HttpResponse::Ok().json(json!({
+                    "id": row.get::<_, String>(0),
+                    "type": row.get::<_, String>(1),
+                    "status": row.get::<_, String>(2),
+                    "data": row.get::<_, String>(3),
+                    "createdAt": row.get::<_, String>(4),
+                })),
+                Ok(None) => HttpResponse::NotFound().json(json!({"error": "record_not_found", "id": id})),
+                Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+            }
+        }
+        None => HttpResponse::ServiceUnavailable().json(json!({"error": "store_unavailable", "detail": "postgres not connected"})),
+    }
+}
+
+/// metrics — Prometheus text exposition (was referenced by the router but
+/// never defined; MN-18 compile repair).
+async fn metrics() -> HttpResponse {
+    prom_metrics().await
 }
 
 #[cfg(test)]
@@ -703,46 +1168,43 @@ mod tests {
     fn test_nibss_fee() { let r = nibss_fee(10000.0); assert!(r >= 0.0); }
 }
 
-async fn update_record(data: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
+// MN-18 compile repair: these previously used sqlx against an AppState.db
+// field that does not exist (sqlx was never in Cargo.toml). Rewritten to the
+// tokio_postgres client against service_records, fail-closed without Postgres.
+async fn update_record(state: web::Data<AppState>, path: web::Path<String>, body: web::Json<CreateRequest>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
     let status = body.status.clone().unwrap_or_else(|| "updated".to_string());
 
-    let result = sqlx::query("UPDATE payments SET status = $1, updated_at = NOW() WHERE id = $2::uuid")
-        .bind(&status)
-        .bind(&id)
-        .execute(&data.db)
-        .await;
-
-    match result {
-        Ok(_) => {
-            let payload = serde_json::json!({"id": &id, "status": &status});
-            sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-                .bind("payments.updated")
-                .bind(&id)
-                .bind(&payload)
-                .execute(&data.db).await.ok();
-            HttpResponse::Ok().json(serde_json::json!({"id": &id, "status": &status}))
+    match &state.db_client {
+        Some(client) => {
+            match client.execute(
+                "UPDATE service_records SET status = $1, updated_at = NOW() WHERE id = $2 AND service = $3",
+                &[&status, &id, &"bulk_payments_rs"],
+            ).await {
+                Ok(0) => HttpResponse::NotFound().json(json!({"error": "record_not_found", "id": id})),
+                Ok(_) => HttpResponse::Ok().json(json!({"id": id, "status": status})),
+                Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+            }
         }
-        Err(e) => HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+        None => HttpResponse::ServiceUnavailable().json(json!({"error": "store_unavailable", "detail": "postgres not connected"})),
     }
 }
 
-async fn delete_record(data: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
+async fn delete_record(state: web::Data<AppState>, path: web::Path<String>, req: actix_web::HttpRequest) -> HttpResponse {
     if let Err(resp) = check_jwt(&req).await { return resp; }
     let id = path.into_inner();
-    sqlx::query("UPDATE payments SET status = 'deleted', updated_at = NOW() WHERE id = $1::uuid")
-        .bind(&id)
-        .execute(&data.db)
-        .await
-        .ok();
-
-    let payload = serde_json::json!({"id": &id});
-    sqlx::query("INSERT INTO outbox (event_type, aggregate_id, payload) VALUES ($1, $2, $3)")
-        .bind("payments.deleted")
-        .bind(&id)
-        .bind(&payload)
-        .execute(&data.db).await.ok();
-
-    HttpResponse::NoContent().finish()
+    match &state.db_client {
+        Some(client) => {
+            match client.execute(
+                "UPDATE service_records SET status = 'deleted', updated_at = NOW() WHERE id = $1 AND service = $2",
+                &[&id, &"bulk_payments_rs"],
+            ).await {
+                Ok(0) => HttpResponse::NotFound().json(json!({"error": "record_not_found", "id": id})),
+                Ok(_) => HttpResponse::NoContent().finish(),
+                Err(e) => HttpResponse::InternalServerError().json(json!({"error": e.to_string()})),
+            }
+        }
+        None => HttpResponse::ServiceUnavailable().json(json!({"error": "store_unavailable", "detail": "postgres not connected"})),
+    }
 }

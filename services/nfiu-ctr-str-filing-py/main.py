@@ -34,6 +34,7 @@ Required environment variables:
 from __future__ import annotations
 
 import os
+import json
 import uuid
 import logging
 import asyncio
@@ -47,13 +48,23 @@ from xml.dom.minidom import parseString
 
 import asyncpg
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Depends, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, field_validator
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# --- OpenTelemetry (SPEC w9 §2.5): make the shared otelkit importable ---
+import sys as _otel_sys
+
+_otel_sys.path.insert(
+    0,
+    os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "shared", "otel", "python")
+    ),
+)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("nfiu-ctr-str")
 
@@ -172,8 +183,41 @@ async def init_db(dsn: str) -> asyncpg.Pool:
 
             CREATE INDEX IF NOT EXISTS idx_nfiu_ctrs_tenant ON nfiu_ctrs (tenant_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_nfiu_strs_tenant ON nfiu_strs (tenant_id, created_at DESC);
+            -- CP-01: idempotency for the automatic transaction-event intake —
+            -- one CTR per (tenant, transaction) regardless of redelivery.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_nfiu_ctrs_tenant_txn
+                ON nfiu_ctrs (tenant_id, transaction_id);
             CREATE INDEX IF NOT EXISTS idx_nfiu_ctrs_deadline ON nfiu_ctrs (filing_deadline, sla_breached, status);
             CREATE INDEX IF NOT EXISTS idx_nfiu_strs_deadline ON nfiu_strs (filing_deadline, sla_breached, status);
+
+            -- CP-10: record retention & purge (CBN: AML records retained min
+            -- 5 years after end of relationship). legal_hold blocks purge.
+            ALTER TABLE nfiu_ctrs ADD COLUMN IF NOT EXISTS legal_hold BOOLEAN NOT NULL DEFAULT false;
+            ALTER TABLE nfiu_strs ADD COLUMN IF NOT EXISTS legal_hold BOOLEAN NOT NULL DEFAULT false;
+
+            CREATE TABLE IF NOT EXISTS retention_policies (
+                record_class    TEXT PRIMARY KEY,
+                retention_days  INT NOT NULL,
+                updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+
+            CREATE TABLE IF NOT EXISTS destruction_certificates (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                record_class    TEXT NOT NULL,
+                record_id       TEXT NOT NULL,
+                tenant_id       TEXT NOT NULL,
+                certificate_hash TEXT NOT NULL,
+                detail          JSONB,
+                purged_by       TEXT NOT NULL DEFAULT 'retention-purge-job',
+                purged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+            );
+            CREATE INDEX IF NOT EXISTS idx_destruction_certs_class ON destruction_certificates (record_class, purged_at);
+        """)
+        # CP-10: default schedules — CBN minimum 5 years post-relationship.
+        await conn.execute("""
+            INSERT INTO retention_policies (record_class, retention_days) VALUES
+                ('nfiu_ctrs', 1825), ('nfiu_strs', 1825)
+            ON CONFLICT (record_class) DO NOTHING
         """)
     return pool
 
@@ -191,6 +235,139 @@ def get_http() -> httpx.AsyncClient:
 
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
+# ── CP-01: filing-deadline SLA sweeper ───────────────────────────────────────
+#
+# Any CTR/STR that is still not 'filed' past its filing_deadline is a
+# regulatory breach-in-progress (CBN AML/CFT 2022: CTR same business day, STR
+# 72h). The sweeper flags sla_breached, increments the
+# nfiu_filing_sla_breach_total alert metric, logs CRITICAL, and publishes
+# nfiu.sla-breach for the alerting pipeline. It runs every 15 minutes.
+
+SLA_SWEEP_INTERVAL_SECONDS = int(os.getenv("SLA_SWEEP_INTERVAL_SECONDS", "900"))
+
+
+async def _check_sla_breaches() -> None:
+    if _pool is None:
+        return
+    for table, rtype in (("nfiu_ctrs", "CTR"), ("nfiu_strs", "STR")):
+        rows = await _pool.fetch(
+            f"""
+            SELECT id, tenant_id, fiu_ref_no, status, filing_deadline
+            FROM {table}
+            WHERE status NOT IN ('filed', 'rejected')
+              AND filing_deadline IS NOT NULL
+              AND filing_deadline < now()
+              AND sla_breached = FALSE
+            """
+        )
+        for r in rows:
+            await _pool.execute(
+                f"UPDATE {table} SET sla_breached = TRUE WHERE id = $1", r["id"]
+            )
+            logger.critical(
+                "NFIU FILING SLA BREACH type=%s id=%s tenant=%s fiu_ref=%s status=%s deadline=%s — report generated but NOT filed past deadline",
+                rtype, r["id"], r["tenant_id"], r["fiu_ref_no"], r["status"], r["filing_deadline"],
+            )
+            _inc_counter("nfiu_filing_sla_breach_total", {
+                "service": "nfiu-ctr-str-filing-py",
+                "tenant_id": str(r["tenant_id"]),
+                "report_type": rtype,
+            })
+            await publish_event("nfiu.sla-breach", {
+                "tenantId": str(r["tenant_id"]),
+                "reportType": rtype,
+                "reportId": str(r["id"]),
+                "fiuRef": r["fiu_ref_no"],
+                "status": r["status"],
+                "deadline": r["filing_deadline"].isoformat() if r["filing_deadline"] else None,
+            })
+
+
+async def _sla_sweeper_loop() -> None:
+    while True:
+        try:
+            await _check_sla_breaches()
+        except Exception as exc:
+            logger.error("SLA sweeper iteration failed: %s", exc)
+        await asyncio.sleep(SLA_SWEEP_INTERVAL_SECONDS)
+
+
+# ── CP-10: retention purge job ────────────────────────────────────────────────
+#
+# Rows past their class retention (default 1825 days = CBN 5y
+# post-relationship) in a terminal state are purged. Every purge writes an
+# immutable certificate-of-destruction row (sha256 over the purged record) so
+# the destruction itself is auditable. Rows under legal_hold are NEVER purged.
+
+RETENTION_PURGE_INTERVAL_SECONDS = int(os.getenv("RETENTION_PURGE_INTERVAL_SECONDS", "86400"))
+_PURGEABLE_TABLES = {"nfiu_ctrs": "CTR", "nfiu_strs": "STR"}
+
+
+def _certificate_hash(record: dict) -> str:
+    import hashlib as _h
+    import json as _j
+
+    def _default(o):
+        return o.isoformat() if hasattr(o, "isoformat") else str(o)
+
+    canonical = _j.dumps(record, sort_keys=True, default=_default)
+    return _h.sha256(canonical.encode()).hexdigest()
+
+
+async def _retention_purge_once() -> None:
+    if _pool is None:
+        return
+    policies = await _pool.fetch("SELECT record_class, retention_days FROM retention_policies")
+    for p in policies:
+        table = p["record_class"]
+        if table not in _PURGEABLE_TABLES:
+            logger.error("retention policy for unknown record_class=%s — skipped (fail-closed)", table)
+            continue
+        rows = await _pool.fetch(
+            f"""
+            SELECT * FROM {table}
+            WHERE legal_hold = FALSE
+              AND status IN ('filed', 'rejected')
+              AND created_at < now() - make_interval(days => $1)
+            LIMIT 500
+            """,
+            p["retention_days"],
+        )
+        for r in rows:
+            record = dict(r)
+            cert = _certificate_hash(record)
+            async with _pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        """INSERT INTO destruction_certificates
+                           (record_class, record_id, tenant_id, certificate_hash, detail)
+                           VALUES ($1,$2,$3,$4,$5)""",
+                        table, str(record["id"]), record["tenant_id"], cert,
+                        '{"reason": "retention_expired", "retention_days": %d}' % p["retention_days"],
+                    )
+                    await conn.execute(f"DELETE FROM {table} WHERE id = $1", record["id"])
+            logger.info(
+                "CP-10 purged %s id=%s tenant=%s cert=%s",
+                table, record["id"], record["tenant_id"], cert,
+            )
+            _inc_counter("nfiu_records_purged_total", {
+                "service": "nfiu-ctr-str-filing-py",
+                "tenant_id": str(record["tenant_id"]),
+                "record_class": table,
+            })
+
+
+async def _retention_purge_loop() -> None:
+    # First sweep shortly after boot, then daily.
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await _retention_purge_once()
+        except Exception as exc:
+            logger.error("retention purge iteration failed: %s", exc)
+        await asyncio.sleep(RETENTION_PURGE_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _pool, _http
@@ -203,7 +380,11 @@ async def lifespan(app: FastAPI):
             logger.error("DB init failed: %s", exc)
     else:
         logger.warning("DATABASE_URL not set — reports will not be persisted")
+    sweeper = asyncio.create_task(_sla_sweeper_loop())
+    purger = asyncio.create_task(_retention_purge_loop())
     yield
+    sweeper.cancel()
+    purger.cancel()
     if _pool:
         await _pool.close()
     if _http:
@@ -216,6 +397,18 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# --- OpenTelemetry init (SPEC w9 §2.5): OTLP gRPC traces+metrics, W3C ---
+# propagation, FastAPI server spans, TenantMiddleware (tenant.id span attr),
+# httpx client spans (goAML submission + Dapr publish). Honors
+# OTEL_SDK_DISABLED; never raises.
+try:
+    from otelkit import init_telemetry, instrument_requests
+
+    init_telemetry("nfiu-ctr-str-filing-py", app)
+    instrument_requests()
+except Exception as _otel_exc:
+    logger.warning("otelkit init skipped: %s", _otel_exc)
 
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
@@ -613,6 +806,17 @@ async def publish_event(topic: str, payload: dict) -> None:
         logger.warning("Dapr publish failed topic=%s: %s", topic, exc)
 
 
+# ── CP-01: metrics helper (otelkit counter; no-op when OTEL disabled) ───────
+
+def _inc_counter(name: str, attrs: Optional[dict] = None) -> None:
+    try:
+        from otelkit import inc_counter
+
+        inc_counter(name, attrs)
+    except Exception:
+        pass
+
+
 # ── SLA helper ─────────────────────────────────────────────────────────────────
 
 def ctr_deadline() -> datetime:
@@ -889,6 +1093,129 @@ async def create_ctr(
     }
 
 
+# ── CP-01: automatic CTR detection feed ──────────────────────────────────────
+#
+# Feed contract (documented for the payment paths that call this):
+#   Topic:     transactions.high-value  (Kafka-backed Dapr pubsub component,
+#              component name from DAPR_SUB_PUBSUB, default "pubsub" — the
+#              component payment-hub publishes to)
+#   Publisher: payment-hub initiate_transfer (and any payment rail emitting
+#              high-value transaction events)
+#   Payload (CloudEvent "data" or raw JSON), camelCase or snake_case:
+#     tenantId (required), amountKobo (required, integer minor units),
+#     reference|transactionId (required — idempotency key),
+#     customerId, customerName, customerType ("individual"|"corporate",
+#     default "individual" = lower threshold = conservative), currency
+#   Semantics: amount >= CBN threshold → CTR created (idempotent per
+#     (tenant_id, transaction_id)) and background-filed; below threshold →
+#     acknowledged no-op. Malformed events are ACKed (200) with an error log
+#     to avoid poison-message redelivery loops.
+#   Direct authenticated intake remains POST /api/ctrs (JWT required).
+#   When NFIU_INTAKE_TOKEN is configured, event intake also requires the
+#   x-intake-token header to match (defence in depth behind the cluster
+#   NetworkPolicy).
+
+INTAKE_TOKEN = os.getenv("NFIU_INTAKE_TOKEN", "")
+DAPR_SUB_PUBSUB = os.getenv("DAPR_SUB_PUBSUB", "pubsub")
+
+
+@app.get("/dapr/subscribe")
+async def dapr_subscribe():
+    return [{
+        "pubsubname": DAPR_SUB_PUBSUB,
+        "topic": "transactions.high-value",
+        "route": "/api/intake/transaction-event",
+    }]
+
+
+@app.post("/api/intake/transaction-event")
+async def intake_transaction_event(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_intake_token: str = Header(default="", alias="x-intake-token"),
+):
+    if INTAKE_TOKEN and x_intake_token != INTAKE_TOKEN:
+        raise HTTPException(status_code=401, detail="invalid intake token")
+    if not INTAKE_TOKEN:
+        logger.warning("NFIU_INTAKE_TOKEN not set — intake relying on NetworkPolicy isolation only")
+
+    body = await request.json()
+    data = body.get("data", body) if isinstance(body, dict) else {}
+    if not isinstance(data, dict):
+        logger.error("CTR intake: malformed event (non-object payload): %.200s", body)
+        return {"created": False, "reason": "malformed_event"}
+
+    tenant_id = data.get("tenantId") or data.get("tenant_id")
+    amount_kobo = data.get("amountKobo") or data.get("amount_kobo")
+    transaction_id = (
+        data.get("reference") or data.get("transactionId") or data.get("transaction_id")
+    )
+    customer_id = data.get("customerId") or data.get("customer_id") or "unknown"
+    customer_name = data.get("customerName") or data.get("customer_name") or str(customer_id)
+    customer_type = data.get("customerType") or data.get("customer_type") or "individual"
+    currency = data.get("currency") or "NGN"
+
+    if not tenant_id or not amount_kobo or not transaction_id:
+        logger.error("CTR intake: event missing tenant/amount/transaction id: %.300s", data)
+        return {"created": False, "reason": "malformed_event"}
+    try:
+        amount_kobo = int(amount_kobo)
+    except (TypeError, ValueError):
+        logger.error("CTR intake: non-integer amountKobo in event: %.300s", data)
+        return {"created": False, "reason": "malformed_event"}
+    if customer_type not in ("individual", "corporate"):
+        customer_type = "individual"  # conservative: lower threshold
+
+    threshold = (
+        CTR_INDIVIDUAL_THRESHOLD_KOBO
+        if customer_type == "individual"
+        else CTR_CORPORATE_THRESHOLD_KOBO
+    )
+    if amount_kobo < threshold:
+        return {"created": False, "reason": "below_threshold"}
+
+    pool = await get_pool()
+    fiu_ref = next_ref("CTR")
+    deadline = ctr_deadline()
+    row = await pool.fetchrow(
+        """
+        INSERT INTO nfiu_ctrs
+          (id, tenant_id, customer_id, customer_name, customer_type,
+           transaction_id, transaction_type, amount_kobo, currency,
+           threshold_kobo, fiu_ref_no, filing_deadline, filed_by)
+        VALUES (gen_random_uuid(),$1,$2,$3,$4,$5,'transfer',$6,$7,$8,$9,$10,'auto-intake')
+        ON CONFLICT (tenant_id, transaction_id) DO NOTHING
+        RETURNING id
+        """,
+        tenant_id, str(customer_id), customer_name, customer_type,
+        str(transaction_id), amount_kobo, currency, threshold, fiu_ref, deadline,
+    )
+    if row is None:
+        return {"created": False, "reason": "duplicate", "transactionId": str(transaction_id)}
+
+    ctr_id = row["id"]
+    await pool.execute(
+        """INSERT INTO nfiu_audit_log (tenant_id, report_type, report_id, action, performed_by)
+           VALUES ($1,'CTR',$2,'created_via_intake','auto-intake')""",
+        tenant_id, ctr_id,
+    )
+    background_tasks.add_task(_file_ctr_background, str(ctr_id), tenant_id)
+    _inc_counter("nfiu_ctr_auto_detected_total", {
+        "service": "nfiu-ctr-str-filing-py", "tenant_id": str(tenant_id),
+    })
+    await publish_event("nfiu.ctr-generated", {
+        "tenantId": tenant_id, "ctrId": str(ctr_id),
+        "customerId": str(customer_id), "amountKobo": amount_kobo,
+        "fiuRef": fiu_ref, "source": "transactions.high-value",
+    })
+    logger.info(
+        "CTR auto-created from transaction event tenant=%s txn=%s amount_kobo=%d ctr=%s",
+        tenant_id, transaction_id, amount_kobo, ctr_id,
+    )
+    return {"created": True, "ctrId": str(ctr_id), "fiuRef": fiu_ref,
+            "filingDeadline": deadline.isoformat()}
+
+
 @app.post("/api/strs", status_code=201)
 async def create_str(
     body: STRRequest,
@@ -1064,6 +1391,109 @@ async def get_str_xml(
     if not row or not row["goaml_xml"]:
         raise HTTPException(status_code=404, detail="STR XML not yet generated")
     return Response(content=row["goaml_xml"], media_type="application/xml")
+
+
+# ── CP-10: retention management endpoints ────────────────────────────────────
+
+class RetentionPolicyUpdate(BaseModel):
+    retention_days: int
+
+    @field_validator("retention_days")
+    @classmethod
+    def validate_days(cls, v: int) -> int:
+        if v < 1825:
+            raise ValueError("retention_days below CBN minimum of 1825 (5 years)")
+        return v
+
+
+class LegalHoldUpdate(BaseModel):
+    held: bool
+    reason: Optional[str] = None
+
+
+@app.get("/api/retention/policies")
+async def list_retention_policies(tenant_id: str = Depends(require_tenant)):
+    pool = await get_pool()
+    rows = await pool.fetch("SELECT * FROM retention_policies ORDER BY record_class")
+    return {"policies": [dict(r) for r in rows]}
+
+
+@app.put("/api/retention/policies/{record_class}")
+async def upsert_retention_policy(
+    record_class: str,
+    body: RetentionPolicyUpdate,
+    tenant_id: str = Depends(require_tenant),
+):
+    if record_class not in _PURGEABLE_TABLES:
+        raise HTTPException(status_code=400, detail=f"unknown record_class {record_class}")
+    pool = await get_pool()
+    await pool.execute(
+        """INSERT INTO retention_policies (record_class, retention_days) VALUES ($1,$2)
+           ON CONFLICT (record_class) DO UPDATE SET retention_days=$2, updated_at=now()""",
+        record_class, body.retention_days,
+    )
+    return {"record_class": record_class, "retention_days": body.retention_days}
+
+
+@app.get("/api/retention/certificates")
+async def list_destruction_certificates(
+    tenant_id: str = Depends(require_tenant),
+    limit: int = 100,
+):
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT * FROM destruction_certificates WHERE tenant_id=$1 ORDER BY purged_at DESC LIMIT $2",
+        tenant_id, min(limit, 500),
+    )
+    return {"certificates": [dict(r) for r in rows]}
+
+
+@app.post("/api/ctrs/{ctr_id}/legal-hold")
+async def set_ctr_legal_hold(
+    ctr_id: str,
+    body: LegalHoldUpdate,
+    tenant_id: str = Depends(require_tenant),
+    x_user_id: str = Header(default="system", alias="x-keycloak-id"),
+):
+    pool = await get_pool()
+    res = await pool.execute(
+        "UPDATE nfiu_ctrs SET legal_hold=$1 WHERE id=$2 AND tenant_id=$3",
+        body.held, ctr_id, tenant_id,
+    )
+    if res == "UPDATE 0":
+        raise HTTPException(status_code=404, detail="CTR not found")
+    await pool.execute(
+        """INSERT INTO nfiu_audit_log (tenant_id, report_type, report_id, action, detail, performed_by)
+           VALUES ($1,'CTR',$2,$3,$4,$5)""",
+        tenant_id, ctr_id,
+        "legal_hold_set" if body.held else "legal_hold_released",
+        json.dumps({"reason": body.reason or ""}), x_user_id,
+    )
+    return {"ctrId": ctr_id, "legal_hold": body.held}
+
+
+@app.post("/api/strs/{str_id}/legal-hold")
+async def set_str_legal_hold(
+    str_id: str,
+    body: LegalHoldUpdate,
+    tenant_id: str = Depends(require_tenant),
+    x_user_id: str = Header(default="system", alias="x-keycloak-id"),
+):
+    pool = await get_pool()
+    res = await pool.execute(
+        "UPDATE nfiu_strs SET legal_hold=$1 WHERE id=$2 AND tenant_id=$3",
+        body.held, str_id, tenant_id,
+    )
+    if res == "UPDATE 0":
+        raise HTTPException(status_code=404, detail="STR not found")
+    await pool.execute(
+        """INSERT INTO nfiu_audit_log (tenant_id, report_type, report_id, action, detail, performed_by)
+           VALUES ($1,'STR',$2,$3,$4,$5)""",
+        tenant_id, str_id,
+        "legal_hold_set" if body.held else "legal_hold_released",
+        json.dumps({"reason": body.reason or ""}), x_user_id,
+    )
+    return {"strId": str_id, "legal_hold": body.held}
 
 
 @app.get("/api/dashboard")

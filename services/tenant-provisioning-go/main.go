@@ -566,14 +566,19 @@ func jwtMiddleware(realmURL string, next http.Handler) http.Handler {
 		claimsBytes, _ := base64.RawURLEncoding.DecodeString(parts[1])
 		var claims map[string]interface{}
 		json.Unmarshal(claimsBytes, &claims)
-		// Check expiry
+		// Check expiry (PL-06: 30s clock-skew leeway; nbf enforced with the same leeway)
+		const jwtLeewaySeconds = 30
 		exp, ok := claims["exp"].(float64)
 		if !ok {
 			http.Error(w, `{"error":"token missing exp claim"}`, http.StatusUnauthorized)
 			return
 		}
-		if time.Now().Unix() >= int64(exp) {
+		if time.Now().Unix() >= int64(exp)+jwtLeewaySeconds {
 			http.Error(w, `{"error":"token expired"}`, http.StatusUnauthorized)
+			return
+		}
+		if nbf, ok := claims["nbf"].(float64); ok && time.Now().Unix()+jwtLeewaySeconds < int64(nbf) {
+			http.Error(w, `{"error":"token not yet valid"}`, http.StatusUnauthorized)
 			return
 		}
 		// Validate issuer/audience when configured (M-55)

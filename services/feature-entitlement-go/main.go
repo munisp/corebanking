@@ -206,46 +206,9 @@ var (
 	storeMu          sync.RWMutex
 )
 
-func init() {
-	// Pre-provision sample tenants and white-label partners
-	now := time.Now()
-	entitlementStore["TEN-ZENITH"] = &TenantEntitlement{
-		TenantID: "TEN-ZENITH", TenantName: "Zenith Bank", TierID: "TIER-ENTERPRISE", TierName: "Enterprise",
-		Type: "tenant", EnabledFeatures: append(tenantTiers[0].Features, tenantTiers[0].GrowthFeatures...),
-		PurchasedAddOns: []string{}, MaxUsers: 100_000, MaxTPS: 10_000,
-		MonthlyBill: 25_000_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "admin@54bank.app",
-	}
-	entitlementStore["TEN-UBA"] = &TenantEntitlement{
-		TenantID: "TEN-UBA", TenantName: "UBA Nigeria", TierID: "TIER-ENTERPRISE", TierName: "Enterprise",
-		Type: "tenant", EnabledFeatures: append(tenantTiers[0].Features, tenantTiers[0].GrowthFeatures...),
-		PurchasedAddOns: []string{}, MaxUsers: 100_000, MaxTPS: 10_000,
-		MonthlyBill: 25_000_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "admin@54bank.app",
-	}
-	entitlementStore["TEN-LAPO-MFB"] = &TenantEntitlement{
-		TenantID: "TEN-LAPO-MFB", TenantName: "LAPO Microfinance", TierID: "TIER-STARTER", TierName: "Starter (MFB/Fintech)",
-		Type: "tenant", EnabledFeatures: append(tenantTiers[3].Features, tenantTiers[3].GrowthFeatures...),
-		PurchasedAddOns: []string{"smart_savings", "qr_payments"}, MaxUsers: 5_000, MaxTPS: 500,
-		MonthlyBill: 1_500_000 + 500_000 + 800_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "ops@54bank.app",
-	}
-	entitlementStore["WL-MONIEPOINT"] = &TenantEntitlement{
-		TenantID: "WL-MONIEPOINT", TenantName: "Moniepoint", TierID: "WL-GOLD", TierName: "Gold Partner",
-		Type: "white_label", EnabledFeatures: append(whiteLabelTiers[1].Features, whiteLabelTiers[1].GrowthFeatures...),
-		PurchasedAddOns: []string{"investments"}, MaxUsers: 200_000, MaxTPS: 20_000,
-		MonthlyBill: 20_000_000 + 4_000_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "admin@54bank.app",
-	}
-	entitlementStore["WL-KUDA"] = &TenantEntitlement{
-		TenantID: "WL-KUDA", TenantName: "Kuda Bank", TierID: "WL-PLATINUM", TierName: "Platinum Partner",
-		Type: "white_label", EnabledFeatures: append(whiteLabelTiers[0].Features, whiteLabelTiers[0].GrowthFeatures...),
-		PurchasedAddOns: []string{}, MaxUsers: 500_000, MaxTPS: 50_000,
-		MonthlyBill: 40_000_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "admin@54bank.app",
-	}
-	entitlementStore["WL-OPAY"] = &TenantEntitlement{
-		TenantID: "WL-OPAY", TenantName: "OPay", TierID: "WL-SILVER", TierName: "Silver Partner",
-		Type: "white_label", EnabledFeatures: append(whiteLabelTiers[2].Features, whiteLabelTiers[2].GrowthFeatures...),
-		PurchasedAddOns: []string{"bnpl", "gamification"}, MaxUsers: 50_000, MaxTPS: 5_000,
-		MonthlyBill: 8_000_000 + 2_500_000 + 1_500_000, BillingStatus: "current", ProvisionedAt: now, ProvisionedBy: "ops@54bank.app",
-	}
-}
+// PL-08: fabricated seed entitlements for real banks (TEN-ZENITH, TEN-UBA,
+// TEN-LAPO-MFB, WL-MONIEPOINT, WL-KUDA, WL-OPAY) deleted. Entitlements are
+// loaded from Postgres (tenant_entitlements) at boot — see initDB/loadEntitlements.
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // HANDLERS
@@ -269,6 +232,10 @@ func getTiers(w http.ResponseWriter, r *http.Request) {
 }
 
 func getEntitlements(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
+		return
+	}
 	storeMu.RLock()
 	defer storeMu.RUnlock()
 	items := make([]*TenantEntitlement, 0, len(entitlementStore))
@@ -280,6 +247,10 @@ func getEntitlements(w http.ResponseWriter, r *http.Request) {
 
 func getEntitlement(w http.ResponseWriter, r *http.Request) {
 	tenantId := r.URL.Query().Get("tenantId")
+	if db == nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
+		return
+	}
 	storeMu.RLock()
 	ent, ok := entitlementStore[tenantId]
 	storeMu.RUnlock()
@@ -293,6 +264,11 @@ func getEntitlement(w http.ResponseWriter, r *http.Request) {
 func checkFeatureAccess(w http.ResponseWriter, r *http.Request) {
 	tenantId := r.URL.Query().Get("tenantId")
 	feature := r.URL.Query().Get("feature")
+	if db == nil {
+		// PL-08: fail closed — never answer entitlement checks from stale memory.
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
+		return
+	}
 	storeMu.RLock()
 	ent, ok := entitlementStore[tenantId]
 	storeMu.RUnlock()
@@ -378,24 +354,28 @@ func provisionTenant(w http.ResponseWriter, r *http.Request) {
 		ProvisionedBy:   req.Operator,
 	}
 
+	if db == nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
+		return
+	}
+	if err := persistEntitlement(ent); err != nil {
+		http.Error(w, `{"error":"failed to persist entitlement"}`, 500)
+		return
+	}
 	storeMu.Lock()
 	entitlementStore[req.TenantID] = ent
 	storeMu.Unlock()
 
+	// PL-08: the fabricated 17-step "provisioningSteps" list was deleted. This
+	// endpoint provisions ONLY the entitlement record — real tenant provisioning
+	// (realm, schema, ledger account) is orchestrator-service's Temporal
+	// createTenantWorkflow.
 	respondJSON(w, map[string]interface{}{
 		"success":     true,
 		"entitlement": ent,
-		"provisioningSteps": []string{
-			"create_tenant_record", "setup_database_schema", "apply_rls_policies",
-			"configure_keycloak_realm", "setup_permify_entitlements", "create_kafka_topics",
-			"initialize_tigerbeetle_billing_account", "setup_opensearch_indices",
-			"configure_redis_entitlement_cache", "register_dapr_components",
-			"setup_temporal_workflows", "assign_feature_flags",
-			"configure_billing_metering", "deploy_white_label_branding",
-			"provision_growth_features", "setup_growth_kafka_topics",
-			"configure_growth_temporal_workflows",
-		},
-		"middleware": middlewareStatus(),
+		"provisioned": []string{"tenant_entitlement_record"},
+		"note":        "Tenant infrastructure provisioning is performed by orchestrator-service (Temporal createTenantWorkflow), not by this endpoint.",
+		"middleware":  middlewareStatus(),
 	})
 }
 
@@ -407,6 +387,10 @@ func purchaseAddOn(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, 400)
+		return
+	}
+	if db == nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
 
@@ -446,6 +430,10 @@ func purchaseAddOn(w http.ResponseWriter, r *http.Request) {
 	ent.EnabledFeatures = append(ent.EnabledFeatures, req.Feature)
 	ent.MonthlyBill += addOnFee
 	storeMu.Unlock()
+	if err := persistEntitlement(ent); err != nil {
+		http.Error(w, `{"error":"failed to persist entitlement"}`, 500)
+		return
+	}
 
 	respondJSON(w, map[string]interface{}{
 		"success":        true,
@@ -465,6 +453,10 @@ func upgradeTier(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, `{"error":"invalid request body"}`, 400)
+		return
+	}
+	if db == nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
 		return
 	}
 
@@ -499,6 +491,10 @@ func upgradeTier(w http.ResponseWriter, r *http.Request) {
 	ent.MonthlyBill = newTier.MonthlyFeeNGN
 	ent.PurchasedAddOns = []string{}
 	storeMu.Unlock()
+	if err := persistEntitlement(ent); err != nil {
+		http.Error(w, `{"error":"failed to persist entitlement"}`, 500)
+		return
+	}
 
 	respondJSON(w, map[string]interface{}{
 		"success":        true,
@@ -541,6 +537,10 @@ func getUpgradeOptions(currentTier, feature, tierType string) []map[string]inter
 }
 
 func featureUsageSummary(w http.ResponseWriter, r *http.Request) {
+	if db == nil {
+		http.Error(w, `{"error":"entitlement store unavailable (postgres down)"}`, 503)
+		return
+	}
 	tenantId := r.URL.Query().Get("tenantId")
 	storeMu.RLock()
 	ent, ok := entitlementStore[tenantId]
@@ -715,6 +715,56 @@ func initDB() {
 	)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_svc ON service_records(service)`)
 	db.Exec(`CREATE INDEX IF NOT EXISTS idx_sr_status ON service_records(service, status)`)
+	// PL-08: durable entitlement store (mirrors migrations/001_tenant_entitlements.up.sql)
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS tenant_entitlements (
+		tenant_id TEXT PRIMARY KEY,
+		data JSONB NOT NULL,
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`); err != nil {
+		log.Printf("[%s] tenant_entitlements DDL failed: %v", serviceName, err)
+	}
+	loadEntitlements()
+}
+
+// PL-08: Postgres-backed entitlement persistence. The in-memory map is a
+// write-through cache ONLY — the DB is authoritative. With no DB the
+// entitlement endpoints fail closed (503) rather than serving stale memory.
+
+func loadEntitlements() {
+	rows, err := db.Query(`SELECT data FROM tenant_entitlements`)
+	if err != nil {
+		log.Printf("[%s] entitlement load failed: %v", serviceName, err)
+		return
+	}
+	defer rows.Close()
+	loaded := 0
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			continue
+		}
+		var ent TenantEntitlement
+		if err := json.Unmarshal(raw, &ent); err != nil {
+			continue
+		}
+		entitlementStore[ent.TenantID] = &ent
+		loaded++
+	}
+	log.Printf("[%s] loaded %d entitlements from postgres", serviceName, loaded)
+}
+
+func persistEntitlement(ent *TenantEntitlement) error {
+	raw, err := json.Marshal(ent)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec(`INSERT INTO tenant_entitlements (tenant_id, data, updated_at)
+		VALUES ($1, $2, NOW())
+		ON CONFLICT (tenant_id) DO UPDATE SET data = $2, updated_at = NOW()`,
+		ent.TenantID, raw)
+	return err
 }
 
 func dbList(service string, limit int) ([]map[string]interface{}, error) {

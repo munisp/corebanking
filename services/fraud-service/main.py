@@ -33,6 +33,24 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# --- OpenTelemetry init (SPEC w9 §2.5): OTLP gRPC traces+metrics, W3C ---
+# propagation, FastAPI server spans, TenantMiddleware (tenant.id span attr).
+# Honors OTEL_SDK_DISABLED; never raises.
+sys.path.insert(
+    0,
+    os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "shared", "otel", "python")
+    ),
+)
+try:
+    from otelkit import init_telemetry
+
+    init_telemetry("fraud-service", app)
+except Exception as _otel_exc:
+    import logging as _otel_logging
+
+    _otel_logging.getLogger("otel").warning("otelkit init skipped: %s", _otel_exc)
+
 # --- Canonical JWT validation (ported from services/shared/auth/jwt_validation.py; stdlib-only) ---
 # RS256 via Keycloak JWKS (fetched with a 5s timeout + TTL cache) when KEYCLOAK_JWKS_URL
 # is set; HS256 via JWT_SECRET otherwise; iss/aud checked when JWT_ISSUER / JWT_AUDIENCE

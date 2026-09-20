@@ -330,8 +330,13 @@ class MerchantResponse(BaseModel):
     updated_at: datetime
 
 class MerchantCreatedResponse(MerchantResponse):
-    """Creation response — the ONLY place the full API key is ever returned."""
-    api_key: str
+    """Creation response.
+
+    OB-12: no API key is issued at creation anymore (kyb_status starts at
+    'not_started'). The full key is returned exactly once by the post-KYB
+    POST /api/v1/merchants/{merchant_id}/issue-api-key endpoint.
+    """
+    api_key: Optional[str] = None
 
 class KYBVerificationRequest(BaseModel):
     merchant_id: str
@@ -613,15 +618,23 @@ def _scrub_api_key(record: dict) -> dict:
 @app.post("/api/v1/merchants", response_model=MerchantCreatedResponse, status_code=201)
 async def create_merchant(
     merchant: MerchantCreate,
+    x_tenant_id: str = Header(..., alias="x-tenant-id"),
     db=Depends(get_db)
 ):
     """Create a new merchant account.
 
-    The full API key is returned ONLY in this response; afterwards only the
-    SHA-256 hash and last-4 characters are stored/retrievable.
+    OB-12: the tenant is ALWAYS the claim-derived x-tenant-id (JWTAuthMiddleware
+    overwrites that header from verified token claims) — a body-supplied
+    tenant_id that disagrees with the token is rejected. No live API key is
+    issued at creation: keys are minted only after KYB via
+    POST /api/v1/merchants/{merchant_id}/issue-api-key.
     """
+    if merchant.tenant_id and merchant.tenant_id != x_tenant_id:
+        raise HTTPException(
+            status_code=403,
+            detail="tenant_id in body does not match the authenticated tenant",
+        )
     merchant_id = f"MER{int(datetime.now().timestamp())}"
-    api_key, api_key_hash, api_key_last4 = _generate_api_key()
 
     async with db.acquire() as conn:
         row = await conn.fetchrow("""
@@ -632,11 +645,11 @@ async def create_merchant(
                 industry, website, api_key, api_key_hash, api_key_last4
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             RETURNING *
-        """, merchant_id, merchant.tenant_id, merchant.business_name, merchant.business_email,
+        """, merchant_id, x_tenant_id, merchant.business_name, merchant.business_email,
             merchant.business_phone, merchant.business_address, merchant.business_type,
             merchant.registration_number, merchant.tax_id, merchant.contact_person_name,
             merchant.contact_person_email, merchant.contact_person_phone, merchant.industry,
-            merchant.website, None, api_key_hash, api_key_last4)
+            merchant.website, None, None, None)
 
         # Initialize fee configuration with defaults
         await conn.execute("""
@@ -645,11 +658,11 @@ async def create_merchant(
         """, merchant_id)
 
         merchant_payload = _scrub_api_key(dict(row))
-        merchant_payload["api_key"] = api_key  # shown exactly once, at creation
+        merchant_payload["api_key"] = None  # OB-12: issued only post-KYB
 
     publish_merchant_event(
         event_type="MERCHANT_CREATED",
-        tenant_id=merchant.tenant_id,
+        tenant_id=x_tenant_id,
         merchant_id=merchant_id,
         user_id=merchant.contact_person_email,
         payload={
@@ -660,6 +673,55 @@ async def create_merchant(
             "kyb_status": merchant_payload.get("kyb_status"),
             "status": merchant_payload.get("status"),
         },
+    )
+    return merchant_payload
+
+
+@app.post("/api/v1/merchants/{merchant_id}/issue-api-key", response_model=MerchantCreatedResponse)
+async def issue_merchant_api_key(
+    merchant_id: str,
+    x_tenant_id: str = Header(..., alias="x-tenant-id"),
+    db=Depends(get_db)
+):
+    """Issue the live API key for a merchant — OB-12: only when KYB is verified.
+
+    The plaintext key is returned exactly once in this response; only the
+    SHA-256 hash + last-4 are stored. Idempotent-safe: a second issuance for an
+    already-keyed merchant is rejected (409) rather than silently rotating.
+    """
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM merchants WHERE merchant_id = $1 AND tenant_id = $2",
+            merchant_id, x_tenant_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="Merchant not found")
+        if row["kyb_status"] != "verified":
+            raise HTTPException(
+                status_code=409,
+                detail="API key issuance requires kyb_status='verified' (complete KYB first)",
+            )
+        if row["api_key_hash"]:
+            raise HTTPException(
+                status_code=409,
+                detail="API key already issued for this merchant",
+            )
+        api_key, api_key_hash, api_key_last4 = _generate_api_key()
+        row = await conn.fetchrow("""
+            UPDATE merchants
+            SET api_key_hash = $1, api_key_last4 = $2, updated_at = CURRENT_TIMESTAMP
+            WHERE merchant_id = $3 AND tenant_id = $4
+            RETURNING *
+        """, api_key_hash, api_key_last4, merchant_id, x_tenant_id)
+        merchant_payload = _scrub_api_key(dict(row))
+        merchant_payload["api_key"] = api_key  # shown exactly once, here
+
+    publish_merchant_event(
+        event_type="MERCHANT_API_KEY_ISSUED",
+        tenant_id=x_tenant_id,
+        merchant_id=merchant_id,
+        user_id=None,
+        payload={"api_key_last4": api_key_last4},
     )
     return merchant_payload
 

@@ -277,6 +277,9 @@ class VerificationStatus(str, Enum):
     PENDING = "pending"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
+    # OB-10: terminal verified state written by the authenticated
+    # /kyc/complete transition endpoint (expand-only enum addition).
+    VERIFIED = "verified"
     FAILED = "failed"
     MANUAL_REVIEW = "manual_review"
 
@@ -437,6 +440,18 @@ def init_db():
         engine = create_engine(DATABASE_URL)
         SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
         Base.metadata.create_all(bind=engine)
+        # OB-10 (expand-migrate, data-preserving): add the 'verified' value to an
+        # already-existing Postgres verificationstatus enum. create_all only
+        # creates the enum on fresh databases; on existing ones this idempotent
+        # ALTER TYPE applies the new value. Non-Postgres dialects are skipped.
+        if engine.dialect.name == "postgresql":
+            try:
+                with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                    conn.exec_driver_sql(
+                        "ALTER TYPE verificationstatus ADD VALUE IF NOT EXISTS 'verified'"
+                    )
+            except Exception as e:
+                logger.warning("verificationstatus enum migration skipped/failed: %s", e)
         seed_demo_data()
 
 @app.on_event("startup")
@@ -456,15 +471,25 @@ def validate_security_context(
     authorization: Optional[str] = Header(None, alias="Authorization"),
     x_user_id: Optional[str] = Header(None, alias="x-keycloak-id"),
 ):
+    """OB-10: real authentication. The Bearer token is cryptographically verified
+    by the RS256/HS256 verifier in this module (validate_jwt, defined above) —
+    the previous implementation only checked that a bearer-shaped string or a
+    bare x-keycloak-id header was present, which authenticated nothing.
+    REQUIRE_AUTH_CONTEXT remains as an emergency killswitch but defaults to
+    true (authentication required)."""
     require_auth = os.getenv("REQUIRE_AUTH_CONTEXT", "true").lower() == "true"
     if not require_auth:
+        logger.warning("REQUIRE_AUTH_CONTEXT=false — authentication disabled (killswitch active)")
         return {"authenticated": False, "principal": x_user_id or "anonymous"}
 
-    has_bearer = bool(authorization and authorization.startswith("Bearer ") and len(authorization.split(" ", 1)[1].strip()) >= 16)
-    has_trusted_user = bool(x_user_id and x_user_id.strip())
-    if not (has_bearer or has_trusted_user):
-        raise HTTPException(status_code=401, detail="Authentication context required")
-    return {"authenticated": True, "principal": x_user_id or "bearer-token"}
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    claims, err = validate_jwt({"authorization": authorization})
+    if not claims:
+        status = 503 if err == "jwks_unavailable" else 401
+        raise HTTPException(status_code=status, detail=f"Invalid token: {err}")
+    principal = claims.get("sub") or claims.get("keycloak_id") or "bearer-token"
+    return {"authenticated": True, "principal": principal, "claims": claims}
 
 
 def mask_value(value: Optional[str], visible_prefix: int = 2, visible_suffix: int = 2) -> Optional[str]:
@@ -507,6 +532,46 @@ async def get_temporal_client():
     """Get Temporal client"""
     return await TemporalClient.connect(TEMPORAL_ADDRESS)
 
+# OB-10/OR-20: verification-service client (client-authenticated). Replaces the
+# phantom Temporal workflow starts to the 'kyc-verification'/'kyb-verification'
+# task queues, for which no worker exists anywhere in the repo.
+VERIFICATION_SVC_URL = os.getenv("VERIFICATION_SVC_URL", "").rstrip("/")
+VERIFICATION_CLIENT_ID = os.getenv("VERIFICATION_CLIENT_ID", "")
+VERIFICATION_CLIENT_SECRET = os.getenv("VERIFICATION_CLIENT_SECRET", "")
+
+
+async def _verification_service_post(path: str, payload: dict) -> dict:
+    """POST to verification-service with client credentials.
+
+    Fail-closed: missing configuration, network errors, non-2xx responses and
+    malformed bodies all raise; the caller marks the customer MANUAL_REVIEW so
+    no phantom progress is ever recorded.
+    """
+    if not (VERIFICATION_SVC_URL and VERIFICATION_CLIENT_ID and VERIFICATION_CLIENT_SECRET):
+        raise RuntimeError(
+            "verification-service integration not configured "
+            "(VERIFICATION_SVC_URL / VERIFICATION_CLIENT_ID / VERIFICATION_CLIENT_SECRET)"
+        )
+    req = _jwt_urlreq.Request(
+        f"{VERIFICATION_SVC_URL}{path}",
+        data=_jwt_json.dumps(payload).encode(),
+        headers={
+            "content-type": "application/json",
+            "x-client-id": VERIFICATION_CLIENT_ID,
+            "x-client-secret": VERIFICATION_CLIENT_SECRET,
+        },
+        method="POST",
+    )
+
+    def _do():
+        with _jwt_urlreq.urlopen(req, timeout=10) as resp:
+            return _jwt_json.loads(resp.read())
+
+    body = await _db_run(_do)
+    if not isinstance(body, dict) or not body.get("id"):
+        raise RuntimeError("verification-service returned no verification id")
+    return body
+
 # API Endpoints
 
 async def _db_run(fn, *args, **kwargs):
@@ -532,6 +597,28 @@ async def onboard_individual_customer(
     4. Return workflow ID for tracking
     """
     
+    # OB-10 idempotency: dedup on (tenant_id, bvn) or (tenant_id, email) BEFORE
+    # insert — a retry returns the existing customer instead of creating a
+    # duplicate row + a second verification.
+    existing = await _db_run(lambda: db.query(Customer).filter(
+        Customer.tenant_id == x_tenant_id,
+        (Customer.bvn == request.bvn) | (Customer.email == request.email),
+    ).first())
+    if existing:
+        return OnboardingResponse(
+            customer_id=existing.customer_id,
+            customer_type=existing.customer_type,
+            verification_status=existing.verification_status,
+            workflow_id=existing.workflow_id or "",
+            estimated_completion="15-30 minutes",
+            message="Existing customer returned (idempotent on tenant+bvn/email).",
+            next_steps=["Track status via /api/v1/onboarding/status/{customer_id}"],
+        )
+    # email is globally unique in this schema — fail cleanly on cross-tenant reuse
+    email_taken = await _db_run(lambda: db.query(Customer).filter(Customer.email == request.email).first())
+    if email_taken:
+        raise HTTPException(status_code=409, detail="A customer with this email already exists.")
+
     # Generate customer ID
     import uuid
     customer_id = f"CUST-{uuid.uuid4().hex[:12].upper()}"
@@ -566,37 +653,34 @@ async def onboard_individual_customer(
     await _db_run(db.add, customer)
     await _db_run(db.commit)
     
-    # Trigger KYC workflow via Temporal
+    # OB-10/OR-20: trigger KYC via verification-service
+    # POST /kyc/initialize-verification (client-authenticated). The previous
+    # Temporal start to task_queue="kyc-verification" is deleted — no worker
+    # ever registered that queue, so every start pended forever. Fail-closed:
+    # any error leaves the customer in MANUAL_REVIEW, never a phantom workflow.
     try:
-        temporal_client = await get_temporal_client()
-        workflow_id = f"kyc-{customer_id}-{int(datetime.utcnow().timestamp())}"
-        
-        # Start KYC workflow
-        workflow_handle = await temporal_client.start_workflow(
-            "kyc_verification_workflow",
+        verification = await _verification_service_post(
+            "/kyc/initialize-verification",
             {
-                "customer_id": customer_id,
-                "tenant_id": x_tenant_id,
-                "bvn": request.bvn,
-                "nin": request.nin,
-                "phone": request.phone,
-                "email": request.email,
-                "id_type": request.id_type,
-                "id_number": request.id_number,
-                "date_of_birth": request.date_of_birth
+                "identityProvider": "liveness",
+                "user": {
+                    "firstName": request.first_name,
+                    "lastName": request.last_name,
+                    "phone": request.phone,
+                    "UIN": request.bvn,
+                    "dateOfBirth": request.date_of_birth,
+                },
+                "metadata": {"customer_id": customer_id, "tenant_id": x_tenant_id},
             },
-            id=workflow_id,
-            task_queue="kyc-verification"
         )
-        
-        # Update customer with workflow ID
+        workflow_id = f"kyc-verification-{verification['id']}"
         customer.workflow_id = workflow_id
-        customer.workflow_channel = "temporal"
+        customer.workflow_channel = "verification-service"
         customer.verification_status = VerificationStatus.IN_PROGRESS
         await _db_run(db.commit)
-        
+
     except Exception as e:
-        logger.warning("Failed to start KYC workflow for %s: %s", customer_id, e)
+        logger.warning("Failed to initialize KYC verification for %s: %s", customer_id, e)
         workflow_id = f"manual-review-{customer_id}"
         customer.workflow_id = workflow_id
         customer.workflow_channel = "manual_review"
@@ -661,6 +745,26 @@ async def onboard_corporate_customer(
     5. Return workflow ID for tracking
     """
     
+    # OB-10 idempotency: dedup on (tenant_id, cac_number) or (tenant_id, email)
+    # before insert — retries return the existing customer.
+    existing = await _db_run(lambda: db.query(Customer).filter(
+        Customer.tenant_id == x_tenant_id,
+        (Customer.cac_number == request.cac_number) | (Customer.email == request.business_email),
+    ).first())
+    if existing:
+        return OnboardingResponse(
+            customer_id=existing.customer_id,
+            customer_type=existing.customer_type,
+            verification_status=existing.verification_status,
+            workflow_id=existing.workflow_id or "",
+            estimated_completion="1-3 business days",
+            message="Existing customer returned (idempotent on tenant+cac/email).",
+            next_steps=["Track status via /api/v1/onboarding/status/{customer_id}"],
+        )
+    email_taken = await _db_run(lambda: db.query(Customer).filter(Customer.email == request.business_email).first())
+    if email_taken:
+        raise HTTPException(status_code=409, detail="A customer with this email already exists.")
+
     # Generate customer ID
     import uuid
     customer_id = f"CORP-{uuid.uuid4().hex[:12].upper()}"
@@ -700,36 +804,28 @@ async def onboard_corporate_customer(
     await _db_run(db.add, customer)
     await _db_run(db.commit)
     
-    # Trigger KYB workflow via Temporal
+    # OB-10/OR-20: trigger KYB via verification-service
+    # POST /kyb/initialize-verification (client-authenticated). The phantom
+    # Temporal start to task_queue="kyb-verification" is deleted (no worker).
     try:
-        temporal_client = await get_temporal_client()
-        workflow_id = f"kyb-{customer_id}-{int(datetime.utcnow().timestamp())}"
-        
-        # Start KYB workflow
-        workflow_handle = await temporal_client.start_workflow(
-            "kyb_verification_workflow",
+        verification = await _verification_service_post(
+            "/kyb/initialize-verification",
             {
-                "customer_id": customer_id,
-                "tenant_id": x_tenant_id,
-                "company_name": request.company_name,
-                "cac_number": request.cac_number,
+                "business_name": request.company_name,
+                "cac": request.cac_number,
                 "tin": request.tin,
-                "beneficial_owners": request.beneficial_owners,
-                "industry": request.industry,
-                "annual_revenue": request.annual_revenue
+                "tenant_id": x_tenant_id,
+                "metadata": {"customer_id": customer_id},
             },
-            id=workflow_id,
-            task_queue="kyb-verification"
         )
-        
-        # Update customer with workflow ID
+        workflow_id = f"kyb-verification-{verification['id']}"
         customer.workflow_id = workflow_id
-        customer.workflow_channel = "temporal"
+        customer.workflow_channel = "verification-service"
         customer.verification_status = VerificationStatus.IN_PROGRESS
         await _db_run(db.commit)
-        
+
     except Exception as e:
-        logger.warning("Failed to start KYB workflow for %s: %s", customer_id, e)
+        logger.warning("Failed to initialize KYB verification for %s: %s", customer_id, e)
         workflow_id = f"manual-review-{customer_id}"
         customer.workflow_id = workflow_id
         customer.workflow_channel = "manual_review"
@@ -785,6 +881,7 @@ async def onboard_corporate_customer(
 async def get_onboarding_status(
     customer_id: str,
     x_tenant_id: str = Header(..., description="Tenant/Bank ID"),
+    security_context: dict = Depends(validate_security_context),  # OB-10: was unauthenticated
     db = Depends(get_db)
 ):
     """Get customer onboarding status"""
@@ -798,7 +895,12 @@ async def get_onboarding_status(
     workflow_status = "UNKNOWN"
     workflow_result = None
     
-    if customer.workflow_id and customer.workflow_id != "MANUAL-REVIEW-REQUIRED":
+    if (
+        customer.workflow_id
+        and customer.workflow_id != "MANUAL-REVIEW-REQUIRED"
+        # OB-10: verification-service ids are not local Temporal workflows
+        and customer.workflow_channel == "temporal"
+    ):
         try:
             temporal_client = await get_temporal_client()
             workflow_handle = temporal_client.get_workflow_handle(customer.workflow_id)
@@ -838,6 +940,7 @@ async def list_onboarding_customers(
     customer_type: Optional[CustomerType] = None,
     search: Optional[str] = None,
     limit: int = Query(20, ge=1, le=100),
+    security_context: dict = Depends(validate_security_context),  # OB-10: was unauthenticated
     db = Depends(get_db),
 ):
     query = db.query(Customer).filter(Customer.tenant_id == x_tenant_id)
@@ -872,6 +975,95 @@ async def list_onboarding_customers(
         ],
         "total": len(rows),
     }
+
+
+# OB-10: KYC outcome transition endpoints — previously no path out of
+# PENDING/IN_PROGRESS existed outside the demo seeder. Both are authenticated
+# (validate_security_context → real JWT verification) and tenant-scoped.
+class KycOutcomeRequest(BaseModel):
+    score: float = Field(..., ge=0, description="Verification score (0-1 or 0-100)")
+    minimum_score: float = Field(80.0, ge=0, le=100, description="Pass threshold")
+    verification_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+@app.post("/api/v1/onboarding/{customer_id}/kyc/complete")
+async def complete_customer_kyc(
+    customer_id: str,
+    payload: KycOutcomeRequest,
+    x_tenant_id: str = Header(..., description="Tenant/Bank ID"),
+    security_context: dict = Depends(validate_security_context),
+    db = Depends(get_db),
+):
+    """Mark a customer KYC-verified when the score meets the threshold.
+
+    Scores on a 0-1 scale are normalized to 0-100 (same convention as the
+    orchestrator callbacks). Terminal-state guard: an already VERIFIED customer
+    cannot be re-completed (idempotent 200 when the same outcome is re-sent).
+    """
+    score = payload.score * 100 if payload.score <= 1 else payload.score
+    if score < payload.minimum_score:
+        raise HTTPException(
+            status_code=422,
+            detail=f"score {score:.1f} below minimum {payload.minimum_score}",
+        )
+    customer = await _db_run(lambda: db.query(Customer).filter(
+        Customer.customer_id == customer_id, Customer.tenant_id == x_tenant_id
+    ).first())
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if customer.verification_status == VerificationStatus.VERIFIED:
+        return {"customer_id": customer.customer_id, "verification_status": "verified",
+                "verified_at": customer.verified_at.isoformat() if customer.verified_at else None,
+                "idempotent": True}
+    if customer.verification_status == VerificationStatus.FAILED:
+        raise HTTPException(status_code=409, detail="Customer KYC already failed; start a new verification")
+
+    customer.verification_status = VerificationStatus.VERIFIED
+    customer.verified_at = datetime.utcnow()
+    customer.risk_score = score
+    await _db_run(db.commit)
+    publish_event("kyc.completed", {
+        "customer_id": customer.customer_id,
+        "tenant_id": x_tenant_id,
+        "score": score,
+        "verification_id": payload.verification_id,
+        "acted_by": security_context["principal"],
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+    return {"customer_id": customer.customer_id, "verification_status": "verified",
+            "verified_at": customer.verified_at.isoformat(), "idempotent": False}
+
+
+@app.post("/api/v1/onboarding/{customer_id}/kyc/fail")
+async def fail_customer_kyc(
+    customer_id: str,
+    payload: KycOutcomeRequest,
+    x_tenant_id: str = Header(..., description="Tenant/Bank ID"),
+    security_context: dict = Depends(validate_security_context),
+    db = Depends(get_db),
+):
+    """Mark a customer KYC-failed (terminal). Idempotent on replay."""
+    customer = await _db_run(lambda: db.query(Customer).filter(
+        Customer.customer_id == customer_id, Customer.tenant_id == x_tenant_id
+    ).first())
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    if customer.verification_status == VerificationStatus.VERIFIED:
+        raise HTTPException(status_code=409, detail="Customer already verified; cannot fail")
+    if customer.verification_status == VerificationStatus.FAILED:
+        return {"customer_id": customer.customer_id, "verification_status": "failed", "idempotent": True}
+
+    customer.verification_status = VerificationStatus.FAILED
+    await _db_run(db.commit)
+    publish_event("kyc.failed", {
+        "customer_id": customer.customer_id,
+        "tenant_id": x_tenant_id,
+        "reason": payload.reason,
+        "acted_by": security_context["principal"],
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+    return {"customer_id": customer.customer_id, "verification_status": "failed", "idempotent": False}
 
 
 @app.get("/ready")

@@ -22,6 +22,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 	"gorm.io/gorm"
+
+	"shared/otel/go/otelkit"
 )
 
 // ...existing code...
@@ -1690,6 +1692,17 @@ func tenantFromClaims(claims map[string]interface{}) string {
 }
 
 func main() {
+	shutdown, oerr := otelkit.Init(context.Background(), "esusu-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
 	// Initialize database connection
 	db, err := InitDatabase()
 	if err != nil {
@@ -1755,7 +1768,7 @@ func main() {
 	log.Printf(" PostgreSQL database connected and migrated")
 	log.Printf("🤖 AI/ML Features: Default Prediction, Optimal Rotation, Fraud Detection, Group Health Scoring")
 
-	if err := http.ListenAndServe(port, jwtAuthMiddleware(r)); err != nil {
+	if err := http.ListenAndServe(port, otelkit.HTTPMiddleware(jwtAuthMiddleware(r))); err != nil {
 		log.Fatal(err)
 	}
 }

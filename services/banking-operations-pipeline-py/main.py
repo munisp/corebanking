@@ -18,6 +18,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 
+# --- OpenTelemetry (SPEC w9 §2.5): make the shared otelkit importable ---
+import sys as _otel_sys
+
+_otel_sys.path.insert(
+    0,
+    os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "shared", "otel", "python")
+    ),
+)
+
 # --- mTLS Configuration ---
 MTLS_ENABLED = os.environ.get("MTLS_ENABLED", "false") == "true"
 TLS_CERT_PATH = os.environ.get("TLS_CERT_PATH", "/etc/54link-dev/certs/service.crt")
@@ -110,6 +120,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="banking-operations-pipeline-py", version="1.0.0", lifespan=lifespan)
+
+# --- OpenTelemetry init (SPEC w9 §2.5): OTLP gRPC traces+metrics, W3C ---
+# propagation, FastAPI server spans, TenantMiddleware (tenant.id span attr),
+# psycopg2 client spans. Supersedes the never-called init_tracing() below.
+# Honors OTEL_SDK_DISABLED; never raises.
+try:
+    from otelkit import init_telemetry, instrument_psycopg2
+
+    init_telemetry("banking-operations-pipeline-py", app)
+    instrument_psycopg2()
+except Exception as _otel_exc:
+    logger.warning("otelkit init skipped: %s", _otel_exc)
 
 # --- JWT enforcement middleware (finding N-1: fail-closed JWT auth on the live FastAPI path) ---
 import inspect as _jwt_inspect

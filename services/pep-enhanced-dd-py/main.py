@@ -20,8 +20,6 @@ from typing import Optional, Dict, Any
 import time
 import threading
 import signal
-import random
-import string
 import socket as _socket
 import urllib.request
 
@@ -221,6 +219,50 @@ def init_schema():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_status ON service_configs(status)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_service_configs_created ON service_configs(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published")
+        # CP-04: real PEP data model.
+        cur.execute("""CREATE TABLE IF NOT EXISTS pep_entries (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            full_name TEXT NOT NULL,
+            name_normalized TEXT NOT NULL,
+            position TEXT NOT NULL,
+            tier TEXT NOT NULL CHECK (tier IN ('tier1','tier2','tier3')),
+            country TEXT NOT NULL DEFAULT 'NG',
+            source TEXT NOT NULL,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (name_normalized, position)
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pep_entries_name ON pep_entries(name_normalized)")
+        cur.execute("""CREATE TABLE IF NOT EXISTS pep_position_tiers (
+            position_key TEXT PRIMARY KEY,
+            tier TEXT NOT NULL CHECK (tier IN ('tier1','tier2','tier3'))
+        )""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS pep_screenings (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            tenant_id TEXT,
+            screened_name TEXT NOT NULL,
+            position TEXT,
+            nationality TEXT,
+            is_pep BOOLEAN NOT NULL,
+            pep_tier TEXT,
+            matched_entry_id UUID,
+            screening_source TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_pep_screenings_tenant ON pep_screenings(tenant_id, created_at DESC)")
+        # CP-04: server-side domestic PEP function classification (CBN AML/CFT
+        # Regulations 2022) — the position tier is looked up HERE, never
+        # asserted by the caller. pep_entries (persons) starts empty and is
+        # loaded via POST /api/v1/pep/entries from the curated/commercial list.
+        cur.execute("""INSERT INTO pep_position_tiers (position_key, tier) VALUES
+            ('president','tier1'), ('vice_president','tier1'), ('governor','tier1'),
+            ('deputy_governor','tier1'), ('minister','tier1'), ('senator','tier1'),
+            ('house_of_representatives','tier1'), ('chief_justice','tier1'),
+            ('service_chief','tier1'), ('judge','tier2'), ('ambassador','tier2'),
+            ('military_general','tier2'), ('cbn_director','tier2'),
+            ('permanent_secretary','tier2'), ('state_commissioner','tier3'),
+            ('local_chairman','tier3')
+            ON CONFLICT (position_key) DO NOTHING""")
         conn.commit()
         logger.info("Schema initialized")
     except Exception as e:
@@ -420,23 +462,11 @@ def validate_jwt(headers):
     return payload, None
 
 # --- Domain Logic ---
-def gen_id():
-    return "PEP-" + "".join(random.choices(string.hexdigits[:16].upper(), k=8))
-
-
-def now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-def screen_pep(name, nationality, position):
-    pep_positions = {"president": "tier1", "governor": "tier1", "minister": "tier1", "senator": "tier1", "judge": "tier2", "ambassador": "tier2", "military_general": "tier2", "cbn_director": "tier2", "local_chairman": "tier3", "state_commissioner": "tier3"}
-    tier = pep_positions.get(position.lower().replace(" ","_"), None)
-    is_pep = tier is not None
-    edd_requirements = []
-    if is_pep:
-        edd_requirements = ["source_of_wealth", "source_of_funds", "senior_management_approval", "ongoing_monitoring"]
-        if tier == "tier1":
-            edd_requirements.extend(["board_approval", "external_verification", "annual_review"])
-    return {"name": name, "is_pep": is_pep, "pep_tier": tier, "edd_requirements": edd_requirements, "risk_rating": "very_high" if tier == "tier1" else "high" if tier == "tier2" else "elevated" if tier == "tier3" else "standard", "monitoring_frequency": "quarterly" if is_pep else "annual"}
+# CP-04: the old screen_pep() fiction was deleted — it matched ONLY the
+# caller-supplied position string against a 10-entry hardcoded dict (name and
+# nationality were ignored), and the function was never routed. Real screening
+# is now DB-backed: see pep_entries / pep_position_tiers in init_schema and
+# POST /api/v1/pep/screen below.
 
 
 
@@ -652,6 +682,204 @@ def create_record(body: CreateRequest, x_tenant_id: Optional[str] = Header(None)
         )
     conn.commit()
     return {"id": record_id, "status": "created"}
+
+
+# ── CP-04: real PEP screening ────────────────────────────────────────────────
+
+COMPLIANCE_SERVICE_URL = os.environ.get("COMPLIANCE_SERVICE_URL", "").rstrip("/")
+PEP_SERVICE_TOKEN = os.environ.get("PEP_SERVICE_TOKEN", "")
+
+
+def _normalize_name(name: str) -> str:
+    return " ".join(name.lower().split())
+
+
+def _edd_requirements(tier: str):
+    reqs = ["source_of_wealth", "source_of_funds", "senior_management_approval", "ongoing_monitoring"]
+    if tier == "tier1":
+        reqs = reqs + ["board_approval", "external_verification", "annual_review"]
+    return reqs
+
+
+def _risk_rating(tier):
+    return {"tier1": "very_high", "tier2": "high", "tier3": "elevated"}.get(tier, "standard")
+
+
+def _route_edd_alert(tenant_id: str, screening: dict) -> bool:
+    """Route a tiered EDD alert to compliance-service's alerts API; always
+    persist to the local outbox first so the alert is durable even if the
+    compliance service is down."""
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO outbox (event_type, aggregate_id, payload) VALUES (%s, %s, %s::jsonb)",
+                ("pep.edd_required", screening["screening_id"], json.dumps(screening)),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+    if not COMPLIANCE_SERVICE_URL:
+        logger.warning("COMPLIANCE_SERVICE_URL not set — PEP EDD alert persisted to outbox only")
+        return False
+    alert = {
+        "tenant_id": tenant_id,
+        "alert_type": "pep_edd_required",
+        "severity": "critical" if screening["pep_tier"] == "tier1" else "high",
+        "entity_type": "customer",
+        "entity_id": screening["screened_name"],
+        "description": f"PEP match ({screening['pep_tier']}): enhanced due diligence required — "
+                       + ", ".join(screening["edd_requirements"]),
+        "metadata": screening,
+    }
+    headers = {"Content-Type": "application/json"}
+    if PEP_SERVICE_TOKEN:
+        headers["Authorization"] = f"Bearer {PEP_SERVICE_TOKEN}"
+    try:
+        import urllib.request as _u
+        req = _u.Request(
+            f"{COMPLIANCE_SERVICE_URL}/api/v1/compliance/alerts",
+            data=json.dumps(alert).encode(), headers=headers, method="POST",
+        )
+        with _u.urlopen(req, timeout=10) as resp:
+            return resp.status < 300
+    except Exception as e:
+        logger.error("PEP EDD alert routing failed (durable in outbox): %s", e)
+        return False
+
+
+class PepScreenRequest(BaseModel):
+    name: str
+    position: Optional[str] = None
+    nationality: Optional[str] = None
+
+
+class PepEntryRequest(BaseModel):
+    full_name: str
+    position: str
+    tier: str
+    country: Optional[str] = "NG"
+    source: Optional[str] = "curated_internal"
+
+
+@app.post("/api/v1/pep/screen")
+def pep_screen(body: PepScreenRequest, x_tenant_id: Optional[str] = Header(None)):
+    """Screen a name + position against the real pep_entries table and the
+    server-side domestic PEP function classification. The caller's position
+    string is matched against pep_position_tiers — never trusted as proof."""
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="name is required")
+    name_norm = _normalize_name(body.name)
+    position_key = (body.position or "").lower().replace(" ", "_") or None
+
+    conn = get_db()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # 1) Person-level match against the curated PEP list.
+            cur.execute(
+                """SELECT id, full_name, position, tier, country, source FROM pep_entries
+                   WHERE active AND (
+                       name_normalized = %s
+                       OR %s ILIKE '%%' || name_normalized || '%%'
+                       OR name_normalized ILIKE '%%' || %s || '%%'
+                   ) ORDER BY LENGTH(name_normalized) DESC LIMIT 5""",
+                (name_norm, name_norm, name_norm),
+            )
+            entries = [dict(r) for r in cur.fetchall()]
+            # 2) Function-level classification (server-side table).
+            tier_by_position = None
+            if position_key:
+                cur.execute("SELECT tier FROM pep_position_tiers WHERE position_key = %s", (position_key,))
+                row = cur.fetchone()
+                if row:
+                    tier_by_position = row["tier"]
+    except Exception as e:
+        logger.error("pep screen query failed: %s", e)
+        raise HTTPException(status_code=503, detail="PEP database unavailable — screening failed closed")
+    finally:
+        release_db(conn)
+
+    entry_tier = entries[0]["tier"] if entries else None
+    tier = entry_tier or tier_by_position
+    is_pep = tier is not None
+    result = {
+        "name": body.name,
+        "position": body.position,
+        "nationality": body.nationality,
+        "is_pep": is_pep,
+        "pep_tier": tier,
+        "match_basis": ("pep_entries" if entry_tier else "position_classification" if tier_by_position else None),
+        "matched_entries": entries,
+        "edd_requirements": _edd_requirements(tier) if is_pep else [],
+        "risk_rating": _risk_rating(tier),
+        "monitoring_frequency": "quarterly" if is_pep else "annual",
+    }
+
+    screening_id = str(uuid.uuid4())
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pep_screenings
+                   (id, tenant_id, screened_name, position, nationality, is_pep, pep_tier, matched_entry_id, screening_source)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (screening_id, x_tenant_id, body.name, body.position, body.nationality,
+                 is_pep, tier, entries[0]["id"] if entries else None,
+                 result["match_basis"] or "no_match"),
+            )
+        conn.commit()
+    finally:
+        release_db(conn)
+
+    if is_pep:
+        alert_payload = dict(result)
+        alert_payload["screening_id"] = screening_id
+        routed = _route_edd_alert(x_tenant_id or "unknown", alert_payload)
+        result["edd_alert"] = {"screening_id": screening_id, "routed_to_compliance_service": routed,
+                               "persisted_to_outbox": True}
+    else:
+        result["edd_alert"] = None
+    return result
+
+
+@app.post("/api/v1/pep/entries", status_code=201)
+def add_pep_entry(body: PepEntryRequest):
+    """Load a curated PEP list entry (compliance admin operation)."""
+    if body.tier not in ("tier1", "tier2", "tier3"):
+        raise HTTPException(status_code=400, detail="tier must be tier1|tier2|tier3")
+    conn = get_db()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO pep_entries (full_name, name_normalized, position, tier, country, source)
+                   VALUES (%s,%s,%s,%s,%s,%s)
+                   ON CONFLICT (name_normalized, position) DO UPDATE
+                     SET tier = EXCLUDED.tier, active = TRUE, source = EXCLUDED.source
+                   RETURNING id""",
+                (body.full_name, _normalize_name(body.full_name), body.position, body.tier,
+                 body.country, body.source),
+            )
+            entry_id = cur.fetchone()[0]
+        conn.commit()
+    finally:
+        release_db(conn)
+    return {"id": str(entry_id), "status": "upserted"}
+
+
+@app.get("/api/v1/pep/entries")
+def list_pep_entries():
+    conn = get_db()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SELECT id, full_name, position, tier, country, source, active, created_at FROM pep_entries ORDER BY created_at DESC LIMIT 500")
+            rows = [dict(r) for r in cur.fetchall()]
+    finally:
+        release_db(conn)
+    for r in rows:
+        if r.get("created_at"):
+            r["created_at"] = r["created_at"].isoformat()
+        r["id"] = str(r["id"])
+    return {"items": rows, "total": len(rows)}
 
 
 

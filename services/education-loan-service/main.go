@@ -28,6 +28,9 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"go.opentelemetry.io/otel/attribute"
+	"shared/otel/go/otelkit"
 )
 
 var (
@@ -35,8 +38,24 @@ var (
 	lakehouseClient *LakehouseClient
 	engine          *EducationLoanUnderwritingEngine
 	eduKafkaClient  = NewEduKafkaClient()
+	eduTBClient     *EduTigerBeetleClient
 	coaClient       *CoAClient
 )
+
+// hasAnyRole reports whether the comma-separated role header (populated from
+// verified JWT realm roles by jwtAuthMiddleware) contains any of the wanted
+// roles. Used for approval authority checks (LN-07).
+func hasAnyRole(roleHeader string, wanted ...string) bool {
+	for _, r := range strings.Split(roleHeader, ",") {
+		r = strings.TrimSpace(r)
+		for _, w := range wanted {
+			if r == w {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // Prometheus metrics
 var (
@@ -522,7 +541,21 @@ func tenantFromClaims(claims map[string]interface{}) string {
 func main() {
 	godotenv.Load()
 
+	shutdown, oerr := otelkit.Init(context.Background(), "education-loan-service")
+	if oerr != nil {
+		log.Fatalf("otelkit init: %v", oerr)
+	}
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if serr := shutdown(sctx); serr != nil {
+			log.Printf("otelkit shutdown: %v", serr)
+		}
+	}()
+
 	db = initDatabase()
+	eduTBClient = NewEduTigerBeetleClient()
+	startEducationIFRS9Sweeper() // LN-09
 	if db != nil {
 		defer db.Close()
 	}
@@ -532,6 +565,7 @@ func main() {
 	coaClient = NewCoAClient()
 
 	router := gin.Default()
+	router.Use(otelkit.GinMiddleware())
 	router.Use(jwtAuthMiddleware())
 	router.Use(corsMiddleware())
 	router.Use(loggingMiddleware())
@@ -595,6 +629,7 @@ func registerRoutes(router *gin.Engine) {
 		// Offer Management
 		api.POST("/applications/:id/generate-offer", generateOffer)
 		api.POST("/applications/:id/accept-offer", acceptOffer)
+		api.POST("/applications/:id/write-off", writeOffEducationLoan) // LN-10 (L11)
 		api.POST("/applications/:id/reject-offer", rejectOffer)
 
 		// Disbursement
@@ -884,7 +919,6 @@ func submitApplication(c *gin.Context) {
 	}
 
 	// Publish events
-	// PublishApplicationEvent("education_loan.application.submitted", app)
 	lakehouseClient.PublishEvent("education_loan_status_change", map[string]interface{}{
 		"application_id": app.ID,
 		"old_status":     StatusDraft,
@@ -919,16 +953,6 @@ func verifyInstitution(c *gin.Context) {
 		app.Status = StatusInstitutionVerified
 		updateEducationLoanStatus(id, tenantID, StatusInstitutionVerified)
 
-		// PublishEvent("education-loans.verification", MortgageEvent{
-		// 	Type:       "education_loan.institution.verified",
-		// 	MortgageID: app.ID,
-		// 	TenantID:   tenantID,
-		// 	Timestamp:  now,
-		// 	Metadata: map[string]interface{}{
-		// 		"institution_name": app.Institution.Name,
-		// 		"accreditation":    app.Institution.AccreditationNumber,
-		// 	},
-		// })
 	}
 
 	c.JSON(200, gin.H{
@@ -967,7 +991,6 @@ func verifyAdmission(c *gin.Context) {
 		app.Status = StatusAdmissionVerified
 		updateEducationLoanStatus(id, tenantID, StatusAdmissionVerified)
 
-		// PublishApplicationEvent("education_loan.admission.verified", app)
 	}
 
 	c.JSON(200, gin.H{
@@ -1005,16 +1028,6 @@ func verifyGuarantor(c *gin.Context) {
 		guarantor.VerifiedAt = &now
 		updateGuarantorStatus(req.GuarantorID, "verified")
 
-		// PublishEvent("education-loans.verification", MortgageEvent{
-		// 	Type:       "education_loan.guarantor.verified",
-		// 	MortgageID: id,
-		// 	TenantID:   tenantID,
-		// 	Timestamp:  now,
-		// 	Metadata: map[string]interface{}{
-		// 		"guarantor_id":   req.GuarantorID,
-		// 		"guarantor_name": guarantor.Name,
-		// 	},
-		// })
 	}
 
 	c.JSON(200, gin.H{
@@ -1060,8 +1073,6 @@ func underwriteApplication(c *gin.Context) {
 		"program_duration": app.ProgramDuration,
 	}, "education-loan-service")
 
-	// PublishApplicationEvent("education_loan.underwriting.completed", app)
-
 	c.JSON(200, decision)
 }
 
@@ -1098,7 +1109,6 @@ func approveApplication(c *gin.Context) {
 	saveApprovalDetails(app, req.ApprovedBy, req.Conditions, req.Notes)
 
 	// Publish events
-	// PublishApplicationEvent("education_loan.application.approved", app)
 	lakehouseClient.PublishEvent("education_loan_approval", map[string]interface{}{
 		"application_id":  app.ID,
 		"approved_amount": app.ApprovedAmount,
@@ -1136,17 +1146,6 @@ func declineApplication(c *gin.Context) {
 
 	updateEducationLoanStatus(id, tenantID, EducationLoanStatus("declined"))
 
-	// PublishEvent("education-loans.decisions", MortgageEvent{
-	// 	Type:       "education_loan.application.declined",
-	// 	MortgageID: id,
-	// 	TenantID:   tenantID,
-	// 	Timestamp:  time.Now(),
-	// 	Metadata: map[string]interface{}{
-	// 		"declined_by": req.DeclinedBy,
-	// 		"reasons":     req.Reasons,
-	// 	},
-	// })
-
 	applicationsTotal.WithLabelValues("declined", "").Inc()
 
 	c.JSON(200, gin.H{"status": "declined", "reasons": req.Reasons})
@@ -1167,8 +1166,6 @@ func generateOffer(c *gin.Context) {
 	app.Status = StatusOfferIssued
 	updateEducationLoanStatus(id, tenantID, StatusOfferIssued)
 
-	// PublishApplicationEvent("education_loan.offer.issued", app)
-
 	c.JSON(200, offer)
 }
 
@@ -1184,8 +1181,6 @@ func acceptOffer(c *gin.Context) {
 
 	app.Status = StatusOfferAccepted
 	updateEducationLoanStatus(id, tenantID, StatusOfferAccepted)
-
-	// PublishApplicationEvent("education_loan.offer.accepted", app)
 
 	c.JSON(200, gin.H{"status": "offer_accepted"})
 }
@@ -1217,6 +1212,20 @@ func getDisbursementSchedule(c *gin.Context) {
 	})
 }
 
+// LN-12 (L13): real two-leg TigerBeetle disbursement saga, modeled on
+// mortgage-service disburseMortgage (main.go:1369-1460, the in-repo
+// reference):
+//  1. CLAIM (atomic): UPDATE ... SET status='disbursing' WHERE status IN
+//     (claimable states) RETURNING — exactly one concurrent request can
+//     claim the disbursement; the double-disbursement race closes at the DB.
+//  2. Amounts ALWAYS come from the claimed disbursement record, never the
+//     request body.
+//  3. FORWARD: linked two-leg TigerBeetle transfer (mint -> institution,
+//     mint -> student) with deterministic IDs (edu:{id}:tuition/:student).
+//  4. COMMIT: persist disbursed state + ledger transaction id.
+//  5. COMPENSATION: post-claim failure reverses the ledger transfer and
+//     releases the claim; a failed reversal marks compensation_failed and
+//     logs an ALERT — never silent.
 func processDisbursement(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
@@ -1236,52 +1245,92 @@ func processDisbursement(c *gin.Context) {
 		return
 	}
 
-	// Find disbursement entry
-	var disbursement *DisbursementEntry
-	for i := range app.DisbursementSchedule {
-		if app.DisbursementSchedule[i].ID == req.DisbursementID {
-			disbursement = &app.DisbursementSchedule[i]
-			break
-		}
-	}
-
-	if disbursement == nil {
-		SendError(c.Writer, "not_found", "Disbursement not found", http.StatusNotFound, nil)
+	// Loan-level precondition: disbursement only from a disbursable state.
+	switch app.Status {
+	case StatusOfferAccepted, StatusDisbursementPending, StatusPartiallyDisbursed:
+		// claimable
+	default:
+		SendError(c.Writer, "invalid_state", fmt.Sprintf("loan status %q cannot accept disbursements", app.Status), http.StatusConflict, nil)
 		return
 	}
 
-	// Process disbursement via TigerBeetle
-	// Tuition goes directly to institution
-	// tuitionTxID, err := CreateDisbursementTransfer(
-	// 	tenantID,
-	// 	app.DisbursementAccountID,
-	// 	disbursement.InstitutionAccountID,
-	// 	disbursement.TuitionAmount,
-	// 	app.ID,
-	// )
-	// if err != nil {
-	// 	SendError(c.Writer, "internal_error", "Failed to disburse tuition", http.StatusInternalServerError, nil)
-	// 	return
-	// }
-
-	// Other amounts go to student
-	if disbursement.AccommodationAmount+disbursement.OtherAmount > 0 {
-		// CreateDisbursementTransfer(
-		// 	tenantID,
-		// 	app.DisbursementAccountID,
-		// 	disbursement.StudentAccountID,
-		// 	disbursement.AccommodationAmount+disbursement.OtherAmount,
-		// 	app.ID,
-		// )
+	// Step 1 — atomic claim. A nil entry with nil error means another request
+	// holds or has completed this disbursement.
+	disbursement, err := claimDisbursementForProcessing(req.DisbursementID, app.ID)
+	if err != nil {
+		log.Printf("ERROR: disbursement claim failed for loan %s entry %s: %v", id, req.DisbursementID, err)
+		SendError(c.Writer, "internal_error", "Failed to initiate disbursement", http.StatusInternalServerError, nil)
+		return
+	}
+	if disbursement == nil {
+		SendError(c.Writer, "conflict", "Disbursement not ready or already processed", http.StatusConflict, nil)
+		return
 	}
 
-	// Update disbursement status
+	// compensate rolls back every side effect of a failed disbursement.
+	compensate := func(transferDone bool, cause error) {
+		if transferDone {
+			if rerr := eduTBClient.ReverseDisbursement(
+				app.DisbursementAccountID,
+				disbursement.InstitutionAccountID,
+				disbursement.StudentAccountID,
+				disbursement.TuitionAmount,
+				disbursement.AccommodationAmount+disbursement.OtherAmount,
+				disbursement.ID,
+			); rerr != nil {
+				log.Printf("ALERT: COMPENSATION FAILED for education loan %s disbursement %s: reversal error: %v (original failure: %v) — manual reconciliation required",
+					app.ID, disbursement.ID, rerr, cause)
+				if merr := markDisbursementCompensationFailed(disbursement.ID); merr != nil {
+					log.Printf("ALERT: could not mark disbursement %s compensation_failed: %v", disbursement.ID, merr)
+				}
+				return
+			}
+			log.Printf("Compensated failed disbursement %s for education loan %s (cause: %v)", disbursement.ID, app.ID, cause)
+		}
+		if rerr := releaseDisbursementClaim(disbursement.ID); rerr != nil {
+			log.Printf("ALERT: failed to release disbursement claim %s: %v", disbursement.ID, rerr)
+			if merr := markDisbursementCompensationFailed(disbursement.ID); merr != nil {
+				log.Printf("ALERT: could not mark disbursement %s compensation_failed: %v", disbursement.ID, merr)
+			}
+		}
+	}
+
+	// Step 2 — server-side amounts from the claimed record.
+	if disbursement.TotalAmount <= 0 || app.DisbursementAccountID == "" {
+		compensate(false, fmt.Errorf("disbursement %s has no amount or source ledger account", disbursement.ID))
+		SendError(c.Writer, "invalid_state", "Disbursement has no amount or source ledger account", http.StatusBadRequest, nil)
+		return
+	}
+	if disbursement.InstitutionAccountID == "" {
+		compensate(false, fmt.Errorf("disbursement %s has no institution account", disbursement.ID))
+		SendError(c.Writer, "invalid_state", "Disbursement has no institution account", http.StatusBadRequest, nil)
+		return
+	}
+
+	// Step 3 — forward: move the funds in TigerBeetle (two linked legs:
+	// tuition -> institution, accommodation+other -> student).
+	studentAmount := disbursement.AccommodationAmount + disbursement.OtherAmount
+	ledgerTxID, err := eduTBClient.CreateTwoLegDisbursement(
+		app.DisbursementAccountID,
+		disbursement.InstitutionAccountID,
+		disbursement.StudentAccountID,
+		disbursement.TuitionAmount,
+		studentAmount,
+		disbursement.ID,
+	)
+	if err != nil {
+		log.Printf("Failed to create disbursement transfer for education loan %s entry %s: %v", app.ID, disbursement.ID, err)
+		compensate(false, err)
+		SendError(c.Writer, "ledger_unavailable", "Failed to process disbursement — no funds were moved", http.StatusBadGateway, nil)
+		return
+	}
+
+	// Step 4 — commit the disbursed state.
 	now := time.Now()
 	disbursement.Status = "disbursed"
 	disbursement.DisbursedDate = &now
-	disbursement.LedgerTransactionID = "" // tuitionTxID
+	disbursement.LedgerTransactionID = ledgerTxID
 
-	// Update application
 	app.DisbursedAmount += disbursement.TotalAmount
 	if app.FirstDisbursementAt == nil {
 		app.FirstDisbursementAt = &now
@@ -1305,22 +1354,32 @@ func processDisbursement(c *gin.Context) {
 		app.Status = StatusPartiallyDisbursed
 	}
 
-	saveDisbursementDetails(app, disbursement)
+	if err := saveDisbursementDetails(app, disbursement); err != nil {
+		// Funds moved but persistence failed — compensate.
+		compensate(true, err)
+		SendError(c.Writer, "internal_error", "Failed to persist disbursement — disbursement reversed", http.StatusInternalServerError, nil)
+		return
+	}
 
-	// Publish events
-	// PublishEvent("education-loans.disbursements", MortgageEvent{
-	// 	Type:       "education_loan.disbursement.completed",
-	// 	MortgageID: app.ID,
-	// 	TenantID:   tenantID,
-	// 	Amount:     disbursement.TotalAmount,
-	// 	Timestamp:  now,
-	// 	Metadata: map[string]interface{}{
-	// 		"disbursement_id":  disbursement.ID,
-	// 		"semester":         disbursement.Semester,
-	// 		"tuition_amount":   disbursement.TuitionAmount,
-	// 		"institution_name": app.Institution.Name,
-	// 	},
-	// })
+	// Real Kafka publish (LN-12): failure is logged honestly, the money
+	// movement is already durable and idempotently replayable.
+	if err := eduKafkaClient.PublishEvent("education_loan.disbursement", EduEvent{
+		Type:      "education_loan.disbursement.completed",
+		EntityID:  app.ID,
+		TenantID:  tenantID,
+		Status:    string(app.Status),
+		Amount:    disbursement.TotalAmount,
+		Timestamp: now,
+		Metadata: map[string]interface{}{
+			"disbursement_id":       disbursement.ID,
+			"semester":              disbursement.Semester,
+			"tuition_amount":        disbursement.TuitionAmount,
+			"student_amount":        studentAmount,
+			"ledger_transaction_id": ledgerTxID,
+		},
+	}); err != nil {
+		log.Printf("ERROR: kafka publish for disbursement %s failed (funds already moved, id %s): %v", disbursement.ID, ledgerTxID, err)
+	}
 
 	lakehouseClient.PublishEvent("education_loan_disbursement", map[string]interface{}{
 		"application_id":   app.ID,
@@ -1333,11 +1392,18 @@ func processDisbursement(c *gin.Context) {
 
 	disbursementsTotal.WithLabelValues(string(app.Institution.Type)).Inc()
 
+	// Telemetry: loan_disbursement_events_total{service,tenant_id,loan_id}
+	// (Wave-9 SPEC addendum; feeds the DoubleDisburseGuard alert rule).
+	otelkit.IncCounter(c.Request.Context(), "loan_disbursement_events_total",
+		attribute.String("service", "education-loan-service"),
+		attribute.String("tenant_id", tenantID),
+		attribute.String("loan_id", id))
+
 	c.JSON(200, gin.H{
 		"status":          "disbursed",
 		"disbursement_id": disbursement.ID,
 		"amount":          disbursement.TotalAmount,
-		"transaction_id":  "",
+		"transaction_id":  ledgerTxID,
 		"total_disbursed": app.DisbursedAmount,
 		"remaining":       app.ApprovedAmount - app.DisbursedAmount,
 	})
@@ -1398,18 +1464,30 @@ func getRepaymentSchedule(c *gin.Context) {
 	})
 }
 
+// LN-12 (L13): real repayment. Money moves FIRST in TigerBeetle
+// (customer -> loan principal/interest, interest-first waterfall,
+// deterministic transfer id repay:{payment_id}); only a cluster-confirmed
+// transfer is recorded. Client-supplied references are stored as metadata,
+// never as the ledger id. Precondition: loan must be in a state with an
+// outstanding disbursed balance. Overpayment beyond the outstanding balance
+// is rejected — never silently clipped.
 func recordPayment(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
 
 	var req struct {
-		Amount           float64 `json:"amount" binding:"required"`
-		PaymentMethod    string  `json:"payment_method"`
-		PaymentReference string  `json:"payment_reference"`
+		Amount            float64 `json:"amount" binding:"required"`
+		PaymentMethod     string  `json:"payment_method"`
+		PaymentReference  string  `json:"payment_reference"`
+		CustomerAccountID string  `json:"customer_account_id" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		SendError(c.Writer, "validation_failed", err.Error(), http.StatusBadRequest, nil)
+		return
+	}
+	if req.Amount <= 0 {
+		SendError(c.Writer, "validation_failed", "amount must be positive", http.StatusBadRequest, nil)
 		return
 	}
 
@@ -1419,56 +1497,100 @@ func recordPayment(c *gin.Context) {
 		return
 	}
 
-	// Process payment via TigerBeetle
-	// txID, err := CreatePaymentTransfer(
-	// 	tenantID,
-	// 	"CUSTOMER_ACCOUNT", // Would be actual customer account
-	// 	app.PrincipalAccountID,
-	// 	app.InterestAccountID,
-	// 	req.Amount,
-	// 	app.ID,
-	// )
-	// if err != nil {
-	// 	SendError(c.Writer, "internal_error", "Failed to process payment", http.StatusInternalServerError, nil)
-	// 	return
-	// }
+	// Precondition: only loans with disbursed funds can accept repayment.
+	switch app.Status {
+	case StatusPartiallyDisbursed, StatusFullyDisbursed, StatusInMoratorium, StatusRepaymentActive, StatusInArrears:
+		// payable
+	default:
+		SendError(c.Writer, "invalid_state", fmt.Sprintf("loan status %q cannot accept payments", app.Status), http.StatusConflict, nil)
+		return
+	}
 
-	// Create payment record
+	// Server-side outstanding balance; overpayment is rejected, not clipped.
+	outstanding, err := fetchOutstandingBalance(app.ID, tenantID)
+	if err != nil {
+		log.Printf("ERROR: cannot read outstanding balance for loan %s: %v", app.ID, err)
+		SendError(c.Writer, "internal_error", "Failed to read outstanding balance", http.StatusInternalServerError, nil)
+		return
+	}
+	if req.Amount > outstanding {
+		SendError(c.Writer, "validation_failed",
+			fmt.Sprintf("payment %.2f exceeds outstanding balance %.2f — pay the exact outstanding amount or request a payoff quote", req.Amount, outstanding),
+			http.StatusBadRequest, nil)
+		return
+	}
+	if app.PrincipalAccountID == "" {
+		SendError(c.Writer, "invalid_state", "loan has no ledger accounts — cannot record repayment", http.StatusConflict, nil)
+		return
+	}
+
+	// Create the payment row in 'processing' state; the TB transfer id is
+	// deterministic on the payment id (repay:{payment_id}).
 	payment := &EducationLoanPayment{
-		ID:                  generateID("PAY"),
-		LoanID:              app.ID,
-		TenantID:            tenantID,
-		PaidDate:            timePtr(time.Now()),
-		PaidAmount:          req.Amount,
-		Status:              "completed",
-		PaymentMethod:       req.PaymentMethod,
-		PaymentReference:    req.PaymentReference,
-		LedgerTransactionID: "", // txID
+		ID:               generateID("PAY"),
+		LoanID:           app.ID,
+		TenantID:         tenantID,
+		PaidDate:         timePtr(time.Now()),
+		PaidAmount:       req.Amount,
+		Status:           "processing",
+		PaymentMethod:    req.PaymentMethod,
+		PaymentReference: req.PaymentReference,
+	}
+	if err := savePayment(payment); err != nil {
+		SendError(c.Writer, "internal_error", "Failed to record payment", http.StatusInternalServerError, nil)
+		return
 	}
 
-	savePayment(payment)
-
-	// Update outstanding balance
-	app.OutstandingBalance -= req.Amount
-	if app.OutstandingBalance <= 0 {
-		app.Status = StatusSettled
-		updateEducationLoanStatus(id, tenantID, StatusSettled)
+	// Move the money FIRST; only a cluster-confirmed transfer is completed.
+	ledgerTxID, err := eduTBClient.CreateRepaymentTransfer(
+		req.CustomerAccountID,
+		app.PrincipalAccountID,
+		app.InterestAccountID,
+		req.Amount,
+		payment.ID,
+	)
+	if err != nil {
+		log.Printf("Repayment transfer failed for loan %s payment %s: %v", app.ID, payment.ID, err)
+		if uerr := updatePaymentLedgerStatus(payment.ID, "failed", ""); uerr != nil {
+			log.Printf("ALERT: could not mark payment %s failed: %v", payment.ID, uerr)
+		}
+		SendError(c.Writer, "ledger_unavailable", "Failed to process payment — no funds were moved", http.StatusBadGateway, nil)
+		return
 	}
 
-	// Publish events
-	// PublishEvent("education-loans.payments", MortgageEvent{
-	// 	Type:       "education_loan.payment.received",
-	// 	MortgageID: app.ID,
-	// 	TenantID:   tenantID,
-	// 	Amount:     req.Amount,
-	// 	Timestamp:  time.Now(),
-	// })
+	if err := updatePaymentLedgerStatus(payment.ID, "completed", ledgerTxID); err != nil {
+		// Funds moved but status persistence failed; the payment row exists
+		// in 'processing' with the deterministic ledger id recoverable.
+		log.Printf("ALERT: payment %s completed in ledger (%s) but status update failed: %v — manual reconciliation required", payment.ID, ledgerTxID, err)
+	}
+
+	newBalance := outstanding - req.Amount
+	settled := newBalance <= 0
+	if err := updateOutstandingBalanceAndStatus(app.ID, tenantID, newBalance, settled); err != nil {
+		log.Printf("ALERT: payment %s ledger-confirmed (%s) but balance update failed for loan %s: %v — manual reconciliation required", payment.ID, ledgerTxID, app.ID, err)
+	}
+
+	if err := eduKafkaClient.PublishEvent("education_loan.payment", EduEvent{
+		Type:      "education_loan.payment.received",
+		EntityID:  app.ID,
+		TenantID:  tenantID,
+		Status:    "completed",
+		Amount:    req.Amount,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"payment_id":            payment.ID,
+			"ledger_transaction_id": ledgerTxID,
+			"outstanding_balance":   newBalance,
+		},
+	}); err != nil {
+		log.Printf("ERROR: kafka publish for payment %s failed (funds already moved, id %s): %v", payment.ID, ledgerTxID, err)
+	}
 
 	lakehouseClient.PublishEvent("education_loan_payment", map[string]interface{}{
 		"application_id":      app.ID,
 		"payment_id":          payment.ID,
 		"amount":              req.Amount,
-		"outstanding_balance": app.OutstandingBalance,
+		"outstanding_balance": newBalance,
 		"payment_method":      req.PaymentMethod,
 		"paid_at":             time.Now(),
 	}, "education-loan-service")
@@ -1477,8 +1599,8 @@ func recordPayment(c *gin.Context) {
 		"status":              "payment_recorded",
 		"payment_id":          payment.ID,
 		"amount":              req.Amount,
-		"transaction_id":      "",
-		"outstanding_balance": app.OutstandingBalance,
+		"transaction_id":      ledgerTxID,
+		"outstanding_balance": newBalance,
 	})
 }
 
@@ -1494,6 +1616,91 @@ func getPaymentHistory(c *gin.Context) {
 	c.JSON(200, gin.H{"payments": payments})
 }
 
+// LN-10 (L11): maker-checker-gated education-loan write-off. Moves the
+// outstanding principal to the write-off account in TigerBeetle
+// (deterministic id writeoff:{loan_id}), marks the loan written_off, and
+// sets the IFRS-9 exposure to stage 3.
+func writeOffEducationLoan(c *gin.Context) {
+	id := c.Param("id")
+	tenantID := c.GetString("tenant_id")
+
+	officerID := c.GetHeader("X-Keycloak-ID")
+	if officerID == "" {
+		SendError(c.Writer, "unauthenticated", "authenticated officer identity required", http.StatusUnauthorized, nil)
+		return
+	}
+	if !hasAnyRole(c.GetHeader("X-User-Role"), "loan_approver", "loan-manager", "lending_manager", "admin") {
+		SendError(c.Writer, "forbidden", "write-off requires a lending-approval role", http.StatusForbidden, nil)
+		return
+	}
+	if c.GetHeader("x-maker-checker-approval-id") == "" {
+		SendError(c.Writer, "precondition_failed", "write-off requires a maker-checker approval id (x-maker-checker-approval-id header)", http.StatusPreconditionFailed, nil)
+		return
+	}
+
+	var req struct {
+		Reason string `json:"reason" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		SendError(c.Writer, "validation_failed", err.Error(), http.StatusBadRequest, nil)
+		return
+	}
+
+	app, err := fetchEducationLoanApplication(id, tenantID)
+	if err != nil {
+		SendError(c.Writer, "not_found", "Application not found", http.StatusNotFound, nil)
+		return
+	}
+	if app.Status != StatusInArrears && app.Status != StatusDefault && app.Status != StatusRepaymentActive {
+		SendError(c.Writer, "conflict", "only delinquent/defaulted loans are write-off eligible", http.StatusConflict, nil)
+		return
+	}
+	if app.PrincipalAccountID == "" {
+		SendError(c.Writer, "invalid_state", "loan has no ledger accounts", http.StatusConflict, nil)
+		return
+	}
+
+	// Outstanding principal from the ledger — fail closed.
+	principalBalance, err := eduTBClient.GetAccountBalance(app.PrincipalAccountID)
+	if err != nil {
+		SendError(c.Writer, "ledger_unavailable", "cannot read outstanding principal: ledger unavailable", http.StatusBadGateway, nil)
+		return
+	}
+	if principalBalance <= 0 {
+		SendError(c.Writer, "conflict", "no outstanding principal to write off", http.StatusConflict, nil)
+		return
+	}
+
+	writeOffAccount := os.Getenv("EDU_WRITE_OFF_ACCOUNT_ID")
+	if writeOffAccount == "" {
+		writeOffAccount = "edu-writeoffs:" + tenantID
+	}
+
+	transferID, err := eduTBClient.CreateWriteOffTransfer(app.PrincipalAccountID, writeOffAccount, principalBalance, app.ID)
+	if err != nil {
+		SendError(c.Writer, "ledger_unavailable", "write-off transfer failed — nothing was written off", http.StatusBadGateway, nil)
+		return
+	}
+
+	if err := updateEducationLoanStatus(id, tenantID, StatusWrittenOff); err != nil {
+		log.Printf("ALERT: education loan %s write-off transfer %s completed but status update failed: %v — manual reconciliation required", id, transferID, err)
+	}
+
+	// ECL stage-3 marker (table read by ifrs9-ecl-engine-rs).
+	if db != nil {
+		if _, err := db.Exec(`UPDATE ifrs9_exposures SET stage = 3 WHERE id = $1`, "education:"+id); err != nil {
+			log.Printf("WARN: ifrs9 stage-3 marker failed for education loan %s: %v", id, err)
+		}
+	}
+
+	log.Printf("Education loan %s written off by %s (transfer %s, reason: %s, mc: %s)",
+		id, officerID, transferID, req.Reason, c.GetHeader("x-maker-checker-approval-id"))
+	c.JSON(200, gin.H{"status": "written_off", "loan_id": id, "transfer_id": transferID, "amount": principalBalance, "written_off_by": officerID})
+}
+
+// LN-06 (L6-edu): real payoff quote. Reads the principal and accrued
+// interest balances from TigerBeetle (fail-closed on cluster error) and
+// returns principal + accrued interest. The print(app) leak is removed.
 func calculatePayoff(c *gin.Context) {
 	id := c.Param("id")
 	tenantID := c.GetString("tenant_id")
@@ -1504,16 +1711,30 @@ func calculatePayoff(c *gin.Context) {
 		return
 	}
 
-	print(app)
+	if app.PrincipalAccountID == "" {
+		SendError(c.Writer, "invalid_state", "loan has no ledger accounts — no payoff quote available", http.StatusConflict, nil)
+		return
+	}
 
-	// Get current balances from TigerBeetle
-	// principalBalance, _ := GetAccountBalance(app.PrincipalAccountID)
-	// interestBalance, _ := GetAccountBalance(app.InterestAccountID)
+	// Current balances from TigerBeetle — fail closed, never fabricate zeros.
+	principalBalance, err := eduTBClient.GetAccountBalance(app.PrincipalAccountID)
+	if err != nil {
+		log.Printf("ERROR: payoff principal balance read failed for loan %s: %v", app.ID, err)
+		SendError(c.Writer, "ledger_unavailable", "Cannot compute payoff: ledger unavailable", http.StatusBadGateway, nil)
+		return
+	}
+	interestBalance := 0.0
+	if app.InterestAccountID != "" {
+		interestBalance, err = eduTBClient.GetAccountBalance(app.InterestAccountID)
+		if err != nil {
+			log.Printf("ERROR: payoff interest balance read failed for loan %s: %v", app.ID, err)
+			SendError(c.Writer, "ledger_unavailable", "Cannot compute payoff: ledger unavailable", http.StatusBadGateway, nil)
+			return
+		}
+	}
 
-	principalBalance := 0
-	interestBalance := 0
-
-	// Calculate payoff amount (principal + accrued interest + any fees)
+	// Payoff = outstanding principal + accrued interest. No rebate policy is
+	// configured for education loans, so the full accrued interest is due.
 	payoffAmount := principalBalance + interestBalance
 
 	c.JSON(200, gin.H{
@@ -1561,17 +1782,6 @@ func recordAcademicProgress(c *gin.Context) {
 	// Check if student is still eligible (minimum GPA requirement)
 	if req.GPA < 2.0 {
 		// Flag for review - may need to pause disbursements
-		// PublishEvent("education-loans.alerts", MortgageEvent{
-		// 	Type:       "education_loan.academic.warning",
-		// 	MortgageID: id,
-		// 	TenantID:   tenantID,
-		// 	Timestamp:  time.Now(),
-		// 	Metadata: map[string]interface{}{
-		// 		"gpa":      req.GPA,
-		// 		"semester": req.Semester,
-		// 		"message":  "Student GPA below minimum requirement",
-		// 	},
-		// })
 	}
 
 	// Publish to lakehouse for analytics
@@ -1606,11 +1816,24 @@ func extendMoratorium(c *gin.Context) {
 	var req struct {
 		AdditionalMonths int    `json:"additional_months" binding:"required"`
 		Reason           string `json:"reason" binding:"required"`
-		ApprovedBy       string `json:"approved_by" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		SendError(c.Writer, "validation_failed", err.Error(), http.StatusBadRequest, nil)
+		return
+	}
+
+	// LN-07 (L7): the approver identity comes ONLY from the verified JWT
+	// claims (X-Keycloak-ID is set by jwtAuthMiddleware from the token sub),
+	// never from a self-asserted request-body field. The caller must hold a
+	// lending-approval role.
+	approvedBy := c.GetHeader("X-Keycloak-ID")
+	if approvedBy == "" {
+		SendError(c.Writer, "unauthenticated", "authenticated approver identity required", http.StatusUnauthorized, nil)
+		return
+	}
+	if !hasAnyRole(c.GetHeader("X-User-Role"), "loan_approver", "loan-manager", "lending_manager", "admin") {
+		SendError(c.Writer, "forbidden", "moratorium extension requires a lending-approval role", http.StatusForbidden, nil)
 		return
 	}
 
@@ -1634,9 +1857,7 @@ func extendMoratorium(c *gin.Context) {
 		app.MaturityDate = &maturity
 	}
 
-	saveMoratoriumExtension(app, req.AdditionalMonths, req.Reason, req.ApprovedBy)
-
-	// PublishApplicationEvent("education_loan.moratorium.extended", app)
+	saveMoratoriumExtension(app, req.AdditionalMonths, req.Reason, approvedBy)
 
 	c.JSON(200, gin.H{
 		"status":              "moratorium_extended",
@@ -1665,18 +1886,6 @@ func requestDeferment(c *gin.Context) {
 	// Create deferment request
 	defermentID := generateID("DEF")
 	saveDefermentRequest(id, defermentID, req.DefermentType, req.DurationMonths, req.Reason)
-
-	// PublishEvent("education-loans.deferments", MortgageEvent{
-	// 	Type:       "education_loan.deferment.requested",
-	// 	MortgageID: id,
-	// 	TenantID:   tenantID,
-	// 	Timestamp:  time.Now(),
-	// 	Metadata: map[string]interface{}{
-	// 		"deferment_id":   defermentID,
-	// 		"deferment_type": req.DefermentType,
-	// 		"duration":       req.DurationMonths,
-	// 	},
-	// })
 
 	c.JSON(200, gin.H{
 		"status":       "deferment_requested",
@@ -1722,18 +1931,6 @@ func addGuarantor(c *gin.Context) {
 	}
 
 	saveGuarantor(guarantor)
-
-	// PublishEvent("education-loans.guarantors", MortgageEvent{
-	// 	Type:       "education_loan.guarantor.added",
-	// 	MortgageID: id,
-	// 	TenantID:   tenantID,
-	// 	Timestamp:  time.Now(),
-	// 	Metadata: map[string]interface{}{
-	// 		"guarantor_id":   guarantor.ID,
-	// 		"guarantor_name": guarantor.Name,
-	// 		"relationship":   guarantor.Relationship,
-	// 	},
-	// })
 
 	c.JSON(201, guarantor)
 }

@@ -14,6 +14,33 @@ import { IQuoteAgreedEvent, IQuoteInitiatedEvent } from "../../types/events";
 import { IIlpPrepTxnData } from "../../types";
 import { lowerDenominatorMultiplier } from "../../utils/constants";
 import Decimal from "decimal.js";
+import { createHmac } from "crypto";
+
+/**
+ * MN-16 (F13-8): HMAC-signed rate-lock token. The token binds
+ * quote_id + transaction_id + integer minor-unit amount + expiry; execution
+ * (payment-processing /transfers/*) verifies the signature and that the
+ * executed amount equals the quoted amount, so quote == execution.
+ */
+function issueRateLockToken(params: {
+  quote_id: string;
+  transaction_id: string;
+  amount_minor: string;
+  currency: string;
+  exp_epoch_seconds: number;
+}): string {
+  const secret = process.env.FX_RATE_LOCK_SECRET || "";
+  if (!secret) {
+    // Fail-fast: a quote without a verifiable rate-lock must not be issued.
+    throw new ApiError(
+      httpStatus.INTERNAL_SERVER_ERROR,
+      "FX_RATE_LOCK_SECRET is not configured; cannot issue rate-locked quote",
+    );
+  }
+  const payloadB64 = Buffer.from(JSON.stringify(params)).toString("base64url");
+  const sig = createHmac("sha256", secret).update(payloadB64).digest("hex");
+  return `${payloadB64}.${sig}`;
+}
 
 const logger = createLogger(extract_name_form_path(__filename));
 
@@ -139,11 +166,24 @@ export const create_quote = asyncHandler(async (req, res) => {
 
   const quotePersistKey = `quote:payee:${payload.transactionId}`;
 
+  // MN-16: signed rate-lock token persisted with the quote and returned to
+  // the payer FSP for execution-time verification.
+  const rateLockToken = issueRateLockToken({
+    quote_id: payload.quoteId,
+    transaction_id: payload.transactionId,
+    amount_minor: amount.toString(),
+    currency: payload.amount.currency,
+    exp_epoch_seconds: Math.floor(expiration.getTime() / 1000),
+  });
+
   const response = {
     ilpPacket,
     condition,
     transferAmount: payload.amount,
     expiration: expiration.toISOString(),
+    extensionList: [
+      { key: "rateLockToken", value: rateLockToken },
+    ],
   };
 
   logger.info(`Quote Response ${JSON.stringify(response)}`);
@@ -155,6 +195,10 @@ export const create_quote = asyncHandler(async (req, res) => {
         fulfillment,
         ilpAddress,
         amount: amount.toString(),
+        // MN-16: persist the rate-lock token with the quote for adjudication.
+        rateLockToken,
+        quoteId: payload.quoteId,
+        currency: payload.amount.currency,
       }),
       "EX",
       20

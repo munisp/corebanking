@@ -14,11 +14,16 @@ import (
 	"syscall"
 
 	"bytes"
+	"crypto"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"os"
@@ -43,28 +48,11 @@ func cryptoRandUint32() uint32 {
 
 var serviceName = "loan-origination-go"
 
-// Inter-service URLs
-var creditScoringURL = func() string {
-	v := os.Getenv("CREDIT_SCORING_URL")
-	if v == "" {
-		return "http://localhost:8203"
-	}
-	return v
-}()
-var amlEngineURL = func() string {
-	v := os.Getenv("AML_ENGINE_URL")
-	if v == "" {
-		return "http://localhost:8120"
-	}
-	return v
-}()
-var coreBankingURL = func() string {
-	v := os.Getenv("CORE_BANKING_URL")
-	if v == "" {
-		return "http://localhost:8100"
-	}
-	return v
-}()
+// LN-16 (L17): the dead callers callCreditScore/callAMLScreen/callDisburseLoan
+// (POST /v1/score, /v1/screen, /v1/transfers — endpoints no service in the
+// fleet serves) are deleted together with their URL configuration. Real
+// scoring is routed through credit-service (see credit-scoring-py route) and
+// disbursement through the owning loan engines.
 
 var startTime = time.Now()
 
@@ -532,24 +520,6 @@ func callService(method, url string, body interface{}) (map[string]interface{}, 
 	return nil, fmt.Errorf("all retries exhausted for %s: %w", url, lastErr)
 }
 
-func callCreditScore(customerID string, amount float64) (map[string]interface{}, error) {
-	return callService("POST", creditScoringURL+"/v1/score", map[string]interface{}{
-		"customer_id": customerID, "loan_amount": amount,
-	})
-}
-
-func callAMLScreen(customerID string, amount float64) (map[string]interface{}, error) {
-	return callService("POST", amlEngineURL+"/v1/screen", map[string]interface{}{
-		"customer_id": customerID, "amount": amount, "type": "loan_origination",
-	})
-}
-
-func callDisburseLoan(loanID string, accountID string, amount float64) (map[string]interface{}, error) {
-	return callService("POST", coreBankingURL+"/v1/transfers", map[string]interface{}{
-		"loan_id": loanID, "to_account": accountID, "amount": amount, "currency": "NGN",
-	})
-}
-
 // --- Counting Middleware ---
 func countingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -802,6 +772,7 @@ func calculateEMI(principal, annualRate float64, tenorMonths int) float64 {
 	}
 	monthlyRate := annualRate / 12.0 / 100.0
 	n := float64(tenorMonths)
+	_ = n // pre-existing unused; retained for clarity
 	pow := 1.0
 	for i := 0; i < tenorMonths; i++ {
 		pow *= (1 + monthlyRate)
@@ -905,6 +876,7 @@ func validateLoanApplication(app LoanApplication) (LoanDecision, error) {
 	if maxAffordableEMI > 0 && app.InterestRate > 0 {
 		monthlyRate := app.InterestRate / 12.0 / 100.0
 		n := float64(app.TenorMonths)
+		_ = n // pre-existing unused; retained for clarity
 		pow := 1.0
 		for i := 0; i < app.TenorMonths; i++ {
 			pow *= (1 + monthlyRate)

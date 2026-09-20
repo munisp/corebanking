@@ -166,16 +166,25 @@ func loanLifecycleToGL(w http.ResponseWriter, r *http.Request) {
 			}},
 	}
 
+	// MN-22: derive summary counters from the event list instead of hardcoding
+	// them, so the response can never contradict its own payload.
+	countByType := map[string]int{}
+	totalGLEntries := 0
+	for _, ev := range events {
+		countByType[ev.EventType]++
+		totalGLEntries += len(ev.GLPostings)
+	}
+
 	result := map[string]interface{}{
 		"batchId":      fmt.Sprintf("LOAN-GL-%s", businessDate),
 		"businessDate": businessDate,
 		"events":       events,
 		"summary": map[string]interface{}{
-			"disbursements":   1,
-			"repayments":      1,
-			"writeOffs":       1,
-			"restructures":    1,
-			"totalGLEntries":  8,
+			"disbursements":   countByType["disbursement"],
+			"repayments":      countByType["repayment"],
+			"writeOffs":       countByType["write_off"],
+			"restructures":    countByType["restructure"],
+			"totalGLEntries":  totalGLEntries,
 			"glCodesImpacted": []string{"1301 (Loans & Advances)", "1309 (Restructured)", "1357 (ECL Provision)", "2101 (Deposits)", "4101 (Interest Income)", "4203 (Processing Fee)", "9101 (Off-BS Memo)"},
 		},
 		"pipeline": map[string]string{
@@ -240,94 +249,34 @@ func fxDealingToGL(w http.ResponseWriter, r *http.Request) {
 // GAP 11: FIXED DEPOSIT → GL (placement, maturity, early liquidation)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// MN-22: The previous implementation served hardcoded fixed-deposit GL events
+// (FD-PLACE-001 etc.) stamped as posted via the middlewareActions fiction.
+// There is no FD table and no FD event source in the fleet
+// (computeFixedDepositMaturity has 0 callers). Fail honestly until the FD
+// module is built (ROADMAP).
 func fixedDepositToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("FD-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"events": []map[string]interface{}{
-			{"eventId": "FD-PLACE-001", "type": "placement", "customerId": "CUST-015", "customer": "Hassan Premium", "principal": 50_000_000, "tenor": 180, "rate": 14.0,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-PLACE-001", DebitGL: "2101", DebitName: "Savings Account (debit)", CreditGL: "2103", CreditName: "Fixed Deposit Liability", Amount: 50_000_000, Narration: "FD placement - 180 days @ 14% p.a."},
-				}},
-			{"eventId": "FD-MATURE-001", "type": "maturity", "customerId": "CUST-008", "customer": "Amina Term Deposit", "principal": 25_000_000, "interest": 1_750_000, "tenor": 365, "rate": 7.0,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-MAT-001-P", DebitGL: "2103", DebitName: "Fixed Deposit Liability (release)", CreditGL: "2101", CreditName: "Customer Savings Account", Amount: 25_000_000, Narration: "FD maturity - principal release"},
-					{EntryID: "JE-FD-MAT-001-I", DebitGL: "5102", DebitName: "Interest Expense on FD", CreditGL: "2101", CreditName: "Customer Savings Account", Amount: 1_750_000, Narration: "FD maturity - interest payout"},
-					{EntryID: "JE-FD-MAT-001-W", DebitGL: "2101", DebitName: "Customer Account (WHT debit)", CreditGL: "2312", CreditName: "WHT Payable to FIRS", Amount: 175_000, Narration: "10% WHT on FD interest (FIRS remittance)"},
-				}},
-			{"eventId": "FD-EARLY-001", "type": "early_liquidation", "customerId": "CUST-022", "customer": "Urgency Corp", "principal": 10_000_000, "penalty": 200_000, "interestForfeited": 350_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-FD-EARLY-001", DebitGL: "2103", DebitName: "Fixed Deposit Liability", CreditGL: "2101", CreditName: "Customer Account (net)", Amount: 9_800_000, Narration: "Early liquidation (principal - penalty)"},
-					{EntryID: "JE-FD-PENALTY-001", DebitGL: "2103", DebitName: "FD Liability (penalty portion)", CreditGL: "4209", CreditName: "Early Liquidation Penalty Income", Amount: 200_000, Narration: "Penalty for breaking FD before maturity"},
-				}},
-		},
-		"summary": map[string]interface{}{
-			"placements":        1,
-			"maturities":        1,
-			"earlyLiquidations": 1,
-			"glCodesImpacted":   []string{"2101 (Savings)", "2103 (FD Liability)", "5102 (Interest Expense)", "2312 (WHT Payable)", "4209 (Penalty Income)"},
-		},
-		"pipeline": map[string]string{
-			"step1": "FD event triggered (placement/maturity/early liquidation/top-up/rollover)",
-			"step2": "Placement: Dr 2101 (savings) / Cr 2103 (FD liability) — funds locked",
-			"step3": "Maturity: Dr 2103 / Cr 2101 (principal + interest released)",
-			"step4": "Deduct WHT at 10% on interest earned → GL 2312 (WHT Payable)",
-			"step5": "Early break: Apply penalty, forfeit accrued interest, release net",
-			"step6": "Auto-rollover: Re-book at prevailing rate if instruction exists",
-		},
-		"middleware": middlewareActions("banking.fixed_deposit.lifecycle"),
-	}
-	respondJSON(w, result)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error":  "not_implemented",
+		"detail": "fixed-deposit lifecycle GL posting is not implemented: no FD ledger or event source exists (MN-22). This endpoint previously returned fabricated journals; it now fails closed.",
+	})
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // GAP 12: STANDING INSTRUCTIONS → GL (scheduled execution posting)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// MN-22: The previous implementation served hardcoded standing-instruction GL
+// executions (SI-001..004) stamped as posted via the middlewareActions fiction.
+// No standing-instruction scheduler/executor exists in the fleet. Fail honestly.
 func standingInstructionsToGL(w http.ResponseWriter, r *http.Request) {
-	businessDate := time.Now().Format("2006-01-02")
-	result := map[string]interface{}{
-		"batchId":      fmt.Sprintf("SI-GL-%s", businessDate),
-		"businessDate": businessDate,
-		"executions": []map[string]interface{}{
-			{"siId": "SI-001", "type": "salary_payment", "customer": "Dangote Cement PLC", "beneficiaries": 450, "totalAmount": 180_000_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-SAL-001", DebitGL: "2101", DebitName: "Corporate Current Account", CreditGL: "2101", CreditName: "Staff Salary Accounts (batch)", Amount: 180_000_000, Narration: "Salary bulk payment - 450 beneficiaries"},
-					{EntryID: "JE-SI-SAL-FEE-001", DebitGL: "2101", DebitName: "Corporate (bulk fee)", CreditGL: "4208", CreditName: "Bulk Payment Fee Income", Amount: 22_500, Narration: "₦50/head × 450 salary credits"},
-				}},
-			{"siId": "SI-002", "type": "sweep", "customer": "Access Industries", "from": "Current", "to": "Investment", "amount": 25_000_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-SWEEP-001", DebitGL: "2101", DebitName: "Current Account", CreditGL: "2104", CreditName: "Call Deposit / Investment Account", Amount: 25_000_000, Narration: "Auto-sweep: balance above ₦50M to investment"},
-				}},
-			{"siId": "SI-003", "type": "loan_repayment", "customer": "Aisha Mohammed", "loanId": "LN-002", "amount": 125_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-REPAY-001", DebitGL: "2101", DebitName: "Customer Savings", CreditGL: "1301", CreditName: "Loans & Advances", Amount: 100_000, Narration: "Auto loan repayment - principal portion"},
-					{EntryID: "JE-SI-REPAY-INT-001", DebitGL: "2101", DebitName: "Customer Savings", CreditGL: "4101", CreditName: "Interest Income", Amount: 25_000, Narration: "Auto loan repayment - interest portion"},
-				}},
-			{"siId": "SI-004", "type": "bill_payment", "customer": "Zenith Construction", "biller": "EKEDC", "amount": 450_000,
-				"glPostings": []GLEntry{
-					{EntryID: "JE-SI-BILL-001", DebitGL: "2101", DebitName: "Customer Account", CreditGL: "2301", CreditName: "Bills Payable / Clearing", Amount: 450_000, Narration: "Auto bill payment to EKEDC"},
-				}},
-		},
-		"summary": map[string]interface{}{
-			"executed":          4,
-			"totalAmount":       205_575_000,
-			"failed":            0,
-			"insufficientFunds": 0,
-			"glCodesImpacted":   []string{"2101 (Current/Savings)", "2104 (Investment)", "2301 (Clearing)", "1301 (Loans)", "4101 (Interest Income)", "4208 (Bulk Fee)"},
-		},
-		"pipeline": map[string]string{
-			"step1": "Temporal workflow triggers at scheduled time (daily/weekly/monthly)",
-			"step2": "Check source account balance ≥ instruction amount",
-			"step3": "Execute transfer: Dr source GL / Cr destination GL",
-			"step4": "If cross-bank: route through NIP/NEFT with settlement GL posting",
-			"step5": "On failure: retry up to 3x, then mark failed + notify customer",
-			"step6": "Update execution counter + next execution date",
-		},
-		"middleware": middlewareActions("banking.standing_instructions.executed"),
-	}
-	respondJSON(w, result)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotImplemented)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error":  "not_implemented",
+		"detail": "standing-instruction execution GL posting is not implemented: no scheduler or execution pipeline exists (MN-22). This endpoint previously returned fabricated journals; it now fails closed.",
+	})
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

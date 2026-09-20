@@ -373,10 +373,69 @@ type LivestockLoan struct {
 
 type AgriculturalService struct {
 	db *sql.DB
+	tb *AgriTigerBeetleClient
 }
 
 func NewAgriculturalService(db *sql.DB) *AgriculturalService {
-	return &AgriculturalService{db: db}
+	return &AgriculturalService{db: db, tb: NewAgriTigerBeetleClient()}
+}
+
+// LN-13 (L14): expand-only schema for the agricultural lending ledger
+// records. No drops, no renames — safe against existing deployments.
+func (s *AgriculturalService) ensureLoanLedgerSchema() {
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS agricultural_loans (
+			id                  VARCHAR(64) PRIMARY KEY,
+			tenant_id           VARCHAR(64) NOT NULL,
+			farmer_id           VARCHAR(64),
+			farm_id             VARCHAR(64),
+			cooperative_id      VARCHAR(64),
+			loan_type           VARCHAR(64),
+			loan_amount         NUMERIC(18,2) NOT NULL DEFAULT 0,
+			disbursed_amount    NUMERIC(18,2) NOT NULL DEFAULT 0,
+			outstanding_amount  NUMERIC(18,2) NOT NULL DEFAULT 0,
+			interest_rate       NUMERIC(8,4) NOT NULL DEFAULT 0,
+			tenor_days          INT NOT NULL DEFAULT 0,
+			crop_type           VARCHAR(64),
+			status              VARCHAR(32) NOT NULL DEFAULT 'pending',
+			disbursed_at        TIMESTAMPTZ,
+			ledger_transaction_id VARCHAR(128),
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`ALTER TABLE agricultural_loans ADD COLUMN IF NOT EXISTS ledger_transaction_id VARCHAR(128)`,
+		`ALTER TABLE agricultural_loans ADD COLUMN IF NOT EXISTS disbursed_amount NUMERIC(18,2) NOT NULL DEFAULT 0`,
+		`ALTER TABLE agricultural_loans ADD COLUMN IF NOT EXISTS outstanding_amount NUMERIC(18,2) NOT NULL DEFAULT 0`,
+		`ALTER TABLE agricultural_loans ADD COLUMN IF NOT EXISTS disbursed_at TIMESTAMPTZ`,
+		`CREATE TABLE IF NOT EXISTS agricultural_loan_installments (
+			id                  VARCHAR(64) PRIMARY KEY,
+			loan_id             VARCHAR(64) NOT NULL REFERENCES agricultural_loans(id),
+			tenant_id           VARCHAR(64) NOT NULL,
+			installment_number  INT NOT NULL,
+			due_date            TIMESTAMPTZ NOT NULL,
+			principal_amount    NUMERIC(18,2) NOT NULL,
+			interest_amount     NUMERIC(18,2) NOT NULL,
+			total_amount        NUMERIC(18,2) NOT NULL,
+			status              VARCHAR(32) NOT NULL DEFAULT 'pending',
+			paid_at             TIMESTAMPTZ,
+			paid_amount         NUMERIC(18,2) NOT NULL DEFAULT 0,
+			created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (loan_id, installment_number)
+		)`,
+		`CREATE TABLE IF NOT EXISTS agricultural_loan_payments (
+			id                    VARCHAR(64) PRIMARY KEY,
+			loan_id               VARCHAR(64) NOT NULL REFERENCES agricultural_loans(id),
+			tenant_id             VARCHAR(64) NOT NULL,
+			amount                NUMERIC(18,2) NOT NULL,
+			status                VARCHAR(32) NOT NULL,
+			ledger_transaction_id VARCHAR(128),
+			created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+	}
+	for _, q := range stmts {
+		if _, err := s.db.Exec(q); err != nil {
+			log.Printf("[agricultural-service] schema ensure failed (loan ledger): %v", err)
+		}
+	}
 }
 
 // ==================== HTTP HANDLERS ====================
@@ -407,6 +466,7 @@ func (s *AgriculturalService) RegisterRoutes(r *mux.Router) {
 	r.HandleFunc("/api/v1/agriculture/loans/assess", s.AssessLoan).Methods("POST")
 	r.HandleFunc("/api/v1/agriculture/loans/apply", s.ApplyForLoan).Methods("POST")
 	r.HandleFunc("/api/v1/agriculture/loans/{loan_id}", s.GetLoan).Methods("GET")
+	r.HandleFunc("/api/v1/agriculture/loans/{loan_id}/approve", s.ApproveLoan).Methods("POST")
 	r.HandleFunc("/api/v1/agriculture/loans/{loan_id}/disburse", s.DisburseLoan).Methods("POST")
 	r.HandleFunc("/api/v1/agriculture/loans/{loan_id}/repay", s.RepayLoan).Methods("POST")
 
@@ -1050,37 +1110,191 @@ func (s *AgriculturalService) ListLoans(w http.ResponseWriter, r *http.Request) 
 	json.NewEncoder(w).Encode(map[string]interface{}{"loans": loans, "total": total, "page": page, "limit": limit})
 }
 
+// LN-13 (L14): minimal approval gate so the disbursement claim
+// (status='approved') is reachable through a controlled transition. The
+// approver identity comes from the authenticated X-Keycloak-ID header,
+// never the request body.
+func (s *AgriculturalService) ApproveLoan(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	loanID := vars["loan_id"]
+	tenantID := r.Header.Get("X-Tenant-ID")
+
+	approver := r.Header.Get("X-Keycloak-ID")
+	if approver == "" {
+		http.Error(w, "authenticated approver identity required", http.StatusUnauthorized)
+		return
+	}
+
+	res, err := s.db.ExecContext(r.Context(),
+		`UPDATE agricultural_loans SET status = 'approved' WHERE id = $1 AND tenant_id = $2 AND status = 'pending_approval'`,
+		loanID, tenantID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		http.Error(w, "loan not found or not pending approval", http.StatusConflict)
+		return
+	}
+	log.Printf("[agricultural-service] loan %s approved by %s", loanID, approver)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "approved", "loan_id": loanID, "approved_by": approver})
+}
+
+// LN-13 (L14): real disbursement saga (mortgage-service pattern):
+//  1. Atomic claim: UPDATE ... SET status='disbursing' WHERE status='approved'
+//     RETURNING — closes the double-disbursement race at the DB.
+//  2. The amount ALWAYS comes from the loan record, never the request body.
+//  3. Forward: TigerBeetle transfer (deterministic id agri:{loan_id}:disb).
+//  4. Commit: persist disbursed state + amortized repayment schedule rows.
+//  5. Compensation: post-claim failure reverses the transfer and releases
+//     the claim; failed reversal marks compensation_failed + ALERT.
 func (s *AgriculturalService) DisburseLoan(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	loanID := vars["loan_id"]
 	tenantID := r.Header.Get("X-Tenant-ID")
 
-	var req struct {
-		Amount float64 `json:"amount"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+	sourceAccount := os.Getenv("AGRI_DISBURSEMENT_ACCOUNT_ID")
+	if sourceAccount == "" {
+		http.Error(w, "AGRI_DISBURSEMENT_ACCOUNT_ID not configured — disbursement unavailable", http.StatusServiceUnavailable)
 		return
 	}
 
-	now := time.Now()
-	query := `UPDATE agricultural_loans SET status = 'disbursed', disbursed_amount = $1,
-		outstanding_amount = $1, disbursed_at = $2 WHERE id = $3 AND tenant_id = $4`
-
-	_, err := s.db.ExecContext(r.Context(), query, req.Amount, now, loanID, tenantID)
+	// Step 1 — atomic claim; amount from the loan record, not the body.
+	var (
+		amount   float64
+		farmerID string
+	)
+	err := s.db.QueryRowContext(r.Context(),
+		`UPDATE agricultural_loans SET status = 'disbursing'
+			WHERE id = $1 AND tenant_id = $2 AND status = 'approved'
+			RETURNING loan_amount, farmer_id`,
+		loanID, tenantID).Scan(&amount, &farmerID)
+	if err == sql.ErrNoRows {
+		http.Error(w, "loan not found, not approved, or disbursement already in progress", http.StatusConflict)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	if amount <= 0 || farmerID == "" {
+		s.releaseAgriDisbursementClaim(r, loanID, tenantID)
+		http.Error(w, "loan has no approved amount or farmer", http.StatusBadRequest)
+		return
+	}
+	farmerAccountID := "farmer:" + farmerID
 
+	// Step 2 — forward: move the funds.
+	transferID, err := s.tb.CreateAgriDisbursementTransfer(sourceAccount, farmerAccountID, amount, loanID)
+	if err != nil {
+		log.Printf("[agricultural-service] disbursement transfer failed for loan %s: %v", loanID, err)
+		s.releaseAgriDisbursementClaim(r, loanID, tenantID)
+		http.Error(w, "ledger unavailable — no funds were moved", http.StatusBadGateway)
+		return
+	}
+
+	// Step 3 — commit disbursed state + persist the repayment schedule.
+	now := time.Now()
+	res, err := s.db.ExecContext(r.Context(),
+		`UPDATE agricultural_loans SET status = 'disbursed', disbursed_amount = $1,
+			outstanding_amount = $1, disbursed_at = $2, ledger_transaction_id = $3
+			WHERE id = $4 AND tenant_id = $5 AND status = 'disbursing'`,
+		amount, now, transferID, loanID, tenantID)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n == 0 {
+			err = fmt.Errorf("commit updated no rows")
+		}
+	}
+	if err != nil {
+		// Compensation: reverse the ledger transfer; failure is never silent.
+		if rerr := s.tb.ReverseAgriDisbursement(sourceAccount, farmerAccountID, amount, loanID); rerr != nil {
+			log.Printf("ALERT: COMPENSATION FAILED for agri loan %s (transfer %s): %v (original: %v) — manual reconciliation required", loanID, transferID, rerr, err)
+			s.db.ExecContext(r.Context(), `UPDATE agricultural_loans SET status = 'compensation_failed' WHERE id = $1 AND tenant_id = $2`, loanID, tenantID)
+			http.Error(w, "disbursement failed and compensation failed — manual reconciliation required", http.StatusInternalServerError)
+			return
+		}
+		s.releaseAgriDisbursementClaim(r, loanID, tenantID)
+		http.Error(w, "failed to persist disbursement — disbursement reversed", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.persistRepaymentSchedule(r, loanID, tenantID, amount, now); err != nil {
+		log.Printf("ALERT: agri loan %s disbursed (%s) but schedule persistence failed: %v", loanID, transferID, err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":       "disbursed",
-		"loan_id":      loanID,
-		"amount":       req.Amount,
-		"disbursed_at": now,
+		"status":         "disbursed",
+		"loan_id":        loanID,
+		"amount":         amount,
+		"transaction_id": transferID,
+		"disbursed_at":   now,
 	})
 }
 
+// releaseAgriDisbursementClaim rolls a claimed loan back to 'approved'.
+func (s *AgriculturalService) releaseAgriDisbursementClaim(r *http.Request, loanID, tenantID string) {
+	if _, err := s.db.ExecContext(r.Context(),
+		`UPDATE agricultural_loans SET status = 'approved' WHERE id = $1 AND tenant_id = $2 AND status = 'disbursing'`,
+		loanID, tenantID); err != nil {
+		log.Printf("ALERT: failed to release disbursement claim for agri loan %s: %v", loanID, err)
+	}
+}
+
+// persistRepaymentSchedule writes the amortized installment rows (EMI over
+// tenor months) that collections are driven from (LN-13).
+func (s *AgriculturalService) persistRepaymentSchedule(r *http.Request, loanID, tenantID string, amount float64, disbursedAt time.Time) error {
+	var interestRate float64
+	var tenorDays int
+	if err := s.db.QueryRowContext(r.Context(),
+		`SELECT interest_rate, tenor_days FROM agricultural_loans WHERE id = $1 AND tenant_id = $2`,
+		loanID, tenantID).Scan(&interestRate, &tenorDays); err != nil {
+		return err
+	}
+	months := tenorDays / 30
+	if months < 1 {
+		months = 1
+	}
+
+	// Amortized EMI (monthly rate = annual% / 12 / 100).
+	mr := interestRate / 12 / 100
+	var emi float64
+	if mr > 0 {
+		pow := math.Pow(1+mr, float64(months))
+		emi = amount * mr * pow / (pow - 1)
+	} else {
+		emi = amount / float64(months)
+	}
+
+	balance := amount
+	for i := 1; i <= months; i++ {
+		interest := balance * mr
+		principal := emi - interest
+		if i == months {
+			principal = balance // final installment absorbs rounding
+		}
+		total := principal + interest
+		due := disbursedAt.AddDate(0, i, 0)
+		_, err := s.db.ExecContext(r.Context(),
+			`INSERT INTO agricultural_loan_installments
+				(id, loan_id, tenant_id, installment_number, due_date, principal_amount, interest_amount, total_amount, status)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+				ON CONFLICT (loan_id, installment_number) DO NOTHING`,
+			fmt.Sprintf("%s-INST-%d", loanID, i), loanID, tenantID, i, due, principal, interest, total)
+		if err != nil {
+			return err
+		}
+		balance -= principal
+	}
+	return nil
+}
+
+// LN-13 (L14): real repayment — the ledger transfer executes FIRST
+// (deterministic id repay-agri:{payment_id}); only a cluster-confirmed
+// transfer updates the outstanding balance. Precondition: loan is
+// disbursed/active. Overpayment is rejected, never silently clipped.
 func (s *AgriculturalService) RepayLoan(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	loanID := vars["loan_id"]
@@ -1093,37 +1307,80 @@ func (s *AgriculturalService) RepayLoan(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	if req.Amount <= 0 {
+		http.Error(w, "amount must be positive", http.StatusBadRequest)
+		return
+	}
 
-	// Get current outstanding
+	// Guard: only a disbursed loan with an outstanding balance can be repaid.
 	var outstanding float64
+	var farmerID, status string
 	err := s.db.QueryRowContext(r.Context(),
-		`SELECT outstanding_amount FROM agricultural_loans WHERE id = $1 AND tenant_id = $2`,
-		loanID, tenantID).Scan(&outstanding)
-
+		`SELECT outstanding_amount, farmer_id, status FROM agricultural_loans WHERE id = $1 AND tenant_id = $2`,
+		loanID, tenantID).Scan(&outstanding, &farmerID, &status)
+	if err == sql.ErrNoRows {
+		http.Error(w, "loan not found", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if status != "disbursed" && status != "active" {
+		http.Error(w, fmt.Sprintf("loan status %q cannot accept payments", status), http.StatusConflict)
+		return
+	}
+	if req.Amount > outstanding {
+		http.Error(w, fmt.Sprintf("payment %.2f exceeds outstanding balance %.2f", req.Amount, outstanding), http.StatusBadRequest)
+		return
+	}
+
+	// Payment row in 'processing' state; deterministic ledger id.
+	paymentID := fmt.Sprintf("AGPAY-%s-%d", loanID, time.Now().UnixNano())
+	if _, err := s.db.ExecContext(r.Context(),
+		`INSERT INTO agricultural_loan_payments (id, loan_id, tenant_id, amount, status) VALUES ($1, $2, $3, $4, 'processing')`,
+		paymentID, loanID, tenantID, req.Amount); err != nil {
+		http.Error(w, "failed to record payment", http.StatusInternalServerError)
+		return
+	}
+
+	// Move the money first.
+	farmerAccountID := "farmer:" + farmerID
+	loanAccountID := "agri-loan:" + loanID
+	transferID, err := s.tb.CreateAgriRepaymentTransfer(farmerAccountID, loanAccountID, req.Amount, paymentID)
+	if err != nil {
+		log.Printf("[agricultural-service] repayment transfer failed for loan %s: %v", loanID, err)
+		s.db.ExecContext(r.Context(), `UPDATE agricultural_loan_payments SET status = 'failed' WHERE id = $1`, paymentID)
+		http.Error(w, "ledger unavailable — no funds were moved", http.StatusBadGateway)
 		return
 	}
 
 	newOutstanding := outstanding - req.Amount
-	status := "active"
+	newStatus := "disbursed"
 	if newOutstanding <= 0 {
 		newOutstanding = 0
-		status = "completed"
+		newStatus = "completed"
 	}
 
-	query := `UPDATE agricultural_loans SET outstanding_amount = $1, status = $2 WHERE id = $3 AND tenant_id = $4`
-	_, err = s.db.ExecContext(r.Context(), query, newOutstanding, status, loanID, tenantID)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+	if _, err := s.db.ExecContext(r.Context(),
+		`UPDATE agricultural_loans SET outstanding_amount = $1, status = $2 WHERE id = $3 AND tenant_id = $4`,
+		newOutstanding, newStatus, loanID, tenantID); err != nil {
+		log.Printf("ALERT: agri repayment %s ledger-confirmed (%s) but balance update failed for loan %s: %v — manual reconciliation required", paymentID, transferID, loanID, err)
+	}
+	if _, err := s.db.ExecContext(r.Context(),
+		`UPDATE agricultural_loan_payments SET status = 'completed', ledger_transaction_id = $1 WHERE id = $2`,
+		transferID, paymentID); err != nil {
+		log.Printf("ALERT: agri repayment %s ledger-confirmed (%s) but payment status update failed: %v", paymentID, transferID, err)
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status":      status,
-		"loan_id":     loanID,
-		"amount_paid": req.Amount,
-		"outstanding": newOutstanding,
+		"status":         newStatus,
+		"loan_id":        loanID,
+		"payment_id":     paymentID,
+		"amount_paid":    req.Amount,
+		"transaction_id": transferID,
+		"outstanding":    newOutstanding,
 	})
 }
 
@@ -2318,6 +2575,7 @@ func main() {
 
 	// Initialize and register core agricultural service
 	service := NewAgriculturalService(db)
+	service.ensureLoanLedgerSchema()
 	service.RegisterRoutes(r)
 
 	// Initialize and register regulatory compliance service (Category 1)

@@ -162,17 +162,9 @@ func handleCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var body map[string]interface{}
 	json.NewDecoder(r.Body).Decode(&body)
-	// Inter-service call: aml_screening
-	_upstreamURL := os.Getenv("AML_ENGINE_URL")
-	if _upstreamURL == "" {
-		_upstreamURL = "http://localhost:8127"
-	}
-	_result, _err := callService("POST", _upstreamURL+"/v1/screen", nil)
-	if _err != nil {
-		log.Printf("aml-case-manager-go: aml_screening failed: %v", _err)
-	} else {
-		log.Printf("aml-case-manager-go: aml_screening ok: %v", _result)
-	}
+	// CP-03: removed decorative "aml_screening" inter-service call — it posted
+	// a nil body to /v1/screen, a path no AML/sanctions service exposes, and
+	// discarded the result.
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -1014,6 +1006,31 @@ func initSchema() {
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_compliance_records_status ON compliance_records(status)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_compliance_records_created ON compliance_records(created_at DESC)`)
 	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_outbox_unpublished ON outbox(published, created_at) WHERE NOT published`)
+
+	// CP-05: real AML case entity linking alerts ↔ SARs ↔ NFIU STRs with a
+	// status lifecycle. The case is the connective tissue of the
+	// alert → investigation → escalation → STR → closure flow.
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS aml_cases (
+		id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+		tenant_id VARCHAR(128) NOT NULL,
+		title TEXT NOT NULL,
+		description TEXT,
+		status VARCHAR(20) NOT NULL DEFAULT 'open'
+			CHECK (status IN ('open','investigating','escalated','str_filed','closed')),
+		priority VARCHAR(10) NOT NULL DEFAULT 'medium',
+		alert_ids JSONB NOT NULL DEFAULT '[]',
+		sar_ids JSONB NOT NULL DEFAULT '[]',
+		nfiu_str_ids JSONB NOT NULL DEFAULT '[]',
+		assignee VARCHAR(255),
+		created_by VARCHAR(255),
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	)`)
+	if err != nil {
+		log.Printf("aml_cases table creation failed: %v", err)
+	}
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_aml_cases_tenant ON aml_cases(tenant_id, created_at DESC)`)
+	_, _ = db.Exec(`CREATE INDEX IF NOT EXISTS idx_aml_cases_status ON aml_cases(status)`)
 }
 
 func domainHandler(w http.ResponseWriter, r *http.Request) {
@@ -1385,8 +1402,12 @@ func validateSTRFiling(caseID, narration string, amount float64) (bool, string) 
 	if narration == "" {
 		return false, "Narration required for STR"
 	}
-	if amount < 1000000 {
-		return false, "CTR threshold is ₦1M (NFIU)"
+	// CP-05: corrected threshold — CBN AML/CFT Regulations 2022 set the
+	// individual CTR threshold at ₦5,000,000 (₦10,000,000 corporate), per
+	// nfiu-ctr-str-filing-py (CTR_INDIVIDUAL_THRESHOLD_KOBO = 500,000,000 kobo).
+	// The previous ₦1M constant was wrong. `amount` is in NGN here.
+	if amount < 5000000 {
+		return false, "below CTR threshold (₦5M individual / ₦10M corporate, CBN AML/CFT 2022)"
 	}
 	return true, "Valid for filing"
 }
@@ -1584,6 +1605,15 @@ func main() {
 	mux.Handle("/v1/aml-case-manager/stats", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleStats)))
 	mux.Handle("/v1/aml-case-manager/screen", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(aml_case_managerScreenHandler)))
 	mux.Handle("/v1/aml-case-manager/risk-score", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(aml_case_managerRiskScoreHandler)))
+	// CP-05: real AML case entity + lifecycle
+	mux.Handle("/v1/aml-case-manager/cases", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" {
+			handleCreateCase(w, r)
+		} else {
+			handleListCases(w, r)
+		}
+	})))
+	mux.Handle("/v1/aml-case-manager/cases/", jwtMiddleware(jwtRealmURL(), http.HandlerFunc(handleCaseDetail)))
 	log.Printf("Aml Case Manager v2.0 (AML/Compliance) on :%s", port)
 	tlsEnabled, tlsCert, tlsKey := getTLSConfig()
 	_ = tlsCert
@@ -1618,6 +1648,238 @@ func main() {
 }
 
 func jsonResp(w http.ResponseWriter, code int, data interface{}) { respondJSON(w, code, data) }
+
+// ── CP-05: AML case lifecycle (real Postgres entity) ────────────────────────
+
+// amlCaseLifecycle defines the only legal status transitions.
+var amlCaseLifecycle = map[string][]string{
+	"open":          {"investigating", "closed"},
+	"investigating": {"escalated", "str_filed", "closed"},
+	"escalated":     {"str_filed", "closed"},
+	"str_filed":     {"closed"},
+	"closed":        {},
+}
+
+func amlCaseDB(w http.ResponseWriter) bool {
+	if db == nil {
+		respondJSON(w, 503, map[string]string{"error": "database unavailable"})
+		return false
+	}
+	return true
+}
+
+func handleCreateCase(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		respondJSON(w, 405, map[string]string{"error": "POST required"})
+		return
+	}
+	if !amlCaseDB(w) {
+		return
+	}
+	var body struct {
+		TenantID    string   `json:"tenant_id"`
+		Title       string   `json:"title"`
+		Description string   `json:"description"`
+		Priority    string   `json:"priority"`
+		AlertIDs    []string `json:"alert_ids"`
+		CreatedBy   string   `json:"created_by"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		respondJSON(w, 400, map[string]string{"error": "invalid json"})
+		return
+	}
+	if body.TenantID == "" || body.Title == "" {
+		respondJSON(w, 400, map[string]string{"error": "tenant_id and title required"})
+		return
+	}
+	if body.Priority == "" {
+		body.Priority = "medium"
+	}
+	alerts, _ := json.Marshal(body.AlertIDs)
+	if body.AlertIDs == nil {
+		alerts = []byte("[]")
+	}
+	var id string
+	err := db.QueryRow(
+		`INSERT INTO aml_cases (tenant_id, title, description, priority, alert_ids, created_by)
+		 VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
+		body.TenantID, body.Title, body.Description, body.Priority, string(alerts), body.CreatedBy,
+	).Scan(&id)
+	if err != nil {
+		log.Printf("create aml case failed: %v", err)
+		respondJSON(w, 500, map[string]string{"error": "case creation failed"})
+		return
+	}
+	respondJSON(w, 201, map[string]interface{}{"id": id, "status": "open"})
+}
+
+func handleListCases(w http.ResponseWriter, r *http.Request) {
+	if !amlCaseDB(w) {
+		return
+	}
+	tenant := r.URL.Query().Get("tenant_id")
+	status := r.URL.Query().Get("status")
+	query := `SELECT id, tenant_id, title, status, priority, alert_ids, sar_ids, nfiu_str_ids, assignee, created_at, updated_at FROM aml_cases`
+	args := []interface{}{}
+	conds := []string{}
+	if tenant != "" {
+		conds = append(conds, fmt.Sprintf("tenant_id = $%d", len(args)+1))
+		args = append(args, tenant)
+	}
+	if status != "" {
+		conds = append(conds, fmt.Sprintf("status = $%d", len(args)+1))
+		args = append(args, status)
+	}
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+	query += " ORDER BY created_at DESC LIMIT 200"
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		respondJSON(w, 500, map[string]string{"error": "query failed"})
+		return
+	}
+	defer rows.Close()
+	cases := []map[string]interface{}{}
+	for rows.Next() {
+		var id, tenantID, title, st, prio string
+		var alerts, sars, strs string
+		var assignee *string
+		var createdAt, updatedAt time.Time
+		if err := rows.Scan(&id, &tenantID, &title, &st, &prio, &alerts, &sars, &strs, &assignee, &createdAt, &updatedAt); err != nil {
+			continue
+		}
+		cases = append(cases, map[string]interface{}{
+			"id": id, "tenant_id": tenantID, "title": title, "status": st, "priority": prio,
+			"alert_ids": json.RawMessage(alerts), "sar_ids": json.RawMessage(sars),
+			"nfiu_str_ids": json.RawMessage(strs), "assignee": assignee,
+			"created_at": createdAt, "updated_at": updatedAt,
+		})
+	}
+	respondJSON(w, 200, map[string]interface{}{"cases": cases, "total": len(cases)})
+}
+
+func amlCaseIDFromPath(r *http.Request) (string, string) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/aml-case-manager/cases/")
+	parts := strings.Split(rest, "/")
+	if len(parts) >= 2 {
+		return parts[0], parts[1]
+	}
+	return parts[0], ""
+}
+
+func handleCaseDetail(w http.ResponseWriter, r *http.Request) {
+	if !amlCaseDB(w) {
+		return
+	}
+	id, sub := amlCaseIDFromPath(r)
+	if id == "" {
+		respondJSON(w, 400, map[string]string{"error": "case id required"})
+		return
+	}
+	switch {
+	case sub == "" && r.Method == "GET":
+		var tenantID, title, st, prio string
+		var desc *string
+		var alerts, sars, strs string
+		var assignee *string
+		var createdAt, updatedAt time.Time
+		err := db.QueryRow(
+			`SELECT tenant_id, title, description, status, priority, alert_ids, sar_ids, nfiu_str_ids, assignee, created_at, updated_at
+			 FROM aml_cases WHERE id = $1`, id,
+		).Scan(&tenantID, &title, &desc, &st, &prio, &alerts, &sars, &strs, &assignee, &createdAt, &updatedAt)
+		if err != nil {
+			respondJSON(w, 404, map[string]string{"error": "case not found"})
+			return
+		}
+		respondJSON(w, 200, map[string]interface{}{
+			"id": id, "tenant_id": tenantID, "title": title, "description": desc, "status": st,
+			"priority": prio, "alert_ids": json.RawMessage(alerts), "sar_ids": json.RawMessage(sars),
+			"nfiu_str_ids": json.RawMessage(strs), "assignee": assignee,
+			"created_at": createdAt, "updated_at": updatedAt,
+		})
+	case sub == "transition" && r.Method == "POST":
+		var body struct {
+			Status   string `json:"status"`
+			Actor    string `json:"actor"`
+			Assignee string `json:"assignee"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondJSON(w, 400, map[string]string{"error": "invalid json"})
+			return
+		}
+		var current string
+		if err := db.QueryRow(`SELECT status FROM aml_cases WHERE id = $1`, id).Scan(&current); err != nil {
+			respondJSON(w, 404, map[string]string{"error": "case not found"})
+			return
+		}
+		allowed := false
+		for _, s := range amlCaseLifecycle[current] {
+			if s == body.Status {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			respondJSON(w, 409, map[string]string{
+				"error": fmt.Sprintf("illegal transition %s -> %s", current, body.Status),
+			})
+			return
+		}
+		_, err := db.Exec(
+			`UPDATE aml_cases SET status=$2, assignee=COALESCE(NULLIF($3,''), assignee), updated_at=NOW() WHERE id=$1`,
+			id, body.Status, body.Assignee,
+		)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "transition failed"})
+			return
+		}
+		log.Printf("[aml-case-manager] case %s transition %s -> %s by %s", id, current, body.Status, body.Actor)
+		respondJSON(w, 200, map[string]string{"id": id, "status": body.Status})
+	case sub == "link" && r.Method == "POST":
+		var body struct {
+			AlertID   string `json:"alert_id"`
+			SarID     string `json:"sar_id"`
+			NfiuStrID string `json:"nfiu_str_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			respondJSON(w, 400, map[string]string{"error": "invalid json"})
+			return
+		}
+		col, val := "", ""
+		switch {
+		case body.AlertID != "":
+			col, val = "alert_ids", body.AlertID
+		case body.SarID != "":
+			col, val = "sar_ids", body.SarID
+		case body.NfiuStrID != "":
+			col, val = "nfiu_str_ids", body.NfiuStrID
+		default:
+			respondJSON(w, 400, map[string]string{"error": "one of alert_id|sar_id|nfiu_str_id required"})
+			return
+		}
+		// Idempotent link: append only when not already present.
+		res, err := db.Exec(fmt.Sprintf(
+			`UPDATE aml_cases SET %s = %s || to_jsonb($2::text), updated_at = NOW()
+			 WHERE id = $1 AND NOT (%s @> to_jsonb($2::text))`, col, col, col), id, val)
+		if err != nil {
+			respondJSON(w, 500, map[string]string{"error": "link failed"})
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			// Distinguish not-found from already-linked.
+			var exists string
+			if err := db.QueryRow(`SELECT id FROM aml_cases WHERE id=$1`, id).Scan(&exists); err != nil {
+				respondJSON(w, 404, map[string]string{"error": "case not found"})
+				return
+			}
+		}
+		respondJSON(w, 200, map[string]string{"id": id, "linked": val, "field": col})
+	default:
+		respondJSON(w, 405, map[string]string{"error": "unsupported method/path"})
+	}
+}
 
 // jwtRealmURL resolves the Keycloak realm URL for jwtMiddleware (added by
 // scripts/fix-go-wire-jwt.py).

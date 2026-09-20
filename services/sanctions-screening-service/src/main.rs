@@ -585,7 +585,7 @@ async fn screen(body: web::Json<ScreenReq>, data: web::Data<AppState>, req: acti
         highest_score
     );
 
-    HttpResponse::Ok().json(ScreeningResponse {
+    let response = ScreeningResponse {
         id: screening_id.to_string(),
         screened_name: name,
         screen_type,
@@ -598,7 +598,61 @@ async fn screen(body: web::Json<ScreenReq>, data: web::Data<AppState>, req: acti
         match_count: matches.len(),
         matches,
         screened_at: screened_at.to_rfc3339(),
-    })
+    };
+
+    // CP-12/T33: the verdict must reach the payment execution path.
+    publish_screening_verdict(&response).await;
+
+    HttpResponse::Ok().json(response)
+}
+
+// CP-12/T33: publish every screening verdict to the Kafka-backed Dapr
+// "pubsub" component on topic "compliance.screening" so payments-hub-go (and
+// any future consumer) can enforce block/unblock decisions. The verdict is
+// already durably persisted in sanctions_screenings (queryable via
+// GET /api/screenings) before this is called, so a publish failure is logged
+// as an error and retried operationally — it never fails the screening.
+async fn publish_screening_verdict(resp: &ScreeningResponse) {
+    let dapr_port = ev("DAPR_HTTP_PORT", "3500");
+    let pubsub_component = ev("DAPR_PUBSUB_COMPONENT", "pubsub");
+    let url = format!(
+        "http://127.0.0.1:{}/v1.0/publish/{}/compliance.screening",
+        dapr_port, pubsub_component
+    );
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                "compliance.screening publish: http client init failed (verdict durable in DB): {}",
+                e
+            );
+            return;
+        }
+    };
+    match client.post(&url).json(resp).send().await {
+        Ok(r) if r.status().is_success() => {
+            info!(
+                "published screening verdict id={} action={} to compliance.screening",
+                resp.id, resp.action
+            );
+        }
+        Ok(r) => {
+            error!(
+                "compliance.screening publish returned status {} for screening id={} (verdict durable in DB)",
+                r.status(),
+                resp.id
+            );
+        }
+        Err(e) => {
+            error!(
+                "compliance.screening publish failed for screening id={} (verdict durable in DB): {}",
+                resp.id, e
+            );
+        }
+    }
 }
 
 async fn add_entry(body: web::Json<AddEntryReq>, data: web::Data<AppState>, req: actix_web::HttpRequest) -> HttpResponse {

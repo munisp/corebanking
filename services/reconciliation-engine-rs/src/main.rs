@@ -14,14 +14,17 @@ use std::sync::atomic::{AtomicU64, AtomicBool, Ordering as AtomicOrdering};
 use std::time::Instant;
 use chrono::Utc;
 
+// MN-17: all money fields are integer kobo (i64). Float comparisons with
+// 0.01 tolerances were deleted — a discrepancy is any nonzero integer
+// difference. Migration 0001 adds the *_kobo columns this engine reads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SettlementRecon {
     recon_id: String,
     business_date: String,
     recon_type: String,
-    gl_balance: f64,
-    external_balance: f64,
-    difference: f64,
+    gl_balance_kobo: i64,
+    external_balance_kobo: i64,
+    difference_kobo: i64,
     status: String, // completed, failed
     items_reconciled: u64,
     items_outstanding: u64,
@@ -38,12 +41,12 @@ struct NostroPosition {
     bank_name: String,
     currency: String,
     gl_code: String,
-    book_balance: f64,
-    statement_balance: f64,
-    uncleared_credits: f64,
-    uncleared_debits: f64,
-    reconciled_balance: f64,
-    difference: f64,
+    book_balance_kobo: i64,
+    statement_balance_kobo: i64,
+    uncleared_credits_kobo: i64,
+    uncleared_debits_kobo: i64,
+    reconciled_balance_kobo: i64,
+    difference_kobo: i64,
     status: String, // reconciled, discrepancy
     last_statement_date: String,
 }
@@ -53,7 +56,7 @@ struct SuspenseItem {
     id: String,
     gl_code: String,
     gl_name: String,
-    amount: f64,
+    amount_kobo: i64,
     aging_days: i64,
     source: String,
     reason: String,
@@ -145,27 +148,30 @@ async fn run_settlement_recon(req: actix_web::HttpRequest, body: web::Json<RunSe
     };
 
     // Pull REAL nostro/vostro positions for the business date.
+    // MN-17: integer-kobo columns only (migration 0001 backfills them); a
+    // discrepancy is ANY nonzero integer difference — no float tolerance.
     let result: Result<Vec<NostroPosition>, String> = async {
+        let _span = otelkit::pg_span("SELECT account_id, bank_name, currency, gl_code, book_balance_kobo, statement_balance_kobo FROM nostro_positions (run_settlement_recon)").entered();
         let client = pg_connect(&db_url).await?;
         let rows = client
             .query(
-                "SELECT account_id, bank_name, currency, gl_code, book_balance::float8, statement_balance::float8, \
-                        uncleared_credits::float8, uncleared_debits::float8, last_statement_date::text \
+                "SELECT account_id, bank_name, currency, gl_code, book_balance_kobo, statement_balance_kobo, \
+                        uncleared_credits_kobo, uncleared_debits_kobo, last_statement_date::text \
                  FROM nostro_positions WHERE last_statement_date <= $2::date ORDER BY account_id",
                 &[&recon_type, &biz_date],
             )
             .await
-            .map_err(|e| format!("nostro_positions query failed: {}", e))?;
+            .map_err(|e| format!("nostro_positions query failed (kobo columns require migration 0001): {}", e))?;
         if rows.is_empty() {
             return Err(format!("no nostro positions found for business date {}", biz_date));
         }
         Ok(rows
             .iter()
             .map(|r| {
-                let book: f64 = r.get(4);
-                let stmt: f64 = r.get(5);
-                let uc: f64 = r.get(6);
-                let ud: f64 = r.get(7);
+                let book: i64 = r.get(4);
+                let stmt: i64 = r.get(5);
+                let uc: i64 = r.get(6);
+                let ud: i64 = r.get(7);
                 let reconciled = stmt - uc + ud;
                 let diff = book - reconciled;
                 NostroPosition {
@@ -173,13 +179,13 @@ async fn run_settlement_recon(req: actix_web::HttpRequest, body: web::Json<RunSe
                     bank_name: r.get(1),
                     currency: r.get(2),
                     gl_code: r.get(3),
-                    book_balance: book,
-                    statement_balance: stmt,
-                    uncleared_credits: uc,
-                    uncleared_debits: ud,
-                    reconciled_balance: reconciled,
-                    difference: diff,
-                    status: if diff.abs() < 0.01 { "reconciled".into() } else { "discrepancy".into() },
+                    book_balance_kobo: book,
+                    statement_balance_kobo: stmt,
+                    uncleared_credits_kobo: uc,
+                    uncleared_debits_kobo: ud,
+                    reconciled_balance_kobo: reconciled,
+                    difference_kobo: diff,
+                    status: if diff == 0 { "reconciled".into() } else { "discrepancy".into() },
                     last_statement_date: r.get(8),
                 }
             })
@@ -189,15 +195,15 @@ async fn run_settlement_recon(req: actix_web::HttpRequest, body: web::Json<RunSe
 
     match result {
         Ok(nostro_positions) => {
-            let total_diff: f64 = nostro_positions.iter().map(|n| n.difference).sum();
+            let total_diff: i64 = nostro_positions.iter().map(|n| n.difference_kobo).sum();
             let discrepancies = nostro_positions.iter().filter(|n| n.status == "discrepancy").count() as u64;
             let recon = SettlementRecon {
                 recon_id: rand_id("SRECON"),
                 business_date: biz_date,
                 recon_type: recon_type.clone(),
-                gl_balance: nostro_positions.iter().map(|n| n.book_balance).sum(),
-                external_balance: nostro_positions.iter().map(|n| n.statement_balance).sum(),
-                difference: total_diff,
+                gl_balance_kobo: nostro_positions.iter().map(|n| n.book_balance_kobo).sum(),
+                external_balance_kobo: nostro_positions.iter().map(|n| n.statement_balance_kobo).sum(),
+                difference_kobo: total_diff,
                 status: if discrepancies == 0 { "completed".into() } else { "completed_with_discrepancies".into() },
                 items_reconciled: nostro_positions.len() as u64 - discrepancies,
                 items_outstanding: discrepancies,
@@ -206,12 +212,52 @@ async fn run_settlement_recon(req: actix_web::HttpRequest, body: web::Json<RunSe
                 reconciled_at: now_str(),
                 error: None,
             };
+
+            // MN-17: every discrepancy is persisted as a recon_break AND a
+            // suspense item (deterministic ids → replay-safe ON CONFLICT).
+            // Detection is no longer ephemeral.
+            if discrepancies > 0 {
+                match pg_connect(&db_url).await {
+                    Ok(client) => {
+                        for n in nostro_positions.iter().filter(|n| n.status == "discrepancy") {
+                            let break_id = format!("BRK-{}-{}", recon.recon_id, n.account_id);
+                            let suspense_id = format!("SUS-{}-{}", recon.recon_id, n.account_id);
+                            let reason = format!(
+                                "nostro recon break {}: book {} kobo vs reconciled {} kobo (diff {} kobo) on {}",
+                                n.account_id, n.book_balance_kobo, n.reconciled_balance_kobo,
+                                n.difference_kobo, recon.business_date);
+                            if let Err(e) = client.execute(
+                                "INSERT INTO suspense_items (id, gl_code, gl_name, amount_kobo, source, reason, status) \
+                                 VALUES ($1, '1999', 'Recon Suspense', $2, 'settlement-recon', $3, 'open') \
+                                 ON CONFLICT (id) DO NOTHING",
+                                &[&suspense_id, &n.difference_kobo, &reason],
+                            ).await {
+                                eprintln!("[reconciliation-engine-rs] suspense insert failed for {}: {}", n.account_id, e);
+                            }
+                            if let Err(e) = client.execute(
+                                "INSERT INTO recon_breaks (id, recon_id, business_date, account_id, bank_name, gl_code, \
+                                    book_balance_kobo, statement_balance_kobo, uncleared_credits_kobo, uncleared_debits_kobo, \
+                                    difference_kobo, status, suspense_item_id) \
+                                 VALUES ($1,$2,$3::date,$4,$5,$6,$7,$8,$9,$10,$11,'open',$12) \
+                                 ON CONFLICT (id) DO NOTHING",
+                                &[&break_id, &recon.recon_id, &recon.business_date, &n.account_id, &n.bank_name, &n.gl_code,
+                                  &n.book_balance_kobo, &n.statement_balance_kobo, &n.uncleared_credits_kobo,
+                                  &n.uncleared_debits_kobo, &n.difference_kobo, &suspense_id],
+                            ).await {
+                                eprintln!("[reconciliation-engine-rs] recon_break insert failed for {}: {}", n.account_id, e);
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[reconciliation-engine-rs] break persistence connect failed: {}", e),
+                }
+            }
+
             let summary = json!({
                 "all_positions_reconciled": discrepancies == 0,
-                "total_uncleared_credits": nostro_positions.iter().map(|n| n.uncleared_credits).sum::<f64>(),
-                "total_uncleared_debits": nostro_positions.iter().map(|n| n.uncleared_debits).sum::<f64>(),
-                "net_uncleared": nostro_positions.iter().map(|n| n.uncleared_credits - n.uncleared_debits).sum::<f64>(),
-                "cbn_reserve_balanced": nostro_positions.iter().find(|n| n.gl_code == "1101").map(|n| n.difference.abs() < 0.01),
+                "total_uncleared_credits_kobo": nostro_positions.iter().map(|n| n.uncleared_credits_kobo).sum::<i64>(),
+                "total_uncleared_debits_kobo": nostro_positions.iter().map(|n| n.uncleared_debits_kobo).sum::<i64>(),
+                "net_uncleared_kobo": nostro_positions.iter().map(|n| n.uncleared_credits_kobo - n.uncleared_debits_kobo).sum::<i64>(),
+                "cbn_reserve_balanced": nostro_positions.iter().find(|n| n.gl_code == "1101").map(|n| n.difference_kobo == 0),
             });
             state.recons.lock().unwrap().push(recon.clone());
             HttpResponse::Ok().json(json!({
@@ -227,7 +273,7 @@ async fn run_settlement_recon(req: actix_web::HttpRequest, body: web::Json<RunSe
                 recon_id: rand_id("SRECON"),
                 business_date: biz_date,
                 recon_type,
-                gl_balance: 0.0, external_balance: 0.0, difference: 0.0,
+                gl_balance_kobo: 0, external_balance_kobo: 0, difference_kobo: 0,
                 status: "failed".into(),
                 items_reconciled: 0, items_outstanding: 0, auto_matched: 0, manual_review: 0,
                 reconciled_at: now_str(),
@@ -243,7 +289,8 @@ async fn fetch_suspense_items(db_url: &str) -> Result<Vec<SuspenseItem>, String>
     let client = pg_connect(db_url).await?;
     let rows = client
         .query(
-            "SELECT id, gl_code, gl_name, amount::float8, source, reason, status, assigned_to, created_at::text \
+            // MN-17: integer kobo column (migration 0001 creates the table).
+            "SELECT id, gl_code, gl_name, amount_kobo, source, reason, status, assigned_to, created_at::text \
              FROM suspense_items ORDER BY created_at",
             &[],
         )
@@ -261,7 +308,7 @@ async fn fetch_suspense_items(db_url: &str) -> Result<Vec<SuspenseItem>, String>
                 id: r.get(0),
                 gl_code: r.get(1),
                 gl_name: r.get(2),
-                amount: r.get(3),
+                amount_kobo: r.get(3),
                 aging_days,
                 source: r.get(4),
                 reason: r.get(5),
@@ -281,14 +328,14 @@ async fn get_suspense(req: actix_web::HttpRequest, state: web::Data<AppState>) -
     };
     match fetch_suspense_items(db_url).await {
         Ok(items) => {
-            let total_amount: f64 = items.iter().map(|i| i.amount).sum();
+            let total_amount_kobo: i64 = items.iter().map(|i| i.amount_kobo).sum();
             let aging_0_7: usize = items.iter().filter(|i| i.aging_days <= 7).count();
             let aging_8_30: usize = items.iter().filter(|i| i.aging_days > 7 && i.aging_days <= 30).count();
             let aging_over_30: usize = items.iter().filter(|i| i.aging_days > 30).count();
             HttpResponse::Ok().json(json!({
                 "suspense_items": items,
                 "total": items.len(),
-                "total_amount": total_amount,
+                "total_amount_kobo": total_amount_kobo,
                 "aging": { "0_7_days": aging_0_7, "8_30_days": aging_8_30, "over_30_days": aging_over_30 },
                 "gl_codes": ["1410 (Uncleared Effects)", "1999 (Recon Suspense)"],
             }))
@@ -346,7 +393,7 @@ async fn get_stats(req: actix_web::HttpRequest, state: web::Data<AppState>) -> H
         "total_recons_run": recons.len(),
         "total_items_reconciled": recons.iter().map(|r| r.items_reconciled).sum::<u64>(),
         "auto_match_rate_pct": (auto_match_rate * 100.0).round() / 100.0,
-        "suspense_balance": suspense.iter().filter(|i| i.status == "open").map(|i| i.amount).sum::<f64>(),
+        "suspense_balance_kobo": suspense.iter().filter(|i| i.status == "open").map(|i| i.amount_kobo).sum::<i64>(),
         "suspense_items_open": suspense.iter().filter(|i| i.status == "open").count(),
         "cbn_returns_filed": cbn_returns_filed,
         "last_eod_recon": last_eod,
@@ -397,13 +444,14 @@ async fn eod_report(req: actix_web::HttpRequest, state: web::Data<AppState>) -> 
     let nostro_reconciled = todays.iter().filter(|r| r.recon_type == "nostro" && r.status.starts_with("completed")).count();
     let reserve = client
         .query_opt(
-            "SELECT (book_balance::float8 - (statement_balance::float8 - uncleared_credits::float8 + uncleared_debits::float8)) FROM nostro_positions WHERE gl_code = '1101' ORDER BY last_statement_date DESC LIMIT 1",
+            // MN-17: integer kobo comparison (migration 0001 columns).
+            "SELECT (book_balance_kobo - (statement_balance_kobo - uncleared_credits_kobo + uncleared_debits_kobo)) FROM nostro_positions WHERE gl_code = '1101' ORDER BY last_statement_date DESC LIMIT 1",
             &[],
         )
         .await
         .ok()
         .flatten()
-        .map(|r| r.get::<usize, f64>(0).abs() < 0.01);
+        .map(|r| r.get::<usize, i64>(0) == 0);
 
     HttpResponse::Ok().json(json!({
         "report_type": "end_of_day_reconciliation",
@@ -411,7 +459,7 @@ async fn eod_report(req: actix_web::HttpRequest, state: web::Data<AppState>) -> 
         "gl_trial_balance_balanced": gl_trial_balance_balanced,
         "nostro_positions_reconciled": nostro_reconciled,
         "suspense_clearance_rate_pct": (clearance_rate * 100.0).round() / 100.0,
-        "inter_branch_balanced": todays.iter().find(|r| r.recon_type == "inter_branch").map(|r| r.difference.abs() < 0.01),
+        "inter_branch_balanced": todays.iter().find(|r| r.recon_type == "inter_branch").map(|r| r.difference_kobo == 0),
         "cbn_reserve_confirmed": reserve,
         "total_recons_today": todays.len(),
         "sign_off": {
@@ -624,7 +672,9 @@ async fn verify_jwt_token(token: &str) -> Result<serde_json::Value, actix_web::H
     }
 }
 
-async fn check_jwt(req: &actix_web) -> Result<(), HttpResponse> {
+// MN-17 compile repair: parameter type was `&actix_web` (a crate name, not a
+// type). Corrected to &actix_web::HttpRequest.
+async fn check_jwt(req: &actix_web::HttpRequest) -> Result<(), HttpResponse> {
     let path = req.path();
     if path == "/healthz" || path == "/readyz" || path == "/livez" || path == "/metrics" || path == "/health" {
         return Ok(());
@@ -679,10 +729,32 @@ fn start_grpc_server(service_name: &'static str, port: u16) {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // Wave-9 otelkit (SPEC §2.5): OTLP gRPC tracing; dropping the guard flushes spans.
+    let _otel_guard = match otelkit::init("reconciliation-engine-rs") {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("[reconciliation-engine-rs] otel init failed: {e}; continuing without telemetry");
+            None
+        }
+    };
     let port = std::env::var("PORT").unwrap_or_else(|_| "8234".to_string());
     let db_url = std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty());
     if db_url.is_none() {
         eprintln!("[reconciliation-engine-rs] DATABASE_URL not set — recon/stats endpoints will fail fast (503)");
+    }
+    // MN-17: apply recon migrations (idempotent DDL: suspense_items,
+    // recon_breaks, nostro_positions integer-kobo columns + backfill).
+    if let Some(ref url) = db_url {
+        match pg_connect(url).await {
+            Ok(c) => {
+                if let Err(e) = c.batch_execute(include_str!("../migrations/0001_recon_integer_kobo.sql")).await {
+                    eprintln!("[reconciliation-engine-rs] migration 0001 failed: {e} — recon endpoints fail closed until applied");
+                } else {
+                    println!("[reconciliation-engine-rs] migration 0001 applied (suspense_items, recon_breaks, integer kobo)");
+                }
+            }
+            Err(e) => eprintln!("[reconciliation-engine-rs] migration connect failed: {e}"),
+        }
     }
     let state = web::Data::new(AppState {
         start_time: Instant::now(),
@@ -701,6 +773,7 @@ async fn main() -> std::io::Result<()> {
                 .add(("X-XSS-Protection", "1; mode=block"))
                 .add(("Referrer-Policy", "strict-origin-when-cross-origin")))
             .app_data(state.clone())
+            .wrap(otelkit::actix::TenantMiddleware)
             .route("/v1/degradation", web::get().to(degradation_status))
             .route("/healthz", web::get().to(healthz))
             .route("/v1/settlement-recon/run", web::post().to(run_settlement_recon))
