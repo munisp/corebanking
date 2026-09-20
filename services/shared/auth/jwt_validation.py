@@ -6,12 +6,15 @@ Resolution order:
 1. If KEYCLOAK_JWKS_URL is set and PyJWT (with crypto extras) is installed,
    verify RS256/HS256 tokens against the Keycloak realm JWKS endpoint, e.g.
    https://<host>/realms/<realm>/protocol/openid-connect/certs
-2. Else if JWT_SECRET is set, verify HS256 tokens using the stdlib
-   (hmac/hashlib/base64) — no third-party dependency required.
+2. Else if JWT_SECRET_CURRENT (or legacy JWT_SECRET) is set, verify HS256
+   tokens against the key ring using the stdlib (hmac/hashlib/base64) —
+   no third-party dependency required. During rotation the previous secret
+   (JWT_SECRET_PREVIOUS) is accepted for the overlap window.
 3. Else FAIL CLOSED: return (None, "auth_not_configured").
 
 Always validates: token structure, signature, alg allowlist, exp claim
-(required), and iss when JWT_ISSUER is configured.
+(required, with JWT_LEEWAY_SECONDS clock-skew tolerance), nbf claim (when
+present, enforced with the same leeway), and iss when JWT_ISSUER is configured.
 
 Usage:
     from shared.auth.jwt_validation import validate_jwt
@@ -31,8 +34,27 @@ import hashlib
 import json
 
 KEYCLOAK_JWKS_URL = os.environ.get("KEYCLOAK_JWKS_URL", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "")
+
+# PL-03/PL-06: HS256 key ring + clock-skew tolerance.
+# Rotation story: set JWT_SECRET_CURRENT to the new key and JWT_SECRET_PREVIOUS
+# to the outgoing key; tokens signed by either verify during the overlap
+# window. JWT_SECRET remains accepted as an alias for JWT_SECRET_CURRENT so
+# existing deployments keep working. Leeway applies to both exp and nbf.
+JWT_SECRET_CURRENT = os.environ.get("JWT_SECRET_CURRENT", "") or os.environ.get("JWT_SECRET", "")
+JWT_SECRET_PREVIOUS = os.environ.get("JWT_SECRET_PREVIOUS", "")
+JWT_SECRET = JWT_SECRET_CURRENT  # backwards-compatible alias
 JWT_ISSUER = os.environ.get("JWT_ISSUER", "")
+try:
+    JWT_LEEWAY_SECONDS = float(os.environ.get("JWT_LEEWAY_SECONDS", "30"))
+except ValueError:
+    JWT_LEEWAY_SECONDS = 30.0
+
+# Key ring: ordered, current first. Placeholder values ("${...}") excluded.
+def _key_ring():
+    return [
+        k for k in (JWT_SECRET_CURRENT, JWT_SECRET_PREVIOUS)
+        if k and not k.startswith("${")
+    ]
 
 try:
     import jwt  # PyJWT
@@ -57,26 +79,42 @@ def _get_jwks_client():
 
 
 def _validate_claims(payload: dict):
-    """Validate exp (required) and iss (when configured). Returns error or None."""
+    """Validate exp (required), nbf (when present) and iss (when configured).
+
+    Both time checks use JWT_LEEWAY_SECONDS of clock-skew tolerance (PL-06):
+      - exp: token is valid until exp + leeway
+      - nbf: token is invalid before nbf - leeway
+    Returns error or None."""
+    now = time.time()
     exp = payload.get("exp")
     if exp is None:
         return "Token missing exp claim"
     try:
-        if time.time() >= float(exp):
+        if now >= float(exp) + JWT_LEEWAY_SECONDS:
             return "Token expired"
     except (TypeError, ValueError):
         return "Invalid token expiry"
+    nbf = payload.get("nbf")
+    if nbf is not None:
+        try:
+            if now + JWT_LEEWAY_SECONDS < float(nbf):
+                return "Token not yet valid"
+        except (TypeError, ValueError):
+            return "Invalid token not-before"
     if JWT_ISSUER and payload.get("iss") != JWT_ISSUER:
         return "Invalid token issuer"
     return None
 
 
 def _verify_hs256_stdlib(token: str):
-    """Stdlib HS256 verification. Returns (payload, None) or (None, reason)."""
+    """Stdlib HS256 verification against the key ring (current, then previous).
+
+    Returns (payload, None) or (None, reason)."""
     parts = token.split(".")
     if len(parts) != 3:
         return None, "Invalid token format"
-    if not JWT_SECRET or JWT_SECRET.startswith("${"):
+    keys = _key_ring()
+    if not keys:
         return None, "auth_not_configured"
     try:
         header = json.loads(_b64url_decode(parts[0]))
@@ -86,10 +124,11 @@ def _verify_hs256_stdlib(token: str):
         return None, "Invalid token encoding"
     if header.get("alg") != "HS256":
         return None, "Unsupported token algorithm"
-    expected = hmac.new(
-        JWT_SECRET.encode(), (parts[0] + "." + parts[1]).encode(), hashlib.sha256
-    ).digest()
-    if not hmac.compare_digest(expected, signature):
+    signing_input = (parts[0] + "." + parts[1]).encode()
+    if not any(
+        hmac.compare_digest(hmac.new(k.encode(), signing_input, hashlib.sha256).digest(), signature)
+        for k in keys
+    ):
         return None, "Invalid token signature"
     err = _validate_claims(payload)
     if err:
@@ -118,8 +157,10 @@ def validate_jwt(headers):
         if _PYJWT_AVAILABLE:
             try:
                 key = _get_jwks_client().get_signing_key_from_jwt(token).key
-                decode_opts = {"require": ["exp"]}
-                kwargs = {}
+                # PL-06: leeway covers exp AND nbf (PyJWT enforces nbf by
+                # default when present; previously no leeway was applied).
+                decode_opts = {"require": ["exp"], "verify_nbf": True}
+                kwargs = {"leeway": JWT_LEEWAY_SECONDS}
                 if JWT_ISSUER:
                     kwargs["issuer"] = JWT_ISSUER
                 else:
@@ -133,8 +174,8 @@ def validate_jwt(headers):
                 return None, f"Invalid token: {e}"
         # PyJWT unavailable — fall through to stdlib HS256 if configured.
 
-    # 2. Stdlib HS256 with JWT_SECRET.
-    if JWT_SECRET and not JWT_SECRET.startswith("${"):
+    # 2. Stdlib HS256 against the key ring.
+    if _key_ring():
         return _verify_hs256_stdlib(token)
 
     # 3. Fail closed.
